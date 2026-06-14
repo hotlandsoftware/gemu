@@ -75,6 +75,11 @@ typedef struct NesState {
     uint32_t mmc3_prg_offsets[4]; /* 4× 8KB windows: $8000, $A000, $C000, $E000 */
     uint32_t mmc3_chr_offsets[8]; /* 8× 1KB windows: PPU $0000–$1FFF */
 
+    /* Mapper 178 (WaixingFS) */
+    uint8_t  m178_mode;    /* $4800: bits[2:1]=PRG mode, bit[0]=mirror */
+    uint8_t  m178_prg_lo;  /* $4801: PRG A16..A14 (inner 16KB bank) */
+    uint8_t  m178_prg_hi;  /* $4802: PRG A24..A17 (outer 128KB block) */
+
     Apu2a03  apu;
 #ifdef HAVE_ALSA
     ApuMidi  apu_midi;

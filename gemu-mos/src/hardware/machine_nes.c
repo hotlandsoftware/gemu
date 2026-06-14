@@ -153,9 +153,9 @@ static bool ines_load(NesState *s, const char *path) {
     else                  s->cart.mirror = RP2C02_MIRROR_HORIZONTAL;
 
     switch (s->cart.mapper) {
-    case 0: case 1: case 2: case 4: case 66: case 228: break;
+    case 0: case 1: case 2: case 4: case 66: case 178: case 228: break;
     default:
-        fprintf(stderr, "nes: mapper %u not supported (NROM/0, MMC1/1, UxROM/2, MMC3/4, GxROM/66, Action52/228)\n",
+        fprintf(stderr, "nes: mapper %u not supported (NROM/0, MMC1/1, UxROM/2, MMC3/4, GxROM/66, WaixingFS/178, Action52/228)\n",
                 s->cart.mapper);
         fclose(f); return false;
     }
@@ -343,6 +343,39 @@ static void mmc3_irq_scanline(void *ud) {
     }
     if (s->mmc3_irq_counter == 0 && s->mmc3_irq_enabled)
         s->cpu.irq = true;
+}
+
+/* ── Mapper 178 (WaixingFS) ──────────────────────────────────────────────── */
+
+static void m178_update_banks(NesState *s) {
+    uint8_t  prg_mode = (s->m178_mode >> 1) & 3u;
+    uint32_t prg_size = (uint32_t)s->cart.prg_banks * 0x4000u;
+    uint32_t outer    = (uint32_t)s->m178_prg_hi * 0x20000u;
+    uint32_t inner    = (uint32_t)(s->m178_prg_lo & 7u) * 0x4000u;
+
+    switch (prg_mode) {
+    case 0: /* NROM-256/BNROM: 32KB page, CPU A14 = PRG A14 */
+        {
+            uint32_t base = (outer + (uint32_t)(s->m178_prg_lo & 6u) * 0x4000u) % prg_size;
+            s->prg_offsets[0] = base;
+            s->prg_offsets[1] = (base + 0x4000u) % prg_size;
+        }
+        break;
+    case 1: /* UNROM: switchable $8000–$BFFF, last inner bank fixed at $C000 */
+        s->prg_offsets[0] = (outer + inner) % prg_size;
+        s->prg_offsets[1] = (outer + 7u * 0x4000u) % prg_size;
+        break;
+    case 2: /* NROM-128: same 16KB bank mirrored at both windows */
+        s->prg_offsets[0] = (outer + inner) % prg_size;
+        s->prg_offsets[1] = (outer + inner) % prg_size;
+        break;
+    default: /* mode 3: UNROM variant — treat as mode 1 */
+        s->prg_offsets[0] = (outer + inner) % prg_size;
+        s->prg_offsets[1] = (outer + 7u * 0x4000u) % prg_size;
+        break;
+    }
+
+    s->ppu.mirror = (s->m178_mode & 1u) ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
 }
 
 /* ── CHR bus callbacks (PPU address space 0x0000–0x1FFF) ─────────────────── */
@@ -597,7 +630,8 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
 
     if (addr >= 0x6000 && addr < 0x8000) {
         if (s->fds_enabled) return s->fds.ram[addr - 0x6000u];
-        if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) || s->cart.mapper == 4)
+        if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
+            s->cart.mapper == 4 || s->cart.mapper == 178)
             return s->prg_ram[addr & 0x1FFF];
         return 0;
     }
@@ -683,9 +717,21 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
         return;
     }
 
+    if (s->cart.mapper == 178 && addr >= 0x4800 && addr <= 0x4803) {
+        switch (addr) {
+        case 0x4800: s->m178_mode   = val; break;
+        case 0x4801: s->m178_prg_lo = val; break;
+        case 0x4802: s->m178_prg_hi = val; break;
+        default: break; /* $4803: PRG-RAM bank — stored implicitly, single 8KB bank only */
+        }
+        m178_update_banks(s);
+        return;
+    }
+
     if (addr >= 0x6000 && addr < 0x8000) {
         if (s->fds_enabled) { s->fds.ram[addr - 0x6000u] = val; return; }
-        if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) || s->cart.mapper == 4)
+        if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
+            s->cart.mapper == 4 || s->cart.mapper == 178)
             s->prg_ram[addr & 0x1FFF] = val;
         return;
     }
@@ -945,6 +991,13 @@ static void nes_reset(NesState *s) {
         uint32_t last = (uint32_t)(s->cart.prg_banks - 1) * 0x4000u;
         s->prg_offsets[0] = last >= 0x4000u ? last - 0x4000u : 0;
         s->prg_offsets[1] = last;
+        s->chr_offsets[0] = 0;
+        s->chr_offsets[1] = 0x1000u;
+    } else if (s->cart.mapper == 178) {
+        s->m178_mode   = 0;
+        s->m178_prg_lo = 0;
+        s->m178_prg_hi = 0;
+        m178_update_banks(s);
         s->chr_offsets[0] = 0;
         s->chr_offsets[1] = 0x1000u;
     } else if (s->cart.mapper == 4) {
