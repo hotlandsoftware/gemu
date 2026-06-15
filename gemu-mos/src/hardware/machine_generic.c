@@ -9,7 +9,7 @@
 
 static uint8_t generic_mem_read(uint16_t addr, void *ud) {
     MosGenericState *s = ud;
-    return s->mem[addr];
+    return s->mem[addr % s->mem_size];
 }
 
 static void generic_mem_write(uint16_t addr, uint8_t val, void *ud) {
@@ -22,22 +22,23 @@ static void generic_mem_write(uint16_t addr, uint8_t val, void *ud) {
         return;
     }
 
-    if (!s->rom[addr])
-        s->mem[addr] = val;
+    uint32_t off = addr % s->mem_size;
+    if (!s->rom_map[off])
+        s->mem[off] = val;
 }
 
 /* ── ROM loading ─────────────────────────────────────────────────────────── */
 
 static bool load_roms(MosGenericState *s, const MosConfig *cfg) {
     for (int i = 0; i < cfg->n_roms; i++) {
-        uint32_t off = cfg->roms[i].addr & 0xFFFFu;
-        GemuMemory tmp = {.data = s->mem + off, .size = 0x10000u - off};
+        uint32_t off = (cfg->roms[i].addr & 0xFFFFu) % s->mem_size;
+        GemuMemory tmp = {.data = s->mem + off, .size = s->mem_size - off};
         size_t len = 0;
         if (!gemu_mem_load_file(&tmp, 0, cfg->roms[i].path, &len)) {
             fprintf(stderr, "gemu-6502: failed to load '%s'\n", cfg->roms[i].path);
             return false;
         }
-        memset(s->rom + off, 1, len);
+        memset(s->rom_map + off, 1, len);
         printf("gemu-6502: %zu bytes @ 0x%04X  ← %s\n",
                len, (unsigned)off, cfg->roms[i].path);
     }
@@ -50,7 +51,15 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
     MosGenericState *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
 
-    s->cfg = cfg;
+    s->cfg      = cfg;
+    s->mem_size = cfg->mem_size ? cfg->mem_size : 0x10000u;
+
+    s->mem     = calloc(1, s->mem_size);
+    s->rom_map = calloc(1, s->mem_size);
+    if (!s->mem || !s->rom_map) {
+        free(s->mem); free(s->rom_map); free(s);
+        return NULL;
+    }
 
     mos6502_init(&s->cpu);   /* zeroes the struct — must come before assigning callbacks */
 
@@ -85,7 +94,7 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
 }
 
 void mos_generic_reset(MosGenericState *s, const MosConfig *cfg) {
-    memset(s->rom, 0, sizeof(s->rom));
+    memset(s->rom_map, 0, s->mem_size);
     load_roms(s, cfg);
     mos6502_reset(&s->cpu);
     if (cfg->has_start_addr)
@@ -95,6 +104,8 @@ void mos_generic_reset(MosGenericState *s, const MosConfig *cfg) {
 void mos_generic_destroy(MosGenericState *s) {
     gemu_monitor_destroy(s->monitor);
     gemu_vnc_destroy(s->vnc);
+    free(s->mem);
+    free(s->rom_map);
     free(s);
 }
 

@@ -153,9 +153,9 @@ static bool ines_load(NesState *s, const char *path) {
     else                  s->cart.mirror = RP2C02_MIRROR_HORIZONTAL;
 
     switch (s->cart.mapper) {
-    case 0: case 1: case 2: case 4: case 66: case 178: case 228: break;
+    case 0: case 1: case 2: case 4: case 5: case 66: case 178: case 228: break;
     default:
-        fprintf(stderr, "nes: mapper %u not supported (NROM/0, MMC1/1, UxROM/2, MMC3/4, GxROM/66, WaixingFS/178, Action52/228)\n",
+        fprintf(stderr, "nes: mapper %u not supported (NROM/0, MMC1/1, UxROM/2, MMC3/4, MMC5/5, GxROM/66, WaixingFS/178, Action52/228)\n",
                 s->cart.mapper);
         fclose(f); return false;
     }
@@ -378,11 +378,170 @@ static void m178_update_banks(NesState *s) {
     s->ppu.mirror = (s->m178_mode & 1u) ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
 }
 
+/* ── Mapper 5 (MMC5) ─────────────────────────────────────────────────────── */
+
+static void mmc5_update_prg_banks(NesState *s) {
+    uint32_t prg_size = (uint32_t)s->cart.prg_banks * 0x4000u;
+    uint32_t unit     = 0x2000u; /* 8KB per slot */
+    uint8_t  *r       = s->mmc5_prg_regs; /* r[0]=$5113 … r[4]=$5117 */
+
+    for (int i = 0; i < 4; i++) s->mmc5_prg_is_ram[i] = false;
+
+    switch (s->mmc5_prg_mode) {
+    case 0: { /* 32KB at $8000-$FFFF from $5117 (always ROM) */
+        uint32_t base = ((uint32_t)(r[4] & 0x7Cu) * unit) % prg_size;
+        for (int i = 0; i < 4; i++) s->mmc5_prg_offsets[i] = base + (uint32_t)i * unit;
+        break;
+    }
+    case 1: { /* 16KB from $5115 at $8000, 16KB from $5117 at $C000 */
+        if (!(r[2] & 0x80u)) { s->mmc5_prg_is_ram[0] = s->mmc5_prg_is_ram[1] = true; }
+        uint32_t b0 = ((uint32_t)(r[2] & 0x7Eu) * unit) % prg_size;
+        uint32_t b1 = ((uint32_t)(r[4] & 0x7Eu) * unit) % prg_size;
+        s->mmc5_prg_offsets[0] = b0;  s->mmc5_prg_offsets[1] = b0 + unit;
+        s->mmc5_prg_offsets[2] = b1;  s->mmc5_prg_offsets[3] = b1 + unit;
+        break;
+    }
+    case 2: { /* 16KB from $5115, 8KB from $5116, 8KB from $5117 */
+        if (!(r[2] & 0x80u)) { s->mmc5_prg_is_ram[0] = s->mmc5_prg_is_ram[1] = true; }
+        if (!(r[3] & 0x80u)) { s->mmc5_prg_is_ram[2] = true; }
+        uint32_t b0 = ((uint32_t)(r[2] & 0x7Eu) * unit) % prg_size;
+        s->mmc5_prg_offsets[0] = b0;  s->mmc5_prg_offsets[1] = b0 + unit;
+        s->mmc5_prg_offsets[2] = ((uint32_t)(r[3] & 0x7Fu) * unit) % prg_size;
+        s->mmc5_prg_offsets[3] = ((uint32_t)(r[4] & 0x7Fu) * unit) % prg_size;
+        break;
+    }
+    case 3: /* Four 8KB banks from $5114-$5117 */
+        for (int i = 0; i < 4; i++) {
+            uint8_t reg = r[i + 1];
+            if (i < 3 && !(reg & 0x80u)) s->mmc5_prg_is_ram[i] = true;
+            s->mmc5_prg_offsets[i] = ((uint32_t)(reg & 0x7Fu) * unit) % prg_size;
+        }
+        break;
+    }
+}
+
+/* Return 1KB CHR byte offset for a given register index + sub-slot offset. */
+static uint32_t mmc5_chr1kb(const NesState *s, uint8_t reg_idx, uint8_t sub) {
+    uint32_t chr_size = (uint32_t)s->cart.chr_banks * 0x2000u;
+    uint16_t bank = (uint16_t)(((uint16_t)(s->mmc5_chr_hi & 3u) << 8) |
+                                s->mmc5_chr_regs[reg_idx]);
+    return ((uint32_t)(bank + sub) * 0x400u) % chr_size;
+}
+
+static uint8_t mmc5_chr_read(NesState *s, uint16_t addr) {
+    if (s->chr_is_ram) return s->chr[addr & 0x1FFFu];
+
+    uint32_t chr_size = (uint32_t)s->cart.chr_banks * 0x2000u;
+    bool rendering = (s->ppu.ppumask & (PPUMASK_SHOW_BG | PPUMASK_SHOW_SPR)) &&
+                     (s->ppu.scanline >= 0 && s->ppu.scanline < 240);
+
+    /* Extended attribute mode: BG uses ExRAM bank bits instead of normal CHR banking */
+    bool is_spr_fetch = rendering && (s->ppu.dot == 257) &&
+                        (s->ppu.ppuctrl & PPUCTRL_SPR_8x16);
+    if (!is_spr_fetch && rendering && s->mmc5_exram_mode == 1) {
+        uint8_t bank8 = (uint8_t)(((s->mmc5_chr_hi & 3u) << 6) |
+                                   (s->mmc5_exattr_latch & 0x3Fu));
+        return s->chr[((uint32_t)bank8 * 0x1000u + (addr & 0x0FFFu)) % chr_size];
+    }
+
+    /* Determine whether this is a sprite or BG fetch */
+    bool use_spr;
+    if (s->ppu.ppuctrl & PPUCTRL_SPR_8x16)
+        use_spr = is_spr_fetch;   /* 8x16: sprites at dot 257, BG elsewhere */
+    else
+        use_spr = !s->mmc5_last_chr_bg; /* 8x8: whichever set was last written */
+
+    uint8_t mode = s->mmc5_chr_mode;
+
+    if (use_spr) {
+        /* Sprite banks: $5120-$5127 (indices 0-7) → 8 × 1KB windows */
+        uint8_t s8 = (addr >> 10) & 7u;
+        switch (mode) {
+        case 0: return s->chr[(mmc5_chr1kb(s, 7, s8))         + (addr & 0x3FFu)];
+        case 1: return s->chr[(mmc5_chr1kb(s, s8 >= 4 ? 7 : 3, s8 & 3u)) + (addr & 0x3FFu)];
+        case 2: return s->chr[(mmc5_chr1kb(s, (s8 >> 1) * 2u + 1u, s8 & 1u)) + (addr & 0x3FFu)];
+        case 3: return s->chr[(mmc5_chr1kb(s, s8, 0))          + (addr & 0x3FFu)];
+        }
+    } else {
+        /* BG banks: $5128-$512B (indices 8-11) → 4 × 1KB, mirrored to $0000-$1FFF */
+        uint8_t s4 = (addr >> 10) & 3u;
+        switch (mode) {
+        case 0: return s->chr[(mmc5_chr1kb(s, 11, s4))          + (addr & 0x3FFu)];
+        case 1: return s->chr[(mmc5_chr1kb(s, 11, s4))          + (addr & 0x3FFu)];
+        case 2: return s->chr[(mmc5_chr1kb(s, (s4 >> 1) * 2u + 9u, s4 & 1u)) + (addr & 0x3FFu)];
+        case 3: return s->chr[(mmc5_chr1kb(s, 8u + s4, 0))      + (addr & 0x3FFu)];
+        }
+    }
+    return 0;
+}
+
+static uint8_t mmc5_nt_read(uint16_t addr, void *ud) {
+    NesState *s = ud;
+    uint8_t  nt  = (addr >> 10) & 3u;
+    uint8_t  mode = (s->mmc5_nt_map >> (nt * 2u)) & 3u;
+    uint16_t off  = addr & 0x3FFu;
+
+    /* Save ExRAM latch on tile reads (used for extended attribute CHR banking) */
+    if (off < 0x3C0u && s->mmc5_exram_mode == 1)
+        s->mmc5_exattr_latch = s->mmc5_exram[off];
+
+    /* Extended attribute: override attribute reads with ExRAM palette bits */
+    if (off >= 0x3C0u && s->mmc5_exram_mode == 1) {
+        uint8_t pal   = (s->mmc5_exattr_latch >> 6) & 3u;
+        uint8_t shift = (uint8_t)(((s->ppu.v >> 4) & 4u) | (s->ppu.v & 2u));
+        return (uint8_t)(pal << shift);
+    }
+
+    switch (mode) {
+    case 0: return s->ppu.vram[off];
+    case 1: return s->ppu.vram[0x400u + off];
+    case 2: return (s->mmc5_exram_mode >= 2) ? s->mmc5_exram[off & 0x3FFu] : 0;
+    case 3: /* fill mode */
+        return (off >= 0x3C0u) ? (uint8_t)(s->mmc5_fill_attr & 3u) * 0x55u
+                                : s->mmc5_fill_tile;
+    }
+    return 0;
+}
+
+static void mmc5_nt_write(uint16_t addr, uint8_t val, void *ud) {
+    NesState *s = ud;
+    uint8_t  nt  = (addr >> 10) & 3u;
+    uint8_t  mode = (s->mmc5_nt_map >> (nt * 2u)) & 3u;
+    uint16_t off  = addr & 0x3FFu;
+    switch (mode) {
+    case 0: s->ppu.vram[off]          = val; break;
+    case 1: s->ppu.vram[0x400u + off] = val; break;
+    case 2: s->mmc5_exram[off & 0x3FFu] = val; break;
+    case 3: break; /* fill-mode: writes ignored */
+    }
+}
+
+static void mmc5_irq_scanline(void *ud) {
+    NesState *s = ud;
+    int sl = s->ppu.scanline;
+    if (sl >= 240) {
+        s->mmc5_in_frame = false;
+        return;
+    }
+    if (!s->mmc5_in_frame) {
+        s->mmc5_in_frame    = true;
+        s->mmc5_irq_counter = 0;
+    } else {
+        s->mmc5_irq_counter++;
+    }
+    if (s->mmc5_irq_target > 0 && s->mmc5_irq_counter == s->mmc5_irq_target) {
+        s->mmc5_irq_pending = true;
+        if (s->mmc5_irq_enabled)
+            s->cpu.irq = true;
+    }
+}
+
 /* ── CHR bus callbacks (PPU address space 0x0000–0x1FFF) ─────────────────── */
 
 static uint8_t nes_chr_read(uint16_t addr, void *ud) {
     NesState *s = ud;
     if (!s->chr) return 0;
+    if (s->cart.mapper == 5) return mmc5_chr_read(s, addr);
     if (s->cart.mapper == 4) {
         if (s->chr_is_ram) return s->chr[addr & 0x1FFF];
         return s->chr[s->mmc3_chr_offsets[addr >> 10] + (addr & 0x3FF)];
@@ -628,8 +787,26 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
         return bit;
     }
 
+    /* MMC5: readable registers at $5100-$5BFF and ExRAM at $5C00-$5FFF */
+    if (s->cart.mapper == 5 && addr >= 0x5000 && addr < 0x6000) {
+        if (addr == 0x5204) {
+            uint8_t v = (s->mmc5_irq_pending ? 0x80u : 0u) |
+                        (s->mmc5_in_frame    ? 0x40u : 0u);
+            s->mmc5_irq_pending = false;
+            s->cpu.irq = false;
+            return v;
+        }
+        if (addr == 0x5205) return (uint8_t)((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]);
+        if (addr == 0x5206) return (uint8_t)(((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]) >> 8);
+        if (addr >= 0x5C00)
+            return (s->mmc5_exram_mode >= 2) ? s->mmc5_exram[addr - 0x5C00u] : 0;
+        return 0;
+    }
+
     if (addr >= 0x6000 && addr < 0x8000) {
         if (s->fds_enabled) return s->fds.ram[addr - 0x6000u];
+        if (s->cart.mapper == 5)
+            return s->prg_ram[addr & 0x1FFFu]; /* $5113 always maps RAM here */
         if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
             s->cart.mapper == 4 || s->cart.mapper == 178)
             return s->prg_ram[addr & 0x1FFF];
@@ -644,7 +821,13 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
         }
         if (!s->prg) return 0;
         uint8_t rom;
-        if (s->cart.mapper == 4) {
+        if (s->cart.mapper == 5) {
+            uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
+            if (s->mmc5_prg_is_ram[slot])
+                rom = s->prg_ram[(s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)) & 0x1FFFu];
+            else
+                rom = s->prg[s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)];
+        } else if (s->cart.mapper == 4) {
             uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
             rom = s->prg[s->mmc3_prg_offsets[slot] + (addr & 0x1FFFu)];
         } else if (s->cart.mapper >= 1) {
@@ -728,8 +911,49 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
         return;
     }
 
+    /* MMC5 registers at $5000-$5BFF and ExRAM at $5C00-$5FFF */
+    if (s->cart.mapper == 5 && addr >= 0x5000 && addr < 0x6000) {
+        if (addr == 0x5100) { s->mmc5_prg_mode = val & 3u; mmc5_update_prg_banks(s); return; }
+        if (addr == 0x5101) { s->mmc5_chr_mode = val & 3u; return; }
+        /* $5102/$5103: PRG-RAM protect — always allow writes (not enforced) */
+        if (addr == 0x5104) { s->mmc5_exram_mode = val & 3u; return; }
+        if (addr == 0x5105) { s->mmc5_nt_map = val; return; }
+        if (addr == 0x5106) { s->mmc5_fill_tile = val; return; }
+        if (addr == 0x5107) { s->mmc5_fill_attr = val & 3u; return; }
+        if (addr >= 0x5113 && addr <= 0x5117) {
+            s->mmc5_prg_regs[addr - 0x5113u] = val;
+            mmc5_update_prg_banks(s);
+            return;
+        }
+        if (addr >= 0x5120 && addr <= 0x5127) {
+            s->mmc5_chr_regs[addr - 0x5120u] = val;
+            s->mmc5_last_chr_bg = false;
+            return;
+        }
+        if (addr >= 0x5128 && addr <= 0x512B) {
+            s->mmc5_chr_regs[8u + (addr - 0x5128u)] = val;
+            s->mmc5_last_chr_bg = true;
+            return;
+        }
+        if (addr == 0x5130) { s->mmc5_chr_hi = val & 3u; return; }
+        if (addr == 0x5203) { s->mmc5_irq_target = val; return; }
+        if (addr == 0x5204) {
+            s->mmc5_irq_enabled = (val & 0x80u) != 0;
+            if (!s->mmc5_irq_enabled) { s->mmc5_irq_pending = false; s->cpu.irq = false; }
+            return;
+        }
+        if (addr == 0x5205) { s->mmc5_mul[0] = val; return; }
+        if (addr == 0x5206) { s->mmc5_mul[1] = val; return; }
+        if (addr >= 0x5C00 && s->mmc5_exram_mode <= 2) {
+            s->mmc5_exram[addr - 0x5C00u] = val;
+            return;
+        }
+        return; /* ignore other MMC5 writes */
+    }
+
     if (addr >= 0x6000 && addr < 0x8000) {
         if (s->fds_enabled) { s->fds.ram[addr - 0x6000u] = val; return; }
+        if (s->cart.mapper == 5) { s->prg_ram[addr & 0x1FFFu] = val; return; }
         if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
             s->cart.mapper == 4 || s->cart.mapper == 178)
             s->prg_ram[addr & 0x1FFF] = val;
@@ -993,6 +1217,22 @@ static void nes_reset(NesState *s) {
         s->prg_offsets[1] = last;
         s->chr_offsets[0] = 0;
         s->chr_offsets[1] = 0x1000u;
+    } else if (s->cart.mapper == 5) {
+        s->mmc5_prg_mode    = 3;    /* four 8KB banks */
+        s->mmc5_chr_mode    = 3;    /* 1KB CHR banks */
+        s->mmc5_exram_mode  = 3;    /* read-only at reset */
+        s->mmc5_nt_map      = 0;    /* all CIRAM page 0 */
+        s->mmc5_irq_enabled = false;
+        s->mmc5_irq_pending = false;
+        s->mmc5_in_frame    = false;
+        s->mmc5_irq_counter = 0;
+        s->mmc5_last_chr_bg = false;
+        s->mmc5_exattr_latch = 0;
+        memset(s->mmc5_prg_regs,  0xFF, sizeof(s->mmc5_prg_regs));
+        memset(s->mmc5_chr_regs,  0,    sizeof(s->mmc5_chr_regs));
+        s->mmc5_chr_hi = 0;
+        /* $5117 = 0xFF → last 8KB ROM bank at $E000-$FFFF */
+        mmc5_update_prg_banks(s);
     } else if (s->cart.mapper == 178) {
         s->m178_mode   = 0;
         s->m178_prg_lo = 0;
@@ -1125,6 +1365,13 @@ NesState *nes_create(const MosConfig *cfg) {
     if (s->cart.mapper == 4) {
         s->ppu.irq_scanline = mmc3_irq_scanline;
         s->ppu.irq_ud       = s;
+    }
+    if (s->cart.mapper == 5) {
+        s->ppu.irq_scanline = mmc5_irq_scanline;
+        s->ppu.irq_ud       = s;
+        s->ppu.nt_read      = mmc5_nt_read;
+        s->ppu.nt_write     = mmc5_nt_write;
+        s->ppu.nt_ud        = s;
     }
 
     if (cfg->vnc_addr) {

@@ -91,6 +91,10 @@ typedef struct Rp2c02 {
     void    (*chr_write)(uint16_t addr, uint8_t val, void *ud);
     void    *chr_ud;
 
+    uint8_t (*nt_read) (uint16_t addr, void *ud);
+    void    (*nt_write)(uint16_t addr, uint8_t val, void *ud);
+    void    *nt_ud;
+
     void (*irq_scanline)(void *ud);
     void *irq_ud;
 

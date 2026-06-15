@@ -75,6 +75,28 @@ typedef struct NesState {
     uint32_t mmc3_prg_offsets[4]; /* 4× 8KB windows: $8000, $A000, $C000, $E000 */
     uint32_t mmc3_chr_offsets[8]; /* 8× 1KB windows: PPU $0000–$1FFF */
 
+    /* Mapper 5 (MMC5) */
+    uint8_t  mmc5_prg_mode;           /* $5100: PRG mode 0-3 */
+    uint8_t  mmc5_chr_mode;           /* $5101: CHR mode 0-3 */
+    uint8_t  mmc5_exram_mode;         /* $5104: ExRAM mode 0-3 */
+    uint8_t  mmc5_nt_map;             /* $5105: nametable mapping (4 × 2-bit fields) */
+    uint8_t  mmc5_fill_tile;          /* $5106: fill-mode tile index */
+    uint8_t  mmc5_fill_attr;          /* $5107: fill-mode palette [1:0] */
+    uint8_t  mmc5_prg_regs[5];        /* $5113-$5117: PRG bank regs (index 0=$5113) */
+    uint8_t  mmc5_chr_regs[12];       /* $5120-$512B: CHR bank regs (index 0=$5120) */
+    uint8_t  mmc5_chr_hi;             /* $5130: upper 2 CHR bank bits */
+    uint8_t  mmc5_irq_target;         /* $5203: IRQ compare scanline */
+    bool     mmc5_irq_enabled;        /* $5204[7]: IRQ enable */
+    bool     mmc5_irq_pending;        /* scanline IRQ pending flag */
+    bool     mmc5_in_frame;           /* rendering "in frame" flag */
+    uint8_t  mmc5_irq_counter;        /* current visible scanline count */
+    uint8_t  mmc5_mul[2];             /* $5205-$5206: multiplier inputs */
+    bool     mmc5_last_chr_bg;        /* last CHR write was to $5128-$512B set */
+    uint8_t  mmc5_exattr_latch;       /* ExRAM byte for current BG tile (ext-attr) */
+    uint32_t mmc5_prg_offsets[4];     /* four 8KB PRG windows for $8000-$FFFF */
+    bool     mmc5_prg_is_ram[4];      /* true when window maps to PRG-RAM */
+    uint8_t  mmc5_exram[0x400];       /* 1KB ExRAM at CPU $5C00-$5FFF / PPU nametable */
+
     /* Mapper 178 (WaixingFS) */
     uint8_t  m178_mode;    /* $4800: bits[2:1]=PRG mode, bit[0]=mirror */
     uint8_t  m178_prg_lo;  /* $4801: PRG A16..A14 (inner 16KB bank) */

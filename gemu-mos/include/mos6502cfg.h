@@ -61,4 +61,5 @@ typedef struct MosConfig {
     NesDeviceType   ports[NES_PORTS]; /* devices on controller ports 1–2 */
     int             n_ports;          /* how many ports were explicitly assigned */
     bool            ppu_debug;
+    uint32_t        mem_size;  /* generic machine RAM in bytes (0 = default 64KB) */
 } MosConfig;

@@ -59,8 +59,11 @@ static uint8_t ppu_bus_rd(Rp2c02 *ppu, uint16_t addr) {
     addr &= 0x3FFFu;
     if (addr < 0x2000u)
         return ppu->chr_read ? ppu->chr_read(addr, ppu->chr_ud) : 0;
-    if (addr < 0x3F00u)
+    if (addr < 0x3F00u) {
+        if (ppu->nt_read)
+            return ppu->nt_read(addr & 0x2FFFu, ppu->nt_ud);
         return ppu->vram[nt_mirror(ppu, addr & 0x2FFFu)];
+    }
     return palette_rd(ppu, (uint8_t)addr);
 }
 
@@ -69,7 +72,10 @@ static void ppu_bus_wr(Rp2c02 *ppu, uint16_t addr, uint8_t val) {
     if (addr < 0x2000u) {
         if (ppu->chr_write) ppu->chr_write(addr, val, ppu->chr_ud);
     } else if (addr < 0x3F00u) {
-        ppu->vram[nt_mirror(ppu, addr & 0x2FFFu)] = val;
+        if (ppu->nt_write)
+            ppu->nt_write(addr & 0x2FFFu, val, ppu->nt_ud);
+        else
+            ppu->vram[nt_mirror(ppu, addr & 0x2FFFu)] = val;
     } else {
         palette_wr(ppu, (uint8_t)addr, val);
     }

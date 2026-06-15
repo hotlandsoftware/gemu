@@ -18,8 +18,9 @@
 typedef struct MosGenericState {
     Mos6502          cpu;
     const MosConfig *cfg;
-    uint8_t          mem[0x10000];  /* flat 64 KB */
-    uint8_t          rom[0x10000];  /* 1 = read-only at that address */
+    uint8_t         *mem;      /* flat address space (heap, mem_size bytes) */
+    uint8_t         *rom_map;  /* 1 = read-only at that address (heap, mem_size bytes) */
+    uint32_t         mem_size; /* size of mem[] and rom_map[] */
 
     GemuVncServer   *vnc;
     GemuMonitor     *monitor;

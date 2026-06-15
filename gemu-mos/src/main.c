@@ -41,6 +41,8 @@ static const GemuArgsDef def = {
     .vnc_support  = true,
     .extra_help =
         "\nArguments:\n"
+        "  -m SIZE            Amount of memory i.e. 4K, 32K, 64K, 1M, etc.\n"
+        "                     Bare number (64) is treated as kilobytes. Default: 64K.\n"
         "  -rom ADDR:FILE     Load a ROM image at CPU address ADDR\n"
         "  -rom FILE          Load a ROM image (or optional FDS BIOS with -device fds)\n"
         "  -rom DIR           Directory containing ROM files (identified by SHA256)\n"
@@ -60,6 +62,21 @@ static const GemuArgsDef def = {
         "  ./bin/gemu-mos -M nes -cartridge game.nes -vnc :1\n"
         "  ./bin/gemu-mos -M nes -device fds -fda game.fds -device nes-controller\n",
 };
+
+/* ── Memory size parsing ─────────────────────────────────────────────────── */
+
+static uint32_t parse_size(const char *s) {
+    char *end;
+    uint32_t v = (uint32_t)strtoul(s, &end, 0);
+    if      (*end == 'K' || *end == 'k') v *= 1024u;
+    else if (*end == 'M' || *end == 'm') v *= 1024u * 1024u;
+    else if (*end == '\0')               v *= 1024u; /* bare number = kilobytes */
+    if (v == 0 || v > 0x10000u) {
+        fprintf(stderr, "gemu-mos: -m: invalid size '%s' (must be 1–64, with optional K/M suffix)\n", s);
+        return 0;
+    }
+    return v;
+}
 
 /* ── ROM argument parsing ────────────────────────────────────────────────── */
 
@@ -129,7 +146,11 @@ int main(int argc, char *argv[]) {
 
     /* 6502-specific flags */
     for (int i = 0; i < nrem; i++) {
-        if (strcmp(rem[i], "-rom") == 0 && i + 1 < nrem) {
+        if (strcmp(rem[i], "-m") == 0 && i + 1 < nrem) {
+            uint32_t sz = parse_size(rem[++i]);
+            if (!sz) return 1;
+            cfg.mem_size = sz;
+        } else if (strcmp(rem[i], "-rom") == 0 && i + 1 < nrem) {
             const char *val = rem[++i];
             struct stat st;
             if (stat(val, &st) == 0 && S_ISDIR(st.st_mode)) {
