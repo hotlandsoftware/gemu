@@ -32,6 +32,7 @@ typedef enum {
 typedef struct GemuMediaDevice {
     const char *name;
     const char *kind;
+    char        file[512];   /* current media path; empty string = no media loaded */
     void       *ud;
 
     GemuMediaResult (*change)(void *ud, const char *arg,
@@ -53,6 +54,15 @@ void         gemu_monitor_enqueue_quit(GemuMonitor *mon);
 
 bool         gemu_monitor_register_media(GemuMonitor *mon,
                                          const GemuMediaDevice *dev);
+
+/* Register a loaded ROM image for display by 'info roms'.
+ * Call once per ROM after a successful load.  addr and size are in the
+ * machine's CPU address space; file is the source path. */
+void         gemu_monitor_register_rom(GemuMonitor *mon,
+                                       uint32_t addr, uint32_t size,
+                                       const char *file);
+/* Clear all registered ROM entries (call before re-loading ROMs on reset). */
+void         gemu_monitor_clear_roms(GemuMonitor *mon);
 
 /* Start the stdin reader thread (no-op if not a TTY). */
 void         gemu_monitor_start(GemuMonitor *mon);

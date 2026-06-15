@@ -35,8 +35,15 @@ typedef int sock_t;
 #  endif
 #endif
 
-#define QUEUE_SIZE 32
+#define QUEUE_SIZE       32
 #define MEDIA_DEVICE_MAX 16
+#define ROM_ENTRY_MAX    16
+
+typedef struct {
+    uint32_t addr;
+    uint32_t size;
+    char     file[512];
+} MonRomEntry;
 
 typedef enum {
     MON_ENTRY_CMD,
@@ -68,6 +75,8 @@ struct GemuMonitor {
     uint32_t        last_step_count;
     GemuMediaDevice media[MEDIA_DEVICE_MAX];
     int             n_media;
+    MonRomEntry     rom_entries[ROM_ENTRY_MAX];
+    int             n_rom_entries;
     bool          (*screendump_cb)(void *ud, const char *path);
     void           *screendump_ud;
     MonBackend      backend;
@@ -259,19 +268,30 @@ static GemuMediaDevice *find_media(GemuMonitor *mon, const char *name) {
     return NULL;
 }
 
-static void list_media(const GemuMonitor *mon) {
+static void info_block(const GemuMonitor *mon) {
     if (!mon || mon->n_media == 0) {
-        mon_printf(mon, "media: no media devices registered\n");
+        mon_printf(mon, "No block devices.\n");
         return;
     }
-    mon_printf(mon, "Media devices:\n");
     for (int i = 0; i < mon->n_media; i++) {
         const GemuMediaDevice *dev = &mon->media[i];
-        char status[256] = "";
-        if (dev->status)
-            dev->status(dev->ud, status, sizeof(status));
-        mon_printf(mon, "  %-12s %-12s %s\n",
-                   dev->name, dev->kind ? dev->kind : "media", status);
+        const char *type      = dev->kind ? dev->kind : dev->name;
+        int         removable = dev->eject ? 1 : 0;
+        const char *file      = dev->file[0] ? dev->file : "(none)";
+        mon_printf(mon, "%s: type=%s removable=%d file=%s\n",
+                   dev->name, type, removable, file);
+    }
+}
+
+static void info_roms(const GemuMonitor *mon) {
+    if (!mon || mon->n_rom_entries == 0) {
+        mon_printf(mon, "No ROMs loaded.\n");
+        return;
+    }
+    for (int i = 0; i < mon->n_rom_entries; i++) {
+        const MonRomEntry *e = &mon->rom_entries[i];
+        mon_printf(mon, "addr=0x%04x size=0x%04x file=%s\n",
+                   e->addr, e->size, e->file);
     }
 }
 
@@ -297,8 +317,15 @@ static bool dispatch_media(GemuMonitor *mon, const char *line,
         return true;
     }
 
-    if (strcasecmp(verb, "media") == 0) {
-        list_media(mon);
+    if (strcasecmp(verb, "info") == 0) {
+        char *sub = next_token(&p);
+        if (!sub || strcasecmp(sub, "block") == 0) {
+            info_block(mon);
+        } else if (strcasecmp(sub, "roms") == 0) {
+            info_roms(mon);
+        } else {
+            mon_printf(mon, "info: unknown subcommand '%s' (try 'info block', 'info roms')\n", sub);
+        }
         *out_cmd = GEMU_MON_NONE;
         return true;
     }
@@ -338,6 +365,8 @@ static bool dispatch_media(GemuMonitor *mon, const char *line,
             return true;
         }
         result = dev->eject(dev->ud, err, sizeof(err));
+        if (result != GEMU_MEDIA_ERR)
+            dev->file[0] = '\0';
     } else {
         char *arg = unquote_arg(p);
         if (!*arg) {
@@ -352,6 +381,8 @@ static bool dispatch_media(GemuMonitor *mon, const char *line,
                 return true;
             }
             result = dev->eject(dev->ud, err, sizeof(err));
+            if (result != GEMU_MEDIA_ERR)
+                dev->file[0] = '\0';
         } else {
             if (!dev->change) {
                 mon_printf(mon, "change: device '%s' cannot be changed\n", dev_name);
@@ -359,6 +390,8 @@ static bool dispatch_media(GemuMonitor *mon, const char *line,
                 return true;
             }
             result = dev->change(dev->ud, arg, err, sizeof(err));
+            if (result != GEMU_MEDIA_ERR)
+                snprintf(dev->file, sizeof(dev->file), "%s", arg);
         }
     }
 
@@ -428,7 +461,8 @@ static bool monitor_handle_line(GemuMonitor *mon, char *line) {
         "  gamegenie add [code] -- add game genie code\n"
         "  gamegenie list -- show active game genie codes\n"
         "  gamegenie delete [code] -- deletes game genie code\n"
-        "  media -- list media devices\n"
+        "  info block -- list block devices\n"
+        "  info roms  -- list loaded ROM images\n"
         "  q / quit -- quits the machine immediately\n"
         "  reset -- reset the machine\n"
         "  screendump <file>[.png] -- save screenshot (PPM or PNG)\n"
@@ -660,6 +694,20 @@ void gemu_monitor_unknown_command(const GemuMonitor *mon) {
 
 bool gemu_monitor_is_paused(const GemuMonitor *mon) {
     return mon && mon->paused;
+}
+
+void gemu_monitor_register_rom(GemuMonitor *mon,
+                               uint32_t addr, uint32_t size,
+                               const char *file) {
+    if (!mon || mon->n_rom_entries >= ROM_ENTRY_MAX || !file) return;
+    MonRomEntry *e = &mon->rom_entries[mon->n_rom_entries++];
+    e->addr = addr;
+    e->size = size;
+    snprintf(e->file, sizeof(e->file), "%s", file);
+}
+
+void gemu_monitor_clear_roms(GemuMonitor *mon) {
+    if (mon) mon->n_rom_entries = 0;
 }
 
 void gemu_monitor_set_screendump_cb(GemuMonitor *mon,

@@ -151,6 +151,7 @@ static bool load_roms(MosGenericState *s, const MosConfig *cfg) {
         memset(s->rom_map + off, 1, len);
         printf("gemu-6502: %zu bytes @ 0x%04X  ← %s\n",
                len, (unsigned)off, cfg->roms[i].path);
+        gemu_monitor_register_rom(s->monitor, off, (uint32_t)len, cfg->roms[i].path);
     }
     return true;
 }
@@ -203,6 +204,7 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
 }
 
 void mos_generic_reset(MosGenericState *s, const MosConfig *cfg) {
+    gemu_monitor_clear_roms(s->monitor);
     memset(s->rom_map, 0, s->mem_size);
     load_roms(s, cfg);
 

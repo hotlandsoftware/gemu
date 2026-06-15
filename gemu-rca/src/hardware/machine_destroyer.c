@@ -440,6 +440,8 @@ RcaDestroyerState *rca_destroyer_create(const RcaConfig *cfg) {
         }
         printf("gemu-rca: %zu bytes @ 0x%04X  <- %s\n",
                len, cfg->roms[i].addr, cfg->roms[i].path);
+        gemu_monitor_register_rom(s->monitor, cfg->roms[i].addr, (uint32_t)len,
+                                  cfg->roms[i].path);
     }
     return s;
 }

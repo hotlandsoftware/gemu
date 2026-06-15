@@ -320,6 +320,7 @@ RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg) {
         if (end > s->rom_size) s->rom_size = end;
         printf("gemu-rca: %zu bytes @ ROM+0x%04X  ← %s\n",
                len, off, cfg->roms[i].path);
+        gemu_monitor_register_rom(s->monitor, off, (uint32_t)len, cfg->roms[i].path);
     }
 
     return s;

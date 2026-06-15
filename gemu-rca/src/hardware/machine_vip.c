@@ -394,14 +394,19 @@ RcaVipState *rca_vip_create(const RcaConfig *cfg) {
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, vip_screendump, s);
-    gemu_monitor_register_media(s->monitor, &(GemuMediaDevice){
-        .name   = "tape",
-        .kind   = "tape",
-        .ud     = s,
-        .change = vip_media_change_tape,
-        .eject  = vip_media_eject_tape,
-        .status = vip_media_status_tape,
-    });
+    {
+        GemuMediaDevice tape_dev = {
+            .name   = "tape",
+            .kind   = "tape",
+            .ud     = s,
+            .change = vip_media_change_tape,
+            .eject  = vip_media_eject_tape,
+            .status = vip_media_status_tape,
+        };
+        if (s->tape.path[0])
+            snprintf(tape_dev.file, sizeof(tape_dev.file), "%s", s->tape.path);
+        gemu_monitor_register_media(s->monitor, &tape_dev);
+    }
     if (cfg->sound_hw == RCA_SOUND_PCSPK && !cfg->vnc_addr) {
         s->speaker = rca_pcspk_create(250u);
         if (!s->speaker)
@@ -438,6 +443,8 @@ RcaVipState *rca_vip_create(const RcaConfig *cfg) {
         }
         printf("gemu-rca: %zu bytes @ 0x%04X  ← %s\n",
                len, cfg->roms[i].addr, cfg->roms[i].path);
+        gemu_monitor_register_rom(s->monitor, cfg->roms[i].addr, (uint32_t)len,
+                                  cfg->roms[i].path);
     }
     vip_apply_start_addr(s, cfg);
     return s;

@@ -1330,23 +1330,29 @@ NesState *nes_create(const MosConfig *cfg) {
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, nes_screendump, s);
     if (s->fds_enabled) {
-        gemu_monitor_register_media(s->monitor, &(GemuMediaDevice){
+        GemuMediaDevice floppy_dev = {
             .name   = "floppy",
             .kind   = "floppy",
             .ud     = s,
             .change = fds_media_change,
             .eject  = fds_media_eject,
             .status = fds_media_status,
-        });
+        };
+        if (cfg->fda_path)
+            snprintf(floppy_dev.file, sizeof(floppy_dev.file), "%s", cfg->fda_path);
+        gemu_monitor_register_media(s->monitor, &floppy_dev);
     } else {
-        gemu_monitor_register_media(s->monitor, &(GemuMediaDevice){
+        GemuMediaDevice cart_dev = {
             .name   = "cartridge",
             .kind   = "cartridge",
             .ud     = s,
             .change = nes_media_change,
             .eject  = nes_media_eject,
             .status = nes_media_status,
-        });
+        };
+        if (s->cart_path_buf[0])
+            snprintf(cart_dev.file, sizeof(cart_dev.file), "%s", s->cart_path_buf);
+        gemu_monitor_register_media(s->monitor, &cart_dev);
     }
 
     if (cfg->display_type == GEMU_DISPLAY_SDL ||

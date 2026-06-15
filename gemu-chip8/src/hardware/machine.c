@@ -77,6 +77,7 @@ Chip8State *chip8_machine_create(const Chip8Config *cfg) {
         return NULL;
     }
     printf("gemu-chip8: loaded %zu bytes from '%s'\n", rom_len, cfg->rom_path);
+    gemu_monitor_register_rom(s->monitor, CHIP8_ROM_BASE, (uint32_t)rom_len, cfg->rom_path);
     return s;
 }
 

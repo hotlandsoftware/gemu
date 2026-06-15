@@ -265,6 +265,7 @@ RcaStudio2State *rca_studio2_create(const RcaConfig *cfg) {
             return NULL;
         }
         printf("gemu-rca: %zu bytes @ 0x%04X  <- %s\n", len, addr, cfg->roms[i].path);
+        gemu_monitor_register_rom(s->monitor, addr, (uint32_t)len, cfg->roms[i].path);
     }
 
     /* Insert cartridge if provided */
@@ -279,14 +280,19 @@ RcaStudio2State *rca_studio2_create(const RcaConfig *cfg) {
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, studio2_screendump, s);
-    gemu_monitor_register_media(s->monitor, &(GemuMediaDevice){
-        .name   = "cartridge",
-        .kind   = "cartridge",
-        .ud     = s,
-        .change = studio2_media_change_cart,
-        .eject  = studio2_media_eject_cart,
-        .status = studio2_media_status_cart,
-    });
+    {
+        GemuMediaDevice cart_dev = {
+            .name   = "cartridge",
+            .kind   = "cartridge",
+            .ud     = s,
+            .change = studio2_media_change_cart,
+            .eject  = studio2_media_eject_cart,
+            .status = studio2_media_status_cart,
+        };
+        if (s->cart_loaded)
+            snprintf(cart_dev.file, sizeof(cart_dev.file), "%s", s->cart_path);
+        gemu_monitor_register_media(s->monitor, &cart_dev);
+    }
     if (cfg->vnc_addr) {
         s->vnc = gemu_vnc_create(cfg->vnc_addr,
                                  STUDIO2_DISPLAY_W * cfg->display_scale,
