@@ -251,6 +251,8 @@ void apu2a03_tick(Apu2a03 *a) {
 
         for (uint32_t i = 0; i < steps; i++) {
             if (pos == pts[i]) {
+                /* 5-step mode step 3 (cycle 29829) is a no-op on hardware */
+                if (a->fc_mode && i == 3) break;
                 bool half = (i == 1) || (i == 3) || (a->fc_mode && i == 4);
                 clock_frame(a, half);
                 if (!a->fc_mode && i == 3 && !a->fc_irq_inhibit)
