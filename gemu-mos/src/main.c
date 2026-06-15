@@ -17,12 +17,12 @@
 
 static const GemuDevDesc machines[] = {
     {"famicom", "Nintendo Family Computer (Ricoh 2A03 + RP2C02, alias for nes)"},
-    {"generic", "Generic MOS 6502 (flat 64 KB, ROM at user-specified address)"},
+    {"generic", "Generic MOS-compatible machine (flat 64 KB, ROM at user-specified address)"},
     {"nes",     "Nintendo Entertainment System (Ricoh 2A03 + RP2C02)"},
 };
 static const GemuDevDesc cpus[] = {
     {"6502", "MOS Technology 6502"},
-    {"2a03", "Ricoh 2A03 (NES CPU — 6502 without decimal mode)"},
+    {"2a03", "Ricoh 2A03 (NES CPU, 6502 without decimal mode)"},
 };
 static const GemuDevDesc vgas[] = {
     {"2c02", "Ricoh RP2C02 (256x240 px, NTSC, NES PPU)"},

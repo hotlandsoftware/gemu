@@ -1,24 +1,134 @@
 #include "generic.h"
 #include "gemu/memory.h"
 #include <SDL2/SDL.h>
+#include <sys/select.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ── IRQ aggregator ──────────────────────────────────────────────────────── */
+
+static void generic_update_irq(MosGenericState *s) {
+    s->cpu.irq =
+        (s->timer_pending  && (s->timer_ctrl  & 0x02u)) ||
+        (s->serial_rxq_cnt && (s->serial_ctrl & 0x01u));
+}
+
+/* ── Timer ───────────────────────────────────────────────────────────────── */
+
+static uint32_t timer_period(MosGenericState *s) {
+    return s->timer_reload ? (uint32_t)s->timer_reload : 0x10000u;
+}
+
+/* Call once per instruction in the run loop. */
+static void generic_timer_tick(MosGenericState *s) {
+    if (!(s->timer_ctrl & 0x01u)) return;
+    if (s->cpu.cycle_count < s->timer_next_fire) return;
+
+    s->timer_pending = true;
+
+    if (s->timer_ctrl & 0x04u)        /* auto-reload: advance from last fire */
+        s->timer_next_fire += timer_period(s);
+    else
+        s->timer_ctrl &= ~0x01u;      /* one-shot: disable */
+
+    generic_update_irq(s);
+}
+
+/* ── Serial ──────────────────────────────────────────────────────────────── */
+
+/* Poll stdin (non-blocking) and fill the RX FIFO. Call once per frame. */
+static void generic_poll_serial(MosGenericState *s) {
+    while (s->serial_rxq_cnt < 16u) {
+        struct timeval tv = {0, 0};
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) <= 0) break;
+
+        uint8_t b;
+        if (read(STDIN_FILENO, &b, 1) != 1) break;
+
+        s->serial_rxq[s->serial_rxq_w] = b;
+        s->serial_rxq_w = (s->serial_rxq_w + 1u) & 15u;
+        s->serial_rxq_cnt++;
+    }
+    if (s->serial_rxq_cnt) generic_update_irq(s);
+}
 
 /* ── Memory callbacks ────────────────────────────────────────────────────── */
 
 static uint8_t generic_mem_read(uint16_t addr, void *ud) {
     MosGenericState *s = ud;
+
+    if (addr >= GENERIC_IO_BASE && addr <= GENERIC_IO_END) {
+        switch (addr - GENERIC_IO_BASE) {
+        case 0x00u:  /* $DF00 timer reload lo */
+            return (uint8_t)(s->timer_reload);
+        case 0x01u:  /* $DF01 timer reload hi */
+            return (uint8_t)(s->timer_reload >> 8);
+        case 0x02u:  /* $DF02 timer control + pending */
+            return s->timer_ctrl | (s->timer_pending ? 0x80u : 0u);
+        case 0x10u:  /* $DF10 serial RX data */
+            if (s->serial_rxq_cnt) {
+                uint8_t b = s->serial_rxq[s->serial_rxq_r];
+                s->serial_rxq_r   = (s->serial_rxq_r + 1u) & 15u;
+                s->serial_rxq_cnt--;
+                generic_update_irq(s);
+                return b;
+            }
+            return 0;
+        case 0x11u:  /* $DF11 serial status */
+            return 0x02u | (s->serial_rxq_cnt ? 0x01u : 0u);  /* TX always ready */
+        case 0x12u:  /* $DF12 serial control */
+            return s->serial_ctrl;
+        }
+        return 0;
+    }
+
     return s->mem[addr % s->mem_size];
 }
 
 static void generic_mem_write(uint16_t addr, uint8_t val, void *ud) {
     MosGenericState *s = ud;
 
-    /* Debug output port: write a byte to stdout (useful for test ROMs) */
+    /* Legacy debug port: write byte to stdout (used by test ROMs) */
     if (addr == 0xF001u) {
         putchar(val);
         fflush(stdout);
+        return;
+    }
+
+    if (addr >= GENERIC_IO_BASE && addr <= GENERIC_IO_END) {
+        switch (addr - GENERIC_IO_BASE) {
+        case 0x00u:  /* $DF00 timer reload lo */
+            s->timer_reload = (s->timer_reload & 0xFF00u) | val;
+            break;
+        case 0x01u:  /* $DF01 timer reload hi */
+            s->timer_reload = (s->timer_reload & 0x00FFu) | ((uint16_t)val << 8);
+            break;
+        case 0x02u: {  /* $DF02 timer control */
+            bool was_enabled = (s->timer_ctrl & 0x01u) != 0;
+            bool now_enabled = (val           & 0x01u) != 0;
+            if (val & 0x80u)                 /* write 1 to bit7 = clear pending */
+                s->timer_pending = false;
+            s->timer_ctrl = val & 0x7Fu;     /* bit7 is status-only, not stored */
+            if (!was_enabled && now_enabled)  /* rising enable edge: arm timer */
+                s->timer_next_fire = s->cpu.cycle_count + timer_period(s);
+            generic_update_irq(s);
+            break;
+        }
+        case 0x10u:  /* $DF10 serial TX data */
+            putchar(val);
+            fflush(stdout);
+            break;
+        case 0x12u:  /* $DF12 serial control */
+            s->serial_ctrl = val;
+            generic_update_irq(s);
+            break;
+        /* $DF11 serial status is read-only; $DF13-$DFFF reserved */
+        }
         return;
     }
 
@@ -63,15 +173,14 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
 
     mos6502_init(&s->cpu);   /* zeroes the struct — must come before assigning callbacks */
 
-    s->cpu.mem_read       = generic_mem_read;
-    s->cpu.mem_write      = generic_mem_write;
-    s->cpu.mem_ud         = s;
+    s->cpu.mem_read        = generic_mem_read;
+    s->cpu.mem_write       = generic_mem_write;
+    s->cpu.mem_ud          = s;
     s->cpu.decimal_disable = (cfg->cpu == MOS_CPU_2A03);
 
     s->monitor = gemu_monitor_create();
 
     if (cfg->vnc_addr) {
-        /* Placeholder 320×200 framebuffer; machines with real video will override */
         s->vnc = gemu_vnc_create(cfg->vnc_addr, 320, 200);
         if (!s->vnc)
             fprintf(stderr, "gemu-6502: failed to start VNC server at %s\n",
@@ -96,6 +205,14 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
 void mos_generic_reset(MosGenericState *s, const MosConfig *cfg) {
     memset(s->rom_map, 0, s->mem_size);
     load_roms(s, cfg);
+
+    s->timer_ctrl    = 0;
+    s->timer_pending = false;
+    s->serial_ctrl   = 0;
+    s->serial_rxq_r  = 0;
+    s->serial_rxq_w  = 0;
+    s->serial_rxq_cnt = 0;
+
     mos6502_reset(&s->cpu);
     if (cfg->has_start_addr)
         s->cpu.PC = cfg->start_addr;
@@ -123,31 +240,32 @@ void mos_generic_run(MosGenericState *s, const MosConfig *cfg) {
     while (!quit) {
         Uint32 t0 = SDL_GetTicks();
 
-        /* SDL quit (headless still needs the event pump for clean exit) */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) quit = true;
         }
 
-        /* Monitor commands */
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-            if      (cmd == GEMU_MON_QUIT)  { quit = true; break; }
-            else if (cmd == GEMU_MON_RESET) mos_generic_reset(s, cfg);
+            if      (cmd == GEMU_MON_QUIT)   { quit = true; break; }
+            else if (cmd == GEMU_MON_RESET)  mos_generic_reset(s, cfg);
             else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
         }
         if (quit) break;
 
-        /* VNC key events (machines that add keyboard hardware poll s->vnc here) */
         if (s->vnc) {
             GemuVncKeyEvent ev_key;
             while (gemu_vnc_pop_key_event(s->vnc, &ev_key)) { /* discard for now */ }
         }
 
         if (!gemu_monitor_is_paused(s->monitor)) {
+            generic_poll_serial(s);
+
             uint64_t target = s->cpu.cycle_count + GENERIC_CYCLES_PER_FRAME;
-            while (s->cpu.cycle_count < target)
+            while (s->cpu.cycle_count < target) {
                 mos6502_step(&s->cpu);
+                generic_timer_tick(s);
+            }
         }
 
         Uint32 elapsed = SDL_GetTicks() - t0;

@@ -23,7 +23,7 @@ Currently emulated hardware for this machine:
 | Name   | Full Name     | Year | Graphics  | Input | Sound | Status |
 |--------|---------------|---------|---------|-------|-------|-------|
 | famicom | `Nintendo Family Computer` | 1983  | 🟢 | 🟢 | 🟢 | imperfect | 
-| generic | `Generic MOS-6502` | N/A | 🔴 | 🔴 | 🔴 | imperfect | 
+| generic | `Generic MOS-compatible machine` | N/A | 🔴 | 🔴 | 🔴 | imperfect | 
 | nes | `Nintendo Entertainment System (NTSC)` | 1985 | 🟢 | 🟢 | 🟢 | imperfect | 
 
 ## Planned, not implemented yet
