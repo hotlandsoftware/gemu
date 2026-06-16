@@ -1400,7 +1400,7 @@ NesState *nes_create(const MosConfig *cfg) {
     }
 
     /* Wire up PPU CHR bus */
-    rp2c02_init(&s->ppu);
+    rp2c02_init(&s->ppu, cfg->is_pal);
     s->ppu.chr_read  = nes_chr_read;
     s->ppu.chr_write = nes_chr_write;
     s->ppu.chr_ud    = s;
@@ -1414,7 +1414,8 @@ NesState *nes_create(const MosConfig *cfg) {
 
     /* APU — only initialise when sound is enabled */
     if (cfg->sound == MOS_SOUND_2A03) {
-        if (!apu2a03_init(&s->apu))
+        uint32_t apu_clock = cfg->is_pal ? 1662607u : 1789773u;
+        if (!apu2a03_init(&s->apu, apu_clock))
             fprintf(stderr, "nes: APU audio init failed (continuing silently)\n");
         s->apu.mem_read = nes_cpu_read;
         s->apu.mem_ud   = s;
@@ -1519,7 +1520,8 @@ void nes_destroy(NesState *s) {
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
 /* Fallback frame duration when audio is off (headless / -soundhw none). */
-#define NES_FRAME_MS   17u   /* 1000/60 ≈ 16.67 ms; round up to avoid running fast */
+#define NES_FRAME_MS       17u   /* NTSC: 1000/60 ≈ 16.67 ms */
+#define NES_FRAME_PAL_MS   20u   /* PAL:  1000/50 = 20.00 ms */
 
 /* Audio queue threshold for sync: allow up to 3 frames of latency (~50 ms).
  * ~735 samples/frame * 3 frames * 4 bytes/float = 8820 bytes */
@@ -1679,8 +1681,9 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                 SDL_Delay(1);
         } else {
             Uint32 elapsed = SDL_GetTicks() - t0;
-            if (elapsed < NES_FRAME_MS)
-                SDL_Delay(NES_FRAME_MS - elapsed);
+            Uint32 frame_ms = cfg->is_pal ? NES_FRAME_PAL_MS : NES_FRAME_MS;
+            if (elapsed < frame_ms)
+                SDL_Delay(frame_ms - elapsed);
         }
 
 #ifdef GEMU_GTK

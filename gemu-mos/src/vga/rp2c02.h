@@ -55,6 +55,7 @@ typedef struct Rp2c02 {
 
     int      scanline;
     int      dot;
+    int      lines_total;  /* 262 NTSC, 312 PAL */
     uint64_t frame;
     bool     odd_frame;
 
@@ -103,7 +104,7 @@ typedef struct Rp2c02 {
 
 extern const uint32_t rp2c02_palette_rgb[64];
 
-void    rp2c02_init(Rp2c02 *ppu);
+void    rp2c02_init(Rp2c02 *ppu, bool is_pal);
 void    rp2c02_reset(Rp2c02 *ppu);
 
 uint8_t rp2c02_read(Rp2c02 *ppu, uint8_t reg);

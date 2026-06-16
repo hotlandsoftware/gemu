@@ -18,7 +18,8 @@
 static const GemuDevDesc machines[] = {
     {"famicom", "Nintendo Family Computer (Ricoh 2A03 + RP2C02, alias for nes)"},
     {"generic", "Generic MOS-compatible machine (flat 64 KB, ROM at user-specified address)"},
-    {"nes",     "Nintendo Entertainment System (Ricoh 2A03 + RP2C02)"},
+    {"nes",     "Nintendo Entertainment System (Ricoh 2A03 + RP2C02, NTSC)"},
+    {"nespal",  "Nintendo Entertainment System (Ricoh 2A03 + RP2C02, PAL)"},
 };
 static const GemuDevDesc cpus[] = {
     {"6502", "MOS Technology 6502"},
@@ -130,6 +131,7 @@ int main(int argc, char *argv[]) {
     if (args.machine) {
         if      (strcmp(args.machine, "generic") == 0) cfg.machine = MOS_MACHINE_GENERIC;
         else if (strcmp(args.machine, "nes")     == 0) cfg.machine = MOS_MACHINE_NES;
+        else if (strcmp(args.machine, "nespal")  == 0) { cfg.machine = MOS_MACHINE_NES; cfg.is_pal = true; }
         else if (strcmp(args.machine, "famicom") == 0) cfg.machine = MOS_MACHINE_NES;
     }
 

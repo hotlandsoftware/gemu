@@ -264,9 +264,8 @@ void apu2a03_tick(Apu2a03 *a) {
 
     /* Sample generation */
     a->sample_acc += 1.0;
-    double cps = (double)APU2A03_CPU_CLOCK / (double)APU2A03_SAMPLE_RATE;
-    if (a->sample_acc >= cps) {
-        a->sample_acc -= cps;
+    if (a->sample_acc >= a->clock_pps) {
+        a->sample_acc -= a->clock_pps;
         if (a->frame_n < 1024) {
             float s = mix(
                 pulse_out(&a->pulse[0], 0, a->ch_en[0]),
@@ -435,12 +434,14 @@ void apu2a03_flush(Apu2a03 *a) {
 void apu2a03_reset(Apu2a03 *a) {
     /* Silence all channels, keep audio device and external hooks */
     SDL_AudioDeviceID dev = a->audio_dev;
+    double pps              = a->clock_pps;
     uint8_t (*mr)(uint16_t, void*) = a->mem_read;
     void *mu = a->mem_ud;
     void (*tap)(uint16_t, uint8_t, void*) = a->write_tap;
     void *tu = a->write_tap_ud;
     memset(a, 0, sizeof(*a));
     a->audio_dev    = dev;
+    a->clock_pps    = pps;
     a->mem_read     = mr;
     a->mem_ud       = mu;
     a->write_tap    = tap;
@@ -452,12 +453,13 @@ void apu2a03_reset(Apu2a03 *a) {
     a->dmc.silence   = true;
 }
 
-bool apu2a03_init(Apu2a03 *a) {
+bool apu2a03_init(Apu2a03 *a, uint32_t cpu_clock_hz) {
     memset(a, 0, sizeof(*a));
     a->noise.lfsr    = 1;
     a->dmc.bits_rem  = 8;
     a->dmc.buf_empty = true;
     a->dmc.silence   = true;
+    a->clock_pps     = (double)cpu_clock_hz / (double)APU2A03_SAMPLE_RATE;
 
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, "apu: SDL_InitSubSystem(AUDIO) failed: %s\n", SDL_GetError());

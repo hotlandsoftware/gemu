@@ -67,6 +67,7 @@ typedef struct Apu2a03 {
 
     /* Timing */
     uint64_t cycle;               /* total CPU cycles elapsed */
+    double   clock_pps;            /* cycles per output sample (CPU_HZ / SAMPLE_RATE) */
     bool     apu_clk;             /* toggles each CPU cycle */
 
     /* Sample generation */
@@ -89,7 +90,7 @@ typedef struct Apu2a03 {
     void  *write_tap_ud;
 } Apu2a03;
 
-bool    apu2a03_init   (Apu2a03 *a);   /* opens SDL audio; returns false on failure */
+bool    apu2a03_init   (Apu2a03 *a, uint32_t cpu_clock_hz);   /* opens SDL audio; returns false on failure */
 void    apu2a03_reset  (Apu2a03 *a);
 void    apu2a03_destroy(Apu2a03 *a);
 

@@ -61,5 +61,6 @@ typedef struct MosConfig {
     NesDeviceType   ports[NES_PORTS]; /* devices on controller ports 1–2 */
     int             n_ports;          /* how many ports were explicitly assigned */
     bool            ppu_debug;
+    bool            is_pal;      /* PAL mode: 312 lines, ~50 Hz, slower CPU clock */
     uint32_t        mem_size;  /* generic machine RAM in bytes (0 = default 64KB) */
 } MosConfig;

@@ -25,6 +25,7 @@ Currently emulated hardware for this machine:
 | famicom | `Nintendo Family Computer` | 1983  | 🟢 | 🟢 | 🟢 | imperfect | 
 | generic | `Generic MOS-compatible machine` | N/A | 🔴 | 🔴 | 🔴 | imperfect | 
 | nes | `Nintendo Entertainment System (NTSC)` | 1985 | 🟢 | 🟢 | 🟢 | imperfect | 
+| nespal | `Nintendo Entertainment System (PAL)` | 1986 | 🟢 | 🟢 | 🟢 | imperfect | 
 
 ## Planned, not implemented yet
 | Name   | Full Name     | Year |
@@ -52,7 +53,6 @@ Currently emulated hardware for this machine:
 | pet | `Commodore PET` | 1977 |
 | vic20 | `Commodore VIC-20` | 1980 |
 | kim1 | `KIM-1` | 1976 |
-| nespal | `Nintendo Entertainment System (PAL)` | 1986 |
 | challenger | `Ohio Scientific Challenger 4P` | 1979 |
 | orao | `Orao (Yugoslavia)` | 1984 |
 | sfc | `Super Famicom` | 1991 |

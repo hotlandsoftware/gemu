@@ -86,7 +86,7 @@ static void incr_y(Rp2c02 *ppu);
 
 static void increment_vram_addr(Rp2c02 *ppu) {
     if ((ppu->ppumask & (PPUMASK_SHOW_BG | PPUMASK_SHOW_SPR)) &&
-        ((ppu->scanline >= 0 && ppu->scanline < 240) || ppu->scanline == 261)) {
+        ((ppu->scanline >= 0 && ppu->scanline < 240) || ppu->scanline == ppu->lines_total - 1)) {
         incr_coarse_x(ppu);
         incr_y(ppu);
         return;
@@ -306,7 +306,7 @@ static uint8_t bit_reverse(uint8_t b) {
 
 static void evaluate_sprites(Rp2c02 *ppu) {
     int target = ppu->scanline + 1;
-    if (target >= 262) target = 0;
+    if (target >= ppu->lines_total) target = 0;
 
     int spr_h = (ppu->ppuctrl & PPUCTRL_SPR_8x16) ? 16 : 8;
     ppu->n_spr = 0;
@@ -334,7 +334,7 @@ static void evaluate_sprites(Rp2c02 *ppu) {
 
 static void load_sprite_shifters(Rp2c02 *ppu) {
     int target = ppu->scanline + 1;
-    if (target >= 262) target = 0;
+    if (target >= ppu->lines_total) target = 0;
 
     for (int i = 0; i < (int)ppu->n_spr; i++) {
         uint8_t spr_y = ppu->oam2[i * 4 + 0];
@@ -454,7 +454,7 @@ void rp2c02_tick(Rp2c02 *ppu) {
     int dot = ppu->dot;
     bool rendering = rendering_enabled(ppu);
     bool visible = sl >= 0 && sl < 240;
-    bool prerender = sl == 261;
+    bool prerender = sl == ppu->lines_total - 1;
     bool active = visible || prerender;
 
     if (sl == 241 && dot == 1) {
@@ -511,7 +511,7 @@ void rp2c02_tick(Rp2c02 *ppu) {
     if (ppu->dot == 341 || (ppu->dot == 340 && prerender && ppu->odd_frame && rendering)) {
         ppu->dot = 0;
         ppu->scanline++;
-        if (ppu->scanline == 262) {
+        if (ppu->scanline == ppu->lines_total) {
             ppu->scanline = 0;
             ppu->odd_frame = !ppu->odd_frame;
             ppu->frame++;
@@ -533,7 +533,7 @@ void rp2c02_reset(Rp2c02 *ppu) {
     ppu->oamaddr = 0;
     ppu->read_buf = 0;
     ppu->open_bus = 0;
-    ppu->scanline = 261;
+    ppu->scanline = ppu->lines_total - 1;
     ppu->dot = 0;
     ppu->odd_frame = false;
     ppu->nmi_pending = false;
@@ -559,8 +559,9 @@ void rp2c02_reset(Rp2c02 *ppu) {
     ppu->spr0_active = false;
 }
 
-void rp2c02_init(Rp2c02 *ppu) {
+void rp2c02_init(Rp2c02 *ppu, bool is_pal) {
     memset(ppu, 0, sizeof(*ppu));
-    ppu->mirror = RP2C02_MIRROR_VERTICAL;
+    ppu->mirror     = RP2C02_MIRROR_VERTICAL;
+    ppu->lines_total = is_pal ? 312 : 262;
     rp2c02_reset(ppu);
 }
