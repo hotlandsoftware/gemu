@@ -1,8 +1,10 @@
 #include "generic.h"
 #include "gemu/memory.h"
 #include <SDL2/SDL.h>
-#include <sys/select.h>
-#include <unistd.h>
+#ifndef _WIN32
+#  include <sys/select.h>
+#  include <unistd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +42,7 @@ static void generic_timer_tick(MosGenericState *s) {
 
 /* Poll stdin (non-blocking) and fill the RX FIFO. Call once per frame. */
 static void generic_poll_serial(MosGenericState *s) {
+#ifndef _WIN32
     while (s->serial_rxq_cnt < 16u) {
         struct timeval tv = {0, 0};
         fd_set fds;
@@ -55,6 +58,11 @@ static void generic_poll_serial(MosGenericState *s) {
         s->serial_rxq_cnt++;
     }
     if (s->serial_rxq_cnt) generic_update_irq(s);
+#else
+    /* Non-blocking stdin polling via select() isn't available on Windows;
+     * serial RX is a no-op there (TX to stdout still works). */
+    (void)s;
+#endif
 }
 
 /* ── Memory callbacks ────────────────────────────────────────────────────── */
