@@ -163,6 +163,23 @@ static void hex_buffer_replace_line(GtkTextBuffer *buf, int line, const char *ne
     gtk_text_buffer_insert(buf, &ds, with_nl, -1);
 }
 
+/* gtk_text_buffer_get_line_count() includes the final empty line when the
+ * buffer ends with '\n'. hex_tab_rebuild() writes one newline per data row,
+ * so compare/update against data rows rather than GTK's raw line count. */
+static int hex_buffer_data_line_count(GtkTextBuffer *buf) {
+    int n_lines = gtk_text_buffer_get_line_count(buf);
+    if (n_lines <= 0) return 0;
+
+    GtkTextIter start, end;
+    gtk_text_buffer_get_iter_at_line(buf, &start, n_lines - 1);
+    end = start;
+    gtk_text_iter_forward_to_line_end(&end);
+
+    if (gtk_text_iter_equal(&start, &end))
+        n_lines--;
+    return n_lines;
+}
+
 /* In-place update: compare each line against live data and only replace
  * lines that changed.  Leaves scroll position completely undisturbed.
  *
@@ -175,7 +192,7 @@ static void hex_buffer_replace_line(GtkTextBuffer *buf, int line, const char *ne
 static void hex_tab_update(HexEditorTab *tab) {
     if (!tab->buf || !tab->data || tab->size == 0) return;
 
-    int n_lines = gtk_text_buffer_get_line_count(tab->buf);
+    int n_lines = hex_buffer_data_line_count(tab->buf);
     size_t expected = (tab->size + HEX_LINE_BYTES - 1) / HEX_LINE_BYTES;
     if ((size_t)n_lines != expected) {
         hex_tab_rebuild(tab);
