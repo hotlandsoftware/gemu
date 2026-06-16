@@ -129,6 +129,88 @@ static void hex_tab_rebuild(HexEditorTab *tab) {
     gtk_text_buffer_get_end_iter(tab->buf, &end);
 }
 
+/* Format one hex line into `out` (without trailing newline).  Returns the
+ * number of characters written (excluding null terminator). */
+static int format_hex_line(char *out, size_t out_sz,
+                            uint32_t addr, const uint8_t *bytes, int n) {
+    char *p = out;
+    p += snprintf(p, out_sz - (size_t)(p - out), "%04X: ", addr);
+    for (int i = 0; i < HEX_LINE_BYTES; i++) {
+        if (i < n)
+            p += snprintf(p, out_sz - (size_t)(p - out),
+                          "%02X%s", bytes[i], (i == 7) ? "  " : " ");
+        else
+            p += snprintf(p, out_sz - (size_t)(p - out),
+                          "  %s", (i == 7) ? " " : " ");
+    }
+    if (p > out && p[-1] == ' ') p--;
+    p += snprintf(p, out_sz - (size_t)(p - out), " ");
+    for (int i = 0; i < HEX_LINE_BYTES; i++) {
+        char c = (i < n && bytes[i] >= 32 && bytes[i] < 127) ? (char)bytes[i] : '.';
+        *p++ = c;
+    }
+    *p = '\0';
+    return (int)(p - out);
+}
+
+/* In-place update: compare each line against live data and only replace
+ * lines that changed.  Leaves scroll position completely undisturbed. */
+static void hex_tab_update(HexEditorTab *tab) {
+    if (!tab->buf || !tab->data || tab->size == 0) return;
+
+    int n_lines = gtk_text_buffer_get_line_count(tab->buf);
+    size_t expected = (tab->size + HEX_LINE_BYTES - 1) / HEX_LINE_BYTES;
+    if ((size_t)n_lines != expected) {
+        hex_tab_rebuild(tab);
+        return;
+    }
+
+    uint32_t addr = tab->base_addr;
+    for (size_t off = 0, line = 0; off < tab->size;
+         off += HEX_LINE_BYTES, line++, addr += HEX_LINE_BYTES) {
+        int n = (int)((tab->size - off) < (size_t)HEX_LINE_BYTES
+                      ? (tab->size - off) : HEX_LINE_BYTES);
+
+        /* Get existing line text (excluding newline) */
+        GtkTextIter ls, le;
+        gtk_text_buffer_get_iter_at_line(tab->buf, &ls, (int)line);
+        le = ls;
+        gtk_text_iter_forward_to_line_end(&le);
+
+        char *old_text = gtk_text_buffer_get_text(tab->buf, &ls, &le, FALSE);
+        if (!old_text) continue;
+
+        /* Format new line */
+        char new_line[128];
+        format_hex_line(new_line, sizeof(new_line),
+                        addr, tab->data + off, n);
+
+        if (strcmp(old_text, new_line) != 0) {
+            /* Delete old line including its newline.
+             * Check is_last after moving past \n so trailing-newline
+             * lines are correctly detected. */
+            GtkTextIter ds, de;
+            gtk_text_buffer_get_iter_at_line(tab->buf, &ds, (int)line);
+            de = ds;
+            gtk_text_iter_forward_to_line_end(&de);
+            gtk_text_iter_forward_char(&de);  /* skip past \n, or stays at end */
+            bool is_last = gtk_text_iter_is_end(&de);
+            gtk_text_buffer_delete(tab->buf, &ds, &de);
+
+            /* Re-insert.  After deleting the last line the old line index
+             * is out of range, so position at end explicitly. */
+            if (is_last)
+                gtk_text_buffer_get_end_iter(tab->buf, &ds);
+            else
+                gtk_text_buffer_get_iter_at_line(tab->buf, &ds, (int)line);
+            char with_nl[130];
+            snprintf(with_nl, sizeof(with_nl), "%s\n", new_line);
+            gtk_text_buffer_insert(tab->buf, &ds, with_nl, -1);
+        }
+        g_free(old_text);
+    }
+}
+
 /* Remove highlight from all bytes in a tab. */
 static void hex_tab_clear_highlight(HexEditorTab *tab) {
     if (!tab->buf || !tab->hl_tag) return;
@@ -162,8 +244,13 @@ static bool hex_tab_byte_at_pos(HexEditorTab *tab, int offset,
     /* Check if click is in the hex data area */
     if (col < HEX_DATA_START) return false;
 
-    int bi = (col - HEX_DATA_START) / 3;
-    int ci = (col - HEX_DATA_START) % 3;
+    /* The double-space after byte 7 shifts columns by 1 for bytes 8-15.
+     * Adjust so that the simple /3,%3 math works for all byte positions. */
+    int data_col = col - HEX_DATA_START;
+    if (data_col >= 24) data_col--;  /* skip the extra space after byte 7 */
+
+    int bi = data_col / 3;
+    int ci = data_col % 3;
     if (bi >= HEX_LINE_BYTES || ci >= 2) return false;
 
     size_t data_off = (size_t)line * HEX_LINE_BYTES + (size_t)bi;
@@ -289,9 +376,9 @@ static void on_write_clicked(GtkButton *btn, gpointer ud) {
                  (uint8_t)val, he->selected_addr);
         gtk_label_set_text(GTK_LABEL(he->status_label), status);
 
-        /* Refresh the display to reflect the change */
+        /* In-place update so scroll is preserved */
         if (he->cur_tab)
-            hex_tab_rebuild(he->cur_tab);
+            hex_tab_update(he->cur_tab);
 
         /* Re-select the byte */
         uint32_t off = he->selected_addr - he->cur_tab->base_addr;
@@ -463,8 +550,9 @@ static GtkWidget *hex_create_tab_view(HexEditor *he, HexEditorTab *tab) {
     g_signal_connect(tab->text_view, "key-press-event",
                      G_CALLBACK(on_key_press), he);
 
-    /* Enable key events on the text view */
-    gtk_widget_add_events(tab->text_view, GDK_KEY_PRESS_MASK);
+    /* Enable mouse and key events on the text view */
+    gtk_widget_add_events(tab->text_view,
+        GDK_BUTTON_PRESS_MASK | GDK_KEY_PRESS_MASK);
 
     return tab->scrolled;
 }
@@ -614,10 +702,14 @@ void hex_editor_show(HexEditor *he) {
     if (!he || he->visible) return;
     he->visible = true;
 
-    /* Rebuild all tabs with fresh data */
+    /* Rebuild all tabs with fresh data, preserving scroll positions */
     for (int i = 0; i < HEX_TAB_COUNT; i++) {
-        if (he->tabs[i].data)
-            hex_tab_rebuild(&he->tabs[i]);
+        if (!he->tabs[i].data) continue;
+        GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(
+            GTK_SCROLLED_WINDOW(he->tabs[i].scrolled));
+        double saved = vadj ? gtk_adjustment_get_value(vadj) : 0.0;
+        hex_tab_rebuild(&he->tabs[i]);
+        if (vadj) gtk_adjustment_set_value(vadj, saved);
     }
 
     gtk_widget_show_all(he->window);
@@ -637,11 +729,11 @@ bool hex_editor_is_visible(const HexEditor *he) {
 void hex_editor_refresh(HexEditor *he) {
     if (!he || !he->visible) return;
 
-    /* Only rebuild every other frame — halves the text-buffer rebuild cost
-     * while keeping the display responsive at ~30 Hz visual refresh. */
-    he->refresh_skip = !he->refresh_skip;
-    if (he->refresh_skip) {
-        /* Still restore highlight if we had a selection */
+    /* Throttle: rebuild only every 4th frame (~15 Hz) to keep overhead low
+     * while still showing live memory changes. */
+    he->refresh_skip = (he->refresh_skip + 1) & 3;
+    if (he->refresh_skip != 0) {
+        /* On skip frames, just restore the selection highlight if any. */
         if (he->has_selection && he->cur_tab) {
             HexEditorTab *sel_tab = he->cur_tab;
             uint32_t off = he->selected_addr - sel_tab->base_addr;
@@ -654,30 +746,16 @@ void hex_editor_refresh(HexEditor *he) {
         return;
     }
 
-    /* Rebuild the RAM tab (always changes).  Save/restore scroll position
-     * so the user's view doesn't jump around. */
-    HexEditorTab *ram = &he->tabs[HEX_TAB_RAM];
-    if (ram->data && ram->buf) {
-        GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(
-            GTK_SCROLLED_WINDOW(ram->scrolled));
-        double saved = vadj ? gtk_adjustment_get_value(vadj) : 0.0;
-        hex_tab_rebuild(ram);
-        if (vadj) gtk_adjustment_set_value(vadj, saved);
+    /* Rebuild all non-read-only tabs with fresh data via in-place line
+     * updates — scroll position is naturally preserved because only
+     * changed lines are replaced. */
+    for (int i = 0; i < HEX_TAB_COUNT; i++) {
+        HexEditorTab *tab = &he->tabs[i];
+        if (!tab->data || tab->read_only) continue;
+        hex_tab_update(tab);
     }
 
-    /* Rebuild CHR if it's RAM (writable) */
-    HexEditorTab *chr = &he->tabs[HEX_TAB_CHR];
-    if (chr->read_only == false && chr->data && chr->buf) {
-        GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(
-            GTK_SCROLLED_WINDOW(chr->scrolled));
-        double saved = vadj ? gtk_adjustment_get_value(vadj) : 0.0;
-        hex_tab_rebuild(chr);
-        if (vadj) gtk_adjustment_set_value(vadj, saved);
-    }
-
-    /* PRG ROM doesn't change — no rebuild needed */
-
-    /* Re-apply selection highlight if there was one */
+    /* Restore selection highlight on the active tab */
     if (he->has_selection && he->cur_tab) {
         HexEditorTab *sel_tab = he->cur_tab;
         uint32_t off = he->selected_addr - sel_tab->base_addr;

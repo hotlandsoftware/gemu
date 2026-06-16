@@ -46,6 +46,8 @@ typedef struct {
     const uint32_t *palette;
     int             n_colors;
     GemuMonitor    *monitor;
+    void          (*hex_toggle_cb)(void *);  /* optional: Debug > Hex Editor */
+    void           *hex_toggle_ud;
 } GemuVideoGtkSpec;
 
 GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec);

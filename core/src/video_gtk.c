@@ -213,7 +213,8 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(v->window), vbox);
-    gemu_gtk_add_action_menu(vbox, spec->monitor);
+    gemu_gtk_add_action_menu(vbox, spec->monitor,
+                              spec->hex_toggle_cb, spec->hex_toggle_ud);
 
     /* GL area */
     v->gl_area = gtk_gl_area_new();

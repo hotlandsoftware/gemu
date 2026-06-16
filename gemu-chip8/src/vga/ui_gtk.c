@@ -230,7 +230,7 @@ Chip8Display *chip8_display_gtk_create(int scale, GemuMonitor *mon) {
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(c->window), vbox);
 
-    gemu_gtk_add_action_menu(vbox, mon);
+    gemu_gtk_add_action_menu(vbox, mon, NULL, NULL);
 
     /* ── CHIP-8 drawing area ── */
     c->drawing_area = gtk_drawing_area_new();

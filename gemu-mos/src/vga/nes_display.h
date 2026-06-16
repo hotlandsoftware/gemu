@@ -25,13 +25,19 @@ NesDisplay *nes_display_sdl_create(const char *title,
 #ifdef GEMU_GTK
 NesDisplay *nes_display_gtk_create(const char *title,
                                    const uint32_t *palette, int scale,
-                                   GemuMonitor *mon);
+                                   GemuMonitor *mon,
+                                   void (*hex_toggle_cb)(void *),
+                                   void *hex_toggle_ud);
 #endif
 
-/* Factory: picks the right backend based on display type */
+/* Factory: picks the right backend based on display type.
+ * hex_toggle_cb/hex_toggle_ud are passed to the GTK backend for the
+ * Debug > Hex Editor menu item (only used when type == GEMU_DISPLAY_GTK). */
 NesDisplay *nes_display_create(GemuDisplayType type, const char *title,
                                const uint32_t *palette, int scale,
-                               GemuRendererType renderer, GemuMonitor *mon);
+                               GemuRendererType renderer, GemuMonitor *mon,
+                               void (*hex_toggle_cb)(void *),
+                               void *hex_toggle_ud);
 
 static inline void    nes_display_render(NesDisplay *d, const uint8_t *px, int w, int h)
                           { if (d) d->render(d->ctx, px, w, h); }

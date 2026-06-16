@@ -119,15 +119,18 @@ fail:
 
 NesDisplay *nes_display_create(GemuDisplayType type, const char *title,
                                const uint32_t *palette, int scale,
-                               GemuRendererType renderer, GemuMonitor *mon) {
+                               GemuRendererType renderer, GemuMonitor *mon,
+                               void (*hex_toggle_cb)(void *),
+                               void *hex_toggle_ud) {
     switch (type) {
     case GEMU_DISPLAY_SDL:
-        (void)mon;
+        (void)mon; (void)hex_toggle_cb; (void)hex_toggle_ud;
         return nes_display_sdl_create(title, palette, scale, renderer);
 #ifdef GEMU_GTK
     case GEMU_DISPLAY_GTK:
         (void)renderer;
-        return nes_display_gtk_create(title, palette, scale, mon);
+        return nes_display_gtk_create(title, palette, scale, mon,
+                                      hex_toggle_cb, hex_toggle_ud);
 #endif
     default:
         return NULL;

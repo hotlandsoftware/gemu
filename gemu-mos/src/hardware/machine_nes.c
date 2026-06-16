@@ -25,6 +25,21 @@
 #  include "gemu/video.h"
 #  include "gemu/gtk_menu.h"
 #endif
+#include "../vga/hex_editor.h"
+
+/* GTK Debug > Hex Editor menu callback (body is no-op when GTK disabled). */
+static void nes_hex_toggle(void *ud) {
+#ifdef GEMU_GTK
+    NesState *s = ud;
+    if (!s->hex_editor) return;
+    if (hex_editor_is_visible(s->hex_editor))
+        hex_editor_hide(s->hex_editor);
+    else
+        hex_editor_show(s->hex_editor);
+#else
+    (void)ud;
+#endif
+}
 
 /* ── Battery-backed SRAM persistence ────────────────────────────────────── */
 
@@ -1368,7 +1383,8 @@ NesState *nes_create(const MosConfig *cfg) {
                                         rp2c02_palette_rgb,
                                         cfg->display_scale,
                                         cfg->display_renderer,
-                                        s->monitor);
+                                        s->monitor,
+                                        nes_hex_toggle, s);
         if (!s->display)
             fprintf(stderr, "nes: failed to create display window\n");
     }
@@ -1568,10 +1584,6 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                 gemu_vnc_update(s->vnc, s->ppu.pixels,
                                 RP2C02_WIDTH, RP2C02_HEIGHT);
 
-#ifdef GEMU_GTK
-            /* Refresh hex editor if visible */
-            hex_editor_refresh(s->hex_editor);
-#endif
         }
 
         /* Frame sync:
@@ -1589,7 +1601,8 @@ void nes_run(NesState *s, const MosConfig *cfg) {
         }
 
 #ifdef GEMU_GTK
-        /* Process GTK events — draws the frame and keeps windows responsive */
+        /* Refresh hex editor with live RAM data, then process GTK events */
+        hex_editor_refresh(s->hex_editor);
         gemu_video_gtk_poll();
 #endif
     }

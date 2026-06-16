@@ -67,19 +67,23 @@ static uint8_t gtk_ctrl1(void *vctx)       { return ((NesGtkCtx *)vctx)->ctrl1; 
 
 NesDisplay *nes_display_gtk_create(const char *title,
                                    const uint32_t *palette, int scale,
-                                   GemuMonitor *mon) {
+                                   GemuMonitor *mon,
+                                   void (*hex_toggle_cb)(void *),
+                                   void *hex_toggle_ud) {
     if (scale <= 0) scale = NES_GTK_DEFAULT_SCALE;
 
     NesGtkCtx *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->video = gemu_video_gtk_create(&(GemuVideoGtkSpec){
-        .title    = title ? title : "GEMU",
-        .width    = RP2C02_WIDTH,
-        .height   = RP2C02_HEIGHT,
-        .scale    = scale,
-        .palette  = palette,
-        .n_colors = 64,
-        .monitor  = mon,
+        .title         = title ? title : "GEMU",
+        .width         = RP2C02_WIDTH,
+        .height        = RP2C02_HEIGHT,
+        .scale         = scale,
+        .palette       = palette,
+        .n_colors      = 64,
+        .monitor       = mon,
+        .hex_toggle_cb = hex_toggle_cb,
+        .hex_toggle_ud = hex_toggle_ud,
     });
     if (!c->video) { free(c); return NULL; }
 
