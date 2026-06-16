@@ -1468,7 +1468,8 @@ NesState *nes_create(const MosConfig *cfg) {
                                         cfg->display_scale,
                                         cfg->display_renderer,
                                         s->monitor,
-                                        nes_hex_toggle, s);
+                                        nes_hex_toggle, s,
+                                        cfg->ports);
         if (!s->display)
             fprintf(stderr, "nes: failed to create display window\n");
     }
@@ -1633,6 +1634,13 @@ void nes_run(NesState *s, const MosConfig *cfg) {
 
         /* SDL window closed */
         if (s->display && nes_display_should_quit(s->display)) break;
+
+        /* SDL input menu: reset requested */
+        if (nes_display_menu_reset_requested(s->display)) {
+            nes_display_menu_clear_reset(s->display);
+            nes_sav_save(s);
+            nes_reset(s);
+        }
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             /* Run one full frame (until PPU marks frame complete) */

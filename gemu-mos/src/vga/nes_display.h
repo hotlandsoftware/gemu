@@ -2,32 +2,38 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include "../hardware/nes_devices.h"
 #include "gemu/display.h"
 #include "gemu/monitor.h"
 
 typedef struct NesDisplay NesDisplay;
 
 struct NesDisplay {
-    void    (*render)      (void *ctx, const uint8_t *pixels, int w, int h);
-    void    (*render_argb) (void *ctx, const uint32_t *pixels, int w, int h);
-    void    (*poll)        (void *ctx);
-    void    (*destroy)     (void *ctx);
-    bool    (*should_quit) (void *ctx);
-    uint8_t (*ctrl1)       (void *ctx);
-    void    (*zapper)      (void *ctx, int *x, int *y, bool *trigger);
+    void    (*render)            (void *ctx, const uint8_t *pixels, int w, int h);
+    void    (*render_argb)       (void *ctx, const uint32_t *pixels, int w, int h);
+    void    (*poll)              (void *ctx);
+    void    (*destroy)           (void *ctx);
+    bool    (*should_quit)       (void *ctx);
+    uint8_t (*ctrl1)             (void *ctx);
+    void    (*zapper)            (void *ctx, int *x, int *y, bool *trigger);
+    bool    (*menu_reset_requested)(void *ctx);   /* SDL input menu: reset requested */
+    void    (*menu_clear_reset)  (void *ctx);     /* SDL input menu: clear reset flag */
     void    *ctx;
+    NesDeviceType port_devices[NES_PORTS]; /* device type attached to each controller port */
 };
 
 /* Backend constructors */
 NesDisplay *nes_display_sdl_create(const char *title,
                                    const uint32_t *palette, int scale,
-                                   GemuRendererType renderer);
+                                   GemuRendererType renderer,
+                                   const NesDeviceType *port_devices);
 #ifdef GEMU_GTK
 NesDisplay *nes_display_gtk_create(const char *title,
                                    const uint32_t *palette, int scale,
                                    GemuMonitor *mon,
                                    void (*hex_toggle_cb)(void *),
-                                   void *hex_toggle_ud);
+                                   void *hex_toggle_ud,
+                                   const NesDeviceType *port_devices);
 #endif
 
 /* Factory: picks the right backend based on display type.
@@ -37,7 +43,8 @@ NesDisplay *nes_display_create(GemuDisplayType type, const char *title,
                                const uint32_t *palette, int scale,
                                GemuRendererType renderer, GemuMonitor *mon,
                                void (*hex_toggle_cb)(void *),
-                               void *hex_toggle_ud);
+                               void *hex_toggle_ud,
+                               const NesDeviceType *port_devices);
 
 static inline void    nes_display_render(NesDisplay *d, const uint8_t *px, int w, int h)
                           { if (d) d->render(d->ctx, px, w, h); }
@@ -62,6 +69,12 @@ static inline void nes_display_zapper(NesDisplay *d, int *x, int *y, bool *trigg
         if (y) *y = -1;
         if (trigger) *trigger = false;
     }
+}
+static inline bool nes_display_menu_reset_requested(NesDisplay *d) {
+    return d && d->menu_reset_requested && d->menu_reset_requested(d->ctx);
+}
+static inline void nes_display_menu_clear_reset(NesDisplay *d) {
+    if (d && d->menu_clear_reset) d->menu_clear_reset(d->ctx);
 }
 static inline void    nes_display_destroy(NesDisplay *d) {
     if (!d) return;

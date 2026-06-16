@@ -349,6 +349,11 @@ static void studio2_poll_display(RcaStudio2State *s, RcaDisplay *display,
         *quit = true;
         return;
     }
+    if (rca_display_menu_reset_requested(display)) {
+        rca_display_menu_clear_reset(display);
+        *reset = true;
+        return;
+    }
 
     for (int i = 0; i < 10; i++) {
         s->keys_a[i] = rca_display_key_down(display, keys_a_map[i]);
@@ -382,7 +387,8 @@ void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
                                                   cfg->display_scale,
                                                   0xFFFFFFFFu,
                                                   0xFF000000u,
-                                                  s->monitor);
+                                                  s->monitor,
+                                                  cfg->keyboard);
     if (!display) {
         fprintf(stderr, "studio2: failed to create display\n");
         return;

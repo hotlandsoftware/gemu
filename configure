@@ -55,6 +55,7 @@ TARGETS = {
             'core/include', 'gemu-rca/include',
             'gemu-rca/src', 'gemu-rca/src/cpu', 'gemu-rca/src/vga',
             'gemu-rca/src/devices', 'gemu-rca/src/hardware',
+            'gemu-mos/src/vga',   # shared input_menu.c/h
         ],
         'core_src': [
             'core/src/memory.c', 'core/src/args.c', 'core/src/monitor.c',
@@ -73,6 +74,7 @@ TARGETS = {
             'gemu-rca/src/hardware/machine_studio2.c',
             'gemu-rca/src/hardware/machine_pecom.c',
             'gemu-rca/src/hardware/romdb.c',
+            'gemu-mos/src/vga/input_menu.c',  # shared input menu
         ],
         'src_curses': ['gemu-rca/src/vga/display_curses.c'],
         'src_gtk': [
@@ -107,6 +109,7 @@ TARGETS = {
             'gemu-mos/src/hardware/fds_hle.c',
             'gemu-mos/src/hardware/nes_devices.c',
             'gemu-mos/src/hardware/romdb.c',
+            'gemu-mos/src/vga/input_menu.c',
         ],
         'src_curses': [],
         'src_gtk': [

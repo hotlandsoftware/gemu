@@ -30,6 +30,7 @@ typedef enum {
     NES_DEVICE_NONE = 0,
     NES_DEVICE_CONTROLLER,  /* NES Standard Controller */
     NES_DEVICE_ZAPPER,      /* NES Zapper light gun */
+    NES_DEVICE_KEYBOARD,    /* Famicom Keyboard */
 } NesDeviceType;
 
 #define NES_PORTS 2

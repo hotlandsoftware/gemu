@@ -456,7 +456,8 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
         cfg->display_scale,
         pecom_palette,
         (int)(sizeof(pecom_palette) / sizeof(pecom_palette[0])),
-        s->monitor);
+        s->monitor,
+        cfg->keyboard);
 
     if (!display) {
         fprintf(stderr, "gemu-rca: pecom32: failed to create display\n");
@@ -482,6 +483,12 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
         if (cfg->display_type != GEMU_DISPLAY_NONE)
             pecom_poll_display(s, display, &quit);
         pecom_poll_vnc(s);
+
+        /* SDL input menu reset */
+        if (rca_display_menu_reset_requested(display)) {
+            rca_display_menu_clear_reset(display);
+            rca_pecom32_reset(s, cfg);
+        }
 
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {

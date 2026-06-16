@@ -11,6 +11,7 @@ typedef struct {
     GemuVideoGtk *video;
     bool          quit;
     uint8_t       ctrl1;
+    NesDeviceType port_devices[NES_PORTS];
 } NesGtkCtx;
 
 static uint8_t gdk_key_to_btn(guint k) {
@@ -69,11 +70,14 @@ NesDisplay *nes_display_gtk_create(const char *title,
                                    const uint32_t *palette, int scale,
                                    GemuMonitor *mon,
                                    void (*hex_toggle_cb)(void *),
-                                   void *hex_toggle_ud) {
+                                   void *hex_toggle_ud,
+                                   const NesDeviceType *port_devices) {
     if (scale <= 0) scale = NES_GTK_DEFAULT_SCALE;
 
     NesGtkCtx *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
+    if (port_devices)
+        memcpy(c->port_devices, port_devices, sizeof(c->port_devices));
     c->video = gemu_video_gtk_create(&(GemuVideoGtkSpec){
         .title         = title ? title : "GEMU",
         .width         = RP2C02_WIDTH,
@@ -101,5 +105,7 @@ NesDisplay *nes_display_gtk_create(const char *title,
     d->should_quit = gtk_should_quit;
     d->ctrl1       = gtk_ctrl1;
     d->ctx         = c;
+    if (port_devices)
+        memcpy(d->port_devices, port_devices, sizeof(d->port_devices));
     return d;
 }

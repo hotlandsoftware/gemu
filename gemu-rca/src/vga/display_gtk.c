@@ -19,6 +19,7 @@ typedef struct {
     } keys[RCA_GTK_MAX_KEYS];
     int              n_keys;
     uint32_t         queued_keysym;
+    RcaKeyboardType  keyboard_type;
 } RcaGtkCtx;
 
 static int find_key(RcaGtkCtx *c, uint32_t keysym) {
@@ -136,7 +137,8 @@ static void gtk_destroy(void *ctx) {
 static RcaDisplay *gtk_create_common(const char *title, int w, int h,
                                      int scale, const uint32_t *palette,
                                      int n_colors, uint32_t on,
-                                     uint32_t off, GemuMonitor *mon) {
+                                     uint32_t off, GemuMonitor *mon,
+                                     RcaKeyboardType keyboard_type) {
     if (scale <= 0) scale = RCA_GTK_DEFAULT_SCALE;
 
     RcaGtkCtx *c = calloc(1, sizeof(*c));
@@ -144,6 +146,7 @@ static RcaDisplay *gtk_create_common(const char *title, int w, int h,
     c->indexed = palette && n_colors > 0;
     c->pixel_on = on;
     c->pixel_off = off;
+    c->keyboard_type = keyboard_type;
     c->video = gemu_video_gtk_create(&(GemuVideoGtkSpec){
         .title    = title ? title : "GEMU",
         .width    = w,
@@ -173,19 +176,23 @@ static RcaDisplay *gtk_create_common(const char *title, int w, int h,
     d->key_down = gtk_key_down;
     d->pop_keysym = gtk_pop_keysym;
     d->ctx = c;
+    d->keyboard_type = keyboard_type;
     return d;
 }
 
 RcaDisplay *rca_display_gtk_create_mono(const char *title, int w, int h,
                                         int scale, uint32_t on,
-                                        uint32_t off, GemuMonitor *mon) {
-    return gtk_create_common(title, w, h, scale, NULL, 0, on, off, mon);
+                                        uint32_t off, GemuMonitor *mon,
+                                        RcaKeyboardType keyboard_type) {
+    return gtk_create_common(title, w, h, scale, NULL, 0, on, off, mon,
+                             keyboard_type);
 }
 
 RcaDisplay *rca_display_gtk_create_indexed(const char *title, int w, int h,
                                            int scale,
                                            const uint32_t *palette,
-                                           int n_colors, GemuMonitor *mon) {
+                                           int n_colors, GemuMonitor *mon,
+                                           RcaKeyboardType keyboard_type) {
     return gtk_create_common(title, w, h, scale, palette, n_colors,
-                             0xFFFFFFFFu, 0xFF000000u, mon);
+                             0xFFFFFFFFu, 0xFF000000u, mon, keyboard_type);
 }

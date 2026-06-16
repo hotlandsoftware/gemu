@@ -9,6 +9,7 @@ static const RcaDeviceDesc devices[] = {
     {"vp601",      "RCA COSMAC VIP VP601 ASCII/QWERTY keyboard", RCA_KEYBOARD_VP601, RCA_DEVICE_VIP_ONLY},
     {"vip-keypad", "COSMAC VIP 16-key hexadecimal keypad",       RCA_KEYBOARD_KEYPAD, RCA_DEVICE_VIP_ONLY},
     {"keypad",     "Alias for vip-keypad",                       RCA_KEYBOARD_KEYPAD, RCA_DEVICE_VIP_ONLY},
+    {"keyboard",   "Generic ASCII/QWERTY keyboard",              RCA_KEYBOARD_GENERIC, RCA_DEVICE_VIP_ONLY},
 };
 
 static const char *rca_machine_type_name(RcaMachineType machine) {
@@ -95,6 +96,8 @@ void rca_device_attach(RcaConfig *cfg, RcaKeyboardType dev) {
         cfg->keyboard = (cfg->keyboard == RCA_KEYBOARD_VP601 ||
                          cfg->keyboard == RCA_KEYBOARD_BOTH)
                       ? RCA_KEYBOARD_BOTH : RCA_KEYBOARD_KEYPAD;
+    } else {
+        cfg->keyboard = dev;
     }
 }
 
@@ -110,11 +113,12 @@ bool rca_vip_has_vp601(const RcaConfig *cfg) {
 
 const char *rca_vip_keyboard_name(RcaKeyboardType keyboard) {
     switch (keyboard) {
-    case RCA_KEYBOARD_NONE:   return "none";
-    case RCA_KEYBOARD_KEYPAD: return "keypad";
-    case RCA_KEYBOARD_VP601:  return "vp601";
-    case RCA_KEYBOARD_BOTH:   return "both";
-    default:                  return "unknown";
+    case RCA_KEYBOARD_NONE:    return "none";
+    case RCA_KEYBOARD_KEYPAD:  return "keypad";
+    case RCA_KEYBOARD_VP601:   return "vp601";
+    case RCA_KEYBOARD_BOTH:    return "both";
+    case RCA_KEYBOARD_GENERIC: return "generic";
+    default:                   return "unknown";
     }
 }
 

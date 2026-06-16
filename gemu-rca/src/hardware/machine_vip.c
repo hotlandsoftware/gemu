@@ -499,7 +499,8 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
                                              CDP1869_VISIBLE_H,
                                              cfg->display_scale,
                                              vip_vis_palette, 8,
-                                             s->monitor);
+                                             s->monitor,
+                                             cfg->keyboard);
     else if (cfg->vga == RCA_VGA_NONE)
         display = rca_display_none_create();
     else
@@ -508,7 +509,8 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
                                           CDP1861_DISPLAY_H,
                                           cfg->display_scale,
                                           0xFFFFFFFFu, 0xFF100080u,
-                                          s->monitor);
+                                          s->monitor,
+                                          cfg->keyboard);
 
     if (!display) {
         fprintf(stderr, "gemu-rca: failed to create display\n");
@@ -546,6 +548,12 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
             vip_poll_display(s, cfg, display, &quit);
 #endif
         if (quit) break;
+
+        /* SDL input menu reset */
+        if (rca_display_menu_reset_requested(display)) {
+            rca_display_menu_clear_reset(display);
+            rca_vip_reset(s, cfg);
+        }
 
         /* Sync any held key to key_down */
         uint8_t vnc_keys[16];

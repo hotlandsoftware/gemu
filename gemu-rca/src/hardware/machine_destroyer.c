@@ -537,7 +537,8 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
                                              destroyer_palette,
                                              (int)(sizeof(destroyer_palette) /
                                                    sizeof(destroyer_palette[0])),
-                                             s->monitor);
+                                             s->monitor,
+                                             cfg->keyboard);
     else if (cfg->vga == RCA_VGA_NONE)
         display = rca_display_none_create();
     else
@@ -547,7 +548,8 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
                                           cfg->display_scale,
                                           0xFFFFFFFFu,
                                           0xFF100080u,
-                                          s->monitor);
+                                          s->monitor,
+                                          cfg->keyboard);
     if (!display) {
         fprintf(stderr, "gemu-rca: failed to create Destroyer display\n");
         return;
@@ -563,6 +565,12 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
             destroyer_poll_display(s, display, &quit);
         destroyer_poll_vnc(s);
         destroyer_sync_inputs(s);
+
+        /* SDL input menu reset */
+        if (rca_display_menu_reset_requested(display)) {
+            rca_display_menu_clear_reset(display);
+            rca_destroyer_reset(s, cfg);
+        }
 
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {

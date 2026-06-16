@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include "gemu/display.h"
 #include "gemu/monitor.h"
+#include "rca.h"
 
 typedef struct RcaDisplay RcaDisplay;
 
@@ -36,25 +37,32 @@ struct RcaDisplay {
     bool (*should_quit)(void *ctx);
     bool (*key_down)(void *ctx, uint32_t keysym);
     uint32_t (*pop_keysym)(void *ctx);
+    bool (*menu_reset_requested)(void *ctx);   /* SDL input menu */
+    void (*menu_clear_reset)(void *ctx);       /* SDL input menu */
     void  *ctx;
+    RcaKeyboardType keyboard_type;
 };
 
 RcaDisplay *rca_display_sdl_create(int scale);
 RcaDisplay *rca_display_sdl_create_mono(const char *title, int w, int h,
                                         int scale, uint32_t on,
-                                        uint32_t off);
+                                        uint32_t off,
+                                        RcaKeyboardType keyboard_type);
 RcaDisplay *rca_display_sdl_create_indexed(const char *title, int w, int h,
                                            int scale,
                                            const uint32_t *palette,
-                                           int n_colors);
+                                           int n_colors,
+                                           RcaKeyboardType keyboard_type);
 #ifdef GEMU_GTK
 RcaDisplay *rca_display_gtk_create_mono(const char *title, int w, int h,
                                         int scale, uint32_t on,
-                                        uint32_t off, GemuMonitor *mon);
+                                        uint32_t off, GemuMonitor *mon,
+                                        RcaKeyboardType keyboard_type);
 RcaDisplay *rca_display_gtk_create_indexed(const char *title, int w, int h,
                                            int scale,
                                            const uint32_t *palette,
-                                           int n_colors, GemuMonitor *mon);
+                                           int n_colors, GemuMonitor *mon,
+                                           RcaKeyboardType keyboard_type);
 #endif
 #ifndef GEMU_NO_CURSES
 RcaDisplay *rca_display_curses_create(void);
@@ -63,11 +71,13 @@ RcaDisplay *rca_display_none_create(void);
 RcaDisplay *rca_display_create_mono(GemuDisplayType type, const char *title,
                                     int w, int h, int scale,
                                     uint32_t on, uint32_t off,
-                                    GemuMonitor *mon);
+                                    GemuMonitor *mon,
+                                    RcaKeyboardType keyboard_type);
 RcaDisplay *rca_display_create_indexed(GemuDisplayType type, const char *title,
                                        int w, int h, int scale,
                                        const uint32_t *palette, int n_colors,
-                                       GemuMonitor *mon);
+                                       GemuMonitor *mon,
+                                       RcaKeyboardType keyboard_type);
 
 static inline void rca_display_render(RcaDisplay *d, const uint8_t *vram,
                                       int w, int h) {
@@ -94,4 +104,12 @@ static inline bool rca_display_key_down(RcaDisplay *d, uint32_t keysym) {
 
 static inline uint32_t rca_display_pop_keysym(RcaDisplay *d) {
     return (d && d->pop_keysym) ? d->pop_keysym(d->ctx) : 0;
+}
+
+static inline bool rca_display_menu_reset_requested(RcaDisplay *d) {
+    return d && d->menu_reset_requested && d->menu_reset_requested(d->ctx);
+}
+
+static inline void rca_display_menu_clear_reset(RcaDisplay *d) {
+    if (d && d->menu_clear_reset) d->menu_clear_reset(d->ctx);
 }

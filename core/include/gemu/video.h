@@ -33,6 +33,12 @@ void gemu_video_sdl_clear(GemuVideoSdl *v);
 bool gemu_video_sdl_is_software(const GemuVideoSdl *v);
 void gemu_video_sdl_mouse_logical(GemuVideoSdl *v, int *x, int *y);
 
+/* Optional overlay: called after emulator frame is drawn but before
+ * SDL_RenderPresent.  Use for in-emulator menus, OSD, etc. */
+void gemu_video_sdl_set_overlay(GemuVideoSdl *v,
+                                void (*cb)(void *ud, SDL_Renderer *r),
+                                void *ud);
+
 #ifdef GEMU_GTK
 #include <gtk/gtk.h>
 

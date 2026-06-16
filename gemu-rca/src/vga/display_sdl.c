@@ -1,5 +1,6 @@
 #include "rca_display.h"
 #include "cdp1802.h"
+#include "input_menu.h"
 #include "gemu/video.h"
 #include <SDL2/SDL.h>
 #include <stdbool.h>
@@ -9,22 +10,31 @@
 #define RCA_SDL_MAX_KEYS 128
 
 typedef struct {
-    GemuVideoSdl *video;
-    bool          indexed;
-    uint32_t      pixel_on;
-    uint32_t      pixel_off;
-    bool          quit;
+    GemuVideoSdl   *video;
+    InputMenu      *menu;
+    bool            indexed;
+    uint32_t        pixel_on;
+    uint32_t        pixel_off;
+    bool            quit;
+    bool            menu_reset_requested;
     struct {
         uint32_t keysym;
         bool     down;
     } keys[RCA_SDL_MAX_KEYS];
-    int           n_keys;
-    uint32_t      queued_keysym;
+    int             n_keys;
+    uint32_t        queued_keysym;
+    RcaKeyboardType keyboard_type;
 } VipSdlCtx;
 
 /* Match Emma02's COSMAC VIP presentation: white pixels on deep blue. */
 #define PIXEL_ON  0xFFFFFFFFu
 #define PIXEL_OFF 0xFF100080u
+
+/* ── Overlay callback for the input menu ────────────────────────────────── */
+
+static void menu_overlay_cb(void *ud, SDL_Renderer *r) {
+    input_menu_render((InputMenu *)ud, r);
+}
 
 static void sdl_render(void *ctx, const uint8_t *vram, int w, int h) {
     VipSdlCtx *c = ctx;
@@ -37,6 +47,7 @@ static void sdl_render(void *ctx, const uint8_t *vram, int w, int h) {
 
 static void sdl_destroy(void *ctx) {
     VipSdlCtx *c = ctx;
+    input_menu_destroy(c->menu);
     gemu_video_sdl_destroy(c->video);
     free(c);
 }
@@ -94,6 +105,12 @@ static void sdl_poll(void *ctx) {
     VipSdlCtx *c = ctx;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
+        /* Menu consumes events when open */
+        if (input_menu_is_open(c->menu)) {
+            input_menu_handle_event(c->menu, &ev);
+            continue;
+        }
+
         if (ev.type == SDL_QUIT) {
             c->quit = true;
             continue;
@@ -108,17 +125,44 @@ static void sdl_poll(void *ctx) {
             continue;
 
         bool down = ev.type == SDL_KEYDOWN;
-        uint32_t sym = sdl_key_to_rca(ev.key.keysym.sym);
+        SDL_Keycode key = ev.key.keysym.sym;
+
+        /* Tab toggles menu (skip when a keyboard device is attached) */
+        if (down && key == SDLK_TAB) {
+            if (c->keyboard_type == RCA_KEYBOARD_NONE)
+                input_menu_toggle(c->menu);
+            continue;
+        }
+
+        uint32_t sym = sdl_key_to_rca(key);
         if (!sym)
             continue;
         if (down && sym == RCA_KEY_ESCAPE)
             c->quit = true;
         set_key(c, sym, down);
     }
+
+    /* Check menu actions after poll */
+    if (input_menu_quit_requested(c->menu)) {
+        c->quit = true;
+        input_menu_clear_actions(c->menu);
+    }
+    if (input_menu_reset_requested(c->menu)) {
+        c->menu_reset_requested = true;
+        input_menu_clear_actions(c->menu);
+    }
 }
 
 static bool sdl_should_quit(void *ctx) {
     return ((VipSdlCtx *)ctx)->quit;
+}
+
+static bool sdl_menu_reset_requested(void *ctx) {
+    return ((VipSdlCtx *)ctx)->menu_reset_requested;
+}
+
+static void sdl_menu_clear_reset(void *ctx) {
+    ((VipSdlCtx *)ctx)->menu_reset_requested = false;
 }
 
 static bool sdl_key_down(void *ctx, uint32_t keysym) {
@@ -139,13 +183,15 @@ static uint32_t sdl_pop_keysym(void *ctx) {
 RcaDisplay *rca_display_sdl_create(int scale) {
     return rca_display_sdl_create_mono("GEMU", CDP1861_DISPLAY_W,
                                        CDP1861_DISPLAY_H, scale,
-                                       PIXEL_ON, PIXEL_OFF);
+                                       PIXEL_ON, PIXEL_OFF,
+                                       RCA_KEYBOARD_NONE);
 }
 
 static RcaDisplay *sdl_create_common(const char *title, int w, int h,
                                      int scale, const uint32_t *palette,
                                      int n_colors, uint32_t on,
-                                     uint32_t off) {
+                                     uint32_t off,
+                                     RcaKeyboardType keyboard_type) {
     if (scale <= 0) scale = VIP_DEFAULT_SCALE;
 
     VipSdlCtx *c = calloc(1, sizeof(*c));
@@ -153,6 +199,7 @@ static RcaDisplay *sdl_create_common(const char *title, int w, int h,
     c->indexed = palette && n_colors > 0;
     c->pixel_on = on;
     c->pixel_off = off;
+    c->keyboard_type = keyboard_type;
     c->video = gemu_video_sdl_create(&(GemuVideoSdlSpec){
         .title         = title ? title : "GEMU",
         .width         = w,
@@ -174,35 +221,50 @@ static RcaDisplay *sdl_create_common(const char *title, int w, int h,
     d->should_quit = sdl_should_quit;
     d->key_down = sdl_key_down;
     d->pop_keysym = sdl_pop_keysym;
+    d->menu_reset_requested = sdl_menu_reset_requested;
+    d->menu_clear_reset     = sdl_menu_clear_reset;
     d->ctx = c;
+    d->keyboard_type = keyboard_type;
+
+    /* Create input menu — no remappable buttons (keyboard devices have none).
+     * The overlay is set once and render is a no-op when closed. */
+    c->menu = input_menu_create(NULL, 0, NULL, NULL, "rca-input");
+    gemu_video_sdl_set_overlay(c->video, menu_overlay_cb, c->menu);
+
     return d;
 }
 
 RcaDisplay *rca_display_sdl_create_mono(const char *title, int w, int h,
                                         int scale, uint32_t on,
-                                        uint32_t off) {
-    return sdl_create_common(title, w, h, scale, NULL, 0, on, off);
+                                        uint32_t off,
+                                        RcaKeyboardType keyboard_type) {
+    return sdl_create_common(title, w, h, scale, NULL, 0, on, off,
+                             keyboard_type);
 }
 
 RcaDisplay *rca_display_sdl_create_indexed(const char *title, int w, int h,
                                            int scale,
                                            const uint32_t *palette,
-                                           int n_colors) {
+                                           int n_colors,
+                                           RcaKeyboardType keyboard_type) {
     return sdl_create_common(title, w, h, scale, palette, n_colors,
-                             PIXEL_ON, PIXEL_OFF);
+                             PIXEL_ON, PIXEL_OFF, keyboard_type);
 }
 
 RcaDisplay *rca_display_create_mono(GemuDisplayType type, const char *title,
                                     int w, int h, int scale,
                                     uint32_t on, uint32_t off,
-                                    GemuMonitor *mon) {
+                                    GemuMonitor *mon,
+                                    RcaKeyboardType keyboard_type) {
     switch (type) {
     case GEMU_DISPLAY_SDL:
         (void)mon;
-        return rca_display_sdl_create_mono(title, w, h, scale, on, off);
+        return rca_display_sdl_create_mono(title, w, h, scale, on, off,
+                                           keyboard_type);
 #ifdef GEMU_GTK
     case GEMU_DISPLAY_GTK:
-        return rca_display_gtk_create_mono(title, w, h, scale, on, off, mon);
+        return rca_display_gtk_create_mono(title, w, h, scale, on, off, mon,
+                                           keyboard_type);
 #endif
 #ifndef GEMU_NO_CURSES
     case GEMU_DISPLAY_CURSES:
@@ -216,16 +278,19 @@ RcaDisplay *rca_display_create_mono(GemuDisplayType type, const char *title,
 RcaDisplay *rca_display_create_indexed(GemuDisplayType type, const char *title,
                                        int w, int h, int scale,
                                        const uint32_t *palette, int n_colors,
-                                       GemuMonitor *mon) {
+                                       GemuMonitor *mon,
+                                       RcaKeyboardType keyboard_type) {
     switch (type) {
     case GEMU_DISPLAY_SDL:
         (void)mon;
         return rca_display_sdl_create_indexed(title, w, h, scale,
-                                              palette, n_colors);
+                                              palette, n_colors,
+                                              keyboard_type);
 #ifdef GEMU_GTK
     case GEMU_DISPLAY_GTK:
         return rca_display_gtk_create_indexed(title, w, h, scale,
-                                              palette, n_colors, mon);
+                                              palette, n_colors, mon,
+                                              keyboard_type);
 #endif
 #ifndef GEMU_NO_CURSES
     case GEMU_DISPLAY_CURSES:

@@ -14,5 +14,6 @@
   { "alias": "visicom",     "name": "Visicom COM-100",     "year": 1978, "cpu": "RCA CDP1802", "core": "gemu-rca",   "status": "working", "gfx": true, "sound": true,  "notes": "Studio II clone by Toshiba"  },
   { "alias": "generic-6502", "name": "Generic MOS 6502",    "year": 1975, "cpu": "MOS 6502",    "core": "gemu-mos",  "status": "skeleton", "gfx": false, "sound": false, "notes": "Flat 64 KB, generic machine"   },
   { "alias": "famicom", "name": "Nintendo Family Computer",    "year": 1983, "cpu": "Ricoh 2A03",    "core": "gemu-mos",  "status": "working", "gfx": true, "sound": true, "notes": "Japanese version of NES"   },
-  { "alias": "nes", "name": "Nintendo Entertainment System (NTSC)",    "year": 1985, "cpu": "Ricoh 2A03",    "core": "gemu-mos",  "status": "working", "gfx": true, "sound": true, "notes": ""   }
+  { "alias": "nes", "name": "Nintendo Entertainment System (NTSC)",    "year": 1985, "cpu": "Ricoh 2A03",    "core": "gemu-mos",  "status": "working", "gfx": true, "sound": true, "notes": ""   },
+  { "alias": "nespal", "name": "Nintendo Entertainment System (PAL)",    "year": 1986, "cpu": "Ricoh 2A03",    "core": "gemu-mos",  "status": "working", "gfx": true, "sound": true, "notes": "PAL version of NES"   }
 ]

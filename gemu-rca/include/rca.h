@@ -27,6 +27,7 @@ typedef enum {
     RCA_KEYBOARD_KEYPAD,
     RCA_KEYBOARD_VP601,
     RCA_KEYBOARD_BOTH,
+    RCA_KEYBOARD_GENERIC,
 } RcaKeyboardType;
 
 typedef enum {

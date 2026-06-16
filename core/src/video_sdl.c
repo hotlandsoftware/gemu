@@ -12,6 +12,8 @@ struct GemuVideoSdl {
     int             width;
     int             height;
     bool            software;
+    void          (*overlay_cb)(void *ud, SDL_Renderer *r);
+    void           *overlay_ud;
 };
 
 static void video_sdl_free(GemuVideoSdl *v) {
@@ -97,8 +99,11 @@ void gemu_video_sdl_present_argb(GemuVideoSdl *v, const uint32_t *pixels,
                                  int w, int h) {
     if (!v || !pixels || w != v->width || h != v->height) return;
     SDL_UpdateTexture(v->texture, NULL, pixels, w * (int)sizeof(uint32_t));
+    SDL_SetRenderDrawColor(v->renderer, 0, 0, 0, 255);
     SDL_RenderClear(v->renderer);
     SDL_RenderCopy(v->renderer, v->texture, NULL, NULL);
+    if (v->overlay_cb)
+        v->overlay_cb(v->overlay_ud, v->renderer);
     SDL_RenderPresent(v->renderer);
 }
 
@@ -142,4 +147,12 @@ void gemu_video_sdl_mouse_logical(GemuVideoSdl *v, int *x, int *y) {
     SDL_RenderWindowToLogical(v->renderer, wx, wy, &lx, &ly);
     if (x) *x = (int)lx;
     if (y) *y = (int)ly;
+}
+
+void gemu_video_sdl_set_overlay(GemuVideoSdl *v,
+                                void (*cb)(void *ud, SDL_Renderer *r),
+                                void *ud) {
+    if (!v) return;
+    v->overlay_cb = cb;
+    v->overlay_ud = ud;
 }
