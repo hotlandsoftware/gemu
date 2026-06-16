@@ -169,9 +169,9 @@ static bool ines_load(NesState *s, const char *path) {
     else                  s->cart.mirror = RP2C02_MIRROR_HORIZONTAL;
 
     switch (s->cart.mapper) {
-    case 0: case 1: case 2: case 4: case 5: case 7: case 66: case 178: case 228: break;
+    case 0: case 1: case 2: case 4: case 5: case 7: case 9: case 66: case 178: case 228: break;
     default:
-        fprintf(stderr, "nes: mapper %u not supported (NROM/0, MMC1/1, UxROM/2, MMC3/4, MMC5/5, AxROM/7, GxROM/66, WaixingFS/178, Action52/228)\n",
+        fprintf(stderr, "nes: mapper %u not supported!\n",
                 s->cart.mapper);
         fclose(f); return false;
     }
@@ -562,6 +562,28 @@ static uint8_t nes_chr_read(uint16_t addr, void *ud) {
         if (s->chr_is_ram) return s->chr[addr & 0x1FFF];
         return s->chr[s->mmc3_chr_offsets[addr >> 10] + (addr & 0x3FF)];
     }
+    if (s->cart.mapper == 9) {
+        /* MMC2: 4 KB CHR windows with latch-based bank selection.
+         * Latch updates AFTER the fetch — the triggering tile ($FD/$FE)
+         * renders with the old bank; the new bank takes effect next fetch. */
+        if (s->chr_is_ram) return s->chr[addr & 0x1FFF];
+        bool     is_right = (addr & 0x1000u) != 0;
+        uint16_t tile     = addr & 0x0FF0u;
+        uint8_t  bank;
+        if (is_right)
+            bank = s->m9_latch_r ? s->m9_chr_rfe : s->m9_chr_rfd;
+        else
+            bank = s->m9_latch_l ? s->m9_chr_lfe : s->m9_chr_lfd;
+        uint32_t chr_size = (uint32_t)s->cart.chr_banks * 0x2000u;
+        uint8_t  data = s->chr[((uint32_t)bank * 0x1000u + (addr & 0x0FFFu)) % chr_size];
+        /* Latch toggles when PPU fetches tile $FD or $FE */
+        if (tile == 0x0FD0u) {
+            if (is_right) s->m9_latch_r = false; else s->m9_latch_l = false;
+        } else if (tile == 0x0FE0u) {
+            if (is_right) s->m9_latch_r = true;  else s->m9_latch_l = true;
+        }
+        return data;
+    }
     if (s->cart.mapper >= 1 && s->cart.mapper != 7) {
         uint8_t slot = addr >= 0x1000 ? 1 : 0;
         return s->chr[s->chr_offsets[slot] + (addr & 0x0FFF)];
@@ -623,6 +645,16 @@ static bool gg_decode(const char *code, uint16_t *addr, uint8_t *val,
 
 static uint8_t nes_prg_direct(const NesState *s, uint16_t addr) {
     if (addr < 0x8000 || !s->prg) return 0;
+    if (s->cart.mapper == 9) {
+        uint8_t slot   = (uint8_t)((addr - 0x8000u) >> 13);
+        uint32_t prg8k = (uint32_t)s->cart.prg_banks * 2u;
+        uint32_t bank8;
+        if      (slot == 0) bank8 = s->m9_prg_reg & 0x0Fu;
+        else if (slot == 1) bank8 = prg8k - 3u;
+        else if (slot == 2) bank8 = prg8k - 2u;
+        else                bank8 = prg8k - 1u;
+        return s->prg[bank8 * 0x2000u + (addr & 0x1FFFu)];
+    }
     if (s->cart.mapper == 4) {
         uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
         return s->prg[s->mmc3_prg_offsets[slot] + (addr & 0x1FFFu)];
@@ -838,7 +870,16 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
         }
         if (!s->prg) return 0;
         uint8_t rom;
-        if (s->cart.mapper == 5) {
+        if (s->cart.mapper == 9) {
+            uint8_t slot   = (uint8_t)((addr - 0x8000u) >> 13);  /* 0..3 */
+            uint32_t prg8k = (uint32_t)s->cart.prg_banks * 2u;
+            uint32_t bank8;
+            if      (slot == 0) bank8 = s->m9_prg_reg & 0x0Fu;
+            else if (slot == 1) bank8 = prg8k - 3u;
+            else if (slot == 2) bank8 = prg8k - 2u;
+            else                bank8 = prg8k - 1u;  /* slot 3 */
+            rom = s->prg[bank8 * 0x2000u + (addr & 0x1FFFu)];
+        } else if (s->cart.mapper == 5) {
             uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
             if (s->mmc5_prg_is_ram[slot])
                 rom = s->prg_ram[(s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)) & 0x1FFFu];
@@ -1001,6 +1042,27 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
             }
         }
         else if (s->cart.mapper == 4) mmc3_cpu_write(s, addr, val);
+        else if (s->cart.mapper == 9) {
+            /* MMC2 register map (decoded from CPU A14..A12):
+             *   $A000-$AFFF  PRG bank (bits 3:0)
+             *   $B000-$BFFF  left CHR  FD-latch bank (bits 4:0)
+             *   $C000-$CFFF  left CHR  FE-latch bank
+             *   $D000-$DFFF  right CHR FD-latch bank
+             *   $E000-$EFFF  right CHR FE-latch bank
+             *   $F000-$FFFF  mirror of PRG bank */
+            if (addr < 0xB000)
+                s->m9_prg_reg = val & 0x0Fu;
+            else if (addr < 0xC000)
+                s->m9_chr_lfd = val & 0x1Fu;
+            else if (addr < 0xD000)
+                s->m9_chr_lfe = val & 0x1Fu;
+            else if (addr < 0xE000)
+                s->m9_chr_rfd = val & 0x1Fu;
+            else if (addr < 0xF000)
+                s->m9_chr_rfe = val & 0x1Fu;
+            else
+                s->m9_prg_reg = val & 0x0Fu;  /* $F000-$FFFF mirror */
+        }
         else if (s->cart.mapper == 7) {
             /* AxROM: bits 2:0 = 32KB PRG bank, bit 4 = mirror (0=single-A, 1=single-B) */
             uint32_t prg_size = (uint32_t)s->cart.prg_banks * 0x4000u;
@@ -1267,6 +1329,14 @@ static void nes_reset(NesState *s) {
         m178_update_banks(s);
         s->chr_offsets[0] = 0;
         s->chr_offsets[1] = 0x1000u;
+    } else if (s->cart.mapper == 9) {
+        s->m9_prg_reg  = 0;
+        s->m9_chr_lfd  = 0;
+        s->m9_chr_lfe  = 0;
+        s->m9_chr_rfd  = 0;
+        s->m9_chr_rfe  = 0;
+        s->m9_latch_l  = false;
+        s->m9_latch_r  = false;
     } else if (s->cart.mapper == 7) {
         s->prg_offsets[0] = 0;
         s->prg_offsets[1] = 0x4000u;

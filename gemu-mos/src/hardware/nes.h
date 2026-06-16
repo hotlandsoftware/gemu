@@ -100,6 +100,15 @@ typedef struct NesState {
     bool     mmc5_prg_is_ram[4];      /* true when window maps to PRG-RAM */
     uint8_t  mmc5_exram[0x400];       /* 1KB ExRAM at CPU $5C00-$5FFF / PPU nametable */
 
+    /* Mapper 9 (MMC2/PxROM) */
+    uint8_t  m9_prg_reg;     /* $A000: 8KB PRG bank at $8000-$9FFF (bits 3:0) */
+    uint8_t  m9_chr_lfd;     /* $B000: left CHR bank when latch=FD (bits 4:0) */
+    uint8_t  m9_chr_lfe;     /* $C000: left CHR bank when latch=FE */
+    uint8_t  m9_chr_rfd;     /* $D000: right CHR bank when latch=FD */
+    uint8_t  m9_chr_rfe;     /* $E000: right CHR bank when latch=FE */
+    bool     m9_latch_l;     /* false=FD side, true=FE side */
+    bool     m9_latch_r;
+
     /* Mapper 178 (WaixingFS) */
     uint8_t  m178_mode;    /* $4800: bits[2:1]=PRG mode, bit[0]=mirror */
     uint8_t  m178_prg_lo;  /* $4801: PRG A16..A14 (inner 16KB bank) */
