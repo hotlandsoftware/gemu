@@ -1,12 +1,15 @@
 #ifdef GEMU_GTK
 #include "gemu/video.h"
 #include "gemu/gtk_menu.h"
+#include <epoxy/gl.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 struct GemuVideoGtk {
     GtkWidget       *window;
-    GtkWidget       *drawing_area;
-    cairo_surface_t *surface;
+    GtkWidget       *gl_area;
+    GtkWidget       *drawing_area;  /* kept for API compat */
     uint32_t        *frame_argb;
     const uint32_t  *palette;
     int              n_colors;
@@ -14,32 +17,172 @@ struct GemuVideoGtk {
     int              height;
     int              scale;
     bool             active;
+    /* OpenGL */
+    GLuint           tex;
+    GLuint           prog;
+    GLuint           vao;
+    GLuint           vbo;
+    bool             gl_ready;
 };
 
-static gboolean on_draw(GtkWidget *w, cairo_t *cr, gpointer data) {
-    (void)w;
+/* ── Shaders ─────────────────────────────────────────────────────────────── */
+
+static const char *vs_src =
+    "#version 130\n"
+    "in vec2 aPos;\n"
+    "in vec2 aUV;\n"
+    "out vec2 vUV;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+    "    vUV = aUV;\n"
+    "}\n";
+
+static const char *fs_src =
+    "#version 130\n"
+    "uniform sampler2D uTex;\n"
+    "in vec2 vUV;\n"
+    "out vec4 fragColor;\n"
+    "void main() {\n"
+    "    fragColor = texture(uTex, vUV);\n"
+    "}\n";
+
+static GLuint gl_compile(GLenum type, const char *src) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &src, NULL);
+    glCompileShader(shader);
+    GLint ok;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+        fprintf(stderr, "gemu/gtk: shader compile error: %s\n", log);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+static GLuint gl_link(GLuint vs, GLuint fs) {
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    GLint ok;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetProgramInfoLog(prog, sizeof(log), NULL, log);
+        fprintf(stderr, "gemu/gtk: shader link error: %s\n", log);
+        glDeleteProgram(prog);
+        return 0;
+    }
+    return prog;
+}
+
+/* Fullscreen quad: two triangles covering [-1,1]² with UV [0,1]² */
+static const float quad_data[] = {
+    /* pos (x,y)    uv (u,v) */
+    -1.0f, -1.0f,   0.0f, 1.0f,
+     1.0f, -1.0f,   1.0f, 1.0f,
+     1.0f,  1.0f,   1.0f, 0.0f,
+
+    -1.0f, -1.0f,   0.0f, 1.0f,
+     1.0f,  1.0f,   1.0f, 0.0f,
+    -1.0f,  1.0f,   0.0f, 0.0f,
+};
+
+static void gl_setup(GemuVideoGtk *v) {
+    GLuint vs = gl_compile(GL_VERTEX_SHADER,   vs_src);
+    GLuint fs = gl_compile(GL_FRAGMENT_SHADER, fs_src);
+    if (!vs || !fs) return;
+    v->prog = gl_link(vs, fs);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    if (!v->prog) return;
+
+    glUseProgram(v->prog);
+    glUniform1i(glGetUniformLocation(v->prog, "uTex"), 0);
+
+    /* VAO + VBO */
+    glGenVertexArrays(1, &v->vao);
+    glBindVertexArray(v->vao);
+    glGenBuffers(1, &v->vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, v->vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad_data), quad_data, GL_STATIC_DRAW);
+
+    GLint aPos = glGetAttribLocation(v->prog, "aPos");
+    GLint aUV  = glGetAttribLocation(v->prog, "aUV");
+    glVertexAttribPointer((GLuint)aPos, 2, GL_FLOAT, GL_FALSE,
+                          4 * sizeof(float), (void *)0);
+    glEnableVertexAttribArray((GLuint)aPos);
+    glVertexAttribPointer((GLuint)aUV, 2, GL_FLOAT, GL_FALSE,
+                          4 * sizeof(float), (void *)(2 * sizeof(float)));
+    glEnableVertexAttribArray((GLuint)aUV);
+
+    /* Texture */
+    glGenTextures(1, &v->tex);
+    glBindTexture(GL_TEXTURE_2D, v->tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, v->width, v->height,
+                 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+
+    v->gl_ready = true;
+}
+
+static void gl_teardown(GemuVideoGtk *v) {
+    if (v->vao) { glDeleteVertexArrays(1, &v->vao); v->vao = 0; }
+    if (v->vbo) { glDeleteBuffers(1, &v->vbo);       v->vbo = 0; }
+    if (v->tex) { glDeleteTextures(1, &v->tex);       v->tex = 0; }
+    if (v->prog){ glDeleteProgram(v->prog);            v->prog = 0; }
+    v->gl_ready = false;
+}
+
+/* ── GTK callbacks ───────────────────────────────────────────────────────── */
+
+static gboolean on_realize(GtkWidget *w, gpointer data) {
     GemuVideoGtk *v = data;
-    if (!v->active) {
-        cairo_set_source_rgb(cr, 0, 0, 0);
-        cairo_paint(cr);
+    gtk_gl_area_make_current(GTK_GL_AREA(w));
+    if (gtk_gl_area_get_error(GTK_GL_AREA(w)) != NULL) {
+        fprintf(stderr, "gemu/gtk: GL area init failed\n");
         return FALSE;
     }
-
-    cairo_save(cr);
-    cairo_scale(cr, v->scale, v->scale);
-    cairo_set_source_surface(cr, v->surface, 0, 0);
-    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_NEAREST);
-    cairo_paint(cr);
-    cairo_restore(cr);
-    return FALSE;
+    gl_setup(v);
+    return TRUE;
 }
 
-static void mark_presented(GemuVideoGtk *v) {
-    cairo_surface_mark_dirty(v->surface);
-    v->active = true;
-    gtk_widget_queue_draw(v->drawing_area);
-    gemu_video_gtk_poll();
+static void on_unrealize(GtkWidget *w, gpointer data) {
+    GemuVideoGtk *v = data;
+    gtk_gl_area_make_current(GTK_GL_AREA(w));
+    gl_teardown(v);
 }
+
+static gboolean on_render(GtkGLArea *area, GdkGLContext *ctx, gpointer data) {
+    (void)area;
+    (void)ctx;
+    GemuVideoGtk *v = data;
+    if (!v->gl_ready) return TRUE;
+
+    int w = v->width  * v->scale;
+    int h = v->height * v->scale;
+
+    glViewport(0, 0, w, h);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (v->active) {
+        glUseProgram(v->prog);
+        glBindVertexArray(v->vao);
+        glBindTexture(GL_TEXTURE_2D, v->tex);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+
+    return TRUE;
+}
+
+/* ── Public API ──────────────────────────────────────────────────────────── */
 
 GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     if (!spec || spec->width <= 0 || spec->height <= 0) return NULL;
@@ -53,29 +196,39 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     v->scale    = spec->scale > 0 ? spec->scale : 1;
     v->palette  = spec->palette;
     v->n_colors = spec->n_colors;
-    v->surface  = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
-                                             v->width, v->height);
+
+    /* ARGB frame buffer for indexed/mono conversions */
     v->frame_argb = malloc((size_t)v->width * (size_t)v->height *
                            sizeof(*v->frame_argb));
-    if (!v->surface || cairo_surface_status(v->surface) != CAIRO_STATUS_SUCCESS ||
-        !v->frame_argb) {
-        gemu_video_gtk_destroy(v);
+    if (!v->frame_argb) {
+        free(v);
         return NULL;
     }
 
+    /* Window */
     v->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(v->window), spec->title ? spec->title : "GEMU");
+    gtk_window_set_title(GTK_WINDOW(v->window),
+                         spec->title ? spec->title : "GEMU");
     gtk_window_set_resizable(GTK_WINDOW(v->window), FALSE);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(v->window), vbox);
     gemu_gtk_add_action_menu(vbox, spec->monitor);
 
-    v->drawing_area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(v->drawing_area,
-                                v->width * v->scale, v->height * v->scale);
-    gtk_box_pack_start(GTK_BOX(vbox), v->drawing_area, TRUE, TRUE, 0);
-    g_signal_connect(v->drawing_area, "draw", G_CALLBACK(on_draw), v);
+    /* GL area */
+    v->gl_area = gtk_gl_area_new();
+    gtk_widget_set_size_request(v->gl_area,
+                                v->width * v->scale,
+                                v->height * v->scale);
+    gtk_gl_area_set_required_version(GTK_GL_AREA(v->gl_area), 3, 2);
+    gtk_box_pack_start(GTK_BOX(vbox), v->gl_area, TRUE, TRUE, 0);
+
+    g_signal_connect(v->gl_area, "realize",   G_CALLBACK(on_realize),   v);
+    g_signal_connect(v->gl_area, "unrealize", G_CALLBACK(on_unrealize), v);
+    g_signal_connect(v->gl_area, "render",    G_CALLBACK(on_render),    v);
+
+    /* For API compat — some callers expect a drawing_area widget */
+    v->drawing_area = v->gl_area;
 
     gtk_widget_show_all(v->window);
     gemu_video_gtk_poll();
@@ -84,7 +237,6 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
 
 void gemu_video_gtk_destroy(GemuVideoGtk *v) {
     if (!v) return;
-    if (v->surface) cairo_surface_destroy(v->surface);
     if (v->window) gtk_widget_destroy(v->window);
     free(v->frame_argb);
     free(v);
@@ -92,20 +244,27 @@ void gemu_video_gtk_destroy(GemuVideoGtk *v) {
 
 void gemu_video_gtk_present_argb(GemuVideoGtk *v, const uint32_t *pixels,
                                  int w, int h) {
-    if (!v || !pixels || w != v->width || h != v->height) return;
-    uint32_t *out = (uint32_t *)cairo_image_surface_get_data(v->surface);
-    int stride = cairo_image_surface_get_stride(v->surface) / 4;
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-            out[y * stride + x] = pixels[y * w + x];
-    mark_presented(v);
+    if (!v || !pixels || w != v->width || h != v->height || !v->gl_ready)
+        return;
+
+    /* Upload directly to GL texture (BGRA format matches typical ARGB layout
+     * on little-endian when reinterpreted as BGRA for glTexSubImage2D). */
+    glBindTexture(GL_TEXTURE_2D, v->tex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+                    GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+
+    v->active = true;
+    gtk_widget_queue_draw(v->gl_area);
 }
 
 void gemu_video_gtk_present_indexed(GemuVideoGtk *v, const uint8_t *pixels,
                                     int w, int h) {
     if (!v || !pixels || w != v->width || h != v->height || !v->palette)
         return;
-    for (int i = 0; i < w * h; i++) {
+
+    /* Convert indexed → ARGB using palette, then copy rows via memcpy */
+    int total = w * h;
+    for (int i = 0; i < total; i++) {
         uint8_t idx = pixels[i];
         if (v->n_colors > 0 && idx >= v->n_colors)
             idx = (uint8_t)(v->n_colors - 1);
@@ -117,7 +276,8 @@ void gemu_video_gtk_present_indexed(GemuVideoGtk *v, const uint8_t *pixels,
 void gemu_video_gtk_present_mono(GemuVideoGtk *v, const uint8_t *pixels,
                                  int w, int h, uint32_t on, uint32_t off) {
     if (!v || !pixels || w != v->width || h != v->height) return;
-    for (int i = 0; i < w * h; i++)
+    int total = w * h;
+    for (int i = 0; i < total; i++)
         v->frame_argb[i] = pixels[i] ? on : off;
     gemu_video_gtk_present_argb(v, v->frame_argb, w, h);
 }

@@ -10,6 +10,9 @@
 #endif
 #include "gemu/vnc.h"
 #include "gemu/monitor.h"
+#ifdef GEMU_GTK
+#  include "../vga/hex_editor.h"
+#endif
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -140,6 +143,11 @@ typedef struct NesState {
     /* Famicom Disk System */
     bool     fds_enabled;
     FdsState fds;
+
+    /* Hex editor (GTK only) */
+#ifdef GEMU_GTK
+    HexEditor *hex_editor;
+#endif
 } NesState;
 
 NesState *nes_create (const MosConfig *cfg);

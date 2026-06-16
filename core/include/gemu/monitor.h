@@ -64,6 +64,27 @@ void         gemu_monitor_register_rom(GemuMonitor *mon,
 /* Clear all registered ROM entries (call before re-loading ROMs on reset). */
 void         gemu_monitor_clear_roms(GemuMonitor *mon);
 
+/* ── Breakpoints / watchpoints ─────────────────────────────────────────────
+ *
+ * Breakpoints fire on exec; watchpoints fire on memory read, write, or both.
+ * Each call to add_bp returns a unique id used for deletion.
+ * The check_* functions are called by the machine in its run loop / memory
+ * callbacks and return true (+ set paused) when a matching breakpoint fires.
+ */
+typedef enum {
+    GEMU_BP_EXEC  = 1,
+    GEMU_BP_READ  = 2,
+    GEMU_BP_WRITE = 4,
+} GemuBpType;
+
+int  gemu_monitor_add_bp   (GemuMonitor *mon, GemuBpType type, uint32_t addr);
+bool gemu_monitor_del_bp   (GemuMonitor *mon, int id);
+void gemu_monitor_clear_bps(GemuMonitor *mon);
+
+bool gemu_monitor_check_exec (GemuMonitor *mon, uint32_t addr);
+bool gemu_monitor_check_read (GemuMonitor *mon, uint32_t addr);
+bool gemu_monitor_check_write(GemuMonitor *mon, uint32_t addr);
+
 /* Start the stdin reader thread (no-op if not a TTY). */
 void         gemu_monitor_start(GemuMonitor *mon);
 /* Signal and join the reader thread. */

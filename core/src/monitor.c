@@ -38,12 +38,19 @@ typedef int sock_t;
 #define QUEUE_SIZE       32
 #define MEDIA_DEVICE_MAX 16
 #define ROM_ENTRY_MAX    16
+#define BP_MAX           32
 
 typedef struct {
     uint32_t addr;
     uint32_t size;
     char     file[512];
 } MonRomEntry;
+
+typedef struct {
+    int        id;
+    GemuBpType type;
+    uint32_t   addr;
+} MonBpEntry;
 
 typedef enum {
     MON_ENTRY_CMD,
@@ -77,6 +84,11 @@ struct GemuMonitor {
     int             n_media;
     MonRomEntry     rom_entries[ROM_ENTRY_MAX];
     int             n_rom_entries;
+    MonBpEntry      bp_entries[BP_MAX];
+    int             n_bps;
+    int             next_bp_id;
+    bool            has_exec_bp;
+    bool            has_mem_bp;
     bool          (*screendump_cb)(void *ud, const char *path);
     void           *screendump_ud;
     MonBackend      backend;
@@ -295,6 +307,22 @@ static void info_roms(const GemuMonitor *mon) {
     }
 }
 
+static void info_breakpoints(const GemuMonitor *mon) {
+    if (!mon || mon->n_bps == 0) {
+        mon_printf(mon, "No breakpoints set.\n");
+        return;
+    }
+    for (int i = 0; i < mon->n_bps; i++) {
+        const MonBpEntry *e = &mon->bp_entries[i];
+        const char *type;
+        if      (e->type == GEMU_BP_EXEC)  type = "exec ";
+        else if (e->type == GEMU_BP_READ)  type = "read ";
+        else if (e->type == GEMU_BP_WRITE) type = "write";
+        else                               type = "rw   ";
+        mon_printf(mon, "  %2d  %s  0x%04x\n", e->id, type, e->addr);
+    }
+}
+
 static bool dispatch_media(GemuMonitor *mon, const char *line,
                            GemuMonCmd *out_cmd) {
     char buf[256];
@@ -323,8 +351,53 @@ static bool dispatch_media(GemuMonitor *mon, const char *line,
             info_block(mon);
         } else if (strcasecmp(sub, "roms") == 0) {
             info_roms(mon);
+        } else if (strcasecmp(sub, "breakpoints") == 0 || strcasecmp(sub, "bp") == 0) {
+            info_breakpoints(mon);
         } else {
-            mon_printf(mon, "info: unknown subcommand '%s' (try 'info block', 'info roms')\n", sub);
+            mon_printf(mon, "info: unknown subcommand '%s' (try 'info block', 'info roms', 'info breakpoints')\n", sub);
+        }
+        *out_cmd = GEMU_MON_NONE;
+        return true;
+    }
+
+    /* break / b / rwatch / watch / awatch / wwatch */
+    bool is_break  = strcasecmp(verb, "break") == 0 || strcmp(verb, "b") == 0;
+    bool is_rwatch = strcasecmp(verb, "rwatch") == 0;
+    bool is_watch  = strcasecmp(verb, "watch")  == 0 || strcasecmp(verb, "awatch") == 0;
+    bool is_wwatch = strcasecmp(verb, "wwatch") == 0;
+    if (is_break || is_rwatch || is_watch || is_wwatch) {
+        char *arg = next_token(&p);
+        if (!arg) {
+            mon_printf(mon, "usage: %s <addr>\n", verb);
+        } else {
+            uint32_t addr = (uint32_t)strtoul(arg, NULL, 16);
+            GemuBpType type = is_break  ? GEMU_BP_EXEC
+                            : is_rwatch ? GEMU_BP_READ
+                            : is_wwatch ? GEMU_BP_WRITE
+                            : (GemuBpType)(GEMU_BP_READ | GEMU_BP_WRITE);
+            int id = gemu_monitor_add_bp(mon, type, addr);
+            const char *tname = is_break  ? "Exec breakpoint"
+                              : is_rwatch ? "Read watchpoint"
+                              : is_wwatch ? "Write watchpoint"
+                              : "Access watchpoint";
+            mon_printf(mon, "%s %d set at 0x%04x\n", tname, id, addr);
+        }
+        *out_cmd = GEMU_MON_NONE;
+        return true;
+    }
+
+    /* delete / del */
+    if (strcasecmp(verb, "delete") == 0 || strcasecmp(verb, "del") == 0) {
+        char *arg = next_token(&p);
+        if (!arg) {
+            gemu_monitor_clear_bps(mon);
+            mon_printf(mon, "All breakpoints deleted.\n");
+        } else {
+            int id = (int)strtol(arg, NULL, 10);
+            if (gemu_monitor_del_bp(mon, id))
+                mon_printf(mon, "Breakpoint %d deleted.\n", id);
+            else
+                mon_printf(mon, "No breakpoint with id %d.\n", id);
         }
         *out_cmd = GEMU_MON_NONE;
         return true;
@@ -453,8 +526,10 @@ static bool monitor_handle_line(GemuMonitor *mon, char *line) {
 
     if (!strcmp(line, "help") || !strcmp(line, "?")) {
         mon_printf(mon,
+        "  break <addr>   -- set exec breakpoint (short: b)\n"
         "  change <device> <file> -- insert/change media\n"
         "  cont / c -- resume emulation\n"
+        "  delete [N] -- delete breakpoint N (or all if N omitted)\n"
         "  dipswitch -- lists DIP switches (when supported)\n"
         "  dipswitch [name] [value] -- sets DIP switch (when supported)\n"
         "  eject <device> -- eject media\n"
@@ -462,12 +537,16 @@ static bool monitor_handle_line(GemuMonitor *mon, char *line) {
         "  gamegenie list -- show active game genie codes\n"
         "  gamegenie delete [code] -- deletes game genie code\n"
         "  info block -- list block devices\n"
+        "  info breakpoints -- list active breakpoints\n"
         "  info roms  -- list loaded ROM images\n"
         "  q / quit -- quits the machine immediately\n"
         "  reset -- reset the machine\n"
+        "  rwatch <addr>  -- set read watchpoint\n"
         "  screendump <file>[.png] -- save screenshot (PPM or PNG)\n"
         "  step / s [count] -- step through (x) instructions (defaults to 1)\n"
-        "  stop / halt -- halt emulation\n");
+        "  stop / halt -- halt emulation\n"
+        "  watch <addr>   -- set read+write watchpoint\n"
+        "  wwatch <addr>  -- set write watchpoint\n");
     } else if (!strcmp(line, "reset") || !strcmp(line, "system_reset")) {
         enqueue(mon, GEMU_MON_RESET, 0);
     } else if (!strcmp(line, "q") || !strcmp(line, "quit")) {
@@ -716,4 +795,83 @@ void gemu_monitor_set_screendump_cb(GemuMonitor *mon,
     if (!mon) return;
     mon->screendump_cb = cb;
     mon->screendump_ud = ud;
+}
+
+/* ── Breakpoints ─────────────────────────────────────────────────────────── */
+
+int gemu_monitor_add_bp(GemuMonitor *mon, GemuBpType type, uint32_t addr) {
+    if (!mon || mon->n_bps >= BP_MAX) return -1;
+    MonBpEntry *e = &mon->bp_entries[mon->n_bps++];
+    e->id   = ++mon->next_bp_id;
+    e->type = type;
+    e->addr = addr;
+    if (type & GEMU_BP_EXEC)                    mon->has_exec_bp = true;
+    if (type & (GEMU_BP_READ | GEMU_BP_WRITE))  mon->has_mem_bp  = true;
+    return e->id;
+}
+
+bool gemu_monitor_del_bp(GemuMonitor *mon, int id) {
+    if (!mon) return false;
+    for (int i = 0; i < mon->n_bps; i++) {
+        if (mon->bp_entries[i].id != id) continue;
+        memmove(&mon->bp_entries[i], &mon->bp_entries[i + 1],
+                (size_t)(mon->n_bps - i - 1) * sizeof(MonBpEntry));
+        mon->n_bps--;
+        mon->has_exec_bp = false;
+        mon->has_mem_bp  = false;
+        for (int j = 0; j < mon->n_bps; j++) {
+            if (mon->bp_entries[j].type & GEMU_BP_EXEC)
+                mon->has_exec_bp = true;
+            if (mon->bp_entries[j].type & (GEMU_BP_READ | GEMU_BP_WRITE))
+                mon->has_mem_bp = true;
+        }
+        return true;
+    }
+    return false;
+}
+
+void gemu_monitor_clear_bps(GemuMonitor *mon) {
+    if (!mon) return;
+    mon->n_bps       = 0;
+    mon->has_exec_bp = false;
+    mon->has_mem_bp  = false;
+}
+
+bool gemu_monitor_check_exec(GemuMonitor *mon, uint32_t addr) {
+    if (!mon || !mon->has_exec_bp) return false;
+    for (int i = 0; i < mon->n_bps; i++) {
+        if ((mon->bp_entries[i].type & GEMU_BP_EXEC) && mon->bp_entries[i].addr == addr) {
+            mon_printf(mon, "Breakpoint %d hit: exec at 0x%04x\n",
+                       mon->bp_entries[i].id, addr);
+            mon->paused = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool gemu_monitor_check_read(GemuMonitor *mon, uint32_t addr) {
+    if (!mon || !mon->has_mem_bp) return false;
+    for (int i = 0; i < mon->n_bps; i++) {
+        if ((mon->bp_entries[i].type & GEMU_BP_READ) && mon->bp_entries[i].addr == addr) {
+            mon_printf(mon, "Watchpoint %d hit: read at 0x%04x\n",
+                       mon->bp_entries[i].id, addr);
+            mon->paused = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool gemu_monitor_check_write(GemuMonitor *mon, uint32_t addr) {
+    if (!mon || !mon->has_mem_bp) return false;
+    for (int i = 0; i < mon->n_bps; i++) {
+        if ((mon->bp_entries[i].type & GEMU_BP_WRITE) && mon->bp_entries[i].addr == addr) {
+            mon_printf(mon, "Watchpoint %d hit: write at 0x%04x\n",
+                       mon->bp_entries[i].id, addr);
+            mon->paused = true;
+            return true;
+        }
+    }
+    return false;
 }

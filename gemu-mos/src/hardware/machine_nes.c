@@ -22,6 +22,7 @@
 #endif
 #ifdef GEMU_GTK
 #  include <gtk/gtk.h>
+#  include "gemu/video.h"
 #  include "gemu/gtk_menu.h"
 #endif
 
@@ -737,6 +738,7 @@ static void nes_gamegenie_cmd(NesState *s, const char *line) {
 
 static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
     NesState *s = ud;
+    gemu_monitor_check_read(s->monitor, addr);
 
     if (addr < 0x2000) return s->ram[addr & 0x07FF];
 
@@ -852,6 +854,7 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
 
 static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
     NesState *s = ud;
+    gemu_monitor_check_write(s->monitor, addr);
 
     if (addr < 0x2000) { s->ram[addr & 0x07FF] = val; return; }
 
@@ -1329,6 +1332,10 @@ NesState *nes_create(const MosConfig *cfg) {
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, nes_screendump, s);
+#ifdef GEMU_GTK
+    if (cfg->display_type == GEMU_DISPLAY_GTK)
+        s->hex_editor = hex_editor_create(s);
+#endif
     if (s->fds_enabled) {
         GemuMediaDevice floppy_dev = {
             .name   = "floppy",
@@ -1395,6 +1402,9 @@ NesState *nes_create(const MosConfig *cfg) {
 void nes_destroy(NesState *s) {
     if (!s->fds_enabled) nes_sav_save(s);
     if (s->fds_enabled) { free(s->fds.disk); free(s->fds.fwd_mask); free(s->fds.raw_disk); }
+#ifdef GEMU_GTK
+    hex_editor_destroy(s->hex_editor);
+#endif
 #ifdef HAVE_ALSA
     apu_midi_close(&s->apu_midi);
 #endif
@@ -1498,6 +1508,19 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                     }
                     if (!shown) printf("(none)");
                     printf("\n");
+#ifdef GEMU_GTK
+                } else if (strncasecmp(text, "hexeditor", 9) == 0 &&
+                           (text[9] == '\0' || text[9] == ' ' || text[9] == '\t')) {
+                    if (!s->hex_editor) {
+                        printf("hexeditor: GTK not available\n");
+                    } else if (hex_editor_is_visible(s->hex_editor)) {
+                        hex_editor_hide(s->hex_editor);
+                        printf("hexeditor: closed\n");
+                    } else {
+                        hex_editor_show(s->hex_editor);
+                        printf("hexeditor: opened\n");
+                    }
+#endif
                 } else
                     gemu_monitor_unknown_command(s->monitor);
             }
@@ -1514,6 +1537,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             /* Run one full frame (until PPU marks frame complete) */
             s->ppu.dirty = false;
             while (!s->ppu.dirty) {
+                if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
                 uint64_t prev = s->cpu.cycle_count;
                 mos6502_step(&s->cpu);
                 uint64_t delta = s->cpu.cycle_count - prev;
@@ -1527,6 +1551,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                     }
 
                 nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+                if (gemu_monitor_is_paused(s->monitor)) break;
             }
 
             /* Flush APU samples to SDL audio */
@@ -1542,6 +1567,11 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             if (s->vnc)
                 gemu_vnc_update(s->vnc, s->ppu.pixels,
                                 RP2C02_WIDTH, RP2C02_HEIGHT);
+
+#ifdef GEMU_GTK
+            /* Refresh hex editor if visible */
+            hex_editor_refresh(s->hex_editor);
+#endif
         }
 
         /* Frame sync:
@@ -1557,6 +1587,11 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             if (elapsed < NES_FRAME_MS)
                 SDL_Delay(NES_FRAME_MS - elapsed);
         }
+
+#ifdef GEMU_GTK
+        /* Process GTK events — draws the frame and keeps windows responsive */
+        gemu_video_gtk_poll();
+#endif
     }
 
     printf("nes: %llu frames, %llu cpu cycles\n",

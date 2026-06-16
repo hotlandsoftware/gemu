@@ -111,6 +111,7 @@ TARGETS = {
         'src_curses': [],
         'src_gtk': [
             'gemu-mos/src/vga/display_gtk.c',
+            'gemu-mos/src/vga/hex_editor.c',
             'core/src/gtk_menu.c', 'core/src/video_gtk.c',
         ],
         'defines_gtk':   ['GEMU_GTK'],
@@ -198,6 +199,7 @@ def main():
 
     # GTK3
     gtk_cflags = gtk_libs = []
+    epoxy_cflags = epoxy_libs = []
     want_gtk = args.gtk
     if want_gtk:
         cf = pkg('gtk+-3.0', '--cflags', *pkg_flags)
@@ -208,6 +210,15 @@ def main():
         else:
             gtk_cflags = cf
             gtk_libs   = lf
+            # Epoxy (OpenGL loader needed by GtkGLArea)
+            ecf = pkg('epoxy', '--cflags', *pkg_flags)
+            elf = pkg('epoxy', '--libs',   *pkg_flags)
+            if check('epoxy (GL)', elf):
+                epoxy_cflags = ecf or []
+                epoxy_libs   = elf
+            else:
+                print('  (epoxy not found — building without GTK)')
+                want_gtk = False
 
     # ALSA (for NES MIDI output, mos target only, Linux optional)
     have_alsa  = False
@@ -298,12 +309,18 @@ def main():
             defs += ' ' + ' '.join(f'-D{d}' for d in td['defines_win'])
         if tname == 'mos' and have_alsa:
             defs += ' -DHAVE_ALSA'
-        cflags = f'$CFLAGS_BASE {inc} {" ".join(sdl2_cflags)}{defs}'.strip()
+        cflags = f'$CFLAGS_BASE {inc} {" ".join(sdl2_cflags)}'  \
+                 f'{" " if want_gtk and gtk_cflags else ""}'  \
+                 f'{" ".join(gtk_cflags) if want_gtk and gtk_cflags else ""}'  \
+                 f'{" " if want_gtk and epoxy_cflags else ""}'  \
+                 f'{" ".join(epoxy_cflags) if want_gtk and epoxy_cflags else ""}'  \
+                 f'{defs}'.strip()
 
         # Per-target LDFLAGS
         ld_parts = [base_ldflags] + sdl2_libs
         if want_gtk:
             ld_parts += gtk_libs
+            ld_parts += epoxy_libs
         if have_curses and td['has_curses']:
             ld_parts += curses_flags
         if tname == 'mos' and have_alsa:

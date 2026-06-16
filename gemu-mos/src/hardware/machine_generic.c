@@ -61,6 +61,7 @@ static void generic_poll_serial(MosGenericState *s) {
 
 static uint8_t generic_mem_read(uint16_t addr, void *ud) {
     MosGenericState *s = ud;
+    gemu_monitor_check_read(s->monitor, addr);
 
     if (addr >= GENERIC_IO_BASE && addr <= GENERIC_IO_END) {
         switch (addr - GENERIC_IO_BASE) {
@@ -92,6 +93,7 @@ static uint8_t generic_mem_read(uint16_t addr, void *ud) {
 
 static void generic_mem_write(uint16_t addr, uint8_t val, void *ud) {
     MosGenericState *s = ud;
+    gemu_monitor_check_write(s->monitor, addr);
 
     /* Legacy debug port: write byte to stdout (used by test ROMs) */
     if (addr == 0xF001u) {
@@ -265,8 +267,10 @@ void mos_generic_run(MosGenericState *s, const MosConfig *cfg) {
 
             uint64_t target = s->cpu.cycle_count + GENERIC_CYCLES_PER_FRAME;
             while (s->cpu.cycle_count < target) {
+                if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
                 mos6502_step(&s->cpu);
                 generic_timer_tick(s);
+                if (gemu_monitor_is_paused(s->monitor)) break;
             }
         }
 
