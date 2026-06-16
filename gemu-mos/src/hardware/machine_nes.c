@@ -169,9 +169,9 @@ static bool ines_load(NesState *s, const char *path) {
     else                  s->cart.mirror = RP2C02_MIRROR_HORIZONTAL;
 
     switch (s->cart.mapper) {
-    case 0: case 1: case 2: case 4: case 5: case 66: case 178: case 228: break;
+    case 0: case 1: case 2: case 4: case 5: case 7: case 66: case 178: case 228: break;
     default:
-        fprintf(stderr, "nes: mapper %u not supported (NROM/0, MMC1/1, UxROM/2, MMC3/4, MMC5/5, GxROM/66, WaixingFS/178, Action52/228)\n",
+        fprintf(stderr, "nes: mapper %u not supported (NROM/0, MMC1/1, UxROM/2, MMC3/4, MMC5/5, AxROM/7, GxROM/66, WaixingFS/178, Action52/228)\n",
                 s->cart.mapper);
         fclose(f); return false;
     }
@@ -562,7 +562,7 @@ static uint8_t nes_chr_read(uint16_t addr, void *ud) {
         if (s->chr_is_ram) return s->chr[addr & 0x1FFF];
         return s->chr[s->mmc3_chr_offsets[addr >> 10] + (addr & 0x3FF)];
     }
-    if (s->cart.mapper >= 1) {
+    if (s->cart.mapper >= 1 && s->cart.mapper != 7) {
         uint8_t slot = addr >= 0x1000 ? 1 : 0;
         return s->chr[s->chr_offsets[slot] + (addr & 0x0FFF)];
     }
@@ -573,7 +573,7 @@ static void nes_chr_write(uint16_t addr, uint8_t val, void *ud) {
     NesState *s = ud;
     if (!s->chr_is_ram) return;
     if (s->cart.mapper == 4) { s->chr[addr & 0x1FFF] = val; return; }
-    if (s->cart.mapper >= 1) {
+    if (s->cart.mapper >= 1 && s->cart.mapper != 7) {
         uint8_t slot = addr >= 0x1000 ? 1 : 0;
         s->chr[s->chr_offsets[slot] + (addr & 0x0FFF)] = val;
     } else {
@@ -1001,6 +1001,15 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
             }
         }
         else if (s->cart.mapper == 4) mmc3_cpu_write(s, addr, val);
+        else if (s->cart.mapper == 7) {
+            /* AxROM: bits 2:0 = 32KB PRG bank, bit 4 = mirror (0=single-A, 1=single-B) */
+            uint32_t prg_size = (uint32_t)s->cart.prg_banks * 0x4000u;
+            uint8_t  bank     = val & 0x07u;
+            s->prg_offsets[0] = ((uint32_t)bank * 0x8000u) % prg_size;
+            s->prg_offsets[1] = s->prg_offsets[0] + 0x4000u;
+            s->ppu.mirror     = (val & 0x10u) ? RP2C02_MIRROR_SINGLE_B
+                                               : RP2C02_MIRROR_SINGLE_A;
+        }
         else if (s->cart.mapper == 228) {
             /* Action 52 — NESdev register layout (address + data bus):
              *   FEDCBA98 76543210  (full 16-bit address)
@@ -1258,6 +1267,10 @@ static void nes_reset(NesState *s) {
         m178_update_banks(s);
         s->chr_offsets[0] = 0;
         s->chr_offsets[1] = 0x1000u;
+    } else if (s->cart.mapper == 7) {
+        s->prg_offsets[0] = 0;
+        s->prg_offsets[1] = 0x4000u;
+        s->ppu.mirror     = RP2C02_MIRROR_SINGLE_A;
     } else if (s->cart.mapper == 4) {
         memset(s->mmc3_regs, 0, sizeof(s->mmc3_regs));
         s->mmc3_bank_sel    = 0;
