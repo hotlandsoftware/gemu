@@ -21,6 +21,7 @@ typedef struct {
     GtkWidget     *text_view;
     GtkTextBuffer *buf;
     GtkTextTag    *hl_tag;       /* highlight for selected byte */
+    GtkTextTag    *cursor_tag;   /* block cursor for active hex/ASCII cells */
     const uint8_t *data;         /* live pointer, or NULL */
     size_t         size;         /* bytes */
     bool           read_only;
@@ -44,6 +45,7 @@ struct HexEditor {
     HexEditorTab  *cur_tab;
     uint32_t       selected_addr;   /* offset into current tab's data */
     bool           has_selection;
+    int            edit_nibble;      /* 0 = high hex digit, 1 = low */
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
@@ -51,6 +53,7 @@ struct HexEditor {
 /* Standard hex line: "XXXX: XX XX ... XX  AAAA...\n" */
 #define HEX_LINE_BYTES   16
 #define HEX_DATA_START   6
+#define HEX_ASCII_START  55
 #define HEX_FMT_BUF      128   /* big enough for one formatted line + NUL */
 
 /* byte index → starting column of its first hex digit in the data area.
@@ -60,6 +63,14 @@ static int hex_byte_col(int i) {
     int col = HEX_DATA_START + i * 3;
     if (i >= 8) col += 1;  /* the extra separator space after byte 7 */
     return col;
+}
+
+static int hex_digit_value(guint keyval) {
+    gunichar ch = gdk_keyval_to_unicode(keyval);
+    if (ch >= '0' && ch <= '9') return (int)(ch - '0');
+    if (ch >= 'a' && ch <= 'f') return (int)(ch - 'a') + 10;
+    if (ch >= 'A' && ch <= 'F') return (int)(ch - 'A') + 10;
+    return -1;
 }
 
 /* Given a text offset into the buffer, return the line number and column. */
@@ -163,6 +174,11 @@ static void hex_buffer_replace_line(GtkTextBuffer *buf, int line, const char *ne
     gtk_text_buffer_insert(buf, &ds, with_nl, -1);
 }
 
+static void hex_tab_invalidate_line_tags(HexEditorTab *tab, int line) {
+    if (tab->hl_line == line)
+        tab->hl_line = -1;
+}
+
 /* gtk_text_buffer_get_line_count() includes the final empty line when the
  * buffer ends with '\n'. hex_tab_rebuild() writes one newline per data row,
  * so compare/update against data rows rather than GTK's raw line count. */
@@ -225,8 +241,10 @@ static void hex_tab_update(HexEditorTab *tab) {
         char new_line[HEX_FMT_BUF];
         format_hex_line(new_line, sizeof(new_line), addr, tab->data + off, n);
 
-        if (strcmp(old_text, new_line) != 0)
+        if (strcmp(old_text, new_line) != 0) {
             hex_buffer_replace_line(tab->buf, line, new_line);
+            hex_tab_invalidate_line_tags(tab, line);
+        }
         g_free(old_text);
     }
 }
@@ -239,6 +257,14 @@ static void hex_tab_clear_highlight(HexEditorTab *tab) {
     gtk_text_buffer_get_end_iter(tab->buf, &e);
     gtk_text_buffer_remove_tag(tab->buf, tab->hl_tag, &s, &e);
     tab->hl_line = -1;
+}
+
+static void hex_tab_clear_cursor(HexEditorTab *tab) {
+    if (!tab->buf || !tab->cursor_tag) return;
+    GtkTextIter s, e;
+    gtk_text_buffer_get_start_iter(tab->buf, &s);
+    gtk_text_buffer_get_end_iter(tab->buf, &e);
+    gtk_text_buffer_remove_tag(tab->buf, tab->cursor_tag, &s, &e);
 }
 
 /* Highlight a single byte at the given line & byte index.
@@ -265,12 +291,33 @@ static void hex_tab_highlight_byte(HexEditorTab *tab, int line, int byte_idx) {
     tab->hl_byte = byte_idx;
 }
 
+static void hex_tab_place_cursor(HexEditorTab *tab, int line, int byte_idx,
+                                  int nibble) {
+    if (!tab->buf || !tab->text_view || !tab->cursor_tag) return;
+    hex_tab_clear_cursor(tab);
+
+    GtkTextIter s, e;
+    gtk_text_buffer_get_iter_at_line_offset(tab->buf, &s, line,
+                                            hex_byte_col(byte_idx) + nibble);
+    e = s;
+    gtk_text_iter_forward_char(&e);
+    gtk_text_buffer_apply_tag(tab->buf, tab->cursor_tag, &s, &e);
+    gtk_text_buffer_place_cursor(tab->buf, &s);
+
+    gtk_text_buffer_get_iter_at_line_offset(tab->buf, &s, line,
+                                            HEX_ASCII_START + byte_idx);
+    e = s;
+    gtk_text_iter_forward_char(&e);
+    gtk_text_buffer_apply_tag(tab->buf, tab->cursor_tag, &s, &e);
+}
+
 /* Given a text offset in the buffer, determine which byte was clicked.
- * Returns true and sets *byte_idx and *addr if a valid hex byte was clicked.
+ * Returns true and sets *byte_idx, *nibble and *addr if a valid hex/ASCII
+ * cell was clicked.
  * Hit-testing walks hex_byte_col() directly so the click target can never
  * drift out of sync with where bytes are actually highlighted/drawn. */
 static bool hex_tab_byte_at_pos(HexEditorTab *tab, int offset,
-                                 int *byte_idx, uint32_t *addr) {
+                                 int *byte_idx, int *nibble, uint32_t *addr) {
     int line, col;
     text_offset_to_line_col(tab->buf, offset, &line, &col);
 
@@ -282,10 +329,36 @@ static bool hex_tab_byte_at_pos(HexEditorTab *tab, int offset,
         if (data_off >= tab->size) return false;
 
         *byte_idx = i;
+        *nibble   = col - start;
+        *addr     = tab->base_addr + (uint32_t)data_off;
+        return true;
+    }
+
+    if (col >= HEX_ASCII_START && col < HEX_ASCII_START + HEX_LINE_BYTES) {
+        int i = col - HEX_ASCII_START;
+        size_t data_off = (size_t)line * HEX_LINE_BYTES + (size_t)i;
+        if (data_off >= tab->size) return false;
+
+        *byte_idx = i;
+        *nibble   = 0;
         *addr     = tab->base_addr + (uint32_t)data_off;
         return true;
     }
     return false;
+}
+
+static HexEditorTab *hex_tab_for_text_view(HexEditor *he, GtkWidget *text_view) {
+    for (int i = 0; i < HEX_TAB_COUNT; i++) {
+        if (he->tabs[i].text_view == text_view)
+            return &he->tabs[i];
+    }
+    return NULL;
+}
+
+static void hex_sync_cur_tab(HexEditor *he) {
+    int page = gtk_notebook_get_current_page(GTK_NOTEBOOK(he->notebook));
+    if (page >= 0 && page < HEX_TAB_COUNT)
+        he->cur_tab = &he->tabs[page];
 }
 
 /* Update the address/value entries to reflect the selected byte. */
@@ -320,8 +393,10 @@ static bool hex_write_byte(HexEditor *he, uint32_t addr, uint8_t val) {
 static void hex_select_byte(HexEditor *he, int line, int byte_idx, uint32_t addr) {
     he->selected_addr = addr;
     he->has_selection = true;
-    if (he->cur_tab)
+    if (he->cur_tab) {
         hex_tab_highlight_byte(he->cur_tab, line, byte_idx);
+        hex_tab_place_cursor(he->cur_tab, line, byte_idx, he->edit_nibble);
+    }
     hex_update_entries(he, addr, hex_read_byte(he));
 
     gtk_widget_set_sensitive(he->write_btn,
@@ -342,6 +417,7 @@ static void hex_update_cur_tab(HexEditor *he) {
     }
     he->cur_tab  = &he->tabs[page];
     he->has_selection = false;
+    he->edit_nibble = 0;
     gtk_widget_set_sensitive(he->write_btn,
                              he->cur_tab && !he->cur_tab->read_only);
     gtk_label_set_text(GTK_LABEL(he->status_label), "");
@@ -351,8 +427,9 @@ static void hex_update_cur_tab(HexEditor *he) {
 
 static gboolean on_text_click(GtkWidget *w, GdkEventButton *ev, gpointer ud) {
     HexEditor *he = ud;
-    HexEditorTab *tab = he->cur_tab;
+    HexEditorTab *tab = hex_tab_for_text_view(he, w);
     if (!tab || !tab->buf) return FALSE;
+    he->cur_tab = tab;
 
     /* Convert window coords to buffer position */
     gint bx, by;
@@ -362,12 +439,16 @@ static gboolean on_text_click(GtkWidget *w, GdkEventButton *ev, gpointer ud) {
     GtkTextIter iter;
     gtk_text_view_get_iter_at_location(GTK_TEXT_VIEW(w), &iter, bx, by);
 
-    int byte_idx;
+    int byte_idx, nibble;
     uint32_t addr;
     int line = gtk_text_iter_get_line(&iter);
 
-    if (hex_tab_byte_at_pos(tab, gtk_text_iter_get_offset(&iter), &byte_idx, &addr)) {
+    if (hex_tab_byte_at_pos(tab, gtk_text_iter_get_offset(&iter),
+                            &byte_idx, &nibble, &addr)) {
+        he->edit_nibble = nibble;
         hex_select_byte(he, line, byte_idx, addr);
+        gtk_widget_grab_focus(tab->text_view);
+        return TRUE;
     }
 
     return FALSE;
@@ -383,6 +464,7 @@ static void on_page_switched(GtkNotebook *nb, GtkWidget *page, guint page_num,
 static void on_write_clicked(GtkButton *btn, gpointer ud) {
     (void)btn;
     HexEditor *he = ud;
+    hex_sync_cur_tab(he);
     if (!he->has_selection || !he->cur_tab || he->cur_tab->read_only) return;
 
     const char *text = gtk_entry_get_text(GTK_ENTRY(he->value_entry));
@@ -406,6 +488,7 @@ static void on_write_clicked(GtkButton *btn, gpointer ud) {
         int line = (int)(off / HEX_LINE_BYTES);
         int bi   = (int)(off % HEX_LINE_BYTES);
         hex_tab_highlight_byte(he->cur_tab, line, bi);
+        hex_tab_place_cursor(he->cur_tab, line, bi, he->edit_nibble);
     }
 }
 
@@ -416,6 +499,7 @@ static void on_value_activate(GtkEntry *entry, gpointer ud) {
 
 static void on_goto_activate(GtkEntry *entry, gpointer ud) {
     HexEditor *he = ud;
+    hex_sync_cur_tab(he);
     const char *text = gtk_entry_get_text(entry);
     uint32_t addr = (uint32_t)strtoul(text, NULL, 16);
 
@@ -439,11 +523,13 @@ static void on_goto_activate(GtkEntry *entry, gpointer ud) {
     int bi   = (int)(off % HEX_LINE_BYTES);
 
     GtkTextIter iter;
-    gtk_text_buffer_get_iter_at_line(he->cur_tab->buf, &iter, line);
+    gtk_text_buffer_get_iter_at_line_offset(he->cur_tab->buf, &iter, line,
+                                            hex_byte_col(bi));
     gtk_text_buffer_place_cursor(he->cur_tab->buf, &iter);
     gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(he->cur_tab->text_view),
                                   &iter, 0.0, FALSE, 0.0, 0.0);
 
+    he->edit_nibble = 0;
     hex_select_byte(he, line, bi, addr);
 }
 
@@ -469,18 +555,94 @@ static void hex_move_selection(HexEditor *he, int32_t delta, bool scroll) {
     }
 }
 
+static void hex_move_cursor_digit(HexEditor *he, int32_t delta) {
+    uint32_t base = he->cur_tab->base_addr;
+    int32_t digit = (int32_t)((he->selected_addr - base) * 2u)
+                    + he->edit_nibble + delta;
+    int32_t max_digit = (int32_t)(he->cur_tab->size * 2u) - 1;
+
+    if (digit < 0 || digit > max_digit) return;
+
+    uint32_t new_addr = base + (uint32_t)(digit / 2);
+    int32_t byte_delta = (int32_t)(new_addr - base)
+                         - (int32_t)(he->selected_addr - base);
+    he->edit_nibble = digit & 1;
+    hex_move_selection(he, byte_delta, false);
+}
+
+static void hex_edit_selected_nibble(HexEditor *he, int nibble_val) {
+    if (!he->cur_tab || !he->cur_tab->data)
+        return;
+    if (he->cur_tab->read_only) {
+        gtk_label_set_text(GTK_LABEL(he->status_label), "Read-only memory");
+        return;
+    }
+
+    uint8_t old_val = hex_read_byte(he);
+    uint8_t new_val = he->edit_nibble == 0
+        ? (uint8_t)((old_val & 0x0Fu) | (uint8_t)(nibble_val << 4))
+        : (uint8_t)((old_val & 0xF0u) | (uint8_t)nibble_val);
+
+    if (!hex_write_byte(he, he->selected_addr, new_val))
+        return;
+
+    uint32_t written_addr = he->selected_addr;
+    uint32_t off = he->selected_addr - he->cur_tab->base_addr;
+    int line = (int)(off / HEX_LINE_BYTES);
+    int bi   = (int)(off % HEX_LINE_BYTES);
+    hex_tab_update(he->cur_tab);
+
+    if (he->edit_nibble == 0) {
+        he->edit_nibble = 1;
+        hex_select_byte(he, line, bi, he->selected_addr);
+    } else if (off + 1 < he->cur_tab->size) {
+        he->edit_nibble = 0;
+        hex_move_selection(he, 1, true);
+    } else {
+        he->edit_nibble = 0;
+        hex_select_byte(he, line, bi, he->selected_addr);
+    }
+
+    char status[64];
+    snprintf(status, sizeof(status), "Wrote $%02X to $%04X", new_val, written_addr);
+    gtk_label_set_text(GTK_LABEL(he->status_label), status);
+}
+
+static bool hex_key_should_edit(HexEditor *he) {
+    if (!he || !he->window || !he->cur_tab || !he->cur_tab->text_view)
+        return false;
+
+    GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(he->window));
+    if (focus && GTK_IS_ENTRY(focus))
+        return false;
+    return !focus || focus == he->cur_tab->text_view
+           || gtk_widget_is_ancestor(focus, he->cur_tab->text_view);
+}
+
 static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer ud) {
     HexEditor *he = ud;
     (void)w;
 
+    if (!hex_key_should_edit(he))
+        return FALSE;
+
+    hex_sync_cur_tab(he);
+
     if (!he->has_selection || !he->cur_tab || !he->cur_tab->data)
         return FALSE;
+
+    int digit = hex_digit_value(ev->keyval);
+    if (digit >= 0) {
+        hex_edit_selected_nibble(he, digit);
+        return TRUE;
+    }
 
     switch (ev->keyval) {
     case GDK_KEY_Up:    hex_move_selection(he, -HEX_LINE_BYTES, true);  return TRUE;
     case GDK_KEY_Down:  hex_move_selection(he,  HEX_LINE_BYTES, true);  return TRUE;
-    case GDK_KEY_Left:  hex_move_selection(he, -1, false);              return TRUE;
-    case GDK_KEY_Right: hex_move_selection(he,  1, false);              return TRUE;
+    case GDK_KEY_Left:  hex_move_cursor_digit(he, -1);                  return TRUE;
+    case GDK_KEY_Right: hex_move_cursor_digit(he,  1);                  return TRUE;
+    case GDK_KEY_BackSpace: hex_move_cursor_digit(he, -1);              return TRUE;
     default:            return FALSE;
     }
 }
@@ -528,10 +690,13 @@ static GtkWidget *hex_create_tab_view(HexEditor *he, HexEditorTab *tab) {
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(tab->text_view), TRUE);
     gtk_text_view_set_left_margin(GTK_TEXT_VIEW(tab->text_view), 4);
     gtk_text_view_set_right_margin(GTK_TEXT_VIEW(tab->text_view), 4);
+    gtk_widget_set_can_focus(tab->text_view, TRUE);
 
     tab->buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tab->text_view));
     tab->hl_tag = gtk_text_buffer_create_tag(tab->buf, "highlight",
         "background", "#FFFF00", "foreground", "#000000", NULL);
+    tab->cursor_tag = gtk_text_buffer_create_tag(tab->buf, "cursor",
+        "background", "#000000", "foreground", "#FFFFFF", NULL);
 
     gtk_container_add(GTK_CONTAINER(tab->scrolled), tab->text_view);
 
@@ -584,6 +749,8 @@ HexEditor *hex_editor_create(NesState *s) {
     gtk_window_set_default_size(GTK_WINDOW(he->window), 660, 520);
     g_signal_connect(he->window, "delete-event",
                      G_CALLBACK(on_window_delete), he);
+    g_signal_connect(he->window, "key-press-event",
+                     G_CALLBACK(on_key_press), he);
 
     /* ── Main vertical box ── */
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
@@ -712,6 +879,7 @@ void hex_editor_refresh(HexEditor *he) {
                 int line = (int)(off / HEX_LINE_BYTES);
                 int bi   = (int)(off % HEX_LINE_BYTES);
                 hex_tab_highlight_byte(sel_tab, line, bi);
+                hex_tab_place_cursor(sel_tab, line, bi, he->edit_nibble);
             }
         }
         return;
@@ -734,6 +902,7 @@ void hex_editor_refresh(HexEditor *he) {
             int line = (int)(off / HEX_LINE_BYTES);
             int bi   = (int)(off % HEX_LINE_BYTES);
             hex_tab_highlight_byte(sel_tab, line, bi);
+            hex_tab_place_cursor(sel_tab, line, bi, he->edit_nibble);
         }
     }
 }
