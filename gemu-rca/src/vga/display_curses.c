@@ -1,4 +1,5 @@
 #define _XOPEN_SOURCE_EXTENDED 1
+#include "vga/rca_display.h"
 #include "vip.h"
 #include "studio2.h"
 #include "devices/vip_devices.h"
