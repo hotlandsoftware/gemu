@@ -10,8 +10,8 @@ GEMU is still in an alpha state. It will likely never be "complete" as there wil
 
 # Build command
 ```
-make
-make GTK=1 # for GTK support
+python configure && ninja -j$(nproc)
+python configure --enable-gtk && ninja -j$(nproc) # for GTK support
 ```
 # Targets
 See https://hotlandsoftware.github.io/gemu/

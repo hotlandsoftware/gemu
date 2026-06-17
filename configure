@@ -8,17 +8,17 @@ Usage:
   ninja gemu-mos   # build one target
 
 Options:
-  --target-list=LIST   Comma-separated targets to build (default: all)
-                       Valid targets: chip8, mos, rca
-  --enable-gtk         Build GTK3 UI (default: no)
-  --disable-sdl        Do not link SDL2 (rarely useful)
+  --target-list=LIST   comma-separated targets to build (default: all)
+                       valid targets: chip8, mos, rca
+  --enable-gtk         build GTK3 UI (default: no)
+  --disable-sdl        do not link SDL2 (rarely useful)
   --cc=CC              C compiler (default: gcc)
-  --extra-cflags=F     Append extra compiler flags
-  --extra-ldflags=F    Append extra linker flags
-  --debug              Build with -O0 -g instead of -O2
-  --build-dir=DIR      Object directory (default: build)
-  --bindir=DIR         Binary output directory (default: bin)
-  --prefix=DIR         Install prefix (default: /usr/local)
+  --extra-cflags=F     append extra compiler flags
+  --extra-ldflags=F    append extra linker flags
+  --debug              build with -O0 -g instead of -O2
+  --build-dir=DIR      object directory (default: build)
+  --bindir=DIR         binary output directory (default: bin)
+  --prefix=DIR         install prefix (default: /usr/local)
 """
 
 import sys, os, argparse, subprocess, shutil

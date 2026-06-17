@@ -396,7 +396,7 @@ static void studio2_poll_vnc(RcaStudio2State *s) {
 void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
     GemuDisplay *display = gemu_display_create(cfg->display_type,
         &(GemuDisplayConfig){
-            .title       = "GEMU — Studio II",
+            .title       = "GEMU",
             .fb_width    = STUDIO2_DISPLAY_W,
             .fb_height   = STUDIO2_DISPLAY_H,
             .scale       = cfg->display_scale,

@@ -1478,7 +1478,7 @@ NesState *nes_create(const MosConfig *cfg) {
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         s->display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
-                .title       = "GEMU — NES",
+                .title       = "GEMU",
                 .fb_width    = RP2C02_WIDTH,
                 .fb_height   = RP2C02_HEIGHT,
                 .scale       = cfg->display_scale,
