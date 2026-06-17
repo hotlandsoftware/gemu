@@ -1,11 +1,14 @@
+#ifndef _WIN32
+#  define _POSIX_C_SOURCE 199309L
+#endif
 #include "nes.h"
 #include "fds.h"
 #include "fds_hle.h"
-#include "../vga/nes_display.h"
 #include "../audio/apu2a03.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
-#include <SDL2/SDL.h>
+#include "gemu/gemu_display.h"
+#include <SDL2/SDL.h>  /* needed for APU audio queue sync */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,10 +25,23 @@
 #endif
 #ifdef GEMU_GTK
 #  include <gtk/gtk.h>
-#  include "gemu/video.h"
-#  include "gemu/gtk_menu.h"
 #endif
 #include "../vga/hex_editor.h"
+
+/* ── NES controller action table ─────────────────────────────────────────── */
+/* GEMU_ACTION(n) = 1u<<n; NES_BTN_* happen to match, so ctrl_state[0] = held & 0xFF */
+#define NES_N_ACTIONS 8
+
+static const GemuActionDef nes_actions[NES_N_ACTIONS] = {
+    { "A",      GEMU_ACTION(0), "z"           },  /* NES_BTN_A      = 0x01 */
+    { "B",      GEMU_ACTION(1), "x"           },  /* NES_BTN_B      = 0x02 */
+    { "Select", GEMU_ACTION(2), "Right Shift" },  /* NES_BTN_SELECT = 0x04 */
+    { "Start",  GEMU_ACTION(3), "Return"      },  /* NES_BTN_START  = 0x08 */
+    { "Up",     GEMU_ACTION(4), "Up"          },  /* NES_BTN_UP     = 0x10 */
+    { "Down",   GEMU_ACTION(5), "Down"        },  /* NES_BTN_DOWN   = 0x20 */
+    { "Left",   GEMU_ACTION(6), "Left"        },  /* NES_BTN_LEFT   = 0x40 */
+    { "Right",  GEMU_ACTION(7), "Right"       },  /* NES_BTN_RIGHT  = 0x80 */
+};
 
 /* GTK Debug > Hex Editor menu callback (body is no-op when GTK disabled). */
 static void nes_hex_toggle(void *ud) {
@@ -1192,25 +1208,23 @@ static void nes_media_status(void *ud, char *buf, size_t buf_len) {
 #define XK_Return 0xFF0Du
 #define XK_ShiftR 0xFFE2u
 
-static void nes_handle_keys(NesState *s) {
-    /* Headless mode: clear state each frame (no display to assign it) */
-    if (!s->display && !s->vnc) {
-        s->ctrl_state[0] = 0;
-        s->ctrl_state[1] = 0;
-    }
-
-    /* SDL display: poll events and read back full button state */
-    if (s->display) {
-        nes_display_poll(s->display);
+/* held: bitmask returned by gemu_display_poll() this frame (0 if headless) */
+static void nes_handle_keys(NesState *s, uint32_t held) {
+    if (!s->display) {
+        /* Headless: clear state unless VNC is feeding us events */
+        if (!s->vnc) { s->ctrl_state[0] = 0; s->ctrl_state[1] = 0; }
+    } else {
+        /* Action bits 0-7 map directly to NES_BTN_* (both are 1<<n) */
         if (s->cfg->ports[0] == NES_DEVICE_CONTROLLER)
-            s->ctrl_state[0] = nes_display_ctrl1(s->display);
+            s->ctrl_state[0] = (uint8_t)(held & 0xFFu);
         if (s->cfg->ports[1] == NES_DEVICE_ZAPPER) {
-            bool btn;
-            nes_display_zapper(s->display, &s->zapper_x, &s->zapper_y, &btn);
-            if (btn && s->zapper_trigger_ttl == 0)
+            GemuPointerState ptr = gemu_display_get_pointer(s->display);
+            if (ptr.button && s->zapper_trigger_ttl == 0)
                 s->zapper_trigger_ttl = 10; /* 10-frame trigger pulse */
             if (s->zapper_trigger_ttl > 0)
                 s->zapper_trigger_ttl--;
+            s->zapper_x = ptr.x;
+            s->zapper_y = ptr.y;
         }
     }
 
@@ -1220,7 +1234,7 @@ static void nes_handle_keys(NesState *s) {
         s->ctrl_inject_frames--;
     }
 
-    /* VNC: drain the key queue; translate to controller buttons if port 0 has one */
+    /* VNC: drain key queue; translate to controller buttons */
     if (s->vnc) {
         GemuVncKeyEvent ev;
         while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
@@ -1461,15 +1475,23 @@ NesState *nes_create(const MosConfig *cfg) {
         gemu_monitor_register_media(s->monitor, &cart_dev);
     }
 
-    if (cfg->display_type == GEMU_DISPLAY_SDL ||
-        cfg->display_type == GEMU_DISPLAY_GTK) {
-        s->display = nes_display_create(cfg->display_type, "GEMU",
-                                        rp2c02_palette_rgb,
-                                        cfg->display_scale,
-                                        cfg->display_renderer,
-                                        s->monitor,
-                                        nes_hex_toggle, s,
-                                        cfg->ports);
+    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+        s->display = gemu_display_create(cfg->display_type,
+            &(GemuDisplayConfig){
+                .title       = "GEMU — NES",
+                .fb_width    = RP2C02_WIDTH,
+                .fb_height   = RP2C02_HEIGHT,
+                .scale       = cfg->display_scale,
+                .renderer    = cfg->display_renderer,
+                .actions     = nes_actions,
+                .n_actions   = NES_N_ACTIONS,
+                .ini_section = "nes-controller",
+                .gtk         = &(GemuDisplayGtkExtras){
+                    .monitor       = s->monitor,
+                    .hex_toggle_cb = nes_hex_toggle,
+                    .hex_toggle_ud = s,
+                },
+            });
         if (!s->display)
             fprintf(stderr, "nes: failed to create display window\n");
     }
@@ -1511,7 +1533,7 @@ void nes_destroy(NesState *s) {
 #endif
     apu2a03_destroy(&s->apu);
     gemu_monitor_destroy(s->monitor);
-    nes_display_destroy(s->display);
+    gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
     free(s->prg);
     free(s->chr);
@@ -1533,13 +1555,18 @@ void nes_run(NesState *s, const MosConfig *cfg) {
 
     bool quit = false;
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
+        Uint32 t0 = SDL_GetTicks();  /* used for non-audio frame sync below */
 
-        /* SDL event pump (headless/VNC path — SDL display polls in handle_keys) */
-        if (!s->display) {
-            SDL_Event ev;
-            while (SDL_PollEvent(&ev))
-                if (ev.type == SDL_QUIT) quit = true;
+        /* Poll display: pump events, update held bitmask, check quit/reset */
+        uint32_t held = 0;
+        if (s->display) {
+            held = gemu_display_poll(s->display);
+            if (gemu_display_should_quit(s->display)) break;
+            if (gemu_display_reset_requested(s->display)) {
+                gemu_display_clear_flags(s->display);
+                nes_sav_save(s);
+                nes_reset(s);
+            }
         }
 
         /* Monitor commands */
@@ -1629,18 +1656,8 @@ void nes_run(NesState *s, const MosConfig *cfg) {
         }
         if (quit) break;
 
-        /* Input: SDL display keys + VNC events */
-        nes_handle_keys(s);
-
-        /* SDL window closed */
-        if (s->display && nes_display_should_quit(s->display)) break;
-
-        /* SDL input menu: reset requested */
-        if (nes_display_menu_reset_requested(s->display)) {
-            nes_display_menu_clear_reset(s->display);
-            nes_sav_save(s);
-            nes_reset(s);
-        }
+        /* Input: display action bits + VNC events */
+        nes_handle_keys(s, held);
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             /* Run one full frame (until PPU marks frame complete) */
@@ -1666,17 +1683,13 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             /* Flush APU samples to SDL audio */
             apu2a03_flush(&s->apu);
 
-            /* Render completed frame */
-            if (nes_display_has_argb(s->display))
-                nes_display_render_argb(s->display, s->ppu.pixels_argb,
-                                        RP2C02_WIDTH, RP2C02_HEIGHT);
-            else if (s->display)
-                nes_display_render(s->display, s->ppu.pixels,
-                                   RP2C02_WIDTH, RP2C02_HEIGHT);
+            /* Render completed frame (PPU already builds pixels_argb) */
+            if (s->display)
+                gemu_display_render(s->display, s->ppu.pixels_argb,
+                                    RP2C02_WIDTH, RP2C02_HEIGHT);
             if (s->vnc)
                 gemu_vnc_update(s->vnc, s->ppu.pixels,
                                 RP2C02_WIDTH, RP2C02_HEIGHT);
-
         }
 
         /* Frame sync:
@@ -1695,16 +1708,13 @@ void nes_run(NesState *s, const MosConfig *cfg) {
         }
 
 #ifdef GEMU_GTK
-        /* Refresh hex editor with live RAM data, then process GTK events */
         hex_editor_refresh(s->hex_editor);
-        gemu_video_gtk_poll();
+        /* GTK event pump is done inside gemu_display_poll() via the backend */
 #endif
     }
 
     printf("nes: %llu frames, %llu cpu cycles\n",
            (unsigned long long)s->ppu.frame,
            (unsigned long long)s->cpu.cycle_count);
-
     gemu_monitor_stop(s->monitor);
-    (void)cfg;
 }

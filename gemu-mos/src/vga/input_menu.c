@@ -330,11 +330,11 @@ static void save_ini(const InputMenu *m) {
 static void build_main_menu(InputMenu *m) {
     m->n_items = 0;
     m->items[m->n_items++] = (MenuItem){
-        .label  = "Input (this machine)",
+        .label  = "Input",
         .action = menu_action_input,
     };
     m->items[m->n_items++] = (MenuItem){
-        .label  = "Reset System",
+        .label  = "Reset",
         .action = menu_action_reset,
     };
     m->items[m->n_items++] = (MenuItem){

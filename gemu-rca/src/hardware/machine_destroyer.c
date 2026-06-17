@@ -1,12 +1,40 @@
+#ifndef _WIN32
+#  define _POSIX_C_SOURCE 199309L
+#endif
 #include "destroyer.h"
 #include "devices/pcspk.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
-#include <SDL2/SDL.h>
+#include "gemu/gemu_display.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+static inline void destroyer_sleep_ms(unsigned ms) { Sleep(ms); }
+#else
+#  include <time.h>
+static inline void destroyer_sleep_ms(unsigned ms) {
+    struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+#endif
+
+#define DESTROYER_N_ACTIONS 8
+
+static const GemuActionDef destroyer_actions[DESTROYER_N_ACTIONS] = {
+    { "Start1",  GEMU_ACTION(0), "1"     },
+    { "Start2",  GEMU_ACTION(1), "2"     },
+    { "Left",    GEMU_ACTION(2), "Left"  },
+    { "Right",   GEMU_ACTION(3), "Right" },
+    { "Fire",    GEMU_ACTION(4), "Space" },
+    { "Service", GEMU_ACTION(5), "F2"    },
+    { "Coin1",   GEMU_ACTION(6), "5"     },
+    { "Coin2",   GEMU_ACTION(7), "6"     },
+};
 
 #define DESTROYER_CPU_HZ 3579000u
 #define DESTROYER_FRAME_HZ 50u
@@ -466,39 +494,29 @@ void rca_destroyer_destroy(RcaDestroyerState *s) {
     free(s);
 }
 
-static void destroyer_poll_display(RcaDestroyerState *s, RcaDisplay *display,
-                                   bool *quit) {
+static void destroyer_apply_held(RcaDestroyerState *s, uint32_t held) {
     static int debug = -1;
-    if (debug < 0)
-        debug = getenv("GEMU_INPUT_DEBUG") != NULL;
-
-    rca_display_poll(display);
-    if (rca_display_should_quit(display)) {
-        *quit = true;
-        return;
-    }
+    if (debug < 0) debug = getenv("GEMU_INPUT_DEBUG") != NULL;
 
     bool old_coin1 = s->coin1;
     bool old_coin2 = s->coin2;
-    s->start1 = rca_display_key_down(display, '1');
-    s->start2 = rca_display_key_down(display, '2');
-    s->right = rca_display_key_down(display, RCA_KEY_RIGHT);
-    s->left = rca_display_key_down(display, RCA_KEY_LEFT);
-    s->fire = rca_display_key_down(display, ' ');
-    s->service = rca_display_key_down(display, RCA_KEY_F2);
-    s->coin1 = rca_display_key_down(display, '5') ||
-               rca_display_key_down(display, 'a');
-    s->coin2 = rca_display_key_down(display, '6') ||
-               rca_display_key_down(display, 'b');
+    s->start1  = (held >> 0) & 1;
+    s->start2  = (held >> 1) & 1;
+    s->left    = (held >> 2) & 1;
+    s->right   = (held >> 3) & 1;
+    s->fire    = (held >> 4) & 1;
+    s->service = (held >> 5) & 1;
+    s->coin1   = (held >> 6) & 1;
+    s->coin2   = (held >> 7) & 1;
     if (s->coin1 && !old_coin1) s->coin1_latch = 15;
     if (s->coin2 && !old_coin2) s->coin2_latch = 15;
 
     if (debug) {
         if (s->start1) fprintf(stderr, "destroyer input: start1 down\n");
         if (s->start2) fprintf(stderr, "destroyer input: start2 down\n");
-        if (s->left) fprintf(stderr, "destroyer input: left down\n");
-        if (s->right) fprintf(stderr, "destroyer input: right down\n");
-        if (s->fire) fprintf(stderr, "destroyer input: fire down\n");
+        if (s->left)   fprintf(stderr, "destroyer input: left down\n");
+        if (s->right)  fprintf(stderr, "destroyer input: right down\n");
+        if (s->fire)   fprintf(stderr, "destroyer input: fire down\n");
         if (s->service) fprintf(stderr, "destroyer input: service down\n");
         if (s->coin1 && !old_coin1) fprintf(stderr, "destroyer input: coin1 down\n");
         if (s->coin2 && !old_coin2) fprintf(stderr, "destroyer input: coin2 down\n");
@@ -528,53 +546,52 @@ static void destroyer_poll_vnc(RcaDestroyerState *s) {
 }
 
 void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
-    RcaDisplay *display = NULL;
-    if (cfg->vga == RCA_VGA_CDP1869)
-        display = rca_display_create_indexed(cfg->display_type, "GEMU",
-                                             DESTROYER_ROTATED_W,
-                                             DESTROYER_ROTATED_H,
-                                             cfg->display_scale,
-                                             destroyer_palette,
-                                             (int)(sizeof(destroyer_palette) /
-                                                   sizeof(destroyer_palette[0])),
-                                             s->monitor,
-                                             cfg->keyboard);
-    else if (cfg->vga == RCA_VGA_NONE)
-        display = rca_display_none_create();
-    else
-        display = rca_display_create_mono(cfg->display_type, "GEMU",
-                                          CDP1861_DISPLAY_W,
-                                          CDP1861_DISPLAY_H,
-                                          cfg->display_scale,
-                                          0xFFFFFFFFu,
-                                          0xFF100080u,
-                                          s->monitor,
-                                          cfg->keyboard);
-    if (!display) {
-        fprintf(stderr, "gemu-rca: failed to create Destroyer display\n");
-        return;
+    int fw = (cfg->vga == RCA_VGA_CDP1869) ? DESTROYER_ROTATED_W : CDP1861_DISPLAY_W;
+    int fh = (cfg->vga == RCA_VGA_CDP1869) ? DESTROYER_ROTATED_H : CDP1861_DISPLAY_H;
+
+    GemuDisplay *display = NULL;
+    if (cfg->vga != RCA_VGA_NONE) {
+        display = gemu_display_create(cfg->display_type,
+            &(GemuDisplayConfig){
+                .title       = "GEMU — Destroyer",
+                .fb_width    = fw,
+                .fb_height   = fh,
+                .scale       = cfg->display_scale,
+                .renderer    = GEMU_RENDERER_AUTO,
+                .actions     = destroyer_actions,
+                .n_actions   = DESTROYER_N_ACTIONS,
+                .ini_section = "destroyer",
+                .gtk         = &(GemuDisplayGtkExtras){ .monitor = s->monitor },
+            });
+        if (!display) {
+            fprintf(stderr, "gemu-rca: failed to create Destroyer display\n");
+            return;
+        }
     }
-
     gemu_monitor_start(s->monitor);
-    const Uint32 frame_ms = 1000 / DESTROYER_FRAME_HZ;
-    bool quit = false;
-    while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
 
-        if (cfg->display_type != GEMU_DISPLAY_NONE)
-            destroyer_poll_display(s, display, &quit);
+    const unsigned frame_ms = 1000u / DESTROYER_FRAME_HZ;
+    uint32_t argb[DESTROYER_ROTATED_W * DESTROYER_ROTATED_H];
+    bool quit = false;
+
+    while (!quit) {
+        /* Input */
+        uint32_t held = 0;
+        if (display) {
+            held = gemu_display_poll(display);
+            if (gemu_display_should_quit(display)) break;
+            if (gemu_display_reset_requested(display)) {
+                gemu_display_clear_flags(display);
+                rca_destroyer_reset(s, cfg);
+            }
+        }
+        destroyer_apply_held(s, held);
         destroyer_poll_vnc(s);
         destroyer_sync_inputs(s);
 
-        /* SDL input menu reset */
-        if (rca_display_menu_reset_requested(display)) {
-            rca_display_menu_clear_reset(display);
-            rca_destroyer_reset(s, cfg);
-        }
-
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-            if (cmd == GEMU_MON_QUIT) quit = true;
+            if (cmd == GEMU_MON_QUIT) { quit = true; break; }
             else if (cmd == GEMU_MON_RESET) rca_destroyer_reset(s, cfg);
             else if (cmd == GEMU_MON_STEP) {
                 uint32_t n = gemu_monitor_step_count(s->monitor);
@@ -592,34 +609,35 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
                 destroyer_video_timing(s, i);
                 cdp1802_step(&s->cpu);
             }
-
             s->vis.non_display = true;
             s->cpu.EF[0] = true;
-            if (cfg->vga == RCA_VGA_CDP1869) {
-                cdp1869_render(&s->vis);
-                destroyer_rotate_bitmap(s);
-                rca_display_render(display, s->rotated_bitmap,
-                                   DESTROYER_ROTATED_W, DESTROYER_ROTATED_H);
-                gemu_vnc_update(s->vnc, s->rotated_bitmap,
-                                DESTROYER_ROTATED_W, DESTROYER_ROTATED_H);
-            } else if (cfg->vga == RCA_VGA_CDP1861) {
-                static const uint8_t blank[CDP1861_DISPLAY_W * CDP1861_DISPLAY_H];
-                rca_display_render(display, blank,
-                                   CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
-                gemu_vnc_update(s->vnc, blank,
-                                CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
+
+            if (display) {
+                if (cfg->vga == RCA_VGA_CDP1869) {
+                    cdp1869_render(&s->vis);
+                    destroyer_rotate_bitmap(s);
+                    for (int i = 0; i < DESTROYER_ROTATED_W * DESTROYER_ROTATED_H; i++)
+                        argb[i] = destroyer_palette[s->rotated_bitmap[i]];
+                    gemu_display_render(display, argb,
+                                        DESTROYER_ROTATED_W, DESTROYER_ROTATED_H);
+                    gemu_vnc_update(s->vnc, s->rotated_bitmap,
+                                    DESTROYER_ROTATED_W, DESTROYER_ROTATED_H);
+                } else if (cfg->vga == RCA_VGA_CDP1861) {
+                    memset(argb, 0, sizeof(uint32_t) * (size_t)(CDP1861_DISPLAY_W * CDP1861_DISPLAY_H));
+                    gemu_display_render(display, argb,
+                                        CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
+                }
             }
         }
 
-        Uint32 elapsed = SDL_GetTicks() - t0;
         if (s->coin1_latch > 0) s->coin1_latch--;
         if (s->coin2_latch > 0) s->coin2_latch--;
-        if (elapsed < frame_ms) SDL_Delay(frame_ms - elapsed);
+        destroyer_sleep_ms(frame_ms);
     }
 
     printf("gemu-rca: %llu machine cycles, %llu instructions\n",
            (unsigned long long)s->cpu.cycle_count,
            (unsigned long long)s->cpu.insn_count);
     gemu_monitor_stop(s->monitor);
-    rca_display_destroy(display);
+    gemu_display_destroy(display);
 }

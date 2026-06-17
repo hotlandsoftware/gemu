@@ -36,6 +36,10 @@ NesDisplay *nes_display_gtk_create(const char *title,
                                    const NesDeviceType *port_devices);
 #endif
 
+#ifdef HAVE_CACA
+NesDisplay *nes_display_caca_create(void);
+#endif
+
 /* Factory: picks the right backend based on display type.
  * hex_toggle_cb/hex_toggle_ud are passed to the GTK backend for the
  * Debug > Hex Editor menu item (only used when type == GEMU_DISPLAY_GTK). */

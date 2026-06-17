@@ -268,7 +268,11 @@ RcaDisplay *rca_display_create_mono(GemuDisplayType type, const char *title,
 #endif
 #ifndef GEMU_NO_CURSES
     case GEMU_DISPLAY_CURSES:
+#ifdef HAVE_CACA
+        return rca_display_caca_create();
+#else
         return rca_display_curses_create();
+#endif
 #endif
     default:
         return rca_display_none_create();
@@ -294,7 +298,11 @@ RcaDisplay *rca_display_create_indexed(GemuDisplayType type, const char *title,
 #endif
 #ifndef GEMU_NO_CURSES
     case GEMU_DISPLAY_CURSES:
+#ifdef HAVE_CACA
+        return rca_display_caca_create();
+#else
         return rca_display_curses_create();
+#endif
 #endif
     default:
         return rca_display_none_create();

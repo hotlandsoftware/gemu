@@ -3,8 +3,8 @@
 #include "fds.h"
 #include "../cpu/mos6502.h"
 #include "../vga/rp2c02.h"
-#include "../vga/nes_display.h"
 #include "../audio/apu2a03.h"
+#include "gemu/gemu_display.h"
 #ifdef HAVE_ALSA
 #  include "../audio/apu_midi.h"
 #endif
@@ -133,7 +133,7 @@ typedef struct NesState {
     bool           battery_autosave;  /* user opted in to save SRAM on exit */
     char           sav_path[512];     /* ~/.gemu/<game>.sav or AppData equivalent */
 
-    NesDisplay    *display;  /* SDL window (NULL if headless) */
+    GemuDisplay   *display;  /* display+input handle (NULL if headless) */
     GemuVncServer *vnc;
     GemuMonitor   *monitor;
 

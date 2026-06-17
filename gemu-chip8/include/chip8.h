@@ -104,33 +104,6 @@ typedef struct Chip8Config {
     Chip8MachineType machine;
 } Chip8Config;
 
-/* ── Display ──────────────────────────────────────────────────────────────── */
-
-typedef struct Chip8Display {
-    void (*render)(void *ctx, const uint8_t *vram);
-    void (*destroy)(void *ctx);
-    /* run() is set by backends that own their own main loop (GTK, curses).
-     * When non-NULL, machine_run delegates to it entirely. */
-    void (*run)(struct Chip8Display *d, Chip8State *s, const Chip8Config *cfg);
-    void *ctx;
-} Chip8Display;
-
-Chip8Display *chip8_display_sdl_create(int scale);
-Chip8Display *chip8_display_curses_create(void);
-Chip8Display *chip8_display_none_create(void);
-#ifdef GEMU_GTK
-Chip8Display *chip8_display_gtk_create(int scale, GemuMonitor *mon);
-#endif
-
-void chip8_display_render(Chip8Display *d, const uint8_t *vram);
-void chip8_display_destroy(Chip8Display *d);
-
-/* ── Input ────────────────────────────────────────────────────────────────── */
-typedef struct Chip8Input Chip8Input;
-Chip8Input *chip8_input_create(void);
-bool        chip8_input_poll(Chip8Input *inp, uint8_t keys[CHIP8_NUM_KEYS],
-                             bool *quit);
-void        chip8_input_destroy(Chip8Input *inp);
 
 /* ── CPU/machine API ──────────────────────────────────────────────────────── */
 /* cpu.c */

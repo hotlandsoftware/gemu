@@ -4,7 +4,7 @@
 #include "chip8.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
-#include <SDL2/SDL.h>
+#include "gemu/gemu_display.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -109,49 +109,32 @@ void chip8_machine_destroy(Chip8State *s) {
     free(s);
 }
 
+/* ── Hex-keypad action table ─────────────────────────────────────────────── */
+/*
+ * CHIP-8 hex keypad → keyboard:
+ *   Keypad   1 2 3 C     Keyboard   1 2 3 4
+ *            4 5 6 D                Q W E R
+ *            7 8 9 E                A S D F
+ *            A 0 B F                Z X C V
+ */
+static const GemuActionDef chip8_actions[CHIP8_NUM_KEYS] = {
+    { "0", GEMU_ACTION(0),  "x" }, { "1", GEMU_ACTION(1),  "1" },
+    { "2", GEMU_ACTION(2),  "2" }, { "3", GEMU_ACTION(3),  "3" },
+    { "4", GEMU_ACTION(4),  "q" }, { "5", GEMU_ACTION(5),  "w" },
+    { "6", GEMU_ACTION(6),  "e" }, { "7", GEMU_ACTION(7),  "a" },
+    { "8", GEMU_ACTION(8),  "s" }, { "9", GEMU_ACTION(9),  "d" },
+    { "A", GEMU_ACTION(10), "z" }, { "B", GEMU_ACTION(11), "c" },
+    { "C", GEMU_ACTION(12), "4" }, { "D", GEMU_ACTION(13), "r" },
+    { "E", GEMU_ACTION(14), "f" }, { "F", GEMU_ACTION(15), "v" },
+};
+
 /* ── Run loop ─────────────────────────────────────────────────────────────── */
 
 void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
-    Chip8Display *display;
-    switch (cfg->display_type) {
-    case GEMU_DISPLAY_SDL:
-        display = chip8_display_sdl_create(cfg->display_scale);
-        break;
-#ifndef GEMU_NO_CURSES
-    case GEMU_DISPLAY_CURSES:
-        display = chip8_display_curses_create();
-        break;
-#endif
-#ifdef GEMU_GTK
-    case GEMU_DISPLAY_GTK:
-        display = chip8_display_gtk_create(cfg->display_scale, s->monitor);
-        break;
-#endif
-    default:
-        display = chip8_display_none_create();
-        break;
-    }
-
-    if (!display) {
-        fprintf(stderr, "gemu-chip8: failed to create display\n");
-        return;
-    }
-
-    /* Curses takes over the terminal — monitor can't use stdin */
-    bool use_monitor = (cfg->display_type != GEMU_DISPLAY_CURSES);
-    if (use_monitor) gemu_monitor_start(s->monitor);
-
-    /* Backends that own their main loop (GTK, curses) handle everything. */
-    if (display->run) {
-        display->run(display, s, cfg);
-        if (use_monitor) gemu_monitor_stop(s->monitor);
-        chip8_display_destroy(display);
-        return;
-    }
-
-    /* Headless loop — VNC-only or silent bench */
+    /* Headless: no display, VNC-only or silent bench */
     if (cfg->display_type == GEMU_DISPLAY_NONE) {
         const int insns_frame = cfg->cpu_hz / CHIP8_TIMER_HZ;
+        gemu_monitor_start(s->monitor);
         bool running = true;
         while (running) {
             GemuMonCmd cmd;
@@ -202,32 +185,51 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
                (unsigned long long)s->tb_hits,
                (unsigned long long)s->tb_misses);
         gemu_monitor_stop(s->monitor);
-        chip8_display_destroy(display);
         return;
     }
 
-    /* ── SDL2 run loop ── */
-    Chip8Input *input = chip8_input_create();
-    if (!input) {
-        fprintf(stderr, "gemu-chip8: failed to init input\n");
-        chip8_display_destroy(display);
+    /* Display-backed run loop (SDL, GTK, caca) */
+    GemuDisplayGtkExtras gtk_extras = { .monitor = s->monitor };
+    GemuDisplay *display = gemu_display_create(cfg->display_type,
+        &(GemuDisplayConfig){
+            .title       = "gemu-chip8",
+            .fb_width    = CHIP8_DISPLAY_W,
+            .fb_height   = CHIP8_DISPLAY_H,
+            .scale       = cfg->display_scale,
+            .renderer    = GEMU_RENDERER_AUTO,
+            .actions     = chip8_actions,
+            .n_actions   = CHIP8_NUM_KEYS,
+            .ini_section = "chip8-keypad",
+            .gtk         = &gtk_extras,
+        });
+    if (!display) {
+        fprintf(stderr, "gemu-chip8: failed to create display\n");
         return;
     }
+    gemu_monitor_start(s->monitor);
 
-    const int    insns_frame = cfg->cpu_hz / CHIP8_TIMER_HZ;
-    const Uint32 frame_ms    = 1000 / CHIP8_TIMER_HZ;
-    bool         quit        = false;
+    const int insns_frame = cfg->cpu_hz / CHIP8_TIMER_HZ;
+    uint32_t  argb[CHIP8_DISPLAY_W * CHIP8_DISPLAY_H];
 
-    while (!quit) {
-        Uint32 frame_start = SDL_GetTicks();
+    while (true) {
+        /* Input */
+        uint32_t held = gemu_display_poll(display);
+        if (gemu_display_should_quit(display)) break;
+        if (gemu_display_reset_requested(display)) {
+            chip8_machine_reset(s, cfg);
+            gemu_display_clear_flags(display);
+        }
 
+        /* Update key arrays for CPU (SKP/SKNP instructions) */
         memcpy(s->keys_prev, s->keys, CHIP8_NUM_KEYS);
-        chip8_input_poll(input, s->keys, &quit);
-        if (quit) break;
+        for (int k = 0; k < CHIP8_NUM_KEYS; k++)
+            s->keys[k] = (held >> k) & 1;
 
+        /* Monitor commands */
+        bool quit = false;
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-            if      (cmd == GEMU_MON_QUIT)  quit = true;
+            if      (cmd == GEMU_MON_QUIT)  { quit = true; break; }
             else if (cmd == GEMU_MON_RESET) chip8_machine_reset(s, cfg);
             else if (cmd == GEMU_MON_STEP) {
                 uint32_t n = gemu_monitor_step_count(s->monitor);
@@ -237,27 +239,24 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
         if (quit) break;
 
         if (gemu_monitor_is_paused(s->monitor)) {
-            Uint32 e = SDL_GetTicks() - frame_start;
-            if (e < frame_ms) SDL_Delay(frame_ms - e);
+            chip8_sleep_frame();
             continue;
         }
 
+        /* Wait for keypress (LD Vx, K) */
         if (s->wait_key) {
-            for (int k = 0; k < CHIP8_NUM_KEYS; k++) {
-                if (s->keys[k] && !s->keys_prev[k]) {
-                    s->V[s->wait_reg] = (uint8_t)k;
-                    s->wait_key = false;
-                    s->PC += 2;
-                    break;
-                }
-            }
-            if (s->wait_key) {
-                Uint32 e = SDL_GetTicks() - frame_start;
-                if (e < frame_ms) SDL_Delay(frame_ms - e);
+            uint32_t pressed = gemu_display_last_pressed(display);
+            if (pressed) {
+                s->V[s->wait_reg] = (uint8_t)__builtin_ctz(pressed);
+                s->wait_key = false;
+                s->PC += 2;
+            } else {
+                chip8_sleep_frame();
                 continue;
             }
         }
 
+        /* Execute */
         int budget = insns_frame;
         while (budget > 0 && !s->wait_key) {
             GemuTb *tb = gemu_tb_lookup(&s->tb_cache, s->PC);
@@ -270,22 +269,22 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
         if (s->delay > 0) s->delay--;
         if (s->sound > 0) s->sound--;
 
+        /* Render */
         if (s->draw_flag) {
-            chip8_display_render(display, s->vram);
+            for (int i = 0; i < CHIP8_DISPLAY_W * CHIP8_DISPLAY_H; i++)
+                argb[i] = s->vram[i] ? 0xFFFFFFFFu : 0xFF000000u;
+            gemu_display_render(display, argb, CHIP8_DISPLAY_W, CHIP8_DISPLAY_H);
             gemu_vnc_update(s->vnc, s->vram, CHIP8_DISPLAY_W, CHIP8_DISPLAY_H);
             s->draw_flag = false;
         }
 
-        Uint32 e = SDL_GetTicks() - frame_start;
-        if (e < frame_ms) SDL_Delay(frame_ms - e);
+        chip8_sleep_frame();
     }
 
     printf("gemu-chip8: %llu instructions executed, %llu TB hits, %llu misses\n",
            (unsigned long long)s->insn_count,
            (unsigned long long)s->tb_hits,
            (unsigned long long)s->tb_misses);
-
     gemu_monitor_stop(s->monitor);
-    chip8_input_destroy(input);
-    chip8_display_destroy(display);
+    gemu_display_destroy(display);
 }

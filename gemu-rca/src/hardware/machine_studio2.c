@@ -1,12 +1,26 @@
+#ifndef _WIN32
+#  define _POSIX_C_SOURCE 199309L
+#endif
 #include "studio2.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
-#include "vga/rca_display.h"
-#include <SDL2/SDL.h>
+#include "gemu/gemu_display.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+static inline void studio2_sleep_ms(unsigned ms) { Sleep(ms); }
+#else
+#  include <time.h>
+static inline void studio2_sleep_ms(unsigned ms) {
+    struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+#endif
 
 #define STUDIO2_FRAME_HZ       60u
 
@@ -319,48 +333,49 @@ void rca_studio2_destroy(RcaStudio2State *s) {
     free(s);
 }
 
-/* ── Input ───────────────────────────────────────────────────────────────── */
+/* ── Action table ────────────────────────────────────────────────────────── */
 
-/* Player A: LALT/Q/W/E/A/S/D/Z/X/C -> keys 0-9 */
-static const uint32_t keys_a_map[10] = {
-    RCA_KEY_LALT, 'q', 'w', 'e',
-    'a',          's', 'd',
-    'z',          'x', 'c',
+/* X11 keysyms used by VNC for Studio II keys (separate from display input) */
+static const uint32_t vnc_keys_a[10] = {
+    0xffe9, /* Alt_L  */ 'q', 'w', 'e', 'a', 's', 'd', 'z', 'x', 'c',
+};
+static const uint32_t vnc_keys_b[10] = {
+    0xffb0, /* KP_0 */ 0xffb7, 0xffb8, 0xffb9,   /* 7 8 9 */
+    0xffb4, 0xffb5, 0xffb6,                         /* 4 5 6 */
+    0xffb1, 0xffb2, 0xffb3,                         /* 1 2 3 */
 };
 
-/* Player B: numpad 0,7,8,9,4,5,6,1,2,3 -> keys 0-9 */
-static const uint32_t keys_b_map[10] = {
-    RCA_KEY_KP_0, RCA_KEY_KP_7, RCA_KEY_KP_8, RCA_KEY_KP_9,
-    RCA_KEY_KP_4, RCA_KEY_KP_5, RCA_KEY_KP_6,
-    RCA_KEY_KP_1, RCA_KEY_KP_2, RCA_KEY_KP_3,
+/* Bits 0-9: P1 keys 0-9 | Bits 10-19: P2 keys 0-9 | Bit 20: RESET */
+static const GemuActionDef studio2_actions[] = {
+    { "P1_0",  GEMU_ACTION(0),  "Left Alt" },
+    { "P1_1",  GEMU_ACTION(1),  "q"        },
+    { "P1_2",  GEMU_ACTION(2),  "w"        },
+    { "P1_3",  GEMU_ACTION(3),  "e"        },
+    { "P1_4",  GEMU_ACTION(4),  "a"        },
+    { "P1_5",  GEMU_ACTION(5),  "s"        },
+    { "P1_6",  GEMU_ACTION(6),  "d"        },
+    { "P1_7",  GEMU_ACTION(7),  "z"        },
+    { "P1_8",  GEMU_ACTION(8),  "x"        },
+    { "P1_9",  GEMU_ACTION(9),  "c"        },
+    { "P2_0",  GEMU_ACTION(10), "Keypad 0" },
+    { "P2_1",  GEMU_ACTION(11), "Keypad 7" },
+    { "P2_2",  GEMU_ACTION(12), "Keypad 8" },
+    { "P2_3",  GEMU_ACTION(13), "Keypad 9" },
+    { "P2_4",  GEMU_ACTION(14), "Keypad 4" },
+    { "P2_5",  GEMU_ACTION(15), "Keypad 5" },
+    { "P2_6",  GEMU_ACTION(16), "Keypad 6" },
+    { "P2_7",  GEMU_ACTION(17), "Keypad 1" },
+    { "P2_8",  GEMU_ACTION(18), "Keypad 2" },
+    { "P2_9",  GEMU_ACTION(19), "Keypad 3" },
+    { "RESET", GEMU_ACTION(20), "F3"       },
 };
+#define STUDIO2_N_ACTIONS ((int)(sizeof(studio2_actions)/sizeof(studio2_actions[0])))
 
 static void studio2_update_ef(RcaStudio2State *s) {
     uint8_t latch = s->keylatch;
     /* EF pins are active-low: TRUE = not pressed, FALSE = pressed */
     s->cpu.EF[2] = !(latch < 10 && s->keys_a[latch]); /* EF3 = Player A */
     s->cpu.EF[3] = !(latch < 10 && s->keys_b[latch]); /* EF4 = Player B */
-}
-
-static void studio2_poll_display(RcaStudio2State *s, RcaDisplay *display,
-                                 bool *quit, bool *reset) {
-    rca_display_poll(display);
-    if (rca_display_should_quit(display)) {
-        *quit = true;
-        return;
-    }
-    if (rca_display_menu_reset_requested(display)) {
-        rca_display_menu_clear_reset(display);
-        *reset = true;
-        return;
-    }
-
-    for (int i = 0; i < 10; i++) {
-        s->keys_a[i] = rca_display_key_down(display, keys_a_map[i]);
-        s->keys_b[i] = rca_display_key_down(display, keys_b_map[i]);
-    }
-    if (rca_display_key_down(display, RCA_KEY_F3))
-        *reset = true;
 }
 
 /* ── Main loop ───────────────────────────────────────────────────────────── */
@@ -372,60 +387,62 @@ static void studio2_poll_vnc(RcaStudio2State *s) {
         bool down = ev.down;
         uint32_t k = ev.keysym;
         for (int i = 0; i < 10; i++) {
-            if (k == keys_a_map[i]) { s->keys_a[i] = down; break; }
-            if (k == keys_b_map[i]) { s->keys_b[i] = down; break; }
+            if (k == vnc_keys_a[i]) { s->keys_a[i] = down; break; }
+            if (k == vnc_keys_b[i]) { s->keys_b[i] = down; break; }
         }
     }
 }
 
 void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
-    bool is_curses = (cfg->display_type == GEMU_DISPLAY_CURSES);
-
-    RcaDisplay *display = rca_display_create_mono(cfg->display_type, "GEMU",
-                                                  STUDIO2_DISPLAY_W,
-                                                  STUDIO2_DISPLAY_H,
-                                                  cfg->display_scale,
-                                                  0xFFFFFFFFu,
-                                                  0xFF000000u,
-                                                  s->monitor,
-                                                  cfg->keyboard);
+    GemuDisplay *display = gemu_display_create(cfg->display_type,
+        &(GemuDisplayConfig){
+            .title       = "GEMU — Studio II",
+            .fb_width    = STUDIO2_DISPLAY_W,
+            .fb_height   = STUDIO2_DISPLAY_H,
+            .scale       = cfg->display_scale,
+            .renderer    = GEMU_RENDERER_AUTO,
+            .actions     = studio2_actions,
+            .n_actions   = STUDIO2_N_ACTIONS,
+            .ini_section = "studio2",
+            .gtk         = &(GemuDisplayGtkExtras){ .monitor = s->monitor },
+        });
     if (!display) {
         fprintf(stderr, "studio2: failed to create display\n");
         return;
     }
-
-    if (!is_curses)
-        gemu_monitor_start(s->monitor);
+    gemu_monitor_start(s->monitor);
 
     const unsigned mcycles_per_frame = s->vdc.lines_total * CDP1861_MCYCLES_PER_LINE;
-    const Uint32   frame_ms = (s->vdc.lines_total == CDP1861_PAL_LINES_TOTAL) ? 20u : 16u;
+    const unsigned frame_ms = (s->vdc.lines_total == CDP1861_PAL_LINES_TOTAL) ? 20u : 16u;
+    uint32_t argb[STUDIO2_DISPLAY_W * STUDIO2_DISPLAY_H];
     bool quit = false;
 
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
         bool reset = false;
 
-#ifdef GEMU_NO_CURSES
-        studio2_poll_display(s, display, &quit, &reset);
-#else
-        if (is_curses) rca_display_curses_poll_studio2(display, s, &quit, &reset);
-        else           studio2_poll_display(s, display, &quit, &reset);
-#endif
+        /* Input */
+        uint32_t held = gemu_display_poll(display);
+        if (gemu_display_should_quit(display)) break;
+        if (gemu_display_reset_requested(display)) {
+            gemu_display_clear_flags(display);
+            reset = true;
+        }
+        if (held & GEMU_ACTION(20)) reset = true; /* F3 = RESET */
+
+        for (int i = 0; i < 10; i++) {
+            s->keys_a[i] = (held >> i) & 1;
+            s->keys_b[i] = (held >> (i + 10)) & 1;
+        }
         studio2_poll_vnc(s);
         studio2_update_ef(s);
 
         /* Monitor commands */
-        if (!is_curses) {
-            GemuMonCmd cmd = gemu_monitor_poll(s->monitor);
-            if (cmd == GEMU_MON_QUIT)  { quit = true; continue; }
-            if (cmd == GEMU_MON_RESET) reset = true;
-            if (cmd == GEMU_MON_CUSTOM)
-                gemu_monitor_unknown_command(s->monitor);
-        }
-        if (reset) {
-            rca_studio2_reset(s, cfg);
-            continue;
-        }
+        GemuMonCmd cmd = gemu_monitor_poll(s->monitor);
+        if (cmd == GEMU_MON_QUIT)   { quit = true; continue; }
+        if (cmd == GEMU_MON_RESET)  reset = true;
+        if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
+
+        if (reset) { rca_studio2_reset(s, cfg); continue; }
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             for (unsigned i = 0; i < mcycles_per_frame; i++) {
@@ -437,28 +454,23 @@ void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
         /* Render */
         if (s->draw_flag) {
             s->draw_flag = false;
-            rca_display_render(display, s->vram,
-                               STUDIO2_DISPLAY_W, STUDIO2_DISPLAY_H);
+            for (int i = 0; i < STUDIO2_DISPLAY_W * STUDIO2_DISPLAY_H; i++)
+                argb[i] = s->vram[i] ? 0xFFFFFFFFu : 0xFF000000u;
+            gemu_display_render(display, argb, STUDIO2_DISPLAY_W, STUDIO2_DISPLAY_H);
             if (s->vnc) {
                 static uint8_t px[STUDIO2_DISPLAY_W * STUDIO2_DISPLAY_H];
                 for (int i = 0; i < STUDIO2_DISPLAY_W * STUDIO2_DISPLAY_H; i++)
                     px[i] = s->vram[i] ? 1u : 0u;
-                gemu_vnc_update(s->vnc, px,
-                                STUDIO2_DISPLAY_W, STUDIO2_DISPLAY_H);
+                gemu_vnc_update(s->vnc, px, STUDIO2_DISPLAY_W, STUDIO2_DISPLAY_H);
             }
         }
 
-        if (!is_curses) {
-            Uint32 elapsed = SDL_GetTicks() - t0;
-            if (elapsed < frame_ms)
-                SDL_Delay(frame_ms - elapsed);
-        }
+        studio2_sleep_ms(frame_ms);
     }
 
     printf("gemu-rca: %llu machine cycles, %llu instructions\n",
            (unsigned long long)s->cpu.cycle_count,
            (unsigned long long)s->cpu.insn_count);
-    if (!is_curses)
-        gemu_monitor_stop(s->monitor);
-    rca_display_destroy(display);
+    gemu_monitor_stop(s->monitor);
+    gemu_display_destroy(display);
 }

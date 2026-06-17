@@ -2,10 +2,13 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Button names and default key bindings live in display_sdl.c
- * (keeps SDL-specific data out of the general device list). */
-extern const char      *nes_ctrl_names[];
-extern const SDL_Keycode nes_ctrl_defaults[];
+static const char *nes_ctrl_names[] = {
+    "A", "B", "Select", "Start", "Up", "Down", "Left", "Right",
+};
+static const SDL_Keycode nes_ctrl_defaults[] = {
+    SDLK_z, SDLK_x, SDLK_RSHIFT, SDLK_RETURN,
+    SDLK_UP, SDLK_DOWN, SDLK_LEFT, SDLK_RIGHT,
+};
 
 static const NesDeviceDesc devices[] = {
     {

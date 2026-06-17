@@ -6,7 +6,7 @@
 #include "gemu/monitor.h"
 #include "gemu/vnc.h"
 #include "devices/pcspk.h"
-#include "vga/rca_display.h"
+#include "gemu/gemu_display.h"
 
 #define DESTRYER_MEM_SIZE 65536u
 

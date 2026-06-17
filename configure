@@ -29,25 +29,29 @@ import sys, os, argparse, subprocess, shutil
 TARGETS = {
     'chip8': {
         'binary': 'gemu-chip8',
-        'includes': ['core/include', 'gemu-chip8/include'],
+        'includes': ['core/include', 'gemu-chip8/include', 'gemu-mos/src/vga'],
         'core_src': [
             'core/src/memory.c', 'core/src/tcg.c', 'core/src/monitor.c',
             'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/args.c',
             'core/src/sha256.c', 'core/src/screendump.c',
+            'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
         ],
         'src': [
             'gemu-chip8/src/main.c',
             'gemu-chip8/src/cpu/chip8_cpu.c',
             'gemu-chip8/src/hardware/machine.c',
-            'gemu-chip8/src/vga/display_sdl.c',
-            'gemu-chip8/src/vga/input_sdl.c',
+            'gemu-mos/src/vga/input_menu.c',
         ],
-        'src_curses': ['gemu-chip8/src/vga/display_curses.c'],
-        'src_gtk':    ['gemu-chip8/src/vga/ui_gtk.c', 'core/src/gtk_menu.c'],
+        'src_curses': [],
+        'src_caca':   ['core/src/gemu_display_caca.c'],
+        'src_gtk': [
+            'core/src/gemu_display_gtk.c',
+            'core/src/gtk_menu.c', 'core/src/video_gtk.c',
+        ],
         'defines_gtk':   ['GEMU_GTK'],
         'defines_win':   ['GEMU_NO_CURSES'],
         'ldflags_win':   ['-lws2_32', '-mconsole'],
-        'has_curses': True,
+        'has_curses': False,
     },
     'rca': {
         'binary': 'gemu-rca',
@@ -61,12 +65,13 @@ TARGETS = {
             'core/src/memory.c', 'core/src/args.c', 'core/src/monitor.c',
             'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/sha256.c',
             'core/src/screendump.c',
+            'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
         ],
         'src': [
             'gemu-rca/src/main.c',
             'gemu-rca/src/cpu/cdp1802.c',
             'gemu-rca/src/vga/cdp1861.c', 'gemu-rca/src/vga/cdp1869.c',
-            'gemu-rca/src/vga/display_sdl.c',
+            'gemu-rca/src/vga/display_sdl.c',   # legacy: still used by Pecom 32
             'gemu-rca/src/devices/vip_devices.c', 'gemu-rca/src/devices/pcspk.c',
             'gemu-rca/src/devices/tape.c',
             'gemu-rca/src/hardware/machine_vip.c',
@@ -74,11 +79,13 @@ TARGETS = {
             'gemu-rca/src/hardware/machine_studio2.c',
             'gemu-rca/src/hardware/machine_pecom.c',
             'gemu-rca/src/hardware/romdb.c',
-            'gemu-mos/src/vga/input_menu.c',  # shared input menu
+            'gemu-mos/src/vga/input_menu.c',
         ],
-        'src_curses': ['gemu-rca/src/vga/display_curses.c'],
+        'src_curses': ['gemu-rca/src/vga/display_curses.c'],  # legacy: Pecom curses path
+        'src_caca':   ['gemu-rca/src/vga/display_caca.c', 'core/src/gemu_display_caca.c'],
         'src_gtk': [
-            'gemu-rca/src/vga/display_gtk.c',
+            'gemu-rca/src/vga/display_gtk.c',   # legacy: Pecom GTK path
+            'core/src/gemu_display_gtk.c',
             'core/src/gtk_menu.c', 'core/src/video_gtk.c',
         ],
         'defines_gtk':   ['GEMU_GTK'],
@@ -97,11 +104,12 @@ TARGETS = {
             'core/src/memory.c', 'core/src/args.c', 'core/src/monitor.c',
             'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/sha256.c',
             'core/src/screendump.c',
+            'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
         ],
         'src': [
             'gemu-mos/src/main.c',
             'gemu-mos/src/cpu/mos6502.c',
-            'gemu-mos/src/vga/rp2c02.c', 'gemu-mos/src/vga/display_sdl.c',
+            'gemu-mos/src/vga/rp2c02.c',
             'gemu-mos/src/audio/apu2a03.c',
             'gemu-mos/src/hardware/machine_generic.c',
             'gemu-mos/src/hardware/machine_nes.c',
@@ -112,8 +120,9 @@ TARGETS = {
             'gemu-mos/src/vga/input_menu.c',
         ],
         'src_curses': [],
+        'src_caca':   ['core/src/gemu_display_caca.c'],
         'src_gtk': [
-            'gemu-mos/src/vga/display_gtk.c',
+            'core/src/gemu_display_gtk.c',
             'gemu-mos/src/vga/hex_editor.c',
             'core/src/gtk_menu.c', 'core/src/video_gtk.c',
         ],
@@ -235,10 +244,22 @@ def main():
             alsa_cflags = cf or []
             alsa_libs   = lf + ['-lm']
 
-    # ncursesw (Linux/macOS only, optional)
+    # libcaca (optional — enhanced terminal renderer; replaces ncurses when present)
+    have_caca   = False
+    caca_cflags = []
+    caca_libs   = []
+    if not on_windows:
+        cf = pkg('caca', '--cflags', *pkg_flags)
+        lf = pkg('caca', '--libs',   *pkg_flags)
+        if check('libcaca', lf):
+            have_caca   = True
+            caca_cflags = cf or []
+            caca_libs   = lf
+
+    # ncursesw (Linux/macOS only, optional — used when libcaca is not available)
     have_curses  = False
     curses_flags = []
-    if not on_windows:
+    if not on_windows and not have_caca:
         cf = pkg('ncursesw', '--cflags', *pkg_flags)
         lf = pkg('ncursesw', '--libs',   *pkg_flags)
         if check('ncursesw', lf):
@@ -312,11 +333,15 @@ def main():
             defs += ' ' + ' '.join(f'-D{d}' for d in td['defines_win'])
         if tname == 'mos' and have_alsa:
             defs += ' -DHAVE_ALSA'
+        if have_caca:
+            defs += ' -DHAVE_CACA'
         cflags = f'$CFLAGS_BASE {inc} {" ".join(sdl2_cflags)}'  \
                  f'{" " if want_gtk and gtk_cflags else ""}'  \
                  f'{" ".join(gtk_cflags) if want_gtk and gtk_cflags else ""}'  \
                  f'{" " if want_gtk and epoxy_cflags else ""}'  \
                  f'{" ".join(epoxy_cflags) if want_gtk and epoxy_cflags else ""}'  \
+                 f'{" " if have_caca and caca_cflags else ""}'  \
+                 f'{" ".join(caca_cflags) if have_caca and caca_cflags else ""}'  \
                  f'{defs}'.strip()
 
         # Per-target LDFLAGS
@@ -324,7 +349,9 @@ def main():
         if want_gtk:
             ld_parts += gtk_libs
             ld_parts += epoxy_libs
-        if have_curses and td['has_curses']:
+        if have_caca:
+            ld_parts += caca_libs
+        elif have_curses and td['has_curses']:
             ld_parts += curses_flags
         if tname == 'mos' and have_alsa:
             ld_parts += alsa_libs
@@ -334,7 +361,9 @@ def main():
 
         # Collect sources
         srcs = list(td['core_src']) + list(td['src'])
-        if have_curses and td['has_curses'] and td['src_curses']:
+        if have_caca and td.get('src_caca'):
+            srcs += td['src_caca']
+        elif have_curses and td['has_curses'] and td['src_curses']:
             srcs += td['src_curses']
         if want_gtk and td['src_gtk']:
             srcs += td['src_gtk']
@@ -373,7 +402,8 @@ def main():
     print(f'  targets   : {", ".join(targets)}')
     print(f'  SDL2      : {"yes" if args.sdl else "no"}')
     print(f'  GTK 3     : {"yes" if want_gtk else "no"}')
-    print(f'  ncursesw  : {"yes" if have_curses else "no"}')
+    print(f'  libcaca   : {"yes (enhanced terminal)" if have_caca else "no"}')
+    print(f'  ncursesw  : {"yes" if have_curses else ("n/a (libcaca used)" if have_caca else "no")}')
     if 'mos' in targets:
         print(f'  ALSA MIDI : {"yes" if have_alsa else "no (MIDI output disabled)"}')
     print(f'  debug     : {"yes (-O0 -g)" if args.debug else "no (-O2)"}')

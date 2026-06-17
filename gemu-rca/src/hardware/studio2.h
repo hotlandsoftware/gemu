@@ -2,7 +2,6 @@
 #include "cdp1802.h"
 #include "cdp1861.h"
 #include "rca.h"
-#include "vga/rca_display.h"
 #include "devices/pcspk.h"
 #include "gemu/monitor.h"
 #include "gemu/vnc.h"
@@ -47,8 +46,3 @@ RcaStudio2State *rca_studio2_create(const RcaConfig *cfg);
 void             rca_studio2_reset(RcaStudio2State *s, const RcaConfig *cfg);
 void             rca_studio2_destroy(RcaStudio2State *s);
 void             rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg);
-
-#ifndef GEMU_NO_CURSES
-void rca_display_curses_poll_studio2(RcaDisplay *d, RcaStudio2State *s,
-                                     bool *quit, bool *reset);
-#endif

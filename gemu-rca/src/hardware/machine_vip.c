@@ -1,14 +1,28 @@
+#ifndef _WIN32
+#  define _POSIX_C_SOURCE 199309L
+#endif
 #include "vip.h"
 #include "devices/vip_devices.h"
 #include "gemu/gemu.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
-#include <SDL2/SDL.h>
+#include "gemu/gemu_display.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <signal.h>
 #include <time.h>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+static inline void vip_sleep_ms(unsigned ms) { Sleep(ms); }
+#else
+static inline void vip_sleep_ms(unsigned ms) {
+    struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+#endif
 
 static RcaVipState *crash_state;
 
@@ -322,37 +336,55 @@ static void vip_media_status_tape(void *ud, char *buf, size_t buf_len) {
         snprintf(buf, buf_len, "empty");
 }
 
+/* ── VIP action table ────────────────────────────────────────────────────── */
+/*
+ * Bits 0-15: hex keypad keys 0-F
+ * Bit 16: EF2 (active-high; mapped to Tab)
+ * Default key layout matches CHIP-8 convention.
+ */
+static const GemuActionDef vip_actions[] = {
+    { "0",   GEMU_ACTION(0),  "x"   }, { "1",   GEMU_ACTION(1),  "1"   },
+    { "2",   GEMU_ACTION(2),  "2"   }, { "3",   GEMU_ACTION(3),  "3"   },
+    { "4",   GEMU_ACTION(4),  "q"   }, { "5",   GEMU_ACTION(5),  "w"   },
+    { "6",   GEMU_ACTION(6),  "e"   }, { "7",   GEMU_ACTION(7),  "a"   },
+    { "8",   GEMU_ACTION(8),  "s"   }, { "9",   GEMU_ACTION(9),  "d"   },
+    { "A",   GEMU_ACTION(10), "z"   }, { "B",   GEMU_ACTION(11), "c"   },
+    { "C",   GEMU_ACTION(12), "4"   }, { "D",   GEMU_ACTION(13), "r"   },
+    { "E",   GEMU_ACTION(14), "f"   }, { "F",   GEMU_ACTION(15), "v"   },
+    { "EF2", GEMU_ACTION(16), "Tab" },
+};
+#define VIP_N_ACTIONS ((int)(sizeof(vip_actions)/sizeof(vip_actions[0])))
+
 static void vip_poll_display(RcaVipState *s, const RcaConfig *cfg,
-                             RcaDisplay *display, bool *quit) {
-    rca_display_poll(display);
-    if (rca_display_should_quit(display)) {
+                             GemuDisplay *display, bool *quit) {
+    uint32_t held = gemu_display_poll(display);
+    if (gemu_display_should_quit(display)) {
         *quit = true;
         return;
     }
+    if (gemu_display_reset_requested(display)) {
+        gemu_display_clear_flags(display);
+        rca_vip_reset(s, cfg);
+    }
 
-    s->ef2_down = rca_display_key_down(display, RCA_KEY_TAB);
+    s->ef2_down = (held >> 16) & 1;
 
-    uint32_t keysym = rca_display_pop_keysym(display);
-    if (keysym && rca_vip_has_vp601(cfg)) {
-        int ascii = (int)keysym;
-        if (ascii >= 'a' && ascii <= 'z')
-            ascii -= 32;
-        if ((ascii >= 0x20 && ascii <= 0x7e) ||
-            ascii == '\r' || ascii == '\n' ||
-            ascii == '\b' || ascii == 0x7f) {
-            if (ascii == '\n') ascii = '\r';
-            if (ascii == 0x7f) ascii = '\b';
-            s->ascii_key = ascii;
+    /* VP-601 ASCII keyboard: drain raw key queue */
+    if (rca_vip_has_vp601(cfg)) {
+        uint32_t raw;
+        while ((raw = gemu_display_pop_raw_key(display)) != 0) {
+            int ascii = (int)raw;
+            if (ascii >= 'a' && ascii <= 'z') ascii -= 32;  /* uppercase */
+            if (ascii == 0x7f) ascii = '\b';                /* Del → BS  */
+            if ((ascii >= 0x20 && ascii <= 0x7e) ||
+                ascii == '\r' || ascii == '\b')
+                s->ascii_key = ascii;
         }
     }
 
     if (rca_vip_has_keypad(cfg)) {
-        static const uint32_t key_map[16] = {
-            'x', '1', '2', '3', 'q', 'w', 'e', 'a',
-            's', 'd', 'z', 'c', '4', 'r', 'f', 'v',
-        };
         for (int k = 0; k < 16; k++)
-            s->keys[k] = rca_display_key_down(display, key_map[k]);
+            s->keys[k] = (held >> k) & 1;
     }
 }
 
@@ -487,94 +519,71 @@ void rca_vip_destroy(RcaVipState *s) {
     free(s);
 }
 
-/* ── SDL run loop ─────────────────────────────────────────────────────────── */
+/* ── Run loop ─────────────────────────────────────────────────────────────── */
 
 void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
     vip_install_crash_handlers(s);
 
-    RcaDisplay *display;
-    if (cfg->vga == RCA_VGA_CDP1869)
-        display = rca_display_create_indexed(cfg->display_type, "GEMU",
-                                             CDP1869_VISIBLE_W,
-                                             CDP1869_VISIBLE_H,
-                                             cfg->display_scale,
-                                             vip_vis_palette, 8,
-                                             s->monitor,
-                                             cfg->keyboard);
-    else if (cfg->vga == RCA_VGA_NONE)
-        display = rca_display_none_create();
-    else
-        display = rca_display_create_mono(cfg->display_type, "GEMU",
-                                          CDP1861_DISPLAY_W,
-                                          CDP1861_DISPLAY_H,
-                                          cfg->display_scale,
-                                          0xFFFFFFFFu, 0xFF100080u,
-                                          s->monitor,
-                                          cfg->keyboard);
+    int fw = CDP1861_DISPLAY_W, fh = CDP1861_DISPLAY_H;
+    if (cfg->vga == RCA_VGA_CDP1869) { fw = CDP1869_VISIBLE_W; fh = CDP1869_VISIBLE_H; }
 
-    if (!display) {
-        fprintf(stderr, "gemu-rca: failed to create display\n");
-        return;
+    GemuDisplay *display = NULL;
+    if (cfg->vga != RCA_VGA_NONE) {
+        display = gemu_display_create(cfg->display_type,
+            &(GemuDisplayConfig){
+                .title       = "GEMU — RCA VIP",
+                .fb_width    = fw,
+                .fb_height   = fh,
+                .scale       = cfg->display_scale,
+                .renderer    = GEMU_RENDERER_AUTO,
+                .actions     = vip_actions,
+                .n_actions   = VIP_N_ACTIONS,
+                .ini_section = "rca-vip",
+                .gtk         = &(GemuDisplayGtkExtras){ .monitor = s->monitor },
+            });
+        if (!display) {
+            fprintf(stderr, "gemu-rca: failed to create display\n");
+            return;
+        }
     }
+    gemu_monitor_start(s->monitor);
 
-    /* backends that own their own loop */
-    if (display->run) {
-        display->run(display, s, cfg);
-        rca_display_destroy(display);
-        return;
-    }
-
-    /* SDL2 run loop — PAL (CDP1869) runs at 50 Hz / 4368 mcycles; NTSC at 60 Hz / 3668 */
     const bool is_pal = (cfg->vga == RCA_VGA_CDP1869);
-    const Uint32 frame_ms = is_pal ? 20u : 16u;
+    const unsigned frame_ms = is_pal ? 20u : 16u;
     const int mcycles_per_frame = is_pal ? CDP1869_MCYCLES_PER_FRAME
                                          : CDP1861_MCYCLES_PER_FRAME;
-    if (cfg->display_type != GEMU_DISPLAY_CURSES)
-        gemu_monitor_start(s->monitor);
-    if (cfg->display_type == GEMU_DISPLAY_SDL && rca_vip_has_vp601(cfg))
-        SDL_StartTextInput();
-
+    uint32_t argb[CDP1869_VISIBLE_W * CDP1869_VISIBLE_H]; /* large enough for both VGAs */
     bool quit = false;
+
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
-
         /* ── Input ── */
-#ifdef GEMU_NO_CURSES
-        vip_poll_display(s, cfg, display, &quit);
-#else
-        if (cfg->display_type == GEMU_DISPLAY_CURSES)
-            rca_display_curses_poll_vip(display, s, &quit);
-        else
+        if (display) {
             vip_poll_display(s, cfg, display, &quit);
-#endif
-        if (quit) break;
-
-        /* SDL input menu reset */
-        if (rca_display_menu_reset_requested(display)) {
-            rca_display_menu_clear_reset(display);
-            rca_vip_reset(s, cfg);
+            if (quit) break;
         }
 
-        /* Sync any held key to key_down */
+        /* VNC key input */
         uint8_t vnc_keys[16];
         gemu_vnc_get_keys(s->vnc, vnc_keys);
         int vnc_ascii = rca_vp601_vnc_keysym_to_ascii(gemu_vnc_pop_keysym(s->vnc));
         if (vnc_ascii >= 0 && rca_vip_has_vp601(cfg))
             s->ascii_key = vnc_ascii;
 
+        /* Resolve key_down (highest priority key index held) */
         s->key_down = -1;
         if (rca_vip_has_keypad(cfg)) {
             for (int k = 0; k < 16; k++)
                 if (s->keys[k] || vnc_keys[k]) { s->key_down = k; break; }
         }
 
-        /* EF4 is active-low for both VIP hex keypad and VP601 data-ready. */
+        /* EF4 is active-low for both VIP hex keypad and VP601 data-ready */
         s->cpu.EF[3] = !vip_ascii_pending(s) &&
                        (!rca_vip_has_keypad(cfg) || s->key_down < 0);
 
+        /* Monitor */
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-            if      (cmd == GEMU_MON_QUIT)  quit = true;
+            if      (cmd == GEMU_MON_QUIT)  { quit = true; break; }
             else if (cmd == GEMU_MON_RESET) rca_vip_reset(s, cfg);
             else if (cmd == GEMU_MON_STEP) {
                 uint32_t n = gemu_monitor_step_count(s->monitor);
@@ -585,16 +594,11 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
         }
         if (quit) break;
 
-        if (gemu_monitor_is_paused(s->monitor)) {
-            Uint32 elapsed = SDL_GetTicks() - t0;
-            if (elapsed < frame_ms) SDL_Delay(frame_ms - elapsed);
-            continue;
-        }
+        if (gemu_monitor_is_paused(s->monitor)) { vip_sleep_ms(frame_ms); continue; }
 
         /* ── Execute one frame worth of machine cycles ── */
         for (int i = 0; i < mcycles_per_frame; i++) {
             s->cpu.EF[1] = !s->ef2_down;
-            /* EF3: cassette when tape is playing, VP601 data-ready otherwise */
             if (s->tape.playing)
                 s->cpu.EF[2] = (bool)vip_tape_ef3(&s->tape, s->cpu.cycle_count);
             else
@@ -605,29 +609,29 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
         }
 
         /* ── Render ── */
-        if (cfg->vga == RCA_VGA_CDP1869) {
-            cdp1869_render(&s->vis);
-            rca_display_render(display, s->vis.bitmap,
-                               CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
-            gemu_vnc_update(s->vnc, s->vis.bitmap,
-                            CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
-        } else if (s->draw_flag && cfg->vga == RCA_VGA_CDP1861) {
-            rca_display_render(display, s->vram, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
-            gemu_vnc_update(s->vnc, s->vram, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
-            s->draw_flag = false;
+        if (display) {
+            if (cfg->vga == RCA_VGA_CDP1869) {
+                cdp1869_render(&s->vis);
+                for (int i = 0; i < CDP1869_VISIBLE_W * CDP1869_VISIBLE_H; i++)
+                    argb[i] = vip_vis_palette[s->vis.bitmap[i] & 7];
+                gemu_display_render(display, argb, CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
+                gemu_vnc_update(s->vnc, s->vis.bitmap,
+                                CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
+            } else if (s->draw_flag) {
+                for (int i = 0; i < CDP1861_DISPLAY_W * CDP1861_DISPLAY_H; i++)
+                    argb[i] = s->vram[i] ? 0xFFFFFFFFu : 0xFF100080u;
+                gemu_display_render(display, argb, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
+                gemu_vnc_update(s->vnc, s->vram, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
+                s->draw_flag = false;
+            }
         }
 
-        Uint32 elapsed = SDL_GetTicks() - t0;
-        if (elapsed < frame_ms) SDL_Delay(frame_ms - elapsed);
+        vip_sleep_ms(frame_ms);
     }
 
     printf("gemu-rca: %llu machine cycles, %llu instructions\n",
            (unsigned long long)s->cpu.cycle_count,
            (unsigned long long)s->cpu.insn_count);
-
-    if (cfg->display_type == GEMU_DISPLAY_SDL && rca_vip_has_vp601(cfg))
-        SDL_StopTextInput();
-    if (cfg->display_type != GEMU_DISPLAY_CURSES)
-        gemu_monitor_stop(s->monitor);
-    rca_display_destroy(display);
+    gemu_monitor_stop(s->monitor);
+    gemu_display_destroy(display);
 }

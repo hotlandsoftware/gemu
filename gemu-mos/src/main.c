@@ -38,6 +38,9 @@ static const GemuArgsDef def = {
 #ifdef GEMU_GTK
                   | GEMU_DISP_F(GEMU_DISPLAY_GTK)
 #endif
+#ifdef HAVE_CACA
+                  | GEMU_DISP_F(GEMU_DISPLAY_CURSES)
+#endif
                   | GEMU_DISP_F(GEMU_DISPLAY_NONE),
     .vnc_support  = true,
     .extra_help =

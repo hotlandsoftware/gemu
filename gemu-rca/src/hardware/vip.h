@@ -7,7 +7,6 @@
 #include "devices/tape.h"
 #include "gemu/monitor.h"
 #include "gemu/vnc.h"
-#include "vga/rca_display.h"
 #include <stdlib.h>
 
 /* ── COSMAC VIP machine state ────────────────────────────────────────────── */
@@ -46,7 +45,3 @@ RcaVipState *rca_vip_create(const RcaConfig *cfg);
 void         rca_vip_reset(RcaVipState *s, const RcaConfig *cfg);
 void         rca_vip_destroy(RcaVipState *s);
 void         rca_machine_run(RcaVipState *s, const RcaConfig *cfg);
-
-#ifndef GEMU_NO_CURSES
-void         rca_display_curses_poll_vip(RcaDisplay *d, RcaVipState *s, bool *quit);
-#endif
