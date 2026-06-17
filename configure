@@ -71,7 +71,6 @@ TARGETS = {
             'gemu-rca/src/main.c',
             'gemu-rca/src/cpu/cdp1802.c',
             'gemu-rca/src/vga/cdp1861.c', 'gemu-rca/src/vga/cdp1869.c',
-            'gemu-rca/src/vga/display_sdl.c',   # legacy: still used by Pecom 32
             'gemu-rca/src/devices/vip_devices.c', 'gemu-rca/src/devices/pcspk.c',
             'gemu-rca/src/devices/tape.c',
             'gemu-rca/src/hardware/machine_vip.c',
@@ -81,17 +80,16 @@ TARGETS = {
             'gemu-rca/src/hardware/romdb.c',
             'gemu-mos/src/vga/input_menu.c',
         ],
-        'src_curses': ['gemu-rca/src/vga/display_curses.c'],  # legacy: Pecom curses path
-        'src_caca':   ['gemu-rca/src/vga/display_caca.c', 'core/src/gemu_display_caca.c'],
+        'src_curses': [],
+        'src_caca':   ['core/src/gemu_display_caca.c'],
         'src_gtk': [
-            'gemu-rca/src/vga/display_gtk.c',   # legacy: Pecom GTK path
             'core/src/gemu_display_gtk.c',
             'core/src/gtk_menu.c', 'core/src/video_gtk.c',
         ],
         'defines_gtk':   ['GEMU_GTK'],
         'defines_win':   ['GEMU_NO_CURSES'],
         'ldflags_win':   ['-lws2_32', '-mconsole'],
-        'has_curses': True,
+        'has_curses': False,
     },
     'mos': {
         'binary': 'gemu-mos',

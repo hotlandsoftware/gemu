@@ -1,4 +1,6 @@
 # gemu-mos
+MOS 65xx microprocessor emulator. 
+
 Currently emulated hardware for this machine:
 
 ## CPUs
@@ -19,7 +21,9 @@ Currently emulated hardware for this machine:
 
 
 # Machines
-## Supported machines
+
+Simulated machines include:
+## Implemented
 | Name   | Full Name     | Year | Graphics  | Input | Sound | Status |
 |--------|---------------|---------|---------|-------|-------|-------|
 | famicom | `Nintendo Family Computer` | 1983  | 🟢 | 🟢 | 🟢 | imperfect | 

@@ -5,7 +5,7 @@
 #include "devices/pcspk.h"
 #include "gemu/monitor.h"
 #include "gemu/vnc.h"
-#include "vga/rca_display.h"
+#include "gemu/gemu_display.h"
 #include <stdlib.h>
 
 /* ── Pecom 32/64 machine state ───────────────────────────────────────────── */

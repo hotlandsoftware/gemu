@@ -1,10 +1,27 @@
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "pecom.h"
 #include "gemu/gemu.h"
+#include "gemu/gemu_display.h"
 #include "gemu/memory.h"
-#include <SDL2/SDL.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#if defined(_WIN32)
+#  include <windows.h>
+#else
+#  include <time.h>
+#endif
+
+static void pecom_sleep_ms(unsigned ms) {
+#if defined(_WIN32)
+    Sleep(ms);
+#else
+    struct timespec ts = { (time_t)(ms / 1000u), (long)(ms % 1000u) * 1000000L };
+    nanosleep(&ts, NULL);
+#endif
+}
 
 /* ── Palette ─────────────────────────────────────────────────────────────── */
 
@@ -103,86 +120,86 @@ static void pecom_mem_write(uint16_t addr, uint8_t val, void *ud) {
  * Shift/Ctrl/Caps are handled via EF pins, not the matrix bits.
  */
 static const struct {
-    uint32_t keysym;   /* SDL2 SDLK or printable ASCII (also matches VNC keysym) */
-    uint8_t  row;      /* matrix row: IN 3 address & 0x3F */
-    uint8_t  bit;      /* 0 or 1 within that row */
+    const char *name;  /* SDL key name (same vocabulary as GemuActionDef.default_key) */
+    uint8_t     row;   /* matrix row: IN 3 address & 0x3F */
+    uint8_t     bit;   /* 0 or 1 within that row */
 } pecom_keymap[] = {
     /* Row 0x0A */
-    {'\r',           0x0A, 0},  /* Return */
-    {SDLK_HOME,      0x0A, 1},  /* Home */
+    {"Return",      0x0A, 0},
+    {"Home",        0x0A, 1},
     /* Row 0x0B */
-    {SDLK_END,       0x0B, 0},  /* End */
+    {"End",         0x0B, 0},
     /* Row 0x0C: 0 1 */
-    {'0',            0x0C, 0},
-    {'1',            0x0C, 1},
+    {"0",           0x0C, 0},
+    {"1",           0x0C, 1},
     /* Row 0x0D: 2 3 */
-    {'2',            0x0D, 0},
-    {'3',            0x0D, 1},
+    {"2",           0x0D, 0},
+    {"3",           0x0D, 1},
     /* Row 0x0E: 4 5 */
-    {'4',            0x0E, 0},
-    {'5',            0x0E, 1},
+    {"4",           0x0E, 0},
+    {"5",           0x0E, 1},
     /* Row 0x0F: 6 7 */
-    {'6',            0x0F, 0},
-    {'7',            0x0F, 1},
+    {"6",           0x0F, 0},
+    {"7",           0x0F, 1},
     /* Row 0x10: 8 9 */
-    {'8',            0x10, 0},
-    {'9',            0x10, 1},
+    {"8",           0x10, 0},
+    {"9",           0x10, 1},
     /* Row 0x11: : ; */
-    {':',            0x11, 0},
-    {';',            0x11, 1},
+    {":",           0x11, 0},
+    {";",           0x11, 1},
     /* Row 0x12: , = */
-    {',',            0x12, 0},
-    {'=',            0x12, 1},
+    {",",           0x12, 0},
+    {"=",           0x12, 1},
     /* Row 0x13: . / */
-    {'.',            0x13, 0},
-    {'/',            0x13, 1},
+    {".",           0x13, 0},
+    {"/",           0x13, 1},
     /* Row 0x14: space a */
-    {' ',            0x14, 0},
-    {'a',            0x14, 1},
+    {"Space",       0x14, 0},
+    {"a",           0x14, 1},
     /* Row 0x15: b c */
-    {'b',            0x15, 0},
-    {'c',            0x15, 1},
+    {"b",           0x15, 0},
+    {"c",           0x15, 1},
     /* Row 0x16: d e */
-    {'d',            0x16, 0},
-    {'e',            0x16, 1},
+    {"d",           0x16, 0},
+    {"e",           0x16, 1},
     /* Row 0x17: f g */
-    {'f',            0x17, 0},
-    {'g',            0x17, 1},
+    {"f",           0x17, 0},
+    {"g",           0x17, 1},
     /* Row 0x18: h i */
-    {'h',            0x18, 0},
-    {'i',            0x18, 1},
+    {"h",           0x18, 0},
+    {"i",           0x18, 1},
     /* Row 0x19: j k */
-    {'j',            0x19, 0},
-    {'k',            0x19, 1},
+    {"j",           0x19, 0},
+    {"k",           0x19, 1},
     /* Row 0x1A: l m */
-    {'l',            0x1A, 0},
-    {'m',            0x1A, 1},
+    {"l",           0x1A, 0},
+    {"m",           0x1A, 1},
     /* Row 0x1B: n o */
-    {'n',            0x1B, 0},
-    {'o',            0x1B, 1},
+    {"n",           0x1B, 0},
+    {"o",           0x1B, 1},
     /* Row 0x1C: p q */
-    {'p',            0x1C, 0},
-    {'q',            0x1C, 1},
+    {"p",           0x1C, 0},
+    {"q",           0x1C, 1},
     /* Row 0x1D: r s */
-    {'r',            0x1D, 0},
-    {'s',            0x1D, 1},
+    {"r",           0x1D, 0},
+    {"s",           0x1D, 1},
     /* Row 0x1E: t u */
-    {'t',            0x1E, 0},
-    {'u',            0x1E, 1},
+    {"t",           0x1E, 0},
+    {"u",           0x1E, 1},
     /* Row 0x1F: v w */
-    {'v',            0x1F, 0},
-    {'w',            0x1F, 1},
+    {"v",           0x1F, 0},
+    {"w",           0x1F, 1},
     /* Row 0x20: x y */
-    {'x',            0x20, 0},
-    {'y',            0x20, 1},
+    {"x",           0x20, 0},
+    {"y",           0x20, 1},
     /* Row 0x21: z down */
-    {'z',            0x21, 0},
-    {SDLK_DOWN,      0x21, 1},
+    {"z",           0x21, 0},
+    {"Down",        0x21, 1},
     /* Row 0x22: left right */
-    {SDLK_LEFT,      0x22, 0},
-    {SDLK_RIGHT,     0x22, 1},
+    {"Left",        0x22, 0},
+    {"Right",       0x22, 1},
     /* Row 0x23: up */
-    {SDLK_UP,        0x23, 0},
+    {"Up",          0x23, 0},
 };
 #define PECOM_N_KEYS (sizeof(pecom_keymap) / sizeof(pecom_keymap[0]))
 
@@ -365,84 +382,75 @@ void rca_pecom32_destroy(RcaPecom32State *s) {
 
 /* ── Input polling ───────────────────────────────────────────────────────── */
 
-static void pecom_poll_keys(RcaPecom32State *s, RcaDisplay *display) {
+static void pecom_poll_keys(RcaPecom32State *s, GemuDisplay *display) {
     if (!display) return;
 
     memset(s->keys, 0, sizeof(s->keys));
     for (size_t i = 0; i < PECOM_N_KEYS; i++) {
-        if (rca_display_key_down(display, pecom_keymap[i].keysym))
+        if (gemu_display_is_key_held(display, pecom_keymap[i].name))
             s->keys[pecom_keymap[i].row] |= (uint8_t)(1u << pecom_keymap[i].bit);
     }
 
-    s->key_esc   = rca_display_key_down(display, RCA_KEY_ESCAPE);
-    s->key_shift = rca_display_key_down(display, SDLK_LSHIFT)
-                || rca_display_key_down(display, SDLK_RSHIFT);
-    s->key_ctrl  = rca_display_key_down(display, SDLK_LCTRL)
-                || rca_display_key_down(display, SDLK_RCTRL);
+    s->key_esc   = gemu_display_is_key_held(display, "Escape");
+    s->key_shift = gemu_display_is_key_held(display, "Left Shift")
+                || gemu_display_is_key_held(display, "Right Shift");
+    s->key_ctrl  = gemu_display_is_key_held(display, "Left Ctrl")
+                || gemu_display_is_key_held(display, "Right Ctrl");
 }
 
-static void pecom_poll_display(RcaPecom32State *s, RcaDisplay *display,
-                               bool *quit) {
-    rca_display_poll(display);
-    if (rca_display_should_quit(display)) {
-        *quit = true;
-        return;
+static void pecom_vnc_apply_key(RcaPecom32State *s, uint32_t ks, bool down) {
+    switch (ks) {
+    case 0xffe1: case 0xffe2: s->key_shift = down; return;
+    case 0xffe3: case 0xffe4: s->key_ctrl  = down; return;
+    case 0xff1b:               s->key_esc   = down; return;
+    case 0xffe5: if (down) s->caps_locked = !s->caps_locked; return;
+    default: break;
     }
 
-    pecom_poll_keys(s, display);
+    /* Translate VNC special keysyms to keymap name strings */
+    const char *name = NULL;
+    char single[2] = {0, 0};
+    switch (ks) {
+    case 0xff08: name = "End";    break;  /* Backspace → BS/DEL key (row 0x0B) */
+    case 0xff0d: name = "Return"; break;
+    case 0xff50: name = "Home";   break;
+    case 0xff57: name = "End";    break;
+    case 0xff52: name = "Up";     break;
+    case 0xff54: name = "Down";   break;
+    case 0xff51: name = "Left";   break;
+    case 0xff53: name = "Right";  break;
+    case ' ':    name = "Space";  break;
+    default:
+        if (ks >= 'A' && ks <= 'Z') ks += 32u;
+        if (ks >= 0x21 && ks < 0x7f) { single[0] = (char)ks; name = single; }
+        break;
+    }
+    if (!name) return;
+
+    for (size_t i = 0; i < PECOM_N_KEYS; i++) {
+        if (strcmp(name, pecom_keymap[i].name) != 0) continue;
+        uint8_t row = pecom_keymap[i].row;
+        uint8_t bit = (uint8_t)(1u << pecom_keymap[i].bit);
+        if (down) {
+            s->keys_live[row]  |= bit;
+            s->keys_latch[row] |= bit;
+        } else {
+            s->keys_live[row]  &= (uint8_t)~bit;
+        }
+        break;
+    }
 }
 
 static void pecom_poll_vnc(RcaPecom32State *s) {
     if (!s->vnc) return;
 
-    /* Clear the one-frame latch set in the previous poll so fast taps don't
-     * linger.  The latch ensures a key pressed AND released within one 20 ms
-     * frame window is still seen by the ROM's keyboard scan. */
+    /* Clear the one-frame latch so fast taps don't linger across frames. */
     memset(s->keys_latch, 0, sizeof(s->keys_latch));
 
     GemuVncKeyEvent ev;
-    while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-        uint32_t ks = (uint32_t)ev.keysym;
+    while (gemu_vnc_pop_key_event(s->vnc, &ev))
+        pecom_vnc_apply_key(s, (uint32_t)ev.keysym, ev.down);
 
-        /* Modifier keys */
-        switch (ks) {
-        case 0xffe1: case 0xffe2: s->key_shift = ev.down; continue;
-        case 0xffe3: case 0xffe4: s->key_ctrl  = ev.down; continue;
-        case 0xff1b:               s->key_esc   = ev.down; continue;
-        case 0xffe5:               /* Caps Lock toggle */
-            if (ev.down) s->caps_locked = !s->caps_locked;
-            continue;
-        default: break;
-        }
-
-        /* Normalise VNC special keysyms to values used in pecom_keymap */
-        if (ks == 0xff08) ks = SDLK_END;   /* Backspace → BS/DEL key (row 0x0B) */
-        if (ks == 0xff0d) ks = '\r';
-        if (ks == 0xff50) ks = SDLK_HOME;
-        if (ks == 0xff57) ks = SDLK_END;
-        if (ks == 0xff52) ks = SDLK_UP;
-        if (ks == 0xff54) ks = SDLK_DOWN;
-        if (ks == 0xff51) ks = SDLK_LEFT;
-        if (ks == 0xff53) ks = SDLK_RIGHT;
-        /* Map uppercase to lowercase — shift state is handled via EF2 */
-        if (ks >= 'A' && ks <= 'Z') ks += 32u;
-
-        for (size_t i = 0; i < PECOM_N_KEYS; i++) {
-            if (ks == pecom_keymap[i].keysym) {
-                uint8_t  row = pecom_keymap[i].row;
-                uint8_t  bit = (uint8_t)(1u << pecom_keymap[i].bit);
-                if (ev.down) {
-                    s->keys_live[row]  |= bit;
-                    s->keys_latch[row] |= bit;  /* hold for this CPU frame */
-                } else {
-                    s->keys_live[row]  &= (uint8_t)~bit;
-                }
-                break;
-            }
-        }
-    }
-
-    /* Merge live state with the one-frame latch into the ROM-visible array */
     for (size_t i = 0; i < 64u; i++)
         s->keys[i] = s->keys_live[i] | s->keys_latch[i];
 }
@@ -450,45 +458,49 @@ static void pecom_poll_vnc(RcaPecom32State *s) {
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
 void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
-    RcaDisplay *display = rca_display_create_indexed(
-        cfg->display_type, "GEMU",
-        CDP1869_VISIBLE_W, CDP1869_VISIBLE_H,
-        cfg->display_scale,
-        pecom_palette,
-        (int)(sizeof(pecom_palette) / sizeof(pecom_palette[0])),
-        s->monitor,
-        cfg->keyboard);
-
-    if (!display) {
-        fprintf(stderr, "gemu-rca: pecom32: failed to create display\n");
-        return;
-    }
-
-    if (display->run) {
-        display->run(display, s, cfg);
-        rca_display_destroy(display);
-        return;
+    GemuDisplay *display = NULL;
+    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+        display = gemu_display_create(cfg->display_type,
+            &(GemuDisplayConfig){
+                .title     = "GEMU",
+                .fb_width  = CDP1869_VISIBLE_W,
+                .fb_height = CDP1869_VISIBLE_H,
+                .scale     = cfg->display_scale,
+                .renderer  = GEMU_RENDERER_AUTO,
+                .actions   = NULL,
+                .n_actions = 0,
+                .ini_section = "pecom",
+                .gtk = &(GemuDisplayGtkExtras){ .monitor = s->monitor },
+            });
+        if (!display) {
+            fprintf(stderr, "gemu-rca: pecom32: failed to create display\n");
+            return;
+        }
     }
 
     /* PAL 50 Hz */
-    const Uint32 frame_ms = 1000u / PECOM32_FRAME_HZ;
+    const unsigned frame_ms = 1000u / PECOM32_FRAME_HZ;
+
+    /* ARGB framebuffer for gemu_display_render() */
+    uint32_t argb[CDP1869_VISIBLE_W * CDP1869_VISIBLE_H];
 
     gemu_monitor_start(s->monitor);
-    SDL_StartTextInput();
 
     bool quit = false;
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        if (cfg->display_type != GEMU_DISPLAY_NONE)
-            pecom_poll_display(s, display, &quit);
-        pecom_poll_vnc(s);
-
-        /* SDL input menu reset */
-        if (rca_display_menu_reset_requested(display)) {
-            rca_display_menu_clear_reset(display);
-            rca_pecom32_reset(s, cfg);
+        if (display) {
+            gemu_display_poll(display);
+            if (gemu_display_should_quit(display)) break;
+            if (gemu_display_reset_requested(display)) {
+                gemu_display_clear_flags(display);
+                rca_pecom32_reset(s, cfg);
+            }
+            pecom_poll_keys(s, display);
         }
+        pecom_poll_vnc(s);
 
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
@@ -510,22 +522,31 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
 
             if (s->vis.dirty) {
                 cdp1869_render(&s->vis);
-                rca_display_render(display, s->vis.bitmap,
-                                   CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
+                if (display) {
+                    int n = CDP1869_VISIBLE_W * CDP1869_VISIBLE_H;
+                    for (int i = 0; i < n; i++)
+                        argb[i] = pecom_palette[s->vis.bitmap[i] & 7u];
+                    gemu_display_render(display, argb,
+                                        CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
+                }
                 gemu_vnc_update(s->vnc, s->vis.bitmap,
                                 CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
             }
         }
 
-        Uint32 elapsed = SDL_GetTicks() - t0;
-        if (elapsed < frame_ms) SDL_Delay(frame_ms - elapsed);
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        unsigned elapsed_ms = (unsigned)(
+            (t1.tv_sec  - t0.tv_sec)  * 1000u +
+            (t1.tv_nsec - t0.tv_nsec) / 1000000u);
+        if (elapsed_ms < frame_ms)
+            pecom_sleep_ms(frame_ms - elapsed_ms);
     }
 
     printf("gemu-rca: %llu machine cycles, %llu instructions\n",
            (unsigned long long)s->cpu.cycle_count,
            (unsigned long long)s->cpu.insn_count);
 
-    SDL_StopTextInput();
     gemu_monitor_stop(s->monitor);
-    rca_display_destroy(display);
+    gemu_display_destroy(display);
 }

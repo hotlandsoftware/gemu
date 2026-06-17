@@ -204,6 +204,17 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
     return held_mask(b);
 }
 
+static bool sdl_do_is_key_held(GemuDisplay *d, const char *name) {
+    (void)d;
+    SDL_Keycode kc = SDL_GetKeyFromName(name);
+    if (kc == SDLK_UNKNOWN) return false;
+    SDL_Scancode sc = SDL_GetScancodeFromKey(kc);
+    if (sc == SDL_SCANCODE_UNKNOWN) return false;
+    int numkeys = 0;
+    const uint8_t *state = SDL_GetKeyboardState(&numkeys);
+    return (int)sc < numkeys && state[sc];
+}
+
 static void sdl_do_open_rebind(GemuDisplay *d) {
     SdlBackend *b = d->backend;
     if (b->menu && !input_menu_is_open(b->menu))
@@ -285,6 +296,7 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     d->backend        = b;
     d->do_render      = sdl_do_render;
     d->do_poll        = sdl_do_poll;
+    d->do_is_key_held = sdl_do_is_key_held;
     d->do_open_rebind = sdl_do_open_rebind;
     d->do_destroy     = sdl_do_destroy;
     d->pointer.x = d->pointer.y = -1;

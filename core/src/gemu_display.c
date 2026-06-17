@@ -125,6 +125,11 @@ uint32_t gemu_display_pop_raw_key(GemuDisplay *d) {
     return cp;
 }
 
+bool gemu_display_is_key_held(GemuDisplay *d, const char *name) {
+    if (!d || !d->do_is_key_held) return false;
+    return d->do_is_key_held(d, name);
+}
+
 void gemu_display_open_rebind_menu(GemuDisplay *d) {
     if (d && d->do_open_rebind) d->do_open_rebind(d);
 }

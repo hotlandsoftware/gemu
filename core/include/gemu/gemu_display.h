@@ -157,6 +157,22 @@ void gemu_display_clear_flags(GemuDisplay *d);
  */
 uint32_t gemu_display_pop_raw_key(GemuDisplay *d);
 
+/* ── Key state query (full-keyboard machines) ───────────────────────────── */
+
+/*
+ * Returns true if the named key is currently held down.  The key_name uses
+ * the same SDL key-name vocabulary as GemuActionDef.default_key ("a", "Return",
+ * "Left Shift", "Home", "Escape", …).
+ *
+ * SDL backend: queries SDL_GetKeyboardState() — always accurate after poll().
+ * Other backends: return false (they don't support arbitrary key queries).
+ *
+ * Intended for machines with large keyboards that don't fit in 32 action bits
+ * (e.g. Pecom 32).  Machines using the standard action-bitmask model do not
+ * need this.
+ */
+bool gemu_display_is_key_held(GemuDisplay *d, const char *key_name);
+
 /* ── Key-rebinding overlay (SDL only) ────────────────────────────────────── */
 
 /*
