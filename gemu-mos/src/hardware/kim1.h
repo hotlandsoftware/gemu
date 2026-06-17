@@ -54,12 +54,6 @@
 #define KIM1_KEYPAD_COLS  4
 #define KIM1_KEYPAD_Y    140
 
-/* Blink cursor: small green rectangle to the right of the 7-segment digits.
- * Blinks every ~250 ms (15 frames at 60 Hz). */
-#define KIM1_CURSOR_W      8
-#define KIM1_CURSOR_H     20
-#define KIM1_BLINK_FRAMES 15
-
 /* ── 6530 register offsets ──────────────────────────────────────────────── */
 
 #define KIM1_U2_BASE   0x1700u
@@ -102,8 +96,6 @@
 
 #define KIM1_NUM_ACTIONS  23
 
-extern const GemuActionDef kim1_actions[KIM1_NUM_ACTIONS];
-
 /* ── Per-6530 state ──────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -128,10 +120,9 @@ typedef struct Kim1State {
     uint8_t          rriot_ram[128];
 
     /* Display */
-    uint8_t          digits[KIM1_NUM_DIGITS];
+    uint8_t          seg_cache[KIM1_NUM_DIGITS]; /* segment patterns cached from Port A/B writes */
     uint32_t         fb[KIM1_FB_WIDTH * KIM1_FB_HEIGHT];
     uint32_t         keypad_held;
-    uint64_t         frame_count;       /* for blink cursor timing */
     bool             has_keypad;        /* -device kim-keypad → render visual keypad */
     GemuDisplay     *display;
 

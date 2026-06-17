@@ -1,40 +1,84 @@
+#ifndef _WIN32
+#  define _POSIX_C_SOURCE 199309L
+#endif
 #include "kim1.h"
-#include <SDL2/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+static inline void kim1_sleep_ms(unsigned ms) { Sleep(ms); }
+#else
+static inline void kim1_sleep_ms(unsigned ms) {
+    struct timespec ts = { (time_t)(ms / 1000u), (long)(ms % 1000u) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+#endif
 
-/* ── Action table ────────────────────────────────────────────────────────── */
+/* ── Keyboard state builder ──────────────────────────────────────────────── */
 
-const GemuActionDef kim1_actions[KIM1_NUM_ACTIONS] = {
-    { "0",    GEMU_ACTION(0),  "0"         },
-    { "1",    GEMU_ACTION(1),  "1"         },
-    { "2",    GEMU_ACTION(2),  "2"         },
-    { "3",    GEMU_ACTION(3),  "3"         },
-    { "4",    GEMU_ACTION(4),  "4"         },
-    { "5",    GEMU_ACTION(5),  "5"         },
-    { "6",    GEMU_ACTION(6),  "6"         },
-    { "7",    GEMU_ACTION(7),  "7"         },
-    { "8",    GEMU_ACTION(8),  "8"         },
-    { "9",    GEMU_ACTION(9),  "9"         },
-    { "A",    GEMU_ACTION(10), "A"         },
-    { "B",    GEMU_ACTION(11), "B"         },
-    { "C",    GEMU_ACTION(12), "C"         },
-    { "D",    GEMU_ACTION(13), "D"         },
-    { "E",    GEMU_ACTION(14), "E"         },
-    { "F",    GEMU_ACTION(15), "F"         },
-    { "AD",   GEMU_ACTION(16), "F1"        },
-    { "DA",   GEMU_ACTION(17), "F2"        },
-    { "PC",   GEMU_ACTION(18), "F3"        },
-    { "+",    GEMU_ACTION(19), "Keypad +"  },
-    { "GO",   GEMU_ACTION(20), "F5"        },
-    { "ST",   GEMU_ACTION(21), "F4"        },
-    { "RS",   GEMU_ACTION(22), "Backspace" },
+static void kim1_update_keys(Kim1State *s, GemuDisplay *d) {
+    if (!d) return;
+
+    bool shift = gemu_display_is_key_held(d, "Left Shift")
+              || gemu_display_is_key_held(d, "Right Shift");
+
+    uint32_t held = 0;
+
+    /* Hex digits 0–9 */
+    if (gemu_display_is_key_held(d, "0")) held |= KIM1_ACT_0;
+    if (gemu_display_is_key_held(d, "1")) held |= KIM1_ACT_1;
+    if (gemu_display_is_key_held(d, "2")) held |= KIM1_ACT_2;
+    if (gemu_display_is_key_held(d, "3")) held |= KIM1_ACT_3;
+    if (gemu_display_is_key_held(d, "4")) held |= KIM1_ACT_4;
+    if (gemu_display_is_key_held(d, "5")) held |= KIM1_ACT_5;
+    if (gemu_display_is_key_held(d, "6")) held |= KIM1_ACT_6;
+    if (gemu_display_is_key_held(d, "7")) held |= KIM1_ACT_7;
+    if (gemu_display_is_key_held(d, "8")) held |= KIM1_ACT_8;
+    if (gemu_display_is_key_held(d, "9")) held |= KIM1_ACT_9;
+
+    /* Hex A–F: lowercase a-f → hex digit; Shift+a → AD, Shift+d → DA */
+    if (gemu_display_is_key_held(d, "a")) held |= shift ? KIM1_ACT_AD : KIM1_ACT_A;
+    if (gemu_display_is_key_held(d, "b")) held |= KIM1_ACT_B;
+    if (gemu_display_is_key_held(d, "c")) held |= KIM1_ACT_C;
+    if (gemu_display_is_key_held(d, "d")) held |= shift ? KIM1_ACT_DA : KIM1_ACT_D;
+    if (gemu_display_is_key_held(d, "e")) held |= KIM1_ACT_E;
+    if (gemu_display_is_key_held(d, "f")) held |= KIM1_ACT_F;
+
+    /* Function keys — p/g/s/r (both cases hit the same physical key) */
+    if (gemu_display_is_key_held(d, "p")) held |= KIM1_ACT_PC;
+    if (gemu_display_is_key_held(d, "g")) held |= KIM1_ACT_GO;
+    if (gemu_display_is_key_held(d, "s")) held |= KIM1_ACT_ST;
+    if (gemu_display_is_key_held(d, "r")) held |= KIM1_ACT_RS;
+
+    /* + key: the = physical key (SDL maps + to the same scancode) or Keypad + */
+    if (gemu_display_is_key_held(d, "+") || gemu_display_is_key_held(d, "Keypad +"))
+        held |= KIM1_ACT_PLUS;
+
+    s->keypad_held = held;
+}
+
+/* ── Hardware keyboard matrix (4 rows × 6 columns) ──────────────────────── *
+ * Row selected by 74145 decoder (PB1-PB4 of u3): decoder values 0-3 = rows.
+ * Columns read on PA0-PA5 (active-low when key pressed).
+ *
+ *        PA0      PA1      PA2      PA3      PA4       PA5
+ * Row 0:  0        1        2        3        C         D
+ * Row 1:  4        5        6        7        E         F
+ * Row 2:  8        9        A        B        +        (nc)
+ * Row 3: AD       DA       GO       ST       PC        RS
+ */
+static const uint32_t hw_keymap[4][6] = {
+    { KIM1_ACT_0,  KIM1_ACT_1,  KIM1_ACT_2,  KIM1_ACT_3,  KIM1_ACT_C,    KIM1_ACT_D  },
+    { KIM1_ACT_4,  KIM1_ACT_5,  KIM1_ACT_6,  KIM1_ACT_7,  KIM1_ACT_E,    KIM1_ACT_F  },
+    { KIM1_ACT_8,  KIM1_ACT_9,  KIM1_ACT_A,  KIM1_ACT_B,  KIM1_ACT_PLUS, 0           },
+    { KIM1_ACT_AD, KIM1_ACT_DA, KIM1_ACT_GO, KIM1_ACT_ST, KIM1_ACT_PC,   KIM1_ACT_RS },
 };
 
-/* ── Keypad matrix → action-bit lookup ──────────────────────────────────── */
-
+/* ── Visual keypad layout (6 rows × 4 cols) for on-screen rendering ──────── */
 static const uint32_t keypad_matrix[6][4] = {
     { KIM1_ACT_0,   KIM1_ACT_1,   KIM1_ACT_2,   KIM1_ACT_3   },
     { KIM1_ACT_4,   KIM1_ACT_5,   KIM1_ACT_6,   KIM1_ACT_7   },
@@ -111,7 +155,6 @@ static const struct { int x, y, w, h; } seg_rects[8] = {
 #define COLOUR_KEY_BD     0xFF444444u  /* key border              */
 #define COLOUR_KEY_LIT    0xFF604020u  /* key pressed highlight   */
 #define COLOUR_KEY_TEXT   0xFFCCCCCCu  /* key label text          */
-#define COLOUR_CURSOR     0xFF00CC00u  /* blinking cursor green   */
 
 /* ── Framebuffer helpers ────────────────────────────────────────────────── */
 
@@ -211,15 +254,10 @@ void kim1_render_fb(Kim1State *s) {
     for (int i = 0; i < KIM1_FB_WIDTH * KIM1_FB_HEIGHT; i++)
         fb[i] = COLOUR_BG;
 
-    /* ── Read 7-segment patterns from KIM-1 RAM ──────────────────────
-     *
-     * The KIM-1 monitor stores raw segment patterns at $00F9–$00FE.
-     * Reading directly from RAM is more reliable than tracking Port B
-     * writes, since the monitor may update the display buffer at any time.
-     * Fall back to tracked digits if RAM hasn't been written yet. */
+    /* Segment patterns are cached from Port A/Port B writes in kim1_mem_write. */
     uint8_t segs[KIM1_NUM_DIGITS];
     for (int d = 0; d < KIM1_NUM_DIGITS; d++)
-        segs[d] = s->ram[0xF9u + (unsigned)d];
+        segs[d] = s->seg_cache[d];
 
     /* ── 7-segment display ──────────────────────────────────────────── */
 
@@ -237,26 +275,6 @@ void kim1_render_fb(Kim1State *s) {
                       seg_rects[i].w, seg_rects[i].h,
                       lit ? COLOUR_LIT : COLOUR_OFF);
         }
-    }
-
-    /* ── Functional cursor ────────────────────────────────────────────
-     *
-     * The KIM-1 monitor tracks editing state in zero page:
-     *   $00F5  mode:  0x00 = display, 0x01 = address entry, 0x02 = data entry
-     *   $00F6  input position (0–5): which digit is being edited
-     *
-     * Blink the cursor on the digit currently being edited.
-     * During display mode, cursor stays off.
-     */
-    uint8_t mode  = s->ram[0xF5u];
-    uint8_t ipos  = s->ram[0xF6u];
-    bool    blink = (s->frame_count / KIM1_BLINK_FRAMES) & 1u;
-
-    if (mode != 0 && ipos < KIM1_NUM_DIGITS && blink) {
-        int cx = dox + (int)ipos * (KIM1_DIGIT_W + KIM1_DIGIT_GAP)
-               + (KIM1_DIGIT_W - KIM1_CURSOR_W) / 2;
-        int cy = doy + KIM1_DIGIT_H - KIM1_CURSOR_H;
-        fill_rect(fb, fw, cx, cy, KIM1_CURSOR_W, KIM1_CURSOR_H, COLOUR_CURSOR);
     }
 
     /* ── Visual keypad ──────────────────────────────────────────────── */
@@ -311,18 +329,20 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
         switch (off) {
         case KIM1_RA: {
             uint8_t out = r->pa & r->ddra;
-            uint8_t in = 0x0Fu;
-            if (~r->ddra & 0x0Fu) {
-                int row = (int)(r->pa & 0x07u);
-                if (row >= 0 && row <= 5) {
-                    for (int col = 0; col < 4; col++) {
-                        uint32_t bit = keypad_matrix[row][col];
+            /* PA0-PA5 keyboard columns, active-low; PA7 = TTY break (high = no break) */
+            uint8_t in = 0xFFu;
+            if (r == &s->u3) {
+                /* 74145 decoder value from PB1-PB4 selects keyboard row (0-3) */
+                int dec = (s->u3.pb >> 1) & 0x0F;
+                if (dec <= 3) {
+                    for (int col = 0; col < 6; col++) {
+                        uint32_t bit = hw_keymap[dec][col];
                         if (bit && (s->keypad_held & bit))
                             in &= (uint8_t)~(1u << col);
                     }
                 }
             }
-            return (out & r->ddra) | (in & ~r->ddra & 0x0Fu);
+            return (out & r->ddra) | (in & ~r->ddra);
         }
         case KIM1_DDRA:  return r->ddra;
         case KIM1_RB: {
@@ -343,8 +363,9 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
         }
     }
 
-    if (a >= 0x1710u && a < 0x1780u)
-        return s->rriot_ram[(a - 0x1710u) & 0x7Fu];
+    /* RRIOT internal RAM: 6530-003 @ 0x1780-0x17BF, 6530-002 @ 0x17C0-0x17FF */
+    if (a >= 0x1780u && a < 0x1800u)
+        return s->rriot_ram[a - 0x1780u];
 
     if (a >= 0x1800u) {
         if (a < 0x1C00u) return s->rom_002[a - 0x1800u];
@@ -372,12 +393,26 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
         switch (off) {
         case KIM1_RA:
             r->pa = val;
+            if (r == &s->u3) {
+                /* PA write during display refresh: latch segment data into the digit
+                 * currently selected by PB1-PB4 (74145 decoder, values 4-9 = LEDs 1-6). */
+                int dec = (s->u3.pb >> 1) & 0x0F;
+                if (dec >= 4 && dec <= 9)
+                    s->seg_cache[dec - 4] = val;
+            }
             break;
         case KIM1_DDRA:
             r->ddra = val;
             break;
         case KIM1_RB:
             r->pb = val;
+            if (r == &s->u3) {
+                /* PB write changes 74145 decoder; latch current PA into the new digit slot.
+                 * Decoder input = PB1-PB4; values 4-9 → LED digits 1-6 (seg_cache[0-5]). */
+                int dec = (val >> 1) & 0x0F;
+                if (dec >= 4 && dec <= 9)
+                    s->seg_cache[dec - 4] = s->u3.pa;
+            }
             break;
         case KIM1_DDRB:
             r->ddrb = val;
@@ -401,8 +436,9 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
         return;
     }
 
-    if (a >= 0x1710u && a < 0x1780u) {
-        s->rriot_ram[(a - 0x1710u) & 0x7Fu] = val;
+    /* RRIOT internal RAM: 6530-003 @ 0x1780-0x17BF, 6530-002 @ 0x17C0-0x17FF */
+    if (a >= 0x1780u && a < 0x1800u) {
+        s->rriot_ram[a - 0x1780u] = val;
         return;
     }
 }
@@ -478,7 +514,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     if (!s) return NULL;
 
     s->cfg        = cfg;
-    s->has_keypad = cfg->kim_keyboard;
+    s->has_keypad = true;  /* always show visual keypad; it's the primary UI */
     s->monitor    = gemu_monitor_create();
 
     mos6502_init(&s->cpu);
@@ -496,14 +532,14 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         s->display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
-                .title       = "KIM-1",
+                .title       = "GEMU",
                 .fb_width    = KIM1_FB_WIDTH,
                 .fb_height   = KIM1_FB_HEIGHT,
                 .scale       = cfg->display_scale,
                 .renderer    = cfg->display_renderer,
-                .actions     = kim1_actions,
-                .n_actions   = KIM1_NUM_ACTIONS,
-                .ini_section = "kim1-keypad",
+                .actions     = NULL,
+                .n_actions   = 0,
+                .ini_section = NULL,
             });
         if (!s->display)
             fprintf(stderr, "gemu-kim1: failed to create display window\n");
@@ -531,11 +567,11 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
 
     bool quit = false;
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
 
         s->keypad_held = 0;
         if (s->display) {
-            s->keypad_held = gemu_display_poll(s->display);
+            gemu_display_poll(s->display);
+            kim1_update_keys(s, s->display);
             if (gemu_display_should_quit(s->display))
                 quit = true;
             if (gemu_display_reset_requested(s->display)) {
@@ -569,7 +605,6 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
             }
         }
 
-        s->frame_count++;
 
         if (s->display) {
             kim1_render_fb(s);
@@ -577,9 +612,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
                                 KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
         }
 
-        Uint32 elapsed = SDL_GetTicks() - t0;
-        if (elapsed < KIM1_FRAME_MS)
-            SDL_Delay(KIM1_FRAME_MS - elapsed);
+        kim1_sleep_ms(KIM1_FRAME_MS);
     }
 
     printf("gemu-kim1: %llu cycles, %llu instructions\n",
