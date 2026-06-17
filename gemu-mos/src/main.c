@@ -22,11 +22,12 @@ static const GemuDevDesc machines[] = {
     {"nespal",  "Nintendo Entertainment System (Ricoh 2A03 + RP2C02, PAL)"},
 };
 static const GemuDevDesc cpus[] = {
+    {"6501", "MOS Technology 6501"},
     {"6502", "MOS Technology 6502"},
-    {"2a03", "Ricoh 2A03 (NES CPU, 6502 without decimal mode)"},
+    {"2a03", "Ricoh 2A03 (6502-like, no decimal mode)"},
 };
 static const GemuDevDesc vgas[] = {
-    {"2c02", "Ricoh RP2C02 (256x240 px, NTSC, NES PPU)"},
+    {"2c02", "Ricoh RP2C02 (256x240 px, NES PPU)"},
 };
 
 static const GemuArgsDef def = {
@@ -139,7 +140,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (args.cpu) {
-        if      (strcmp(args.cpu, "6502") == 0) cfg.cpu = MOS_CPU_6502;
+        if      (strcmp(args.cpu, "6501") == 0) cfg.cpu = MOS_CPU_6501;
+        else if (strcmp(args.cpu, "6502") == 0) cfg.cpu = MOS_CPU_6502;
         else if (strcmp(args.cpu, "2a03") == 0) cfg.cpu = MOS_CPU_2A03;
     } else if (cfg.machine == MOS_MACHINE_NES) {
         cfg.cpu = MOS_CPU_2A03;

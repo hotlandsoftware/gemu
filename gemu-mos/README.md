@@ -7,6 +7,7 @@ Currently emulated hardware for this machine:
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|
 | 2a03 | `Ricoh 2A03` | working |  |
+| 6501 | `MOS Technology 6501` | working | |
 | 6502 | `MOS Technology 6502` | working | |
 
 ## VGA
