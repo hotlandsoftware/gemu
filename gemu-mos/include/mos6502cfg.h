@@ -6,6 +6,7 @@
 typedef enum {
     MOS_MACHINE_GENERIC,
     MOS_MACHINE_NES,    /* Nintendo Entertainment System */
+    MOS_MACHINE_KIM1,   /* MOS KIM-1 single-board computer */
 } MosMachineType;
 
 typedef enum {
@@ -64,5 +65,6 @@ typedef struct MosConfig {
     int             n_ports;          /* how many ports were explicitly assigned */
     bool            ppu_debug;
     bool            is_pal;      /* PAL mode: 312 lines, ~50 Hz, slower CPU clock */
+    bool            kim_keyboard; /* KIM-1: -device kim-keypad → visual keypad overlay */
     uint32_t        mem_size;  /* generic machine RAM in bytes (0 = default 64KB) */
 } MosConfig;

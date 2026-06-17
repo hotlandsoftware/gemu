@@ -1,7 +1,9 @@
 #include "mos6502cfg.h"
 #include "hardware/generic.h"
 #include "hardware/nes.h"
+#include "hardware/kim1.h"
 #include "hardware/nes_devices.h"
+#include "hardware/kim_devices.h"
 #include "hardware/romdb.h"
 #include "gemu/gemu.h"
 #include "gemu/args.h"
@@ -18,6 +20,7 @@
 static const GemuDevDesc machines[] = {
     {"famicom", "Nintendo Family Computer (Ricoh 2A03 + RP2C02, alias for nes)"},
     {"generic", "Generic MOS-compatible machine (flat 64 KB, ROM at user-specified address)"},
+    {"kim1",    "MOS KIM-1 single-board computer (6502, 1 KB RAM, 2x 6530 RRIOT)"},
     {"nes",     "Nintendo Entertainment System (Ricoh 2A03 + RP2C02, NTSC)"},
     {"nespal",  "Nintendo Entertainment System (Ricoh 2A03 + RP2C02, PAL)"},
 };
@@ -134,6 +137,7 @@ int main(int argc, char *argv[]) {
 
     if (args.machine) {
         if      (strcmp(args.machine, "generic") == 0) cfg.machine = MOS_MACHINE_GENERIC;
+        else if (strcmp(args.machine, "kim1")    == 0) cfg.machine = MOS_MACHINE_KIM1;
         else if (strcmp(args.machine, "nes")     == 0) cfg.machine = MOS_MACHINE_NES;
         else if (strcmp(args.machine, "nespal")  == 0) { cfg.machine = MOS_MACHINE_NES; cfg.is_pal = true; }
         else if (strcmp(args.machine, "famicom") == 0) cfg.machine = MOS_MACHINE_NES;
@@ -148,7 +152,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (args.vga) {
-        if (strcmp(args.vga, "2c02") == 0) cfg.vga = MOS_VGA_RP2C02;
+        if      (strcmp(args.vga, "2c02") == 0) cfg.vga = MOS_VGA_RP2C02;
     }
 
     /* 6502-specific flags */
@@ -198,21 +202,30 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(rem[i], "-device") == 0 && i + 1 < nrem) {
             const char *name = rem[++i];
             if (strcmp(name, "?") == 0) {
-                int n = 0;
-                const NesDeviceDesc *devs = nes_device_list(&n);
+                int n_nes = 0, n_kim = 0;
+                const NesDeviceDesc *ndevs = nes_device_list(&n_nes);
+                const KimDeviceDesc *kdevs = kim_device_list(&n_kim);
                 int maxw = (int)strlen("fds");
-                for (int d = 0; d < n; d++) {
-                    int w = (int)strlen(devs[d].name);
+                for (int d = 0; d < n_nes; d++) {
+                    int w = (int)strlen(ndevs[d].name);
+                    if (w > maxw) maxw = w;
+                }
+                for (int d = 0; d < n_kim; d++) {
+                    int w = (int)strlen(kdevs[d].name);
                     if (w > maxw) maxw = w;
                 }
                 printf("Available devices:\n");
                 printf("  %-*s  Famicom Disk System\n", maxw, "fds");
-                for (int d = 0; d < n; d++)
-                    printf("  %-*s  %s\n", maxw, devs[d].name, devs[d].desc);
+                for (int d = 0; d < n_nes; d++)
+                    printf("  %-*s  %s\n", maxw, ndevs[d].name, ndevs[d].desc);
+                for (int d = 0; d < n_kim; d++)
+                    printf("  %-*s  %s\n", maxw, kdevs[d].name, kdevs[d].desc);
                 SDL_Quit(); return 0;
             }
             if (strcmp(name, "fds") == 0) {
                 cfg.fds_enabled = true;
+            } else if (strcmp(name, "kim-keypad") == 0) {
+                cfg.kim_keyboard = true;
             } else {
                 const NesDeviceDesc *dev = nes_device_find(name);
                 if (!dev) {
@@ -262,8 +275,8 @@ int main(int argc, char *argv[]) {
     cfg.display_scale = args.display_scale;
     cfg.vnc_addr      = args.vnc_addr;
 
-    /* NES without any display preference → GTK if available, else SDL */
-    if (cfg.machine == MOS_MACHINE_NES
+    /* KIM-1 / NES without any display preference → GTK if available, else SDL */
+    if ((cfg.machine == MOS_MACHINE_NES || cfg.machine == MOS_MACHINE_KIM1)
         && !cfg.vnc_addr && !args.display_explicit) {
 #ifdef GEMU_GTK
         cfg.display_type = GEMU_DISPLAY_GTK;
@@ -325,6 +338,11 @@ int main(int argc, char *argv[]) {
         s->ppu.debug = cfg.ppu_debug;
         nes_run(s, &cfg);
         nes_destroy(s);
+    } else if (cfg.machine == MOS_MACHINE_KIM1) {
+        Kim1State *s = kim1_create(&cfg);
+        if (!s) { SDL_Quit(); return 1; }
+        kim1_run(s, &cfg);
+        kim1_destroy(s);
     } else {
         MosGenericState *s = mos_generic_create(&cfg);
         if (!s) { SDL_Quit(); return 1; }
