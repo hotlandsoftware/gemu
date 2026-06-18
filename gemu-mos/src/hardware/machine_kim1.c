@@ -19,6 +19,10 @@ static inline void kim1_sleep_ms(unsigned ms) {
 #endif
 
 static void kim1_reset_rriots(Kim1State *s);
+static uint8_t kim1_mem_read(uint16_t addr, void *ud);
+static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud);
+static void kim1_update_monitor_display(Kim1State *s);
+static void kim1_panel_command(Kim1State *s, uint8_t key);
 
 /* ── KIM-1 keypad action table ──────────────────────────────────────────── */
 
@@ -301,8 +305,7 @@ static void kim1_queue_keypress(Kim1State *s, uint32_t newly_pressed) {
 
         int key = kim1_action_to_key_number(bit);
         if (key >= 0) {
-            s->kim_key_number = (uint8_t)key;
-            s->kim_key_pending = true;
+            kim1_panel_command(s, (uint8_t)key);
         } else if (bit == KIM1_ACT_RS) {
             mos6502_reset(&s->cpu);
             kim1_reset_rriots(s);
@@ -337,6 +340,52 @@ static void kim1_set_a_nz(Kim1State *s, uint8_t v) {
     s->cpu.P = (uint8_t)((s->cpu.P & ~(MOS6502_P_N | MOS6502_P_Z))
              | (v == 0 ? MOS6502_P_Z : 0)
              | (v & 0x80u ? MOS6502_P_N : 0));
+}
+
+static void kim1_panel_refresh(Kim1State *s) {
+    uint8_t data = kim1_mem_read(s->kim_panel_addr, s);
+    s->ram[0xFB] = (uint8_t)(s->kim_panel_addr >> 8);
+    s->ram[0xFA] = (uint8_t)s->kim_panel_addr;
+    s->ram[0xF9] = data;
+    kim1_update_monitor_display(s);
+}
+
+static void kim1_panel_command(Kim1State *s, uint8_t key) {
+    if (key <= 0x0F) {
+        if (s->kim_address_mode) {
+            s->kim_panel_addr = (uint16_t)((s->kim_panel_addr << 4) | key);
+        } else {
+            uint8_t data = (uint8_t)((kim1_mem_read(s->kim_panel_addr, s) << 4) | key);
+            kim1_mem_write(s->kim_panel_addr, data, s);
+        }
+        kim1_panel_refresh(s);
+        return;
+    }
+
+    switch (key) {
+    case 0x10: /* AD */
+        s->kim_address_mode = true;
+        kim1_panel_refresh(s);
+        break;
+    case 0x11: /* DA */
+        s->kim_address_mode = false;
+        kim1_panel_refresh(s);
+        break;
+    case 0x12: /* + */
+        s->kim_panel_addr++;
+        kim1_panel_refresh(s);
+        break;
+    case 0x13: /* GO */
+        s->cpu.PC = s->kim_panel_addr;
+        break;
+    case 0x14: /* PC */
+        s->kim_panel_addr = s->cpu.PC;
+        s->kim_address_mode = true;
+        kim1_panel_refresh(s);
+        break;
+    default:
+        break;
+    }
 }
 
 /* ── Framebuffer rendering ──────────────────────────────────────────────── */
@@ -416,6 +465,8 @@ static void kim1_reset_rriots(Kim1State *s) {
     s->keypad_prev = 0;
     s->kim_key_pending = false;
     s->kim_key_number = 0x15u;
+    s->kim_address_mode = true;
+    s->kim_panel_addr = 0x0000u;
 
     /* 6530-003 (u2, addr 0x1700): application I/O */
     s->u2 = (Kim1Rriot){0};
@@ -430,6 +481,7 @@ static void kim1_reset_rriots(Kim1State *s) {
     s->u3.ddrb    = 0x3Fu;
     s->u3.irq_flag = true;
     rriot_update_irq(s);
+    kim1_panel_refresh(s);
 }
 
 static uint8_t kim1_hex_to_segments(uint8_t v) {

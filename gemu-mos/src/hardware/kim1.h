@@ -126,6 +126,8 @@ typedef struct Kim1State {
     uint32_t         keypad_prev;
     bool             kim_key_pending;
     uint8_t          kim_key_number;
+    bool             kim_address_mode;
+    uint16_t         kim_panel_addr;
     bool             has_keypad;        /* -device kim-keypad → render visual keypad */
     GemuDisplay     *display;
 
