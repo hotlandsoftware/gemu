@@ -208,22 +208,37 @@ int main(int argc, char *argv[]) {
                 int n_nes = 0, n_kim = 0;
                 const NesDeviceDesc *ndevs = nes_device_list(&n_nes);
                 const KimDeviceDesc *kdevs = kim_device_list(&n_kim);
-                int maxw = (int)strlen("vt100");
-                for (int d = 0; d < n_nes; d++) {
-                    int w = (int)strlen(ndevs[d].name);
-                    if (w > maxw) maxw = w;
-                }
-                for (int d = 0; d < n_kim; d++) {
-                    int w = (int)strlen(kdevs[d].name);
-                    if (w > maxw) maxw = w;
-                }
-                printf("Available devices:\n");
-                printf("  %-*s  Famicom Disk System\n", maxw, "fds");
-                printf("  %-*s  DEC VT100 serial terminal (second window)\n", maxw, "vt100");
+
+                typedef struct { const char *name; const char *desc; } DevEntry;
+                DevEntry all[64];
+                int n_all = 0;
+                all[n_all++] = (DevEntry){"fds",   "Famicom Disk System"};
+                all[n_all++] = (DevEntry){"vt100", "DEC VT100 serial terminal (second window)"};
                 for (int d = 0; d < n_nes; d++)
-                    printf("  %-*s  %s\n", maxw, ndevs[d].name, ndevs[d].desc);
+                    all[n_all++] = (DevEntry){ndevs[d].name, ndevs[d].desc};
                 for (int d = 0; d < n_kim; d++)
-                    printf("  %-*s  %s\n", maxw, kdevs[d].name, kdevs[d].desc);
+                    all[n_all++] = (DevEntry){kdevs[d].name, kdevs[d].desc};
+
+                int maxw = 0;
+                for (int d = 0; d < n_all; d++) {
+                    int w = (int)strlen(all[d].name);
+                    if (w > maxw) maxw = w;
+                }
+
+                /* Sort alphabetically by device name */
+                for (int i = 1; i < n_all; i++) {
+                    DevEntry tmp = all[i];
+                    int j = i - 1;
+                    while (j >= 0 && strcmp(all[j].name, tmp.name) > 0) {
+                        all[j + 1] = all[j];
+                        j--;
+                    }
+                    all[j + 1] = tmp;
+                }
+
+                printf("Available devices:\n");
+                for (int d = 0; d < n_all; d++)
+                    printf("  %-*s  %s\n", maxw, all[d].name, all[d].desc);
                 SDL_Quit(); return 0;
             }
             if (strcmp(name, "fds") == 0) {
