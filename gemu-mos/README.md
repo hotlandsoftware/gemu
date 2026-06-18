@@ -58,7 +58,6 @@ Simulated machines include:
 | c128 | `Commodore 128` | 1985 |
 | pet | `Commodore PET` | 1977 |
 | vic20 | `Commodore VIC-20` | 1980 |
-| kim1 | `KIM-1` | 1976 |
 | challenger | `Ohio Scientific Challenger 4P` | 1979 |
 | orao | `Orao (Yugoslavia)` | 1984 |
 | sfc | `Super Famicom` | 1991 |
