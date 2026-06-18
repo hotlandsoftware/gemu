@@ -147,6 +147,16 @@ static const struct { int x, y, w, h; } seg_rects[8] = {
 #define COLOUR_KEY_LIT    0xFF8A7A50u  /* key pressed highlight   */
 #define COLOUR_KEY_TEXT   0xFFFFFFFFu  /* key label text          */
 
+static const uint32_t kim1_vnc_palette[] = {
+    0x000000u, /* background */
+    0x301010u, /* LED off    */
+    0xFF2020u, /* LED lit    */
+    0x3F3F3Fu, /* key border */
+    0x6A6A68u, /* key body   */
+    0x8A7A50u, /* key active */
+    0xFFFFFFu, /* key text   */
+};
+
 /* ── Framebuffer helpers ────────────────────────────────────────────────── */
 
 static void fill_rect(uint32_t *fb, int fb_w, int x, int y,
@@ -167,6 +177,39 @@ static void draw_rect_border(uint32_t *fb, int fb_w, int x, int y,
     fill_rect(fb, fb_w, x, y + h - t, w, t, c);     /* bottom */
     fill_rect(fb, fb_w, x, y + t, t, h - 2 * t, c); /* left   */
     fill_rect(fb, fb_w, x + w - t, y + t, t, h - 2 * t, c); /* right */
+}
+
+static uint8_t kim1_vnc_index(uint32_t argb) {
+    uint32_t rgb = argb & 0x00FFFFFFu;
+    switch (rgb) {
+    case 0x000000u: return 0;
+    case 0x301010u: return 1;
+    case 0xFF2020u: return 2;
+    case 0x3F3F3Fu: return 3;
+    case 0x6A6A68u: return 4;
+    case 0x8A7A50u: return 5;
+    case 0xFFFFFFu: return 6;
+    default:
+        if (((rgb >> 16) & 0xFFu) > 0xC0u && (rgb & 0xFFFFu) < 0x8080u)
+            return 2;
+        if ((rgb & 0xFFu) > 0xC0u && ((rgb >> 8) & 0xFFu) > 0xC0u)
+            return 6;
+        return 0;
+    }
+}
+
+static void kim1_update_vnc(Kim1State *s) {
+    if (!s->vnc) return;
+
+    for (int y = 0; y < KIM1_PRESENT_HEIGHT; y++) {
+        int sy = y * KIM1_FB_HEIGHT / KIM1_PRESENT_HEIGHT;
+        for (int x = 0; x < KIM1_PRESENT_WIDTH; x++) {
+            int sx = x * KIM1_FB_WIDTH / KIM1_PRESENT_WIDTH;
+            s->vnc_fb[y * KIM1_PRESENT_WIDTH + x] =
+                kim1_vnc_index(s->fb[sy * KIM1_FB_WIDTH + sx]);
+        }
+    }
+    gemu_vnc_update(s->vnc, s->vnc_fb, KIM1_PRESENT_WIDTH, KIM1_PRESENT_HEIGHT);
 }
 
 /* ── Font rendering ─────────────────────────────────────────────────────── */
@@ -310,6 +353,9 @@ static void kim1_queue_keypress(Kim1State *s, uint32_t newly_pressed) {
             mos6502_reset(&s->cpu);
             kim1_reset_rriots(s);
         } else if (bit == KIM1_ACT_ST) {
+            if (s->kim_running_user)
+                s->kim_saved_pc = s->cpu.PC;
+            s->kim_running_user = false;
             s->cpu.nmi = true;
         }
         return;
@@ -335,6 +381,18 @@ static uint32_t kim1_raw_key_to_action(uint32_t cp) {
     }
 }
 
+static void kim1_poll_vnc(Kim1State *s) {
+    if (!s->vnc) return;
+
+    GemuVncKeyEvent ev;
+    while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
+        if (!ev.down)
+            continue;
+        uint32_t action = kim1_raw_key_to_action(ev.keysym);
+        kim1_queue_keypress(s, action);
+    }
+}
+
 static void kim1_set_a_nz(Kim1State *s, uint8_t v) {
     s->cpu.A = v;
     s->cpu.P = (uint8_t)((s->cpu.P & ~(MOS6502_P_N | MOS6502_P_Z))
@@ -350,7 +408,15 @@ static void kim1_panel_refresh(Kim1State *s) {
     kim1_update_monitor_display(s);
 }
 
+static void kim1_display_blank(Kim1State *s) {
+    for (int i = 0; i < KIM1_NUM_DIGITS; i++)
+        s->seg_cache[i] = 0;
+}
+
 static void kim1_panel_command(Kim1State *s, uint8_t key) {
+    if (s->kim_running_user && key != 0x15 && key != 0x16)
+        return;
+
     if (key <= 0x0F) {
         if (s->kim_address_mode) {
             s->kim_panel_addr = (uint16_t)((s->kim_panel_addr << 4) | key);
@@ -376,10 +442,13 @@ static void kim1_panel_command(Kim1State *s, uint8_t key) {
         kim1_panel_refresh(s);
         break;
     case 0x13: /* GO */
+        s->kim_saved_pc = s->kim_panel_addr;
         s->cpu.PC = s->kim_panel_addr;
+        s->kim_running_user = true;
+        kim1_display_blank(s);
         break;
     case 0x14: /* PC */
-        s->kim_panel_addr = s->cpu.PC;
+        s->kim_panel_addr = s->kim_saved_pc;
         s->kim_address_mode = true;
         kim1_panel_refresh(s);
         break;
@@ -467,6 +536,8 @@ static void kim1_reset_rriots(Kim1State *s) {
     s->kim_key_number = 0x15u;
     s->kim_address_mode = true;
     s->kim_panel_addr = 0x0000u;
+    s->kim_saved_pc = 0x0000u;
+    s->kim_running_user = false;
 
     /* 6530-003 (u2, addr 0x1700): application I/O */
     s->u2 = (Kim1Rriot){0};
@@ -577,7 +648,8 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
 
     if (a >= 0x1800u) {
         if (a == 0x1F1Fu) {
-            kim1_update_monitor_display(s);
+            if (!s->kim_running_user)
+                kim1_update_monitor_display(s);
             s->cpu.PC = 0x1F44u;
             return 0xEAu;
         }
@@ -760,8 +832,8 @@ Kim1State *kim1_create(const MosConfig *cfg) {
                 .fb_width    = KIM1_FB_WIDTH,
                 .fb_height   = KIM1_FB_HEIGHT,
                 .scale       = cfg->display_scale,
-                .window_width  = KIM1_FB_WIDTH * 3 / 4,
-                .window_height = KIM1_FB_HEIGHT * 3 / 4,
+                .window_width  = KIM1_PRESENT_WIDTH,
+                .window_height = KIM1_PRESENT_HEIGHT,
                 .renderer    = cfg->display_renderer,
                 .actions     = kim1_actions,
                 .n_actions   = KIM1_NUM_ACTIONS,
@@ -771,6 +843,15 @@ Kim1State *kim1_create(const MosConfig *cfg) {
             fprintf(stderr, "gemu-kim1: failed to create display window\n");
     }
 
+    if (cfg->vnc_addr) {
+        s->vnc = gemu_vnc_create(cfg->vnc_addr, KIM1_PRESENT_WIDTH, KIM1_PRESENT_HEIGHT);
+        if (s->vnc)
+            gemu_vnc_set_palette(s->vnc, kim1_vnc_palette,
+                                 (int)(sizeof(kim1_vnc_palette) / sizeof(kim1_vnc_palette[0])));
+        else
+            fprintf(stderr, "gemu-kim1: failed to start VNC at %s\n", cfg->vnc_addr);
+    }
+
     kim1_reset_rriots(s);
     mos6502_reset(&s->cpu);
     return s;
@@ -778,6 +859,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
 
 void kim1_destroy(Kim1State *s) {
     gemu_display_destroy(s->display);
+    gemu_vnc_destroy(s->vnc);
     gemu_monitor_destroy(s->monitor);
     free(s);
 }
@@ -813,6 +895,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
                 kim1_reset_rriots(s);
             }
         }
+        kim1_poll_vnc(s);
 
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
@@ -837,10 +920,13 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
         }
 
 
-        if (s->display) {
+        if (s->display || s->vnc) {
             kim1_render_fb(s);
-            gemu_display_render(s->display, s->fb,
-                                KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
+            if (s->display)
+                gemu_display_render(s->display, s->fb,
+                                    KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
+            if (s->vnc)
+                kim1_update_vnc(s);
         }
 
         kim1_sleep_ms(KIM1_FRAME_MS);

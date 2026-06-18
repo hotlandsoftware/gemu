@@ -29,7 +29,7 @@ Simulated machines include:
 |--------|---------------|---------|---------|-------|-------|-------|
 | famicom | `Nintendo Family Computer` | 1983  | 🟢 | 🟢 | 🟢 | imperfect | 
 | generic | `Generic MOS-compatible machine` | N/A | 🔴 | 🔴 | 🔴 | imperfect | 
-| kim1 | `MOS KIM-1` | 1976 | 🟠 | 🟠 | 🔴 | imperfect | 
+| kim1 | `MOS KIM-1` | 1976 | 🟠 | 🔴 | 🔴 | imperfect | 
 | nes | `Nintendo Entertainment System (NTSC)` | 1985 | 🟢 | 🟢 | 🟢 | imperfect | 
 | nespal | `Nintendo Entertainment System (PAL)` | 1986 | 🟢 | 🟢 | 🟢 | imperfect | 
 

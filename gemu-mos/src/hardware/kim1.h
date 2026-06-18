@@ -3,6 +3,7 @@
 #include "mos6502cfg.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
+#include "gemu/vnc.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -53,6 +54,9 @@
 #define KIM1_KEYPAD_ROWS  6
 #define KIM1_KEYPAD_COLS  4
 #define KIM1_KEYPAD_Y    205
+
+#define KIM1_PRESENT_WIDTH   346
+#define KIM1_PRESENT_HEIGHT  640
 
 /* ── 6530 register offsets ──────────────────────────────────────────────── */
 
@@ -128,8 +132,12 @@ typedef struct Kim1State {
     uint8_t          kim_key_number;
     bool             kim_address_mode;
     uint16_t         kim_panel_addr;
+    uint16_t         kim_saved_pc;
+    bool             kim_running_user;
     bool             has_keypad;        /* -device kim-keypad → render visual keypad */
     GemuDisplay     *display;
+    GemuVncServer   *vnc;
+    uint8_t          vnc_fb[KIM1_PRESENT_WIDTH * KIM1_PRESENT_HEIGHT];
 
     GemuMonitor     *monitor;
 } Kim1State;
