@@ -3,6 +3,7 @@
 #include "mos6502cfg.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
+#include "gemu/serial.h"
 #include "gemu/vnc.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -140,6 +141,8 @@ typedef struct Kim1State {
     uint8_t          vnc_fb[KIM1_PRESENT_WIDTH * KIM1_PRESENT_HEIGHT];
 
     GemuMonitor     *monitor;
+
+    GemuSerial      *serial;            /* NULL if no serial terminal attached */
 } Kim1State;
 
 Kim1State *kim1_create (const MosConfig *cfg);

@@ -4,6 +4,7 @@
 #include "hardware/kim1.h"
 #include "hardware/nes_devices.h"
 #include "hardware/kim_devices.h"
+#include "hardware/vt100.h"
 #include "hardware/romdb.h"
 #include "gemu/gemu.h"
 #include "gemu/args.h"
@@ -116,6 +117,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    bool want_vt100 = false;
+
     MosConfig cfg = {
         .machine      = MOS_MACHINE_GENERIC,
         .cpu          = MOS_CPU_6502,
@@ -205,7 +208,7 @@ int main(int argc, char *argv[]) {
                 int n_nes = 0, n_kim = 0;
                 const NesDeviceDesc *ndevs = nes_device_list(&n_nes);
                 const KimDeviceDesc *kdevs = kim_device_list(&n_kim);
-                int maxw = (int)strlen("fds");
+                int maxw = (int)strlen("vt100");
                 for (int d = 0; d < n_nes; d++) {
                     int w = (int)strlen(ndevs[d].name);
                     if (w > maxw) maxw = w;
@@ -216,6 +219,7 @@ int main(int argc, char *argv[]) {
                 }
                 printf("Available devices:\n");
                 printf("  %-*s  Famicom Disk System\n", maxw, "fds");
+                printf("  %-*s  DEC VT100 serial terminal (second window)\n", maxw, "vt100");
                 for (int d = 0; d < n_nes; d++)
                     printf("  %-*s  %s\n", maxw, ndevs[d].name, ndevs[d].desc);
                 for (int d = 0; d < n_kim; d++)
@@ -224,6 +228,8 @@ int main(int argc, char *argv[]) {
             }
             if (strcmp(name, "fds") == 0) {
                 cfg.fds_enabled = true;
+            } else if (strcmp(name, "vt100") == 0) {
+                want_vt100 = true;
             } else if (strcmp(name, "kim-keypad") == 0) {
                 cfg.kim_keyboard = true;
             } else {
@@ -331,25 +337,36 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Create serial terminal if requested — any machine can use it. */
+    Vt100State *vt100 = NULL;
+    GemuSerial  vt100_serial;
+    if (want_vt100) {
+        vt100 = vt100_create(cfg.display_type);
+        if (!vt100) { SDL_Quit(); return 1; }
+        vt100_as_serial(vt100, &vt100_serial);
+        cfg.serial = &vt100_serial;
+    }
+
     int rc = 0;
     if (cfg.machine == MOS_MACHINE_NES) {
         NesState *s = nes_create(&cfg);
-        if (!s) { SDL_Quit(); return 1; }
+        if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
         s->ppu.debug = cfg.ppu_debug;
         nes_run(s, &cfg);
         nes_destroy(s);
     } else if (cfg.machine == MOS_MACHINE_KIM1) {
         Kim1State *s = kim1_create(&cfg);
-        if (!s) { SDL_Quit(); return 1; }
+        if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
         kim1_run(s, &cfg);
         kim1_destroy(s);
     } else {
         MosGenericState *s = mos_generic_create(&cfg);
-        if (!s) { SDL_Quit(); return 1; }
+        if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
         mos_generic_run(s, &cfg);
         mos_generic_destroy(s);
     }
 
+    vt100_destroy(vt100);
     SDL_Quit();
     return rc;
 }

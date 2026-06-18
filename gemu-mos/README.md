@@ -2,12 +2,11 @@
 MOS 65xx microprocessor emulator. 
 
 Currently emulated hardware for this machine:
-
 ## CPUs
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|
 | 2a03 | `Ricoh 2A03` | working |  |
-| 6501 | `MOS Technology 6501` | working | |
+| 6501 | `MOS Technology 6501` | working | Extremely rare early version of 6502,  pin-compatible with Motorola 6800 |
 | 6502 | `MOS Technology 6502` | working | |
 
 ## VGA
@@ -18,8 +17,17 @@ Currently emulated hardware for this machine:
 ## Sound Cards
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|
-| 2a03 | `Ricoh 2A03` | imperfect | supports MIDI playback via `2a03,outpu=midi` |
+| 2a03 | `Ricoh 2A03` | imperfect | supports MIDI playback via `2a03,output=midi` |
 
+## Devices
+| Name   | Full Name     | Status | Notes |
+|--------|---------------|---------|---------|
+| fds | `Famicom Disk System` | working |  |
+| famicom-keyboard | `Famicom 72-key Keyboard` | working |  |
+| kim-keypad | `KIM-1 hex keypad` | working |  |
+| nes-controller | `NES/Famicom Standard Controller` | working |  |
+| vt100 | `DEC VT100 serial terminal` | working |  |
+| zapper | `NES Zapper (light gun)` | working |  |
 
 # Machines
 

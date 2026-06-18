@@ -112,6 +112,7 @@ TARGETS = {
             'gemu-mos/src/hardware/machine_generic.c',
             'gemu-mos/src/hardware/machine_nes.c',
             'gemu-mos/src/hardware/machine_kim1.c',
+            'gemu-mos/src/hardware/vt100.c',
             'gemu-mos/src/hardware/fds.c',
             'gemu-mos/src/hardware/fds_hle.c',
             'gemu-mos/src/hardware/nes_devices.c',
@@ -231,6 +232,20 @@ def main():
             else:
                 print('  (epoxy not found — building without GTK)')
                 want_gtk = False
+
+    # SDL2_ttf (for VT100 terminal, mos target)
+    have_ttf  = False
+    ttf_cflags = []
+    ttf_libs   = []
+    if 'mos' in targets and args.sdl:
+        cf = pkg('SDL2_ttf', '--cflags', *pkg_flags)
+        lf = pkg('SDL2_ttf', '--libs',   *pkg_flags)
+        if check('SDL2_ttf (VT100)', lf):
+            have_ttf   = True
+            ttf_cflags = cf or []
+            ttf_libs   = lf
+        else:
+            die('SDL2_ttf not found — install libsdl2-ttf-dev (required for VT100 terminal)')
 
     # ALSA (for NES MIDI output, mos target only, Linux optional)
     have_alsa  = False
@@ -353,6 +368,8 @@ def main():
             ld_parts += caca_libs
         elif have_curses and td['has_curses']:
             ld_parts += curses_flags
+        if tname == 'mos' and have_ttf:
+            ld_parts += ttf_libs
         if tname == 'mos' and have_alsa:
             ld_parts += alsa_libs
         if on_windows:

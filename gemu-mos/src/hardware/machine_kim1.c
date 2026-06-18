@@ -2,6 +2,7 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "kim1.h"
+#include <SDL2/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -664,6 +665,30 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
             s->cpu.PC = 0x1F8Fu;
             return 0xEAu;
         }
+        /* OUTCH: CPU about to execute at $1EA0 — output char in A to serial terminal */
+        if (s->serial && a == 0x1EA0u) {
+            s->serial->write_byte(s->serial->ud, s->cpu.A);
+            s->cpu.PC = 0x1ED4u;   /* skip to OUTCH's RTS */
+            return 0xEAu;
+        }
+        /* GETCH: CPU about to execute at $1E5A — read char from serial terminal (blocking) */
+        if (s->serial && a == 0x1E5Au) {
+            while (!s->serial->key_available(s->serial->ud)) {
+                s->serial->poll(s->serial->ud);
+                if (s->serial->should_quit(s->serial->ud)) break;
+                if (s->display) {
+                    gemu_display_poll(s->display);
+                    if (gemu_display_should_quit(s->display)) break;
+                    kim1_render_fb(s);
+                    gemu_display_render(s->display, s->fb,
+                                        KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
+                }
+                SDL_Delay(1);
+            }
+            kim1_set_a_nz(s, s->serial->read_byte(s->serial->ud));
+            s->cpu.PC = 0x1E88u;   /* skip to GETCH's RTS */
+            return 0xEAu;
+        }
         if (a < 0x1C00u) return s->rom_002[a - 0x1800u];
         return s->rom_003[a - 0x1C00u];
     }
@@ -853,6 +878,8 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     }
 
     kim1_reset_rriots(s);
+    s->serial = cfg->serial;
+
     mos6502_reset(&s->cpu);
     return s;
 }
@@ -877,6 +904,14 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
     bool quit = false;
     while (!quit) {
 
+        /* Serial terminal must poll first: it batch-collects SDL events and
+         * pushes non-terminal events back so gemu_display_poll sees them. */
+        if (s->serial) {
+            s->serial->poll(s->serial->ud);
+            if (s->serial->should_quit(s->serial->ud))
+                quit = true;
+        }
+
         s->keypad_held = 0;
         if (s->display) {
             uint32_t held = gemu_display_poll(s->display) | kim1_pointer_key(s);
@@ -884,6 +919,11 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
             uint32_t cp;
             while ((cp = gemu_display_pop_raw_key(s->display)) != 0)
                 raw_pressed |= kim1_raw_key_to_action(cp);
+            /* Drain chars forwarded by the terminal (SDL_TEXTINPUT events that
+             * could not be pushed back via SDL_PushEvent on SDL3-compat). */
+            if (s->serial && s->serial->pop_forwarded)
+                while ((cp = s->serial->pop_forwarded(s->serial->ud)) != 0)
+                    raw_pressed |= kim1_raw_key_to_action(cp);
             s->keypad_held = held;
             kim1_queue_keypress(s, (held & ~s->keypad_prev) | raw_pressed);
             s->keypad_prev = held;
