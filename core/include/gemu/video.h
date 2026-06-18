@@ -49,6 +49,8 @@ typedef struct {
     int             width;
     int             height;
     int             scale;
+    int             window_width;
+    int             window_height;
     const uint32_t *palette;
     int             n_colors;
     GemuMonitor    *monitor;

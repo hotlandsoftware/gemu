@@ -16,6 +16,8 @@ struct GemuVideoGtk {
     int              width;
     int              height;
     int              scale;
+    int              window_width;
+    int              window_height;
     bool             active;
     /* OpenGL */
     GLuint           tex;
@@ -122,8 +124,8 @@ static void gl_setup(GemuVideoGtk *v) {
     /* Texture */
     glGenTextures(1, &v->tex);
     glBindTexture(GL_TEXTURE_2D, v->tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, v->width, v->height,
@@ -165,8 +167,8 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *ctx, gpointer data) {
     GemuVideoGtk *v = data;
     if (!v->gl_ready) return TRUE;
 
-    int w = v->width  * v->scale;
-    int h = v->height * v->scale;
+    int w = gtk_widget_get_allocated_width(GTK_WIDGET(area));
+    int h = gtk_widget_get_allocated_height(GTK_WIDGET(area));
 
     glViewport(0, 0, w, h);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -194,6 +196,10 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     v->width    = spec->width;
     v->height   = spec->height;
     v->scale    = spec->scale > 0 ? spec->scale : 1;
+    v->window_width  = spec->window_width  > 0 ? spec->window_width
+                                                : v->width * v->scale;
+    v->window_height = spec->window_height > 0 ? spec->window_height
+                                                : v->height * v->scale;
     v->palette  = spec->palette;
     v->n_colors = spec->n_colors;
 
@@ -219,8 +225,8 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     /* GL area */
     v->gl_area = gtk_gl_area_new();
     gtk_widget_set_size_request(v->gl_area,
-                                v->width * v->scale,
-                                v->height * v->scale);
+                                v->window_width,
+                                v->window_height);
     gtk_gl_area_set_required_version(GTK_GL_AREA(v->gl_area), 3, 2);
     gtk_box_pack_start(GTK_BOX(vbox), v->gl_area, TRUE, TRUE, 0);
 

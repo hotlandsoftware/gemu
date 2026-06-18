@@ -24,35 +24,35 @@
  *
  * Framebuffer layout (when visual keypad is enabled via -device kim-keypad):
  *   ┌──────────────────────────────────────┐
- *   │   ─── ─── ─── ─── ─── ───   [█]     │  ← 7-segment LED + blink cursor
+ *   │   ─── ─── ─── ───  ─── ───          │  ← 7-segment LED display
  *   │                                      │
- *   │  [ 0] [ 1] [ 2] [ 3]                │  ← keypad (6 rows × 4 cols)
- *   │  [ 4] [ 5] [ 6] [ 7]                │
- *   │  [ 8] [ 9] [ A] [ B]                │
- *   │  [ C] [ D] [ E] [ F]                │
+ *   │  [GO] [ST] [RS] [SST]               │  ← physical keypad layout
  *   │  [AD] [DA] [PC] [ +]                │
- *   │  [GO] [ST] [RS]                     │
+ *   │  [ C] [ D] [ E] [ F]                │
+ *   │  [ 8] [ 9] [ A] [ B]                │
+ *   │  [ 4] [ 5] [ 6] [ 7]                │
+ *   │  [ 0] [ 1] [ 2] [ 3]                │
  *   └──────────────────────────────────────┘
  */
 
 /* ── Framebuffer geometry ───────────────────────────────────────────────── */
 
-#define KIM1_FB_WIDTH    440
-#define KIM1_FB_HEIGHT   430
+#define KIM1_FB_WIDTH    520
+#define KIM1_FB_HEIGHT   960
 
 /* 7-segment digits */
 #define KIM1_NUM_DIGITS  6
-#define KIM1_DIGIT_W     50
-#define KIM1_DIGIT_H     90
-#define KIM1_DIGIT_GAP   10
+#define KIM1_DIGIT_W     72
+#define KIM1_DIGIT_H     110
+#define KIM1_DIGIT_GAP    6
 
 /* Visual keypad */
-#define KIM1_KEY_W       62
-#define KIM1_KEY_H       42
-#define KIM1_KEY_GAP      6
+#define KIM1_KEY_W       102
+#define KIM1_KEY_H       104
+#define KIM1_KEY_GAP      26
 #define KIM1_KEYPAD_ROWS  6
 #define KIM1_KEYPAD_COLS  4
-#define KIM1_KEYPAD_Y    140
+#define KIM1_KEYPAD_Y    205
 
 /* ── 6530 register offsets ──────────────────────────────────────────────── */
 
@@ -123,6 +123,9 @@ typedef struct Kim1State {
     uint8_t          seg_cache[KIM1_NUM_DIGITS]; /* segment patterns cached from Port A/B writes */
     uint32_t         fb[KIM1_FB_WIDTH * KIM1_FB_HEIGHT];
     uint32_t         keypad_held;
+    uint32_t         keypad_prev;
+    bool             kim_key_pending;
+    uint8_t          kim_key_number;
     bool             has_keypad;        /* -device kim-keypad → render visual keypad */
     GemuDisplay     *display;
 

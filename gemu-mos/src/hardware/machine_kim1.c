@@ -18,48 +18,35 @@ static inline void kim1_sleep_ms(unsigned ms) {
 }
 #endif
 
-/* ── Keyboard state builder ──────────────────────────────────────────────── */
+static void kim1_reset_rriots(Kim1State *s);
 
-static void kim1_update_keys(Kim1State *s, GemuDisplay *d) {
-    if (!d) return;
+/* ── KIM-1 keypad action table ──────────────────────────────────────────── */
 
-    bool shift = gemu_display_is_key_held(d, "Left Shift")
-              || gemu_display_is_key_held(d, "Right Shift");
-
-    uint32_t held = 0;
-
-    /* Hex digits 0–9 */
-    if (gemu_display_is_key_held(d, "0")) held |= KIM1_ACT_0;
-    if (gemu_display_is_key_held(d, "1")) held |= KIM1_ACT_1;
-    if (gemu_display_is_key_held(d, "2")) held |= KIM1_ACT_2;
-    if (gemu_display_is_key_held(d, "3")) held |= KIM1_ACT_3;
-    if (gemu_display_is_key_held(d, "4")) held |= KIM1_ACT_4;
-    if (gemu_display_is_key_held(d, "5")) held |= KIM1_ACT_5;
-    if (gemu_display_is_key_held(d, "6")) held |= KIM1_ACT_6;
-    if (gemu_display_is_key_held(d, "7")) held |= KIM1_ACT_7;
-    if (gemu_display_is_key_held(d, "8")) held |= KIM1_ACT_8;
-    if (gemu_display_is_key_held(d, "9")) held |= KIM1_ACT_9;
-
-    /* Hex A–F: lowercase a-f → hex digit; Shift+a → AD, Shift+d → DA */
-    if (gemu_display_is_key_held(d, "a")) held |= shift ? KIM1_ACT_AD : KIM1_ACT_A;
-    if (gemu_display_is_key_held(d, "b")) held |= KIM1_ACT_B;
-    if (gemu_display_is_key_held(d, "c")) held |= KIM1_ACT_C;
-    if (gemu_display_is_key_held(d, "d")) held |= shift ? KIM1_ACT_DA : KIM1_ACT_D;
-    if (gemu_display_is_key_held(d, "e")) held |= KIM1_ACT_E;
-    if (gemu_display_is_key_held(d, "f")) held |= KIM1_ACT_F;
-
-    /* Function keys — p/g/s/r (both cases hit the same physical key) */
-    if (gemu_display_is_key_held(d, "p")) held |= KIM1_ACT_PC;
-    if (gemu_display_is_key_held(d, "g")) held |= KIM1_ACT_GO;
-    if (gemu_display_is_key_held(d, "s")) held |= KIM1_ACT_ST;
-    if (gemu_display_is_key_held(d, "r")) held |= KIM1_ACT_RS;
-
-    /* + key: the = physical key (SDL maps + to the same scancode) or Keypad + */
-    if (gemu_display_is_key_held(d, "+") || gemu_display_is_key_held(d, "Keypad +"))
-        held |= KIM1_ACT_PLUS;
-
-    s->keypad_held = held;
-}
+static const GemuActionDef kim1_actions[KIM1_NUM_ACTIONS] = {
+    { "0",    KIM1_ACT_0,    "0" },
+    { "1",    KIM1_ACT_1,    "1" },
+    { "2",    KIM1_ACT_2,    "2" },
+    { "3",    KIM1_ACT_3,    "3" },
+    { "4",    KIM1_ACT_4,    "4" },
+    { "5",    KIM1_ACT_5,    "5" },
+    { "6",    KIM1_ACT_6,    "6" },
+    { "7",    KIM1_ACT_7,    "7" },
+    { "8",    KIM1_ACT_8,    "8" },
+    { "9",    KIM1_ACT_9,    "9" },
+    { "A",    KIM1_ACT_A,    "a" },
+    { "B",    KIM1_ACT_B,    "b" },
+    { "C",    KIM1_ACT_C,    "c" },
+    { "D",    KIM1_ACT_D,    "d" },
+    { "E",    KIM1_ACT_E,    "e" },
+    { "F",    KIM1_ACT_F,    "f" },
+    { "AD",   KIM1_ACT_AD,   "<" },
+    { "DA",   KIM1_ACT_DA,   ">" },
+    { "PC",   KIM1_ACT_PC,   "p" },
+    { "+",    KIM1_ACT_PLUS, "+" },
+    { "GO",   KIM1_ACT_GO,   "g" },
+    { "ST",   KIM1_ACT_ST,   "s" },
+    { "RS",   KIM1_ACT_RS,   "r" },
+};
 
 /* ── Hardware keyboard matrix (4 rows × 6 columns) ──────────────────────── *
  * Row selected by 74145 decoder (PB1-PB4 of u3): decoder values 0-3 = rows.
@@ -80,23 +67,23 @@ static const uint32_t hw_keymap[4][6] = {
 
 /* ── Visual keypad layout (6 rows × 4 cols) for on-screen rendering ──────── */
 static const uint32_t keypad_matrix[6][4] = {
-    { KIM1_ACT_0,   KIM1_ACT_1,   KIM1_ACT_2,   KIM1_ACT_3   },
-    { KIM1_ACT_4,   KIM1_ACT_5,   KIM1_ACT_6,   KIM1_ACT_7   },
-    { KIM1_ACT_8,   KIM1_ACT_9,   KIM1_ACT_A,   KIM1_ACT_B   },
-    { KIM1_ACT_C,   KIM1_ACT_D,   KIM1_ACT_E,   KIM1_ACT_F   },
+    { KIM1_ACT_GO,  KIM1_ACT_ST,  KIM1_ACT_RS,  0             },
     { KIM1_ACT_AD,  KIM1_ACT_DA,  KIM1_ACT_PC,  KIM1_ACT_PLUS },
-    { KIM1_ACT_GO,  KIM1_ACT_ST,  KIM1_ACT_RS,  0            },
+    { KIM1_ACT_C,   KIM1_ACT_D,   KIM1_ACT_E,   KIM1_ACT_F    },
+    { KIM1_ACT_8,   KIM1_ACT_9,   KIM1_ACT_A,   KIM1_ACT_B    },
+    { KIM1_ACT_4,   KIM1_ACT_5,   KIM1_ACT_6,   KIM1_ACT_7    },
+    { KIM1_ACT_0,   KIM1_ACT_1,   KIM1_ACT_2,   KIM1_ACT_3    },
 };
 
 /* ── Key labels (for visual rendering) ──────────────────────────────────── */
 
 static const char *key_labels[6][4] = {
-    {"0",  "1",  "2",  "3" },
-    {"4",  "5",  "6",  "7" },
-    {"8",  "9",  "A",  "B" },
-    {"C",  "D",  "E",  "F" },
+    {"GO", "ST", "RS", "SST"},
     {"AD", "DA", "PC", "+" },
-    {"GO", "ST", "RS", NULL},
+    {"C",  "D",  "E",  "F" },
+    {"8",  "9",  "A",  "B" },
+    {"4",  "5",  "6",  "7" },
+    {"0",  "1",  "2",  "3" },
 };
 
 /* ── 5×7 bitmap font (7 bytes per char, MSB = leftmost pixel) ─────────────
@@ -133,28 +120,28 @@ static const uint8_t font_data[128][FONT_H] = {
     ['T'] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
 };
 
-/* ── 7-segment segment geometry (scaled for KIM1_DIGIT_W=50, KIM1_DIGIT_H=90) */
+/* ── 7-segment segment geometry (scaled for KIM1_DIGIT_W=72, KIM1_DIGIT_H=110) */
 
 static const struct { int x, y, w, h; } seg_rects[8] = {
-    {10,  2, 30,  8},  /* a — top horizontal       */
-    {33,  5,  5, 34},  /* b — top right vertical    */
-    {33, 44,  5, 34},  /* c — bottom right vertical */
-    {10, 80, 30,  8},  /* d — bottom horizontal     */
-    { 5, 44,  5, 34},  /* e — bottom left vertical  */
-    { 5,  5,  5, 34},  /* f — top left vertical     */
-    {10, 40, 30,  8},  /* g — middle horizontal     */
-    {40, 78,  8,  8},  /* dp — decimal point        */
+    {12,   4, 48, 10},  /* a — top horizontal       */
+    {58,  12,  8, 42},  /* b — top right vertical    */
+    {58,  60,  8, 42},  /* c — bottom right vertical */
+    {12, 100, 48, 10},  /* d — bottom horizontal     */
+    { 6,  60,  8, 42},  /* e — bottom left vertical  */
+    { 6,  12,  8, 42},  /* f — top left vertical     */
+    {12,  52, 48, 10},  /* g — middle horizontal     */
+    {66, 100,  8,  8},  /* dp — decimal point        */
 };
 
 /* ── Colours (0xAARRGGBB) ───────────────────────────────────────────────── */
 
 #define COLOUR_LIT        0xFFFF2020u  /* bright red LED on      */
 #define COLOUR_OFF        0xFF301010u  /* dim red LED off (visible) */
-#define COLOUR_BG         0xFF101010u  /* dark grey background   */
-#define COLOUR_KEY_BG     0xFF282828u  /* key background          */
-#define COLOUR_KEY_BD     0xFF444444u  /* key border              */
-#define COLOUR_KEY_LIT    0xFF604020u  /* key pressed highlight   */
-#define COLOUR_KEY_TEXT   0xFFCCCCCCu  /* key label text          */
+#define COLOUR_BG         0xFF000000u  /* black front panel       */
+#define COLOUR_KEY_BG     0xFF6A6A68u  /* key background          */
+#define COLOUR_KEY_BD     0xFF3F3F3Fu  /* key border              */
+#define COLOUR_KEY_LIT    0xFF8A7A50u  /* key pressed highlight   */
+#define COLOUR_KEY_TEXT   0xFFFFFFFFu  /* key label text          */
 
 /* ── Framebuffer helpers ────────────────────────────────────────────────── */
 
@@ -180,28 +167,29 @@ static void draw_rect_border(uint32_t *fb, int fb_w, int x, int y,
 
 /* ── Font rendering ─────────────────────────────────────────────────────── */
 
-static void draw_char(uint32_t *fb, int fb_w, int x, int y,
-                      char ch, uint32_t colour) {
+static void draw_char_scaled(uint32_t *fb, int fb_w, int x, int y,
+                             char ch, int scale, uint32_t colour) {
     int c = (int)(unsigned char)ch;
-    if (c < 0 || c > 127) return;
+    if (c < 0 || c > 127 || scale <= 0) return;
     const uint8_t *bits = font_data[c];
     if (!bits[0] && !bits[1] && !bits[2] && !bits[3] &&
-        !bits[4] && !bits[5] && !bits[6]) return;  /* empty glyph */
+        !bits[4] && !bits[5] && !bits[6]) return;
 
     for (int row = 0; row < FONT_H; row++) {
         uint8_t b = bits[row];
         for (int col = 0; col < FONT_W; col++) {
             if (b & (0x10u >> col))
-                fb[(y + row) * fb_w + (x + col)] = colour;
+                fill_rect(fb, fb_w, x + col * scale, y + row * scale,
+                          scale, scale, colour);
         }
     }
 }
 
-static void draw_text(uint32_t *fb, int fb_w, int x, int y,
-                      const char *s, uint32_t colour) {
+static void draw_text_scaled(uint32_t *fb, int fb_w, int x, int y,
+                             const char *s, int scale, uint32_t colour) {
     while (*s) {
-        draw_char(fb, fb_w, x, y, *s, colour);
-        x += FONT_W + 1;
+        draw_char_scaled(fb, fb_w, x, y, *s, scale, colour);
+        x += (FONT_W + 1) * scale;
         s++;
     }
 }
@@ -228,20 +216,127 @@ static void draw_keypad(Kim1State *s) {
             uint32_t bit = keypad_matrix[row][col];
             bool pressed = bit && (s->keypad_held & bit);
 
-            /* Key body */
-            fill_rect(fb, fw, kx + 2, ky + 2, kw - 4, kh - 4,
-                      pressed ? COLOUR_KEY_LIT : COLOUR_KEY_BG);
-            /* Border */
-            draw_rect_border(fb, fw, kx, ky, kw, kh, 2,
+            bool inactive = strcmp(label, "SST") == 0;
+            uint32_t key_bg = inactive ? COLOUR_BG :
+                              (pressed ? COLOUR_KEY_LIT : COLOUR_KEY_BG);
+
+            fill_rect(fb, fw, kx + 5, ky + 5, kw - 10, kh - 10, key_bg);
+            draw_rect_border(fb, fw, kx, ky, kw, kh, 5,
                              pressed ? COLOUR_KEY_LIT : COLOUR_KEY_BD);
 
-            /* Label — center in key */
-            int text_w = (int)strlen(label) * (FONT_W + 1) - 1;
+            int scale = (strlen(label) >= 3) ? 4 : ((strlen(label) == 2) ? 5 : 6);
+            int text_w = ((int)strlen(label) * FONT_W +
+                         ((int)strlen(label) - 1)) * scale;
+            int text_h = FONT_H * scale;
             int tx = kx + (kw - text_w) / 2;
-            int ty = ky + (kh - FONT_H) / 2;
-            draw_text(fb, fw, tx, ty, label, COLOUR_KEY_TEXT);
+            int ty = ky + (kh - text_h) / 2;
+            draw_text_scaled(fb, fw, tx, ty, label, scale, COLOUR_KEY_TEXT);
         }
     }
+}
+
+static uint32_t kim1_pointer_key(Kim1State *s) {
+    if (!s->display) return 0;
+
+    GemuPointerState ptr = gemu_display_get_pointer(s->display);
+    if ((!ptr.button && !ptr.pressed) || ptr.x < 0 || ptr.y < 0)
+        return 0;
+
+    int kw = KIM1_KEY_W, kh = KIM1_KEY_H, kg = KIM1_KEY_GAP;
+    int total_w = kw * KIM1_KEYPAD_COLS + kg * (KIM1_KEYPAD_COLS - 1);
+    int ox = (KIM1_FB_WIDTH - total_w) / 2;
+    int oy = KIM1_KEYPAD_Y;
+
+    for (int row = 0; row < KIM1_KEYPAD_ROWS; row++) {
+        for (int col = 0; col < KIM1_KEYPAD_COLS; col++) {
+            uint32_t bit = keypad_matrix[row][col];
+            if (!bit) continue;
+
+            int kx = ox + col * (kw + kg);
+            int ky = oy + row * (kh + kg);
+            if (ptr.x >= kx && ptr.x < kx + kw &&
+                ptr.y >= ky && ptr.y < ky + kh)
+                return bit;
+        }
+    }
+
+    return 0;
+}
+
+static int kim1_action_to_key_number(uint32_t bit) {
+    switch (bit) {
+    case KIM1_ACT_0:    return 0x00;
+    case KIM1_ACT_1:    return 0x01;
+    case KIM1_ACT_2:    return 0x02;
+    case KIM1_ACT_3:    return 0x03;
+    case KIM1_ACT_4:    return 0x04;
+    case KIM1_ACT_5:    return 0x05;
+    case KIM1_ACT_6:    return 0x06;
+    case KIM1_ACT_7:    return 0x07;
+    case KIM1_ACT_8:    return 0x08;
+    case KIM1_ACT_9:    return 0x09;
+    case KIM1_ACT_A:    return 0x0A;
+    case KIM1_ACT_B:    return 0x0B;
+    case KIM1_ACT_C:    return 0x0C;
+    case KIM1_ACT_D:    return 0x0D;
+    case KIM1_ACT_E:    return 0x0E;
+    case KIM1_ACT_F:    return 0x0F;
+    case KIM1_ACT_AD:   return 0x10;
+    case KIM1_ACT_DA:   return 0x11;
+    case KIM1_ACT_PLUS: return 0x12;
+    case KIM1_ACT_GO:   return 0x13;
+    case KIM1_ACT_PC:   return 0x14;
+    default:            return -1;
+    }
+}
+
+static void kim1_queue_keypress(Kim1State *s, uint32_t newly_pressed) {
+    if (!newly_pressed || s->kim_key_pending)
+        return;
+
+    for (int i = 0; i < KIM1_NUM_ACTIONS; i++) {
+        uint32_t bit = 1u << i;
+        if (!(newly_pressed & bit))
+            continue;
+
+        int key = kim1_action_to_key_number(bit);
+        if (key >= 0) {
+            s->kim_key_number = (uint8_t)key;
+            s->kim_key_pending = true;
+        } else if (bit == KIM1_ACT_RS) {
+            mos6502_reset(&s->cpu);
+            kim1_reset_rriots(s);
+        } else if (bit == KIM1_ACT_ST) {
+            s->cpu.nmi = true;
+        }
+        return;
+    }
+}
+
+static uint32_t kim1_raw_key_to_action(uint32_t cp) {
+    if (cp >= '0' && cp <= '9')
+        return 1u << (cp - '0');
+    if (cp >= 'a' && cp <= 'f')
+        return 1u << (10 + cp - 'a');
+    if (cp >= 'A' && cp <= 'F')
+        return 1u << (10 + cp - 'A');
+    switch (cp) {
+    case '<': return KIM1_ACT_AD;
+    case '>': return KIM1_ACT_DA;
+    case 'p': case 'P': return KIM1_ACT_PC;
+    case '+': return KIM1_ACT_PLUS;
+    case 'g': case 'G': return KIM1_ACT_GO;
+    case 's': case 'S': return KIM1_ACT_ST;
+    case 'r': case 'R': return KIM1_ACT_RS;
+    default: return 0;
+    }
+}
+
+static void kim1_set_a_nz(Kim1State *s, uint8_t v) {
+    s->cpu.A = v;
+    s->cpu.P = (uint8_t)((s->cpu.P & ~(MOS6502_P_N | MOS6502_P_Z))
+             | (v == 0 ? MOS6502_P_Z : 0)
+             | (v & 0x80u ? MOS6502_P_N : 0));
 }
 
 /* ── Framebuffer rendering ──────────────────────────────────────────────── */
@@ -261,13 +356,17 @@ void kim1_render_fb(Kim1State *s) {
 
     /* ── 7-segment display ──────────────────────────────────────────── */
 
-    int total_dw = (KIM1_DIGIT_W + KIM1_DIGIT_GAP) * KIM1_NUM_DIGITS - KIM1_DIGIT_GAP;
+    int display_middle_gap = 24;
+    int total_dw = (KIM1_DIGIT_W + KIM1_DIGIT_GAP) * KIM1_NUM_DIGITS -
+                   KIM1_DIGIT_GAP + display_middle_gap;
     int dox = (KIM1_FB_WIDTH - total_dw) / 2;
     int doy = 10;
 
     for (int d = 0; d < KIM1_NUM_DIGITS; d++) {
         uint8_t pat = segs[d];
         int dx = dox + d * (KIM1_DIGIT_W + KIM1_DIGIT_GAP);
+        if (d >= 4)
+            dx += display_middle_gap;
 
         for (int i = 0; i < 8; i++) {
             bool lit = (pat >> i) & 1u;
@@ -309,6 +408,63 @@ static void rriot_timer_start(Kim1Rriot *r, Kim1State *s) {
     r->irq_flag = false;
     rriot_update_irq(s);
     r->next_fire = s->cpu.cycle_count + (uint64_t)rriot_period(r);
+}
+
+/* ── 6530 RRIOT reset state ─────────────────────────────────────────────── */
+
+static void kim1_reset_rriots(Kim1State *s) {
+    s->keypad_prev = 0;
+    s->kim_key_pending = false;
+    s->kim_key_number = 0x15u;
+
+    /* 6530-003 (u2, addr 0x1700): application I/O */
+    s->u2 = (Kim1Rriot){0};
+    s->u2.irq_flag = true;
+
+    /* 6530-002 (u3, addr 0x1740): LED display / keyboard / tape.
+     * PB0=1 (TTY idle-high), DDRB=$3F (PB0-PB5 outputs).
+     * irq_flag=true so the monitor's first BIT $1747 spin exits immediately
+     * rather than looping forever waiting for a timer that hasn't started yet. */
+    s->u3 = (Kim1Rriot){0};
+    s->u3.pb      = 0x01u;
+    s->u3.ddrb    = 0x3Fu;
+    s->u3.irq_flag = true;
+    rriot_update_irq(s);
+}
+
+static uint8_t kim1_hex_to_segments(uint8_t v) {
+    static const uint8_t segs[16] = {
+        0x3Fu, /* 0: a b c d e f     */
+        0x06u, /* 1: b c             */
+        0x5Bu, /* 2: a b d e g       */
+        0x4Fu, /* 3: a b c d g       */
+        0x66u, /* 4: b c f g         */
+        0x6Du, /* 5: a c d f g       */
+        0x7Du, /* 6: a c d e f g     */
+        0x07u, /* 7: a b c           */
+        0x7Fu, /* 8: a b c d e f g   */
+        0x6Fu, /* 9: a b c d f g     */
+        0x77u, /* A: a b c e f g     */
+        0x7Cu, /* b: c d e f g       */
+        0x39u, /* C: a d e f         */
+        0x5Eu, /* d: b c d e g       */
+        0x79u, /* E: a d e f g       */
+        0x71u, /* F: a e f g         */
+    };
+    return segs[v & 0x0Fu];
+}
+
+static void kim1_update_monitor_display(Kim1State *s) {
+    uint8_t fb = s->ram[0xFB];
+    uint8_t fa = s->ram[0xFA];
+    uint8_t f9 = s->ram[0xF9];
+
+    s->seg_cache[0] = kim1_hex_to_segments(fb >> 4);
+    s->seg_cache[1] = kim1_hex_to_segments(fb);
+    s->seg_cache[2] = kim1_hex_to_segments(fa >> 4);
+    s->seg_cache[3] = kim1_hex_to_segments(fa);
+    s->seg_cache[4] = kim1_hex_to_segments(f9 >> 4);
+    s->seg_cache[5] = kim1_hex_to_segments(f9);
 }
 
 /* ── Memory callbacks ────────────────────────────────────────────────────── */
@@ -368,6 +524,22 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
         return s->rriot_ram[a - 0x1780u];
 
     if (a >= 0x1800u) {
+        if (a == 0x1F1Fu) {
+            kim1_update_monitor_display(s);
+            s->cpu.PC = 0x1F44u;
+            return 0xEAu;
+        }
+        if (a == 0x1EFEu) {
+            kim1_set_a_nz(s, s->kim_key_pending ? 0xFFu : 0x00u);
+            s->cpu.PC = 0x1F17u;
+            return 0xEAu;
+        }
+        if (a == 0x1F6Au) {
+            kim1_set_a_nz(s, s->kim_key_pending ? s->kim_key_number : 0x15u);
+            s->kim_key_pending = false;
+            s->cpu.PC = 0x1F8Fu;
+            return 0xEAu;
+        }
         if (a < 0x1C00u) return s->rom_002[a - 0x1800u];
         return s->rom_003[a - 0x1C00u];
     }
@@ -536,15 +708,18 @@ Kim1State *kim1_create(const MosConfig *cfg) {
                 .fb_width    = KIM1_FB_WIDTH,
                 .fb_height   = KIM1_FB_HEIGHT,
                 .scale       = cfg->display_scale,
+                .window_width  = KIM1_FB_WIDTH * 3 / 4,
+                .window_height = KIM1_FB_HEIGHT * 3 / 4,
                 .renderer    = cfg->display_renderer,
-                .actions     = NULL,
-                .n_actions   = 0,
-                .ini_section = NULL,
+                .actions     = kim1_actions,
+                .n_actions   = KIM1_NUM_ACTIONS,
+                .ini_section = "kim-keypad",
             });
         if (!s->display)
             fprintf(stderr, "gemu-kim1: failed to create display window\n");
     }
 
+    kim1_reset_rriots(s);
     mos6502_reset(&s->cpu);
     return s;
 }
@@ -570,15 +745,20 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
 
         s->keypad_held = 0;
         if (s->display) {
-            gemu_display_poll(s->display);
-            kim1_update_keys(s, s->display);
+            uint32_t held = gemu_display_poll(s->display) | kim1_pointer_key(s);
+            uint32_t raw_pressed = 0;
+            uint32_t cp;
+            while ((cp = gemu_display_pop_raw_key(s->display)) != 0)
+                raw_pressed |= kim1_raw_key_to_action(cp);
+            s->keypad_held = held;
+            kim1_queue_keypress(s, (held & ~s->keypad_prev) | raw_pressed);
+            s->keypad_prev = held;
             if (gemu_display_should_quit(s->display))
                 quit = true;
             if (gemu_display_reset_requested(s->display)) {
                 gemu_display_clear_flags(s->display);
                 mos6502_reset(&s->cpu);
-                s->u2 = (Kim1Rriot){0};
-                s->u3 = (Kim1Rriot){0};
+                kim1_reset_rriots(s);
             }
         }
 
@@ -587,8 +767,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
             if      (cmd == GEMU_MON_QUIT)   { quit = true; break; }
             else if (cmd == GEMU_MON_RESET) {
                 mos6502_reset(&s->cpu);
-                s->u2 = (Kim1Rriot){0};
-                s->u3 = (Kim1Rriot){0};
+                kim1_reset_rriots(s);
             }
             else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
         }

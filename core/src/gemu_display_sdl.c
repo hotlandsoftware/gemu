@@ -134,8 +134,10 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             gemu_video_sdl_mouse_logical(b->video,
                                          &d->pointer.x, &d->pointer.y);
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
-                ev.button.button == SDL_BUTTON_LEFT)
+                ev.button.button == SDL_BUTTON_LEFT) {
                 d->pointer.button = true;
+                d->pointer.pressed = true;
+            }
             if (ev.type == SDL_MOUSEBUTTONUP &&
                 ev.button.button == SDL_BUTTON_LEFT)
                 d->pointer.button = false;
