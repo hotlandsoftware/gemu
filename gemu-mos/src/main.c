@@ -58,6 +58,7 @@ static const GemuArgsDef def = {
         "  -start ADDR        Override reset vector and start execution at ADDR\n"
         "  -cartridge FILE    Insert a cartridge\n"
         "  -fda FILE          Insert a floppy disk image\n"
+        "  -tape FILE         Mount a KIM-1 cassette tape image (.kim binary)\n"
         "  -renderer MODE     SDL renderer: auto | software | accelerated (default: auto)\n"
         "  -soundhw CHIP      Sound hardware: none | 2a03"
 #ifdef HAVE_ALSA
@@ -186,6 +187,8 @@ int main(int argc, char *argv[]) {
             cfg.cart_path = rem[++i];
         } else if (strcmp(rem[i], "-fda") == 0 && i + 1 < nrem) {
             cfg.fda_path = rem[++i];
+        } else if (strcmp(rem[i], "-tape") == 0 && i + 1 < nrem) {
+            cfg.tape_path = rem[++i];
         } else if (strcmp(rem[i], "-renderer") == 0 && i + 1 < nrem) {
             const char *mode = rem[++i];
             if (strcmp(mode, "?") == 0) {

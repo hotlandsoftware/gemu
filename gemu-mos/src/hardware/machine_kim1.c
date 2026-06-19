@@ -3,6 +3,7 @@
 #endif
 #include "kim1.h"
 #include <SDL2/SDL.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -394,6 +395,439 @@ static void kim1_poll_vnc(Kim1State *s) {
     }
 }
 
+/* ── Cassette tape I/O ───────────────────────────────────────────────────── *
+ *
+ * KIM-1 binary tape format (used by DUMPT $1800 / LOADT $1873 routines):
+ *   2A  ID  SAL SAH  EAL EAH  <data bytes>  2F  CHKL CHKH  04 04
+ *
+ * Checksum = SAL+SAH+EAL+EAH + sum(data) masked to 16 bits.
+ * Parameters are read/written from RRIOT RAM at $17F5–$17F9.
+ * On success: ram[$FA]=$00, ram[$FB]=$00.  On error: $FF, $FF.
+ * PC is redirected to $1C4F (MONITR entry) after either op.
+ */
+
+#define TAPE_SAL  (s->rriot_ram[0x75])
+#define TAPE_SAH  (s->rriot_ram[0x76])
+#define TAPE_EAL  (s->rriot_ram[0x77])
+#define TAPE_EAH  (s->rriot_ram[0x78])
+#define TAPE_ID   (s->rriot_ram[0x79])
+
+static void tape_ok(Kim1State *s) {
+    s->ram[0xFA] = 0x00;
+    s->ram[0xFB] = 0x00;
+}
+static void tape_fail(Kim1State *s, const char *msg) {
+    fprintf(stderr, "gemu-kim1: tape: %s\n", msg);
+    s->ram[0xFA] = 0xFF;
+    s->ram[0xFB] = 0xFF;
+}
+
+/* ── WAV cassette encode / decode ──────────────────────────────────────────
+ *
+ * KIM-1 FSK timing recovered from 6530-003 ROM ($199E short, $19C4 long):
+ *   Short burst : 9 cycles,  126 µs half-period  → ~3968 Hz
+ *   Long  burst : 6 cycles,  195 µs half-period  → ~2564 Hz
+ *   Bit 0 = SSL  |  Bit 1 = SLL  (LSB-first)
+ *   Sync leader : 100 × 0x16  then start marker 0x2A
+ */
+
+/* ---- encode helpers ---- */
+static void kwav_w16(FILE *f, uint16_t v) { fputc(v&0xFF,f); fputc(v>>8,f); }
+static void kwav_w32(FILE *f, uint32_t v) { kwav_w16(f,v&0xFFFFu); kwav_w16(f,v>>16); }
+
+#define KWAV_SRATE  44100
+#define KWAV_AMP    28000
+#define KWAV_HP_S   6       /* short half-period (samples at 44100) */
+#define KWAV_HP_L   9       /* long  half-period */
+#define KWAV_CY_S   9       /* short burst cycles */
+#define KWAV_CY_L   6       /* long  burst cycles */
+
+static void kwav_burst_enc(FILE *f, int ncyc, int hp, int *pol)
+{
+    for (int h = 0; h < ncyc*2; h++) {
+        int16_t s = (int16_t)(*pol * KWAV_AMP);
+        for (int i = 0; i < hp; i++) kwav_w16(f, (uint16_t)s);
+        *pol = -(*pol);
+    }
+}
+static void kwav_enc_byte(FILE *f, uint8_t byte, int *pol)
+{
+    for (int b = 0; b < 8; b++) {
+        kwav_burst_enc(f, KWAV_CY_S, KWAV_HP_S, pol);
+        if ((byte >> b) & 1) {
+            kwav_burst_enc(f, KWAV_CY_L, KWAV_HP_L, pol);
+            kwav_burst_enc(f, KWAV_CY_L, KWAV_HP_L, pol);
+        } else {
+            kwav_burst_enc(f, KWAV_CY_S, KWAV_HP_S, pol);
+            kwav_burst_enc(f, KWAV_CY_L, KWAV_HP_L, pol);
+        }
+    }
+}
+
+static bool path_ends_wav(const char *p)
+{
+    size_t n = strlen(p);
+    if (n < 4) return false;
+    const char *e = p + n - 4;
+    return e[0]=='.' &&
+           (e[1]=='w'||e[1]=='W') &&
+           (e[2]=='a'||e[2]=='A') &&
+           (e[3]=='v'||e[3]=='V');
+}
+
+static bool kim1_tape_save_wav(Kim1State *s)
+{
+    FILE *fp = fopen(s->cfg->tape_path, "wb");
+    if (!fp) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "cannot write '%s': %s",
+                 s->cfg->tape_path, strerror(errno));
+        tape_fail(s, msg); return false;
+    }
+    uint16_t start = (uint16_t)(TAPE_SAL | ((uint16_t)TAPE_SAH << 8));
+    uint16_t end   = (uint16_t)(TAPE_EAL | ((uint16_t)TAPE_EAH << 8));
+    uint8_t  id    = TAPE_ID;
+    uint16_t cksum = (uint16_t)(TAPE_SAL + TAPE_SAH + TAPE_EAL + TAPE_EAH);
+
+    fwrite("RIFF",1,4,fp); long riff_pos = ftell(fp); kwav_w32(fp,0);
+    fwrite("WAVE",1,4,fp);
+    fwrite("fmt ",1,4,fp); kwav_w32(fp,16);
+    kwav_w16(fp,1); kwav_w16(fp,1);               /* PCM, mono */
+    kwav_w32(fp,KWAV_SRATE); kwav_w32(fp,KWAV_SRATE*2);
+    kwav_w16(fp,2); kwav_w16(fp,16);              /* block align, bps */
+    fwrite("data",1,4,fp); long data_pos = ftell(fp); kwav_w32(fp,0);
+    long data_start = ftell(fp);
+
+    int pol = 1;
+    for (int i = 0; i < 100; i++) kwav_enc_byte(fp, 0x16, &pol);
+    kwav_enc_byte(fp, 0x2A,      &pol);
+    kwav_enc_byte(fp, id,        &pol);
+    kwav_enc_byte(fp, TAPE_SAL,  &pol);
+    kwav_enc_byte(fp, TAPE_SAH,  &pol);
+    kwav_enc_byte(fp, TAPE_EAL,  &pol);
+    kwav_enc_byte(fp, TAPE_EAH,  &pol);
+    if (end >= start) {
+        for (uint32_t a = start; a <= (uint32_t)end; a++) {
+            uint8_t b = kim1_mem_read((uint16_t)a, s);
+            cksum = (uint16_t)(cksum + b);
+            kwav_enc_byte(fp, b, &pol);
+        }
+    }
+    kwav_enc_byte(fp, 0x2F,         &pol);
+    kwav_enc_byte(fp, cksum & 0xFF, &pol);
+    kwav_enc_byte(fp, cksum >> 8,   &pol);
+    kwav_enc_byte(fp, 0x04, &pol);
+    kwav_enc_byte(fp, 0x04, &pol);
+
+    uint32_t dsz = (uint32_t)(ftell(fp) - data_start);
+    fseek(fp, data_pos,  SEEK_SET); kwav_w32(fp, dsz);
+    fseek(fp, riff_pos,  SEEK_SET); kwav_w32(fp, 36 + dsz);
+    fclose(fp);
+
+    printf("gemu-kim1: tape SAVE $%04X–$%04X → %s (WAV, %.1fs)\n",
+           start, end, s->cfg->tape_path, (double)dsz / (KWAV_SRATE*2));
+    tape_ok(s);
+    return true;
+}
+
+/* ---- decode helpers ---- */
+typedef struct {
+    FILE    *fp;
+    uint32_t sr;
+    int      ch, bps;
+    float    thresh;         /* S/L half-cycle threshold (samples) */
+    float    hp_x, hp_y;    /* IIR DC-removal state */
+    int      zx_sign;
+    int      zx_n;
+} KWavDec;
+
+static bool kwav_open(KWavDec *d, FILE *fp)
+{
+    memset(d, 0, sizeof(*d));
+    d->fp = fp;
+    char tag[4]; unsigned char sb[4];
+
+    if (fread(tag,1,4,fp)!=4 || memcmp(tag,"RIFF",4)) return false;
+    fread(sb,1,4,fp); /* skip RIFF size */
+    if (fread(tag,1,4,fp)!=4 || memcmp(tag,"WAVE",4)) return false;
+
+    bool got_fmt = false;
+    for (;;) {
+        if (fread(tag,1,4,fp)!=4 || fread(sb,1,4,fp)!=4) break;
+        uint32_t csz = (uint32_t)sb[0] | ((uint32_t)sb[1]<<8) |
+                       ((uint32_t)sb[2]<<16) | ((uint32_t)sb[3]<<24);
+        long cend = ftell(fp) + (long)csz;
+
+        if (memcmp(tag,"fmt ",4)==0) {
+            unsigned char fb[16];
+            if (fread(fb,1,16,fp)!=16) return false;
+            if ((fb[0]|(fb[1]<<8)) != 1) return false; /* PCM only */
+            d->ch  = fb[2] | (fb[3]<<8);
+            d->sr  = (uint32_t)fb[4] | ((uint32_t)fb[5]<<8) |
+                     ((uint32_t)fb[6]<<16) | ((uint32_t)fb[7]<<24);
+            d->bps = fb[14] | (fb[15]<<8);
+            d->thresh = (float)(160.0 * (double)d->sr * 1e-6);
+            got_fmt = true;
+            fseek(fp, cend, SEEK_SET);
+        } else if (memcmp(tag,"data",4)==0) {
+            break;   /* fp now at first PCM byte */
+        } else {
+            fseek(fp, cend, SEEK_SET);
+        }
+    }
+    return got_fmt && d->sr >= 11000 && (d->bps == 8 || d->bps == 16);
+}
+
+static bool kwav_sample(KWavDec *d, float *out)
+{
+    float raw;
+    if (d->bps == 16) {
+        int lo = fgetc(d->fp), hi = fgetc(d->fp);
+        if (lo == EOF || hi == EOF) return false;
+        raw = (float)(int16_t)((unsigned)lo | ((unsigned)(uint8_t)hi << 8)) / 32768.0f;
+        for (int c = 1; c < d->ch; c++) { fgetc(d->fp); fgetc(d->fp); }
+    } else {
+        int v = fgetc(d->fp);
+        if (v == EOF) return false;
+        raw = ((float)v - 128.0f) / 128.0f;
+        for (int c = 1; c < d->ch; c++) fgetc(d->fp);
+    }
+    float y = 0.9999f * (d->hp_y + raw - d->hp_x);
+    d->hp_x = raw; d->hp_y = y; *out = y;
+    return true;
+}
+
+/* Length of next half-cycle in samples, or -1 for EOF */
+static int kwav_half(KWavDec *d)
+{
+    float s;
+    for (;;) {
+        if (!kwav_sample(d, &s)) return -1;
+        int sign = (s >= 0.0f) ? 1 : -1;
+        d->zx_n++;
+        if (!d->zx_sign) { d->zx_sign = sign; continue; }
+        if (sign != d->zx_sign) {
+            int len = d->zx_n;
+            d->zx_n = 1; d->zx_sign = sign;
+            return len;
+        }
+    }
+}
+
+/* Returns 'S', 'L', or 0 for EOF.
+ * Burst ends when 3+ consecutive half-cycles of the opposite type appear. */
+static int kwav_next_burst(KWavDec *d)
+{
+    int cur = 0, noise = 0;
+    for (;;) {
+        int hlen = kwav_half(d);
+        if (hlen < 0) return cur ? cur : 0;
+        int t = ((float)hlen < d->thresh) ? 'S' : 'L';
+        if (!cur) { cur = t; noise = 0; }
+        else if (t == cur) { noise = 0; }
+        else if (++noise >= 3) return cur;
+    }
+}
+
+/* Decode one byte from the burst stream. Returns 0–255 or -1 for EOF. */
+static int kwav_read_byte(KWavDec *d)
+{
+    uint8_t val = 0;
+    for (int b = 0; b < 8; b++) {
+        int b1 = kwav_next_burst(d); if (b1 != 'S') return -1;
+        int b2 = kwav_next_burst(d); if (!b2)        return -1;
+        int b3 = kwav_next_burst(d); if (!b3)        return -1;
+        (void)b3;
+        if (b2 == 'L') val |= (uint8_t)(1u << b);
+    }
+    return val;
+}
+
+static bool kim1_tape_load_wav(Kim1State *s, FILE *fp)
+{
+    KWavDec d;
+    if (!kwav_open(&d, fp)) {
+        tape_fail(s, "WAV: not PCM or unsupported format");
+        return false;
+    }
+    /* Scan for start marker 0x2A (discard sync/preamble) */
+    for (int tries = 0; ; tries++) {
+        if (tries > 20000) { tape_fail(s, "WAV: start marker not found"); return false; }
+        int b = kwav_read_byte(&d);
+        if (b < 0) { tape_fail(s, "WAV: start marker not found"); return false; }
+        if (b == 0x2A) break;
+    }
+
+    int r_id = kwav_read_byte(&d); if (r_id < 0) goto trunc;
+    int r_sal= kwav_read_byte(&d); if (r_sal< 0) goto trunc;
+    int r_sah= kwav_read_byte(&d); if (r_sah< 0) goto trunc;
+    int r_eal= kwav_read_byte(&d); if (r_eal< 0) goto trunc;
+    int r_eah= kwav_read_byte(&d); if (r_eah< 0) goto trunc;
+
+    {
+        uint8_t req_id = TAPE_ID;
+        if (req_id!=0x00 && req_id!=0xFF && (uint8_t)r_id!=req_id) {
+            tape_fail(s,"WAV: ID mismatch"); return false;
+        }
+        uint16_t fstart = (uint16_t)(r_sal | (r_sah<<8));
+        uint16_t fend   = (uint16_t)(r_eal | (r_eah<<8));
+        uint16_t load_at = (req_id==0xFF)
+            ? (uint16_t)(TAPE_SAL | ((uint16_t)TAPE_SAH<<8)) : fstart;
+        if (fend < fstart) { tape_fail(s,"WAV: bad address range"); return false; }
+
+        uint16_t cksum = (uint16_t)(r_sal + r_sah + r_eal + r_eah);
+        uint16_t size  = (uint16_t)(fend - fstart + 1);
+        for (uint16_t i = 0; i < size; i++) {
+            int b = kwav_read_byte(&d); if (b<0) goto trunc;
+            cksum = (uint16_t)(cksum + b);
+            kim1_mem_write((uint16_t)(load_at + i), (uint8_t)b, s);
+        }
+        int em = kwav_read_byte(&d);
+        if (em != 0x2F) { tape_fail(s,"WAV: bad end marker"); return false; }
+        int cl = kwav_read_byte(&d); if (cl<0) goto trunc;
+        int ch = kwav_read_byte(&d); if (ch<0) goto trunc;
+        if (cksum != (uint16_t)(cl|(ch<<8))) { tape_fail(s,"WAV: checksum mismatch"); return false; }
+
+        printf("gemu-kim1: tape LOAD $%04X–$%04X ID=$%02X ← %s (WAV)\n",
+               fstart, fend, (uint8_t)r_id, s->cfg->tape_path);
+        tape_ok(s);
+        return true;
+    }
+trunc:
+    tape_fail(s,"WAV: file truncated"); return false;
+}
+
+static void kim1_tape_save(Kim1State *s) {
+    if (!s->cfg->tape_path) {
+        tape_fail(s, "no -tape FILE specified");
+        return;
+    }
+    if (path_ends_wav(s->cfg->tape_path)) {
+        (void)kim1_tape_save_wav(s);
+        return;
+    }
+
+    uint16_t start = (uint16_t)(TAPE_SAL | ((uint16_t)TAPE_SAH << 8));
+    uint16_t end   = (uint16_t)(TAPE_EAL | ((uint16_t)TAPE_EAH << 8));
+    uint8_t  id    = TAPE_ID;
+
+    if (end < start) {
+        tape_fail(s, "end address < start address");
+        return;
+    }
+
+    FILE *fp = fopen(s->cfg->tape_path, "wb");
+    if (!fp) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "cannot write '%s': %s", s->cfg->tape_path, strerror(errno));
+        tape_fail(s, msg);
+        return;
+    }
+
+    uint16_t cksum = (uint16_t)(TAPE_SAL + TAPE_SAH + TAPE_EAL + TAPE_EAH);
+
+    fputc(0x2A, fp);
+    fputc(id,   fp);
+    fputc(TAPE_SAL, fp);
+    fputc(TAPE_SAH, fp);
+    fputc(TAPE_EAL, fp);
+    fputc(TAPE_EAH, fp);
+
+    for (uint32_t a = start; a <= (uint32_t)end; a++) {
+        uint8_t b = kim1_mem_read((uint16_t)a, s);
+        fputc(b, fp);
+        cksum = (uint16_t)(cksum + b);
+    }
+
+    fputc(0x2F,           fp);
+    fputc(cksum & 0xFF,   fp);
+    fputc(cksum >> 8,     fp);
+    fputc(0x04, fp);
+    fputc(0x04, fp);
+    fclose(fp);
+
+    printf("gemu-kim1: tape SAVE $%04X–$%04X ID=$%02X → %s\n",
+           start, end, id, s->cfg->tape_path);
+    tape_ok(s);
+}
+
+static void kim1_tape_load(Kim1State *s) {
+    if (!s->cfg->tape_path) {
+        tape_fail(s, "no -tape FILE specified");
+        return;
+    }
+
+    FILE *fp = fopen(s->cfg->tape_path, "rb");
+    if (!fp) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "cannot read '%s': %s", s->cfg->tape_path, strerror(errno));
+        tape_fail(s, msg);
+        return;
+    }
+    /* auto-detect WAV by RIFF magic */
+    {
+        unsigned char mg[4];
+        bool is_wav = fread(mg,1,4,fp)==4 && memcmp(mg,"RIFF",4)==0;
+        rewind(fp);
+        if (is_wav) { (void)kim1_tape_load_wav(s, fp); fclose(fp); return; }
+    }
+
+    int b;
+    if ((b = fgetc(fp)) != 0x2A) { tape_fail(s, "bad start marker"); fclose(fp); return; }
+
+    uint8_t file_id  = (uint8_t)fgetc(fp);
+    uint8_t sal      = (uint8_t)fgetc(fp);
+    uint8_t sah      = (uint8_t)fgetc(fp);
+    uint8_t eal      = (uint8_t)fgetc(fp);
+    uint8_t eah      = (uint8_t)fgetc(fp);
+    if (feof(fp)) { tape_fail(s, "truncated header"); fclose(fp); return; }
+
+    uint8_t req_id = TAPE_ID;
+    if (req_id != 0x00 && req_id != 0xFF && req_id != file_id) {
+        tape_fail(s, "ID mismatch");
+        fclose(fp);
+        return;
+    }
+
+    uint16_t file_start = (uint16_t)(sal | ((uint16_t)sah << 8));
+    uint16_t file_end   = (uint16_t)(eal | ((uint16_t)eah << 8));
+    /* ID=$FF: load at stored start address rather than file's */
+    uint16_t load_at = (req_id == 0xFF)
+        ? (uint16_t)(TAPE_SAL | ((uint16_t)TAPE_SAH << 8))
+        : file_start;
+
+    if (file_end < file_start) { tape_fail(s, "bad address range"); fclose(fp); return; }
+
+    uint16_t cksum = (uint16_t)(sal + sah + eal + eah);
+    uint16_t size  = (uint16_t)(file_end - file_start + 1);
+
+    for (uint16_t i = 0; i < size; i++) {
+        if ((b = fgetc(fp)) == EOF) { tape_fail(s, "truncated data"); fclose(fp); return; }
+        uint8_t byte = (uint8_t)b;
+        cksum = (uint16_t)(cksum + byte);
+        kim1_mem_write((uint16_t)(load_at + i), byte, s);
+    }
+
+    if ((b = fgetc(fp)) != 0x2F) { tape_fail(s, "bad end marker"); fclose(fp); return; }
+
+    uint8_t  chkl     = (uint8_t)fgetc(fp);
+    uint8_t  chkh     = (uint8_t)fgetc(fp);
+    uint16_t file_chk = (uint16_t)(chkl | ((uint16_t)chkh << 8));
+    fclose(fp);
+
+    if (cksum != file_chk) { tape_fail(s, "checksum mismatch"); return; }
+
+    printf("gemu-kim1: tape LOAD $%04X–$%04X ID=$%02X ← %s\n",
+           file_start, file_end, file_id, s->cfg->tape_path);
+    tape_ok(s);
+}
+
+#undef TAPE_SAL
+#undef TAPE_SAH
+#undef TAPE_EAL
+#undef TAPE_EAH
+#undef TAPE_ID
+
 static void kim1_set_a_nz(Kim1State *s, uint8_t v) {
     s->cpu.A = v;
     s->cpu.P = (uint8_t)((s->cpu.P & ~(MOS6502_P_N | MOS6502_P_Z))
@@ -663,6 +1097,18 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
             kim1_set_a_nz(s, s->kim_key_pending ? s->kim_key_number : 0x15u);
             s->kim_key_pending = false;
             s->cpu.PC = 0x1F8Fu;
+            return 0xEAu;
+        }
+        /* DUMPT: CPU about to execute at $1800 — save memory block to tape */
+        if (a == 0x1800u) {
+            kim1_tape_save(s);
+            s->cpu.PC = 0x1C4Fu;
+            return 0xEAu;
+        }
+        /* LOADT: CPU about to execute at $1873 — load tape into memory */
+        if (a == 0x1873u) {
+            kim1_tape_load(s);
+            s->cpu.PC = 0x1C4Fu;
             return 0xEAu;
         }
         /* OUTCH: CPU about to execute at $1EA0 — output char in A to serial terminal */
