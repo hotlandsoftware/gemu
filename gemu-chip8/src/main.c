@@ -53,11 +53,13 @@ int main(int argc, char *argv[]) {
 
     Chip8Config cfg = {
         .mem_size      = CHIP8_MEM_SIZE,
-        .cpu_hz        = CHIP8_DEFAULT_HZ,
+        .cpu_hz        = 0,            /* 0 = auto; resolved below after path is known */
         .display_type  = GEMU_DISPLAY_SDL,
         .display_scale = 10,
         .quirk_shift   = false,
         .quirk_jump    = false,
+        .fg_argb       = 0,            /* 0 = auto; resolved below */
+        .bg_argb       = 0xFF000000u,
     };
 
     GemuArgs args = {
@@ -80,18 +82,32 @@ int main(int argc, char *argv[]) {
     /* Binary-specific remainder flags */
     for (int i = 0; i < nrem; i++) {
         if (strcmp(rem[i], "-hz") == 0 && i + 1 < nrem) {
-            int hz = atoi(rem[++i]);
-            cfg.cpu_hz = (hz > 0) ? hz : CHIP8_DEFAULT_HZ;
+            int cpf = atoi(rem[++i]);
+            cfg.cpu_hz = (cpf > 0) ? cpf : -1; /* -1 = explicit auto */
         } else if (strcmp(rem[i], "-m") == 0 && i + 1 < nrem) {
             cfg.mem_size = parse_size(rem[++i]);
         } else if (strcmp(rem[i], "-quirk-shift") == 0) {
             cfg.quirk_shift = true;
         } else if (strcmp(rem[i], "-quirk-jump") == 0) {
             cfg.quirk_jump = true;
+        } else if (strcmp(rem[i], "-fg") == 0 && i + 1 < nrem) {
+            cfg.fg_argb = 0xFF000000u | (uint32_t)strtoul(rem[++i], NULL, 16);
+        } else if (strcmp(rem[i], "-bg") == 0 && i + 1 < nrem) {
+            cfg.bg_argb = 0xFF000000u | (uint32_t)strtoul(rem[++i], NULL, 16);
         } else {
             fprintf(stderr, "gemu-chip8: unknown option '%s' (try -h)\n", rem[i]);
             return 1;
         }
+    }
+
+    /* Auto-select speed and colors based on file type if not explicitly set */
+    {
+        size_t rlen = cfg.rom_path ? strlen(cfg.rom_path) : 0;
+        bool is_8o  = rlen >= 3 && strcmp(cfg.rom_path + rlen - 3, ".8o") == 0;
+        if (cfg.cpu_hz <= 0)
+            cfg.cpu_hz = is_8o ? CHIP8_DEFAULT_CPF_8O : CHIP8_DEFAULT_CPF;
+        if (!cfg.fg_argb)
+            cfg.fg_argb = is_8o ? 0xFFFFCC00u : 0xFFFFFFFFu;
     }
 
     if (!cfg.rom_path) {

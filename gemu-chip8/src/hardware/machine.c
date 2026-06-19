@@ -170,7 +170,7 @@ static const GemuActionDef chip8_actions[CHIP8_NUM_KEYS] = {
 void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
     /* Headless: no display, VNC-only or silent bench */
     if (cfg->display_type == GEMU_DISPLAY_NONE) {
-        const int insns_frame = cfg->cpu_hz / CHIP8_TIMER_HZ;
+        const int insns_frame = cfg->cpu_hz; /* cpu_hz is cycles per frame */
         gemu_monitor_start(s->monitor);
         bool running = true;
         while (running) {
@@ -245,7 +245,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
     }
     gemu_monitor_start(s->monitor);
 
-    const int insns_frame = cfg->cpu_hz / CHIP8_TIMER_HZ;
+    const int insns_frame = cfg->cpu_hz; /* cpu_hz is cycles per frame */
     uint32_t  argb[CHIP8_DISPLAY_W * CHIP8_DISPLAY_H];
 
     while (true) {
@@ -309,7 +309,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
         /* Render */
         if (s->draw_flag) {
             for (int i = 0; i < CHIP8_DISPLAY_W * CHIP8_DISPLAY_H; i++)
-                argb[i] = s->vram[i] ? 0xFFFFFFFFu : 0xFF000000u;
+                argb[i] = s->vram[i] ? cfg->fg_argb : cfg->bg_argb;
             gemu_display_render(display, argb, CHIP8_DISPLAY_W, CHIP8_DISPLAY_H);
             gemu_vnc_update(s->vnc, s->vram, CHIP8_DISPLAY_W, CHIP8_DISPLAY_H);
             s->draw_flag = false;

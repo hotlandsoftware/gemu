@@ -20,8 +20,12 @@
 #define CHIP8_NUM_REGS    16
 #define CHIP8_STACK_DEPTH 16
 #define CHIP8_NUM_KEYS    16
-#define CHIP8_TIMER_HZ    60
-#define CHIP8_DEFAULT_HZ  700
+#define CHIP8_TIMER_HZ        60
+#define CHIP8_DEFAULT_CPF     10   /* classic .ch8 ROMs: ~600 Hz at 60 fps */
+#define CHIP8_DEFAULT_CPF_8O  30   /* Octo .8o ROMs need more cycles/frame */
+
+/* Legacy alias */
+#define CHIP8_DEFAULT_HZ  CHIP8_DEFAULT_CPF
 
 /* ── Decoded instruction types ────────────────────────────────────────────── */
 typedef enum {
@@ -95,13 +99,15 @@ typedef struct Chip8State {
 typedef struct Chip8Config {
     const char      *rom_path;
     uint32_t         mem_size;
-    int              cpu_hz;
+    int              cpu_hz;       /* cycles per frame (not Hz) */
     GemuDisplayType  display_type;
     int              display_scale;
     bool             quirk_shift;
     bool             quirk_jump;
     const char      *vnc_addr;
     Chip8MachineType machine;
+    uint32_t         fg_argb;     /* on-pixel color  (default: Octo yellow) */
+    uint32_t         bg_argb;     /* off-pixel color (default: black) */
 } Chip8Config;
 
 
