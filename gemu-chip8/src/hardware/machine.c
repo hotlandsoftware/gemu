@@ -5,6 +5,7 @@
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
 #include "gemu/gemu_display.h"
+#include "../octo/octo.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -54,6 +55,43 @@ static bool chip8_screendump(void *ud, const char *path) {
     return ok;
 }
 
+/* ── ROM loading (raw .ch8 or compiled .8o) ──────────────────────────────── */
+
+static bool path_ends_8o(const char *p)
+{
+    size_t n = strlen(p);
+    return n >= 3 && strcmp(p + n - 3, ".8o") == 0;
+}
+
+/* Returns bytes loaded, or 0 on error (fills errbuf). */
+static size_t chip8_load_rom(uint8_t *mem, uint32_t mem_size,
+                              const char *path, char *errbuf, size_t ebsz)
+{
+    if (path_ends_8o(path)) {
+        /* Read source text */
+        FILE *fp = fopen(path, "rb");
+        if (!fp) { snprintf(errbuf, ebsz, "cannot open '%s'", path); return 0; }
+        fseek(fp, 0, SEEK_END); long fsz = ftell(fp); rewind(fp);
+        if (fsz <= 0) { fclose(fp); snprintf(errbuf, ebsz, "empty file"); return 0; }
+        char *src = malloc((size_t)fsz + 1);
+        if (!src) { fclose(fp); snprintf(errbuf, ebsz, "OOM"); return 0; }
+        if (fread(src, 1, (size_t)fsz, fp) != (size_t)fsz)
+            { free(src); fclose(fp); snprintf(errbuf, ebsz, "read error"); return 0; }
+        src[fsz] = '\0'; fclose(fp);
+
+        int max = (int)(mem_size - CHIP8_ROM_BASE);
+        int n = octo_compile(src, mem + CHIP8_ROM_BASE, max, errbuf, (int)ebsz);
+        free(src);
+        return (n >= 0) ? (size_t)n : 0;
+    }
+
+    GemuMemory tmp = {.data = mem, .size = mem_size};
+    size_t rom_len = 0;
+    if (!gemu_mem_load_file(&tmp, CHIP8_ROM_BASE, path, &rom_len))
+        { snprintf(errbuf, ebsz, "failed to load '%s'", path); return 0; }
+    return rom_len;
+}
+
 Chip8State *chip8_machine_create(const Chip8Config *cfg) {
     Chip8State *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -69,10 +107,10 @@ Chip8State *chip8_machine_create(const Chip8Config *cfg) {
 
     memcpy(s->mem + CHIP8_FONT_BASE, chip8_font, CHIP8_FONT_BYTES);
 
-    GemuMemory tmp = {.data = s->mem, .size = cfg->mem_size};
-    size_t rom_len = 0;
-    if (!gemu_mem_load_file(&tmp, CHIP8_ROM_BASE, cfg->rom_path, &rom_len)) {
-        fprintf(stderr, "gemu-chip8: failed to load ROM '%s'\n", cfg->rom_path);
+    char errbuf[256] = {0};
+    size_t rom_len = chip8_load_rom(s->mem, cfg->mem_size, cfg->rom_path, errbuf, sizeof(errbuf));
+    if (!rom_len) {
+        fprintf(stderr, "gemu-chip8: %s\n", errbuf);
         free(s);
         return NULL;
     }
@@ -95,8 +133,7 @@ void chip8_machine_reset(Chip8State *s, const Chip8Config *cfg) {
     gemu_tb_cache_flush(&s->tb_cache);
 
     memset(s->mem + CHIP8_ROM_BASE, 0, CHIP8_MEM_SIZE - CHIP8_ROM_BASE);
-    GemuMemory tmp = {.data = s->mem, .size = cfg->mem_size};
-    gemu_mem_load_file(&tmp, CHIP8_ROM_BASE, cfg->rom_path, NULL);
+    char errbuf[256]; chip8_load_rom(s->mem, cfg->mem_size, cfg->rom_path, errbuf, sizeof(errbuf));
 
     printf("gemu-chip8: reset\n");
 }

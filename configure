@@ -41,6 +41,7 @@ TARGETS = {
             'gemu-chip8/src/main.c',
             'gemu-chip8/src/cpu/chip8_cpu.c',
             'gemu-chip8/src/hardware/machine.c',
+            'gemu-chip8/src/octo/octo.c',
             'gemu-mos/src/vga/input_menu.c',
         ],
         'src_curses': [],
