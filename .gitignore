@@ -3,3 +3,4 @@ bin/
 roms/
 .ninja_deps
 .ninja_log
+build.ninja
