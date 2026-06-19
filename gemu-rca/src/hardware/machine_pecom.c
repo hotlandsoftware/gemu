@@ -8,10 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #if defined(_WIN32)
 #  include <windows.h>
-#else
-#  include <time.h>
 #endif
 
 static void pecom_sleep_ms(unsigned ms) {
