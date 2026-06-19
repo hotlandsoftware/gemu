@@ -58,9 +58,9 @@ static const GemuArgsDef def = {
         "  -start ADDR        Override reset vector and start execution at ADDR\n"
         "  -cartridge FILE    Insert a cartridge\n"
         "  -fda FILE          Insert a floppy disk image\n"
-        "  -tape FILE         Mount a KIM-1 cassette tape image (.kim binary)\n"
-        "  -renderer MODE     SDL renderer: auto | software | accelerated (default: auto)\n"
-        "  -soundhw CHIP      Sound hardware: none | 2a03"
+        "  -tape FILE         Insert a casette tape\n"
+        "  -renderer MODE     Set SDL renderer: auto | software | accelerated (default: auto)\n"
+        "  -soundhw CHIP      Insert a sound card"
 #ifdef HAVE_ALSA
         " | 2a03,output=midi"
 #endif
