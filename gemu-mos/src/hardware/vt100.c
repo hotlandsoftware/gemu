@@ -8,14 +8,16 @@
  */
 
 #include "vt100.h"
-#include "vt100_font.h"      /* embedded TTF: _home_admin_jemu_Reference_Hack_VT100_Regular_ttf[] */
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_ttf.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+
+#ifdef HAVE_TTF
+#include "vt100_font.h"
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_ttf.h>
 
 /* ── Terminal geometry ───────────────────────────────────────────────────── */
 
@@ -1175,7 +1177,184 @@ Vt100State *vt100_create(GemuDisplayType dtype) {
     return t;
 }
 
-/* ── GemuSerial adapter ──────────────────────────────────────────────────── */
+#else /* !HAVE_TTF — spawn xterm (or fall back to stdin/stdout) */
+
+#ifndef _WIN32
+#  if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#    include <util.h>
+#  else
+#    include <pty.h>
+#  endif
+#  include <termios.h>
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <signal.h>
+#  include <sys/wait.h>
+#else
+#  include <conio.h>
+#endif
+
+#define TTY_KBUF 256
+
+struct Vt100State {
+    uint8_t kbuf[TTY_KBUF];
+    int     khead, ktail;
+    bool    quit;
+#ifndef _WIN32
+    int     master_fd;      /* pty master when xterm is running; -1 otherwise */
+    pid_t   xterm_pid;
+    /* stdin/stdout fallback state */
+    struct termios saved_term;
+    bool           raw;
+#endif
+};
+
+static void tty_kpush(Vt100State *t, uint8_t ch)
+{
+    int n = (t->khead + 1) & (TTY_KBUF - 1);
+    if (n != t->ktail) { t->kbuf[t->khead] = ch; t->khead = n; }
+}
+
+Vt100State *vt100_create(GemuDisplayType dtype)
+{
+    (void)dtype;
+    Vt100State *t = calloc(1, sizeof(*t));
+    if (!t) return NULL;
+
+#ifndef _WIN32
+    t->master_fd = -1;
+
+    /* ── Try to spawn xterm via pty ── */
+    int master = -1, slave = -1;
+    char slave_name[64];
+    if (openpty(&master, &slave, slave_name, NULL, NULL) == 0) {
+        /*
+         * Use a CLOEXEC pipe to detect exec failure: if execlp succeeds,
+         * the write end closes automatically and we read 0 bytes; if it
+         * fails the child writes a byte before _exit.
+         */
+        int ep[2];
+        if (pipe(ep) == 0) {
+            fcntl(ep[1], F_SETFD, FD_CLOEXEC);
+
+            pid_t pid = fork();
+            if (pid == 0) {
+                close(ep[0]); close(master);
+                /* xterm -S<pty_rel_path>/<slave_fd>
+                 * e.g. -Spts/4/5 for /dev/pts/4 with slave fd 5 */
+                char sflag[128];
+                const char *rel = slave_name;
+                if (strncmp(rel, "/dev/", 5) == 0) rel += 5;
+                snprintf(sflag, sizeof(sflag), "-S%s/%d", rel, slave);
+                // TODO: check users terminal emulator?
+                execlp("xterm", "xterm",
+                       "-title", "GEMU (VT100 Terminal)",
+                       "-geometry", "80x24",
+                       sflag, NULL);
+                /* exec failed */
+                char err = 1; (void)write(ep[1], &err, 1);
+                _exit(1);
+            }
+            close(ep[1]);
+            char err = 0; ssize_t nr = read(ep[0], &err, 1);
+            close(ep[0]);
+            close(slave);
+
+            if (pid > 0 && nr == 0) {
+                /* exec succeeded (CLOEXEC closed the pipe) */
+                fcntl(master, F_SETFL,
+                      fcntl(master, F_GETFL, 0) | O_NONBLOCK);
+                t->master_fd = master;
+                t->xterm_pid = pid;
+                fprintf(stderr, "vt100: terminal window created (xterm)\n");
+                return t;
+            }
+            if (pid > 0) waitpid(pid, NULL, 0);
+        }
+        close(master); close(slave);
+    }
+
+    /* ── Fallback: use stdin/stdout of current terminal ── */
+    if (isatty(STDIN_FILENO)) {
+        struct termios raw;
+        tcgetattr(STDIN_FILENO, &t->saved_term);
+        raw = t->saved_term;
+        raw.c_lflag &= (tcflag_t)~(ECHO | ICANON);
+        raw.c_cc[VMIN]  = 0;
+        raw.c_cc[VTIME] = 0;
+        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0)
+            t->raw = true;
+    }
+    fprintf(stderr, "vt100: xterm not found — using host terminal (stdin/stdout)\n");
+#endif
+    return t;
+}
+
+void vt100_destroy(Vt100State *t)
+{
+    if (!t) return;
+#ifndef _WIN32
+    if (t->master_fd >= 0) {
+        close(t->master_fd);
+        if (t->xterm_pid > 0) {
+            kill(t->xterm_pid, SIGTERM);
+            waitpid(t->xterm_pid, NULL, 0);
+        }
+    } else if (t->raw) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &t->saved_term);
+    }
+#endif
+    free(t);
+}
+
+void vt100_write(Vt100State *t, uint8_t ch)
+{
+#ifndef _WIN32
+    if (t->master_fd >= 0) { (void)write(t->master_fd, &ch, 1); return; }
+#endif
+    fputc((int)ch, stdout); fflush(stdout);
+}
+
+void vt100_poll(Vt100State *t)
+{
+#ifndef _WIN32
+    int fd = (t->master_fd >= 0) ? t->master_fd : STDIN_FILENO;
+    unsigned char buf[64]; ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0)
+        for (ssize_t i = 0; i < n; i++) tty_kpush(t, buf[i]);
+#else
+    while (_kbhit()) tty_kpush(t, (uint8_t)_getch());
+#endif
+}
+
+bool vt100_key_available(Vt100State *t) { return t->khead != t->ktail; }
+
+uint8_t vt100_read_key(Vt100State *t)
+{
+    if (!vt100_key_available(t)) return 0;
+    uint8_t ch = t->kbuf[t->ktail];
+    t->ktail = (t->ktail + 1) & (TTY_KBUF - 1);
+    return ch;
+}
+
+bool vt100_should_quit(Vt100State *t)
+{
+#ifndef _WIN32
+    if (t->master_fd >= 0 && t->xterm_pid > 0) {
+        if (waitpid(t->xterm_pid, NULL, WNOHANG) == t->xterm_pid) {
+            t->xterm_pid = -1;
+            t->quit = true;
+        }
+    }
+#endif
+    return t->quit;
+}
+
+uint32_t vt100_pop_fwd_key(Vt100State *t) { (void)t; return 0; }
+
+#endif /* HAVE_TTF */
+
+/* ── GemuSerial adapter (SDL and TTY modes) ──────────────────────────────── */
 
 static void     _ser_write(void *ud, uint8_t ch) { vt100_write(ud, ch); }
 static uint8_t  _ser_read (void *ud)             { return vt100_read_key(ud); }
