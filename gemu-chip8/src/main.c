@@ -81,7 +81,7 @@ int main(int argc, char *argv[]) {
 
     /* Binary-specific remainder flags */
     for (int i = 0; i < nrem; i++) {
-        if (strcmp(rem[i], "-hz") == 0 && i + 1 < nrem) {
+        if ((strcmp(rem[i], "-hz") == 0 || strcmp(rem[i], "-speed") == 0) && i + 1 < nrem) {
             int cpf = atoi(rem[++i]);
             cfg.cpu_hz = (cpf > 0) ? cpf : -1; /* -1 = explicit auto */
         } else if (strcmp(rem[i], "-m") == 0 && i + 1 < nrem) {

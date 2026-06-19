@@ -229,7 +229,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
     GemuDisplayGtkExtras gtk_extras = { .monitor = s->monitor };
     GemuDisplay *display = gemu_display_create(cfg->display_type,
         &(GemuDisplayConfig){
-            .title       = "gemu-chip8",
+            .title       = "GEMU",
             .fb_width    = CHIP8_DISPLAY_W,
             .fb_height   = CHIP8_DISPLAY_H,
             .scale       = cfg->display_scale,
