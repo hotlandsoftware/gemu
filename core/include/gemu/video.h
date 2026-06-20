@@ -35,8 +35,10 @@ void gemu_video_sdl_mouse_logical(GemuVideoSdl *v, int *x, int *y);
 
 /* Optional overlay: called after emulator frame is drawn but before
  * SDL_RenderPresent.  Use for in-emulator menus, OSD, etc. */
+/* pixel_scale: integer window/fb scale passed to the callback so overlays
+ * can render at the right size (e.g. font 6px × scale). */
 void gemu_video_sdl_set_overlay(GemuVideoSdl *v,
-                                void (*cb)(void *ud, SDL_Renderer *r),
+                                void (*cb)(void *ud, SDL_Renderer *r, int pixel_scale),
                                 void *ud);
 
 #ifdef GEMU_GTK

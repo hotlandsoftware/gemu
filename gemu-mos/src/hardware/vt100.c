@@ -1085,7 +1085,9 @@ void vt100_destroy(Vt100State *t) {
 }
 
 Vt100State *vt100_create(GemuDisplayType dtype) {
-    (void)dtype;  /* SDL is always used for VT100 */
+    /* In GTK mode the frame cadence is driven by GLib; SDL VSync would
+     * fight GLib's timing and break the cursor blink accumulator. */
+    bool use_vsync = (dtype != GEMU_DISPLAY_GTK);
 
     build_graphics_map();
 
@@ -1134,8 +1136,8 @@ Vt100State *vt100_create(GemuDisplayType dtype) {
     t->window_id = SDL_GetWindowID(t->window);
 
     /* Create renderer */
-    t->renderer = SDL_CreateRenderer(t->window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    Uint32 rflags = SDL_RENDERER_ACCELERATED | (use_vsync ? SDL_RENDERER_PRESENTVSYNC : 0);
+    t->renderer = SDL_CreateRenderer(t->window, -1, rflags);
     if (!t->renderer)
         t->renderer = SDL_CreateRenderer(t->window, -1, SDL_RENDERER_SOFTWARE);
     if (!t->renderer) {

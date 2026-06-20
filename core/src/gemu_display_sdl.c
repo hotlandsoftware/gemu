@@ -128,6 +128,11 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             d->quit = true;
             break;
 
+        case SDL_WINDOWEVENT:
+            if (ev.window.event == SDL_WINDOWEVENT_CLOSE)
+                d->quit = true;
+            break;
+
         case SDL_MOUSEMOTION:
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
@@ -234,8 +239,8 @@ static void sdl_do_destroy(GemuDisplay *d) {
 
 /* ── Overlay callback for InputMenu ─────────────────────────────────────── */
 
-static void menu_overlay_cb(void *ud, SDL_Renderer *r) {
-    input_menu_render((InputMenu *)ud, r);
+static void menu_overlay_cb(void *ud, SDL_Renderer *r, int pixel_scale) {
+    input_menu_render((InputMenu *)ud, r, pixel_scale);
 }
 
 /* ── Create ──────────────────────────────────────────────────────────────── */
@@ -266,29 +271,23 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     /* Build action→key binding table */
     build_bindings(b);
 
-    /* InputMenu: pass action names + defaults so user can rebind in-game.
-     * We need SDL_Keycode defaults, so build them from the action table. */
-    if (cfg->n_actions > 0 && cfg->ini_section) {
-        SDL_Keycode *defaults = calloc((size_t)cfg->n_actions, sizeof(SDL_Keycode));
-        if (defaults) {
-            for (int i = 0; i < cfg->n_actions; i++) {
+    /* InputMenu: create whenever ini_section is set so Tab always opens a menu
+     * (at minimum: Reset / Close Menu / Quit).  When no_rebind is set or there
+     * are no rebindable actions, pass 0 buttons so the Input page is hidden. */
+    if (cfg->ini_section) {
+        int nb = (cfg->no_rebind || !cfg->actions || cfg->n_actions <= 0)
+                 ? 0 : cfg->n_actions;
+        SDL_Keycode *defaults = nb ? calloc((size_t)nb, sizeof(SDL_Keycode)) : NULL;
+        const char **names    = nb ? calloc((size_t)nb, sizeof(char *))      : NULL;
+        if (nb == 0 || (defaults && names)) {
+            for (int i = 0; i < nb; i++) {
+                names[i]    = cfg->actions[i].name;
                 defaults[i] = SDL_GetKeyFromName(cfg->actions[i].default_key);
-                if (defaults[i] == SDLK_UNKNOWN) defaults[i] = SDLK_UNKNOWN;
             }
-            /* Extract names into a separate array (InputMenu takes const char**) */
-            const char **names = calloc((size_t)cfg->n_actions, sizeof(char *));
-            if (names) {
-                for (int i = 0; i < cfg->n_actions; i++)
-                    names[i] = cfg->actions[i].name;
-                b->menu = input_menu_create(NULL,
-                                            cfg->n_actions,
-                                            names,
-                                            defaults,
-                                            cfg->ini_section);
-                free(names);
-            }
-            free(defaults);
+            b->menu = input_menu_create(NULL, nb, names, defaults, cfg->ini_section);
         }
+        free(names);
+        free(defaults);
         if (b->menu)
             gemu_video_sdl_set_overlay(b->video, menu_overlay_cb, b->menu);
     }

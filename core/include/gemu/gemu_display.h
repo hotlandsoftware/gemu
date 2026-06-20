@@ -79,6 +79,7 @@ typedef struct {
     const GemuActionDef *actions;
     int                  n_actions;
     const char          *ini_section; /* gemu.ini section, e.g. "nes-controller" */
+    bool                 no_rebind;   /* show menu but hide the Input/rebind page */
 
     /* GTK extras — NULL for non-GTK builds / backends */
     const GemuDisplayGtkExtras *gtk;

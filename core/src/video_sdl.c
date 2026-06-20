@@ -12,7 +12,7 @@ struct GemuVideoSdl {
     int             width;
     int             height;
     bool            software;
-    void          (*overlay_cb)(void *ud, SDL_Renderer *r);
+    void          (*overlay_cb)(void *ud, SDL_Renderer *r, int pixel_scale);
     void           *overlay_ud;
 };
 
@@ -102,8 +102,17 @@ void gemu_video_sdl_present_argb(GemuVideoSdl *v, const uint32_t *pixels,
     SDL_SetRenderDrawColor(v->renderer, 0, 0, 0, 255);
     SDL_RenderClear(v->renderer);
     SDL_RenderCopy(v->renderer, v->texture, NULL, NULL);
-    if (v->overlay_cb)
-        v->overlay_cb(v->overlay_ud, v->renderer);
+    if (v->overlay_cb) {
+        /* Draw overlay at native window pixels, not logical (fb) pixels.
+         * Compute integer scale so the menu can size fonts/boxes proportionally. */
+        int ow = v->width, oh = v->height;
+        SDL_GetRendererOutputSize(v->renderer, &ow, &oh);
+        int scale = (v->width > 0) ? (ow / v->width) : 1;
+        if (scale < 1) scale = 1;
+        SDL_RenderSetLogicalSize(v->renderer, 0, 0);
+        v->overlay_cb(v->overlay_ud, v->renderer, scale);
+        SDL_RenderSetLogicalSize(v->renderer, v->width, v->height);
+    }
     SDL_RenderPresent(v->renderer);
 }
 
@@ -150,7 +159,7 @@ void gemu_video_sdl_mouse_logical(GemuVideoSdl *v, int *x, int *y) {
 }
 
 void gemu_video_sdl_set_overlay(GemuVideoSdl *v,
-                                void (*cb)(void *ud, SDL_Renderer *r),
+                                void (*cb)(void *ud, SDL_Renderer *r, int pixel_scale),
                                 void *ud) {
     if (!v) return;
     v->overlay_cb = cb;

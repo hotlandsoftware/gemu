@@ -126,6 +126,7 @@ typedef struct Kim1State {
 
     /* Display */
     uint8_t          seg_cache[KIM1_NUM_DIGITS]; /* segment patterns cached from Port A/B writes */
+    bool             display_dirty;
     uint32_t         fb[KIM1_FB_WIDTH * KIM1_FB_HEIGHT];
     uint32_t         keypad_held;
     uint32_t         keypad_prev;

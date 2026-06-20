@@ -329,10 +329,11 @@ static void save_ini(const InputMenu *m) {
 
 static void build_main_menu(InputMenu *m) {
     m->n_items = 0;
-    m->items[m->n_items++] = (MenuItem){
-        .label  = "Input",
-        .action = menu_action_input,
-    };
+    if (m->n_buttons > 0)
+        m->items[m->n_items++] = (MenuItem){
+            .label  = "Input",
+            .action = menu_action_input,
+        };
     m->items[m->n_items++] = (MenuItem){
         .label  = "Reset",
         .action = menu_action_reset,
@@ -386,13 +387,13 @@ static void menu_action_input(InputMenu *m) {
 /* ── Font rendering helpers ─────────────────────────────────────────────── */
 
 static void draw_char(SDL_Renderer *r, int x, int y, char ch,
-                      uint32_t fg, uint32_t bg) {
+                      uint32_t fg, uint32_t bg, int s) {
     if (ch < 32 || ch > 122) ch = '?';
     const uint8_t *glyph = FONT_GLYPH(ch);
     for (int col = 0; col < FONT_W; col++) {
         uint8_t bits = glyph[col];
         for (int row = 0; row < FONT_H; row++) {
-            SDL_Rect dot = { x + col, y + row, 1, 1 };
+            SDL_Rect dot = { x + col * s, y + row * s, s, s };
             if (bits & (1u << (unsigned)row)) {
                 SDL_SetRenderDrawColor(r, (fg >> 16) & 0xFF,
                                        (fg >> 8) & 0xFF, fg & 0xFF, 255);
@@ -405,23 +406,27 @@ static void draw_char(SDL_Renderer *r, int x, int y, char ch,
     }
 }
 
-static int draw_text(SDL_Renderer *r, int x, int y, const char *s,
-                     uint32_t fg, uint32_t bg) {
+static int draw_text(SDL_Renderer *r, int x, int y, const char *str,
+                     uint32_t fg, uint32_t bg, int s) {
     int start = x;
-    for (; *s; s++) {
-        draw_char(r, x, y, *s, fg, bg);
-        x += FONT_W;
+    for (; *str; str++) {
+        draw_char(r, x, y, *str, fg, bg, s);
+        x += FONT_W * s;
     }
     return x - start;
 }
 
 /* ── Rendering ──────────────────────────────────────────────────────────── */
 
-void input_menu_render(InputMenu *m, SDL_Renderer *r) {
+void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
     if (!m || m->page == MENU_CLOSED) return;
+    if (pixel_scale < 1) pixel_scale = 1;
+
+    int s = pixel_scale;
+    int fw = FONT_W * s, fh = FONT_H * s;
 
     int w = 256, h = 240;
-    SDL_RenderGetLogicalSize(r, &w, &h);
+    SDL_GetRendererOutputSize(r, &w, &h);
     if (w <= 0) w = 256;
     if (h <= 0) h = 240;
 
@@ -433,7 +438,7 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r) {
 
     /* Menu box: centered, 75% width */
     int mw = (w * 3) / 4;
-    int mh = (int)(m->n_items + 2) * (FONT_H + 2) + 8;
+    int mh = (int)(m->n_items + 2) * (fh + 2 * s) + 8 * s;
     int mx = (w - mw) / 2;
     int my = (h - mh) / 2;
 
@@ -446,30 +451,30 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r) {
     SDL_SetRenderDrawColor(r, 60, 60, 180, 255);
     SDL_RenderDrawRect(r, &(SDL_Rect){ mx - 1, my - 1, mw + 2, mh + 2 });
 
-    int ty = my + 6;
+    int ty = my + 6 * s;
 
     /* Title */
     if (m->page == MENU_KEY_CAPTURE) {
-        draw_text(r, mx + 6, ty, "Press key for: ", 0xFFFFFFFF, 0x000050FF);
-        draw_text(r, mx + 6 + 13 * FONT_W, ty,
-                  m->button_names[m->capture_index], 0xFFFFFF00, 0x000050FF);
-        draw_text(r, mx + 6, ty + FONT_H + 4,
-                  "(Esc to cancel)", 0xFF8888FF, 0x000050FF);
+        draw_text(r, mx + 6 * s, ty, "Press key for: ", 0xFFFFFFFF, 0x000050FF, s);
+        draw_text(r, mx + 6 * s + 15 * fw, ty,
+                  m->button_names[m->capture_index], 0xFFFFFF00, 0x000050FF, s);
+        draw_text(r, mx + 6 * s, ty + fh + 4 * s,
+                  "(Esc to cancel)", 0xFF8888FF, 0x000050FF, s);
         return;
     }
 
-    bool is_input_submenu = (m->items[0].key_ptr != NULL);
+    bool is_input_submenu = (m->n_items > 0 && m->items[0].key_ptr != NULL);
 
     if (is_input_submenu)
-        draw_text(r, mx + 6, ty, m->section, 0xFFFFFFFF, 0x000050FF);
+        draw_text(r, mx + 6 * s, ty, m->section, 0xFFFFFFFF, 0x000050FF, s);
     else
-        draw_text(r, mx + 6, ty, "Main Menu", 0xFFFFFFFF, 0x000050FF);
-    ty += FONT_H + 4;
+        draw_text(r, mx + 6 * s, ty, "Main Menu", 0xFFFFFFFF, 0x000050FF, s);
+    ty += fh + 4 * s;
 
     /* Separator */
     SDL_SetRenderDrawColor(r, 60, 60, 180, 255);
-    SDL_RenderDrawLine(r, mx + 4, ty, mx + mw - 4, ty);
-    ty += 4;
+    SDL_RenderDrawLine(r, mx + 4 * s, ty, mx + mw - 4 * s, ty);
+    ty += 4 * s;
 
     /* Items */
     for (int i = 0; i < m->n_items; i++) {
@@ -479,22 +484,21 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r) {
         if (i == m->selected) {
             SDL_SetRenderDrawColor(r, 60, 60, 180, 255);
             SDL_RenderFillRect(r, &(SDL_Rect){
-                mx + 4, ty - 1, mw - 8, FONT_H + 2
+                mx + 4 * s, ty - s, mw - 8 * s, fh + 2 * s
             });
             fg = 0xFF000000;
             bg = 0x3C3CB4FF;
         }
 
-        int tx = mx + 8;
-        draw_text(r, tx, ty, m->items[i].label, fg, bg);
+        draw_text(r, mx + 8 * s, ty, m->items[i].label, fg, bg, s);
 
         if (m->items[i].key_ptr) {
             const char *kname = SDL_GetKeyName(*m->items[i].key_ptr);
-            int kw = (int)strlen(kname) * FONT_W;
-            draw_text(r, mx + mw - 8 - kw, ty, kname, fg, bg);
+            int kw = (int)strlen(kname) * fw;
+            draw_text(r, mx + mw - 8 * s - kw, ty, kname, fg, bg, s);
         }
 
-        ty += FONT_H + 2;
+        ty += fh + 2 * s;
     }
 }
 
@@ -599,8 +603,9 @@ InputMenu *input_menu_create(SDL_Renderer *renderer,
     m->bindings = malloc(n_buttons ? (size_t)n_buttons * sizeof(*m->bindings)
                                    : sizeof(*m->bindings));
     if (!m->bindings) { free(m); return NULL; }
-    memcpy(m->bindings, default_bindings,
-           (size_t)n_buttons * sizeof(*m->bindings));
+    if (n_buttons > 0 && default_bindings)
+        memcpy(m->bindings, default_bindings,
+               (size_t)n_buttons * sizeof(*m->bindings));
     load_ini(m);
 
     build_main_menu(m);

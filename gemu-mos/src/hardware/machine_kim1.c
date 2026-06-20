@@ -1023,6 +1023,7 @@ static void kim1_update_monitor_display(Kim1State *s) {
     s->seg_cache[3] = kim1_hex_to_segments(fa);
     s->seg_cache[4] = kim1_hex_to_segments(f9 >> 4);
     s->seg_cache[5] = kim1_hex_to_segments(f9);
+    s->display_dirty = true;
 }
 
 /* ── Memory callbacks ────────────────────────────────────────────────────── */
@@ -1164,8 +1165,10 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
                 /* PA write during display refresh: latch segment data into the digit
                  * currently selected by PB1-PB4 (74145 decoder, values 4-9 = LEDs 1-6). */
                 int dec = (s->u3.pb >> 1) & 0x0F;
-                if (dec >= 4 && dec <= 9)
+                if (dec >= 4 && dec <= 9) {
                     s->seg_cache[dec - 4] = val;
+                    s->display_dirty = true;
+                }
             }
             break;
         case KIM1_DDRA:
@@ -1177,8 +1180,10 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
                 /* PB write changes 74145 decoder; latch current PA into the new digit slot.
                  * Decoder input = PB1-PB4; values 4-9 → LED digits 1-6 (seg_cache[0-5]). */
                 int dec = (val >> 1) & 0x0F;
-                if (dec >= 4 && dec <= 9)
+                if (dec >= 4 && dec <= 9) {
                     s->seg_cache[dec - 4] = s->u3.pa;
+                    s->display_dirty = true;
+                }
             }
             break;
         case KIM1_DDRB:
@@ -1309,6 +1314,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
                 .actions     = kim1_actions,
                 .n_actions   = KIM1_NUM_ACTIONS,
                 .ini_section = "kim-keypad",
+                .no_rebind   = true,
             });
         if (!s->display)
             fprintf(stderr, "gemu-kim1: failed to create display window\n");
@@ -1325,6 +1331,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
 
     kim1_reset_rriots(s);
     s->serial = cfg->serial;
+    s->display_dirty = true;
 
     mos6502_reset(&s->cpu);
     return s;
@@ -1370,6 +1377,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
             if (s->serial && s->serial->pop_forwarded)
                 while ((cp = s->serial->pop_forwarded(s->serial->ud)) != 0)
                     raw_pressed |= kim1_raw_key_to_action(cp);
+            if (held != s->keypad_held) s->display_dirty = true;
             s->keypad_held = held;
             kim1_queue_keypress(s, (held & ~s->keypad_prev) | raw_pressed);
             s->keypad_prev = held;
@@ -1406,8 +1414,9 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
         }
 
 
-        if (s->display || s->vnc) {
+        if ((s->display || s->vnc) && s->display_dirty) {
             kim1_render_fb(s);
+            s->display_dirty = false;
             if (s->display)
                 gemu_display_render(s->display, s->fb,
                                     KIM1_FB_WIDTH, KIM1_FB_HEIGHT);

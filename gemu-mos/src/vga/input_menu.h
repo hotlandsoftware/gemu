@@ -24,8 +24,9 @@ bool input_menu_toggle(InputMenu *menu);
 bool input_menu_handle_event(InputMenu *menu, const SDL_Event *ev);
 
 /* Render the menu overlay on top of the current frame.
+ * pixel_scale: integer window/fb scale (1 = 1:1, 2 = 2x window, etc.).
  * Call after the emulator frame is drawn but before SDL_RenderPresent. */
-void input_menu_render(InputMenu *menu, SDL_Renderer *r);
+void input_menu_render(InputMenu *menu, SDL_Renderer *r, int pixel_scale);
 
 /* Menu state queries */
 bool input_menu_is_open(const InputMenu *menu);
