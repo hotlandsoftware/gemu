@@ -73,17 +73,16 @@ static void build_bindings(GtkBackend *b) {
         const char *key_name = (val[0]) ? val : def->default_key;
         guint kv = sdl_name_to_gdk(key_name);
         if (kv == GDK_KEY_VoidSymbol) continue;
-        b->bindings[b->n_bindings].keyval = kv;
+        b->bindings[b->n_bindings].keyval = gdk_keyval_to_lower(kv);
         b->bindings[b->n_bindings].bit    = def->bit;
         b->n_bindings++;
     }
 }
 
 static uint32_t keyval_to_bits(const GtkBackend *b, guint kv) {
-    guint lo = gdk_keyval_to_lower(kv);
+    guint lo = gdk_keyval_to_lower(kv);  /* bindings are pre-lowercased */
     for (int i = 0; i < b->n_bindings; i++) {
-        guint bkv = b->bindings[i].keyval;
-        if (bkv == kv || bkv == lo) return b->bindings[i].bit;
+        if (b->bindings[i].keyval == lo) return b->bindings[i].bit;
     }
     return 0;
 }
@@ -96,8 +95,7 @@ static gboolean on_key(GtkWidget *w, GdkEventKey *ev, gpointer ud) {
     GemuDisplay *d    = b->parent;
     bool         down = (ev->type == GDK_KEY_PRESS);
 
-    if (down && (ev->keyval == GDK_KEY_Escape ||
-                 ev->keyval == GDK_KEY_q)) {
+    if (down && ev->keyval == GDK_KEY_Escape) {
         d->quit = true;
         return TRUE;
     }
