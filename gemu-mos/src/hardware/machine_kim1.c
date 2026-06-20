@@ -2,6 +2,9 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "kim1.h"
+#ifdef GEMU_GTK
+#  include "../vga/hex_editor.h"
+#endif
 #include <SDL2/SDL.h>
 #include <errno.h>
 #include <stdio.h>
@@ -25,6 +28,17 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud);
 static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud);
 static void kim1_update_monitor_display(Kim1State *s);
 static void kim1_panel_command(Kim1State *s, uint8_t key);
+
+#ifdef GEMU_GTK
+static void kim1_hex_toggle(void *ud) {
+    Kim1State *s = ud;
+    if (!s->hex_editor) return;
+    if (hex_editor_is_visible(s->hex_editor))
+        hex_editor_hide(s->hex_editor);
+    else
+        hex_editor_show(s->hex_editor);
+}
+#endif
 
 /* ── KIM-1 keypad action table ──────────────────────────────────────────── */
 
@@ -1302,6 +1316,13 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     }
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
+#ifdef GEMU_GTK
+        GemuDisplayGtkExtras gtk_extras = {
+            .monitor       = s->monitor,
+            .hex_toggle_cb = kim1_hex_toggle,
+            .hex_toggle_ud = s,
+        };
+#endif
         s->display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
                 .title       = "GEMU",
@@ -1315,10 +1336,25 @@ Kim1State *kim1_create(const MosConfig *cfg) {
                 .n_actions   = KIM1_NUM_ACTIONS,
                 .ini_section = "kim-keypad",
                 .no_rebind   = true,
+#ifdef GEMU_GTK
+                .gtk         = &gtk_extras,
+#endif
             });
         if (!s->display)
             fprintf(stderr, "gemu-kim1: failed to create display window\n");
     }
+
+#ifdef GEMU_GTK
+    if (cfg->display_type == GEMU_DISPLAY_GTK) {
+        HexRegion kim1_regions[] = {
+            { "RAM ($0000-$03FF)",      s->ram,      sizeof(s->ram),      false, 0x0000u },
+            { "RRIOT RAM ($1780-$17FF)",s->rriot_ram,sizeof(s->rriot_ram),false, 0x1780u },
+            { "ROM 6530-002 ($1800)",   s->rom_002,  sizeof(s->rom_002),  true,  0x1800u },
+            { "ROM 6530-003 ($1C00)",   s->rom_003,  sizeof(s->rom_003),  true,  0x1C00u },
+        };
+        s->hex_editor = hex_editor_create(kim1_regions, 4);
+    }
+#endif
 
     if (cfg->vnc_addr) {
         s->vnc = gemu_vnc_create(cfg->vnc_addr, KIM1_PRESENT_WIDTH, KIM1_PRESENT_HEIGHT);
@@ -1338,6 +1374,9 @@ Kim1State *kim1_create(const MosConfig *cfg) {
 }
 
 void kim1_destroy(Kim1State *s) {
+#ifdef GEMU_GTK
+    hex_editor_destroy(s->hex_editor);
+#endif
     gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
     gemu_monitor_destroy(s->monitor);
@@ -1423,6 +1462,10 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
             if (s->vnc)
                 kim1_update_vnc(s);
         }
+
+#ifdef GEMU_GTK
+        hex_editor_refresh(s->hex_editor);
+#endif
 
         kim1_sleep_ms(KIM1_FRAME_MS);
     }

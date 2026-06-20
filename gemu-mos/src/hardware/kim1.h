@@ -144,6 +144,10 @@ typedef struct Kim1State {
     GemuMonitor     *monitor;
 
     GemuSerial      *serial;            /* NULL if no serial terminal attached */
+
+#ifdef GEMU_GTK
+    struct HexEditor *hex_editor;
+#endif
 } Kim1State;
 
 Kim1State *kim1_create (const MosConfig *cfg);

@@ -10,7 +10,8 @@ struct GemuVideoGtk {
     GtkWidget       *window;
     GtkWidget       *gl_area;
     GtkWidget       *drawing_area;  /* kept for API compat */
-    uint32_t        *frame_argb;
+    uint32_t        *frame_argb;    /* staging buffer — new pixels land here */
+    bool             frame_dirty;   /* frame_argb has a frame not yet uploaded */
     const uint32_t  *palette;
     int              n_colors;
     int              width;
@@ -167,6 +168,14 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *ctx, gpointer data) {
     GemuVideoGtk *v = data;
     if (!v->gl_ready) return TRUE;
 
+    /* Upload pending frame — must happen here where the GL context is current. */
+    if (v->frame_dirty) {
+        glBindTexture(GL_TEXTURE_2D, v->tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, v->width, v->height,
+                        GL_BGRA, GL_UNSIGNED_BYTE, v->frame_argb);
+        v->frame_dirty = false;
+    }
+
     int w = gtk_widget_get_allocated_width(GTK_WIDGET(area));
     int h = gtk_widget_get_allocated_height(GTK_WIDGET(area));
 
@@ -257,14 +266,13 @@ void gemu_video_gtk_present_argb(GemuVideoGtk *v, const uint32_t *pixels,
     if (!v || !pixels || w != v->width || h != v->height || !v->gl_ready)
         return;
 
-    /* Upload directly to GL texture (BGRA format matches typical ARGB layout
-     * on little-endian when reinterpreted as BGRA for glTexSubImage2D). */
-    glBindTexture(GL_TEXTURE_2D, v->tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
-                    GL_BGRA, GL_UNSIGNED_BYTE, pixels);
-
+    /* Stage the frame — upload happens in on_render where the GL context is
+     * guaranteed to be current (GTK makes it current before the callback). */
+    if (pixels != v->frame_argb)
+        memcpy(v->frame_argb, pixels, (size_t)w * h * sizeof(*v->frame_argb));
+    v->frame_dirty = true;
     v->active = true;
-    gtk_widget_queue_draw(v->gl_area);
+    gtk_gl_area_queue_render(GTK_GL_AREA(v->gl_area));
 }
 
 void gemu_video_gtk_present_indexed(GemuVideoGtk *v, const uint8_t *pixels,

@@ -1135,8 +1135,13 @@ Vt100State *vt100_create(GemuDisplayType dtype) {
     }
     t->window_id = SDL_GetWindowID(t->window);
 
-    /* Create renderer */
-    Uint32 rflags = SDL_RENDERER_ACCELERATED | (use_vsync ? SDL_RENDERER_PRESENTVSYNC : 0);
+    /* Create renderer.
+     * In GTK mode use software rendering: the accelerated renderer uses OpenGL,
+     * and every SDL_RenderPresent triggers glXSwapBuffers which causes the
+     * compositor to re-composite all windows — making the GTK menu bar flicker. */
+    Uint32 rflags = (dtype == GEMU_DISPLAY_GTK)
+                    ? SDL_RENDERER_SOFTWARE
+                    : (SDL_RENDERER_ACCELERATED | (use_vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
     t->renderer = SDL_CreateRenderer(t->window, -1, rflags);
     if (!t->renderer)
         t->renderer = SDL_CreateRenderer(t->window, -1, SDL_RENDERER_SOFTWARE);
