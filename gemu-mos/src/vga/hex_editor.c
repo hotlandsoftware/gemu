@@ -1,6 +1,5 @@
 #ifdef GEMU_GTK
 #include "hex_editor.h"
-#include "../hardware/nes.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -8,12 +7,7 @@
 
 /* ── Per-tab state ──────────────────────────────────────────────────────── */
 
-typedef enum {
-    HEX_TAB_RAM = 0,
-    HEX_TAB_PRG,
-    HEX_TAB_CHR,
-    HEX_TAB_COUNT
-} HexTabId;
+#define HEX_MAX_TABS 8
 
 typedef struct {
     const char    *label;
@@ -38,14 +32,14 @@ struct HexEditor {
     GtkWidget     *write_btn;
     GtkWidget     *status_label;
     GtkWidget     *goto_entry;
-    NesState      *nes;
     bool           visible;
-    int            refresh_skip;    /* rebuild only every other frame */
-    HexEditorTab   tabs[HEX_TAB_COUNT];
+    int            refresh_skip;
+    int            n_tabs;
+    HexEditorTab   tabs[HEX_MAX_TABS];
     HexEditorTab  *cur_tab;
     uint32_t       selected_addr;   /* offset into current tab's data */
     bool           has_selection;
-    int            edit_nibble;      /* 0 = high hex digit, 1 = low */
+    int            edit_nibble;     /* 0 = high hex digit, 1 = low */
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
@@ -348,7 +342,7 @@ static bool hex_tab_byte_at_pos(HexEditorTab *tab, int offset,
 }
 
 static HexEditorTab *hex_tab_for_text_view(HexEditor *he, GtkWidget *text_view) {
-    for (int i = 0; i < HEX_TAB_COUNT; i++) {
+    for (int i = 0; i < he->n_tabs; i++) {
         if (he->tabs[i].text_view == text_view)
             return &he->tabs[i];
     }
@@ -357,7 +351,7 @@ static HexEditorTab *hex_tab_for_text_view(HexEditor *he, GtkWidget *text_view) 
 
 static void hex_sync_cur_tab(HexEditor *he) {
     int page = gtk_notebook_get_current_page(GTK_NOTEBOOK(he->notebook));
-    if (page >= 0 && page < HEX_TAB_COUNT)
+    if (page >= 0 && page < he->n_tabs)
         he->cur_tab = &he->tabs[page];
 }
 
@@ -411,7 +405,7 @@ static void hex_select_byte(HexEditor *he, int line, int byte_idx, uint32_t addr
 
 static void hex_update_cur_tab(HexEditor *he) {
     int page = gtk_notebook_get_current_page(GTK_NOTEBOOK(he->notebook));
-    if (page < 0 || page >= HEX_TAB_COUNT) {
+    if (page < 0 || page >= he->n_tabs) {
         he->cur_tab = NULL;
         return;
     }
@@ -713,10 +707,11 @@ static GtkWidget *hex_create_tab_view(HexEditor *he, HexEditorTab *tab) {
 
 /* Initialize one tab's data source, build its view, rebuild its contents,
  * and append it to the notebook. */
-static void hex_editor_add_tab(HexEditor *he, HexTabId id, const char *label,
+static void hex_editor_add_tab(HexEditor *he, const char *label,
                                 const uint8_t *data, size_t size,
                                 bool read_only, uint32_t base_addr) {
-    HexEditorTab *tab = &he->tabs[id];
+    if (he->n_tabs >= HEX_MAX_TABS) return;
+    HexEditorTab *tab = &he->tabs[he->n_tabs++];
     *tab = (HexEditorTab){
         .label     = label,
         .data      = data,
@@ -732,16 +727,13 @@ static void hex_editor_add_tab(HexEditor *he, HexTabId id, const char *label,
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-HexEditor *hex_editor_create(NesState *s) {
-    if (!s) return NULL;
+HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
+    if (!regions || n_regions <= 0 || n_regions > HEX_MAX_TABS) return NULL;
 
-    /* Ensure GTK is initialized before creating any widgets. */
     if (!gtk_init_check(NULL, NULL)) return NULL;
 
     HexEditor *he = calloc(1, sizeof(*he));
     if (!he) return NULL;
-    he->nes = s;
-    he->visible = false;
 
     /* ── Window ── */
     he->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -762,14 +754,10 @@ HexEditor *hex_editor_create(NesState *s) {
                      G_CALLBACK(on_page_switched), he);
     gtk_box_pack_start(GTK_BOX(vbox), he->notebook, TRUE, TRUE, 0);
 
-    hex_editor_add_tab(he, HEX_TAB_RAM, "CPU RAM ($0000-$07FF)",
-                        s->ram, sizeof(s->ram), false, 0x0000);
-    hex_editor_add_tab(he, HEX_TAB_PRG, "PRG ROM ($8000+)",
-                        s->prg, s->prg ? (size_t)s->cart.prg_banks * 0x4000u : 0,
-                        true, 0x8000);
-    hex_editor_add_tab(he, HEX_TAB_CHR, "CHR ROM/RAM",
-                        s->chr, s->chr ? (size_t)s->cart.chr_banks * 0x2000u : 0,
-                        !s->chr_is_ram, 0x0000);
+    for (int i = 0; i < n_regions; i++)
+        hex_editor_add_tab(he, regions[i].label, regions[i].data,
+                           regions[i].size, regions[i].read_only,
+                           regions[i].base_addr);
 
     /* ── Bottom control bar ── */
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
@@ -841,7 +829,7 @@ void hex_editor_show(HexEditor *he) {
     he->visible = true;
 
     /* Rebuild all tabs with fresh data, preserving scroll positions */
-    for (int i = 0; i < HEX_TAB_COUNT; i++) {
+    for (int i = 0; i < he->n_tabs; i++) {
         if (!he->tabs[i].data) continue;
         GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(
             GTK_SCROLLED_WINDOW(he->tabs[i].scrolled));
@@ -888,7 +876,7 @@ void hex_editor_refresh(HexEditor *he) {
     /* Rebuild all non-read-only tabs with fresh data via in-place line
      * updates — scroll position is naturally preserved because only
      * changed lines are replaced. */
-    for (int i = 0; i < HEX_TAB_COUNT; i++) {
+    for (int i = 0; i < he->n_tabs; i++) {
         HexEditorTab *tab = &he->tabs[i];
         if (!tab->data || tab->read_only) continue;
         hex_tab_update(tab);

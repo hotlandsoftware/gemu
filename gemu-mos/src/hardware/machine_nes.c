@@ -1446,8 +1446,19 @@ NesState *nes_create(const MosConfig *cfg) {
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, nes_screendump, s);
 #ifdef GEMU_GTK
-    if (cfg->display_type == GEMU_DISPLAY_GTK)
-        s->hex_editor = hex_editor_create(s);
+    if (cfg->display_type == GEMU_DISPLAY_GTK) {
+        HexRegion nes_regions[] = {
+            { "CPU RAM ($0000-$07FF)", s->ram,
+              sizeof(s->ram), false, 0x0000 },
+            { "PRG ROM ($8000+)", s->prg,
+              s->prg ? (size_t)s->cart.prg_banks * 0x4000u : 0,
+              true, 0x8000 },
+            { "CHR ROM/RAM", s->chr,
+              s->chr ? (size_t)s->cart.chr_banks * 0x2000u : 0,
+              !s->chr_is_ram, 0x0000 },
+        };
+        s->hex_editor = hex_editor_create(nes_regions, 3);
+    }
 #endif
     if (s->fds_enabled) {
         GemuMediaDevice floppy_dev = {

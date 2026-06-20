@@ -17,4 +17,4 @@ python configure --enable-gtk && ninja -j$(nproc) # for GTK support
 See https://hotlandsoftware.github.io/gemu/
 
 # Why?
-To put it bluntly, I'm very curious to see how far AI agents have come, and I'm curious to see *how* many different machines we can make AI emulate with little reference. (And also because I wanted something like MAME with the power of QEMU that could run off a VNC server.) 
+I'm very curious to see how far AI agents have come, and I'm curious to see *how* many different machines we can make AI emulate with little reference. (And also because I wanted something like MAME, with the power of QEMU, that could run off a VNC server...)

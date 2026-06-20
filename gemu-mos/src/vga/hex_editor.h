@@ -5,15 +5,23 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Forward declaration — the full NesState is in nes.h */
-typedef struct NesState NesState;
+/* One memory region shown as a tab in the hex editor. */
+typedef struct {
+    const char    *label;      /* tab title, e.g. "CPU RAM ($0000-$07FF)" */
+    uint8_t       *data;       /* live pointer (may be NULL → "(no data)") */
+    size_t         size;       /* bytes */
+    bool           read_only;
+    uint32_t       base_addr;  /* address shown at offset 0 */
+} HexRegion;
 
 typedef struct HexEditor HexEditor;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
 
-/* Create a hidden hex editor window.  Returns NULL on failure. */
-HexEditor *hex_editor_create(NesState *s);
+/* Create a hidden hex editor window with one tab per region.
+ * n_regions must be > 0 and <= HEX_MAX_TABS (8).
+ * Returns NULL on failure. */
+HexEditor *hex_editor_create(const HexRegion *regions, int n_regions);
 
 /* Destroy the window and free all resources. */
 void hex_editor_destroy(HexEditor *he);
