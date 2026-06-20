@@ -222,8 +222,11 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     gemu_gtk_add_action_menu(vbox, spec->monitor,
                               spec->hex_toggle_cb, spec->hex_toggle_ud);
 
-    /* GL area */
+    /* GL area — must not be focusable: if it grabs focus, key events go to
+     * the GL area (which has no key handler) and don't reliably propagate
+     * back to the window where our on_key signal handler lives. */
     v->gl_area = gtk_gl_area_new();
+    gtk_widget_set_can_focus(v->gl_area, FALSE);
     gtk_widget_set_size_request(v->gl_area,
                                 v->window_width,
                                 v->window_height);
