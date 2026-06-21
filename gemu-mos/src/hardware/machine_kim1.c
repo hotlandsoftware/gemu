@@ -951,30 +951,35 @@ void kim1_render_fb(Kim1State *s) {
 
 /* ── 6530 timer helpers ─────────────────────────────────────────────────── */
 
-static inline uint32_t rriot_period(Kim1Rriot *r) {
-    return r->reload ? (uint32_t)r->reload : 0x10000u;
+/* irq_en (set by $0C-$0F writes) controls whether irq_flag drives cpu.irq. */
+static void rriot_update_irq(Kim1State *s) {
+    s->cpu.irq = (s->u2.irq_flag && s->u2.irq_en)
+              || (s->u3.irq_flag && s->u3.irq_en);
 }
 
-static void rriot_update_irq(Kim1State *s) {
-    s->cpu.irq = s->u2.irq_flag || s->u3.irq_flag;
+/* Live 8-bit count: counts down from reload to 0 (underflow), then wraps
+ * to $FF and continues freely. */
+static uint8_t rriot_current_count(const Kim1Rriot *r, uint64_t cycle) {
+    if (!r->running) return r->reload;
+    if (cycle < r->next_fire)
+        return (uint8_t)((r->next_fire - cycle - 1u) / r->prescale);
+    /* post-underflow: wraps $00 → $FF → $FE … */
+    return (uint8_t)(-(uint8_t)((cycle - r->next_fire) / r->prescale));
 }
 
 static void rriot_timer_tick(Kim1Rriot *r, Kim1State *s) {
-    if (!r->running) return;
+    if (!r->running || r->irq_flag) return;
     if (s->cpu.cycle_count < r->next_fire) return;
-
     r->irq_flag = true;
-    r->count    = 0;
     rriot_update_irq(s);
-    r->next_fire = s->cpu.cycle_count + (uint64_t)rriot_period(r);
 }
 
 static void rriot_timer_start(Kim1Rriot *r, Kim1State *s) {
-    r->count    = r->reload;
     r->running  = true;
     r->irq_flag = false;
     rriot_update_irq(s);
-    r->next_fire = s->cpu.cycle_count + (uint64_t)rriot_period(r);
+    uint64_t period = (uint64_t)(r->reload ? r->reload : 256u) * r->prescale;
+    r->next_fire = s->cpu.cycle_count + period;
 }
 
 /* ── 6530 RRIOT reset state ─────────────────────────────────────────────── */
@@ -990,6 +995,7 @@ static void kim1_reset_rriots(Kim1State *s) {
 
     /* 6530-003 (u2, addr 0x1700): application I/O */
     s->u2 = (Kim1Rriot){0};
+    s->u2.prescale = 1;
     s->u2.irq_flag = true;
 
     /* 6530-002 (u3, addr 0x1740): LED display / keyboard / tape.
@@ -997,6 +1003,7 @@ static void kim1_reset_rriots(Kim1State *s) {
      * irq_flag=true so the monitor's first BIT $1747 spin exits immediately
      * rather than looping forever waiting for a timer that hasn't started yet. */
     s->u3 = (Kim1Rriot){0};
+    s->u3.prescale = 1;
     s->u3.pb      = 0x01u;
     s->u3.ddrb    = 0x3Fu;
     s->u3.irq_flag = true;
@@ -1079,11 +1086,15 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
             return out | (0u & ~r->ddrb);
         }
         case KIM1_DDRB:  return r->ddrb;
-        case KIM1_TL:    return (uint8_t)(r->count & 0xFFu);
-        case KIM1_TH:    return (uint8_t)((r->count >> 8) & 0xFFu);
-        case KIM1_TW:    return 0u;
-        case KIM1_TIF: {
-            uint8_t v = r->irq_flag ? 0x80u : 0u;
+        /* $04/$05 ($0C/$0D): read live count, no side-effects */
+        case KIM1_TL: case KIM1_TH:
+        case 0x0Cu:   case 0x0Du:
+            return rriot_current_count(r, s->cpu.cycle_count);
+        /* $06/$07 ($0E/$0F): read IRQ status + count, clears IRQ flag */
+        case KIM1_TW: case KIM1_TIF:
+        case 0x0Eu:   case 0x0Fu: {
+            uint8_t cnt = rriot_current_count(r, s->cpu.cycle_count);
+            uint8_t v = (r->irq_flag ? 0x80u : 0u) | (cnt & 0x7Fu);
             r->irq_flag = false;
             rriot_update_irq(s);
             return v;
@@ -1203,21 +1214,17 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
         case KIM1_DDRB:
             r->ddrb = val;
             break;
-        case KIM1_TL:
-            r->reload = (r->reload & 0xFF00u) | val;
+        /* $04-$07: load 8-bit timer, prescale ×1/×8/×64/×1024, no CPU IRQ */
+        /* $0C-$0F: same prescales but assert CPU IRQ line on underflow      */
+        case KIM1_TL: case KIM1_TH: case KIM1_TW: case KIM1_TIF:
+        case 0x0Cu:   case 0x0Du:   case 0x0Eu:   case 0x0Fu: {
+            static const uint16_t ps[4] = {1, 8, 64, 1024};
+            r->reload   = val;
+            r->prescale = ps[off & 3u];
+            r->irq_en   = (off & 0x08u) != 0;
             rriot_timer_start(r, s);
             break;
-        case KIM1_TH:
-            r->reload = (r->reload & 0x00FFu) | ((uint16_t)val << 8);
-            rriot_timer_start(r, s);
-            break;
-        case KIM1_TW:
-            r->reload = (r->reload & 0xFF00u) | val;
-            break;
-        case KIM1_TIF:
-            r->irq_flag = false;
-            rriot_update_irq(s);
-            break;
+        }
         }
         return;
     }

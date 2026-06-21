@@ -75,7 +75,23 @@ Simulated machines include:
 | oricatoms | `Tangerine Oric Atoms` | 1983 |
 | tg16 | `TurboGrafx-16` | 1987 |
 
-## Maybe?
-| Name   | Full Name     | Year |
-|--------|---------------|---------------|
-| dg6501 | `Digital Group 6501 CPU Board` | 1975 |
+## Maybe in the future?
+| Name   | Full Name     | Year | Notes |
+|--------|---------------|---------------|---------------|
+| aone | `A-ONE` | 2006 | Apple 1 Replica | 
+| beneater | `Ben Eater 6502 Computer` | ? | |
+| beta | `Beta Single-Board Computer` | 1984 | |
+| bem | `Brutech B.E.M.` | 1984 | |
+| cepac65 | `CEPAC-65` | 1984 | |
+| datahandler | `Data Handler` | 1975 | Built in 1975 by Western Data Systems Corporation, one of the first 6502 computers |
+| datac1000 | `DATAC 1000` | 1976 | |
+| dg6501 | `Digital Group 6501 CPU Board` | 1975 | |
+| ec65 | `Elektor EC65` | 1981(?) | |
+| elektor-clock | `Elektor 6502 Clock` | 1981(?) | |
+| elektor-junior | `Elektor Junior` | 1980 | |
+| rc6502 | `RC6502` | ? | Apple 1 Replica |
+| replica1-se | `Replica 1 SE` | 2006 | Apple 1 Replica |
+| replica1-te | `Replica 1 TE` | 2008 | Apple 1 Replica |
+| replica1-ten | `Replica 1 TEN` | 2014 | Apple 1 Replica |
+| mega6502 | `Mega6502` | ? | Apple 1 Replica |
+| mini-master | `Mini Master` | ? | Apple 1 Replica |

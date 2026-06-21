@@ -106,11 +106,12 @@
 typedef struct {
     uint8_t  pa, pb;
     uint8_t  ddra, ddrb;
-    uint16_t reload;
-    uint16_t count;
+    uint8_t  reload;        /* 8-bit countdown load value */
+    uint16_t prescale;      /* 1, 8, 64, or 1024 */
+    bool     irq_en;        /* true = drive CPU IRQ line on underflow */
     bool     running;
     bool     irq_flag;
-    uint64_t next_fire;
+    uint64_t next_fire;     /* cpu cycle count at timer underflow */
 } Kim1Rriot;
 
 typedef struct Kim1State {
