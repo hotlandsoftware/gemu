@@ -12,6 +12,7 @@ struct GemuVideoSdl {
     int             width;
     int             height;
     bool            software;
+    bool            resizable;  /* true for scale-based windows (window_width==0) */
     void          (*overlay_cb)(void *ud, SDL_Renderer *r, int pixel_scale);
     void           *overlay_ud;
 };
@@ -44,12 +45,17 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
                            sizeof(*v->frame_argb));
     if (!v->frame_argb) goto fail;
 
+    /* Windows with an explicit fixed size (e.g. KIM-1 keypad) are not
+     * resizable.  Scale-based windows (window_width == 0) are resizable and
+     * will snap to integer scale on SDL_WINDOWEVENT_RESIZED. */
+    v->resizable = (spec->window_width == 0);
     int ww = spec->window_width  > 0 ? spec->window_width  : spec->width;
     int wh = spec->window_height > 0 ? spec->window_height : spec->height;
+    Uint32 win_flags = SDL_WINDOW_SHOWN | (v->resizable ? SDL_WINDOW_RESIZABLE : 0);
     v->window = SDL_CreateWindow(
         spec->title ? spec->title : "GEMU",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        ww, wh, SDL_WINDOW_SHOWN);
+        ww, wh, win_flags);
     if (!v->window) goto fail;
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
@@ -75,6 +81,10 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
     }
 
     SDL_RenderSetLogicalSize(v->renderer, v->width, v->height);
+    /* For resizable windows, render at the largest integer scale that fits —
+     * avoids fighting the WM with SDL_SetWindowSize during a resize drag. */
+    if (v->resizable)
+        SDL_RenderSetIntegerScale(v->renderer, SDL_TRUE);
 
     v->texture = SDL_CreateTexture(v->renderer, SDL_PIXELFORMAT_ARGB8888,
                                    SDL_TEXTUREACCESS_STREAMING,
@@ -156,6 +166,16 @@ void gemu_video_sdl_mouse_logical(GemuVideoSdl *v, int *x, int *y) {
     SDL_RenderWindowToLogical(v->renderer, wx, wy, &lx, &ly);
     if (x) *x = (int)lx;
     if (y) *y = (int)ly;
+}
+
+void gemu_video_sdl_snap_resize(GemuVideoSdl *v, int new_w, int new_h) {
+    if (!v || !v->resizable || v->width <= 0 || v->height <= 0) return;
+    int scale = (new_w + v->width / 2) / v->width;
+    if (scale < 1) scale = 1;
+    int snapped_w = v->width  * scale;
+    int snapped_h = v->height * scale;
+    if (new_w != snapped_w || new_h != snapped_h)
+        SDL_SetWindowSize(v->window, snapped_w, snapped_h);
 }
 
 void gemu_video_sdl_set_overlay(GemuVideoSdl *v,

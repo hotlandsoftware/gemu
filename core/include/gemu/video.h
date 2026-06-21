@@ -32,6 +32,8 @@ void gemu_video_sdl_clear(GemuVideoSdl *v);
 
 bool gemu_video_sdl_is_software(const GemuVideoSdl *v);
 void gemu_video_sdl_mouse_logical(GemuVideoSdl *v, int *x, int *y);
+/* Snap window to nearest integer scale on resize (no-op for fixed-size windows). */
+void gemu_video_sdl_snap_resize(GemuVideoSdl *v, int new_w, int new_h);
 
 /* Optional overlay: called after emulator frame is drawn but before
  * SDL_RenderPresent.  Use for in-emulator menus, OSD, etc. */

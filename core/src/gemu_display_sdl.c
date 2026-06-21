@@ -31,6 +31,14 @@ typedef struct {
     const GemuActionDef *action_defs;
     int                  n_actions;
     const char          *ini_section;
+
+    /* Resize snap: record last RESIZED dimensions + time; snap 150ms after
+     * the last event so we never call SDL_SetWindowSize mid-drag (which
+     * conflicts with the WM's pointer grab on X11 and causes the window to
+     * move instead of resize). */
+    int    pending_snap_w;
+    int    pending_snap_h;
+    Uint32 pending_snap_t;
 } SdlBackend;
 
 /* ── Binding table ───────────────────────────────────────────────────────── */
@@ -109,6 +117,15 @@ static void sdl_do_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
 static uint32_t sdl_do_poll(GemuDisplay *d) {
     SdlBackend *b = d->backend;
 
+    /* Apply debounced resize snap: fire 150ms after the last RESIZED event.
+     * We never snap mid-drag because calling SDL_SetWindowSize while the WM
+     * holds the pointer grab causes the window to move on X11. */
+    if (b->pending_snap_w > 0 &&
+        SDL_TICKS_PASSED(SDL_GetTicks(), b->pending_snap_t + 150)) {
+        gemu_video_sdl_snap_resize(b->video, b->pending_snap_w, b->pending_snap_h);
+        b->pending_snap_w = 0;
+    }
+
     /* Detect menu close → reload INI bindings */
     bool menu_open = b->menu && input_menu_is_open(b->menu);
     if (b->menu_was_open && !menu_open)
@@ -131,6 +148,11 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         case SDL_WINDOWEVENT:
             if (ev.window.event == SDL_WINDOWEVENT_CLOSE)
                 d->quit = true;
+            else if (ev.window.event == SDL_WINDOWEVENT_RESIZED) {
+                b->pending_snap_w = ev.window.data1;
+                b->pending_snap_h = ev.window.data2;
+                b->pending_snap_t = SDL_GetTicks();
+            }
             break;
 
         case SDL_MOUSEMOTION:

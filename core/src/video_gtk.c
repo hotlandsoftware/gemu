@@ -26,6 +26,12 @@ struct GemuVideoGtk {
     GLuint           vao;
     GLuint           vbo;
     bool             gl_ready;
+    /* Integer-scale resize (resizable windows only) */
+    bool             resizable;
+    bool             setup_done;    /* ignore size-allocate during initial layout */
+    int              pending_snap_w;
+    int              pending_snap_h;
+    guint            snap_source_id;
 };
 
 /* ── Shaders ─────────────────────────────────────────────────────────────── */
@@ -143,6 +149,45 @@ static void gl_teardown(GemuVideoGtk *v) {
     v->gl_ready = false;
 }
 
+/* ── Integer-scale resize ────────────────────────────────────────────────── */
+
+static gboolean do_gtk_snap(gpointer data) {
+    GemuVideoGtk *v = data;
+    v->snap_source_id = 0;
+    if (!v->width || !v->height) return G_SOURCE_REMOVE;
+
+    int scale = (v->pending_snap_w + v->width / 2) / v->width;
+    if (scale < 1) scale = 1;
+    int target_w = v->width  * scale;
+    int target_h = v->height * scale;
+
+    int gl_w  = gtk_widget_get_allocated_width(v->gl_area);
+    int gl_h  = gtk_widget_get_allocated_height(v->gl_area);
+    int win_w = gtk_widget_get_allocated_width(GTK_WIDGET(v->window));
+    int win_h = gtk_widget_get_allocated_height(GTK_WIDGET(v->window));
+
+    if (target_w == gl_w && target_h == gl_h) return G_SOURCE_REMOVE;
+
+    /* Resize window by the same delta the GL area needs to change — this
+     * keeps the menu bar height out of the calculation entirely. */
+    gtk_window_resize(GTK_WINDOW(v->window),
+                      win_w + (target_w - gl_w),
+                      win_h + (target_h - gl_h));
+    return G_SOURCE_REMOVE;
+}
+
+static void on_gl_size_allocate(GtkWidget *widget, GtkAllocation *alloc,
+                                gpointer data) {
+    (void)widget;
+    GemuVideoGtk *v = data;
+    if (!v->resizable || !v->setup_done) return;
+    if (v->snap_source_id)
+        g_source_remove(v->snap_source_id);
+    v->pending_snap_w = alloc->width;
+    v->pending_snap_h = alloc->height;
+    v->snap_source_id = g_timeout_add(150, do_gtk_snap, v);
+}
+
 /* ── GTK callbacks ───────────────────────────────────────────────────────── */
 
 static gboolean on_realize(GtkWidget *w, gpointer data) {
@@ -220,11 +265,15 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
         return NULL;
     }
 
+    /* Scale-based windows (window_width == 0 in spec) are resizable and snap
+     * to integer multiples.  Fixed-size windows (KIM-1 keypad, etc.) are not. */
+    v->resizable = (spec->window_width == 0);
+
     /* Window */
     v->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(v->window),
                          spec->title ? spec->title : "GEMU");
-    gtk_window_set_resizable(GTK_WINDOW(v->window), FALSE);
+    gtk_window_set_resizable(GTK_WINDOW(v->window), v->resizable);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(v->window), vbox);
@@ -236,11 +285,21 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
      * back to the window where our on_key signal handler lives. */
     v->gl_area = gtk_gl_area_new();
     gtk_widget_set_can_focus(v->gl_area, FALSE);
-    gtk_widget_set_size_request(v->gl_area,
-                                v->window_width,
-                                v->window_height);
+    /* For resizable windows, set minimum size to 1x; the initial scale is
+     * applied after the first show via gtk_window_resize.
+     * For fixed-size windows, the size request IS the window size. */
+    if (v->resizable)
+        gtk_widget_set_size_request(v->gl_area, v->width, v->height);
+    else
+        gtk_widget_set_size_request(v->gl_area, v->window_width, v->window_height);
     gtk_gl_area_set_required_version(GTK_GL_AREA(v->gl_area), 3, 2);
     gtk_box_pack_start(GTK_BOX(vbox), v->gl_area, TRUE, TRUE, 0);
+
+    /* size-allocate connected before show so it fires during initial layout;
+     * setup_done is false so those early firings are ignored. */
+    if (v->resizable)
+        g_signal_connect(v->gl_area, "size-allocate",
+                         G_CALLBACK(on_gl_size_allocate), v);
 
     g_signal_connect(v->gl_area, "realize",   G_CALLBACK(on_realize),   v);
     g_signal_connect(v->gl_area, "unrealize", G_CALLBACK(on_unrealize), v);
@@ -251,11 +310,28 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
 
     gtk_widget_show_all(v->window);
     gemu_video_gtk_poll();
+
+    if (v->resizable) {
+        /* Resize to the configured initial scale.  We can now measure the
+         * menu bar height as (window height - GL area height) and add it
+         * back when resizing to the target dimensions. */
+        int gl_h  = gtk_widget_get_allocated_height(v->gl_area);
+        int win_h = gtk_widget_get_allocated_height(GTK_WIDGET(v->window));
+        gtk_window_resize(GTK_WINDOW(v->window),
+                          v->window_width,
+                          v->window_height + (win_h - gl_h));
+        gemu_video_gtk_poll();
+        /* Initial layout complete — future size-allocates are user resizes. */
+        v->setup_done = true;
+    }
+
     return v;
 }
 
 void gemu_video_gtk_destroy(GemuVideoGtk *v) {
     if (!v) return;
+    if (v->snap_source_id)
+        g_source_remove(v->snap_source_id);
     if (v->window) gtk_widget_destroy(v->window);
     free(v->frame_argb);
     free(v);
