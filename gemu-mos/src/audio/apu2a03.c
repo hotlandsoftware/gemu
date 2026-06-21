@@ -199,43 +199,44 @@ void apu2a03_tick(Apu2a03 *a) {
             a->noise.lfsr = (uint16_t)((a->noise.lfsr >> 1) | (feedback << 14));
         }
 
-        /* DMC */
-        if (a->ch_en[4]) {
-            if (a->dmc.timer > 0) {
-                a->dmc.timer--;
-            } else {
-                a->dmc.timer = a->dmc.period;
-                if (!a->dmc.silence) {
-                    if (a->dmc.shift & 1) {
-                        if (a->dmc.level <= 125) a->dmc.level += 2;
-                    } else {
-                        if (a->dmc.level >= 2)   a->dmc.level -= 2;
-                    }
-                    a->dmc.shift >>= 1;
+    }
+
+    /* DMC: clocked every CPU cycle (rate table values are in CPU cycles) */
+    if (a->ch_en[4]) {
+        if (a->dmc.timer > 0) {
+            a->dmc.timer--;
+        } else {
+            a->dmc.timer = a->dmc.period;
+            if (!a->dmc.silence) {
+                if (a->dmc.shift & 1) {
+                    if (a->dmc.level <= 125) a->dmc.level += 2;
+                } else {
+                    if (a->dmc.level >= 2)   a->dmc.level -= 2;
                 }
-                if (--a->dmc.bits_rem == 0) {
-                    a->dmc.bits_rem = 8;
-                    if (a->dmc.buf_empty) {
-                        a->dmc.silence = true;
-                    } else {
-                        a->dmc.silence  = false;
-                        a->dmc.shift    = a->dmc.sample_buf;
-                        a->dmc.buf_empty = true;
-                    }
+                a->dmc.shift >>= 1;
+            }
+            if (--a->dmc.bits_rem == 0) {
+                a->dmc.bits_rem = 8;
+                if (a->dmc.buf_empty) {
+                    a->dmc.silence = true;
+                } else {
+                    a->dmc.silence  = false;
+                    a->dmc.shift    = a->dmc.sample_buf;
+                    a->dmc.buf_empty = true;
                 }
-                /* Refill DMC sample buffer from memory */
-                if (a->dmc.buf_empty && a->dmc.bytes_rem > 0 && a->mem_read) {
-                    a->dmc.sample_buf = a->mem_read(a->dmc.cur_addr, a->mem_ud);
-                    a->dmc.buf_empty  = false;
-                    a->dmc.cur_addr   = (a->dmc.cur_addr == 0xFFFF)
-                                        ? 0x8000 : a->dmc.cur_addr + 1;
-                    if (--a->dmc.bytes_rem == 0) {
-                        if (a->dmc.loop) {
-                            a->dmc.cur_addr  = a->dmc.start_addr;
-                            a->dmc.bytes_rem = a->dmc.start_len;
-                        } else if (a->dmc.irq_en) {
-                            a->dmc.irq_flag = true;
-                        }
+            }
+            /* Refill DMC sample buffer from memory */
+            if (a->dmc.buf_empty && a->dmc.bytes_rem > 0 && a->mem_read) {
+                a->dmc.sample_buf = a->mem_read(a->dmc.cur_addr, a->mem_ud);
+                a->dmc.buf_empty  = false;
+                a->dmc.cur_addr   = (a->dmc.cur_addr == 0xFFFF)
+                                    ? 0x8000 : a->dmc.cur_addr + 1;
+                if (--a->dmc.bytes_rem == 0) {
+                    if (a->dmc.loop) {
+                        a->dmc.cur_addr  = a->dmc.start_addr;
+                        a->dmc.bytes_rem = a->dmc.start_len;
+                    } else if (a->dmc.irq_en) {
+                        a->dmc.irq_flag = true;
                     }
                 }
             }
@@ -413,7 +414,8 @@ uint8_t apu2a03_read(Apu2a03 *a, uint16_t addr) {
     if (a->dmc.bytes_rem> 0) s |= 0x10;
     if (a->fc_irq)           s |= 0x40;
     if (a->dmc.irq_flag)     s |= 0x80;
-    a->fc_irq = false;
+    a->fc_irq       = false;
+    a->dmc.irq_flag = false;
     return s;
 }
 

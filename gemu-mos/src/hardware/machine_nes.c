@@ -584,7 +584,7 @@ static uint8_t nes_chr_read(uint16_t addr, void *ud) {
          * renders with the old bank; the new bank takes effect next fetch. */
         if (s->chr_is_ram) return s->chr[addr & 0x1FFF];
         bool     is_right = (addr & 0x1000u) != 0;
-        uint16_t tile     = addr & 0x0FF0u;
+        uint16_t tile     = addr & 0x0FF8u;
         uint8_t  bank;
         if (is_right)
             bank = s->m9_latch_r ? s->m9_chr_rfe : s->m9_chr_rfd;
@@ -592,10 +592,10 @@ static uint8_t nes_chr_read(uint16_t addr, void *ud) {
             bank = s->m9_latch_l ? s->m9_chr_lfe : s->m9_chr_lfd;
         uint32_t chr_size = (uint32_t)s->cart.chr_banks * 0x2000u;
         uint8_t  data = s->chr[((uint32_t)bank * 0x1000u + (addr & 0x0FFFu)) % chr_size];
-        /* Latch toggles when PPU fetches tile $FD or $FE */
-        if (tile == 0x0FD0u) {
+        /* Latch fires only on the high bitplane fetch ($xFD8-$xFDF / $xFE8-$xFEF) */
+        if (tile == 0x0FD8u) {
             if (is_right) s->m9_latch_r = false; else s->m9_latch_l = false;
-        } else if (tile == 0x0FE0u) {
+        } else if (tile == 0x0FE8u) {
             if (is_right) s->m9_latch_r = true;  else s->m9_latch_l = true;
         }
         return data;
@@ -817,7 +817,12 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
         return v;
     }
 
-    if (addr == 0x4015) return apu2a03_read(&s->apu, 0x4015);
+    if (addr == 0x4015) {
+        uint8_t v = apu2a03_read(&s->apu, 0x4015);
+        if (!s->apu.fc_irq && !s->apu.dmc.irq_flag)
+            s->cpu.irq = false;
+        return v;
+    }
 
     if (addr == 0x4016) {
         if (s->cfg->ports[0] != NES_DEVICE_CONTROLLER) return 0;
@@ -1065,7 +1070,7 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
              *   $C000-$CFFF  left CHR  FE-latch bank
              *   $D000-$DFFF  right CHR FD-latch bank
              *   $E000-$EFFF  right CHR FE-latch bank
-             *   $F000-$FFFF  mirror of PRG bank */
+             *   $F000-$FFFF  mirroring (bit 0: 0=vertical, 1=horizontal) */
             if (addr < 0xB000)
                 s->m9_prg_reg = val & 0x0Fu;
             else if (addr < 0xC000)
@@ -1077,7 +1082,7 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
             else if (addr < 0xF000)
                 s->m9_chr_rfe = val & 0x1Fu;
             else
-                s->m9_prg_reg = val & 0x0Fu;  /* $F000-$FFFF mirror */
+                s->ppu.mirror = (val & 1u) ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
         }
         else if (s->cart.mapper == 7) {
             /* AxROM: bits 2:0 = 32KB PRG bank, bit 4 = mirror (0=single-A, 1=single-B) */
@@ -1686,6 +1691,8 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                             s->apu.fds_in = fds_audio_tick(&s->fds);
                         apu2a03_tick(&s->apu);
                     }
+                if (s->apu.fc_irq || s->apu.dmc.irq_flag)
+                    s->cpu.irq = true;
 
                 nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
                 if (gemu_monitor_is_paused(s->monitor)) break;
