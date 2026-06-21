@@ -1053,14 +1053,20 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
     Kim1State *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
 
-    uint16_t a = addr & 0x1FFFu;
+    /* $2000+: expansion RAM only, no KIM-1 mirroring */
+    if (addr >= 0x2000u) {
+        if (s->ext_ram && addr < s->ext_ram_top)
+            return s->ext_ram[addr - 0x0400u];
+        return 0u;
+    }
 
-    if (a < 0x0400u)
-        return s->ram[a];
+    /* $0000–$1FFF: standard KIM-1 memory map */
+    if (addr < 0x0400u)
+        return s->ram[addr];
 
-    if (a >= KIM1_U2_BASE && a < KIM1_U2_BASE + 0x0080u) {
-        uint8_t off = a & 0x0Fu;
-        Kim1Rriot *r = (a & 0x0040u) ? &s->u3 : &s->u2;
+    if (addr >= KIM1_U2_BASE && addr < KIM1_U2_BASE + 0x0080u) {
+        uint8_t off = addr & 0x0Fu;
+        Kim1Rriot *r = (addr & 0x0040u) ? &s->u3 : &s->u2;
 
         switch (off) {
         case KIM1_RA: {
@@ -1104,47 +1110,47 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
     }
 
     /* RRIOT internal RAM: 6530-003 @ 0x1780-0x17BF, 6530-002 @ 0x17C0-0x17FF */
-    if (a >= 0x1780u && a < 0x1800u)
-        return s->rriot_ram[a - 0x1780u];
+    if (addr >= 0x1780u && addr < 0x1800u)
+        return s->rriot_ram[addr - 0x1780u];
 
-    if (a >= 0x1800u) {
-        if (a == 0x1F1Fu) {
+    if (addr >= 0x1800u) {
+        if (addr == 0x1F1Fu) {
             if (!s->kim_running_user)
                 kim1_update_monitor_display(s);
             s->cpu.PC = 0x1F44u;
             return 0xEAu;
         }
-        if (a == 0x1EFEu) {
+        if (addr == 0x1EFEu) {
             kim1_set_a_nz(s, s->kim_key_pending ? 0xFFu : 0x00u);
             s->cpu.PC = 0x1F17u;
             return 0xEAu;
         }
-        if (a == 0x1F6Au) {
+        if (addr == 0x1F6Au) {
             kim1_set_a_nz(s, s->kim_key_pending ? s->kim_key_number : 0x15u);
             s->kim_key_pending = false;
             s->cpu.PC = 0x1F8Fu;
             return 0xEAu;
         }
         /* DUMPT: CPU about to execute at $1800 — save memory block to tape */
-        if (a == 0x1800u) {
+        if (addr == 0x1800u) {
             kim1_tape_save(s);
             s->cpu.PC = 0x1C4Fu;
             return 0xEAu;
         }
         /* LOADT: CPU about to execute at $1873 — load tape into memory */
-        if (a == 0x1873u) {
+        if (addr == 0x1873u) {
             kim1_tape_load(s);
             s->cpu.PC = 0x1C4Fu;
             return 0xEAu;
         }
         /* OUTCH: CPU about to execute at $1EA0 — output char in A to serial terminal */
-        if (s->serial && a == 0x1EA0u) {
+        if (s->serial && addr == 0x1EA0u) {
             s->serial->write_byte(s->serial->ud, s->cpu.A);
             s->cpu.PC = 0x1ED4u;   /* skip to OUTCH's RTS */
             return 0xEAu;
         }
         /* GETCH: CPU about to execute at $1E5A — read char from serial terminal (blocking) */
-        if (s->serial && a == 0x1E5Au) {
+        if (s->serial && addr == 0x1E5Au) {
             while (!s->serial->key_available(s->serial->ud)) {
                 s->serial->poll(s->serial->ud);
                 if (s->serial->should_quit(s->serial->ud)) break;
@@ -1161,10 +1167,13 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
             s->cpu.PC = 0x1E88u;   /* skip to GETCH's RTS */
             return 0xEAu;
         }
-        if (a < 0x1C00u) return s->rom_002[a - 0x1800u];
-        return s->rom_003[a - 0x1C00u];
+        if (addr < 0x1C00u) return s->rom_002[addr - 0x1800u];
+        return s->rom_003[addr - 0x1C00u];
     }
 
+    /* $0400–$16FF: expansion RAM or open bus */
+    if (s->ext_ram && addr >= 0x0400u)
+        return s->ext_ram[addr - 0x0400u];
     return 0u;
 }
 
@@ -1172,16 +1181,22 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
     Kim1State *s = ud;
     gemu_monitor_check_write(s->monitor, addr);
 
-    uint16_t a = addr & 0x1FFFu;
-
-    if (a < 0x0400u) {
-        s->ram[a] = val;
+    /* $2000+: expansion RAM only, no KIM-1 mirroring */
+    if (addr >= 0x2000u) {
+        if (s->ext_ram && addr < s->ext_ram_top)
+            s->ext_ram[addr - 0x0400u] = val;
         return;
     }
 
-    if (a >= KIM1_U2_BASE && a < KIM1_U2_BASE + 0x0080u) {
-        uint8_t off = a & 0x0Fu;
-        Kim1Rriot *r = (a & 0x0040u) ? &s->u3 : &s->u2;
+    /* $0000–$1FFF: standard KIM-1 memory map */
+    if (addr < 0x0400u) {
+        s->ram[addr] = val;
+        return;
+    }
+
+    if (addr >= KIM1_U2_BASE && addr < KIM1_U2_BASE + 0x0080u) {
+        uint8_t off = addr & 0x0Fu;
+        Kim1Rriot *r = (addr & 0x0040u) ? &s->u3 : &s->u2;
 
         switch (off) {
         case KIM1_RA:
@@ -1230,10 +1245,14 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
     }
 
     /* RRIOT internal RAM: 6530-003 @ 0x1780-0x17BF, 6530-002 @ 0x17C0-0x17FF */
-    if (a >= 0x1780u && a < 0x1800u) {
-        s->rriot_ram[a - 0x1780u] = val;
+    if (addr >= 0x1780u && addr < 0x1800u) {
+        s->rriot_ram[addr - 0x1780u] = val;
         return;
     }
+
+    /* $0400–$16FF: expansion RAM or open bus */
+    if (s->ext_ram && addr >= 0x0400u)
+        s->ext_ram[addr - 0x0400u] = val;
 }
 
 /* ── ROM loading ─────────────────────────────────────────────────────────── */
@@ -1351,15 +1370,32 @@ Kim1State *kim1_create(const MosConfig *cfg) {
             fprintf(stderr, "gemu-kim1: failed to create display window\n");
     }
 
+    /* Expansion RAM: covers $0400–(mem_size-1), $2000+ without KIM-1 mirroring */
+    if (cfg->mem_size > 0x0400u) {
+        uint32_t top = cfg->mem_size < 0x10000u ? cfg->mem_size : 0xFFFFu;
+        s->ext_ram = calloc(1, top - 0x0400u);
+        if (s->ext_ram) {
+            s->ext_ram_top = top;
+            printf("gemu-kim1: expansion RAM %u KB ($0400–$%04X)\n",
+                   (top - 0x0400u) / 1024u, top - 1u);
+        }
+    }
+
 #ifdef GEMU_GTK
     if (cfg->display_type == GEMU_DISPLAY_GTK) {
-        HexRegion kim1_regions[] = {
+        HexRegion kim1_regions[5] = {
             { "RAM ($0000-$03FF)",      s->ram,      sizeof(s->ram),      false, 0x0000u },
             { "RRIOT RAM ($1780-$17FF)",s->rriot_ram,sizeof(s->rriot_ram),false, 0x1780u },
             { "ROM 6530-002 ($1800)",   s->rom_002,  sizeof(s->rom_002),  true,  0x1800u },
             { "ROM 6530-003 ($1C00)",   s->rom_003,  sizeof(s->rom_003),  true,  0x1C00u },
         };
-        s->hex_editor = hex_editor_create(kim1_regions, 4);
+        int n_regions = 4;
+        if (s->ext_ram)
+            kim1_regions[n_regions++] = (HexRegion){
+                "Expansion RAM ($0400+)", s->ext_ram,
+                s->ext_ram_top - 0x0400u, false, 0x0400u
+            };
+        s->hex_editor = hex_editor_create(kim1_regions, n_regions);
     }
 #endif
 
@@ -1387,6 +1423,7 @@ void kim1_destroy(Kim1State *s) {
     gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
     gemu_monitor_destroy(s->monitor);
+    free(s->ext_ram);
     free(s);
 }
 

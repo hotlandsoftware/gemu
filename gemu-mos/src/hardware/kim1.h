@@ -146,6 +146,11 @@ typedef struct Kim1State {
 
     GemuSerial      *serial;            /* NULL if no serial terminal attached */
 
+    /* Expansion RAM: covers $0400–(ext_ram_top-1), NULL if none.
+     * Addresses $2000+ map here without KIM-1 mirror (full address decoding). */
+    uint8_t  *ext_ram;
+    uint32_t  ext_ram_top;
+
 #ifdef GEMU_GTK
     struct HexEditor *hex_editor;
 #endif
