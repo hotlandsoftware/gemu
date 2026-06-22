@@ -5,11 +5,10 @@ gemu configure — probes dependencies and writes build.ninja.
 Usage:
   ./configure [options]
   ninja            # build everything
-  ninja gemu-mos   # build one target
 
 Options:
-  --target-list=LIST   comma-separated targets to build (default: all)
-                       valid targets: chip8, mos, rca
+  --target-list=LIST   comma-separated families to include (default: all)
+                       valid families: chip8, mos, rca
   --enable-gtk         build GTK3 UI (default: no)
   --disable-sdl        do not link SDL2 (rarely useful)
   --disable-ttf        skip SDL2_ttf; VT100 terminal uses host stdin/stdout
@@ -24,134 +23,71 @@ Options:
 
 import sys, os, argparse, subprocess, shutil
 
-# ── Target definitions ─────────────────────────────────────────────────────────
-# Each key maps to the configuration for one emulator binary.
+# ── Source file lists per family ───────────────────────────────────────────────
 
-TARGETS = {
-    'chip8': {
-        'binary': 'gemu-chip8',
-        'includes': ['core/include', 'gemu-chip8/include', 'gemu-mos/src/vga'],
-        'core_src': [
-            'core/src/memory.c', 'core/src/tcg.c', 'core/src/monitor.c',
-            'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/args.c',
-            'core/src/sha256.c', 'core/src/screendump.c',
-            'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
-        ],
-        'src': [
-            'gemu-chip8/src/main.c',
-            'gemu-chip8/src/cpu/chip8_cpu.c',
-            'gemu-chip8/src/hardware/machine.c',
-            'gemu-chip8/src/octo/octo.c',
-            'gemu-mos/src/vga/input_menu.c',
-        ],
-        'src_curses': [],
-        'src_caca':   ['core/src/gemu_display_caca.c'],
-        'src_gtk': [
-            'core/src/gemu_display_gtk.c',
-            'core/src/gtk_menu.c', 'core/src/video_gtk.c',
-        ],
-        'defines_gtk':   ['GEMU_GTK'],
-        'defines_win':   ['GEMU_NO_CURSES'],
-        'ldflags_win':   ['-lws2_32', '-mconsole'],
-        'has_curses': False,
-    },
-    'rca': {
-        'binary': 'gemu-rca',
-        'includes': [
-            'core/include', 'gemu-rca/include',
-            'gemu-rca/src', 'gemu-rca/src/cpu', 'gemu-rca/src/vga',
-            'gemu-rca/src/devices', 'gemu-rca/src/hardware',
-            'gemu-mos/src/vga',   # shared input_menu.c/h
-        ],
-        'core_src': [
-            'core/src/memory.c', 'core/src/args.c', 'core/src/monitor.c',
-            'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/sha256.c',
-            'core/src/screendump.c',
-            'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
-        ],
-        'src': [
-            'gemu-rca/src/main.c',
-            'gemu-rca/src/cpu/cdp1802.c',
-            'gemu-rca/src/vga/cdp1861.c', 'gemu-rca/src/vga/cdp1869.c',
-            'gemu-rca/src/devices/vip_devices.c', 'gemu-rca/src/devices/pcspk.c',
-            'gemu-rca/src/devices/tape.c',
-            'gemu-rca/src/hardware/machine_vip.c',
-            'gemu-rca/src/hardware/machine_destroyer.c',
-            'gemu-rca/src/hardware/machine_studio2.c',
-            'gemu-rca/src/hardware/machine_pecom.c',
-            'gemu-rca/src/hardware/romdb.c',
-            'gemu-mos/src/vga/input_menu.c',
-        ],
-        'src_curses': [],
-        'src_caca':   ['core/src/gemu_display_caca.c'],
-        'src_gtk': [
-            'core/src/gemu_display_gtk.c',
-            'core/src/gtk_menu.c', 'core/src/video_gtk.c',
-        ],
-        'defines_gtk':   ['GEMU_GTK'],
-        'defines_win':   ['GEMU_NO_CURSES'],
-        'ldflags_win':   ['-lws2_32', '-mconsole'],
-        'has_curses': False,
-    },
-    'mos': {
-        'binary': 'gemu-mos',
-        'includes': [
-            'core/include', 'gemu-mos/include',
-            'gemu-mos/src', 'gemu-mos/src/cpu', 'gemu-mos/src/hardware',
-            'gemu-mos/src/vga', 'gemu-mos/src/audio',
-        ],
-        'core_src': [
-            'core/src/memory.c', 'core/src/args.c', 'core/src/monitor.c',
-            'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/sha256.c',
-            'core/src/screendump.c',
-            'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
-        ],
-        'src': [
-            'gemu-mos/src/main.c',
-            'gemu-mos/src/cpu/mos6502.c',
-            'gemu-mos/src/vga/rp2c02.c',
-            'gemu-mos/src/audio/apu2a03.c',
-            'gemu-mos/src/hardware/machine_generic.c',
-            'gemu-mos/src/hardware/machine_nes.c',
-            'gemu-mos/src/hardware/machine_kim1.c',
-            'gemu-mos/src/hardware/vt100.c',
-            'gemu-mos/src/hardware/fds.c',
-            'gemu-mos/src/hardware/fds_hle.c',
-            'gemu-mos/src/hardware/nes_devices.c',
-            'gemu-mos/src/hardware/kim_devices.c',
-            'gemu-mos/src/hardware/romdb.c',
-            'gemu-mos/src/vga/input_menu.c',
-        ],
-        'src_curses': [],
-        'src_caca':   ['core/src/gemu_display_caca.c'],
-        'src_gtk': [
-            'core/src/gemu_display_gtk.c',
-            'gemu-mos/src/vga/hex_editor.c',
-            'core/src/gtk_menu.c', 'core/src/video_gtk.c',
-        ],
-        'defines_gtk':   ['GEMU_GTK'],
-        'defines_win':   [],
-        'ldflags_win':   ['-lws2_32', '-mconsole'],
-        'has_curses': False,
-    },
+CORE_SRC = [
+    'core/src/memory.c', 'core/src/tcg.c', 'core/src/monitor.c',
+    'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/args.c',
+    'core/src/sha256.c', 'core/src/screendump.c',
+    'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
+]
+
+CORE_SRC_CACA = ['core/src/gemu_display_caca.c']
+
+CORE_SRC_GTK = [
+    'core/src/gemu_display_gtk.c',
+    'core/src/gtk_menu.c', 'core/src/video_gtk.c',
+]
+
+FAMILY_SRC = {
+    'chip8': [
+        'cpu/chip8_cpu.c', 'cpu/octo.c',
+        'hardware/machine_chip8.c',
+        'vga/input_menu.c',
+        'src/chip8_setup.c',
+    ],
+    'mos': [
+        'cpu/mos6502.c',
+        'vga/rp2c02.c', 'vga/input_menu.c',
+        'audio/apu2a03.c',
+        'hardware/machine_mos.c', 'hardware/machine_nes.c', 'hardware/machine_kim1.c',
+        'hardware/fds.c', 'hardware/fds_hle.c',
+        'hardware/nes_devices.c', 'hardware/kim_devices.c',
+        'hardware/vt100.c', 'hardware/mos_romdb.c',
+        'src/mos_setup.c',
+    ],
+    'rca': [
+        'cpu/cdp1802.c',
+        'vga/cdp1861.c', 'vga/cdp1869.c', 'vga/input_menu.c',
+        'audio/pcspk.c',
+        'hardware/machine_vip.c', 'hardware/machine_destroyer.c',
+        'hardware/machine_studio2.c', 'hardware/machine_pecom.c',
+        'hardware/vip_devices.c', 'hardware/tape.c', 'hardware/rca_romdb.c',
+        'src/rca_setup.c',
+    ],
+}
+
+FAMILY_SRC_GTK = {
+    'mos': ['vga/hex_editor.c'],
+}
+
+FAMILY_SRC_ALSA = {
+    'mos': ['audio/midi_out.c', 'audio/apu_midi.c'],
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def run(cmd):
-    """Run cmd, return stdout on success or None on failure."""
     try:
         return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
 def pkg(package, *flags):
-    """Run pkg-config and return list of flags, or None if not found."""
     r = run(['pkg-config'] + list(flags) + [package])
     return r.split() if r is not None else None
 
 def check(label, result):
-    """Print a probe result line."""
     print(f'  checking {label}... {"yes" if result else "no"}')
     return result
 
@@ -164,7 +100,7 @@ def die(msg):
 def main():
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument('--help', '-h', action='store_true')
-    p.add_argument('--target-list', default=','.join(TARGETS))
+    p.add_argument('--target-list', default=','.join(FAMILY_SRC))
     p.add_argument('--enable-gtk',    dest='gtk',  action='store_true',  default=False)
     p.add_argument('--disable-gtk',   dest='gtk',  action='store_false')
     p.add_argument('--enable-sdl',    dest='sdl',  action='store_true',  default=True)
@@ -185,18 +121,17 @@ def main():
         print(__doc__)
         sys.exit(0)
 
-    # Resolve targets
     targets = [t.strip() for t in args.target_list.split(',') if t.strip()]
     for t in targets:
-        if t not in TARGETS:
-            die(f'unknown target {t!r}. Valid: {", ".join(TARGETS)}')
+        if t not in FAMILY_SRC:
+            die(f'unknown family {t!r}. Valid: {", ".join(FAMILY_SRC)}')
 
     on_windows = sys.platform == 'win32'
     build_dir  = args.build_dir
     bin_dir    = args.bindir
 
     print(f'gemu configure')
-    print(f'  targets   : {", ".join(targets)}')
+    print(f'  families  : {", ".join(targets)}')
     print(f'  compiler  : {args.cc}')
     print()
 
@@ -204,7 +139,6 @@ def main():
 
     pkg_flags = ['--static'] if args.static else []
 
-    # SDL2
     sdl2_cflags = sdl2_libs = []
     if args.sdl:
         cf = pkg('sdl2', '--cflags', *pkg_flags)
@@ -214,7 +148,6 @@ def main():
         sdl2_cflags = cf
         sdl2_libs   = lf
 
-    # GTK3
     gtk_cflags = gtk_libs = []
     epoxy_cflags = epoxy_libs = []
     want_gtk = args.gtk
@@ -227,7 +160,6 @@ def main():
         else:
             gtk_cflags = cf
             gtk_libs   = lf
-            # Epoxy (OpenGL loader needed by GtkGLArea)
             ecf = pkg('epoxy', '--cflags', *pkg_flags)
             elf = pkg('epoxy', '--libs',   *pkg_flags)
             if check('epoxy (GL)', elf):
@@ -237,7 +169,6 @@ def main():
                 print('  (epoxy not found — building without GTK)')
                 want_gtk = False
 
-    # SDL2_ttf (for VT100 terminal, mos target)
     have_ttf  = False
     ttf_cflags = []
     ttf_libs   = []
@@ -251,7 +182,6 @@ def main():
         else:
             print('  (SDL2_ttf not found — VT100 terminal will use host stdin/stdout)')
 
-    # ALSA (for NES MIDI output, mos target only, Linux optional)
     have_alsa  = False
     alsa_cflags = []
     alsa_libs   = []
@@ -263,7 +193,6 @@ def main():
             alsa_cflags = cf or []
             alsa_libs   = lf + ['-lm']
 
-    # libcaca (optional — enhanced terminal renderer; replaces ncurses when present)
     have_caca   = False
     caca_cflags = []
     caca_libs   = []
@@ -275,7 +204,6 @@ def main():
             caca_cflags = cf or []
             caca_libs   = lf
 
-    # ncursesw (Linux/macOS only, optional — used when libcaca is not available)
     have_curses  = False
     curses_flags = []
     if not on_windows and not have_caca:
@@ -285,14 +213,13 @@ def main():
             have_curses  = True
             curses_flags = (cf or []) + lf
         else:
-            # Fallback: try bare -lncursesw
             if run([args.cc, '-lncursesw', '-x', 'c', '/dev/null', '-o', '/dev/null']) is not None:
                 have_curses  = True
                 curses_flags = ['-lncursesw']
 
     print()
 
-    # ── Ninja file ─────────────────────────────────────────────────────────────
+    # ── Build CFLAGS / LDFLAGS ────────────────────────────────────────────────
 
     opt_flag = '-O0 -g' if args.debug else '-O2'
     base_cflags = f'-Wall -Wextra {opt_flag} -std=c11 -pthread'
@@ -302,8 +229,73 @@ def main():
     if args.extra_ldflags:
         base_ldflags += ' ' + args.extra_ldflags
 
-    # Reconstruct the original configure invocation for regeneration.
     orig_args = ' '.join(sys.argv[1:])
+
+    # All sources share a single unified include path — no per-family separation.
+    inc_dirs = ['core/include', 'cpu', 'vga', 'audio', 'hardware', 'src']
+    inc_flags = ' '.join(f'-I{d}' for d in inc_dirs)
+
+    defs_list = [f'HAVE_{t.upper()}' for t in targets]
+    if want_gtk:   defs_list.append('GEMU_GTK')
+    if on_windows: defs_list.append('GEMU_NO_CURSES')
+    if have_ttf:   defs_list.append('HAVE_TTF')
+    if have_alsa:  defs_list.append('HAVE_ALSA')
+    if have_caca:  defs_list.append('HAVE_CACA')
+    defs = ' '.join(f'-D{d}' for d in defs_list)
+
+    cflags_parts = ['$CFLAGS_BASE', inc_flags] + sdl2_cflags
+    if want_gtk:  cflags_parts += gtk_cflags + epoxy_cflags
+    if have_caca: cflags_parts += caca_cflags
+    if defs:      cflags_parts.append(defs)
+    unified_cflags = ' '.join(cflags_parts)
+
+    ld_parts = [base_ldflags] + sdl2_libs
+    if want_gtk:  ld_parts += gtk_libs + epoxy_libs
+    if have_caca: ld_parts += caca_libs
+    elif have_curses: ld_parts += curses_flags
+    if 'mos' in targets:
+        if have_ttf:
+            ld_parts += ttf_libs
+        elif not on_windows:
+            ld_parts += ['-lutil']
+        if have_alsa:
+            ld_parts += alsa_libs
+    if on_windows:
+        ld_parts += ['-lws2_32', '-mconsole']
+    ldflags = ' '.join(ld_parts)
+
+    # ── Collect source files ──────────────────────────────────────────────────
+
+    srcs = []
+    seen = set()
+
+    def add(src):
+        if src not in seen:
+            seen.add(src)
+            srcs.append(src)
+
+    for src in CORE_SRC:
+        add(src)
+    if have_caca:
+        for src in CORE_SRC_CACA:
+            add(src)
+    if want_gtk:
+        for src in CORE_SRC_GTK:
+            add(src)
+
+    for tname in targets:
+        for src in FAMILY_SRC[tname]:
+            add(src)
+        if want_gtk:
+            for src in FAMILY_SRC_GTK.get(tname, []):
+                add(src)
+        if have_alsa:
+            for src in FAMILY_SRC_ALSA.get(tname, []):
+                add(src)
+
+    add('src/main.c')
+
+    # ── Write build.ninja ─────────────────────────────────────────────────────
 
     lines = [
         f'# Auto-generated by ./configure {orig_args}',
@@ -311,12 +303,12 @@ def main():
         f'',
         f'ninja_required_version = 1.3',
         f'',
-        f'CC       = {args.cc}',
+        f'CC          = {args.cc}',
         f'CFLAGS_BASE = {base_cflags}',
         f'',
         '# Compile a C file; deps tracked via GCC depfile.',
         'rule cc',
-        '  command = $CC $CFLAGS -Icore/include -MD -MF $out.d -c -o $out $in',
+        '  command = $CC $CFLAGS -MD -MF $out.d -c -o $out $in',
         '  depfile = $out.d',
         '  deps    = gcc',
         '  description = CC $in',
@@ -326,7 +318,7 @@ def main():
         f'  command = $CC -o $out $in $LDFLAGS',
         '  description = LINK $out',
         '',
-        '# Regenerate build.ninja when configure or its inputs change.',
+        '# Regenerate build.ninja when configure changes.',
         'rule reconfigure',
         f'  command = python3 configure {orig_args}',
         '  generator = 1',
@@ -336,84 +328,22 @@ def main():
         '',
     ]
 
-    all_bins = []
+    all_objs = []
+    for src in srcs:
+        obj = f'{build_dir}/{src[:-2]}.o'
+        lines.append(f'build {obj}: cc {src}')
+        lines.append(f'  CFLAGS = {unified_cflags}')
+        all_objs.append(obj)
 
+    lines.append('')
+    binary = f'{bin_dir}/gemu'
+    lines.append(f'build {binary}: link {" ".join(all_objs)}')
+    lines.append(f'  LDFLAGS = {ldflags}')
+    lines.append(f'build gemu: phony {binary}')
     for tname in targets:
-        td = TARGETS[tname]
-        obj_dir = f'{build_dir}/{tname}'
-        binary  = f'{bin_dir}/{td["binary"]}'
-
-        # Per-target CFLAGS
-        inc   = ' '.join(f'-I{i}' for i in td['includes'])
-        defs  = ''
-        if want_gtk:
-            defs += ' ' + ' '.join(f'-D{d}' for d in td['defines_gtk'])
-        if on_windows:
-            defs += ' ' + ' '.join(f'-D{d}' for d in td['defines_win'])
-        if tname == 'mos' and have_ttf:
-            defs += ' -DHAVE_TTF'
-        if tname == 'mos' and have_alsa:
-            defs += ' -DHAVE_ALSA'
-        if have_caca:
-            defs += ' -DHAVE_CACA'
-        cflags = f'$CFLAGS_BASE {inc} {" ".join(sdl2_cflags)}'  \
-                 f'{" " if want_gtk and gtk_cflags else ""}'  \
-                 f'{" ".join(gtk_cflags) if want_gtk and gtk_cflags else ""}'  \
-                 f'{" " if want_gtk and epoxy_cflags else ""}'  \
-                 f'{" ".join(epoxy_cflags) if want_gtk and epoxy_cflags else ""}'  \
-                 f'{" " if have_caca and caca_cflags else ""}'  \
-                 f'{" ".join(caca_cflags) if have_caca and caca_cflags else ""}'  \
-                 f'{defs}'.strip()
-
-        # Per-target LDFLAGS
-        ld_parts = [base_ldflags] + sdl2_libs
-        if want_gtk:
-            ld_parts += gtk_libs
-            ld_parts += epoxy_libs
-        if have_caca:
-            ld_parts += caca_libs
-        elif have_curses and td['has_curses']:
-            ld_parts += curses_flags
-        if tname == 'mos' and have_ttf:
-            ld_parts += ttf_libs
-        if tname == 'mos' and not have_ttf and not on_windows:
-            ld_parts += ['-lutil']   # openpty for xterm spawn
-        if tname == 'mos' and have_alsa:
-            ld_parts += alsa_libs
-        if on_windows:
-            ld_parts += td['ldflags_win']
-        ldflags = ' '.join(ld_parts)
-
-        # Collect sources
-        srcs = list(td['core_src']) + list(td['src'])
-        if have_caca and td.get('src_caca'):
-            srcs += td['src_caca']
-        elif have_curses and td['has_curses'] and td['src_curses']:
-            srcs += td['src_curses']
-        if want_gtk and td['src_gtk']:
-            srcs += td['src_gtk']
-        if tname == 'mos' and have_alsa:
-            srcs += [
-                'gemu-mos/src/audio/midi_out.c',
-                'gemu-mos/src/audio/apu_midi.c',
-            ]
-
-        lines.append(f'# --- {tname} ---')
-        objs = []
-        for src in srcs:
-            obj = f'{obj_dir}/{src[:-2]}.o'   # replace .c with .o, keep subpath
-            lines.append(f'build {obj}: cc {src}')
-            lines.append(f'  CFLAGS = {cflags}')
-            objs.append(obj)
-
-        lines.append(f'build {binary}: link {" ".join(objs)}')
-        lines.append(f'  LDFLAGS = {ldflags}')
-        # Phony alias so `ninja gemu-mos` works without typing bin/
-        lines.append(f'build {td["binary"]}: phony {binary}')
-        lines.append('')
-        all_bins.append(binary)
-
-    lines.append('default ' + ' '.join(all_bins))
+        lines.append(f'build gemu-{tname}: phony {binary}')
+    lines.append('')
+    lines.append(f'default {binary}')
     lines.append('')
 
     os.makedirs(bin_dir, exist_ok=True)
@@ -421,10 +351,22 @@ def main():
     with open('build.ninja', 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
 
+    # Symlinks for backward compat: gemu-chip8, gemu-mos, gemu-rca → gemu
+    if not on_windows:
+        for tname in targets:
+            alias = os.path.join(bin_dir, f'gemu-{tname}')
+            if os.path.islink(alias):
+                os.unlink(alias)
+            elif os.path.exists(alias):
+                print(f'  warning: {alias} exists and is not a symlink; skipping')
+                continue
+            os.symlink('gemu', alias)
+
     # ── Summary ───────────────────────────────────────────────────────────────
 
     print('Configuration:')
-    print(f'  targets   : {", ".join(targets)}')
+    print(f'  binary    : {binary}')
+    print(f'  families  : {", ".join(targets)}')
     print(f'  SDL2      : {"yes" if args.sdl else "no"}')
     print(f'  GTK 3     : {"yes" if want_gtk else "no"}')
     print(f'  libcaca   : {"yes (enhanced terminal)" if have_caca else "no"}')
