@@ -213,8 +213,15 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *ctx, gpointer data) {
     GemuVideoGtk *v = data;
     if (!v->gl_ready) return TRUE;
 
-    /* Upload pending frame — must happen here where the GL context is current. */
+    /* Upload pending frame — must happen here where the GL context is current.
+     * GTK3 can leave GL_UNPACK_SKIP_ROWS non-zero after compositing widgets
+     * in this same context; reset all unpack state so Mesa reads exactly the
+     * right number of rows and doesn't overrun v->frame_argb. */
     if (v->frame_dirty) {
+        glPixelStorei(GL_UNPACK_ALIGNMENT,   4);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH,  0);
+        glPixelStorei(GL_UNPACK_SKIP_ROWS,   0);
+        glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
         glBindTexture(GL_TEXTURE_2D, v->tex);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, v->width, v->height,
                         GL_BGRA, GL_UNSIGNED_BYTE, v->frame_argb);

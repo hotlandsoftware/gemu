@@ -720,7 +720,9 @@ static void hex_editor_add_tab(HexEditor *he, const char *label,
         .base_addr = base_addr,
     };
     hex_create_tab_view(he, tab);
-    hex_tab_rebuild(tab);
+    /* Don't populate the buffer here — hex_editor_show() rebuilds all tabs
+     * on first display; building large regions now would queue thousands of
+     * GTK repaint events that starve the GL renderer before it's ready. */
     gtk_notebook_append_page(GTK_NOTEBOOK(he->notebook), tab->scrolled,
                               gtk_label_new(tab->label));
 }

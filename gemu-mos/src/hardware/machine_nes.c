@@ -977,6 +977,9 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
     /* APU registers */
     if ((addr >= 0x4000 && addr <= 0x4013) || addr == 0x4015 || addr == 0x4017) {
         apu2a03_write(&s->apu, addr, val);
+        /* $4010/$4017 can clear APU IRQ flags; drop cpu.irq if both are now clear */
+        if (!s->apu.fc_irq && !s->apu.dmc.irq_flag)
+            s->cpu.irq = false;
         return;
     }
 

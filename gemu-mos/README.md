@@ -76,6 +76,8 @@ Simulated machines include:
 | tg16 | `TurboGrafx-16` | 1987 |
 
 ## Maybe in the future?
+
+### Computers
 | Name   | Full Name     | Year | Notes |
 |--------|---------------|---------------|---------------|
 | aone | `A-ONE` | 2006 | Apple 1 Replica | 
@@ -93,5 +95,15 @@ Simulated machines include:
 | replica1-se | `Replica 1 SE` | 2006 | Apple 1 Replica |
 | replica1-te | `Replica 1 TE` | 2008 | Apple 1 Replica |
 | replica1-ten | `Replica 1 TEN` | 2014 | Apple 1 Replica |
+| mac3 | `Mac III Microcomputer` | 1990 |  |
 | mega6502 | `Mega6502` | ? | Apple 1 Replica |
 | mini-master | `Mini Master` | ? | Apple 1 Replica |
+
+
+### Other
+| Name   | Full Name     | Year | Notes |
+|--------|---------------|---------------|---------------|
+| asteroids | `Asteroids Deluxe` | 1980 |  | 
+| rackemup | `Hollywood Heat` | 1986 | Pinball game | 
+| mtrap | `Mouse Trap` | 1981 | | 
+| rackemup | `Rack 'em Up! Pinball` | 1983 | Pinball game | 
