@@ -7,6 +7,11 @@ static const KimDeviceDesc devices[] = {
         .desc = "KIM-1 hex keypad (23 keys)",
         .type = KIM_DEVICE_KEYBOARD,
     },
+    {
+        .name = "keypad",
+        .desc = "Alias for kim-keypad",
+        .type = KIM_DEVICE_KEYBOARD,
+    },
 };
 
 const KimDeviceDesc *kim_device_list(int *count) {

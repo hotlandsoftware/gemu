@@ -1,7 +1,5 @@
-# gemu-mos
-MOS 65xx microprocessor emulator. 
+# MOS 6502 machines emulated by GEMU
 
-Currently emulated hardware for this machine:
 ## CPUs
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|

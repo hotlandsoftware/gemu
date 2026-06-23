@@ -106,7 +106,7 @@
                 <table><tr><td>Manufacturer</td><td>Nintendo</td></tr>
 <tr><td>Year</td><td>1983</td></tr>
 <tr><td>CPU</td><td>Ricoh 2A03</td></tr>
-<tr><td>Core</td><td>gemu-mos</td></tr>
+<tr><td>Family</td><td>mos</td></tr>
 <tr><td>TV System</td><td>NTSC</td></tr>
 <tr><td>Screen</td><td>256 × 240</td></tr>
 <tr><td>Input</td><td>Standard Controller</td></tr>
@@ -125,11 +125,12 @@
                     <li>Many of the games were released exclusively on floppy disks instead of cartridges.</li>
                 </ul>
                 <br>
-                This system has an optional ROM for FDS games. While you can load FDS games without a ROM, certain games may need it to boot properly.
+                This system has an optional ROM for FDS games. While the emulator does include basic support for direct booting FDS games, most games will need the BIOS to boot properly.
             </p>
 
             <div class="section-title">Run</div>
-            <div class="run-block">./bin/gemu-mos -M famicom -cartridge /path/to/cartridge.nes -floppy /path/to/floppy.img -rom path/to/disksys.rom</div>
+            <div class="run-block">./bin/gemu -M famicom -cartridge /path/to/cartridge.nes
+./bin/gemu -M famicom -device fds -fda /path/to/game.fds -rom /path/to/disksys.rom</div>
             <div class="section-title">Controls</div>
             <table class="ctrls">
                 <thead><tr><th>Key #</th><th>Player A</th></tr></thead>

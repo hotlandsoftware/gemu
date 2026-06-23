@@ -198,17 +198,20 @@
 
 <div class="filter-bar">
     <div class="container">
-        <label>Core</label>
+        <label>Family</label>
         <select id="filter-core">
             <option value="">All</option>
-            <option value="gemu-rca">gemu-rca</option>
-            <option value="gemu-chip8">gemu-chip8</option>
+            <option value="chip8">chip8</option>
+            <option value="mos">mos</option>
+            <option value="rca">rca</option>
         </select>
         <label>CPU</label>
         <select id="filter-cpu">
             <option value="">All</option>
-            <option value="RCA CDP1802">RCA CDP1802</option>
             <option value="CHIP-8">CHIP-8</option>
+            <option value="MOS 6502">MOS 6502</option>
+            <option value="Ricoh 2A03">Ricoh 2A03</option>
+            <option value="RCA CDP1802">RCA CDP1802</option>
         </select>
         <input type="search" id="filter-search" placeholder="Search machines…">
         <span id="result-count"></span>
@@ -223,7 +226,7 @@
                     <th data-col="name">Machine</th>
                     <th data-col="year">Year</th>
                     <th data-col="cpu">CPU</th>
-                    <th data-col="core">Core</th>
+                    <th data-col="family">Family</th>
                     <th data-col="status">Status</th>
                     <th data-col="gfx">GFX</th>
                     <th data-col="sound">Sound</th>
@@ -260,7 +263,7 @@ function render(list) {
             <td class="name"><a href="machines/${m.alias}.html">${m.name}</a></td>
             <td>${m.year}</td>
             <td>${m.cpu}</td>
-            <td>${m.core}</td>
+            <td>${m.family}</td>
             <td>${statusBadge(m.status)}</td>
             <td>${badge(m.gfx)}</td>
             <td>${badge(m.sound)}</td>
@@ -275,7 +278,7 @@ function filter() {
     const cpu    = document.getElementById("filter-cpu").value;
     const search = document.getElementById("filter-search").value.toLowerCase();
     render(ALL.filter(m =>
-        (!core   || m.core === core) &&
+        (!core   || m.family === core) &&
         (!cpu    || m.cpu  === cpu)  &&
         (!search || m.name.toLowerCase().includes(search) || m.notes.toLowerCase().includes(search))
     ));

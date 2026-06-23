@@ -246,7 +246,7 @@ int mos_setup(int argc, char *argv[]) {
                 cfg.fds_enabled = true;
             } else if (strcmp(name, "vt100") == 0) {
                 want_vt100 = true;
-            } else if (strcmp(name, "kim-keypad") == 0) {
+            } else if (kim_device_find(name)) {
                 cfg.kim_keyboard = true;
             } else {
                 const NesDeviceDesc *dev = nes_device_find(name);
