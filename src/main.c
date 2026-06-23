@@ -83,6 +83,7 @@ static void list_all_devices(void) {
 #ifdef HAVE_MOS
     devs[n++] = (DevEntry){"fds",              "Famicom Disk System",                         "nes, famicom"};
     devs[n++] = (DevEntry){"vt100",            "DEC VT100 serial terminal (second window)",   "mos, nes, kim1"};
+    devs[n++] = (DevEntry){"wozmon",           "Wozniak Monitor", "kim1"};
     int n_nes = 0;
     const NesDeviceDesc *ndevs = nes_device_list(&n_nes);
     for (int i = 0; i < n_nes; i++)

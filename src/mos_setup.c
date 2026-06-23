@@ -222,8 +222,9 @@ int mos_setup(int argc, char *argv[]) {
                 typedef struct { const char *name; const char *desc; } DevEntry;
                 DevEntry all[64];
                 int n_all = 0;
-                all[n_all++] = (DevEntry){"fds",   "Famicom Disk System"};
-                all[n_all++] = (DevEntry){"vt100", "DEC VT100 serial terminal (second window)"};
+                all[n_all++] = (DevEntry){"fds",    "Famicom Disk System"};
+                all[n_all++] = (DevEntry){"vt100",  "DEC VT100 serial terminal (second window)"};
+                all[n_all++] = (DevEntry){"wozmon", "Wozniak Monitor"};
                 for (int d = 0; d < n_nes; d++)
                     all[n_all++] = (DevEntry){ndevs[d].name, ndevs[d].desc};
                 for (int d = 0; d < n_kim; d++)
@@ -254,6 +255,8 @@ int mos_setup(int argc, char *argv[]) {
                 cfg.fds_enabled = true;
             } else if (strcmp(name, "vt100") == 0) {
                 want_vt100 = true;
+            } else if (strcmp(name, "wozmon") == 0) {
+                cfg.want_wozmon = true;
             } else if (kim_device_find(name)) {
                 cfg.kim_keyboard = true;
             } else {
@@ -353,10 +356,20 @@ int mos_setup(int argc, char *argv[]) {
         return 1;
     }
 
+    if (cfg.want_wozmon) {
+        if (!cfg.has_start_addr) {
+            cfg.start_addr     = 0x1AA0u;
+            cfg.has_start_addr = true;
+        }
+        if (!want_vt100)
+            want_vt100 = true; /* WozMon requires a serial terminal for I/O */
+    }
+
     Vt100State *vt100 = NULL;
     GemuSerial  vt100_serial;
     if (want_vt100) {
-        vt100 = vt100_create(cfg.display_type);
+        const char *vt_title = cfg.want_wozmon ? "GEMU (Wozniak Monitor)" : NULL;
+        vt100 = vt100_create(cfg.display_type, vt_title);
         if (!vt100) { SDL_Quit(); return 1; }
         vt100_as_serial(vt100, &vt100_serial);
         cfg.serial = &vt100_serial;

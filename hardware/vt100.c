@@ -1084,9 +1084,10 @@ void vt100_destroy(Vt100State *t) {
     free(t);
 }
 
-Vt100State *vt100_create(GemuDisplayType dtype) {
+Vt100State *vt100_create(GemuDisplayType dtype, const char *title) {
     /* In GTK mode the frame cadence is driven by GLib; SDL VSync would
      * fight GLib's timing and break the cursor blink accumulator. */
+    if (!title) title = "GEMU (VT100 Terminal)";
     bool use_vsync = (dtype != GEMU_DISPLAY_GTK);
 
     build_graphics_map();
@@ -1125,7 +1126,7 @@ Vt100State *vt100_create(GemuDisplayType dtype) {
 
     /* Create window */
     t->window = SDL_CreateWindow(
-        "GEMU (VT100 Terminal)",
+        title,
         SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
         WIN_W, WIN_H,
         SDL_WINDOW_SHOWN);
@@ -1222,9 +1223,9 @@ static void tty_kpush(Vt100State *t, uint8_t ch)
     if (n != t->ktail) { t->kbuf[t->khead] = ch; t->khead = n; }
 }
 
-Vt100State *vt100_create(GemuDisplayType dtype)
+Vt100State *vt100_create(GemuDisplayType dtype, const char *title)
 {
-    (void)dtype;
+    (void)dtype; (void)title;
     Vt100State *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
 

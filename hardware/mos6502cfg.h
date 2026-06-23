@@ -67,6 +67,7 @@ typedef struct MosConfig {
     bool            ppu_debug;
     bool            is_pal;      /* PAL mode: 312 lines, ~50 Hz, slower CPU clock */
     bool            kim_keyboard; /* KIM-1: -device kim-keypad → visual keypad overlay */
+    bool            want_wozmon;  /* -device wozmon → patch wozmon into KIM-1 ROM at $1AA0 */
     const char     *tape_path;   /* KIM-1: cassette tape image (.kim binary), NULL = none */
     GemuSerial     *serial;      /* serial terminal attached to this machine (NULL = none) */
     uint32_t        mem_size;  /* generic machine RAM in bytes (0 = default 64KB) */

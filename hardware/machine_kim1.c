@@ -2,6 +2,7 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "kim1.h"
+#include "wozmon_rom.h"
 #ifdef GEMU_GTK
 #  include "../vga/hex_editor.h"
 #endif
@@ -1349,6 +1350,18 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         return NULL;
     }
 
+    if (cfg->want_wozmon) {
+        /* Patch EWoz KIM monitor (WozMon) into unused tail of 6530-002 ROM */
+        const uint32_t off = WOZMON_LOAD_ADDR - 0x1800u; /* = 0x2A0 = 672 */
+        if (off + WOZMON_SIZE <= sizeof(s->rom_002)) {
+            memcpy(s->rom_002 + off, wozmon_rom, WOZMON_SIZE);
+            printf("gemu-kim1: wozmon patched into 6530-002 @ $%04X\n",
+                   WOZMON_LOAD_ADDR);
+        } else {
+            fprintf(stderr, "gemu-kim1: wozmon does not fit in 6530-002 ROM\n");
+        }
+    }
+
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
 #ifdef GEMU_GTK
         GemuDisplayGtkExtras gtk_extras = {
@@ -1426,6 +1439,8 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     s->display_dirty = true;
 
     mos6502_reset(&s->cpu);
+    if (cfg->has_start_addr)
+        s->cpu.PC = cfg->start_addr;
     return s;
 }
 
