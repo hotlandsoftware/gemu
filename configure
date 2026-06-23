@@ -76,6 +76,10 @@ FAMILY_SRC_ALSA = {
     'mos': ['audio/midi_out.c', 'audio/apu_midi.c'],
 }
 
+FAMILY_SRC_WINMIDI = {
+    'mos': ['audio/midi_out_winmm.c', 'audio/apu_midi.c'],
+}
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def run(cmd):
@@ -107,7 +111,7 @@ def _xml_files(*patterns):
         paths.extend(sorted(glob.glob(pat)))
     return paths
 
-def generate_data(build_dir, targets, have_alsa):
+def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     gen_dir = os.path.join(build_dir, 'generated')
     os.makedirs(gen_dir, exist_ok=True)
 
@@ -187,8 +191,8 @@ def generate_data(build_dir, targets, have_alsa):
         mlist  = [m.get('name') for m in root.findall('machine')]
         if req and req not in active:
             continue
-        if req_ft == 'alsa' and not have_alsa:
-            continue
+        if req_ft == 'alsa'  and not have_alsa:    continue
+        if req_ft == 'midi'  and not (have_alsa or have_winmidi): continue
         mlist = [mn for mn in mlist if machine_family.get(mn, '') in active]
         mstr  = ', '.join(mlist) if mlist else 'all'
         soundhw.append({'name': name, 'desc': desc, 'machines': mstr})
@@ -302,6 +306,10 @@ def main():
             alsa_cflags = cf or []
             alsa_libs   = lf + ['-lm']
 
+    have_winmidi = on_windows and 'mos' in targets
+    if on_windows and 'mos' in targets:
+        check('WinMM MIDI out', True)
+
     have_caca   = False
     caca_cflags = []
     caca_libs   = []
@@ -341,7 +349,7 @@ def main():
     orig_args = ' '.join(sys.argv[1:])
 
     # Generate .inc files from data/ XML files before writing build.ninja
-    data_xml_files = generate_data(build_dir, targets, have_alsa)
+    data_xml_files = generate_data(build_dir, targets, have_alsa, have_winmidi)
 
     # All sources share a single unified include path — no per-family separation.
     inc_dirs = ['core/include', 'cpu', 'vga', 'audio', 'hardware', 'src', build_dir]
@@ -351,7 +359,8 @@ def main():
     if want_gtk:   defs_list.append('GEMU_GTK')
     if on_windows: defs_list.append('GEMU_NO_CURSES')
     if have_ttf:   defs_list.append('HAVE_TTF')
-    if have_alsa:  defs_list.append('HAVE_ALSA')
+    if have_alsa:    defs_list.append('HAVE_ALSA')
+    if have_winmidi: defs_list.append('HAVE_WINMIDI')
     if have_caca:  defs_list.append('HAVE_CACA')
     defs = ' '.join(f'-D{d}' for d in defs_list)
 
@@ -374,6 +383,8 @@ def main():
             ld_parts += alsa_libs
     if on_windows:
         ld_parts += ['-lws2_32', '-mconsole']
+        if have_winmidi:
+            ld_parts += ['-lwinmm']
     ldflags = ' '.join(ld_parts)
 
     # ── Collect source files ──────────────────────────────────────────────────
@@ -403,6 +414,9 @@ def main():
                 add(src)
         if have_alsa:
             for src in FAMILY_SRC_ALSA.get(tname, []):
+                add(src)
+        if have_winmidi:
+            for src in FAMILY_SRC_WINMIDI.get(tname, []):
                 add(src)
 
     add('src/main.c')
@@ -484,7 +498,10 @@ def main():
     print(f'  libcaca   : {"yes (enhanced terminal)" if have_caca else "no"}')
     print(f'  ncursesw  : {"yes" if have_curses else ("n/a (libcaca used)" if have_caca else "no")}')
     if 'mos' in targets:
-        print(f'  ALSA MIDI : {"yes" if have_alsa else "no (MIDI output disabled)"}')
+        if have_winmidi:
+            print( '  MIDI out  : yes (WinMM)')
+        else:
+            print(f'  ALSA MIDI : {"yes" if have_alsa else "no (MIDI output disabled)"}')
     print(f'  debug     : {"yes (-O0 -g)" if args.debug else "no (-O2)"}')
     print(f'  build dir : {build_dir}/')
     print(f'  bin dir   : {bin_dir}/')
