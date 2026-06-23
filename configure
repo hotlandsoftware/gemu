@@ -135,7 +135,7 @@ def generate_data(build_dir, targets, have_alsa):
             continue
         setup = FAMILY_SETUP.get(m['family'], m['family'] + '_setup')
         lines.append(f'    {{ "{m["name"]}", {setup}, "{m["desc"]}" }},\n')
-    with open(os.path.join(gen_dir, 'machines.inc'), 'w') as f:
+    with open(os.path.join(gen_dir, 'machines.inc'), 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
     # romdb_mos.inc / romdb_rca.inc (always generate; .c files only compiled when active)
@@ -150,9 +150,9 @@ def generate_data(build_dir, targets, have_alsa):
                 mos_lines.append(entry)
             elif m['family'] == 'rca':
                 rca_lines.append(entry)
-    with open(os.path.join(gen_dir, 'romdb_mos.inc'), 'w') as f:
+    with open(os.path.join(gen_dir, 'romdb_mos.inc'), 'w', encoding='utf-8') as f:
         f.writelines(mos_lines)
-    with open(os.path.join(gen_dir, 'romdb_rca.inc'), 'w') as f:
+    with open(os.path.join(gen_dir, 'romdb_rca.inc'), 'w', encoding='utf-8') as f:
         f.writelines(rca_lines)
 
     # ── Parse device XMLs ─────────────────────────────────────────────────────
@@ -173,7 +173,7 @@ def generate_data(build_dir, targets, have_alsa):
         desc = d['desc'].replace('"', '\\"')
         mstr = ', '.join(d['machines'])
         lines.append(f'    {{ "{d["name"]}", "{desc}", "{mstr}" }},\n')
-    with open(os.path.join(gen_dir, 'devices.inc'), 'w') as f:
+    with open(os.path.join(gen_dir, 'devices.inc'), 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
     # ── Parse soundhw XMLs ────────────────────────────────────────────────────
@@ -198,7 +198,7 @@ def generate_data(build_dir, targets, have_alsa):
     for s in soundhw:
         desc = s['desc'].replace('"', '\\"')
         lines.append(f'    {{ "{s["name"]}", "{desc}", "{s["machines"]}" }},\n')
-    with open(os.path.join(gen_dir, 'soundhw.inc'), 'w') as f:
+    with open(os.path.join(gen_dir, 'soundhw.inc'), 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
     return _xml_files('data/machine/*.xml', 'data/device/*.xml',
