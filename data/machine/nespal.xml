@@ -1,2 +1,3 @@
 <?xml version="1.0"?>
-<machine name="nespal" family="mos" description="Nintendo Entertainment System (PAL)"/>
+<machine name="nespal" family="mos" description="Nintendo Entertainment System (PAL)"
+         alias="nes" tv="pal"/>

@@ -1,2 +1,3 @@
 <?xml version="1.0"?>
-<machine name="rca" family="rca" description="Generic RCA COSMAC machine (flat 64 KB)"/>
+<machine name="rca" family="rca" description="Generic RCA COSMAC machine (flat 64 KB)"
+         cpu="cdp1802" ram="64K"/>

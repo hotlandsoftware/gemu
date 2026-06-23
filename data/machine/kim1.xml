@@ -1,5 +1,6 @@
 <?xml version="1.0"?>
-<machine name="kim1" family="mos" description="MOS KIM-1 single-board computer">
+<machine name="kim1" family="mos" description="MOS KIM-1 single-board computer"
+         cpu="6502">
     <rom name="6530-002.bin" addr="0x1800" sha256="79c6dbd54aa3911f53c1068c4310aabceb7a6ce9714d1c402b73af76ea109237"/>
     <rom name="6530-003.bin" addr="0x1C00" sha256="80f5c6393e0bbcfc8a5b68fd73858da34e6d6a415f32d4820f21edb52fecafec"/>
 </machine>

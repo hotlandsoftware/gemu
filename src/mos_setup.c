@@ -16,6 +16,20 @@
 #include <string.h>
 #include <stdint.h>
 
+typedef struct {
+    const char *name;
+    const char *canonical;
+    const char *cpu;
+    const char *vga;
+    const char *tv;
+    const char *ram;
+} MachineDef;
+
+static const MachineDef machine_defs[] = {
+#include "generated/machine_defaults.inc"
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
@@ -140,19 +154,30 @@ int mos_setup(int argc, char *argv[]) {
     gemu_monitor_set_default(args.monitor_spec);
 
     if (args.machine) {
-        if      (strcmp(args.machine, "mos")     == 0) cfg.machine = MOS_MACHINE_GENERIC;
-        else if (strcmp(args.machine, "kim1")    == 0) cfg.machine = MOS_MACHINE_KIM1;
-        else if (strcmp(args.machine, "nes")     == 0) cfg.machine = MOS_MACHINE_NES;
-        else if (strcmp(args.machine, "nespal")  == 0) { cfg.machine = MOS_MACHINE_NES; cfg.is_pal = true; }
-        else if (strcmp(args.machine, "famicom") == 0) cfg.machine = MOS_MACHINE_NES;
+        for (int i = 0; machine_defs[i].name; i++) {
+            if (strcmp(args.machine, machine_defs[i].name) != 0) continue;
+            const MachineDef *md = &machine_defs[i];
+            const char *canon = md->canonical;
+            if      (strcmp(canon, "mos")  == 0) cfg.machine = MOS_MACHINE_GENERIC;
+            else if (strcmp(canon, "kim1") == 0) cfg.machine = MOS_MACHINE_KIM1;
+            else if (strcmp(canon, "nes")  == 0) cfg.machine = MOS_MACHINE_NES;
+            cfg.is_pal = md->tv && strcmp(md->tv, "pal") == 0;
+            if (!args.cpu && md->cpu) {
+                if      (strcmp(md->cpu, "6501") == 0) cfg.cpu = MOS_CPU_6501;
+                else if (strcmp(md->cpu, "6502") == 0) cfg.cpu = MOS_CPU_6502;
+                else if (strcmp(md->cpu, "2a03") == 0) cfg.cpu = MOS_CPU_2A03;
+            }
+            if (!args.vga && md->vga) {
+                if (strcmp(md->vga, "rp2c02") == 0) cfg.vga = MOS_VGA_RP2C02;
+            }
+            break;
+        }
     }
 
     if (args.cpu) {
         if      (strcmp(args.cpu, "6501") == 0) cfg.cpu = MOS_CPU_6501;
         else if (strcmp(args.cpu, "6502") == 0) cfg.cpu = MOS_CPU_6502;
         else if (strcmp(args.cpu, "2a03") == 0) cfg.cpu = MOS_CPU_2A03;
-    } else if (cfg.machine == MOS_MACHINE_NES) {
-        cfg.cpu = MOS_CPU_2A03;
     }
 
     if (args.vga) {

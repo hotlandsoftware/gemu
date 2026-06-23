@@ -128,9 +128,31 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         roms   = [{'name': r.get('name'), 'addr': int(r.get('addr', '0'), 16),
                    'sha256': r.get('sha256', '')}
                   for r in root.findall('rom')]
-        machines.append({'name': name, 'family': family, 'desc': desc, 'roms': roms})
+        machines.append({
+            'name':   name,
+            'family': family,
+            'desc':   desc,
+            'roms':   roms,
+            'alias':  root.get('alias',  ''),
+            'cpu':    root.get('cpu',    ''),
+            'vga':    root.get('vga',    ''),
+            'tv':     root.get('tv',     ''),
+            'ram':    root.get('ram',    ''),
+        })
         machine_family[name] = family
     machines.sort(key=lambda m: m['name'])
+
+    # Resolve alias inheritance: aliases inherit cpu/vga from their canonical
+    # (but not tv — that is machine-specific) and fill in canonical name.
+    name_to_m = {m['name']: m for m in machines}
+    for m in machines:
+        if m['alias']:
+            canon = name_to_m.get(m['alias'], {})
+            if not m['cpu'] and canon.get('cpu'): m['cpu'] = canon['cpu']
+            if not m['vga'] and canon.get('vga'): m['vga'] = canon['vga']
+            m['canonical'] = m['alias']
+        else:
+            m['canonical'] = m['name']
 
     # machines.inc — filtered to active families, no #ifdef needed
     lines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
@@ -141,6 +163,21 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         lines.append(f'    {{ "{m["name"]}", {setup}, "{m["desc"]}" }},\n')
     with open(os.path.join(gen_dir, 'machines.inc'), 'w', encoding='utf-8') as f:
         f.writelines(lines)
+
+    # machine_defaults.inc — per-machine defaults table used by *_setup.c
+    def cstr(s): return f'"{s}"' if s else 'NULL'
+    dlines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
+    for m in machines:
+        if m['family'] not in active:
+            continue
+        tv = m['tv'] or ('pal' if m.get('alias') and name_to_m.get(m['alias'], {}).get('tv') == 'pal' else 'ntsc')
+        dlines.append(
+            f'    {{ "{m["name"]}", "{m["canonical"]}", '
+            f'{cstr(m["cpu"])}, {cstr(m["vga"])}, '
+            f'"{tv}", {cstr(m["ram"])} }},\n'
+        )
+    with open(os.path.join(gen_dir, 'machine_defaults.inc'), 'w', encoding='utf-8') as f:
+        f.writelines(dlines)
 
     # romdb_mos.inc / romdb_rca.inc (always generate; .c files only compiled when active)
     mos_lines = ['// Auto-generated from data/machine/*.xml — do not edit\n']

@@ -1,5 +1,6 @@
 <?xml version="1.0"?>
-<machine name="sm1200" family="rca" description="Sheen M1200 (alias for studio2)">
+<machine name="sm1200" family="rca" description="Sheen M1200"
+         alias="studio2" tv="pal">
     <rom name="86676.ic13"  addr="0x0000" sha256="44e2132aa7a394dc5e1ad4d0750021b7fcf37505d801065b87b656c529508e37"/>
     <rom name="86677b.ic14" addr="0x0400" sha256="be7a432e440a5614e3790f7d7105d64cf0b02c0c62f4991c0ad8d9bab8271118"/>
     <rom name="87201.ic12"  addr="0x0C00" sha256="d826c3bdb10be43f62e6fb15a31dc34c6c62a7afd6249fcdb6d40d46f4522d3c"/>

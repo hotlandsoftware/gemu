@@ -15,6 +15,20 @@
 #include <string.h>
 #include <stdint.h>
 
+typedef struct {
+    const char *name;
+    const char *canonical;
+    const char *cpu;
+    const char *vga;
+    const char *tv;
+    const char *ram;
+} MachineDef;
+
+static const MachineDef machine_defs[] = {
+#include "generated/machine_defaults.inc"
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
@@ -170,34 +184,34 @@ int rca_setup(int argc, char *argv[]) {
     gemu_monitor_set_default(args.monitor_spec);
 
     if (args.machine) {
-        if      (strcmp(args.machine, "vip")        == 0) cfg.machine = RCA_MACHINE_COSMAC_VIP;
-        else if (strcmp(args.machine, "altair2")    == 0) cfg.machine = RCA_MACHINE_DESTROYER;
-        else if (strcmp(args.machine, "apollo80")   == 0) { cfg.machine = RCA_MACHINE_STUDIO2; cfg.tv_mode = RCA_TV_PAL; }
-        else if (strcmp(args.machine, "cm1200")     == 0) { cfg.machine = RCA_MACHINE_STUDIO2; cfg.tv_mode = RCA_TV_PAL; }
-        else if (strcmp(args.machine, "destroyer")  == 0) cfg.machine = RCA_MACHINE_DESTROYER;
-        else if (strcmp(args.machine, "rca")        == 0) cfg.machine = RCA_MACHINE_GENERIC;
-        else if (strcmp(args.machine, "mpt02")      == 0) { cfg.machine = RCA_MACHINE_STUDIO2; cfg.tv_mode = RCA_TV_PAL; }
-        else if (strcmp(args.machine, "pecom32")    == 0) { cfg.machine = RCA_MACHINE_PECOM32; cfg.tv_mode = RCA_TV_PAL; }
-        else if (strcmp(args.machine, "pecom64")    == 0) { cfg.machine = RCA_MACHINE_PECOM32; cfg.tv_mode = RCA_TV_PAL; }
-        else if (strcmp(args.machine, "mpt02j")     == 0) { cfg.machine = RCA_MACHINE_STUDIO2; cfg.tv_mode = RCA_TV_PAL; }
-        else if (strcmp(args.machine, "mtc9016")    == 0) { cfg.machine = RCA_MACHINE_STUDIO2; cfg.tv_mode = RCA_TV_PAL; }
-        else if (strcmp(args.machine, "sm1200")     == 0) { cfg.machine = RCA_MACHINE_STUDIO2; cfg.tv_mode = RCA_TV_PAL; }
-        else if (strcmp(args.machine, "studio2")    == 0) cfg.machine = RCA_MACHINE_STUDIO2;
-        else if (strcmp(args.machine, "visicom")    == 0) cfg.machine = RCA_MACHINE_STUDIO2;
+        for (int i = 0; machine_defs[i].name; i++) {
+            if (strcmp(args.machine, machine_defs[i].name) != 0) continue;
+            const MachineDef *md = &machine_defs[i];
+            const char *canon = md->canonical;
+            if      (strcmp(canon, "rca")       == 0) cfg.machine = RCA_MACHINE_GENERIC;
+            else if (strcmp(canon, "vip")       == 0) cfg.machine = RCA_MACHINE_COSMAC_VIP;
+            else if (strcmp(canon, "studio2")   == 0) cfg.machine = RCA_MACHINE_STUDIO2;
+            else if (strcmp(canon, "destroyer") == 0) cfg.machine = RCA_MACHINE_DESTROYER;
+            else if (strcmp(canon, "pecom32")   == 0) cfg.machine = RCA_MACHINE_PECOM32;
+            cfg.tv_mode = (md->tv && strcmp(md->tv, "pal") == 0) ? RCA_TV_PAL : RCA_TV_NTSC;
+            if (!args.cpu && md->cpu) {
+                if (strcmp(md->cpu, "cdp1802") == 0) cfg.cpu = RCA_CPU_CDP1802;
+            }
+            if (!args.vga && md->vga) {
+                if      (strcmp(md->vga, "cdp1861") == 0) cfg.vga = RCA_VGA_CDP1861;
+                else if (strcmp(md->vga, "cdp1869") == 0) cfg.vga = RCA_VGA_CDP1869;
+                else if (strcmp(md->vga, "none")    == 0) cfg.vga = RCA_VGA_NONE;
+            }
+            break;
+        }
     }
     if (args.vga) {
         if      (strcmp(args.vga, "cdp1861") == 0) cfg.vga = RCA_VGA_CDP1861;
         else if (strcmp(args.vga, "cdp1869") == 0) cfg.vga = RCA_VGA_CDP1869;
         else if (strcmp(args.vga, "none")    == 0) cfg.vga = RCA_VGA_NONE;
     }
-    if (cfg.machine == RCA_MACHINE_DESTROYER && !args.vga)
-        cfg.vga = RCA_VGA_CDP1869;
     if (cfg.machine == RCA_MACHINE_DESTROYER)
         cfg.keyboard = RCA_KEYBOARD_NONE;
-    if (cfg.machine == RCA_MACHINE_STUDIO2 && !args.vga)
-        cfg.vga = RCA_VGA_CDP1861;
-    if (cfg.machine == RCA_MACHINE_PECOM32 && !args.vga)
-        cfg.vga = RCA_VGA_CDP1869;
 
     uint32_t positional_addr = 0x0000;
     for (int i = 0; i < nrem; i++) {
