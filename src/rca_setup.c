@@ -201,7 +201,8 @@ int rca_setup(int argc, char *argv[]) {
 
     uint32_t positional_addr = 0x0000;
     for (int i = 0; i < nrem; i++) {
-        if (strcmp(rem[i], "-rom") == 0 && i + 1 < nrem) {
+        if (strcmp(rem[i], "-rom") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -rom requires an argument\n"); return 1; }
             const char *val = rem[++i];
             struct stat st;
             if (stat(val, &st) == 0 && S_ISDIR(st.st_mode)) {
@@ -216,17 +217,21 @@ int rca_setup(int argc, char *argv[]) {
             } else {
                 if (!parse_rom_arg(&cfg, val)) return 1;
             }
-        } else if (strcmp(rem[i], "-load-addr") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-load-addr") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -load-addr requires an argument\n"); return 1; }
             positional_addr = (uint32_t)strtoul(rem[++i], NULL, 0);
-        } else if (strcmp(rem[i], "-start") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-start") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -start requires an argument\n"); return 1; }
             cfg.start_addr = (uint16_t)strtoul(rem[++i], NULL, 0);
             cfg.has_start_addr = true;
-        } else if (strcmp(rem[i], "-mode") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-mode") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -mode requires an argument (pal|ntsc)\n"); return 1; }
             const char *v = rem[++i];
             if      (strcmp(v, "pal")  == 0) cfg.tv_mode = RCA_TV_PAL;
             else if (strcmp(v, "ntsc") == 0) cfg.tv_mode = RCA_TV_NTSC;
             else { fprintf(stderr, "gemu: unknown mode '%s' (pal|ntsc)\n", v); return 1; }
-        } else if (strcmp(rem[i], "-device") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-device") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -device requires an argument\n"); return 1; }
             const char *v = rem[++i];
             if (strcmp(v, "?") == 0 || strcmp(v, "help") == 0) {
                 rca_device_list_print();
@@ -259,14 +264,16 @@ int rca_setup(int argc, char *argv[]) {
                 fprintf(stderr, "gemu: unknown sound hardware '%s' (try -soundhw ?)\n", v);
                 return 1;
             }
-        } else if (strcmp(rem[i], "-tape") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-tape") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -tape requires an argument\n"); return 1; }
             const char *v = rem[++i];
             uint32_t tape_addr = 0;
             const char *tape_path;
             if (gemu_parse_addr_arg("gemu", v, &tape_addr, &tape_path) < 0) return 1;
             cfg.tape_addr = (uint16_t)tape_addr;
             cfg.tape_path = tape_path;
-        } else if (strcmp(rem[i], "-cartridge") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-cartridge") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cartridge requires an argument\n"); return 1; }
             cfg.cartridge_path = rem[++i];
         } else {
             fprintf(stderr, "gemu: unknown option '%s' (try -h)\n", rem[i]);

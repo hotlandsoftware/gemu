@@ -160,11 +160,13 @@ int mos_setup(int argc, char *argv[]) {
     }
 
     for (int i = 0; i < nrem; i++) {
-        if (strcmp(rem[i], "-m") == 0 && i + 1 < nrem) {
+        if (strcmp(rem[i], "-m") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -m requires an argument\n"); return 1; }
             uint32_t sz = parse_size(rem[++i]);
             if (!sz) return 1;
             cfg.mem_size = sz;
-        } else if (strcmp(rem[i], "-rom") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-rom") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -rom requires an argument\n"); return 1; }
             const char *val = rem[++i];
             struct stat st;
             if (stat(val, &st) == 0 && S_ISDIR(st.st_mode)) {
@@ -179,16 +181,21 @@ int mos_setup(int argc, char *argv[]) {
             } else {
                 if (!parse_rom_arg(&cfg, val)) return 1;
             }
-        } else if (strcmp(rem[i], "-start") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-start") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -start requires an argument\n"); return 1; }
             cfg.start_addr     = (uint16_t)strtoul(rem[++i], NULL, 0);
             cfg.has_start_addr = true;
-        } else if (strcmp(rem[i], "-cartridge") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-cartridge") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cartridge requires an argument\n"); return 1; }
             cfg.cart_path = rem[++i];
-        } else if (strcmp(rem[i], "-fda") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-fda") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -fda requires an argument\n"); return 1; }
             cfg.fda_path = rem[++i];
-        } else if (strcmp(rem[i], "-tape") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-tape") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -tape requires an argument\n"); return 1; }
             cfg.tape_path = rem[++i];
-        } else if (strcmp(rem[i], "-renderer") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-renderer") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -renderer requires an argument\n"); return 1; }
             const char *mode = rem[++i];
             if (strcmp(mode, "?") == 0) {
                 printf("Available SDL renderers:\n");
@@ -204,7 +211,8 @@ int mos_setup(int argc, char *argv[]) {
                 fprintf(stderr, "gemu: unknown -renderer '%s' (use -renderer ? to list)\n", mode);
                 return 1;
             }
-        } else if (strcmp(rem[i], "-device") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-device") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -device requires an argument\n"); return 1; }
             const char *name = rem[++i];
             if (strcmp(name, "?") == 0) {
                 int n_nes = 0, n_kim = 0;
@@ -260,7 +268,8 @@ int mos_setup(int argc, char *argv[]) {
                 }
                 cfg.ports[cfg.n_ports++] = dev->type;
             }
-        } else if (strcmp(rem[i], "-soundhw") == 0 && i + 1 < nrem) {
+        } else if (strcmp(rem[i], "-soundhw") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -soundhw requires an argument\n"); return 1; }
             const char *hw = rem[++i];
             if (strcmp(hw, "?") == 0) {
                 printf("Available sound hardware:\n");
