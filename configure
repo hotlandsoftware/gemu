@@ -21,7 +21,8 @@ Options:
   --prefix=DIR         install prefix (default: /usr/local)
 """
 
-import sys, os, argparse, subprocess, shutil
+import sys, os, argparse, subprocess, shutil, glob
+import xml.etree.ElementTree as ET
 
 # ── Source file lists per family ───────────────────────────────────────────────
 
@@ -94,6 +95,114 @@ def check(label, result):
 def die(msg):
     print(f'configure: error: {msg}', file=sys.stderr)
     sys.exit(1)
+
+# ── Data-file generation ───────────────────────────────────────────────────────
+
+FAMILY_SETUP  = {'mos': 'mos_setup', 'rca': 'rca_setup', 'chip8': 'chip8_setup'}
+FAMILY_DEFINE = {'mos': 'HAVE_MOS',  'rca': 'HAVE_RCA',  'chip8': 'HAVE_CHIP8'}
+
+def _xml_files(*patterns):
+    paths = []
+    for pat in patterns:
+        paths.extend(sorted(glob.glob(pat)))
+    return paths
+
+def generate_data(build_dir, targets, have_alsa):
+    gen_dir = os.path.join(build_dir, 'generated')
+    os.makedirs(gen_dir, exist_ok=True)
+
+    active = set(targets)
+
+    # ── Parse machine XMLs ────────────────────────────────────────────────────
+    machines = []
+    machine_family = {}
+    for path in _xml_files('data/machine/*.xml'):
+        root = ET.parse(path).getroot()
+        name   = root.get('name')
+        family = root.get('family')
+        desc   = root.get('description', '')
+        roms   = [{'name': r.get('name'), 'addr': int(r.get('addr', '0'), 16),
+                   'sha256': r.get('sha256', '')}
+                  for r in root.findall('rom')]
+        machines.append({'name': name, 'family': family, 'desc': desc, 'roms': roms})
+        machine_family[name] = family
+    machines.sort(key=lambda m: m['name'])
+
+    # machines.inc — filtered to active families, no #ifdef needed
+    lines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
+    for m in machines:
+        if m['family'] not in active:
+            continue
+        setup = FAMILY_SETUP.get(m['family'], m['family'] + '_setup')
+        lines.append(f'    {{ "{m["name"]}", {setup}, "{m["desc"]}" }},\n')
+    with open(os.path.join(gen_dir, 'machines.inc'), 'w') as f:
+        f.writelines(lines)
+
+    # romdb_mos.inc / romdb_rca.inc (always generate; .c files only compiled when active)
+    mos_lines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
+    rca_lines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
+    for m in machines:
+        for r in m['roms']:
+            if not r['sha256']:
+                continue
+            entry = f'    {{ "{r["sha256"]}", 0x{r["addr"]:04X}u, "{m["name"]}", "{r["name"]}" }},\n'
+            if m['family'] == 'mos':
+                mos_lines.append(entry)
+            elif m['family'] == 'rca':
+                rca_lines.append(entry)
+    with open(os.path.join(gen_dir, 'romdb_mos.inc'), 'w') as f:
+        f.writelines(mos_lines)
+    with open(os.path.join(gen_dir, 'romdb_rca.inc'), 'w') as f:
+        f.writelines(rca_lines)
+
+    # ── Parse device XMLs ─────────────────────────────────────────────────────
+    devices = []
+    for path in _xml_files('data/device/*.xml'):
+        root = ET.parse(path).getroot()
+        name  = root.get('name')
+        desc  = root.get('description', '')
+        mlist = [m.get('name') for m in root.findall('machine')]
+        mlist = [mn for mn in mlist if machine_family.get(mn, '') in active]
+        if not mlist:
+            continue
+        devices.append({'name': name, 'desc': desc, 'machines': mlist})
+    devices.sort(key=lambda d: d['name'])
+
+    lines = ['// Auto-generated from data/device/*.xml — do not edit\n']
+    for d in devices:
+        desc = d['desc'].replace('"', '\\"')
+        mstr = ', '.join(d['machines'])
+        lines.append(f'    {{ "{d["name"]}", "{desc}", "{mstr}" }},\n')
+    with open(os.path.join(gen_dir, 'devices.inc'), 'w') as f:
+        f.writelines(lines)
+
+    # ── Parse soundhw XMLs ────────────────────────────────────────────────────
+    soundhw = []
+    for path in _xml_files('data/soundhw/*.xml'):
+        root = ET.parse(path).getroot()
+        name   = root.get('name')
+        desc   = root.get('description', '')
+        req    = root.get('requires', '')
+        req_ft = root.get('requires-feature', '')
+        mlist  = [m.get('name') for m in root.findall('machine')]
+        if req and req not in active:
+            continue
+        if req_ft == 'alsa' and not have_alsa:
+            continue
+        mlist = [mn for mn in mlist if machine_family.get(mn, '') in active]
+        mstr  = ', '.join(mlist) if mlist else 'all'
+        soundhw.append({'name': name, 'desc': desc, 'machines': mstr})
+    soundhw.sort(key=lambda s: s['name'])
+
+    lines = ['// Auto-generated from data/soundhw/*.xml — do not edit\n']
+    for s in soundhw:
+        desc = s['desc'].replace('"', '\\"')
+        lines.append(f'    {{ "{s["name"]}", "{desc}", "{s["machines"]}" }},\n')
+    with open(os.path.join(gen_dir, 'soundhw.inc'), 'w') as f:
+        f.writelines(lines)
+
+    return _xml_files('data/machine/*.xml', 'data/device/*.xml',
+                      'data/soundhw/*.xml', 'data/vga/*.xml')
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -231,8 +340,11 @@ def main():
 
     orig_args = ' '.join(sys.argv[1:])
 
+    # Generate .inc files from data/ XML files before writing build.ninja
+    data_xml_files = generate_data(build_dir, targets, have_alsa)
+
     # All sources share a single unified include path — no per-family separation.
-    inc_dirs = ['core/include', 'cpu', 'vga', 'audio', 'hardware', 'src']
+    inc_dirs = ['core/include', 'cpu', 'vga', 'audio', 'hardware', 'src', build_dir]
     inc_flags = ' '.join(f'-I{d}' for d in inc_dirs)
 
     defs_list = [f'HAVE_{t.upper()}' for t in targets]
@@ -324,7 +436,7 @@ def main():
         '  generator = 1',
         '  description = RECONFIGURE',
         '',
-        f'build build.ninja: reconfigure configure',
+        f'build build.ninja: reconfigure configure {" ".join(data_xml_files)}',
         '',
     ]
 

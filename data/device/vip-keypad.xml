@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<device name="vip-keypad" description="COSMAC VIP 16-key hexadecimal keypad">
+    <machine name="vip"/>
+</device>

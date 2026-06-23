@@ -1,0 +1,2 @@
+<?xml version="1.0"?>
+<machine name="chip8" family="chip8" description="Generic CHIP-8 interpreter"/>

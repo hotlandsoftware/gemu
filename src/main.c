@@ -2,14 +2,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifdef HAVE_MOS
-#include "nes_devices.h"
-#include "kim_devices.h"
-#endif
-#ifdef HAVE_RCA
-#include "vip_devices.h"
-#endif
-
 #ifdef HAVE_CHIP8
 int chip8_setup(int argc, char *argv[]);
 #endif
@@ -29,40 +21,7 @@ typedef struct {
 } MachineEntry;
 
 static const MachineEntry MACHINES[] = {
-#ifdef HAVE_RCA
-    {"altair2",   rca_setup,   "Cidelsa Altair II (alias for destroyer)"},
-    {"apollo80",  rca_setup,   "Academy Apollo 80 (alias for studio2)"},
-#endif
-#ifdef HAVE_CHIP8
-    {"chip8",     chip8_setup, "Generic CHIP-8 interpreter"},
-#endif
-#ifdef HAVE_RCA
-    {"cm1200",    rca_setup,   "Conic M-1200 (alias for studio2)"},
-    {"destroyer", rca_setup,   "Cidelsa Destroyer arcade board"},
-#endif
-#ifdef HAVE_MOS
-    {"famicom",   mos_setup,   "Nintendo Family Computer (alias for nes)"},
-    {"kim1",      mos_setup,   "MOS KIM-1 single-board computer"},
-    {"mos",       mos_setup,   "Generic MOS 6502 machine (flat 64 KB)"},
-#endif
-#ifdef HAVE_RCA
-    {"mpt02",     rca_setup,   "Victory MPT-02 (alias for studio2)"},
-    {"mpt02j",    rca_setup,   "Hanimex MPT-02 (alias for studio2)"},
-    {"mtc9016",   rca_setup,   "Mustang 9016 (alias for studio2)"},
-#endif
-#ifdef HAVE_MOS
-    {"nes",       mos_setup,   "Nintendo Entertainment System (NTSC)"},
-    {"nespal",    mos_setup,   "Nintendo Entertainment System (PAL)"},
-#endif
-#ifdef HAVE_RCA
-    {"pecom32",   rca_setup,   "Pecom 32"},
-    {"pecom64",   rca_setup,   "Pecom 64 (alias for pecom32)"},
-    {"rca",       rca_setup,   "Generic RCA COSMAC machine"},
-    {"sm1200",    rca_setup,   "Sheen M1200 (alias for studio2)"},
-    {"studio2",   rca_setup,   "RCA Studio II"},
-    {"vip",       rca_setup,   "RCA COSMAC VIP"},
-    {"visicom",   rca_setup,   "Visicom COM-100 (alias for studio2)"},
-#endif
+#include "generated/machines.inc"
 };
 
 #define N_MACHINES ((int)(sizeof MACHINES / sizeof *MACHINES))
@@ -71,46 +30,16 @@ static const MachineEntry MACHINES[] = {
 
 typedef struct { const char *name; const char *desc; const char *machines; } DevEntry;
 
-static int dev_cmp(const void *a, const void *b) {
-    return strcmp(((const DevEntry *)a)->name, ((const DevEntry *)b)->name);
-}
-
 static void list_all_devices(void) {
-    DevEntry devs[64];
-    char rca_mach_bufs[16][96];
-    int n = 0;
-
-#ifdef HAVE_MOS
-    devs[n++] = (DevEntry){"fds",              "Famicom Disk System",                         "nes, famicom"};
-    devs[n++] = (DevEntry){"vt100",            "DEC VT100 serial terminal (second window)",   "mos, nes, kim1"};
-    devs[n++] = (DevEntry){"wozmon",           "Wozniak Monitor", "kim1"};
-    int n_nes = 0;
-    const NesDeviceDesc *ndevs = nes_device_list(&n_nes);
-    for (int i = 0; i < n_nes; i++)
-        devs[n++] = (DevEntry){ndevs[i].name, ndevs[i].desc, "nes, famicom"};
-    int n_kim = 0;
-    const KimDeviceDesc *kdevs = kim_device_list(&n_kim);
-    for (int i = 0; i < n_kim; i++)
-        devs[n++] = (DevEntry){kdevs[i].name, kdevs[i].desc, "kim1"};
-#endif
-
-#ifdef HAVE_RCA
-    int n_rca = 0;
-    const RcaDeviceDesc *rdevs = rca_device_list(&n_rca);
-    for (int i = 0; i < n_rca && i < 16; i++) {
-        rca_device_supported_machines(&rdevs[i], rca_mach_bufs[i], sizeof(rca_mach_bufs[i]));
-        devs[n++] = (DevEntry){rdevs[i].name, rdevs[i].desc, rca_mach_bufs[i]};
-    }
-#endif
-
-    qsort(devs, (size_t)n, sizeof(devs[0]), dev_cmp);
-
+    static const DevEntry devs[] = {
+#include "generated/devices.inc"
+    };
+    int n = (int)(sizeof devs / sizeof *devs);
     int maxw = 0;
     for (int i = 0; i < n; i++) {
         int w = (int)strlen(devs[i].name);
         if (w > maxw) maxw = w;
     }
-
     printf("Available devices:\n");
     for (int i = 0; i < n; i++)
         printf("  %-*s  %s [%s]\n", maxw, devs[i].name, devs[i].desc, devs[i].machines);
@@ -118,29 +47,15 @@ static void list_all_devices(void) {
 
 static void list_all_soundhw(void) {
     typedef struct { const char *name; const char *desc; const char *machines; } SwEntry;
-    SwEntry hw[] = {
-#ifdef HAVE_MOS
-        {"2a03",             "Ricoh 2A03 APU \xe2\x86\x92 SDL audio",      "nes, famicom"},
-#ifdef HAVE_ALSA
-        {"2a03,output=midi", "Ricoh 2A03 APU \xe2\x86\x92 ALSA MIDI port", "nes, famicom"},
-#endif
-#endif
-        {"none",             "Disable sound output",                         "all"},
-#ifdef HAVE_RCA
-        {"pcspk",            "PC speaker / one-bit loudspeaker",             "vip, studio2, pecom32, destroyer"},
-#endif
+    static const SwEntry hw[] = {
+#include "generated/soundhw.inc"
     };
     int n = (int)(sizeof hw / sizeof *hw);
-
-    /* reuse dev_cmp — same struct layout (name is first field) */
-    qsort(hw, (size_t)n, sizeof(hw[0]), dev_cmp);
-
     int maxw = 0;
     for (int i = 0; i < n; i++) {
         int w = (int)strlen(hw[i].name);
         if (w > maxw) maxw = w;
     }
-
     printf("Available sound hardware:\n");
     for (int i = 0; i < n; i++)
         printf("  %-*s  %s [%s]\n", maxw, hw[i].name, hw[i].desc, hw[i].machines);

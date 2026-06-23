@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<device name="kim-keypad" description="KIM-1 hex keypad (23 keys)">
+    <machine name="kim1"/>
+</device>

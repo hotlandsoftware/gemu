@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<device name="famicom-keyboard" description="72-key Famicom Computer Keyboard">
+    <machine name="famicom"/>
+</device>

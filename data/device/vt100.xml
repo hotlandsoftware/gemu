@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<device name="vt100" description="DEC VT100 serial terminal (second window)">
+    <machine name="mos"/>
+    <machine name="nes"/>
+    <machine name="kim1"/>
+</device>

@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<device name="vp601" description="RCA COSMAC VIP VP601 ASCII/QWERTY keyboard">
+    <machine name="vip"/>
+</device>

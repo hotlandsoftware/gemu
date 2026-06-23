@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<device name="wozmon" description="EWoz KIM-1 monitor (WozMon, patched at $1AA0)">
+    <machine name="kim1"/>
+</device>

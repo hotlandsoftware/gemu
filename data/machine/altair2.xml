@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<machine name="altair2" family="rca" description="Cidelsa Altair II (alias for destroyer)">
+    <rom name="alta2-2716.ic7"  addr="0x0000" sha256="e103b4f3171ae4f945d4663cce841d4ef8bf247c10fa636d59e7ef65287d1e46"/>
+    <rom name="alta2-2716.ic8"  addr="0x0800" sha256="1c1ad37bcca3a250e0f4d50e23eb4b8cf8e6ba7954b5cfa1ff59e5a27f0204a3"/>
+    <rom name="alta2-2716.ic9"  addr="0x1000" sha256="5afa77d6a957b8be7f6331a26caf110f53c35519eccbd68b3e1454069cb53317"/>
+    <rom name="alta2-2716.ic10" addr="0x1800" sha256="d0493155d5b9d9534648bfc85c6f4235f31759d4d33963d1b2cb06a405d804ed"/>
+    <rom name="alta2-2716.ic11" addr="0x2000" sha256="428d6d56dea2ef4f2b308e0de2abc3f387671654a28f7c8b1dcbab57296b728a"/>
+    <rom name="alta2-2716.ic12" addr="0x2800" sha256="a495dc121091f97a0ef70756590862614e49d01dbe7e5be3b85c7a4860c7bd36"/>
+</machine>
