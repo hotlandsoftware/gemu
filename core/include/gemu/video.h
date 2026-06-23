@@ -43,6 +43,8 @@ void gemu_video_sdl_set_overlay(GemuVideoSdl *v,
                                 void (*cb)(void *ud, SDL_Renderer *r, int pixel_scale),
                                 void *ud);
 
+SDL_Window *gemu_video_sdl_get_window(const GemuVideoSdl *v);
+
 #ifdef GEMU_GTK
 #include <gtk/gtk.h>
 

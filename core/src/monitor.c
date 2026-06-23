@@ -716,6 +716,21 @@ void gemu_monitor_stop(GemuMonitor *mon) {
         sock_close(mon->client_fd);
         mon->client_fd = INVALID_SOCK;
     }
+#ifdef _WIN32
+    /* pthread_cancel doesn't interrupt fgets(stdin) on Windows.
+     * Inject a synthetic Enter key so the stdio loop unblocks, sees
+     * mon->running == false at the top of its while(), and exits. */
+    if (mon->backend == MON_BACKEND_STDIO) {
+        INPUT_RECORD ir = {0};
+        ir.EventType = KEY_EVENT;
+        ir.Event.KeyEvent.bKeyDown      = TRUE;
+        ir.Event.KeyEvent.wRepeatCount  = 1;
+        ir.Event.KeyEvent.wVirtualKeyCode = VK_RETURN;
+        ir.Event.KeyEvent.uChar.AsciiChar = '\n';
+        DWORD written;
+        WriteConsoleInputA(GetStdHandle(STD_INPUT_HANDLE), &ir, 1, &written);
+    }
+#endif
     pthread_cancel(mon->thread);
     pthread_join(mon->thread, NULL);
     mon->thread_started = false;

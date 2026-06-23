@@ -185,3 +185,7 @@ void gemu_video_sdl_set_overlay(GemuVideoSdl *v,
     v->overlay_cb = cb;
     v->overlay_ud = ud;
 }
+
+SDL_Window *gemu_video_sdl_get_window(const GemuVideoSdl *v) {
+    return v ? v->window : NULL;
+}

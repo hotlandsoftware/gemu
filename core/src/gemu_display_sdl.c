@@ -1,8 +1,15 @@
 #include "gemu_display_priv.h"
 #include "gemu/video.h"
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_syswm.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  define IDM_FILE_RESET 0x0101
+#  define IDM_FILE_QUIT  0x0102
+#endif
 
 /* InputMenu lives in gemu-mos/src/vga/ but is included via the build's
  * include path (same hack that lets rca share it). */
@@ -213,6 +220,18 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             }
             break;
 
+#ifdef _WIN32
+        case SDL_SYSWMEVENT:
+            if (ev.syswm.msg->subsystem == SDL_SYSWM_WINDOWS &&
+                ev.syswm.msg->msg.win.msg == WM_COMMAND) {
+                switch (LOWORD(ev.syswm.msg->msg.win.wParam)) {
+                case IDM_FILE_RESET: d->reset = true; break;
+                case IDM_FILE_QUIT:  d->quit  = true; break;
+                }
+            }
+            break;
+#endif
+
         default:
             break;
         }
@@ -323,5 +342,28 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     d->do_open_rebind = sdl_do_open_rebind;
     d->do_destroy     = sdl_do_destroy;
     d->pointer.x = d->pointer.y = -1;
+
+#ifdef _WIN32
+    /* Attach a native Win32 menu bar (File > Reset / Quit). */
+    SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
+    {
+        SDL_SysWMinfo wm;
+        SDL_VERSION(&wm.version);
+        SDL_Window *win = gemu_video_sdl_get_window(b->video);
+        if (win && SDL_GetWindowWMInfo(win, &wm) &&
+            wm.subsystem == SDL_SYSWM_WINDOWS) {
+            HWND hwnd  = wm.info.win.window;
+            HMENU bar  = CreateMenu();
+            HMENU file = CreatePopupMenu();
+            AppendMenuA(file, MF_STRING,    IDM_FILE_RESET, "&Reset");
+            AppendMenuA(file, MF_SEPARATOR, 0,              NULL);
+            AppendMenuA(file, MF_STRING,    IDM_FILE_QUIT,  "&Quit\tEsc");
+            AppendMenuA(bar,  MF_POPUP, (UINT_PTR)file, "&File");
+            SetMenu(hwnd, bar);
+            DrawMenuBar(hwnd);
+        }
+    }
+#endif
+
     return d;
 }
