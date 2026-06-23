@@ -1,102 +1,102 @@
-# gemu — Jaguar Emulator
+# GEMU — Generic EMUlator
 
-General-purpose machine emulator written in C. Modeled after QEMU in architecture,
-targeting speed over strict accuracy (balanced). Not associated with the Atari Jaguar.
-
----
-
-## Architecture
-
-```
-gemu/
-├── core/               # Platform-agnostic emulator infrastructure
-│   ├── include/gemu/
-│   │   ├── gemu.h      # Version, common macros
-│   │   ├── memory.h    # Memory bus abstraction
-│   │   ├── cpu.h       # Abstract CPU interface
-│   │   ├── device.h    # Device I/O interface
-│   │   └── tcg.h       # Translation Block Cache (DCT infrastructure)
-│   └── src/
-│       ├── memory.c
-│       └── tcg.c
-└── gemu-chip8/         # CHIP-8 platform (first target)
-    ├── include/chip8.h
-    └── src/
-        ├── main.c      # CLI entry + arg parsing
-        ├── cpu.c       # Decoder, TB translator, executor
-        ├── display.c   # SDL2 display backend
-        ├── input.c     # SDL2 keyboard input
-        └── machine.c   # Machine init, run loop, timers
-```
+Single unified binary (`bin/gemu`) dispatching on `-M <machine>`. Three CPU
+families: CHIP-8, MOS 6502 (NES/KIM-1), RCA CDP1802 (COSMAC VIP / Studio II).
+Modeled after QEMU in CLI style.
 
 ---
 
-## Design Principles
+## Build
 
-### Dynamic Code Translation (DCT)
-Guest instructions are translated into **Translation Blocks (TBs)** — sequences of
-decoded instructions from a starting PC to the next branch. TBs are cached in a hash
-table keyed on guest PC. On cache hit the decoded block is executed directly without
-re-decoding, eliminating repeated fetch-decode overhead on hot paths.
+```
+./configure --target-list="chip8,mos,rca"
+ninja
+```
 
-Future roadmap: TBs will hold native host machine code (JIT), then optionally backed
-by KVM for hardware-accelerated execution.
-
-### Separation of Concerns
-| Layer            | Responsibility                                      |
-|------------------|-----------------------------------------------------|
-| core/tcg         | TB cache management, invalidation                   |
-| core/memory      | Flat and banked memory, ROM/RAM regions             |
-| core/cpu         | Abstract CPU vtable (reset, step, destroy)          |
-| core/device      | Device I/O vtable (read, write, update)             |
-| gemu-\<platform\> | Platform-specific decoder, machine init, run loop   |
+`bin/gemu-chip8`, `bin/gemu-mos`, `bin/gemu-rca` are symlinks to `bin/gemu`
+for backward compatibility.
 
 ---
 
-## Platforms
+## Machines
 
-### gemu-chip8 (current)
-CHIP-8 interpreter + translation block cache.
+Run `./bin/gemu -M ?` for the full sorted list. Key entries:
 
-**Specs:**
-- 4 KB memory (0x000–0xFFF); ROM loads at 0x200
-- 16 × 8-bit general registers (V0–VF); VF = flag register
-- 16-bit index register I, program counter PC
-- 16-level call stack
-- Delay timer + sound timer (60 Hz)
-- 64×32 monochrome display (XOR sprite drawing)
-- 16-key hex keypad (mapped to 1234/QWER/ASDF/ZXCV)
-- 34 opcodes, all 2 bytes wide
+| Machine    | Description                                  |
+|------------|----------------------------------------------|
+| `chip8`    | Generic CHIP-8 / SUPER-CHIP interpreter      |
+| `nes`      | Nintendo Entertainment System (NTSC)         |
+| `nespal`   | Nintendo Entertainment System (PAL)          |
+| `famicom`  | Nintendo Family Computer (alias for nes)     |
+| `kim1`     | MOS KIM-1 single-board computer              |
+| `mos`      | Generic MOS 6502 flat 64 KB machine          |
+| `vip`      | RCA COSMAC VIP                               |
+| `studio2`  | RCA Studio II                                |
+| `pecom32`  | Pecom 32 (Yugoslav CDP1802 home computer)    |
+| `destroyer`| Cidelsa Destroyer arcade board               |
 
-**Usage:**
+---
+
+## Key flags
+
 ```
-gemu-chip8 [options] <rom.ch8>
-
-Options:
-  -m SIZE     Memory size (default: 4K)
-  -cpu TYPE   CPU variant: chip8 (default)
-  -vga TYPE   Display backend: std (SDL2, default) | none (headless)
-  -scale N    Pixel scale factor (default: 10 → 640×320 window)
-  -hz N       CPU speed in instructions/sec (default: 700)
+./bin/gemu -M <machine> [options] [rom]
 ```
 
-**Example:**
+- `-M ?` — list all machines
+- `-M <machine> -h` — machine-specific help and usage examples
+- `-device ?` — list all attachable devices (all families, alphabetical)
+- `-soundhw ?` — list all sound hardware options (all families)
+- `-rom [ADDR:]FILE` — load ROM image (or directory for SHA-256 scan)
+- `-cartridge FILE` — insert cartridge (NES .nes, Studio II)
+- `-tape [ADDR:]FILE` — load cassette tape (KIM-1, COSMAC VIP)
+- `-fda FILE` — Famicom Disk System image
+- `-m SIZE` — RAM size (e.g. `32K`, `1M`)
+- `-display TYPE` — sdl | gtk | curses | none
+- `-scale N` — window scale factor
+
+---
+
+## Source layout
+
 ```
-gemu-chip8 -m 4K -cpu chip8 -vga std roms/pong.ch8
+cpu/        CPU cores: chip8_cpu.c, mos6502.c, cdp1802.c, octo.c
+vga/        Display chips: rp2c02.c (NES PPU), cdp1861.c, cdp1869.c
+audio/      Sound: apu2a03.c (NES APU), pcspk.c (PC speaker/CDP1802)
+hardware/   Machine glue, devices, ROM databases
+  machine_chip8.c / machine_mos.c / machine_nes.c / machine_kim1.c
+  machine_vip.c / machine_studio2.c / machine_pecom.c / machine_destroyer.c
+  nes_devices.c / kim_devices.c / vip_devices.c
+  mos_romdb.c / rca_romdb.c
+src/        Entry points
+  main.c          — global -M dispatch, -device ?/-soundhw ? listing
+  chip8_setup.c   — CHIP-8 family setup
+  mos_setup.c     — MOS 6502 family setup
+  rca_setup.c     — RCA CDP1802 family setup
+core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
 ```
 
 ---
 
-## Future Platforms (planned, not yet implemented)
+## Compile-time guards
 
-| Binary        | Target                     |
-|---------------|----------------------------|
-| gemu-x86      | x86/x86-64 PC (i440FX)     |
-| gemu-arm      | ARMv7/AArch64              |
+`HAVE_CHIP8`, `HAVE_MOS`, `HAVE_RCA` — set by configure based on
+`--target-list`. Used in `src/main.c` and anywhere code is family-specific.
 
-## Future Features (not yet implemented)
-- KVM acceleration backend
-- User-mode emulation
-- Virtual PC 2007-style GUI frontend
-- Snapshot / save states
-- GDB remote stub for guest debugging
+---
+
+## Device / soundhw APIs
+
+- `nes_device_list()` / `kim_device_list()` — `hardware/nes_devices.h`, `hardware/kim_devices.h`
+- `rca_device_list()` / `rca_device_supported_machines()` — `hardware/vip_devices.h`
+- Cross-family listing: `list_all_devices()` / `list_all_soundhw()` in `src/main.c`
+
+---
+
+## Architecture notes
+
+- DCT (Dynamic Code Translation): guest instructions decoded into Translation
+  Blocks (TBs) cached by PC. Future path: native JIT, then KVM.
+- All sources compiled with unified include path:
+  `-Icore/include -Icpu -Ivga -Iaudio -Ihardware -Isrc`
+- Build system: Ninja, generated by Python `configure` script.

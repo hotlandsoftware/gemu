@@ -29,7 +29,7 @@ jobs:
         run: ninja
 
       - name: Package
-        run: tar czf gemu-linux-x86_64.tar.gz -C bin gemu-chip8 gemu-rca gemu-mos
+        run: tar czf gemu-linux-x86_64.tar.gz -C bin gemu gemu-chip8 gemu-mos gemu-rca
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

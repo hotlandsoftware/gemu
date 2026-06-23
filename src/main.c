@@ -2,6 +2,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef HAVE_MOS
+#include "nes_devices.h"
+#include "kim_devices.h"
+#endif
+#ifdef HAVE_RCA
+#include "vip_devices.h"
+#endif
+
 #ifdef HAVE_CHIP8
 int chip8_setup(int argc, char *argv[]);
 #endif
@@ -59,6 +67,86 @@ static const MachineEntry MACHINES[] = {
 
 #define N_MACHINES ((int)(sizeof MACHINES / sizeof *MACHINES))
 
+/* ── Global device / soundhw listings ───────────────────────────────────── */
+
+typedef struct { const char *name; const char *desc; const char *machines; } DevEntry;
+
+static int dev_cmp(const void *a, const void *b) {
+    return strcmp(((const DevEntry *)a)->name, ((const DevEntry *)b)->name);
+}
+
+static void list_all_devices(void) {
+    DevEntry devs[64];
+    char rca_mach_bufs[16][96];
+    int n = 0;
+
+#ifdef HAVE_MOS
+    devs[n++] = (DevEntry){"fds",              "Famicom Disk System",                         "nes, famicom"};
+    devs[n++] = (DevEntry){"vt100",            "DEC VT100 serial terminal (second window)",   "mos, nes, kim1"};
+    int n_nes = 0;
+    const NesDeviceDesc *ndevs = nes_device_list(&n_nes);
+    for (int i = 0; i < n_nes; i++)
+        devs[n++] = (DevEntry){ndevs[i].name, ndevs[i].desc, "nes, famicom"};
+    int n_kim = 0;
+    const KimDeviceDesc *kdevs = kim_device_list(&n_kim);
+    for (int i = 0; i < n_kim; i++)
+        devs[n++] = (DevEntry){kdevs[i].name, kdevs[i].desc, "kim1"};
+#endif
+
+#ifdef HAVE_RCA
+    int n_rca = 0;
+    const RcaDeviceDesc *rdevs = rca_device_list(&n_rca);
+    for (int i = 0; i < n_rca && i < 16; i++) {
+        rca_device_supported_machines(&rdevs[i], rca_mach_bufs[i], sizeof(rca_mach_bufs[i]));
+        devs[n++] = (DevEntry){rdevs[i].name, rdevs[i].desc, rca_mach_bufs[i]};
+    }
+#endif
+
+    qsort(devs, (size_t)n, sizeof(devs[0]), dev_cmp);
+
+    int maxw = 0;
+    for (int i = 0; i < n; i++) {
+        int w = (int)strlen(devs[i].name);
+        if (w > maxw) maxw = w;
+    }
+
+    printf("Available devices:\n");
+    for (int i = 0; i < n; i++)
+        printf("  %-*s  %s [%s]\n", maxw, devs[i].name, devs[i].desc, devs[i].machines);
+}
+
+static void list_all_soundhw(void) {
+    typedef struct { const char *name; const char *desc; const char *machines; } SwEntry;
+    SwEntry hw[] = {
+#ifdef HAVE_MOS
+        {"2a03",             "Ricoh 2A03 APU \xe2\x86\x92 SDL audio",      "nes, famicom"},
+#ifdef HAVE_ALSA
+        {"2a03,output=midi", "Ricoh 2A03 APU \xe2\x86\x92 ALSA MIDI port", "nes, famicom"},
+#endif
+#endif
+        {"none",             "Disable sound output",                         "all"},
+#ifdef HAVE_RCA
+        {"pcspk",            "PC speaker / one-bit loudspeaker",             "vip, studio2, pecom32, destroyer"},
+#endif
+    };
+    int n = (int)(sizeof hw / sizeof *hw);
+
+    /* reuse dev_cmp — same struct layout (name is first field) */
+    qsort(hw, (size_t)n, sizeof(hw[0]), dev_cmp);
+
+    int maxw = 0;
+    for (int i = 0; i < n; i++) {
+        int w = (int)strlen(hw[i].name);
+        if (w > maxw) maxw = w;
+    }
+
+    printf("Available sound hardware:\n");
+    for (int i = 0; i < n; i++)
+        printf("  %-*s  %s [%s]\n", maxw, hw[i].name, hw[i].desc, hw[i].machines);
+}
+
+/* ── Usage / machine listing ─────────────────────────────────────────────── */
+
 static void print_machines(FILE *f) {
     fprintf(f, "Available machines (-M <machine>):\n");
     int maxw = 0;
@@ -101,8 +189,8 @@ static void print_usage(const char *prog) {
 
     fprintf(f, "Machine options:\n");
     OPT("-m SIZE",            "RAM size — plain number = KB, or suffix K/M (e.g. 32K, 1M)");
-    OPT("-device NAME",       "Attach a device (use -device ? to list)");
-    OPT("-soundhw NAME",      "Sound hardware (use -soundhw ? to list)");
+    OPT("-device NAME",       "Attach a device (use -device ? to list all)");
+    OPT("-soundhw NAME",      "Sound hardware (use -soundhw ? to list all)");
     OPT("-renderer MODE",     "SDL renderer: auto | software | accelerated");
     fprintf(f, "\n");
 
@@ -116,8 +204,22 @@ static void print_usage(const char *prog) {
                "Use '-M <machine> -h' for machine-specific options and examples.\n");
 }
 
+/* ── Entry point ─────────────────────────────────────────────────────────── */
+
 int main(int argc, char *argv[]) {
     const char *prog = argv[0];
+
+    /* Global -device ? and -soundhw ? — list across all families without -M */
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "-device") == 0 && strcmp(argv[i + 1], "?") == 0) {
+            list_all_devices();
+            return 0;
+        }
+        if (strcmp(argv[i], "-soundhw") == 0 && strcmp(argv[i + 1], "?") == 0) {
+            list_all_soundhw();
+            return 0;
+        }
+    }
 
     /* Scan for -M <machine> */
     const char *machine_name = NULL;

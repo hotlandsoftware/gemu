@@ -15,7 +15,7 @@ static const RcaDeviceDesc devices[] = {
 static const char *rca_machine_type_name(RcaMachineType machine) {
     switch (machine) {
     case RCA_MACHINE_GENERIC:    return "generic";
-    case RCA_MACHINE_COSMAC_VIP: return "cosmac-vip";
+    case RCA_MACHINE_COSMAC_VIP: return "vip";
     case RCA_MACHINE_DESTROYER:  return "destroyer";
     default:                     return "unknown";
     }
