@@ -59,22 +59,61 @@ static const MachineEntry MACHINES[] = {
 
 #define N_MACHINES ((int)(sizeof MACHINES / sizeof *MACHINES))
 
-static void print_machines(void) {
-    fprintf(stderr, "Available machines (-M <machine>):\n");
+static void print_machines(FILE *f) {
+    fprintf(f, "Available machines (-M <machine>):\n");
     int maxw = 0;
     for (int i = 0; i < N_MACHINES; i++) {
         int w = (int)strlen(MACHINES[i].name);
         if (w > maxw) maxw = w;
     }
     for (int i = 0; i < N_MACHINES; i++)
-        fprintf(stderr, "  %-*s  %s\n", maxw, MACHINES[i].name, MACHINES[i].desc);
+        fprintf(f, "  %-*s  %s\n", maxw, MACHINES[i].name, MACHINES[i].desc);
 }
 
 static void print_usage(const char *prog) {
-    fprintf(stderr, "GEMU " GEMU_VERSION_STR " — Generic Emulator\n\n");
-    fprintf(stderr, "Usage: %s -M <machine> [options]\n\n", prog);
-    print_machines();
-    fprintf(stderr, "\nRun '%s -M <machine> -h' for machine-specific help.\n", prog);
+    FILE *f = stderr;
+    fprintf(f, "GEMU v" GEMU_VERSION_STR " — Generic EMUlator\n"
+               "Usage: %s -M <machine> [options] [rom]\n\n", prog);
+
+#define OPT(name, desc) fprintf(f, "  %-26s %s\n", name, desc)
+
+    fprintf(f, "Standard options:\n");
+    OPT("-M <machine>",       "Select emulated machine (use -M ? to list all)");
+    OPT("-cpu <type>",        "CPU model, if selectable (use -cpu ? to list)");
+    OPT("-vga <type>",        "Video chip, if selectable (use -vga ? to list)");
+    OPT("-h, -help",          "Show this help");
+    fprintf(f, "\n");
+
+    fprintf(f, "Display options:\n");
+    OPT("-display <type>",    "Display backend: sdl | gtk | curses | none (use -display ? to list)");
+    OPT("-scale N",           "Window scale factor");
+    OPT("-vnc <addr>",        "Start VNC server on <addr> (use -vnc ? for address format)");
+    fprintf(f, "\n");
+
+    fprintf(f, "Media options:\n");
+    OPT("-rom [ADDR:]FILE",   "Load ROM image at ADDR (auto-detected if omitted)");
+    OPT("-rom DIR",           "Scan directory and load known ROMs by SHA-256");
+    OPT("-cartridge FILE",    "Insert cartridge (NES .nes, Studio II)");
+    OPT("-fda FILE",          "Insert floppy/disk image (Famicom Disk System)");
+    OPT("-tape [ADDR:]FILE",  "Insert cassette tape (KIM-1, COSMAC VIP)");
+    OPT("-start ADDR",        "Override reset vector / force start address");
+    fprintf(f, "\n");
+
+    fprintf(f, "Machine options:\n");
+    OPT("-m SIZE",            "RAM size — plain number = KB, or suffix K/M (e.g. 32K, 1M)");
+    OPT("-device NAME",       "Attach a device (use -device ? to list)");
+    OPT("-soundhw NAME",      "Sound hardware (use -soundhw ? to list)");
+    OPT("-renderer MODE",     "SDL renderer: auto | software | accelerated");
+    fprintf(f, "\n");
+
+    fprintf(f, "Debug options:\n");
+    OPT("-monitor <spec>",    "Monitor: stdio | none | telnet:HOST:PORT,server,nowait");
+    fprintf(f, "\n");
+
+#undef OPT
+
+    fprintf(f, "Use '-M ?' to list all available machines.\n"
+               "Use '-M <machine> -h' for machine-specific options and examples.\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -91,7 +130,7 @@ int main(int argc, char *argv[]) {
 
     /* -M ? lists all machines */
     if (machine_name && strcmp(machine_name, "?") == 0) {
-        print_machines();
+        print_machines(stdout);
         return 0;
     }
 

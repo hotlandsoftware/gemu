@@ -20,8 +20,8 @@ static const DispEntry display_table[] = {
 /* ── Help / listing helpers ──────────────────────────────────────────────── */
 
 static void print_usage(const GemuArgsDef *def) {
-    printf("gemu — Jaguar Emulator v" GEMU_VERSION_STR "\n"
-           "Usage: %s [options] <rom>\n\n"
+    printf("GEMU v" GEMU_VERSION_STR " — Generic EMUlator\n"
+           "Usage: %s -M <machine> [options] [rom]\n\n"
            "Options:\n", def->prog);
     if (def->n_machines > 0)
         printf("  %-14s Machine type      (use -M ? to list)\n", "-M TYPE");
