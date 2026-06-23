@@ -61,7 +61,7 @@ static const GemuArgsDef def = {
         "  -tape FILE         Insert a casette tape\n"
         "  -renderer MODE     Set SDL renderer: auto | software | accelerated (default: auto)\n"
         "  -soundhw CHIP      Insert a sound card"
-#ifdef HAVE_ALSA
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
         " | 2a03,output=midi"
 #endif
         "  (default: 2a03 for NES)\n"
@@ -277,15 +277,15 @@ int mos_setup(int argc, char *argv[]) {
             if (strcmp(hw, "?") == 0) {
                 printf("Available sound hardware:\n");
                 printf("  2a03               Ricoh 2A03 APU -> SDL audio (default)\n");
-#ifdef HAVE_ALSA
-                printf("  2a03,output=midi   Ricoh 2A03 APU -> ALSA MIDI port\n");
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
+                printf("  2a03,output=midi   Ricoh 2A03 APU -> MIDI output\n");
 #endif
                 printf("  none               Disable sound output\n");
                 SDL_Quit(); return 0;
             }
             if      (strcmp(hw, "none") == 0) { cfg.sound = MOS_SOUND_NONE; cfg.sound_explicit = true; }
             else if (strcmp(hw, "2a03") == 0) { cfg.sound = MOS_SOUND_2A03; cfg.sound_explicit = true; }
-#ifdef HAVE_ALSA
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
             else if (strcmp(hw, "2a03,output=midi") == 0) { cfg.sound = MOS_SOUND_2A03_MIDI; cfg.sound_explicit = true; }
 #endif
             else {

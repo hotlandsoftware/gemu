@@ -1441,7 +1441,7 @@ NesState *nes_create(const MosConfig *cfg) {
             fprintf(stderr, "nes: APU audio init failed (continuing silently)\n");
         s->apu.mem_read = nes_cpu_read;
         s->apu.mem_ud   = s;
-#ifdef HAVE_ALSA
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     } else if (cfg->sound == MOS_SOUND_2A03_MIDI) {
         s->apu.mem_read    = nes_cpu_read;
         s->apu.mem_ud      = s;
@@ -1547,7 +1547,7 @@ void nes_destroy(NesState *s) {
 #ifdef GEMU_GTK
     hex_editor_destroy(s->hex_editor);
 #endif
-#ifdef HAVE_ALSA
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     apu_midi_close(&s->apu_midi);
 #endif
     apu2a03_destroy(&s->apu);

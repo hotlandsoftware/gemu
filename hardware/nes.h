@@ -5,7 +5,7 @@
 #include "rp2c02.h"
 #include "apu2a03.h"
 #include "gemu/gemu_display.h"
-#ifdef HAVE_ALSA
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
 #  include "../audio/apu_midi.h"
 #endif
 #include "gemu/vnc.h"
@@ -115,7 +115,7 @@ typedef struct NesState {
     uint8_t  m178_prg_hi;  /* $4802: PRG A24..A17 (outer 128KB block) */
 
     Apu2a03  apu;
-#ifdef HAVE_ALSA
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     ApuMidi  apu_midi;
 #endif
 
