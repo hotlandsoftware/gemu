@@ -1,0 +1,2 @@
+<?xml version="1.0"?>
+<vga name="cdp1861" description="RCA CDP1861 Pixie (64×128 px, DMA-driven, NTSC 60 Hz)" requires="rca"/>

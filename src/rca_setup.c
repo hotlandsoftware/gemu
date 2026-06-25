@@ -51,9 +51,7 @@ static const GemuDevDesc cpus[] = {
     {"cdp1802", "RCA CDP1802 COSMAC"},
 };
 static const GemuDevDesc vgas[] = {
-    {"cdp1861", "RCA CDP1861 Pixie (64x128 px, NTSC 60 Hz, DMA-driven)"},
-    {"cdp1869", "RCA CDP1869/1870 VIS tile display"},
-    {"none",    "No video output"},
+#include "generated/vgas_rca.inc"
 };
 static const GemuDevDesc soundhws[] = {
     {"pcspk", "Standard PC speaker / one-bit loudspeaker"},

@@ -45,7 +45,7 @@ static const GemuDevDesc cpus[] = {
     {"2a03", "Ricoh 2A03 (6502-like, no decimal mode)"},
 };
 static const GemuDevDesc vgas[] = {
-    {"2c02", "Ricoh RP2C02 (256x240 px, NES PPU)"},
+#include "generated/vgas_mos.inc"
 };
 
 static const GemuArgsDef def = {
@@ -181,7 +181,7 @@ int mos_setup(int argc, char *argv[]) {
     }
 
     if (args.vga) {
-        if (strcmp(args.vga, "2c02") == 0) cfg.vga = MOS_VGA_RP2C02;
+        if (strcmp(args.vga, "rp2c02") == 0) cfg.vga = MOS_VGA_RP2C02;
     }
 
     for (int i = 0; i < nrem; i++) {
