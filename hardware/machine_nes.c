@@ -850,7 +850,8 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
             }
             return trigger | light;
         }
-        if (s->cfg->ports[1] != NES_DEVICE_CONTROLLER) return 0;
+        if (s->cfg->ports[1] != NES_DEVICE_CONTROLLER &&
+            s->cfg->ports[1] != NES_DEVICE_ROB) return 0;
         if (s->ctrl_strobe) return (s->ctrl_state[1] & NES_BTN_A) ? 1u : 0u;
         uint8_t bit = s->ctrl_shift[1] & 1;
         s->ctrl_shift[1] = (s->ctrl_shift[1] >> 1) | 0x80u;
@@ -1725,10 +1726,14 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                 gemu_vnc_update(s->vnc, s->ppu.pixels,
                                 RP2C02_WIDTH, RP2C02_HEIGHT);
 #ifdef HAVE_ROB
-            if (s->rob_window) {
+            if (s->cfg->n_ports > 1 && s->cfg->ports[1] == NES_DEVICE_ROB) {
                 rob_frame(&s->rob, s->ppu.pixels_argb, RP2C02_WIDTH, RP2C02_HEIGHT);
-                rob_window_render(s->rob_window, &s->rob.state);
+                s->ctrl_state[1] = 0;
+                if (s->rob.btn_a) s->ctrl_state[1] |= NES_BTN_A;
+                if (s->rob.btn_b) s->ctrl_state[1] |= NES_BTN_B;
             }
+            if (s->rob_window)
+                rob_window_render(s->rob_window, &s->rob);
 #endif
         }
 

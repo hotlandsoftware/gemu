@@ -12,6 +12,9 @@
 #define ROB_WIN_W 360
 #define ROB_WIN_H 480
 #define ROB_MAX_MESHES 16
+#define ROB_GYRO_SEGMENTS 32
+#define ROB_GYRO_VERTS ((ROB_GYRO_SEGMENTS + 1) * 4)
+#define ROB_GYRO_IDX (ROB_GYRO_SEGMENTS * 12)
 
 /* ── Simple column-major mat4 ────────────────────────────────────────────── */
 typedef struct { float m[16]; } Mat4;
@@ -45,7 +48,11 @@ static Mat4 mat4_rotate_y(float angle) {
     return r;
 }
 
-
+static Mat4 mat4_scale(float x, float y, float z) {
+    Mat4 r = mat4_identity();
+    r.m[0] = x; r.m[5] = y; r.m[10] = z;
+    return r;
+}
 
 static Mat4 mat4_perspective(float fovy_rad, float aspect, float n, float f) {
     float t = 1.0f / tanf(fovy_rad * 0.5f);
@@ -79,6 +86,37 @@ static Mat4 mat4_lookat(float ex, float ey, float ez,
     return m;
 }
 
+/* ── Gyro cylinder geometry (unit radius, unit height) ───────────────────── */
+static void build_cylinder(float *verts, unsigned *idx) {
+    for (int i = 0; i <= ROB_GYRO_SEGMENTS; i++) {
+        float a = (float)i * (2.0f * 3.14159265f / ROB_GYRO_SEGMENTS);
+        float x = cosf(a), z = sinf(a);
+        int v = i * 24;
+
+        verts[v +  0] = x; verts[v +  1] = -0.5f; verts[v +  2] = z;
+        verts[v +  3] = x; verts[v +  4] =  0.0f; verts[v +  5] = z;
+        verts[v +  6] = x; verts[v +  7] =  0.5f; verts[v +  8] = z;
+        verts[v +  9] = x; verts[v + 10] =  0.0f; verts[v + 11] = z;
+        verts[v + 12] = 0; verts[v + 13] =  0.5f; verts[v + 14] = 0;
+        verts[v + 15] = 0; verts[v + 16] =  1.0f; verts[v + 17] = 0;
+        verts[v + 18] = 0; verts[v + 19] = -0.5f; verts[v + 20] = 0;
+        verts[v + 21] = 0; verts[v + 22] = -1.0f; verts[v + 23] = 0;
+    }
+
+    for (int i = 0; i < ROB_GYRO_SEGMENTS; i++) {
+        unsigned side0 = (unsigned)i * 4;
+        unsigned side1 = side0 + 4;
+        unsigned top0 = side0 + 2, top1 = side1 + 2;
+        unsigned bot0 = side0 + 3, bot1 = side1 + 3;
+        int k = i * 12;
+
+        idx[k +  0] = side0;     idx[k +  1] = side1;     idx[k +  2] = side1 + 1;
+        idx[k +  3] = side0;     idx[k +  4] = side1 + 1; idx[k +  5] = side0 + 1;
+        idx[k +  6] = top0;      idx[k +  7] = top1;      idx[k +  8] = side1 + 1;
+        idx[k +  9] = bot0;      idx[k + 10] = side1;     idx[k + 11] = bot1;
+    }
+}
+
 /* ── GL mesh ─────────────────────────────────────────────────────────────── */
 typedef struct {
     GLuint vao, vbo, ebo;
@@ -89,6 +127,31 @@ typedef struct {
     bool   is_arm;    /* participates in vertical movement */
 } RobMesh;
 
+typedef struct {
+    float x, z;
+} RobColumnPos;
+
+/* Positions copied from rob-code/Robert-Godot/RobotScene.tscn and
+ * RobotVisual.cs.  Column order is ROB_COL_SPINNER, B, A, TRAY1, TRAY2. */
+static const RobColumnPos GYRO_COL_POS[5] = {
+    {-0.065f, -0.11258f},
+    { 0.065f, -0.11258f},
+    { 0.130f,  0.00000f},
+    { 0.065f,  0.11258f},
+    {-0.065f,  0.11258f},
+};
+
+static int arm_step_to_column_for_view(int arm_step) {
+    switch (arm_step) {
+        case  0: return ROB_COL_A_BTN;
+        case  1: return ROB_COL_B_BTN;
+        case  2: return ROB_COL_SPINNER;
+        case 10: return ROB_COL_TRAY2;
+        case 11: return ROB_COL_TRAY1;
+        default: return ROB_COL_NONE;
+    }
+}
+
 /* ── Window ──────────────────────────────────────────────────────────────── */
 struct RobWindow {
     SDL_Window   *win;
@@ -98,12 +161,25 @@ struct RobWindow {
     GLint         u_mvp, u_model, u_color, u_light;
     RobMesh       meshes[ROB_MAX_MESHES];
     int           n_meshes;
+    /* Shared gyro cylinder mesh */
+    GLuint        gyro_vao, gyro_vbo, gyro_ebo;
     /* Camera orbit state (spherical coords around ROB's centre) */
     float         cam_yaw;    /* horizontal angle around Y (radians) */
     float         cam_pitch;  /* vertical angle above horizontal (radians) */
     float         cam_dist;   /* distance from look-at target */
     bool          dragging;
 };
+
+static void draw_cylinder(RobWindow *w, Mat4 pv, float x, float y, float z,
+                          float radius, float height, const float color[3]) {
+    Mat4 model = mat4_mul(mat4_translate(x, y, z),
+                          mat4_scale(radius, height, radius));
+    Mat4 mvp = mat4_mul(pv, model);
+    glUniformMatrix4fv(w->u_mvp,   1, GL_FALSE, mvp.m);
+    glUniformMatrix4fv(w->u_model, 1, GL_FALSE, model.m);
+    glUniform3fv(w->u_color, 1, color);
+    glDrawElements(GL_TRIANGLES, ROB_GYRO_IDX, GL_UNSIGNED_INT, 0);
+}
 
 /* ── Shaders ─────────────────────────────────────────────────────────────── */
 static const char *VS_SRC =
@@ -287,6 +363,25 @@ RobWindow *rob_window_create(const char *model_dir) {
         aiReleaseImport(sc);
     }
 
+    /* Gyro cylinder mesh (reused for all gyro parts, different model matrices) */
+    float gyro_verts[ROB_GYRO_VERTS * 6];
+    unsigned gyro_idx[ROB_GYRO_IDX];
+    build_cylinder(gyro_verts, gyro_idx);
+
+    glGenVertexArrays(1, &w->gyro_vao);
+    glGenBuffers(1, &w->gyro_vbo);
+    glGenBuffers(1, &w->gyro_ebo);
+    glBindVertexArray(w->gyro_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, w->gyro_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof gyro_verts, gyro_verts, GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, w->gyro_ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof gyro_idx, gyro_idx, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)(3*sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+
     /* Initial orbit matching the old hardcoded lookat:
      *   eye=(0.14,0.26,0.52) target=(0.04,0.09,0.00)
      *   offset=(0.10,0.17,0.52), dist≈0.556, yaw≈0.190 rad, pitch≈0.311 rad */
@@ -300,7 +395,8 @@ RobWindow *rob_window_create(const char *model_dir) {
     return w;
 }
 
-void rob_window_render(RobWindow *w, const RobMotorState *state) {
+void rob_window_render(RobWindow *w, const RobState *rob) {
+    const RobMotorState *state = &rob->state;
     SDL_GL_MakeCurrent(w->win, w->ctx);
 
     glViewport(0, 0, ROB_WIN_W, ROB_WIN_H);
@@ -339,10 +435,12 @@ void rob_window_render(RobWindow *w, const RobMotorState *state) {
             Mat4 rot = mat4_rotate_y(angle);
             model = mat4_mul(model, rot);
 
-            /* Gripper open/close: rotate each finger around Y toward the centre.
-             * Default model = open (fingers at ±75mm from axis).
-             * Closed: ~25° inward rotation brings tips to z≈0. */
-            float close_ang = state->hands_open ? 0.0f : 0.436f; /* 0.436 rad ≈ 25° */
+            /* Gripper open/close: rotate each finger inward around Y.
+             * Actual tip vertex: x=0.149, z=±0.020. To bring z→0:
+             * θ = atan(0.020/0.149) ≈ 0.133 rad ≈ 7.6°.
+             * The old 0.436 rad used the bounding-box extent (z=±0.075) which
+             * is the arm BASE, not the tip — that triple-overshot and crossed. */
+            float close_ang = state->hands_open ? 0.0f : 0.133f; /* 7.6°: tips meet at z=0 */
             /* arm_idx 0 is at −Z: closing needs a negative Y rotation (moves −z toward 0).
              * arm_idx 1 is at +Z: closing needs a positive Y rotation (moves +z toward 0). */
             float fdir = (rm->arm_idx == 0) ? -1.0f : 1.0f;
@@ -356,6 +454,77 @@ void rob_window_render(RobWindow *w, const RobMotorState *state) {
 
         glBindVertexArray(rm->vao);
         glDrawElements(GL_TRIANGLES, rm->n_idx, GL_UNSIGNED_INT, 0);
+    }
+
+    /* Draw gyros as simple cylinder assemblies.
+     * Held gyro tracks the current arm position; resting gyros sit at their
+     * column's angular position at rest height (1 for buttons/trays, 3 for spinner). */
+    static const float gyro_rim[3]        = {0.95f, 0.95f, 0.95f};
+    static const float gyro_top[3]        = {0.90f, 0.02f, 0.02f};
+    static const float gyro_black[3]      = {0.01f, 0.01f, 0.01f};
+    static const float gyro_held_top[3]   = {1.00f, 0.38f, 0.02f};
+    static const float gyro_topple[3]     = {0.55f, 0.55f, 0.55f};
+    const float gyro_base_y = 0.072f;
+    static const float button_red[3]      = {0.85f, 0.02f, 0.02f};
+    static const float button_blue[3]     = {0.02f, 0.12f, 0.90f};
+    static const float tray_black[3]      = {0.01f, 0.01f, 0.01f};
+    static const float spinner_grey[3]    = {0.70f, 0.70f, 0.70f};
+
+    glBindVertexArray(w->gyro_vao);
+    draw_cylinder(w, pv, GYRO_COL_POS[ROB_COL_A_BTN].x, 0.0525f,
+                  GYRO_COL_POS[ROB_COL_A_BTN].z, 0.018f, 0.010f, button_red);
+    draw_cylinder(w, pv, GYRO_COL_POS[ROB_COL_B_BTN].x, 0.0525f,
+                  GYRO_COL_POS[ROB_COL_B_BTN].z, 0.018f, 0.010f, button_blue);
+    draw_cylinder(w, pv, GYRO_COL_POS[ROB_COL_TRAY1].x, 0.058f,
+                  GYRO_COL_POS[ROB_COL_TRAY1].z, 0.022f, 0.010f, tray_black);
+    draw_cylinder(w, pv, GYRO_COL_POS[ROB_COL_TRAY2].x, 0.058f,
+                  GYRO_COL_POS[ROB_COL_TRAY2].z, 0.022f, 0.010f, tray_black);
+    draw_cylinder(w, pv, GYRO_COL_POS[ROB_COL_SPINNER].x, 0.086f,
+                  GYRO_COL_POS[ROB_COL_SPINNER].z, 0.022f, 0.006f, spinner_grey);
+
+    for (int i = 0; i < ROB_GYRO_COUNT; i++) {
+        const RobGyroState *g = &rob->gyros[i];
+        float gx, gy, gz;
+        const float *top_col = gyro_top;
+
+        if (i == rob->held_gyro) {
+            int col_idx = arm_step_to_column_for_view(state->arm_step);
+            if (col_idx >= 0 && col_idx < 5) {
+                gx = GYRO_COL_POS[col_idx].x;
+                gz = GYRO_COL_POS[col_idx].z;
+            } else {
+                float ang = (float)state->arm_step * (2.0f * 3.14159265f / ROB_ARM_STEPS);
+                gx = 0.13f * cosf(ang);
+                gz = -0.13f * sinf(ang);
+            }
+            gy = gyro_base_y + (float)state->arm_height * 0.014f - 0.012f;
+            top_col = gyro_held_top;
+        } else if (g->toppled) {
+            /* Toppled: stay at last column, drop to floor height */
+            gx = GYRO_COL_POS[g->column].x;
+            gy = gyro_base_y + 0.014f; /* height 1 */
+            gz = GYRO_COL_POS[g->column].z;
+            top_col = gyro_topple;
+        } else {
+            int rest_h = (g->column == ROB_COL_SPINNER) ? 3 : 1;
+            gx = GYRO_COL_POS[g->column].x;
+            gy = gyro_base_y + (float)rest_h * 0.014f;
+            gz = GYRO_COL_POS[g->column].z;
+        }
+
+        const struct {
+            float dy, radius, height;
+            const float *color;
+        } parts[] = {
+            {0.000f, 0.022f, 0.005f, gyro_rim},
+            {0.004f, 0.018f, 0.003f, top_col},
+            {0.018f, 0.003f, 0.026f, gyro_rim},
+            {0.034f, 0.012f, 0.006f, gyro_black},
+        };
+
+        for (unsigned p = 0; p < sizeof parts / sizeof parts[0]; p++)
+            draw_cylinder(w, pv, gx, gy + parts[p].dy, gz,
+                          parts[p].radius, parts[p].height, parts[p].color);
     }
     glBindVertexArray(0);
 
@@ -407,6 +576,10 @@ int rob_window_event(RobWindow *w, const SDL_Event *e) {
 void rob_window_destroy(RobWindow *w) {
     if (!w) return;
     SDL_DelEventWatch(rob_event_watch, w);
+    SDL_GL_MakeCurrent(w->win, w->ctx);
+    glDeleteVertexArrays(1, &w->gyro_vao);
+    glDeleteBuffers(1, &w->gyro_vbo);
+    glDeleteBuffers(1, &w->gyro_ebo);
     SDL_GL_DeleteContext(w->ctx);
     SDL_DestroyWindow(w->win);
     free(w);

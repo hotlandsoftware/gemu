@@ -93,11 +93,90 @@ static void apply_command(RobMotorState *st, int cmd) {
     }
 }
 
+/* ── Gyromite gyro simulation ────────────────────────────────────────────────
+ * Column layout (arm_step → column after reset at step 0):
+ *   step  0 → col 2  red/A button    (reset position)
+ *   step  1 → col 1  blue/B button
+ *   step  2 → col 0  spinner stand
+ *   step 11 → col 3  gyro tray 1
+ *   step 10 → col 4  gyro tray 2
+ *
+ * A gyro rests at height 3 on the spinner and height 1 everywhere else.
+ * btn_a is set when a gyro sits at col 2 height 1 (not held, not toppled).
+ * btn_b is set when a gyro sits at col 1 height 1.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+static int arm_step_to_column(int arm_step) {
+    switch (arm_step) {
+        case  0: return ROB_COL_A_BTN;
+        case  1: return ROB_COL_B_BTN;
+        case  2: return ROB_COL_SPINNER;
+        case 10: return ROB_COL_TRAY2;
+        case 11: return ROB_COL_TRAY1;
+        default: return ROB_COL_NONE;
+    }
+}
+
+static int gyro_rest_height(int col) {
+    return (col == ROB_COL_SPINNER) ? 3 : 1;
+}
+
+static void rob_update_buttons(RobState *rob) {
+    rob->btn_a = rob->btn_b = false;
+    for (int i = 0; i < ROB_GYRO_COUNT; i++) {
+        if (i == rob->held_gyro) continue;
+        const RobGyroState *g = &rob->gyros[i];
+        if (g->toppled) continue;
+        if (g->column == ROB_COL_A_BTN) rob->btn_a = true;
+        if (g->column == ROB_COL_B_BTN) rob->btn_b = true;
+    }
+}
+
+static void rob_gyro_tick(RobState *rob) {
+    bool open = rob->state.hands_open;
+    int  col  = arm_step_to_column(rob->state.arm_step);
+    int  h    = rob->state.arm_height;
+
+    /* Close edge: try to pick up a gyro at the current position */
+    if (rob->prev_hands_open && !open && col != ROB_COL_NONE && rob->held_gyro < 0) {
+        for (int i = 0; i < ROB_GYRO_COUNT; i++) {
+            RobGyroState *g = &rob->gyros[i];
+            if (!g->toppled && g->column == col && gyro_rest_height(col) == h) {
+                rob->held_gyro = i;
+                break;
+            }
+        }
+    }
+
+    /* Open edge: drop the held gyro at the current column */
+    if (!rob->prev_hands_open && open && rob->held_gyro >= 0 && col != ROB_COL_NONE) {
+        RobGyroState *g = &rob->gyros[rob->held_gyro];
+        g->column = col;
+        /* Topple if another gyro already occupies this column */
+        for (int i = 0; i < ROB_GYRO_COUNT; i++) {
+            if (i == rob->held_gyro) continue;
+            RobGyroState *o = &rob->gyros[i];
+            if (!o->toppled && o->column == col) {
+                g->toppled = true;
+                break;
+            }
+        }
+        rob->held_gyro = -1;
+    }
+
+    rob->prev_hands_open = open;
+    rob_update_buttons(rob);
+}
+
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
 void rob_init(RobState *rob) {
     memset(rob, 0, sizeof *rob);
-    rob->state.hands_open = true;
+    rob->state.hands_open   = true;
+    rob->gyros[0].column    = ROB_COL_TRAY1;
+    rob->gyros[1].column    = ROB_COL_TRAY2;
+    rob->held_gyro          = -1;
+    rob->prev_hands_open    = true;
 }
 
 void rob_frame(RobState *rob, const uint32_t *pixels_argb, int w, int h) {
@@ -111,5 +190,6 @@ void rob_frame(RobState *rob, const uint32_t *pixels_argb, int w, int h) {
         int cmd = extract_command(rob->bits);
         rob->bits = 0x1fff; /* saturate to prevent immediate re-trigger */
         apply_command(&rob->state, cmd);
+        rob_gyro_tick(rob);
     }
 }
