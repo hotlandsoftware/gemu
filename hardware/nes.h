@@ -13,6 +13,10 @@
 #ifdef GEMU_GTK
 #  include "../vga/hex_editor.h"
 #endif
+#ifdef HAVE_ROB
+#  include "rob.h"
+#  include "rob_window.h"
+#endif
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -156,6 +160,11 @@ typedef struct NesState {
     /* Hex editor (GTK only) */
 #ifdef GEMU_GTK
     HexEditor *hex_editor;
+#endif
+
+#ifdef HAVE_ROB
+    RobState    rob;
+    RobWindow  *rob_window;
 #endif
 } NesState;
 

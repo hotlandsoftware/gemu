@@ -597,12 +597,17 @@ InputMenu *input_menu_create(SDL_Renderer *renderer,
     snprintf(m->section, sizeof(m->section), "%s",
              ini_section ? ini_section : "default");
 
-    m->n_buttons    = n_buttons;
-    m->button_names = button_names;
+    m->n_buttons = n_buttons;
+    if (n_buttons > 0 && button_names) {
+        m->button_names = malloc((size_t)n_buttons * sizeof(*m->button_names));
+        if (!m->button_names) { free(m); return NULL; }
+        memcpy(m->button_names, button_names,
+               (size_t)n_buttons * sizeof(*m->button_names));
+    }
     /* allocate at least 1 to avoid malloc(0) portability issues */
     m->bindings = malloc(n_buttons ? (size_t)n_buttons * sizeof(*m->bindings)
                                    : sizeof(*m->bindings));
-    if (!m->bindings) { free(m); return NULL; }
+    if (!m->bindings) { free(m->button_names); free(m); return NULL; }
     if (n_buttons > 0 && default_bindings)
         memcpy(m->bindings, default_bindings,
                (size_t)n_buttons * sizeof(*m->bindings));
@@ -617,6 +622,7 @@ InputMenu *input_menu_create(SDL_Renderer *renderer,
 
 void input_menu_destroy(InputMenu *m) {
     if (!m) return;
+    free(m->button_names);
     free(m->bindings);
     free(m);
 }

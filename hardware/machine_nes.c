@@ -1538,6 +1538,17 @@ NesState *nes_create(const MosConfig *cfg) {
     }
 
     nes_reset(s);
+
+#ifdef HAVE_ROB
+    for (int p = 0; p < cfg->n_ports; p++) {
+        if (cfg->ports[p] == NES_DEVICE_ROB) {
+            rob_init(&s->rob);
+            s->rob_window = rob_window_create("mdl/rob");
+            break;
+        }
+    }
+#endif
+
     return s;
 }
 
@@ -1552,6 +1563,9 @@ void nes_destroy(NesState *s) {
 #endif
     apu2a03_destroy(&s->apu);
     gemu_monitor_destroy(s->monitor);
+#ifdef HAVE_ROB
+    rob_window_destroy(s->rob_window);  /* must happen before display destroy */
+#endif
     gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
     free(s->prg);
@@ -1587,7 +1601,6 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                 nes_reset(s);
             }
         }
-
         /* Monitor commands */
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
@@ -1711,6 +1724,12 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             if (s->vnc)
                 gemu_vnc_update(s->vnc, s->ppu.pixels,
                                 RP2C02_WIDTH, RP2C02_HEIGHT);
+#ifdef HAVE_ROB
+            if (s->rob_window) {
+                rob_frame(&s->rob, s->ppu.pixels_argb, RP2C02_WIDTH, RP2C02_HEIGHT);
+                rob_window_render(s->rob_window, &s->rob.state);
+            }
+#endif
         }
 
         /* Frame sync:

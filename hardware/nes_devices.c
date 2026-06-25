@@ -38,6 +38,15 @@ static const NesDeviceDesc devices[] = {
         .default_bindings= NULL,
         .ini_section     = NULL,
     },
+    {
+        .name            = "rob",
+        .desc            = "R.O.B. (Robotic Operating Buddy)",
+        .type            = NES_DEVICE_ROB,
+        .n_buttons       = 0,
+        .button_names    = NULL,
+        .default_bindings= NULL,
+        .ini_section     = NULL,
+    },
 };
 
 const NesDeviceDesc *nes_device_list(int *count) {
