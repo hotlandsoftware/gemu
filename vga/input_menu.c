@@ -224,11 +224,12 @@ struct InputMenu {
 
     MenuPage       page;
     MenuList       list;
+    int            input_page;
+    int            input_page_count;
     int            selected;
     int            option_selected;
     int            capture_index;
     bool           capture_controller;
-    bool           edit_controller;
     bool           capture_backspace_armed;
     bool           quit_requested;
     bool           reset_requested;
@@ -248,6 +249,7 @@ static void start_binding_options(InputMenu *m, int index, bool controller);
 static void start_capture(InputMenu *m, int index, bool controller);
 static bool binding_matches_controller(const InputBinding *binding,
                                        const SDL_Event *ev);
+static const char *display_button_name(const char *name);
 
 /* ── INI load / save (uses m->n_buttons / m->button_names) ─────────────── */
 
@@ -283,6 +285,20 @@ static void binding_set_controller(InputBinding *binding, const char *name) {
 
 static const char *binding_display_name(const InputBinding *binding) {
     return (binding && binding->name[0]) ? binding->name : "(none)";
+}
+
+static const char *display_button_name(const char *name) {
+    if (!name) return "";
+    if (name[0] == 'P' && name[1] >= '2' && name[1] <= '9' && name[2] == ' ')
+        return name + 3;
+    return name;
+}
+
+static int duplicate_page_for_button(const char *name) {
+    if (!name) return 0;
+    if (name[0] == 'P' && name[1] >= '2' && name[1] <= '9' && name[2] == ' ')
+        return name[1] - '1';
+    return 0;
 }
 
 static bool is_menu_control_index(int index) {
@@ -591,14 +607,31 @@ static void build_main_menu(InputMenu *m) {
 
 static void build_input_menu(InputMenu *m) {
     m->list = MENU_LIST_INPUT;
-    m->n_items = 0;
-    m->items[m->n_items++] = (MenuItem){
-        .label = "Menu >",
-        .action = menu_action_menu_controls,
-    };
+    m->input_page_count = 1;
     for (int i = 0; i < m->n_buttons; i++) {
+        int page = duplicate_page_for_button(m->button_names[i]);
+        if (page + 1 > m->input_page_count)
+            m->input_page_count = page + 1;
+    }
+    if (m->input_page_count < 1)
+        m->input_page_count = 1;
+    if (m->input_page < 0)
+        m->input_page = 0;
+    if (m->input_page >= m->input_page_count)
+        m->input_page = m->input_page_count - 1;
+
+    m->n_items = 0;
+    if (m->input_page == 0) {
         m->items[m->n_items++] = (MenuItem){
-            .label = m->button_names[i],
+            .label = "Menu >",
+            .action = menu_action_menu_controls,
+        };
+    }
+    for (int i = 0; i < m->n_buttons; i++) {
+        if (duplicate_page_for_button(m->button_names[i]) != m->input_page)
+            continue;
+        m->items[m->n_items++] = (MenuItem){
+            .label = display_button_name(m->button_names[i]),
             .binding_ptr = &m->key_bindings[i],
             .controller_ptr = &m->controller_bindings[i],
             .binding_index = i,
@@ -645,6 +678,7 @@ static void menu_action_close(InputMenu *m) {
 
 static void menu_action_input(InputMenu *m) {
     m->page = MENU_MAIN;
+    m->input_page = 0;
     build_input_menu(m);
     m->selected = 0;
 }
@@ -653,7 +687,6 @@ static void menu_action_menu_controls(InputMenu *m) {
     m->page = MENU_MAIN;
     build_menu_controls_menu(m);
     m->selected = 0;
-    m->edit_controller = false;
 }
 
 static void start_binding_options(InputMenu *m, int index, bool controller) {
@@ -705,6 +738,7 @@ void input_menu_reset_keys(InputMenu *m) {
     build_main_menu(m);
     m->page = MENU_MAIN;
     m->selected = 0;
+    m->input_page = 0;
 }
 
 /* ── Font rendering helpers ─────────────────────────────────────────────── */
@@ -826,12 +860,19 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
     bool is_binding_menu = (m->list == MENU_LIST_INPUT ||
                             m->list == MENU_LIST_CONTROLS);
 
-    if (m->list == MENU_LIST_INPUT)
-        draw_text(r, mx + 6 * s, ty, m->section, 0xFFFFFFFF, 0x000050FF, s);
-    else if (m->list == MENU_LIST_CONTROLS)
+    if (m->list == MENU_LIST_INPUT) {
+        char title[128];
+        if (m->input_page_count > 1)
+            snprintf(title, sizeof(title), "%s (%d/%d)", m->section,
+                     m->input_page + 1, m->input_page_count);
+        else
+            snprintf(title, sizeof(title), "%s", m->section);
+        draw_text(r, mx + 6 * s, ty, title, 0xFFFFFFFF, 0x000050FF, s);
+    } else if (m->list == MENU_LIST_CONTROLS) {
         draw_text(r, mx + 6 * s, ty, "Menu", 0xFFFFFFFF, 0x000050FF, s);
-    else
+    } else {
         draw_text(r, mx + 6 * s, ty, "Main Menu", 0xFFFFFFFF, 0x000050FF, s);
+    }
     ty += fh + 4 * s;
 
     /* Separator */
@@ -861,12 +902,7 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
                               ? binding_display_name(m->items[i].controller_ptr)
                               : "(none)";
             char pair[192];
-            if (i == m->selected && m->edit_controller && m->items[i].controller_ptr)
-                snprintf(pair, sizeof(pair), "%s / [%s]", kname, cname);
-            else if (i == m->selected)
-                snprintf(pair, sizeof(pair), "[%s] / %s", kname, cname);
-            else
-                snprintf(pair, sizeof(pair), "%s / %s", kname, cname);
+            snprintf(pair, sizeof(pair), "%s / %s", kname, cname);
             int kw = (int)strlen(pair) * fw;
             int x = mx + mw - 8 * s - kw;
             if (x < mx + 8 * s + 12 * fw)
@@ -1040,32 +1076,42 @@ bool input_menu_handle_event(InputMenu *m, const SDL_Event *ev) {
         return true;
     }
     if (go_left) {
-        if (is_binding_menu && m->items[m->selected].binding_ptr)
-            m->edit_controller = false;
+        if (m->list == MENU_LIST_INPUT && m->input_page_count > 1) {
+            if (m->input_page > 0)
+                m->input_page--;
+            else
+                m->input_page = m->input_page_count - 1;
+            build_input_menu(m);
+            m->selected = 0;
+        }
         return true;
     }
     if (go_right) {
-        if (is_binding_menu && m->items[m->selected].controller_ptr)
-            m->edit_controller = true;
+        if (m->list == MENU_LIST_INPUT && m->input_page_count > 1) {
+            if (m->input_page < m->input_page_count - 1)
+                m->input_page++;
+            else
+                m->input_page = 0;
+            build_input_menu(m);
+            m->selected = 0;
+        }
         return true;
     }
     if (accept) {
         if (is_binding_menu) {
             if (m->items[m->selected].binding_ptr) {
                 start_binding_options(m, m->items[m->selected].binding_index,
-                                      m->edit_controller && m->items[m->selected].controller_ptr);
+                                      false);
             } else if (m->items[m->selected].action) {
                 m->items[m->selected].action(m);
             } else if (m->list == MENU_LIST_CONTROLS) {
                 build_input_menu(m);
                 m->page = MENU_MAIN;
                 m->selected = 0;
-                m->edit_controller = false;
             } else {
                 build_main_menu(m);
                 m->page = MENU_MAIN;
                 m->selected = 0;
-                m->edit_controller = false;
             }
         } else if (m->items[m->selected].action) {
             m->items[m->selected].action(m);
@@ -1077,12 +1123,10 @@ bool input_menu_handle_event(InputMenu *m, const SDL_Event *ev) {
             build_input_menu(m);
             m->page = MENU_MAIN;
             m->selected = 0;
-            m->edit_controller = false;
         } else if (m->list == MENU_LIST_INPUT) {
             build_main_menu(m);
             m->page = MENU_MAIN;
             m->selected = 0;
-            m->edit_controller = false;
         } else {
             m->page = MENU_CLOSED;
         }
@@ -1148,8 +1192,12 @@ InputMenu *input_menu_create(SDL_Renderer *renderer,
         free(m->controller_button_names); free(m->button_names); free(m); return NULL;
     }
     if (n_buttons > 0 && default_bindings) {
-        for (int i = 0; i < n_buttons; i++)
-            binding_set_key(&m->key_bindings[i], default_bindings[i]);
+        for (int i = 0; i < n_buttons; i++) {
+            if (default_bindings[i] != SDLK_UNKNOWN)
+                binding_set_key(&m->key_bindings[i], default_bindings[i]);
+            else
+                binding_clear(&m->key_bindings[i]);
+        }
     }
     if (n_buttons > 0 && default_controller_bindings) {
         for (int i = 0; i < n_buttons; i++)

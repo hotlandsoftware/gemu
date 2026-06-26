@@ -31,6 +31,7 @@
 /* ── NES controller action table ─────────────────────────────────────────── */
 /* GEMU_ACTION(n) = 1u<<n; NES_BTN_* happen to match, so ctrl_state[0] = held & 0xFF */
 #define NES_N_ACTIONS 8
+#define NES_2P_N_ACTIONS 16
 
 static const GemuActionDef nes_actions[NES_N_ACTIONS] = {
     { "A",      GEMU_ACTION(0), "z"           },  /* NES_BTN_A      = 0x01 */
@@ -41,6 +42,25 @@ static const GemuActionDef nes_actions[NES_N_ACTIONS] = {
     { "Down",   GEMU_ACTION(5), "Down"        },  /* NES_BTN_DOWN   = 0x20 */
     { "Left",   GEMU_ACTION(6), "Left"        },  /* NES_BTN_LEFT   = 0x40 */
     { "Right",  GEMU_ACTION(7), "Right"       },  /* NES_BTN_RIGHT  = 0x80 */
+};
+
+static const GemuActionDef nes_2p_actions[NES_2P_N_ACTIONS] = {
+    { "A",        GEMU_ACTION(0),  "z"           },
+    { "B",        GEMU_ACTION(1),  "x"           },
+    { "Select",   GEMU_ACTION(2),  "Right Shift" },
+    { "Start",    GEMU_ACTION(3),  "Return"      },
+    { "Up",       GEMU_ACTION(4),  "Up"          },
+    { "Down",     GEMU_ACTION(5),  "Down"        },
+    { "Left",     GEMU_ACTION(6),  "Left"        },
+    { "Right",    GEMU_ACTION(7),  "Right"       },
+    { "P2 A",      GEMU_ACTION(8),  "" },
+    { "P2 B",      GEMU_ACTION(9),  "" },
+    { "P2 Select", GEMU_ACTION(10), "" },
+    { "P2 Start",  GEMU_ACTION(11), "" },
+    { "P2 Up",     GEMU_ACTION(12), "" },
+    { "P2 Down",   GEMU_ACTION(13), "" },
+    { "P2 Left",   GEMU_ACTION(14), "" },
+    { "P2 Right",  GEMU_ACTION(15), "" },
 };
 
 static bool nes_device_is_rob(NesDeviceType dev) {
@@ -1227,9 +1247,15 @@ static void nes_handle_keys(NesState *s, uint32_t held) {
         /* Headless: clear state unless VNC is feeding us events */
         if (!s->vnc) { s->ctrl_state[0] = 0; s->ctrl_state[1] = 0; }
     } else {
-        /* Action bits 0-7 map directly to NES_BTN_* (both are 1<<n) */
+        /* Action bits 0-7 and 8-15 map directly to NES_BTN_* for ports 1/2. */
         if (s->cfg->ports[0] == NES_DEVICE_CONTROLLER)
             s->ctrl_state[0] = (uint8_t)(held & 0xFFu);
+        else
+            s->ctrl_state[0] = 0;
+        if (s->cfg->ports[1] == NES_DEVICE_CONTROLLER)
+            s->ctrl_state[1] = (uint8_t)((held >> 8) & 0xFFu);
+        else if (!nes_device_is_rob(s->cfg->ports[1]))
+            s->ctrl_state[1] = 0;
         if (s->cfg->ports[1] == NES_DEVICE_ZAPPER) {
             GemuPointerState ptr = gemu_display_get_pointer(s->display);
             if (ptr.button && s->zapper_trigger_ttl == 0)
@@ -1500,6 +1526,8 @@ NesState *nes_create(const MosConfig *cfg) {
     }
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
+        bool two_controllers = cfg->ports[0] == NES_DEVICE_CONTROLLER &&
+                               cfg->ports[1] == NES_DEVICE_CONTROLLER;
         s->display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
                 .title       = "GEMU",
@@ -1507,8 +1535,8 @@ NesState *nes_create(const MosConfig *cfg) {
                 .fb_height   = RP2C02_HEIGHT,
                 .scale       = cfg->display_scale,
                 .renderer    = cfg->display_renderer,
-                .actions     = nes_actions,
-                .n_actions   = NES_N_ACTIONS,
+                .actions     = two_controllers ? nes_2p_actions : nes_actions,
+                .n_actions   = two_controllers ? NES_2P_N_ACTIONS : NES_N_ACTIONS,
                 .ini_section = "nes-controller",
                 .gtk         = &(GemuDisplayGtkExtras){
                     .monitor       = s->monitor,
