@@ -312,6 +312,7 @@ RcaStudio2State *rca_studio2_create(const RcaConfig *cfg) {
                                  STUDIO2_DISPLAY_W * cfg->display_scale,
                                  STUDIO2_DISPLAY_H * cfg->display_scale);
     }
+    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     rca_studio2_reset(s, cfg);
     return s;

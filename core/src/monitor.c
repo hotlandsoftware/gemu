@@ -1,4 +1,5 @@
 #include "gemu/monitor.h"
+#include "gemu/vnc.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,7 @@ typedef SOCKET sock_t;
 #  endif
 #else
 #  include <strings.h>
+#  include <termios.h>
 #  include <unistd.h>
 #  include <sys/select.h>
 #  include <sys/socket.h>
@@ -81,6 +83,7 @@ struct GemuMonitor {
     char            last_text[256];
     uint32_t        last_step_count;
     GemuMediaDevice media[MEDIA_DEVICE_MAX];
+    GemuVncServer  *vnc;
     int             n_media;
     MonRomEntry     rom_entries[ROM_ENTRY_MAX];
     int             n_rom_entries;
@@ -528,6 +531,7 @@ static bool monitor_handle_line(GemuMonitor *mon, char *line) {
         mon_printf(mon,
         "  break <addr>   -- set exec breakpoint (short: b)\n"
         "  change <device> <file> -- insert/change media\n"
+        "  change vnc password -- set VNC password\n"
         "  cont / c -- resume emulation\n"
         "  delete [N] -- delete breakpoint N (or all if N omitted)\n"
         "  dipswitch -- lists DIP switches (when supported)\n"
@@ -570,6 +574,96 @@ static bool monitor_handle_line(GemuMonitor *mon, char *line) {
     return true;
 }
 
+static bool read_password_stdio(char *out, size_t out_len) {
+    size_t n = 0;
+#ifndef _WIN32
+    struct termios oldt, raw;
+    bool have_term = tcgetattr(STDIN_FILENO, &oldt) == 0;
+    if (have_term) {
+        raw = oldt;
+        raw.c_lflag &= (tcflag_t)~(ECHO | ICANON);
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    }
+#endif
+
+    int ch;
+    while ((ch = getchar()) != EOF) {
+        if (ch == '\n' || ch == '\r') break;
+        if (ch == 8 || ch == 127) {
+            if (n > 0) {
+                n--;
+                fputs("\b \b", stdout);
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (n + 1 < out_len)
+            out[n++] = (char)ch;
+        fputc('*', stdout);
+        fflush(stdout);
+    }
+    out[n] = '\0';
+    fputc('\n', stdout);
+    fflush(stdout);
+
+#ifndef _WIN32
+    if (have_term)
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+#endif
+    return ch != EOF;
+}
+
+static bool read_password_telnet(GemuMonitor *mon, char *out, size_t out_len) {
+    size_t n = 0;
+    while (n + 1 < out_len) {
+        unsigned char ch;
+        int r = recv(mon->client_fd, (char *)&ch, 1, 0);
+        if (r <= 0) return false;
+        if (ch == 255) {
+            unsigned char cmd;
+            if (recv(mon->client_fd, (char *)&cmd, 1, 0) <= 0) return false;
+            if (cmd >= 251 && cmd <= 254) {
+                unsigned char opt;
+                if (recv(mon->client_fd, (char *)&opt, 1, 0) <= 0) return false;
+            }
+            continue;
+        }
+        if (ch == '\n') break;
+        if (ch == '\r') continue;
+        if (ch == 8 || ch == 127) {
+            if (n > 0) {
+                n--;
+                sendall(mon->client_fd, "\b \b", 3);
+            }
+            continue;
+        }
+        out[n++] = (char)ch;
+        sendall(mon->client_fd, "*", 1);
+    }
+    out[n] = '\0';
+    sendall(mon->client_fd, "\n", 1);
+    return true;
+}
+
+static bool monitor_change_vnc_password(GemuMonitor *mon) {
+    if (!mon->vnc) {
+        mon_printf(mon, "vnc: not active\n");
+        return true;
+    }
+
+    char password[256];
+    mon_printf(mon, "Password: ");
+    bool ok = (mon->backend == MON_BACKEND_TELNET)
+            ? read_password_telnet(mon, password, sizeof(password))
+            : read_password_stdio(password, sizeof(password));
+    if (!ok) return false;
+    if (strlen(password) > 8)
+        mon_printf(mon, "warning: VNC passwords are limited to 8 characters; only the first 8 will be used\n");
+    gemu_vnc_set_password(mon->vnc, password);
+    mon_printf(mon, "vnc: password changed\n");
+    return true;
+}
+
 static bool telnet_read_line(sock_t fd, char *line, size_t len) {
     size_t n = 0;
     while (n + 1 < len) {
@@ -602,6 +696,11 @@ static void monitor_stdio_loop(GemuMonitor *mon) {
     while (mon->running) {
         mon_printf(mon, "(gemu) ");
         if (!fgets(line, sizeof(line), stdin)) break;
+        trim_line(line);
+        if (strcasecmp(line, "change vnc password") == 0) {
+            if (!monitor_change_vnc_password(mon)) break;
+            continue;
+        }
         if (!monitor_handle_line(mon, line)) break;
     }
 }
@@ -625,6 +724,11 @@ static void monitor_telnet_loop(GemuMonitor *mon) {
         while (mon->running) {
             mon_printf(mon, "(gemu) ");
             if (!telnet_read_line(client, line, sizeof(line))) break;
+            trim_line(line);
+            if (strcasecmp(line, "change vnc password") == 0) {
+                if (!monitor_change_vnc_password(mon)) break;
+                continue;
+            }
             if (!monitor_handle_line(mon, line)) {
                 quit_requested = true;
                 mon->running = false;
@@ -685,6 +789,10 @@ bool gemu_monitor_register_media(GemuMonitor *mon,
         return false;
     mon->media[mon->n_media++] = *dev;
     return true;
+}
+
+void gemu_monitor_set_vnc(GemuMonitor *mon, GemuVncServer *vnc) {
+    if (mon) mon->vnc = vnc;
 }
 
 void gemu_monitor_start(GemuMonitor *mon) {

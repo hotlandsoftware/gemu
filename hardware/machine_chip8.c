@@ -104,6 +104,7 @@ Chip8State *chip8_machine_create(const Chip8Config *cfg) {
         s->vnc = gemu_vnc_create(cfg->vnc_addr,
                                  CHIP8_DISPLAY_W * cfg->display_scale,
                                  CHIP8_DISPLAY_H * cfg->display_scale);
+    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     memcpy(s->mem + CHIP8_FONT_BASE, chip8_font, CHIP8_FONT_BYTES);
 

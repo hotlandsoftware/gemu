@@ -457,6 +457,7 @@ RcaDestroyerState *rca_destroyer_create(const RcaConfig *cfg) {
                                  (int)(sizeof(destroyer_palette) /
                                        sizeof(destroyer_palette[0])));
     }
+    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     GemuMemory tmp = {.data = s->mem, .size = DESTRYER_MEM_SIZE};
     for (int i = 0; i < cfg->n_roms; i++) {

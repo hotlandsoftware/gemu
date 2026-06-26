@@ -402,6 +402,14 @@ def main():
                 have_curses  = True
                 curses_flags = ['-lncursesw']
 
+    crypto_libs = []
+    if args.sdl:
+        lf = pkg('libcrypto', '--libs', *pkg_flags)
+        if check('OpenSSL libcrypto (VNC auth)', lf or ['-lcrypto']):
+            crypto_libs = lf or ['-lcrypto']
+        else:
+            die('OpenSSL libcrypto not found — install libssl-dev')
+
     print()
 
     # ── Build CFLAGS / LDFLAGS ────────────────────────────────────────────────
@@ -439,7 +447,7 @@ def main():
     if defs:      cflags_parts.append(defs)
     unified_cflags = ' '.join(cflags_parts)
 
-    ld_parts = [base_ldflags] + sdl2_libs
+    ld_parts = [base_ldflags] + sdl2_libs + crypto_libs
     if want_gtk:  ld_parts += gtk_libs + epoxy_libs
     if have_caca: ld_parts += caca_libs
     elif have_curses: ld_parts += curses_flags

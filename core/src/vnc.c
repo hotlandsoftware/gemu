@@ -1,4 +1,6 @@
 #include "gemu/vnc.h"
+#include <openssl/rand.h>
+#include <openssl/des.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +47,8 @@ struct GemuVncServer {
     uint32_t        bg_rgb;
     uint32_t        palette[256];
     int             n_colors;
+    bool            password_set;
+    char            password[9];
 };
 
 /* X11 keysyms matching the SDL/GTK CHIP-8 keypad layout:
@@ -154,20 +158,77 @@ static void write_pixel(uint8_t *dst, uint32_t val, int bpp, bool be) {
 
 /* ── RFB handshake ───────────────────────────────────────────────────────── */
 
-static bool vnc_handshake(sock_t fd) {
+static uint8_t reverse_bits(uint8_t v) {
+    v = (uint8_t)(((v & 0xf0u) >> 4) | ((v & 0x0fu) << 4));
+    v = (uint8_t)(((v & 0xccu) >> 2) | ((v & 0x33u) << 2));
+    v = (uint8_t)(((v & 0xaau) >> 1) | ((v & 0x55u) << 1));
+    return v;
+}
+
+static bool vnc_authenticate(GemuVncServer *vnc, sock_t fd) {
+    uint8_t challenge[16];
+    if (RAND_bytes(challenge, (int)sizeof(challenge)) != 1) {
+        for (size_t i = 0; i < sizeof(challenge); i++)
+            challenge[i] = (uint8_t)(rand() & 0xff);
+    }
+    if (!sendall(fd, challenge, sizeof(challenge))) return false;
+
+    uint8_t response[16];
+    if (!recvall(fd, response, sizeof(response))) return false;
+
+    char password[9];
+    pthread_mutex_lock(&vnc->lock);
+    snprintf(password, sizeof(password), "%s", vnc->password);
+    pthread_mutex_unlock(&vnc->lock);
+
+    DES_cblock key;
+    memset(key, 0, sizeof(key));
+    for (int i = 0; i < 8 && password[i]; i++)
+        key[i] = reverse_bits((uint8_t)password[i]);
+    DES_key_schedule sched;
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    DES_set_key_unchecked(&key, &sched);
+    DES_ecb_encrypt((const_DES_cblock *)challenge,
+                    (DES_cblock *)challenge, &sched, DES_ENCRYPT);
+    DES_ecb_encrypt((const_DES_cblock *)(challenge + 8),
+                    (DES_cblock *)(challenge + 8), &sched, DES_ENCRYPT);
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+    uint32_t result = htonl(memcmp(challenge, response, sizeof(challenge)) == 0 ? 0u : 1u);
+    if (!sendall(fd, &result, 4)) return false;
+    return result == 0;
+}
+
+static bool vnc_handshake(GemuVncServer *vnc, sock_t fd) {
     if (!sendall(fd, "RFB 003.008\n", 12)) return false;
     char ver[13]; ver[12] = '\0';
     if (!recvall(fd, ver, 12)) return false;
     int major = 0, minor = 0;
     sscanf(ver, "RFB %d.%03d", &major, &minor);
+
+    pthread_mutex_lock(&vnc->lock);
+    bool password_set = vnc->password_set;
+    pthread_mutex_unlock(&vnc->lock);
+
     if (major == 3 && minor == 3) {
-        uint32_t sec = htonl(1);
+        uint32_t sec = htonl(password_set ? 2u : 1u);
         if (!sendall(fd, &sec, 4)) return false;
+        if (password_set && !vnc_authenticate(vnc, fd)) return false;
     } else {
-        uint8_t offer[2] = {1, 1};
+        uint8_t offer[2] = {1, password_set ? 2u : 1u};
         if (!sendall(fd, offer, 2)) return false;
         uint8_t chosen; if (!recvall(fd, &chosen, 1)) return false;
-        if (minor >= 8) { uint32_t ok = 0; if (!sendall(fd, &ok, 4)) return false; }
+        if (chosen != (password_set ? 2u : 1u)) return false;
+        if (password_set) {
+            if (!vnc_authenticate(vnc, fd)) return false;
+        } else if (minor >= 8) {
+            uint32_t ok = 0; if (!sendall(fd, &ok, 4)) return false;
+        }
     }
     uint8_t shared; return recvall(fd, &shared, 1);
 }
@@ -240,7 +301,7 @@ static bool vnc_send_update(GemuVncServer *vnc, sock_t fd, const PixFmt *fmt) {
 /* ── Client message loop ─────────────────────────────────────────────────── */
 
 static void vnc_handle_client(GemuVncServer *vnc, sock_t fd) {
-    if (!vnc_handshake(fd) || !vnc_send_server_init(vnc, fd)) return;
+    if (!vnc_handshake(vnc, fd) || !vnc_send_server_init(vnc, fd)) return;
     PixFmt fmt = default_fmt();
     while (vnc->running) {
         uint8_t type; if (!recvall(fd, &type, 1)) break;
@@ -365,6 +426,14 @@ void gemu_vnc_set_colors(GemuVncServer *vnc, uint32_t fg_rgb, uint32_t bg_rgb) {
     vnc->fg_rgb = fg_rgb & 0xFFFFFFu;
     vnc->bg_rgb = bg_rgb & 0xFFFFFFu;
     vnc->n_colors = 0;
+    pthread_mutex_unlock(&vnc->lock);
+}
+
+void gemu_vnc_set_password(GemuVncServer *vnc, const char *password) {
+    if (!vnc) return;
+    pthread_mutex_lock(&vnc->lock);
+    snprintf(vnc->password, sizeof(vnc->password), "%s", password ? password : "");
+    vnc->password_set = vnc->password[0] != '\0';
     pthread_mutex_unlock(&vnc->lock);
 }
 

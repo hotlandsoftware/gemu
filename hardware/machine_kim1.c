@@ -1433,6 +1433,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         else
             fprintf(stderr, "gemu-kim1: failed to start VNC at %s\n", cfg->vnc_addr);
     }
+    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     kim1_reset_rriots(s);
     s->serial = cfg->serial;

@@ -197,6 +197,7 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
             fprintf(stderr, "gemu-6502: failed to start VNC server at %s\n",
                     cfg->vnc_addr);
     }
+    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     if (!load_roms(s, cfg)) {
         gemu_vnc_destroy(s->vnc);

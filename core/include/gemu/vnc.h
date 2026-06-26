@@ -13,6 +13,7 @@ typedef struct {
  * fb_w/fb_h: framebuffer dimensions in pixels                */
 GemuVncServer *gemu_vnc_create(const char *addr, int fb_w, int fb_h);
 void           gemu_vnc_destroy(GemuVncServer *vnc);
+void           gemu_vnc_set_password(GemuVncServer *vnc, const char *password);
 void           gemu_vnc_set_colors(GemuVncServer *vnc,
                                    uint32_t fg_rgb, uint32_t bg_rgb);
 void           gemu_vnc_set_palette(GemuVncServer *vnc,

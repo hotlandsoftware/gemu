@@ -319,6 +319,7 @@ RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg) {
         gemu_vnc_set_palette(s->vnc, pecom_palette,
                              (int)(sizeof(pecom_palette) / sizeof(pecom_palette[0])));
     }
+    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     /* Load ROM (16 KB for Pecom 32, 32 KB across two chips for Pecom 64) */
     s->rom_size = 0;

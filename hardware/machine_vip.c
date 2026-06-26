@@ -457,6 +457,7 @@ RcaVipState *rca_vip_create(const RcaConfig *cfg) {
         else if (cfg->vga == RCA_VGA_CDP1869)
             gemu_vnc_set_palette(s->vnc, vip_vis_palette, 8);
     }
+    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     s->key_down = -1;
     s->ascii_key = -1;

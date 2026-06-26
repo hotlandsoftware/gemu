@@ -1541,6 +1541,7 @@ NesState *nes_create(const MosConfig *cfg) {
         else
             fprintf(stderr, "nes: failed to start VNC at %s\n", cfg->vnc_addr);
     }
+    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     nes_reset(s);
 

@@ -22,6 +22,7 @@ typedef enum {
 } GemuMonCmd;
 
 typedef struct GemuMonitor GemuMonitor;
+typedef struct GemuVncServer GemuVncServer;
 
 typedef enum {
     GEMU_MEDIA_OK = 0,
@@ -54,6 +55,7 @@ void         gemu_monitor_enqueue_quit(GemuMonitor *mon);
 
 bool         gemu_monitor_register_media(GemuMonitor *mon,
                                          const GemuMediaDevice *dev);
+void         gemu_monitor_set_vnc(GemuMonitor *mon, GemuVncServer *vnc);
 
 /* Register a loaded ROM image for display by 'info roms'.
  * Call once per ROM after a successful load.  addr and size are in the
