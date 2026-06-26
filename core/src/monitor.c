@@ -294,9 +294,10 @@ static void info_block(const GemuMonitor *mon) {
         const GemuMediaDevice *dev = &mon->media[i];
         const char *type      = dev->kind ? dev->kind : dev->name;
         int         removable = dev->eject ? 1 : 0;
+        int         flippable = dev->flip ? 1 : 0;
         const char *file      = dev->file[0] ? dev->file : "(none)";
-        mon_printf(mon, "%s: type=%s removable=%d file=%s\n",
-                   dev->name, type, removable, file);
+        mon_printf(mon, "%s: type=%s removable=%d flippable=%d file=%s\n",
+                   dev->name, type, removable, flippable, file);
     }
 }
 
@@ -427,12 +428,13 @@ static bool dispatch_media(GemuMonitor *mon, const char *line,
 
     bool is_change = strcasecmp(verb, "change") == 0;
     bool is_eject  = strcasecmp(verb, "eject") == 0;
-    if (!is_change && !is_eject)
+    bool is_flip   = strcasecmp(verb, "flip") == 0;
+    if (!is_change && !is_eject && !is_flip)
         return false;
 
     char *dev_name = next_token(&p);
     if (!dev_name) {
-        mon_printf(mon, "usage: change <device> <file> | eject <device>\n");
+        mon_printf(mon, "usage: change <device> <file> | eject <device> | flip <device>\n");
         *out_cmd = GEMU_MON_NONE;
         return true;
     }
@@ -447,7 +449,20 @@ static bool dispatch_media(GemuMonitor *mon, const char *line,
 
     GemuMediaResult result = GEMU_MEDIA_ERR;
     char err[256] = "";
-    if (is_eject) {
+    if (is_flip) {
+        char *extra = next_token(&p);
+        if (extra) {
+            mon_printf(mon, "usage: flip <device>\n");
+            *out_cmd = GEMU_MON_NONE;
+            return true;
+        }
+        if (!dev->flip) {
+            mon_printf(mon, "%s: device '%s' cannot be flipped\n", verb, dev_name);
+            *out_cmd = GEMU_MON_NONE;
+            return true;
+        }
+        result = dev->flip(dev->ud, err, sizeof(err));
+    } else if (is_eject) {
         char *extra = next_token(&p);
         if (extra) {
             mon_printf(mon, "usage: eject <device>\n");
@@ -556,6 +571,7 @@ static bool monitor_handle_line(GemuMonitor *mon, char *line) {
         "  dipswitch -- lists DIP switches (when supported)\n"
         "  dipswitch [name] [value] -- sets DIP switch (when supported)\n"
         "  eject <device> -- eject media\n"
+        "  flip <device> -- flip disk media to the next side\n"
         "  gamegenie add [code] -- add game genie code\n"
         "  gamegenie list -- show active game genie codes\n"
         "  gamegenie delete [code] -- deletes game genie code\n"

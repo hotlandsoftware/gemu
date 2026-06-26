@@ -19,6 +19,7 @@ typedef struct {
     uint8_t  disk_sides;
     uint8_t  cur_side;
     bool     disk_inserted;
+    uint32_t disk_change_cycles; /* transient no-disk pulse after side flip */
     bool     hle_mode;    /* true = no BIOS ROM, stub installed, files pre-loaded */
 
     /* Timer IRQ — $4020/$4021 latch, $4022 control */
@@ -83,6 +84,7 @@ float   fds_audio_tick(FdsState *f);   /* advance synthesizer one CPU cycle; ret
 bool    fds_bios_load(FdsState *f, const char *path);
 bool    fds_disk_load(FdsState *f, const char *path);
 void    fds_disk_eject(FdsState *f);
+bool    fds_disk_flip(FdsState *f);
 
 /* Advance one CPU cycle.  Returns true while any IRQ condition is asserted. */
 bool    fds_tick(FdsState *f);

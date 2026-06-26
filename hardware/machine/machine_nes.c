@@ -31,7 +31,7 @@
 /* ── NES controller action table ─────────────────────────────────────────── */
 /* GEMU_ACTION(n) = 1u<<n; NES_BTN_* happen to match, so ctrl_state[0] = held & 0xFF */
 #define NES_N_ACTIONS 8
-#define NES_2P_N_ACTIONS 8
+#define NES_2P_N_ACTIONS 16
 
 static const GemuActionDef nes_actions[NES_N_ACTIONS] = {
     { "A",      GEMU_ACTION(0), "z"           },  /* NES_BTN_A      = 0x01 */
@@ -56,12 +56,12 @@ static const GemuActionDef nes_fc2mic_actions[NES_FC2MIC_N_ACTIONS] = {
     { "Left",      GEMU_ACTION(6),  "Left"        },
     { "Right",     GEMU_ACTION(7),  "Right"       },
     /* famicom-mic page (P2: no Select/Start on FC2 hardware) */
-    { "A",         GEMU_ACTION(8),  "a"           },
-    { "B",         GEMU_ACTION(9),  "s"           },
-    { "Up",        GEMU_ACTION(12), "i"           },
-    { "Down",      GEMU_ACTION(13), "k"           },
-    { "Left",      GEMU_ACTION(14), "j"           },
-    { "Right",     GEMU_ACTION(15), "l"           },
+    { "P2 A",      GEMU_ACTION(8),  "a"           },
+    { "P2 B",      GEMU_ACTION(9),  "s"           },
+    { "P2 Up",     GEMU_ACTION(12), "i"           },
+    { "P2 Down",   GEMU_ACTION(13), "k"           },
+    { "P2 Left",   GEMU_ACTION(14), "j"           },
+    { "P2 Right",  GEMU_ACTION(15), "l"           },
     { "Send Mic",  GEMU_ACTION(16), "m"           },
 };
 
@@ -79,6 +79,14 @@ static const GemuActionDef nes_2p_actions[NES_2P_N_ACTIONS] = {
     { "Down",     GEMU_ACTION(5),  "Down"        },
     { "Left",     GEMU_ACTION(6),  "Left"        },
     { "Right",    GEMU_ACTION(7),  "Right"       },
+    { "P2 A",      GEMU_ACTION(8),  "" },
+    { "P2 B",      GEMU_ACTION(9),  "" },
+    { "P2 Select", GEMU_ACTION(10), "" },
+    { "P2 Start",  GEMU_ACTION(11), "" },
+    { "P2 Up",     GEMU_ACTION(12), "" },
+    { "P2 Down",   GEMU_ACTION(13), "" },
+    { "P2 Left",   GEMU_ACTION(14), "" },
+    { "P2 Right",  GEMU_ACTION(15), "" },
 };
 
 static bool nes_device_is_rob(NesDeviceType dev) {
@@ -1206,9 +1214,33 @@ static GemuMediaResult fds_media_eject(void *ud, char *err, size_t err_len) {
     return GEMU_MEDIA_OK;
 }
 
+static GemuMediaResult fds_media_flip(void *ud, char *err, size_t err_len) {
+    NesState *s = ud;
+    if (!s->fds.disk_inserted) {
+        snprintf(err, err_len, "no disk inserted");
+        return GEMU_MEDIA_ERR;
+    }
+    if (s->fds.disk_sides < 2) {
+        snprintf(err, err_len, "disk has only one side");
+        return GEMU_MEDIA_ERR;
+    }
+    return fds_disk_flip(&s->fds) ? GEMU_MEDIA_OK : GEMU_MEDIA_ERR;
+}
+
 static void fds_media_status(void *ud, char *buf, size_t buf_len) {
     const NesState *s = ud;
-    snprintf(buf, buf_len, "%s", s->fds.disk_inserted ? "disk inserted" : "no disk");
+    if (!s->fds.disk_inserted)
+        snprintf(buf, buf_len, "no disk");
+    else if (s->fds.disk_change_cycles > 0)
+        snprintf(buf, buf_len, "changing disk, side %c (%u/%u)",
+                 (char)('A' + s->fds.cur_side),
+                 (unsigned)s->fds.cur_side + 1u,
+                 (unsigned)s->fds.disk_sides);
+    else
+        snprintf(buf, buf_len, "disk inserted, side %c (%u/%u)",
+                 (char)('A' + s->fds.cur_side),
+                 (unsigned)s->fds.cur_side + 1u,
+                 (unsigned)s->fds.disk_sides);
 }
 
 /* ── Cartridge media device ──────────────────────────────────────────────── */
@@ -1530,6 +1562,7 @@ NesState *nes_create(const MosConfig *cfg) {
             .ud     = s,
             .change = fds_media_change,
             .eject  = fds_media_eject,
+            .flip   = fds_media_flip,
             .status = fds_media_status,
         };
         if (cfg->fda_path)

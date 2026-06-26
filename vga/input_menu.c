@@ -303,6 +303,13 @@ static const char *page_title(const InputMenu *m, int p) {
     return m->section;
 }
 
+static const char *display_button_name(const char *name) {
+    if (!name) return "";
+    if (name[0] == 'P' && name[1] >= '2' && name[1] <= '9' && name[2] == ' ')
+        return name + 3;
+    return name;
+}
+
 static bool is_menu_control_index(int index) {
     return index <= MENU_CONTROL_INDEX_BASE;
 }
@@ -625,7 +632,7 @@ static void build_input_menu(InputMenu *m) {
         if (page_for_button(m, i) != m->input_page)
             continue;
         m->items[m->n_items++] = (MenuItem){
-            .label = m->button_names[i],
+            .label = display_button_name(m->button_names[i]),
             .binding_ptr = &m->key_bindings[i],
             .controller_ptr = &m->controller_bindings[i],
             .binding_index = i,

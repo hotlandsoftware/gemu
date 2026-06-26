@@ -39,6 +39,7 @@ typedef struct GemuMediaDevice {
     GemuMediaResult (*change)(void *ud, const char *arg,
                               char *err, size_t err_len);
     GemuMediaResult (*eject)(void *ud, char *err, size_t err_len);
+    GemuMediaResult (*flip)(void *ud, char *err, size_t err_len);
     void (*status)(void *ud, char *buf, size_t buf_len);
 } GemuMediaDevice;
 

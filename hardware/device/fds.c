@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define FDS_DISK_CHANGE_CYCLES 500000u
+
 /* ── Physical disk format helpers ────────────────────────────────────────── */
 
 /* FDS CRC-CCITT: poly 0x8408 (bit-reversed), initial 0x8000, flush 2 zero bytes */
@@ -157,6 +159,7 @@ bool fds_disk_load(FdsState *f, const char *path) {
     f->transfer_flag = false;
     f->end_of_head   = false;
     f->disk_inserted = true;
+    f->disk_change_cycles = 0;
 
     fprintf(stderr, "fds: loaded '%s' — %u side%s\n", path, sides, sides == 1 ? "" : "s");
     return true;
@@ -171,6 +174,7 @@ void fds_disk_eject(FdsState *f) {
     f->raw_disk      = NULL;
     f->disk_sides    = 0;
     f->disk_inserted = false;
+    f->disk_change_cycles = 0;
     f->disk_pos      = 0;
     f->cyc_acc       = 0;
     f->transfer_flag = false;
@@ -178,9 +182,27 @@ void fds_disk_eject(FdsState *f) {
     fprintf(stderr, "fds: disk ejected\n");
 }
 
+bool fds_disk_flip(FdsState *f) {
+    if (!f->disk_inserted || f->disk_sides == 0)
+        return false;
+    f->cur_side = (uint8_t)((f->cur_side + 1u) % f->disk_sides);
+    f->disk_pos = 0;
+    f->cyc_acc = 0;
+    f->transfer_flag = false;
+    f->end_of_head = false;
+    f->disk_change_cycles = FDS_DISK_CHANGE_CYCLES;
+    fprintf(stderr, "fds: flipped to side %c (%u/%u)\n",
+            (char)('A' + f->cur_side), (unsigned)f->cur_side + 1u,
+            (unsigned)f->disk_sides);
+    return true;
+}
+
 /* ── Per-cycle tick ──────────────────────────────────────────────────────── */
 
 bool fds_tick(FdsState *f) {
+    if (f->disk_change_cycles > 0)
+        f->disk_change_cycles--;
+
     /* ---- Timer IRQ ---- */
     if (f->timer_enabled && f->timer_ctr > 0) {
         if (--f->timer_ctr == 0) {
@@ -199,7 +221,8 @@ bool fds_tick(FdsState *f) {
     bool not_reset = (f->drive_ctrl & 0x02) == 0;
     bool read_mode = (f->drive_ctrl & 0x04) != 0;
 
-    if (f->disk_inserted && motor_on && not_reset && read_mode && !f->end_of_head) {
+    if (f->disk_inserted && f->disk_change_cycles == 0 &&
+        motor_on && not_reset && read_mode && !f->end_of_head) {
         if (++f->cyc_acc >= FDS_CYCLES_PER_BYTE) {
             f->cyc_acc = 0;
             if (f->disk_pos < FDS_SIDE_BYTES) {
@@ -326,8 +349,9 @@ uint8_t fds_reg_read(FdsState *f, uint16_t addr) {
     case 0x4032: {
         /* Bit 0: no disk (1=no disk); bit 1: motor not ready (1=not ready); bit 2: write protect */
         uint8_t v = 0;
-        if (!f->disk_inserted)          v |= 0x01;
-        if ((f->drive_ctrl & 0x01) == 0) v |= 0x02;  /* motor off → not ready */
+        if (!f->disk_inserted || f->disk_change_cycles > 0) v |= 0x01;
+        if (f->disk_change_cycles > 0 || (f->drive_ctrl & 0x01) == 0)
+            v |= 0x02;  /* motor off / changing disk → not ready */
         return v;
     }
     case 0x4033:
@@ -420,13 +444,6 @@ void fds_reg_write(FdsState *f, uint16_t addr, uint8_t val) {
         break;
     case 0x4025:
         if (val & 0x02) {
-            /* Auto-flip to the next side when the head reached end-of-side and
-             * the game/BIOS seeks back to the start.  Mirrors real-world disk
-             * swap: side 0 fully read → user flips → side 1, and vice versa. */
-            if (f->end_of_head && f->disk_sides > 1) {
-                f->cur_side = (uint8_t)((f->cur_side + 1) % f->disk_sides);
-                fprintf(stderr, "fds: auto-flip → side %u\n", f->cur_side);
-            }
             f->disk_pos      = 0;
             f->cyc_acc       = 0;
             f->transfer_flag = false;
