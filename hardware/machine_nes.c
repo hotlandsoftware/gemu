@@ -1770,8 +1770,14 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                 if (s->rob.btn_a) s->ctrl_state[1] |= NES_BTN_A;
                 if (s->rob.btn_b) s->ctrl_state[1] |= NES_BTN_B;
             }
-            if (s->rob_window)
-                rob_window_render(s->rob_window, &s->rob);
+            if (s->rob_window) {
+                if (rob_window_close_requested(s->rob_window)) {
+                    rob_window_destroy(s->rob_window);
+                    s->rob_window = NULL;
+                } else {
+                    rob_window_render(s->rob_window, &s->rob);
+                }
+            }
 #endif
         }
 

@@ -217,6 +217,7 @@ struct RobWindow {
     float         cam_dist;   /* distance from look-at target */
     bool          dragging;
     bool          famicom_skin;
+    bool          close_requested;
 };
 
 static void draw_cylinder(RobWindow *w, Mat4 pv, float x, float y, float z,
@@ -436,6 +437,11 @@ RobWindow *rob_window_create(const char *model_dir, bool famicom_skin) {
         SDL_DestroyWindow(w->win); free(w); return NULL;
     }
     SDL_GL_MakeCurrent(w->win, w->ctx);
+
+    /* Disable VSync: the NES emulator uses audio-based frame sync as the
+     * master clock. VSync on this secondary window would add a second
+     * synchronisation point and cause intermittent audio buffer starvation. */
+    SDL_GL_SetSwapInterval(0);
 
     glEnable(GL_DEPTH_TEST);
     glClearColor(0.19f, 0.22f, 0.48f, 1.0f);
@@ -680,17 +686,18 @@ static int SDLCALL rob_event_watch(void *ud, SDL_Event *e) {
             if (w->cam_dist > 3.00f) w->cam_dist = 3.00f;
         }
         break;
+    case SDL_WINDOWEVENT:
+        if (e->window.windowID == w->win_id &&
+            e->window.event == SDL_WINDOWEVENT_CLOSE)
+            w->close_requested = true;
+        break;
     default: break;
     }
     return 1; /* always pass event through */
 }
 
-int rob_window_event(RobWindow *w, const SDL_Event *e) {
-    if (e->type == SDL_WINDOWEVENT &&
-        e->window.windowID == w->win_id &&
-        e->window.event == SDL_WINDOWEVENT_CLOSE)
-        return 1;
-    return 0;
+bool rob_window_close_requested(const RobWindow *w) {
+    return w && w->close_requested;
 }
 
 void rob_window_destroy(RobWindow *w) {

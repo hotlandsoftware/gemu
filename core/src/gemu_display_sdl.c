@@ -277,9 +277,15 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             break;
 
         case SDL_WINDOWEVENT:
-            if (ev.window.event == SDL_WINDOWEVENT_CLOSE)
-                d->quit = true;
-            else if (ev.window.event == SDL_WINDOWEVENT_RESIZED) {
+            if (ev.window.event == SDL_WINDOWEVENT_CLOSE) {
+                /* Only quit if it's the main (NES) window being closed.
+                 * Closing a secondary window (e.g. ROB display) must not
+                 * terminate the emulator — that window handles itself. */
+                SDL_Window *main_win = gemu_video_sdl_get_window(b->video);
+                if (!main_win ||
+                    ev.window.windowID == SDL_GetWindowID(main_win))
+                    d->quit = true;
+            } else if (ev.window.event == SDL_WINDOWEVENT_RESIZED) {
                 b->pending_snap_w = ev.window.data1;
                 b->pending_snap_h = ev.window.data2;
                 b->pending_snap_t = SDL_GetTicks();
