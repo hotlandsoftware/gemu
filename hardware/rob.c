@@ -1,4 +1,5 @@
 #include "rob.h"
+#include <stdio.h>
 #include <string.h>
 
 /* ── Screen sampling (matches the reference Mesen Lua script) ────────────────
@@ -101,9 +102,9 @@ static void apply_command(RobMotorState *st, int cmd) {
  *   step 11 → col 3  gyro tray 1
  *   step 10 → col 4  gyro tray 2
  *
- * A gyro rests at height 3 on the spinner and height 1 everywhere else.
- * btn_a is set when a gyro sits at col 2 height 1 (not held, not toppled).
- * btn_b is set when a gyro sits at col 1 height 1.
+ * A gyro rests at height 3 on the spinner and height 0 everywhere else.
+ * btn_a is set when a gyro sits at col 2 (not held, not toppled).
+ * btn_b is set when a gyro sits at col 1.
  * ─────────────────────────────────────────────────────────────────────────── */
 
 static int arm_step_to_column(int arm_step) {
@@ -118,7 +119,39 @@ static int arm_step_to_column(int arm_step) {
 }
 
 static int gyro_rest_height(int col) {
-    return (col == ROB_COL_SPINNER) ? 3 : 1;
+    return (col == ROB_COL_SPINNER) ? 3 : 0;
+}
+
+static const char *rob_col_name(int col) {
+    switch (col) {
+        case ROB_COL_SPINNER: return "spinner";
+        case ROB_COL_B_BTN:   return "b-button";
+        case ROB_COL_A_BTN:   return "a-button";
+        case ROB_COL_TRAY1:   return "tray1";
+        case ROB_COL_TRAY2:   return "tray2";
+        case ROB_COL_NONE:    return "none";
+        default:              return "?";
+    }
+}
+
+static void rob_debug_state(const char *tag, const RobState *rob) {
+    int col = arm_step_to_column(rob->state.arm_step);
+    char held_buf[16];
+    if (rob->held_gyro >= 0)
+        snprintf(held_buf, sizeof held_buf, "gyro%d", rob->held_gyro + 1);
+    else
+        snprintf(held_buf, sizeof held_buf, "none");
+
+    fprintf(stderr,
+            "rob: %s step=%d col=%s(%d) height=%d hands=%s held=%s "
+            "gyro1={col=%s(%d),toppled=%d} gyro2={col=%s(%d),toppled=%d}\n",
+            tag,
+            rob->state.arm_step, rob_col_name(col), col,
+            rob->state.arm_height,
+            rob->state.hands_open ? "open" : "closed",
+            held_buf,
+            rob_col_name(rob->gyros[0].column), rob->gyros[0].column, rob->gyros[0].toppled,
+            rob_col_name(rob->gyros[1].column), rob->gyros[1].column, rob->gyros[1].toppled);
 }
 
 static void rob_update_buttons(RobState *rob) {
@@ -143,6 +176,7 @@ static void rob_gyro_tick(RobState *rob) {
             RobGyroState *g = &rob->gyros[i];
             if (!g->toppled && g->column == col && gyro_rest_height(col) == h) {
                 rob->held_gyro = i;
+                rob_debug_state("pickup", rob);
                 break;
             }
         }
@@ -162,6 +196,7 @@ static void rob_gyro_tick(RobState *rob) {
             }
         }
         rob->held_gyro = -1;
+        rob_debug_state("drop", rob);
     }
 
     rob->prev_hands_open = open;
@@ -189,7 +224,9 @@ void rob_frame(RobState *rob, const uint32_t *pixels_argb, int w, int h) {
     if (bits_follow_pattern(rob->bits)) {
         int cmd = extract_command(rob->bits);
         rob->bits = 0x1fff; /* saturate to prevent immediate re-trigger */
+        fprintf(stderr, "rob: cmd=%d\n", cmd);
         apply_command(&rob->state, cmd);
         rob_gyro_tick(rob);
+        rob_debug_state("state", rob);
     }
 }
