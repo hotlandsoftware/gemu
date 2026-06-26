@@ -49,6 +49,14 @@ static Mat4 mat4_rotate_y(float angle) {
     return r;
 }
 
+static Mat4 mat4_rotate_z(float angle) {
+    float c = cosf(angle), s = sinf(angle);
+    Mat4 r = mat4_identity();
+    r.m[0] = c;  r.m[1] = s;
+    r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
 static Mat4 mat4_scale(float x, float y, float z) {
     Mat4 r = mat4_identity();
     r.m[0] = x; r.m[5] = y; r.m[10] = z;
@@ -221,6 +229,18 @@ static void draw_cylinder(RobWindow *w, Mat4 pv, float x, float y, float z,
     glDrawElements(GL_TRIANGLES, ROB_GYRO_IDX, GL_UNSIGNED_INT, 0);
 }
 
+static void draw_disc_x(RobWindow *w, Mat4 pv, float x, float y, float z,
+                        float radius, float thickness, const float color[3]) {
+    Mat4 model = mat4_mul(mat4_translate(x, y, z),
+                          mat4_mul(mat4_rotate_z(1.57079633f),
+                                   mat4_scale(radius, thickness, radius)));
+    Mat4 mvp = mat4_mul(pv, model);
+    glUniformMatrix4fv(w->u_mvp,   1, GL_FALSE, mvp.m);
+    glUniformMatrix4fv(w->u_model, 1, GL_FALSE, model.m);
+    glUniform3fv(w->u_color, 1, color);
+    glDrawElements(GL_TRIANGLES, ROB_GYRO_IDX, GL_UNSIGNED_INT, 0);
+}
+
 static void draw_box(RobWindow *w, Mat4 pv, float x, float y, float z,
                      float sx, float sy, float sz, float angle_y,
                      const float color[3]) {
@@ -344,6 +364,16 @@ static void load_node(RobWindow *w, const struct aiScene *sc,
         rm->n_idx = (int)n_idx;
         get_material_color(sc, am->mMaterialIndex,
                            &rm->color[0], &rm->color[1], &rm->color[2]);
+
+        if (strcmp(name, "Base and Head") == 0 ||
+            strcmp(name, "Shoulders") == 0) {
+            rm->color[0] = 0.68f; rm->color[1] = 0.68f; rm->color[2] = 0.68f;
+        } else if (strcmp(name, "Spine") == 0) {
+            rm->color[0] = 0.08f; rm->color[1] = 0.08f; rm->color[2] = 0.08f;
+        } else if (strcmp(name, "Arms") == 0 ||
+                   strcmp(name, "Arms.001") == 0) {
+            rm->color[0] = 0.36f; rm->color[1] = 0.36f; rm->color[2] = 0.34f;
+        }
 
         /* Translation from node transform (aiMatrix4x4 is row-major) */
         rm->base_tx = node->mTransformation.a4;
@@ -528,16 +558,14 @@ void rob_window_render(RobWindow *w, const RobState *rob) {
     static const float prop_led[3]     = {1.00f, 0.00f, 0.00f};
 
     glBindVertexArray(w->box_vao);
-    /* ROB.gltf does not include the Godot head texture, so add simple face
-     * markers on the head front as a visual reference. */
-    draw_box(w, pv, 0.108f, 0.205f, -0.035f,
-             0.003f, 0.018f, 0.018f, 0.0f, prop_black);
-    draw_box(w, pv, 0.108f, 0.205f,  0.035f,
-             0.003f, 0.018f, 0.018f, 0.0f, prop_black);
     draw_box(w, pv, -0.065f, 0.041605383f, -0.11258f,
              0.034f, 0.028f, 0.034f, -2.0943951f, prop_grey);
 
     glBindVertexArray(w->gyro_vao);
+    /* ROB.gltf does not include the Godot head texture, so add simple eyes
+     * on the head front as a visual reference. */
+    draw_disc_x(w, pv, 0.050f, 0.220f, -0.025f, 0.016f, 0.002f, prop_black);
+    draw_disc_x(w, pv, 0.050f, 0.220f,  0.025f, 0.016f, 0.002f, prop_black);
     draw_cylinder(w, pv, -0.065f, 0.086f, -0.11258f,
                   0.025f, 0.006f, prop_grey);
     draw_cylinder(w, pv, 0.130f, 0.0525f, 0.0f,
