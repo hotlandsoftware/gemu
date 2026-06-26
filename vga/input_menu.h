@@ -4,16 +4,27 @@
 
 typedef struct InputMenu InputMenu;
 
+/* One named group of buttons shown as a separate page in the Input menu.
+ * Pages partition the flat button array into consecutive slices. */
+typedef struct {
+    const char *name;      /* page heading, e.g. "nes-controller", "famicom-mic" */
+    int         n_buttons; /* number of consecutive buttons on this page */
+} InputMenuPage;
+
 /* Create an input menu.
  * n_buttons / button_names / default_bindings define remappable keyboard keys.
  * default_controller_bindings defines a parallel controller binding set.
- * ini_section is the INI section name (e.g. "nes-controller"). */
+ * ini_section is the INI section name (e.g. "nes-controller").
+ * n_pages / pages partition the buttons into named pages; pass 0/NULL for a
+ * single page titled with ini_section (original behaviour). */
 InputMenu *input_menu_create(SDL_Renderer *renderer,
                              int n_buttons,
                              const char **button_names,
                              const SDL_Keycode *default_bindings,
                              const char **default_controller_bindings,
-                             const char *ini_section);
+                             const char *ini_section,
+                             int n_pages,
+                             const InputMenuPage *pages);
 
 void input_menu_destroy(InputMenu *menu);
 

@@ -131,6 +131,7 @@ typedef struct NesState {
     uint8_t  ctrl_state[2]; /* live button bits */
     uint8_t  ctrl_shift[2]; /* serial shift register */
     bool     ctrl_strobe;
+    bool     mic_noise;     /* FC2 microphone active (drives $4016 D2) */
 
     char           cart_path_buf[512]; /* path of currently loaded cartridge */
     uint64_t       ppu_synced_cpu_cycle;

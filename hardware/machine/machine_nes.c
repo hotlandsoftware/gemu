@@ -31,7 +31,7 @@
 /* ── NES controller action table ─────────────────────────────────────────── */
 /* GEMU_ACTION(n) = 1u<<n; NES_BTN_* happen to match, so ctrl_state[0] = held & 0xFF */
 #define NES_N_ACTIONS 8
-#define NES_2P_N_ACTIONS 16
+#define NES_2P_N_ACTIONS 8
 
 static const GemuActionDef nes_actions[NES_N_ACTIONS] = {
     { "A",      GEMU_ACTION(0), "z"           },  /* NES_BTN_A      = 0x01 */
@@ -44,6 +44,32 @@ static const GemuActionDef nes_actions[NES_N_ACTIONS] = {
     { "Right",  GEMU_ACTION(7), "Right"       },  /* NES_BTN_RIGHT  = 0x80 */
 };
 
+#define NES_FC2MIC_N_ACTIONS 15
+static const GemuActionDef nes_fc2mic_actions[NES_FC2MIC_N_ACTIONS] = {
+    /* nes-controller page (P1: full controller with Select + Start) */
+    { "A",         GEMU_ACTION(0),  "z"           },
+    { "B",         GEMU_ACTION(1),  "x"           },
+    { "Select",    GEMU_ACTION(2),  "Right Shift" },
+    { "Start",     GEMU_ACTION(3),  "Return"      },
+    { "Up",        GEMU_ACTION(4),  "Up"          },
+    { "Down",      GEMU_ACTION(5),  "Down"        },
+    { "Left",      GEMU_ACTION(6),  "Left"        },
+    { "Right",     GEMU_ACTION(7),  "Right"       },
+    /* famicom-mic page (P2: no Select/Start on FC2 hardware) */
+    { "A",         GEMU_ACTION(8),  "a"           },
+    { "B",         GEMU_ACTION(9),  "s"           },
+    { "Up",        GEMU_ACTION(12), "i"           },
+    { "Down",      GEMU_ACTION(13), "k"           },
+    { "Left",      GEMU_ACTION(14), "j"           },
+    { "Right",     GEMU_ACTION(15), "l"           },
+    { "Send Mic",  GEMU_ACTION(16), "m"           },
+};
+
+static const GemuInputPage nes_fc2mic_pages[] = {
+    { "nes-controller", 8 },   /* P1: A, B, Select, Start, Up, Down, Left, Right */
+    { "famicom-mic",    7 },   /* P2: A, B, Up, Down, Left, Right, Send Mic */
+};
+
 static const GemuActionDef nes_2p_actions[NES_2P_N_ACTIONS] = {
     { "A",        GEMU_ACTION(0),  "z"           },
     { "B",        GEMU_ACTION(1),  "x"           },
@@ -53,14 +79,6 @@ static const GemuActionDef nes_2p_actions[NES_2P_N_ACTIONS] = {
     { "Down",     GEMU_ACTION(5),  "Down"        },
     { "Left",     GEMU_ACTION(6),  "Left"        },
     { "Right",    GEMU_ACTION(7),  "Right"       },
-    { "P2 A",      GEMU_ACTION(8),  "" },
-    { "P2 B",      GEMU_ACTION(9),  "" },
-    { "P2 Select", GEMU_ACTION(10), "" },
-    { "P2 Start",  GEMU_ACTION(11), "" },
-    { "P2 Up",     GEMU_ACTION(12), "" },
-    { "P2 Down",   GEMU_ACTION(13), "" },
-    { "P2 Left",   GEMU_ACTION(14), "" },
-    { "P2 Right",  GEMU_ACTION(15), "" },
 };
 
 static bool nes_device_is_rob(NesDeviceType dev) {
@@ -853,7 +871,9 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
         if (s->ctrl_strobe) return (s->ctrl_state[0] & NES_BTN_A) ? 1u : 0u;
         uint8_t bit = s->ctrl_shift[0] & 1;
         s->ctrl_shift[0] = (s->ctrl_shift[0] >> 1) | 0x80u;
-        return bit;
+        /* D2: Famicom hardwired controller 2 microphone */
+        uint8_t mic = (s->cfg->ports[1] == NES_DEVICE_FC2_MIC && s->mic_noise) ? 0x04u : 0u;
+        return bit | mic;
     }
     if (addr == 0x4017) {
         if (s->cfg->ports[1] == NES_DEVICE_ZAPPER) {
@@ -875,6 +895,7 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
             return trigger | light;
         }
         if (s->cfg->ports[1] != NES_DEVICE_CONTROLLER &&
+            s->cfg->ports[1] != NES_DEVICE_FC2_MIC &&
             !nes_device_is_rob(s->cfg->ports[1])) return 0;
         if (s->ctrl_strobe) return (s->ctrl_state[1] & NES_BTN_A) ? 1u : 0u;
         uint8_t bit = s->ctrl_shift[1] & 1;
@@ -1252,10 +1273,13 @@ static void nes_handle_keys(NesState *s, uint32_t held) {
             s->ctrl_state[0] = (uint8_t)(held & 0xFFu);
         else
             s->ctrl_state[0] = 0;
-        if (s->cfg->ports[1] == NES_DEVICE_CONTROLLER)
+        if (s->cfg->ports[1] == NES_DEVICE_CONTROLLER ||
+            s->cfg->ports[1] == NES_DEVICE_FC2_MIC)
             s->ctrl_state[1] = (uint8_t)((held >> 8) & 0xFFu);
         else if (!nes_device_is_rob(s->cfg->ports[1]))
             s->ctrl_state[1] = 0;
+        if (s->cfg->ports[1] == NES_DEVICE_FC2_MIC)
+            s->mic_noise = (held & GEMU_ACTION(16)) != 0;
         if (s->cfg->ports[1] == NES_DEVICE_ZAPPER) {
             GemuPointerState ptr = gemu_display_get_pointer(s->display);
             if (ptr.button && s->zapper_trigger_ttl == 0)
@@ -1528,6 +1552,16 @@ NesState *nes_create(const MosConfig *cfg) {
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         bool two_controllers = cfg->ports[0] == NES_DEVICE_CONTROLLER &&
                                cfg->ports[1] == NES_DEVICE_CONTROLLER;
+        bool has_fc2_mic     = cfg->ports[1] == NES_DEVICE_FC2_MIC;
+        const GemuActionDef  *acts      = nes_actions;
+        int                   n_acts    = NES_N_ACTIONS;
+        const GemuInputPage  *act_pages = NULL;
+        int                   n_pages   = 0;
+        if (two_controllers) { acts = nes_2p_actions;    n_acts = NES_2P_N_ACTIONS;    }
+        if (has_fc2_mic)     {
+            acts      = nes_fc2mic_actions; n_acts  = NES_FC2MIC_N_ACTIONS;
+            act_pages = nes_fc2mic_pages;   n_pages = 2;
+        }
         s->display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
                 .title       = "GEMU",
@@ -1535,9 +1569,11 @@ NesState *nes_create(const MosConfig *cfg) {
                 .fb_height   = RP2C02_HEIGHT,
                 .scale       = cfg->display_scale,
                 .renderer    = cfg->display_renderer,
-                .actions     = two_controllers ? nes_2p_actions : nes_actions,
-                .n_actions   = two_controllers ? NES_2P_N_ACTIONS : NES_N_ACTIONS,
+                .actions     = acts,
+                .n_actions   = n_acts,
                 .ini_section = "nes-controller",
+                .pages       = act_pages,
+                .n_pages     = n_pages,
                 .gtk         = &(GemuDisplayGtkExtras){
                     .monitor       = s->monitor,
                     .hex_toggle_cb = nes_hex_toggle,

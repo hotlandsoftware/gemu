@@ -3,8 +3,8 @@
 #include "destroyer.h"
 #include "studio2.h"
 #include "pecom.h"
-#include "rca_romdb.h"
-#include "vip_devices.h"
+#include "romdb.h"
+#include "rca_keyboard.h"
 #include "gemu/gemu.h"
 #include "gemu/args.h"
 #include "gemu/monitor.h"
@@ -14,6 +14,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+
+static bool romdb_add_rca(const char *path, uint32_t addr, void *ud) {
+    RcaConfig *cfg = ud;
+    if (cfg->n_roms >= RCA_MAX_ROM_LOADS) {
+        fprintf(stderr, "gemu: too many ROMs (max %d)\n", RCA_MAX_ROM_LOADS);
+        return false;
+    }
+    char *p = strdup(path);
+    if (!p) return false;
+    cfg->roms[cfg->n_roms].path = p;
+    cfg->roms[cfg->n_roms].addr = addr;
+    cfg->n_roms++;
+    return true;
+}
 
 typedef struct {
     const char *name;
@@ -219,7 +233,7 @@ int rca_setup(int argc, char *argv[]) {
             struct stat st;
             if (stat(val, &st) == 0 && S_ISDIR(st.st_mode)) {
                 const char *alias = args.machine ? args.machine : "studio2";
-                int n = rca_romdb_load_dir(&cfg, val, alias);
+                int n = romdb_load_dir(val, alias, romdb_add_rca, &cfg);
                 if (n < 0) return 1;
                 if (n == 0) {
                     fprintf(stderr, "gemu: no known ROMs found in '%s' for machine '%s'\n",
@@ -246,22 +260,37 @@ int rca_setup(int argc, char *argv[]) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -device requires an argument\n"); return 1; }
             const char *v = rem[++i];
             if (strcmp(v, "?") == 0 || strcmp(v, "help") == 0) {
-                rca_device_list_print();
+                static const struct { const char *name; const char *desc; const char *machines; } devs[] = {
+#include "generated/devices.inc"
+                };
+                int maxw = 0;
+                for (int d = 0; d < (int)(sizeof(devs)/sizeof(devs[0])); d++) {
+                    int w = (int)strlen(devs[d].name);
+                    if (w > maxw) maxw = w;
+                }
+                printf("Available devices:\n");
+                for (int d = 0; d < (int)(sizeof(devs)/sizeof(devs[0])); d++)
+                    printf("  %-*s  %s\n", maxw, devs[d].name, devs[d].desc);
                 return 0;
             }
-            const RcaDeviceDesc *dev = rca_device_find(v);
-            if (!dev) {
+            static const struct { const char *name; RcaKeyboardType kb; } rca_devs[] = {
+                {"vp601",      RCA_KEYBOARD_VP601},
+                {"vip-keypad", RCA_KEYBOARD_KEYPAD},
+                {"keypad",     RCA_KEYBOARD_KEYPAD},
+                {"keyboard",   RCA_KEYBOARD_GENERIC},
+            };
+            RcaKeyboardType kb = RCA_KEYBOARD_NONE;
+            for (int d = 0; d < (int)(sizeof(rca_devs)/sizeof(rca_devs[0])); d++)
+                if (strcmp(v, rca_devs[d].name) == 0) { kb = rca_devs[d].kb; break; }
+            if (kb == RCA_KEYBOARD_NONE) {
                 fprintf(stderr, "gemu: unknown device '%s' (try -device ?)\n", v);
                 return 1;
             }
-            if (!rca_device_supports_machine(dev, cfg.machine)) {
-                char machines_buf[96];
-                rca_device_supported_machines(dev, machines_buf, sizeof(machines_buf));
-                fprintf(stderr, "gemu: %s device is only supported by %s\n",
-                        dev->name, machines_buf);
+            if (cfg.machine != RCA_MACHINE_COSMAC_VIP) {
+                fprintf(stderr, "gemu: keyboard devices are only supported by vip\n");
                 return 1;
             }
-            rca_device_attach(&cfg, dev->keyboard);
+            rca_device_attach(&cfg, kb);
         } else if (strcmp(rem[i], "-soundhw") == 0) {
             if (i + 1 >= nrem) {
                 fprintf(stderr, "gemu: -soundhw requires an argument\n");
@@ -304,7 +333,7 @@ int rca_setup(int argc, char *argv[]) {
         cfg.sound_hw = RCA_SOUND_NONE;
     if (cfg.n_roms == 0 && cfg.machine != RCA_MACHINE_GENERIC) {
         const char *alias = args.machine ? args.machine : "studio2";
-        rca_romdb_print_needed(alias);
+        romdb_print_needed(alias);
         return 1;
     }
 

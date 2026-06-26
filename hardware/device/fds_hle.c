@@ -199,6 +199,9 @@ void fds_hle_boot(FdsState *f, uint8_t *chr_ram) {
         fprintf(stderr, "fds-hle: no disk inserted\n");
         return;
     }
-    for (uint8_t s = 0; s < f->disk_sides; s++)
-        load_side(f, s, chr_ram);
+    /* Load in reverse order so side 0 wins any address conflicts.
+     * Side 1+ may have small patch files at side-0 addresses; loading side 0
+     * last keeps the boot code intact. */
+    for (int s = (int)f->disk_sides - 1; s >= 0; s--)
+        load_side(f, (uint8_t)s, chr_ram);
 }

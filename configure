@@ -43,7 +43,7 @@ CORE_SRC_GTK = [
 FAMILY_SRC = {
     'chip8': [
         'cpu/chip8_cpu.c', 'cpu/octo.c',
-        'hardware/machine_chip8.c',
+        'hardware/machine/machine_chip8.c',
         'vga/input_menu.c',
         'src/chip8_setup.c',
     ],
@@ -51,19 +51,18 @@ FAMILY_SRC = {
         'cpu/mos6502.c',
         'vga/rp2c02.c', 'vga/input_menu.c',
         'audio/apu2a03.c',
-        'hardware/machine_mos.c', 'hardware/machine_nes.c', 'hardware/machine_kim1.c',
-        'hardware/fds.c', 'hardware/fds_hle.c',
-        'hardware/nes_devices.c', 'hardware/kim_devices.c',
-        'hardware/vt100.c', 'hardware/mos_romdb.c',
+        'hardware/machine/machine_mos.c', 'hardware/machine/machine_nes.c', 'hardware/machine/machine_kim1.c',
+        'hardware/device/fds.c', 'hardware/device/fds_hle.c',
+        'hardware/device/vt100.c', 'hardware/romdb.c',
         'src/mos_setup.c',
     ],
     'rca': [
         'cpu/cdp1802.c',
         'vga/cdp1861.c', 'vga/cdp1869.c', 'vga/input_menu.c',
         'audio/pcspk.c',
-        'hardware/machine_vip.c', 'hardware/machine_destroyer.c',
-        'hardware/machine_studio2.c', 'hardware/machine_pecom.c',
-        'hardware/vip_devices.c', 'hardware/tape.c', 'hardware/rca_romdb.c',
+        'hardware/machine/machine_vip.c', 'hardware/machine/machine_destroyer.c',
+        'hardware/machine/machine_studio2.c', 'hardware/machine/machine_pecom.c',
+        'hardware/device/rca_keyboard.c', 'hardware/device/tape.c', 'hardware/romdb.c',
         'src/rca_setup.c',
     ],
 }
@@ -81,7 +80,7 @@ FAMILY_SRC_WINMIDI = {
 }
 
 FAMILY_SRC_ROB = {
-    'mos': ['hardware/rob.c', 'hardware/rob_window.c'],
+    'mos': ['hardware/device/rob.c', 'hardware/device/rob_window.c'],
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -183,22 +182,17 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     with open(os.path.join(gen_dir, 'machine_defaults.inc'), 'w', encoding='utf-8') as f:
         f.writelines(dlines)
 
-    # romdb_mos.inc / romdb_rca.inc (always generate; .c files only compiled when active)
-    mos_lines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
-    rca_lines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
+    # romdb.inc — all families combined; romdb.c is family-agnostic
+    romdb_lines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
     for m in machines:
         for r in m['roms']:
             if not r['sha256']:
                 continue
-            entry = f'    {{ "{r["sha256"]}", 0x{r["addr"]:04X}u, "{m["name"]}", "{r["name"]}" }},\n'
-            if m['family'] == 'mos':
-                mos_lines.append(entry)
-            elif m['family'] == 'rca':
-                rca_lines.append(entry)
-    with open(os.path.join(gen_dir, 'romdb_mos.inc'), 'w', encoding='utf-8') as f:
-        f.writelines(mos_lines)
-    with open(os.path.join(gen_dir, 'romdb_rca.inc'), 'w', encoding='utf-8') as f:
-        f.writelines(rca_lines)
+            romdb_lines.append(
+                f'    {{ "{r["sha256"]}", 0x{r["addr"]:04X}u, "{m["name"]}", "{r["name"]}" }},\n'
+            )
+    with open(os.path.join(gen_dir, 'romdb.inc'), 'w', encoding='utf-8') as f:
+        f.writelines(romdb_lines)
 
     # ── Parse device XMLs ─────────────────────────────────────────────────────
     devices = []
@@ -428,7 +422,9 @@ def main():
     data_xml_files = generate_data(build_dir, targets, have_alsa, have_winmidi)
 
     # All sources share a single unified include path — no per-family separation.
-    inc_dirs = ['core/include', 'cpu', 'vga', 'audio', 'hardware', 'src', build_dir]
+    inc_dirs = ['core/include', 'cpu', 'vga', 'audio',
+                'hardware', 'hardware/machine', 'hardware/device',
+                'src', build_dir]
     inc_flags = ' '.join(f'-I{d}' for d in inc_dirs)
 
     defs_list = [f'HAVE_{t.upper()}' for t in targets]

@@ -2,7 +2,7 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "vip.h"
-#include "vip_devices.h"
+#include "rca_keyboard.h"
 #include "gemu/gemu.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"

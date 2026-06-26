@@ -2,10 +2,8 @@
 #include "machine_mos.h"
 #include "nes.h"
 #include "kim1.h"
-#include "nes_devices.h"
-#include "kim_devices.h"
 #include "vt100.h"
-#include "mos_romdb.h"
+#include "romdb.h"
 #include "gemu/gemu.h"
 #include "gemu/args.h"
 #include "gemu/monitor.h"
@@ -115,6 +113,20 @@ static bool add_rom(MosConfig *cfg, uint32_t addr, const char *path) {
     return true;
 }
 
+static bool romdb_add_mos(const char *path, uint32_t addr, void *ud) {
+    MosConfig *cfg = ud;
+    if (cfg->n_roms >= MOS_MAX_ROM_LOADS) {
+        fprintf(stderr, "gemu: too many ROMs (max %d)\n", MOS_MAX_ROM_LOADS);
+        return false;
+    }
+    char *p = strdup(path);
+    if (!p) return false;
+    cfg->roms[cfg->n_roms].path = p;
+    cfg->roms[cfg->n_roms].addr = addr;
+    cfg->n_roms++;
+    return true;
+}
+
 static bool parse_rom_arg(MosConfig *cfg, const char *arg) {
     uint32_t addr = 0;
     const char *path;
@@ -196,7 +208,7 @@ int mos_setup(int argc, char *argv[]) {
             struct stat st;
             if (stat(val, &st) == 0 && S_ISDIR(st.st_mode)) {
                 const char *alias = args.machine ? args.machine : "mos";
-                int n = mos_romdb_load_dir(&cfg, val, alias);
+                int n = romdb_load_dir(val, alias, romdb_add_mos, &cfg);
                 if (n < 0) return 1;
                 if (n == 0) {
                     fprintf(stderr, "gemu: no known ROMs in '%s' for machine '%s'\n",
@@ -240,40 +252,17 @@ int mos_setup(int argc, char *argv[]) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -device requires an argument\n"); return 1; }
             const char *name = rem[++i];
             if (strcmp(name, "?") == 0) {
-                int n_nes = 0, n_kim = 0;
-                const NesDeviceDesc *ndevs = nes_device_list(&n_nes);
-                const KimDeviceDesc *kdevs = kim_device_list(&n_kim);
-
-                typedef struct { const char *name; const char *desc; } DevEntry;
-                DevEntry all[64];
-                int n_all = 0;
-                all[n_all++] = (DevEntry){"fds",    "Famicom Disk System"};
-                all[n_all++] = (DevEntry){"vt100",  "DEC VT100 serial terminal (second window)"};
-                all[n_all++] = (DevEntry){"wozmon", "Wozniak Monitor"};
-                for (int d = 0; d < n_nes; d++)
-                    all[n_all++] = (DevEntry){ndevs[d].name, ndevs[d].desc};
-                for (int d = 0; d < n_kim; d++)
-                    all[n_all++] = (DevEntry){kdevs[d].name, kdevs[d].desc};
-
+                static const struct { const char *name; const char *desc; const char *machines; } devs[] = {
+#include "generated/devices.inc"
+                };
                 int maxw = 0;
-                for (int d = 0; d < n_all; d++) {
-                    int w = (int)strlen(all[d].name);
+                for (int d = 0; d < (int)(sizeof(devs)/sizeof(devs[0])); d++) {
+                    int w = (int)strlen(devs[d].name);
                     if (w > maxw) maxw = w;
                 }
-
-                for (int i2 = 1; i2 < n_all; i2++) {
-                    DevEntry tmp = all[i2];
-                    int j = i2 - 1;
-                    while (j >= 0 && strcmp(all[j].name, tmp.name) > 0) {
-                        all[j + 1] = all[j];
-                        j--;
-                    }
-                    all[j + 1] = tmp;
-                }
-
                 printf("Available devices:\n");
-                for (int d = 0; d < n_all; d++)
-                    printf("  %-*s  %s\n", maxw, all[d].name, all[d].desc);
+                for (int d = 0; d < (int)(sizeof(devs)/sizeof(devs[0])); d++)
+                    printf("  %-*s  %s\n", maxw, devs[d].name, devs[d].desc);
                 SDL_Quit(); return 0;
             }
             if (strcmp(name, "fds") == 0) {
@@ -282,11 +271,21 @@ int mos_setup(int argc, char *argv[]) {
                 want_vt100 = true;
             } else if (strcmp(name, "wozmon") == 0) {
                 cfg.want_wozmon = true;
-            } else if (kim_device_find(name)) {
+            } else if (strcmp(name, "kim-keypad") == 0 || strcmp(name, "keypad") == 0) {
                 cfg.kim_keyboard = true;
             } else {
-                const NesDeviceDesc *dev = nes_device_find(name);
-                if (!dev) {
+                static const struct { const char *name; NesDeviceType type; } nes_devs[] = {
+                    {"nes-controller",   NES_DEVICE_CONTROLLER},
+                    {"zapper",           NES_DEVICE_ZAPPER},
+                    {"famicom-keyboard", NES_DEVICE_KEYBOARD},
+                    {"rob",              NES_DEVICE_ROB},
+                    {"rob-famicom",      NES_DEVICE_ROB_FAMICOM},
+                    {"famicom-mic",      NES_DEVICE_FC2_MIC},
+                };
+                NesDeviceType type = NES_DEVICE_NONE;
+                for (int d = 0; d < (int)(sizeof(nes_devs)/sizeof(nes_devs[0])); d++)
+                    if (strcmp(name, nes_devs[d].name) == 0) { type = nes_devs[d].type; break; }
+                if (type == NES_DEVICE_NONE) {
                     fprintf(stderr, "gemu: unknown device '%s' (try -device ?)\n", name);
                     return 1;
                 }
@@ -294,7 +293,7 @@ int mos_setup(int argc, char *argv[]) {
                     fprintf(stderr, "gemu: all %d controller ports are already occupied\n", NES_PORTS);
                     return 1;
                 }
-                cfg.ports[cfg.n_ports++] = dev->type;
+                cfg.ports[cfg.n_ports++] = type;
             }
         } else if (strcmp(rem[i], "-soundhw") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -soundhw requires an argument\n"); return 1; }
@@ -371,7 +370,9 @@ int mos_setup(int argc, char *argv[]) {
         }
     } else {
         if (cfg.n_roms == 0) {
-            fprintf(stderr, "gemu: no ROM specified — use -rom ADDR:FILE\n");
+            fprintf(stderr, "gemu: no ROM specified\n"
+                            "  Load a single file:  -rom ADDR:FILE\n"
+                            "  Load from directory: -rom /path/to/roms/\n");
             return 1;
         }
     }

@@ -222,6 +222,9 @@ struct InputMenu {
     InputBinding   menu_key_bindings[MENU_CTL_COUNT];
     InputBinding   menu_controller_bindings[MENU_CTL_COUNT];
 
+    InputMenuPage *pages;      /* malloc'd copy; NULL when n_pages==0 */
+    int            n_pages;
+
     MenuPage       page;
     MenuList       list;
     int            input_page;
@@ -249,7 +252,6 @@ static void start_binding_options(InputMenu *m, int index, bool controller);
 static void start_capture(InputMenu *m, int index, bool controller);
 static bool binding_matches_controller(const InputBinding *binding,
                                        const SDL_Event *ev);
-static const char *display_button_name(const char *name);
 
 /* ── INI load / save (uses m->n_buttons / m->button_names) ─────────────── */
 
@@ -287,18 +289,18 @@ static const char *binding_display_name(const InputBinding *binding) {
     return (binding && binding->name[0]) ? binding->name : "(none)";
 }
 
-static const char *display_button_name(const char *name) {
-    if (!name) return "";
-    if (name[0] == 'P' && name[1] >= '2' && name[1] <= '9' && name[2] == ' ')
-        return name + 3;
-    return name;
+static int page_for_button(const InputMenu *m, int i) {
+    int start = 0;
+    for (int p = 0; p < m->n_pages; p++) {
+        if (i < start + m->pages[p].n_buttons) return p;
+        start += m->pages[p].n_buttons;
+    }
+    return m->n_pages > 0 ? m->n_pages - 1 : 0;
 }
 
-static int duplicate_page_for_button(const char *name) {
-    if (!name) return 0;
-    if (name[0] == 'P' && name[1] >= '2' && name[1] <= '9' && name[2] == ' ')
-        return name[1] - '1';
-    return 0;
+static const char *page_title(const InputMenu *m, int p) {
+    if (m->n_pages > 0 && p < m->n_pages) return m->pages[p].name;
+    return m->section;
 }
 
 static bool is_menu_control_index(int index) {
@@ -607,16 +609,8 @@ static void build_main_menu(InputMenu *m) {
 
 static void build_input_menu(InputMenu *m) {
     m->list = MENU_LIST_INPUT;
-    m->input_page_count = 1;
-    for (int i = 0; i < m->n_buttons; i++) {
-        int page = duplicate_page_for_button(m->button_names[i]);
-        if (page + 1 > m->input_page_count)
-            m->input_page_count = page + 1;
-    }
-    if (m->input_page_count < 1)
-        m->input_page_count = 1;
-    if (m->input_page < 0)
-        m->input_page = 0;
+    m->input_page_count = m->n_pages > 0 ? m->n_pages : 1;
+    if (m->input_page < 0) m->input_page = 0;
     if (m->input_page >= m->input_page_count)
         m->input_page = m->input_page_count - 1;
 
@@ -628,10 +622,10 @@ static void build_input_menu(InputMenu *m) {
         };
     }
     for (int i = 0; i < m->n_buttons; i++) {
-        if (duplicate_page_for_button(m->button_names[i]) != m->input_page)
+        if (page_for_button(m, i) != m->input_page)
             continue;
         m->items[m->n_items++] = (MenuItem){
-            .label = display_button_name(m->button_names[i]),
+            .label = m->button_names[i],
             .binding_ptr = &m->key_bindings[i],
             .controller_ptr = &m->controller_bindings[i],
             .binding_index = i,
@@ -862,11 +856,12 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
 
     if (m->list == MENU_LIST_INPUT) {
         char title[128];
+        const char *pname = page_title(m, m->input_page);
         if (m->input_page_count > 1)
-            snprintf(title, sizeof(title), "%s (%d/%d)", m->section,
+            snprintf(title, sizeof(title), "%s (%d/%d)", pname,
                      m->input_page + 1, m->input_page_count);
         else
-            snprintf(title, sizeof(title), "%s", m->section);
+            snprintf(title, sizeof(title), "%s", pname);
         draw_text(r, mx + 6 * s, ty, title, 0xFFFFFFFF, 0x000050FF, s);
     } else if (m->list == MENU_LIST_CONTROLS) {
         draw_text(r, mx + 6 * s, ty, "Menu", 0xFFFFFFFF, 0x000050FF, s);
@@ -1143,7 +1138,9 @@ InputMenu *input_menu_create(SDL_Renderer *renderer,
                              const char **button_names,
                              const SDL_Keycode *default_bindings,
                              const char **default_controller_bindings,
-                             const char *ini_section) {
+                             const char *ini_section,
+                             int n_pages,
+                             const InputMenuPage *pages) {
     (void)renderer;
     InputMenu *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
@@ -1203,6 +1200,18 @@ InputMenu *input_menu_create(SDL_Renderer *renderer,
         for (int i = 0; i < n_buttons; i++)
             binding_set_controller(&m->controller_bindings[i], default_controller_bindings[i]);
     }
+    if (n_pages > 0 && pages) {
+        m->pages = malloc((size_t)n_pages * sizeof(*m->pages));
+        if (!m->pages) {
+            free(m->controller_bindings); free(m->key_bindings);
+            free(m->default_controller_bindings); free(m->default_bindings);
+            free(m->controller_button_names); free(m->button_names); free(m);
+            return NULL;
+        }
+        memcpy(m->pages, pages, (size_t)n_pages * sizeof(*m->pages));
+        m->n_pages = n_pages;
+    }
+
     load_menu_binding(m);
     load_ini(m);
 
@@ -1215,6 +1224,7 @@ InputMenu *input_menu_create(SDL_Renderer *renderer,
 
 void input_menu_destroy(InputMenu *m) {
     if (!m) return;
+    free(m->pages);
     free(m->button_names);
     free(m->controller_button_names);
     free(m->default_bindings);

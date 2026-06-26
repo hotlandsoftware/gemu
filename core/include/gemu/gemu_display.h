@@ -65,6 +65,14 @@ typedef struct {
     void        *hex_toggle_ud;
 } GemuDisplayGtkExtras;
 
+/* ── Input page descriptor ───────────────────────────────────────────────────
+ * Partitions actions[] into named pages shown in the input menu.
+ * Pages are consecutive slices: pages[0] covers the first n_actions actions, etc. */
+typedef struct {
+    const char *name;      /* page heading, e.g. "nes-controller", "famicom-mic" */
+    int         n_actions; /* count of consecutive actions belonging to this page */
+} GemuInputPage;
+
 /* ── Display config ──────────────────────────────────────────────────────── */
 typedef struct {
     /* Window / framebuffer */
@@ -80,6 +88,10 @@ typedef struct {
     int                  n_actions;
     const char          *ini_section; /* gemu.ini section, e.g. "nes-controller" */
     bool                 no_rebind;   /* show menu but hide the Input/rebind page */
+
+    /* Optional per-device pages; NULL means all actions on one page (ini_section). */
+    const GemuInputPage *pages;
+    int                  n_pages;
 
     /* GTK extras — NULL for non-GTK builds / backends */
     const GemuDisplayGtkExtras *gtk;

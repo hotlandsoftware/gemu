@@ -459,6 +459,20 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
         SDL_Keycode *defaults = nb ? calloc((size_t)nb, sizeof(SDL_Keycode)) : NULL;
         const char **names    = nb ? calloc((size_t)nb, sizeof(char *))      : NULL;
         const char **controller_defaults = nb ? calloc((size_t)nb, sizeof(char *)) : NULL;
+        /* Translate GemuInputPage[] → InputMenuPage[] if provided */
+        InputMenuPage *menu_pages = NULL;
+        int n_menu_pages = 0;
+        if (nb > 0 && cfg->n_pages > 0 && cfg->pages) {
+            menu_pages = malloc((size_t)cfg->n_pages * sizeof(*menu_pages));
+            if (menu_pages) {
+                for (int p = 0; p < cfg->n_pages; p++) {
+                    menu_pages[p].name      = cfg->pages[p].name;
+                    menu_pages[p].n_buttons = cfg->pages[p].n_actions;
+                }
+                n_menu_pages = cfg->n_pages;
+            }
+        }
+
         if (nb == 0 || (defaults && names && controller_defaults)) {
             for (int i = 0; i < nb; i++) {
                 names[i]               = cfg->actions[i].name;
@@ -466,8 +480,10 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
                 controller_defaults[i] = default_controller_binding(&cfg->actions[i]);
             }
             b->menu = input_menu_create(NULL, nb, names, defaults,
-                                        controller_defaults, cfg->ini_section);
+                                        controller_defaults, cfg->ini_section,
+                                        n_menu_pages, menu_pages);
         }
+        free(menu_pages);
         free(controller_defaults);
         free(names);
         free(defaults);

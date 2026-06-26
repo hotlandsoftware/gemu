@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<device name="famicom-mic" description="Famicom Microphone Controller">
+    <machine name="nes"/>
+    <machine name="famicom"/>
+</device>

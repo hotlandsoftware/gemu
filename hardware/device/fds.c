@@ -203,9 +203,10 @@ bool fds_tick(FdsState *f) {
         if (++f->cyc_acc >= FDS_CYCLES_PER_BYTE) {
             f->cyc_acc = 0;
             if (f->disk_pos < FDS_SIDE_BYTES) {
-                size_t abs = (size_t)f->cur_side * FDS_SIDE_BYTES + f->disk_pos;
+                size_t abs      = (size_t)f->cur_side * FDS_SIDE_BYTES + f->disk_pos;
+                size_t mask_abs = (size_t)f->cur_side * FDS_MASK_BYTES + (f->disk_pos >> 3);
                 uint8_t byte = f->disk[abs];
-                bool forward = f->fwd_mask && ((f->fwd_mask[f->disk_pos >> 3] >> (f->disk_pos & 7)) & 1);
+                bool forward = f->fwd_mask && ((f->fwd_mask[mask_abs] >> (f->disk_pos & 7)) & 1);
                 f->disk_pos++;
                 if (forward) {
                     f->read_data     = byte;
@@ -419,6 +420,13 @@ void fds_reg_write(FdsState *f, uint16_t addr, uint8_t val) {
         break;
     case 0x4025:
         if (val & 0x02) {
+            /* Auto-flip to the next side when the head reached end-of-side and
+             * the game/BIOS seeks back to the start.  Mirrors real-world disk
+             * swap: side 0 fully read → user flips → side 1, and vice versa. */
+            if (f->end_of_head && f->disk_sides > 1) {
+                f->cur_side = (uint8_t)((f->cur_side + 1) % f->disk_sides);
+                fprintf(stderr, "fds: auto-flip → side %u\n", f->cur_side);
+            }
             f->disk_pos      = 0;
             f->cyc_acc       = 0;
             f->transfer_flag = false;
