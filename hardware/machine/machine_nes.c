@@ -1706,7 +1706,7 @@ NesState *nes_create(const MosConfig *cfg) {
 
 void nes_destroy(NesState *s) {
     nes_save_persistent(s);
-    if (s->fds_enabled) { free(s->fds.disk); free(s->fds.fwd_mask); free(s->fds.raw_disk); }
+    if (s->fds_enabled) { free(s->fds.raw_disk); }
 #ifdef GEMU_GTK
     hex_editor_destroy(s->hex_editor);
 #endif

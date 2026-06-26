@@ -112,6 +112,26 @@ void fds_hle_build_rom(FdsState *f) {
         0x6C, 0xFC, 0xDF   /* JMP ($DFFC)  game entry       */
     );
 
+    /* ── $E237: BIOS disk write file ──
+     * Real BIOS: seeks disk, writes file header + data blocks with CRC.
+     * HLE: return A=0 (success) without touching disk so the game doesn't see ERR xx. */
+    ROM(0xE237,
+        0xA9, 0x00,  /* LDA #$00  (success code) */
+        0x60         /* RTS */
+    );
+
+    /* ── $E7A3: BIOS read one byte from disk (called in DATA mode) ──
+     * Real BIOS: IRQ-driven — JSR $E7A3 parks here, IRQ fires on transfer_flag,
+     * IRQ handler does PLA/PLA/PLA to unwind both frames, then RTS to caller.
+     * HLE: synchronous — read $4031 directly, return byte in A.
+     * This avoids the IRQ stack-frame dance entirely. */
+    ROM(0xE7A3,
+        0xAE, 0x31, 0x40,   /* LDX $4031  — read disk byte (clears transfer_flag) */
+        0x8D, 0x24, 0x40,   /* STA $4024  — echo write byte (nop in read mode) */
+        0x8A,               /* TXA        — result byte into A */
+        0x60                /* RTS */
+    );
+
     /* ── Interrupt vectors ── */
     f->bios[0x1FFA] = 0x8B; f->bios[0x1FFB] = 0xE1; /* NMI  → $E18B */
     f->bios[0x1FFC] = 0x24; f->bios[0x1FFD] = 0xEE; /* RST  → $EE24 */

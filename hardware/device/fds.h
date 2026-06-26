@@ -7,15 +7,12 @@
 #define FDS_BIOS_SIZE       0x2000u  /* 8 KB BIOS ROM:  CPU $E000–$FFFF       */
 #define FDS_CHR_SIZE        0x2000u  /* 8 KB CHR RAM:   PPU $0000–$1FFF       */
 #define FDS_CYCLES_PER_BYTE 150u     /* CPU cycles between disk byte transfers */
-#define FDS_MASK_BYTES      ((FDS_SIDE_BYTES + 7u) / 8u) /* 1 bit per phys byte */
 
 typedef struct {
     uint8_t  bios[FDS_BIOS_SIZE];
     uint8_t  ram[FDS_RAM_SIZE];   /* CPU $6000–$DFFF */
 
-    uint8_t *disk;        /* disk_sides * FDS_SIDE_BYTES: physical byte stream  */
-    uint8_t *fwd_mask;    /* disk_sides * FDS_MASK_BYTES: 1=forward to CPU     */
-    uint8_t *raw_disk;    /* disk_sides * FDS_SIDE_BYTES: raw .fds block data  */
+    uint8_t *raw_disk;   /* disk_sides * FDS_SIDE_BYTES: raw .fds block data (mutable) */
     uint8_t  disk_sides;
     uint8_t  cur_side;
     bool     disk_inserted;
@@ -36,15 +33,23 @@ typedef struct {
     uint8_t  drive_ctrl;
     bool     drive_ctrl_written;
 
-    /* Disk transfer state */
-    uint32_t disk_pos;       /* current byte offset within the current side */
-    uint32_t cyc_acc;        /* cycles accumulated toward next byte */
-    uint8_t  read_data;      /* last byte received from disk ($4031) */
-    uint8_t  write_data;     /* last byte written by CPU ($4024) */
-    bool     write_pending;  /* write_data is queued for next transfer interval */
-    bool     transfer_flag;  /* byte ready; cleared by $4031 or $4030 read */
-    bool     end_of_head;    /* disk_pos reached end of side */
-    bool     dirty;          /* physical disk stream modified in memory */
+    /* Disk block state machine (FCEUX-style logical block tracking) */
+    uint8_t  blk_type;      /* 0=init 1=volume 2=filecnt 3=filehdr 4=filedata */
+    uint32_t blk_start;     /* byte offset in raw_disk[cur_side] for block start */
+    uint32_t blk_len;       /* length of current block in bytes */
+    uint32_t blk_addr;      /* byte offset within current block */
+    uint16_t blk_filesize;  /* file size captured from header block (for data block len) */
+    uint8_t  blk_access;    /* 0 = first-write guard pending for this block */
+    int32_t  disk_irq_ctr;  /* countdown to disk-transfer IRQ (-1 = inactive) */
+
+    /* Byte received from disk during read ($4031) */
+    uint8_t  read_data;
+
+    /* Transfer flag: byte ready for CPU; cleared by $4030/$4031 read */
+    bool     transfer_flag;
+
+    /* Set when raw_disk has been modified; triggers save on quit */
+    bool     dirty;
 
     /* ---- FDS wavetable synthesizer ($4040–$408A) ---- */
     uint8_t  snd_wav[64];    /* 6-bit waveform table ($4040–$407F) */
