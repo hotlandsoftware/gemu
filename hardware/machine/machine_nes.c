@@ -133,6 +133,19 @@ static void nes_build_sav_path(const char *game, char *out, size_t len) {
 #endif
 }
 
+static void nes_build_fds_sav_path(const char *game, char *out, size_t len) {
+#ifdef _WIN32
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !base[0]) base = getenv("APPDATA");
+    if (!base || !base[0]) base = "C:\\Users\\Default\\AppData\\Local";
+    snprintf(out, len, "%s\\gemu\\%s.fds.sav", base, game);
+#else
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    snprintf(out, len, "%s/.gemu/%s.fds.sav", home, game);
+#endif
+}
+
 static void nes_ensure_sav_dir(const char *sav_path) {
     char dir[512];
     snprintf(dir, sizeof(dir), "%s", sav_path);
@@ -193,6 +206,29 @@ static void nes_sav_save(NesState *s) {
     fwrite(s->prg_ram, 1, sizeof(s->prg_ram), f);
     fclose(f);
     printf("nes: saved to '%s'\n", s->sav_path);
+}
+
+static void nes_fds_save(NesState *s) {
+    if (!s->fds_enabled || !s->fds.dirty || !s->sav_path[0])
+        return;
+    nes_ensure_sav_dir(s->sav_path);
+    if (!fds_disk_save(&s->fds, s->sav_path))
+        fprintf(stderr, "fds: cannot write save '%s'\n", s->sav_path);
+}
+
+static void nes_fds_save_setup(NesState *s, const char *disk_path) {
+    if (!disk_path || !disk_path[0]) return;
+    char game[256];
+    nes_game_basename(disk_path, game, sizeof(game));
+    nes_build_fds_sav_path(game, s->sav_path, sizeof(s->sav_path));
+    fds_disk_load_save(&s->fds, s->sav_path);
+}
+
+static void nes_save_persistent(NesState *s) {
+    if (s->fds_enabled)
+        nes_fds_save(s);
+    else
+        nes_sav_save(s);
 }
 
 static void nes_battery_setup(NesState *s) {
@@ -1198,11 +1234,14 @@ static GemuMediaResult fds_media_change(void *ud, const char *arg,
                                          char *err, size_t err_len) {
     NesState *s = ud;
     if (!arg || !arg[0]) { snprintf(err, err_len, "missing disk path"); return GEMU_MEDIA_ERR; }
+    nes_fds_save(s);
+    s->sav_path[0] = '\0';
     fds_disk_eject(&s->fds);
     if (!fds_disk_load(&s->fds, arg)) {
         snprintf(err, err_len, "failed to load '%s'", arg);
         return GEMU_MEDIA_ERR;
     }
+    nes_fds_save_setup(s, arg);
     if (s->fds.hle_mode)
         fds_hle_boot(&s->fds, s->chr);
     return GEMU_MEDIA_OK;
@@ -1210,7 +1249,10 @@ static GemuMediaResult fds_media_change(void *ud, const char *arg,
 
 static GemuMediaResult fds_media_eject(void *ud, char *err, size_t err_len) {
     (void)err; (void)err_len;
-    fds_disk_eject(&((NesState *)ud)->fds);
+    NesState *s = ud;
+    nes_fds_save(s);
+    s->sav_path[0] = '\0';
+    fds_disk_eject(&s->fds);
     return GEMU_MEDIA_OK;
 }
 
@@ -1497,6 +1539,7 @@ NesState *nes_create(const MosConfig *cfg) {
 
         if (cfg->fda_path) {
             if (!fds_disk_load(&s->fds, cfg->fda_path)) { free(s->chr); free(s); return NULL; }
+            nes_fds_save_setup(s, cfg->fda_path);
             if (s->fds.hle_mode)
                 fds_hle_boot(&s->fds, s->chr);
         }
@@ -1621,7 +1664,8 @@ NesState *nes_create(const MosConfig *cfg) {
                                             s->display);
     }
 
-    nes_battery_setup(s);
+    if (!s->fds_enabled)
+        nes_battery_setup(s);
 
     if (s->cart.mapper == 4) {
         s->ppu.irq_scanline = mmc3_irq_scanline;
@@ -1661,7 +1705,7 @@ NesState *nes_create(const MosConfig *cfg) {
 }
 
 void nes_destroy(NesState *s) {
-    if (!s->fds_enabled) nes_sav_save(s);
+    nes_save_persistent(s);
     if (s->fds_enabled) { free(s->fds.disk); free(s->fds.fwd_mask); free(s->fds.raw_disk); }
 #ifdef GEMU_GTK
     hex_editor_destroy(s->hex_editor);
@@ -1705,7 +1749,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             if (gemu_display_should_quit(s->display)) break;
             if (gemu_display_reset_requested(s->display)) {
                 gemu_display_clear_flags(s->display);
-                nes_sav_save(s);
+                nes_save_persistent(s);
                 nes_reset(s);
             }
         }
@@ -1713,7 +1757,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
             if      (cmd == GEMU_MON_QUIT)   { quit = true; break; }
-            else if (cmd == GEMU_MON_RESET)  { nes_sav_save(s); nes_reset(s); }
+            else if (cmd == GEMU_MON_RESET)  { nes_save_persistent(s); nes_reset(s); }
             else if (cmd == GEMU_MON_CUSTOM) {
                 const char *text = gemu_monitor_command_text(s->monitor);
                 while (*text == ' ' || *text == '\t') text++;

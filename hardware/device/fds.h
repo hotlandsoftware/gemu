@@ -34,13 +34,17 @@ typedef struct {
 
     /* $4025 drive control register (stored verbatim) */
     uint8_t  drive_ctrl;
+    bool     drive_ctrl_written;
 
     /* Disk transfer state */
     uint32_t disk_pos;       /* current byte offset within the current side */
     uint32_t cyc_acc;        /* cycles accumulated toward next byte */
     uint8_t  read_data;      /* last byte received from disk ($4031) */
+    uint8_t  write_data;     /* last byte written by CPU ($4024) */
+    bool     write_pending;  /* write_data is queued for next transfer interval */
     bool     transfer_flag;  /* byte ready; cleared by $4031 or $4030 read */
     bool     end_of_head;    /* disk_pos reached end of side */
+    bool     dirty;          /* physical disk stream modified in memory */
 
     /* ---- FDS wavetable synthesizer ($4040–$408A) ---- */
     uint8_t  snd_wav[64];    /* 6-bit waveform table ($4040–$407F) */
@@ -83,6 +87,8 @@ float   fds_audio_tick(FdsState *f);   /* advance synthesizer one CPU cycle; ret
 
 bool    fds_bios_load(FdsState *f, const char *path);
 bool    fds_disk_load(FdsState *f, const char *path);
+bool    fds_disk_load_save(FdsState *f, const char *path);
+bool    fds_disk_save(FdsState *f, const char *path);
 void    fds_disk_eject(FdsState *f);
 bool    fds_disk_flip(FdsState *f);
 

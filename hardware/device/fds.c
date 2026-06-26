@@ -2,8 +2,35 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #define FDS_DISK_CHANGE_CYCLES 500000u
+#define FDS_SAVE_MAGIC "GEMUFD2S"
+
+static bool fds_trace_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("GEMU_FDS_TRACE");
+        cached = env && env[0] && strcmp(env, "0") != 0;
+    }
+    return cached != 0;
+}
+
+static void fds_trace(const FdsState *f, const char *fmt, ...) {
+    if (!fds_trace_enabled()) return;
+    fprintf(stderr, "fds: ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, " side=%c pos=%u ctrl=%02x io=%d tf=%d eoh=%d change=%u dirty=%d\n",
+            (char)('A' + f->cur_side), (unsigned)f->disk_pos,
+            f->drive_ctrl, f->disk_io_en ? 1 : 0,
+            f->transfer_flag ? 1 : 0, f->end_of_head ? 1 : 0,
+            (unsigned)f->disk_change_cycles, f->dirty ? 1 : 0);
+}
+
+#define FDS_TRACE fds_trace
 
 /* ── Physical disk format helpers ────────────────────────────────────────── */
 
@@ -33,6 +60,32 @@ static uint16_t fds_crc16(const uint8_t *data, size_t len) {
 static void mask_set(uint8_t *mask, size_t pos, size_t len) {
     for (size_t i = pos; i < pos + len; i++)
         mask[i >> 3] |= (uint8_t)(1u << (i & 7));
+}
+
+static bool mask_get(const uint8_t *mask, size_t pos) {
+    return mask && ((mask[pos >> 3] >> (pos & 7)) & 1);
+}
+
+/* After writing a data byte at side-relative position pos, find the extent
+ * of its forwarded region (data + 2-byte CRC) and recompute the CRC so the
+ * BIOS read-back verification sees a consistent value. */
+static void fds_update_block_crc(FdsState *f, uint8_t side, uint32_t pos) {
+    uint8_t *phys = f->disk     + (size_t)side * FDS_SIDE_BYTES;
+    uint8_t *mask = f->fwd_mask + (size_t)side * FDS_MASK_BYTES;
+
+    if (!mask_get(mask, pos)) return;
+
+    uint32_t lo = pos;
+    while (lo > 0 && mask_get(mask, lo - 1)) lo--;
+
+    uint32_t hi = pos + 1;
+    while (hi < FDS_SIDE_BYTES && mask_get(mask, hi)) hi++;
+
+    if (hi - lo < 3) return;
+
+    uint16_t crc = fds_crc16(phys + lo, hi - lo - 2);
+    phys[hi - 2] = (uint8_t)(crc & 0xFF);
+    phys[hi - 1] = (uint8_t)(crc >> 8);
 }
 
 static void fds_expand_side(uint8_t *phys, uint8_t *mask, const uint8_t *raw, size_t raw_len) {
@@ -157,12 +210,68 @@ bool fds_disk_load(FdsState *f, const char *path) {
     f->disk_pos      = 0;
     f->cyc_acc       = 0;
     f->transfer_flag = false;
+    f->write_pending = false;
     f->end_of_head   = false;
+    f->drive_ctrl_written = false;
     f->disk_inserted = true;
     f->disk_change_cycles = 0;
+    f->dirty = false;
 
     fprintf(stderr, "fds: loaded '%s' — %u side%s\n", path, sides, sides == 1 ? "" : "s");
+    FDS_TRACE(f, "load");
     return true;
+}
+
+bool fds_disk_load_save(FdsState *f, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    uint8_t magic[8];
+    if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic) ||
+        memcmp(magic, FDS_SAVE_MAGIC, 8) != 0) {
+        fclose(fp);
+        return false;
+    }
+    uint8_t sides = 0;
+    if (fread(&sides, 1, 1, fp) != 1 || sides != f->disk_sides) {
+        fclose(fp);
+        return false;
+    }
+    if (!f->disk || !f->fwd_mask) {
+        fclose(fp);
+        return false;
+    }
+    size_t disk_len = (size_t)sides * FDS_SIDE_BYTES;
+    size_t mask_len = (size_t)sides * FDS_MASK_BYTES;
+    bool ok = fread(f->disk, 1, disk_len, fp) == disk_len &&
+              fread(f->fwd_mask, 1, mask_len, fp) == mask_len;
+    fclose(fp);
+    if (ok) {
+        f->dirty = false;
+        fprintf(stderr, "fds: loaded save '%s'\n", path);
+        FDS_TRACE(f, "load-save");
+    }
+    return ok;
+}
+
+bool fds_disk_save(FdsState *f, const char *path) {
+    if (!f->disk_inserted || !f->disk || !f->fwd_mask || !path || !path[0])
+        return false;
+    FILE *fp = fopen(path, "wb");
+    if (!fp)
+        return false;
+    size_t disk_len = (size_t)f->disk_sides * FDS_SIDE_BYTES;
+    size_t mask_len = (size_t)f->disk_sides * FDS_MASK_BYTES;
+    bool ok = fwrite(FDS_SAVE_MAGIC, 1, 8, fp) == 8 &&
+              fwrite(&f->disk_sides, 1, 1, fp) == 1 &&
+              fwrite(f->disk, 1, disk_len, fp) == disk_len &&
+              fwrite(f->fwd_mask, 1, mask_len, fp) == mask_len;
+    fclose(fp);
+    if (ok) {
+        f->dirty = false;
+        fprintf(stderr, "fds: saved to '%s'\n", path);
+        FDS_TRACE(f, "save");
+    }
+    return ok;
 }
 
 void fds_disk_eject(FdsState *f) {
@@ -178,8 +287,12 @@ void fds_disk_eject(FdsState *f) {
     f->disk_pos      = 0;
     f->cyc_acc       = 0;
     f->transfer_flag = false;
+    f->write_pending = false;
     f->end_of_head   = false;
+    f->drive_ctrl_written = false;
+    f->dirty          = false;
     fprintf(stderr, "fds: disk ejected\n");
+    FDS_TRACE(f, "eject");
 }
 
 bool fds_disk_flip(FdsState *f) {
@@ -189,11 +302,13 @@ bool fds_disk_flip(FdsState *f) {
     f->disk_pos = 0;
     f->cyc_acc = 0;
     f->transfer_flag = false;
+    f->write_pending = false;
     f->end_of_head = false;
     f->disk_change_cycles = FDS_DISK_CHANGE_CYCLES;
     fprintf(stderr, "fds: flipped to side %c (%u/%u)\n",
             (char)('A' + f->cur_side), (unsigned)f->cur_side + 1u,
             (unsigned)f->disk_sides);
+    FDS_TRACE(f, "flip");
     return true;
 }
 
@@ -216,20 +331,37 @@ bool fds_tick(FdsState *f) {
 
     /* ---- Disk transfer ----
      * Active when: disk inserted, motor on ($4025 bit 0), not in reset
-     * ($4025 bit 1 = 0), read mode ($4025 bit 2), not past end of side. */
+     * ($4025 bit 1 = 0), and not past end of side. */
     bool motor_on  = (f->drive_ctrl & 0x01) != 0;
     bool not_reset = (f->drive_ctrl & 0x02) == 0;
     bool read_mode = (f->drive_ctrl & 0x04) != 0;
+    bool write_mode = !read_mode;
+    bool write_enabled = write_mode && (f->drive_ctrl & 0x40) != 0;
 
     if (f->disk_inserted && f->disk_change_cycles == 0 &&
-        motor_on && not_reset && read_mode && !f->end_of_head) {
+        motor_on && not_reset && !f->end_of_head) {
         if (++f->cyc_acc >= FDS_CYCLES_PER_BYTE) {
             f->cyc_acc = 0;
             if (f->disk_pos < FDS_SIDE_BYTES) {
                 size_t abs      = (size_t)f->cur_side * FDS_SIDE_BYTES + f->disk_pos;
-                size_t mask_abs = (size_t)f->cur_side * FDS_MASK_BYTES + (f->disk_pos >> 3);
+                if (write_mode) {
+                    if (write_enabled && f->write_pending) {
+                        f->disk[abs] = f->write_data;
+                        fds_update_block_crc(f, f->cur_side, f->disk_pos);
+                        f->disk_pos++;
+                        f->dirty = true;
+                        f->write_pending = false;
+                        if (f->disk_pos >= FDS_SIDE_BYTES)
+                            f->end_of_head = true;
+                    }
+                    if (write_enabled)
+                        f->transfer_flag = true;
+                    return f->timer_pending
+                        || (f->transfer_flag && (f->drive_ctrl & 0x80) != 0);
+                }
+                bool forward = mask_get(f->fwd_mask + (size_t)f->cur_side * FDS_MASK_BYTES,
+                                        f->disk_pos);
                 uint8_t byte = f->disk[abs];
-                bool forward = f->fwd_mask && ((f->fwd_mask[mask_abs] >> (f->disk_pos & 7)) & 1);
                 f->disk_pos++;
                 if (forward) {
                     f->read_data     = byte;
@@ -341,10 +473,12 @@ uint8_t fds_reg_read(FdsState *f, uint16_t addr) {
         if (f->transfer_flag)              v |= 0x80;
         f->timer_pending  = false;
         f->transfer_flag  = false;
+        FDS_TRACE(f, "read 4030 -> %02x", v);
         return v;
     }
     case 0x4031:
         f->transfer_flag = false;
+        FDS_TRACE(f, "read 4031 -> %02x", f->read_data);
         return f->read_data;
     case 0x4032: {
         /* Bit 0: no disk (1=no disk); bit 1: motor not ready (1=not ready); bit 2: write protect */
@@ -352,6 +486,7 @@ uint8_t fds_reg_read(FdsState *f, uint16_t addr) {
         if (!f->disk_inserted || f->disk_change_cycles > 0) v |= 0x01;
         if (f->disk_change_cycles > 0 || (f->drive_ctrl & 0x01) == 0)
             v |= 0x02;  /* motor off / changing disk → not ready */
+        FDS_TRACE(f, "read 4032 -> %02x", v);
         return v;
     }
     case 0x4033:
@@ -428,6 +563,7 @@ void fds_reg_write(FdsState *f, uint16_t addr, uint8_t val) {
         f->timer_latch = (f->timer_latch & 0x00FFu) | ((uint16_t)val << 8);
         break;
     case 0x4022:
+        FDS_TRACE(f, "write 4022 <- %02x", val);
         f->timer_repeat  = (val & 0x01) != 0;
         f->timer_enabled = (val & 0x02) != 0;
         if (f->timer_enabled)
@@ -436,20 +572,31 @@ void fds_reg_write(FdsState *f, uint16_t addr, uint8_t val) {
             f->timer_pending = false;
         break;
     case 0x4023:
+        FDS_TRACE(f, "write 4023 <- %02x", val);
         f->disk_io_en = (val & 0x01) != 0;
+        if (!f->disk_io_en) {
+            f->timer_pending = false;
+            f->transfer_flag = false;
+        }
         break;
     case 0x4024:
-        /* Write data register — disk write not yet implemented */
+        FDS_TRACE(f, "write 4024 <- %02x", val);
+        f->write_data = val;
+        f->write_pending = true;
         f->transfer_flag = false;
         break;
     case 0x4025:
+        FDS_TRACE(f, "write 4025 <- %02x", val);
+        f->transfer_flag = false;
         if (val & 0x02) {
             f->disk_pos      = 0;
             f->cyc_acc       = 0;
-            f->transfer_flag = false;
+            f->write_pending = false;
             f->end_of_head   = false;
         }
         f->drive_ctrl = val;
+        f->drive_ctrl_written = true;
+        FDS_TRACE(f, "after 4025");
         break;
     case 0x4026:
         /* External connector output — ignored */
