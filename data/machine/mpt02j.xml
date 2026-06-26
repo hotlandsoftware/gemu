@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="mpt02j" family="rca" description="Hanimex MPT-02"
+<machine name="mpt02j" family="rca" description="Hanimex MPT-02 (alias for studio2)"
          alias="studio2" tv="pal">
     <rom name="86676.ic13" addr="0x0000" sha256="44e2132aa7a394dc5e1ad4d0750021b7fcf37505d801065b87b656c529508e37"/>
 </machine>

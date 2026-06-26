@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="visicom" family="rca" description="Visicom COM-100"
+<machine name="visicom" family="rca" description="Visicom COM-100 (alias for studio2)"
          alias="studio2" tv="ntsc">
     <rom name="visicom.q003" addr="0x0000" sha256="7a95530b9be7fe487e027a5ea7ffe4a7561762cc3fc8cdc535d6f36e5f23c8a0"/>
 </machine>
