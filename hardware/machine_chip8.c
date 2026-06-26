@@ -244,6 +244,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
         fprintf(stderr, "gemu-chip8: failed to create display\n");
         return;
     }
+    gemu_monitor_set_input_reset_cb(s->monitor, gemu_display_reset_input_bindings_ud, display);
     gemu_monitor_start(s->monitor);
 
     const int insns_frame = cfg->cpu_hz; /* cpu_hz is cycles per frame */

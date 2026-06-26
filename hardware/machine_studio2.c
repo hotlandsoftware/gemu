@@ -411,6 +411,7 @@ void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
         fprintf(stderr, "studio2: failed to create display\n");
         return;
     }
+    gemu_monitor_set_input_reset_cb(s->monitor, gemu_display_reset_input_bindings_ud, display);
     gemu_monitor_start(s->monitor);
 
     const unsigned mcycles_per_frame = s->vdc.lines_total * CDP1861_MCYCLES_PER_LINE;

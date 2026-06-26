@@ -18,6 +18,8 @@ void input_menu_destroy(InputMenu *menu);
 
 /* Toggle the menu open/closed.  Returns true if now open. */
 bool input_menu_toggle(InputMenu *menu);
+bool input_menu_event_opens(const InputMenu *menu, const SDL_Event *ev);
+void input_menu_reset_keys(InputMenu *menu);
 
 /* Process an SDL event.  Returns true if the event was consumed
  * (caller should NOT process it further). */

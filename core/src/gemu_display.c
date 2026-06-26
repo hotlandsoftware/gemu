@@ -134,3 +134,11 @@ bool gemu_display_is_key_held(GemuDisplay *d, const char *name) {
 void gemu_display_open_rebind_menu(GemuDisplay *d) {
     if (d && d->do_open_rebind) d->do_open_rebind(d);
 }
+
+void gemu_display_reset_input_bindings(GemuDisplay *d) {
+    if (d && d->do_reset_input_bindings) d->do_reset_input_bindings(d);
+}
+
+void gemu_display_reset_input_bindings_ud(void *d) {
+    gemu_display_reset_input_bindings((GemuDisplay *)d);
+}

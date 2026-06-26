@@ -1389,6 +1389,10 @@ Kim1State *kim1_create(const MosConfig *cfg) {
             });
         if (!s->display)
             fprintf(stderr, "gemu-kim1: failed to create display window\n");
+        else
+            gemu_monitor_set_input_reset_cb(s->monitor,
+                                            gemu_display_reset_input_bindings_ud,
+                                            s->display);
     }
 
     /* Expansion RAM: covers $0400–(mem_size-1), $2000+ without KIM-1 mirroring */

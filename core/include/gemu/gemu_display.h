@@ -183,3 +183,5 @@ bool gemu_display_is_key_held(GemuDisplay *d, const char *key_name);
  * The display's key map is reloaded from the updated INI automatically.
  */
 void gemu_display_open_rebind_menu(GemuDisplay *d);
+void gemu_display_reset_input_bindings(GemuDisplay *d);
+void gemu_display_reset_input_bindings_ud(void *d);

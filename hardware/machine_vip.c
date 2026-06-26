@@ -546,6 +546,9 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
             fprintf(stderr, "gemu-rca: failed to create display\n");
             return;
         }
+        gemu_monitor_set_input_reset_cb(s->monitor,
+                                        gemu_display_reset_input_bindings_ud,
+                                        display);
     }
     gemu_monitor_start(s->monitor);
 

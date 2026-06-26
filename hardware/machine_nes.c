@@ -1518,6 +1518,10 @@ NesState *nes_create(const MosConfig *cfg) {
             });
         if (!s->display)
             fprintf(stderr, "nes: failed to create display window\n");
+        else
+            gemu_monitor_set_input_reset_cb(s->monitor,
+                                            gemu_display_reset_input_bindings_ud,
+                                            s->display);
     }
 
     nes_battery_setup(s);

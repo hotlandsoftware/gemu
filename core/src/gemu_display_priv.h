@@ -27,6 +27,7 @@ struct GemuDisplay {
     uint32_t (*do_poll)       (struct GemuDisplay *);  /* returns new held mask */
     bool     (*do_is_key_held)(struct GemuDisplay *, const char *);
     void     (*do_open_rebind)(struct GemuDisplay *);
+    void     (*do_reset_input_bindings)(struct GemuDisplay *);
     void     (*do_destroy)    (struct GemuDisplay *);
     void      *backend;
 };

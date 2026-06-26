@@ -85,6 +85,8 @@ struct GemuMonitor {
     GemuMediaDevice media[MEDIA_DEVICE_MAX];
     GemuVncServer  *vnc;
     int             n_media;
+    void          (*input_reset_cb)(void *ud);
+    void           *input_reset_ud;
     MonRomEntry     rom_entries[ROM_ENTRY_MAX];
     int             n_rom_entries;
     MonBpEntry      bp_entries[BP_MAX];
@@ -348,6 +350,23 @@ static bool dispatch_media(GemuMonitor *mon, const char *line,
         return true;
     }
 
+    if (strcasecmp(verb, "reset") == 0) {
+        char *sub = next_token(&p);
+        if (sub && strcasecmp(sub, "keys") == 0) {
+            char *extra = next_token(&p);
+            if (extra) {
+                mon_printf(mon, "usage: reset keys\n");
+            } else if (!mon->input_reset_cb) {
+                mon_printf(mon, "reset keys: input reset is not available\n");
+            } else {
+                mon->input_reset_cb(mon->input_reset_ud);
+                mon_printf(mon, "input bindings reset to defaults\n");
+            }
+            *out_cmd = GEMU_MON_NONE;
+            return true;
+        }
+    }
+
     if (strcasecmp(verb, "info") == 0) {
         char *sub = next_token(&p);
         if (!sub || strcasecmp(sub, "block") == 0) {
@@ -545,6 +564,7 @@ static bool monitor_handle_line(GemuMonitor *mon, char *line) {
         "  info roms  -- list loaded ROM images\n"
         "  q / quit -- quits the machine immediately\n"
         "  reset -- reset the machine\n"
+        "  reset keys -- reset input bindings to defaults\n"
         "  rwatch <addr>  -- set read watchpoint\n"
         "  screendump <file>[.png] -- save screenshot (PPM or PNG)\n"
         "  step / s [count] -- step through (x) instructions (defaults to 1)\n"
@@ -793,6 +813,14 @@ bool gemu_monitor_register_media(GemuMonitor *mon,
 
 void gemu_monitor_set_vnc(GemuMonitor *mon, GemuVncServer *vnc) {
     if (mon) mon->vnc = vnc;
+}
+
+void gemu_monitor_set_input_reset_cb(GemuMonitor *mon,
+                                     void (*cb)(void *ud),
+                                     void *ud) {
+    if (!mon) return;
+    mon->input_reset_cb = cb;
+    mon->input_reset_ud = ud;
 }
 
 void gemu_monitor_start(GemuMonitor *mon) {

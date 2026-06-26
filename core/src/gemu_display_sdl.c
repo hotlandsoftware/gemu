@@ -251,9 +251,16 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
 
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
+        if (!menu_open && b->menu && input_menu_event_opens(b->menu, &ev)) {
+            input_menu_toggle(b->menu);
+            menu_open = true;
+            continue;
+        }
+
         /* Menu swallows all events while open */
         if (menu_open) {
             input_menu_handle_event(b->menu, &ev);
+            menu_open = input_menu_is_open(b->menu);
             continue;
         }
 
@@ -302,12 +309,6 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         case SDL_KEYDOWN: {
             SDL_Keycode kc = ev.key.keysym.sym;
             if (kc == SDLK_ESCAPE) { d->quit = true; break; }
-
-            /* Tab opens rebind menu unless Tab is a game action */
-            if (kc == SDLK_TAB && !b->tab_is_action && b->menu) {
-                input_menu_toggle(b->menu);
-                break;
-            }
 
             uint32_t bits = key_to_bits(b, kc);
             held_set(b, kc, bits, true);
@@ -391,6 +392,14 @@ static void sdl_do_open_rebind(GemuDisplay *d) {
         input_menu_toggle(b->menu);
 }
 
+static void sdl_do_reset_input_bindings(GemuDisplay *d) {
+    SdlBackend *b = d->backend;
+    if (!b->menu) return;
+    input_menu_reset_keys(b->menu);
+    build_bindings(b);
+    build_default_controller_bindings(b);
+}
+
 static void sdl_do_destroy(GemuDisplay *d) {
     SdlBackend *b = d->backend;
     if (!b) return;
@@ -470,6 +479,7 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     d->do_poll        = sdl_do_poll;
     d->do_is_key_held = sdl_do_is_key_held;
     d->do_open_rebind = sdl_do_open_rebind;
+    d->do_reset_input_bindings = sdl_do_reset_input_bindings;
     d->do_destroy     = sdl_do_destroy;
     d->pointer.x = d->pointer.y = -1;
 
