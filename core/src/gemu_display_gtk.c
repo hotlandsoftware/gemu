@@ -68,9 +68,10 @@ static void build_bindings(GtkBackend *b) {
     for (int i = 0; i < b->n_actions && b->n_bindings < GTK_MAX_BINDINGS; i++) {
         const GemuActionDef *def = &b->action_defs[i];
         char val[64] = "";
+        bool has_binding = false;
         if (b->ini_section)
-            gemu_ini_read(b->ini_section, def->name, val, sizeof(val));
-        const char *key_name = (val[0]) ? val : def->default_key;
+            has_binding = gemu_ini_read(b->ini_section, def->name, val, sizeof(val));
+        const char *key_name = has_binding ? val : def->default_key;
         guint kv = sdl_name_to_gdk(key_name);
         if (kv == GDK_KEY_VoidSymbol) continue;
         b->bindings[b->n_bindings].keyval = gdk_keyval_to_lower(kv);

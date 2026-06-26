@@ -5,13 +5,14 @@
 typedef struct InputMenu InputMenu;
 
 /* Create an input menu.
- * n_buttons / button_names / default_bindings define the remappable keys
- * (e.g. NES controller: 8 buttons named A,B,START,... with defaults z,x,return,...).
+ * n_buttons / button_names / default_bindings define remappable keyboard keys.
+ * default_controller_bindings defines a parallel controller binding set.
  * ini_section is the INI section name (e.g. "nes-controller"). */
 InputMenu *input_menu_create(SDL_Renderer *renderer,
                              int n_buttons,
                              const char **button_names,
                              const SDL_Keycode *default_bindings,
+                             const char **default_controller_bindings,
                              const char *ini_section);
 
 void input_menu_destroy(InputMenu *menu);

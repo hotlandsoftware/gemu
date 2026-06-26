@@ -142,11 +142,60 @@ static void ensure_ini_dir(const char *ini_path) {
 typedef enum {
     MENU_CLOSED,
     MENU_MAIN,
+    MENU_BINDING_OPTIONS,
     MENU_KEY_CAPTURE,
 } MenuPage;
 
-#define MENU_ITEM_MAX  16
+#define MENU_ITEM_MAX  64
 #define INPUT_BINDING_NAME_MAX 64
+#define MENU_CONTROL_INDEX_BASE (-100)
+
+typedef enum {
+    MENU_LIST_MAIN,
+    MENU_LIST_INPUT,
+    MENU_LIST_CONTROLS,
+} MenuList;
+
+typedef enum {
+    MENU_CTL_OPEN,
+    MENU_CTL_ACCEPT,
+    MENU_CTL_BACK,
+    MENU_CTL_UP,
+    MENU_CTL_DOWN,
+    MENU_CTL_LEFT,
+    MENU_CTL_RIGHT,
+    MENU_CTL_COUNT,
+} MenuControl;
+
+static const char *menu_control_names[MENU_CTL_COUNT] = {
+    "Open",
+    "Accept",
+    "Back",
+    "Up",
+    "Down",
+    "Left",
+    "Right",
+};
+
+static const SDL_Keycode menu_control_default_keys[MENU_CTL_COUNT] = {
+    SDLK_TAB,
+    SDLK_RETURN,
+    SDLK_ESCAPE,
+    SDLK_UP,
+    SDLK_DOWN,
+    SDLK_LEFT,
+    SDLK_RIGHT,
+};
+
+static const char *menu_control_default_controllers[MENU_CTL_COUNT] = {
+    "Controller leftshoulder",
+    "Controller a",
+    "Controller b",
+    "Controller dpup",
+    "Controller dpdown",
+    "Controller dpleft",
+    "Controller dpright",
+};
 
 typedef struct {
     SDL_Keycode key;
@@ -156,7 +205,8 @@ typedef struct {
 typedef struct {
     const char *label;
     InputBinding *binding_ptr;
-    bool is_menu_binding;
+    InputBinding *controller_ptr;
+    int binding_index; /* -1 = global menu binding */
     void (*action)(struct InputMenu *);
 } MenuItem;
 
@@ -164,13 +214,21 @@ struct InputMenu {
     char           section[64];
     int            n_buttons;
     const char   **button_names;
+    char          (*controller_button_names)[INPUT_BINDING_NAME_MAX];
     SDL_Keycode   *default_bindings;
-    InputBinding  *bindings;          /* malloc'd, n_buttons entries */
-    InputBinding   menu_binding;
+    char          (*default_controller_bindings)[INPUT_BINDING_NAME_MAX];
+    InputBinding  *key_bindings;        /* malloc'd, n_buttons entries */
+    InputBinding  *controller_bindings; /* malloc'd, n_buttons entries */
+    InputBinding   menu_key_bindings[MENU_CTL_COUNT];
+    InputBinding   menu_controller_bindings[MENU_CTL_COUNT];
 
     MenuPage       page;
+    MenuList       list;
     int            selected;
+    int            option_selected;
     int            capture_index;
+    bool           capture_controller;
+    bool           edit_controller;
     bool           capture_backspace_armed;
     bool           quit_requested;
     bool           reset_requested;
@@ -185,7 +243,11 @@ static void menu_action_reset(InputMenu *m);
 static void menu_action_close(InputMenu *m);
 static void menu_action_quit(InputMenu *m);
 static void menu_action_input(InputMenu *m);
-static void menu_action_menu_key(InputMenu *m);
+static void menu_action_menu_controls(InputMenu *m);
+static void start_binding_options(InputMenu *m, int index, bool controller);
+static void start_capture(InputMenu *m, int index, bool controller);
+static bool binding_matches_controller(const InputBinding *binding,
+                                       const SDL_Event *ev);
 
 /* ── INI load / save (uses m->n_buttons / m->button_names) ─────────────── */
 
@@ -207,6 +269,32 @@ static SDL_Keycode name_to_key(const char *name) {
 static void binding_set_key(InputBinding *binding, SDL_Keycode key) {
     binding->key = key;
     snprintf(binding->name, sizeof(binding->name), "%s", SDL_GetKeyName(key));
+}
+
+static void binding_clear(InputBinding *binding) {
+    binding->key = SDLK_UNKNOWN;
+    binding->name[0] = '\0';
+}
+
+static void binding_set_controller(InputBinding *binding, const char *name) {
+    binding->key = SDLK_UNKNOWN;
+    snprintf(binding->name, sizeof(binding->name), "%s", name ? name : "");
+}
+
+static const char *binding_display_name(const InputBinding *binding) {
+    return (binding && binding->name[0]) ? binding->name : "(none)";
+}
+
+static bool is_menu_control_index(int index) {
+    return index <= MENU_CONTROL_INDEX_BASE;
+}
+
+static int menu_control_from_index(int index) {
+    return MENU_CONTROL_INDEX_BASE - index;
+}
+
+static int menu_control_to_index(int control) {
+    return MENU_CONTROL_INDEX_BASE - control;
 }
 
 static bool controller_binding_name(const SDL_Event *ev, char *out, size_t out_len) {
@@ -272,14 +360,28 @@ static void load_ini(InputMenu *m) {
         char *val = eq + 1;
         while (*val == ' ' || *val == '\t') val++;
 
+        bool controller = false;
+        char *dot = strrchr(key, '.');
+        if (dot && strcasecmp(dot, ".controller") == 0) {
+            *dot = '\0';
+            controller = true;
+        }
+
         for (int i = 0; i < m->n_buttons; i++) {
             if (strcasecmp(key, m->button_names[i]) != 0) continue;
+            if (!*val) {
+                binding_clear(controller ? &m->controller_bindings[i]
+                                         : &m->key_bindings[i]);
+                break;
+            }
             SDL_Keycode k = name_to_key(val);
-            if (k != SDLK_UNKNOWN)
-                binding_set_key(&m->bindings[i], k);
-            else if (strncasecmp(val, "Controller ", 11) == 0) {
-                m->bindings[i].key = SDLK_UNKNOWN;
-                snprintf(m->bindings[i].name, sizeof(m->bindings[i].name), "%s", val);
+            if (controller) {
+                if (strncasecmp(val, "Controller ", 11) == 0)
+                    binding_set_controller(&m->controller_bindings[i], val);
+            } else if (k != SDLK_UNKNOWN) {
+                binding_set_key(&m->key_bindings[i], k);
+            } else if (strncasecmp(val, "Controller ", 11) == 0) {
+                binding_set_controller(&m->controller_bindings[i], val);
             }
             break;
         }
@@ -288,7 +390,11 @@ static void load_ini(InputMenu *m) {
 }
 
 static void load_menu_binding(InputMenu *m) {
-    binding_set_key(&m->menu_binding, SDLK_TAB);
+    for (int i = 0; i < MENU_CTL_COUNT; i++) {
+        binding_set_key(&m->menu_key_bindings[i], menu_control_default_keys[i]);
+        binding_set_controller(&m->menu_controller_bindings[i],
+                               menu_control_default_controllers[i]);
+    }
 
     char path[512];
     build_ini_path(path, sizeof(path));
@@ -321,33 +427,61 @@ static void load_menu_binding(InputMenu *m) {
         while (*key == ' ' || *key == '\t') key++;
         char *ke = key + strlen(key) - 1;
         while (ke >= key && (*ke == ' ' || *ke == '\t')) *ke-- = '\0';
-        if (strcasecmp(key, "Menu") != 0) continue;
+        bool controller = false;
+        char *dot = strrchr(key, '.');
+        if (dot && strcasecmp(dot, ".controller") == 0) {
+            *dot = '\0';
+            controller = true;
+        }
+        int control = -1;
+        for (int i = 0; i < MENU_CTL_COUNT; i++) {
+            if (strcasecmp(key, i == MENU_CTL_OPEN ? "Menu" : menu_control_names[i]) == 0) {
+                control = i;
+                break;
+            }
+        }
+        if (control < 0) continue;
 
         char *val = eq + 1;
         while (*val == ' ' || *val == '\t') val++;
-        SDL_Keycode k = name_to_key(val);
-        if (k != SDLK_UNKNOWN)
-            binding_set_key(&m->menu_binding, k);
-        else if (strncasecmp(val, "Controller ", 11) == 0) {
-            m->menu_binding.key = SDLK_UNKNOWN;
-            snprintf(m->menu_binding.name, sizeof(m->menu_binding.name), "%s", val);
+        if (!*val) {
+            binding_clear(controller ? &m->menu_controller_bindings[control]
+                                     : &m->menu_key_bindings[control]);
+            continue;
         }
-        break;
+        SDL_Keycode k = name_to_key(val);
+        if (controller) {
+            if (strncasecmp(val, "Controller ", 11) == 0)
+                binding_set_controller(&m->menu_controller_bindings[control], val);
+        } else if (k != SDLK_UNKNOWN) {
+            binding_set_key(&m->menu_key_bindings[control], k);
+        } else if (strncasecmp(val, "Controller ", 11) == 0) {
+            binding_set_controller(&m->menu_controller_bindings[control], val);
+        }
     }
     fclose(f);
 }
 
 static void write_ini_section(FILE *fw, const InputMenu *m) {
     fprintf(fw, "[%s]\n", m->section);
-    for (int i = 0; i < m->n_buttons; i++)
+    for (int i = 0; i < m->n_buttons; i++) {
         fprintf(fw, "%s = %s\n", m->button_names[i],
-                m->bindings[i].name);
+                m->key_bindings[i].name);
+        fprintf(fw, "%s.controller = %s\n", m->button_names[i],
+                m->controller_bindings[i].name);
+    }
     fprintf(fw, "\n");
 }
 
 static void write_menu_ini_section(FILE *fw, const InputMenu *m) {
     fprintf(fw, "[input]\n");
-    fprintf(fw, "Menu = %s\n\n", m->menu_binding.name);
+    for (int i = 0; i < MENU_CTL_COUNT; i++) {
+        const char *name = i == MENU_CTL_OPEN ? "Menu" : menu_control_names[i];
+        fprintf(fw, "%s = %s\n", name, m->menu_key_bindings[i].name);
+        fprintf(fw, "%s.controller = %s\n", name,
+                m->menu_controller_bindings[i].name);
+    }
+    fprintf(fw, "\n");
 }
 
 static void save_section(const InputMenu *m, const char *section,
@@ -435,6 +569,7 @@ static void save_menu_binding(const InputMenu *m) {
 /* ── Menu item tables ───────────────────────────────────────────────────── */
 
 static void build_main_menu(InputMenu *m) {
+    m->list = MENU_LIST_MAIN;
     m->n_items = 0;
     m->items[m->n_items++] = (MenuItem){
         .label  = "Input",
@@ -455,21 +590,39 @@ static void build_main_menu(InputMenu *m) {
 }
 
 static void build_input_menu(InputMenu *m) {
+    m->list = MENU_LIST_INPUT;
     m->n_items = 0;
     m->items[m->n_items++] = (MenuItem){
-        .label = "Menu Key",
-        .binding_ptr = &m->menu_binding,
-        .is_menu_binding = true,
-        .action = menu_action_menu_key,
+        .label = "Menu >",
+        .action = menu_action_menu_controls,
     };
     for (int i = 0; i < m->n_buttons; i++) {
         m->items[m->n_items++] = (MenuItem){
-            .label   = m->button_names[i],
-            .binding_ptr = &m->bindings[i],
+            .label = m->button_names[i],
+            .binding_ptr = &m->key_bindings[i],
+            .controller_ptr = &m->controller_bindings[i],
+            .binding_index = i,
         };
     }
     m->items[m->n_items++] = (MenuItem){
         .label  = "(back)",
+        .action = NULL,
+    };
+}
+
+static void build_menu_controls_menu(InputMenu *m) {
+    m->list = MENU_LIST_CONTROLS;
+    m->n_items = 0;
+    for (int i = 0; i < MENU_CTL_COUNT; i++) {
+        m->items[m->n_items++] = (MenuItem){
+            .label = i == MENU_CTL_OPEN ? "Open" : menu_control_names[i],
+            .binding_ptr = &m->menu_key_bindings[i],
+            .controller_ptr = &m->menu_controller_bindings[i],
+            .binding_index = menu_control_to_index(i),
+        };
+    }
+    m->items[m->n_items++] = (MenuItem){
+        .label = "(back)",
         .action = NULL,
     };
 }
@@ -496,20 +649,56 @@ static void menu_action_input(InputMenu *m) {
     m->selected = 0;
 }
 
-static void menu_action_menu_key(InputMenu *m) {
-    m->capture_index = -1;
+static void menu_action_menu_controls(InputMenu *m) {
+    m->page = MENU_MAIN;
+    build_menu_controls_menu(m);
+    m->selected = 0;
+    m->edit_controller = false;
+}
+
+static void start_binding_options(InputMenu *m, int index, bool controller) {
+    m->capture_index = index;
+    m->capture_controller = controller;
+    m->capture_backspace_armed = false;
+    m->option_selected = 0;
+    m->page = MENU_BINDING_OPTIONS;
+}
+
+static void start_capture(InputMenu *m, int index, bool controller) {
+    m->capture_index = index;
+    m->capture_controller = controller;
     m->capture_backspace_armed = false;
     m->page = MENU_KEY_CAPTURE;
 }
 
+static InputBinding *menu_capture_binding(InputMenu *m, bool controller) {
+    if (!is_menu_control_index(m->capture_index))
+        return NULL;
+    int control = menu_control_from_index(m->capture_index);
+    if (control < 0 || control >= MENU_CTL_COUNT)
+        return NULL;
+    return controller ? &m->menu_controller_bindings[control]
+                      : &m->menu_key_bindings[control];
+}
+
 void input_menu_reset_keys(InputMenu *m) {
     if (!m) return;
-    binding_set_key(&m->menu_binding, SDLK_TAB);
+    for (int i = 0; i < MENU_CTL_COUNT; i++) {
+        binding_set_key(&m->menu_key_bindings[i], menu_control_default_keys[i]);
+        binding_set_controller(&m->menu_controller_bindings[i],
+                               menu_control_default_controllers[i]);
+    }
     save_menu_binding(m);
 
-    for (int i = 0; i < m->n_buttons; i++)
-        binding_set_key(&m->bindings[i],
-                        m->default_bindings ? m->default_bindings[i] : SDLK_UNKNOWN);
+    for (int i = 0; i < m->n_buttons; i++) {
+        SDL_Keycode key = m->default_bindings ? m->default_bindings[i] : SDLK_UNKNOWN;
+        if (key != SDLK_UNKNOWN)
+            binding_set_key(&m->key_bindings[i], key);
+        else
+            binding_clear(&m->key_bindings[i]);
+        binding_set_controller(&m->controller_bindings[i],
+                               m->default_controller_bindings ? m->default_controller_bindings[i] : "");
+    }
     if (m->n_buttons > 0)
         save_ini(m);
 
@@ -588,10 +777,44 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
     int ty = my + 6 * s;
 
     /* Title */
+    if (m->page == MENU_BINDING_OPTIONS) {
+        static const char *options[] = { "< Back", "Clear", "Set" };
+        char title[128];
+        snprintf(title, sizeof(title), "%s%s",
+                 m->items[m->selected].label,
+                 m->capture_controller ? " Controller" : "");
+        draw_text(r, mx + 6 * s, ty, "Binding: ", 0xFFFFFFFF, 0x000050FF, s);
+        draw_text(r, mx + 6 * s + 9 * fw, ty, title,
+                  0xFFFFFF00, 0x000050FF, s);
+        ty += fh + 4 * s;
+        SDL_SetRenderDrawColor(r, 60, 60, 180, 255);
+        SDL_RenderDrawLine(r, mx + 4 * s, ty, mx + mw - 4 * s, ty);
+        ty += 4 * s;
+
+        for (int i = 0; i < 3; i++) {
+            uint32_t fg = 0xFFFFFFFF;
+            uint32_t bgc = 0x000050FF;
+            if (i == m->option_selected) {
+                SDL_SetRenderDrawColor(r, 60, 60, 180, 255);
+                SDL_RenderFillRect(r, &(SDL_Rect){
+                    mx + 4 * s, ty - s, mw - 8 * s, fh + 2 * s
+                });
+                fg = 0xFF000000;
+                bgc = 0x3C3CB4FF;
+            }
+            draw_text(r, mx + 8 * s, ty, options[i], fg, bgc, s);
+            ty += fh + 2 * s;
+        }
+        return;
+    }
+
     if (m->page == MENU_KEY_CAPTURE) {
-        draw_text(r, mx + 6 * s, ty, "Press key for: ", 0xFFFFFFFF, 0x000050FF, s);
-        draw_text(r, mx + 6 * s + 15 * fw, ty,
-                  m->capture_index < 0 ? "Menu" : m->button_names[m->capture_index],
+        char title[128];
+        snprintf(title, sizeof(title), "%s%s",
+                 m->items[m->selected].label,
+                 m->capture_controller ? " Controller" : "");
+        draw_text(r, mx + 6 * s, ty, "Press input for: ", 0xFFFFFFFF, 0x000050FF, s);
+        draw_text(r, mx + 6 * s + 17 * fw, ty, title,
                   0xFFFFFF00, 0x000050FF, s);
         draw_text(r, mx + 6 * s, ty + fh + 4 * s,
                   m->capture_backspace_armed ? "(Backspace again to cancel)"
@@ -600,10 +823,13 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
         return;
     }
 
-    bool is_input_submenu = (m->n_items > 0 && m->items[0].binding_ptr != NULL);
+    bool is_binding_menu = (m->list == MENU_LIST_INPUT ||
+                            m->list == MENU_LIST_CONTROLS);
 
-    if (is_input_submenu)
+    if (m->list == MENU_LIST_INPUT)
         draw_text(r, mx + 6 * s, ty, m->section, 0xFFFFFFFF, 0x000050FF, s);
+    else if (m->list == MENU_LIST_CONTROLS)
+        draw_text(r, mx + 6 * s, ty, "Menu", 0xFFFFFFFF, 0x000050FF, s);
     else
         draw_text(r, mx + 6 * s, ty, "Main Menu", 0xFFFFFFFF, 0x000050FF, s);
     ty += fh + 4 * s;
@@ -629,10 +855,23 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
 
         draw_text(r, mx + 8 * s, ty, m->items[i].label, fg, bg, s);
 
-        if (m->items[i].binding_ptr) {
-            const char *kname = m->items[i].binding_ptr->name;
-            int kw = (int)strlen(kname) * fw;
-            draw_text(r, mx + mw - 8 * s - kw, ty, kname, fg, bg, s);
+        if (is_binding_menu && m->items[i].binding_ptr) {
+            const char *kname = binding_display_name(m->items[i].binding_ptr);
+            const char *cname = m->items[i].controller_ptr
+                              ? binding_display_name(m->items[i].controller_ptr)
+                              : "(none)";
+            char pair[192];
+            if (i == m->selected && m->edit_controller && m->items[i].controller_ptr)
+                snprintf(pair, sizeof(pair), "%s / [%s]", kname, cname);
+            else if (i == m->selected)
+                snprintf(pair, sizeof(pair), "[%s] / %s", kname, cname);
+            else
+                snprintf(pair, sizeof(pair), "%s / %s", kname, cname);
+            int kw = (int)strlen(pair) * fw;
+            int x = mx + mw - 8 * s - kw;
+            if (x < mx + 8 * s + 12 * fw)
+                x = mx + 8 * s + 12 * fw;
+            draw_text(r, x, ty, pair, fg, bg, s);
         }
 
         ty += fh + 2 * s;
@@ -644,6 +883,63 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
 bool input_menu_handle_event(InputMenu *m, const SDL_Event *ev) {
     if (!m || m->page == MENU_CLOSED) return false;
 
+    if (m->page == MENU_BINDING_OPTIONS) {
+        bool go_up = false, go_down = false, accept = false, back = false;
+        if (ev->type == SDL_KEYDOWN) {
+            SDL_Keycode sym = ev->key.keysym.sym;
+            go_up = sym == m->menu_key_bindings[MENU_CTL_UP].key;
+            go_down = sym == m->menu_key_bindings[MENU_CTL_DOWN].key;
+            accept = sym == m->menu_key_bindings[MENU_CTL_ACCEPT].key;
+            back = sym == m->menu_key_bindings[MENU_CTL_BACK].key ||
+                   sym == SDLK_BACKSPACE;
+        } else if (binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_UP], ev)) {
+            go_up = true;
+        } else if (binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_DOWN], ev)) {
+            go_down = true;
+        } else if (binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_ACCEPT], ev)) {
+            accept = true;
+        } else if (binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_BACK], ev)) {
+            back = true;
+        } else {
+            return true;
+        }
+
+        if (go_up) {
+            m->option_selected = (m->option_selected + 2) % 3;
+            return true;
+        }
+        if (go_down) {
+            m->option_selected = (m->option_selected + 1) % 3;
+            return true;
+        }
+        if (back) {
+            m->page = MENU_MAIN;
+            return true;
+        }
+        if (accept) {
+            if (m->option_selected == 0) {
+                m->page = MENU_MAIN;
+            } else if (m->option_selected == 1) {
+                if (is_menu_control_index(m->capture_index)) {
+                    InputBinding *key = menu_capture_binding(m, false);
+                    InputBinding *controller = menu_capture_binding(m, true);
+                    if (key) binding_clear(key);
+                    if (controller) binding_clear(controller);
+                    save_menu_binding(m);
+                } else {
+                    binding_clear(&m->key_bindings[m->capture_index]);
+                    binding_clear(&m->controller_bindings[m->capture_index]);
+                    save_ini(m);
+                }
+                m->page = MENU_MAIN;
+            } else {
+                start_capture(m, m->capture_index, m->capture_controller);
+            }
+            return true;
+        }
+        return true;
+    }
+
     /* Key capture mode: record the next non-modifier key */
     if (m->page == MENU_KEY_CAPTURE) {
         if (ev->type == SDL_CONTROLLERBUTTONDOWN ||
@@ -651,12 +947,12 @@ bool input_menu_handle_event(InputMenu *m, const SDL_Event *ev) {
             char name[INPUT_BINDING_NAME_MAX];
             if (!controller_binding_name(ev, name, sizeof(name)))
                 return true;
-            InputBinding *binding = m->capture_index < 0
-                                  ? &m->menu_binding
-                                  : &m->bindings[m->capture_index];
-            binding->key = SDLK_UNKNOWN;
-            snprintf(binding->name, sizeof(binding->name), "%s", name);
-            if (m->capture_index < 0)
+            InputBinding *binding = is_menu_control_index(m->capture_index)
+                                  ? menu_capture_binding(m, true)
+                                  : &m->controller_bindings[m->capture_index];
+            if (!binding) return true;
+            binding_set_controller(binding, name);
+            if (is_menu_control_index(m->capture_index))
                 save_menu_binding(m);
             else
                 save_ini(m);
@@ -681,11 +977,13 @@ bool input_menu_handle_event(InputMenu *m, const SDL_Event *ev) {
             sym == SDLK_LALT   || sym == SDLK_RALT ||
             sym == SDLK_LGUI   || sym == SDLK_RGUI)
             return true;
-        if (m->capture_index < 0) {
-            binding_set_key(&m->menu_binding, sym);
+        if (is_menu_control_index(m->capture_index)) {
+            InputBinding *binding = menu_capture_binding(m, false);
+            if (!binding) return true;
+            binding_set_key(binding, sym);
             save_menu_binding(m);
         } else {
-            binding_set_key(&m->bindings[m->capture_index], sym);
+            binding_set_key(&m->key_bindings[m->capture_index], sym);
             save_ini(m);
         }
         m->page = MENU_MAIN;
@@ -698,65 +996,97 @@ bool input_menu_handle_event(InputMenu *m, const SDL_Event *ev) {
         return true;
     }
 
-    if (ev->type != SDL_KEYDOWN) return m->page != MENU_CLOSED;
-    SDL_Keycode sym = ev->key.keysym.sym;
+    bool go_up = false, go_down = false, go_left = false, go_right = false;
+    bool accept = false, back = false;
+    if (ev->type == SDL_KEYDOWN) {
+        SDL_Keycode sym = ev->key.keysym.sym;
+        go_up = sym == m->menu_key_bindings[MENU_CTL_UP].key;
+        go_down = sym == m->menu_key_bindings[MENU_CTL_DOWN].key;
+        go_left = sym == m->menu_key_bindings[MENU_CTL_LEFT].key;
+        go_right = sym == m->menu_key_bindings[MENU_CTL_RIGHT].key;
+        accept = sym == m->menu_key_bindings[MENU_CTL_ACCEPT].key;
+        back = sym == m->menu_key_bindings[MENU_CTL_BACK].key;
+    } else if (binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_UP], ev)) {
+        go_up = true;
+    } else if (binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_DOWN], ev)) {
+        go_down = true;
+    } else if (binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_LEFT], ev)) {
+        go_left = true;
+    } else if (binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_RIGHT], ev)) {
+        go_right = true;
+    } else if (binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_ACCEPT], ev)) {
+        accept = true;
+    } else if (binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_BACK], ev)) {
+        back = true;
+    } else {
+        return m->page != MENU_CLOSED;
+    }
 
-    bool is_input_submenu = (m->items[0].binding_ptr != NULL);
+    bool is_binding_menu = (m->list == MENU_LIST_INPUT ||
+                            m->list == MENU_LIST_CONTROLS);
 
-    switch (sym) {
-    case SDLK_TAB:
-        m->page = MENU_CLOSED;
-        return true;
-    case SDLK_UP:
+    if (go_up) {
         if (m->selected > 0)
             m->selected--;
         else
             m->selected = m->n_items - 1;
         return true;
-    case SDLK_DOWN:
+    }
+    if (go_down) {
         if (m->selected < m->n_items - 1)
             m->selected++;
         else
             m->selected = 0;
         return true;
-    case SDLK_RETURN:
-    case SDLK_KP_ENTER:
-        if (is_input_submenu) {
-            if (m->items[m->selected].is_menu_binding) {
-                menu_action_menu_key(m);
-            } else if (m->items[m->selected].binding_ptr) {
-                m->capture_index = 0;
-                m->capture_backspace_armed = false;
-                for (int i = 0; i < m->n_buttons; i++) {
-                    if (m->items[m->selected].binding_ptr == &m->bindings[i]) {
-                        m->capture_index = i;
-                        break;
-                    }
-                }
-                m->page = MENU_KEY_CAPTURE;
+    }
+    if (go_left) {
+        if (is_binding_menu && m->items[m->selected].binding_ptr)
+            m->edit_controller = false;
+        return true;
+    }
+    if (go_right) {
+        if (is_binding_menu && m->items[m->selected].controller_ptr)
+            m->edit_controller = true;
+        return true;
+    }
+    if (accept) {
+        if (is_binding_menu) {
+            if (m->items[m->selected].binding_ptr) {
+                start_binding_options(m, m->items[m->selected].binding_index,
+                                      m->edit_controller && m->items[m->selected].controller_ptr);
+            } else if (m->items[m->selected].action) {
+                m->items[m->selected].action(m);
+            } else if (m->list == MENU_LIST_CONTROLS) {
+                build_input_menu(m);
+                m->page = MENU_MAIN;
+                m->selected = 0;
+                m->edit_controller = false;
             } else {
                 build_main_menu(m);
                 m->page = MENU_MAIN;
                 m->selected = 0;
+                m->edit_controller = false;
             }
-        } else {
-            if (m->items[m->selected].is_menu_binding)
-                menu_action_menu_key(m);
-            else if (m->items[m->selected].action)
-                m->items[m->selected].action(m);
+        } else if (m->items[m->selected].action) {
+            m->items[m->selected].action(m);
         }
         return true;
-    case SDLK_ESCAPE:
-        if (is_input_submenu) {
+    }
+    if (back) {
+        if (m->list == MENU_LIST_CONTROLS) {
+            build_input_menu(m);
+            m->page = MENU_MAIN;
+            m->selected = 0;
+            m->edit_controller = false;
+        } else if (m->list == MENU_LIST_INPUT) {
             build_main_menu(m);
             m->page = MENU_MAIN;
             m->selected = 0;
+            m->edit_controller = false;
         } else {
             m->page = MENU_CLOSED;
         }
         return true;
-    default:
-        break;
     }
 
     return m->page != MENU_CLOSED;
@@ -768,6 +1098,7 @@ InputMenu *input_menu_create(SDL_Renderer *renderer,
                              int n_buttons,
                              const char **button_names,
                              const SDL_Keycode *default_bindings,
+                             const char **default_controller_bindings,
                              const char *ini_section) {
     (void)renderer;
     InputMenu *m = calloc(1, sizeof(*m));
@@ -783,18 +1114,46 @@ InputMenu *input_menu_create(SDL_Renderer *renderer,
         memcpy(m->button_names, button_names,
                (size_t)n_buttons * sizeof(*m->button_names));
     }
+    m->controller_button_names = calloc(n_buttons ? (size_t)n_buttons : 1,
+                                        sizeof(*m->controller_button_names));
+    if (!m->controller_button_names) { free(m->button_names); free(m); return NULL; }
+    for (int i = 0; i < n_buttons; i++)
+        snprintf(m->controller_button_names[i], INPUT_BINDING_NAME_MAX,
+                 "%s Controller", m->button_names[i]);
     m->default_bindings = calloc(n_buttons ? (size_t)n_buttons : 1,
                                  sizeof(*m->default_bindings));
-    if (!m->default_bindings) { free(m->button_names); free(m); return NULL; }
+    if (!m->default_bindings) {
+        free(m->controller_button_names); free(m->button_names); free(m); return NULL;
+    }
     if (n_buttons > 0 && default_bindings)
         memcpy(m->default_bindings, default_bindings,
                (size_t)n_buttons * sizeof(*m->default_bindings));
+    m->default_controller_bindings = calloc(n_buttons ? (size_t)n_buttons : 1,
+                                            sizeof(*m->default_controller_bindings));
+    if (!m->default_controller_bindings) {
+        free(m->default_bindings); free(m->controller_button_names);
+        free(m->button_names); free(m); return NULL;
+    }
+    if (n_buttons > 0 && default_controller_bindings) {
+        for (int i = 0; i < n_buttons; i++)
+            snprintf(m->default_controller_bindings[i], INPUT_BINDING_NAME_MAX,
+                     "%s", default_controller_bindings[i] ? default_controller_bindings[i] : "");
+    }
     /* allocate at least 1 to avoid malloc(0) portability issues */
-    m->bindings = calloc(n_buttons ? (size_t)n_buttons : 1, sizeof(*m->bindings));
-    if (!m->bindings) { free(m->default_bindings); free(m->button_names); free(m); return NULL; }
+    m->key_bindings = calloc(n_buttons ? (size_t)n_buttons : 1, sizeof(*m->key_bindings));
+    m->controller_bindings = calloc(n_buttons ? (size_t)n_buttons : 1, sizeof(*m->controller_bindings));
+    if (!m->key_bindings || !m->controller_bindings) {
+        free(m->controller_bindings); free(m->key_bindings);
+        free(m->default_controller_bindings); free(m->default_bindings);
+        free(m->controller_button_names); free(m->button_names); free(m); return NULL;
+    }
     if (n_buttons > 0 && default_bindings) {
         for (int i = 0; i < n_buttons; i++)
-            binding_set_key(&m->bindings[i], default_bindings[i]);
+            binding_set_key(&m->key_bindings[i], default_bindings[i]);
+    }
+    if (n_buttons > 0 && default_controller_bindings) {
+        for (int i = 0; i < n_buttons; i++)
+            binding_set_controller(&m->controller_bindings[i], default_controller_bindings[i]);
     }
     load_menu_binding(m);
     load_ini(m);
@@ -809,8 +1168,11 @@ InputMenu *input_menu_create(SDL_Renderer *renderer,
 void input_menu_destroy(InputMenu *m) {
     if (!m) return;
     free(m->button_names);
+    free(m->controller_button_names);
     free(m->default_bindings);
-    free(m->bindings);
+    free(m->default_controller_bindings);
+    free(m->key_bindings);
+    free(m->controller_bindings);
     free(m);
 }
 
@@ -826,8 +1188,7 @@ bool input_menu_toggle(InputMenu *m) {
 }
 
 static bool binding_matches_controller(const InputBinding *binding,
-                                       const SDL_Event *ev,
-                                       bool allow_default_l1) {
+                                       const SDL_Event *ev) {
     if (ev->type != SDL_CONTROLLERBUTTONDOWN &&
         ev->type != SDL_CONTROLLERAXISMOTION)
         return false;
@@ -837,15 +1198,15 @@ static bool binding_matches_controller(const InputBinding *binding,
         return false;
     if (strcasecmp(binding->name, name) == 0)
         return true;
-    return allow_default_l1 && strcasecmp(name, "Controller leftshoulder") == 0;
+    return false;
 }
 
 bool input_menu_event_opens(const InputMenu *m, const SDL_Event *ev) {
     if (!m || !ev) return false;
     if (ev->type == SDL_KEYDOWN)
-        return m->menu_binding.key != SDLK_UNKNOWN &&
-               ev->key.keysym.sym == m->menu_binding.key;
-    return binding_matches_controller(&m->menu_binding, ev, true);
+        return m->menu_key_bindings[MENU_CTL_OPEN].key != SDLK_UNKNOWN &&
+               ev->key.keysym.sym == m->menu_key_bindings[MENU_CTL_OPEN].key;
+    return binding_matches_controller(&m->menu_controller_bindings[MENU_CTL_OPEN], ev);
 }
 
 bool input_menu_is_open(const InputMenu *m) {
@@ -870,7 +1231,7 @@ void input_menu_clear_actions(InputMenu *m) {
 int input_menu_key_to_btn_index(const InputMenu *m, SDL_Keycode key) {
     if (!m) return -1;
     for (int i = 0; i < m->n_buttons; i++)
-        if (key == m->bindings[i].key)
+        if (key == m->key_bindings[i].key)
             return i;
     return -1;
 }

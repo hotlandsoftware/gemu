@@ -69,9 +69,10 @@ static void build_bindings(CacaBackend *b, const GemuDisplayConfig *cfg) {
     for (int i = 0; i < cfg->n_actions && b->n_bindings < CACA_MAX_BINDINGS; i++) {
         const GemuActionDef *def = &cfg->actions[i];
         char val[64] = "";
+        bool has_binding = false;
         if (cfg->ini_section)
-            gemu_ini_read(cfg->ini_section, def->name, val, sizeof(val));
-        const char *key_name = (val[0]) ? val : def->default_key;
+            has_binding = gemu_ini_read(cfg->ini_section, def->name, val, sizeof(val));
+        const char *key_name = has_binding ? val : def->default_key;
         int ck = sdl_name_to_caca(key_name);
         if (!ck) continue;
         b->bindings[b->n_bindings].key = ck;

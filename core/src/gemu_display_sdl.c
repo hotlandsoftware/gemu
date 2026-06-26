@@ -61,6 +61,8 @@ typedef struct {
 
 /* ── Binding table ───────────────────────────────────────────────────────── */
 
+static const char *default_controller_binding(const GemuActionDef *def);
+
 static void build_bindings(SdlBackend *b) {
     b->n_bindings   = 0;
     b->n_controller_bindings = 0;
@@ -69,13 +71,34 @@ static void build_bindings(SdlBackend *b) {
     for (int i = 0; i < b->n_actions && b->n_bindings < SDL_MAX_BINDINGS; i++) {
         const GemuActionDef *def = &b->action_defs[i];
         char val[64] = "";
+        bool has_key_binding = false;
         if (b->ini_section)
-            gemu_ini_read(b->ini_section, def->name, val, sizeof(val));
-        const char *key_name = (val[0]) ? val : def->default_key;
+            has_key_binding = gemu_ini_read(b->ini_section, def->name, val, sizeof(val));
+        const char *key_name = has_key_binding ? val : def->default_key;
 
-        if (strncmp(key_name, "Controller ", 11) == 0 &&
+        SDL_Keycode kc = SDL_GetKeyFromName(key_name);
+        if (kc != SDLK_UNKNOWN) {
+            b->bindings[b->n_bindings].key = kc;
+            b->bindings[b->n_bindings].bit = def->bit;
+            b->n_bindings++;
+
+            if (kc == SDLK_TAB) b->tab_is_action = true;
+        }
+
+        char controller_val[64] = "";
+        char controller_key[96];
+        snprintf(controller_key, sizeof(controller_key), "%s.controller", def->name);
+        bool has_controller_binding = false;
+        if (b->ini_section)
+            has_controller_binding = gemu_ini_read(b->ini_section, controller_key,
+                                                   controller_val, sizeof(controller_val));
+        const char *controller_name = has_controller_binding
+                                    ? controller_val
+                                    : default_controller_binding(def);
+
+        if (controller_name && strncmp(controller_name, "Controller ", 11) == 0 &&
             b->n_controller_bindings < SDL_MAX_BINDINGS) {
-            const char *name = key_name + 11;
+            const char *name = controller_name + 11;
             size_t len = strlen(name);
             int axis_dir = 0;
             char axis_name[64];
@@ -94,7 +117,6 @@ static void build_bindings(SdlBackend *b) {
                         .axis_dir = axis_dir,
                         .bit = def->bit,
                     };
-                    continue;
                 }
             } else {
                 SDL_GameControllerButton button = SDL_GameControllerGetButtonFromString(name);
@@ -105,19 +127,9 @@ static void build_bindings(SdlBackend *b) {
                         .axis_dir = 0,
                         .bit = def->bit,
                     };
-                    continue;
                 }
             }
         }
-
-        SDL_Keycode kc = SDL_GetKeyFromName(key_name);
-        if (kc == SDLK_UNKNOWN) continue;
-
-        b->bindings[b->n_bindings].key = kc;
-        b->bindings[b->n_bindings].bit = def->bit;
-        b->n_bindings++;
-
-        if (kc == SDLK_TAB) b->tab_is_action = true;
     }
 }
 
@@ -132,23 +144,6 @@ static const char *default_controller_binding(const GemuActionDef *def) {
     if (strcasecmp(def->name, "Left") == 0)   return "Controller dpleft";
     if (strcasecmp(def->name, "Right") == 0)  return "Controller dpright";
     return NULL;
-}
-
-static void build_default_controller_bindings(SdlBackend *b) {
-    if (b->n_controller_bindings > 0) return;
-    for (int i = 0; i < b->n_actions && b->n_controller_bindings < SDL_MAX_BINDINGS; i++) {
-        const char *binding = default_controller_binding(&b->action_defs[i]);
-        if (!binding) continue;
-        const char *name = binding + 11;
-        SDL_GameControllerButton button = SDL_GameControllerGetButtonFromString(name);
-        if (button == SDL_CONTROLLER_BUTTON_INVALID) continue;
-        b->controller_bindings[b->n_controller_bindings++] = (SdlControllerBinding){
-            .button = button,
-            .axis = SDL_CONTROLLER_AXIS_INVALID,
-            .axis_dir = 0,
-            .bit = b->action_defs[i].bit,
-        };
-    }
 }
 
 static uint32_t key_to_bits(const SdlBackend *b, SDL_Keycode kc) {
@@ -397,7 +392,6 @@ static void sdl_do_reset_input_bindings(GemuDisplay *d) {
     if (!b->menu) return;
     input_menu_reset_keys(b->menu);
     build_bindings(b);
-    build_default_controller_bindings(b);
 }
 
 static void sdl_do_destroy(GemuDisplay *d) {
@@ -449,7 +443,6 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
 
     /* Build action→key binding table */
     build_bindings(b);
-    build_default_controller_bindings(b);
 
     /* InputMenu: create whenever ini_section is set so Tab always opens a menu
      * (at minimum: Reset / Close Menu / Quit).  When no_rebind is set or there
@@ -459,13 +452,17 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
                  ? 0 : cfg->n_actions;
         SDL_Keycode *defaults = nb ? calloc((size_t)nb, sizeof(SDL_Keycode)) : NULL;
         const char **names    = nb ? calloc((size_t)nb, sizeof(char *))      : NULL;
-        if (nb == 0 || (defaults && names)) {
+        const char **controller_defaults = nb ? calloc((size_t)nb, sizeof(char *)) : NULL;
+        if (nb == 0 || (defaults && names && controller_defaults)) {
             for (int i = 0; i < nb; i++) {
-                names[i]    = cfg->actions[i].name;
-                defaults[i] = SDL_GetKeyFromName(cfg->actions[i].default_key);
+                names[i]               = cfg->actions[i].name;
+                defaults[i]            = SDL_GetKeyFromName(cfg->actions[i].default_key);
+                controller_defaults[i] = default_controller_binding(&cfg->actions[i]);
             }
-            b->menu = input_menu_create(NULL, nb, names, defaults, cfg->ini_section);
+            b->menu = input_menu_create(NULL, nb, names, defaults,
+                                        controller_defaults, cfg->ini_section);
         }
+        free(controller_defaults);
         free(names);
         free(defaults);
         if (b->menu)
