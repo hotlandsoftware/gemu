@@ -535,7 +535,7 @@ void rob_window_render(RobWindow *w, const RobState *rob) {
              * θ = atan(0.020/0.149) ≈ 0.133 rad ≈ 7.6°.
              * The old 0.436 rad used the bounding-box extent (z=±0.075) which
              * is the arm BASE, not the tip — that triple-overshot and crossed. */
-            float close_ang = state->hands_open ? 0.0f : 0.133f; /* 7.6°: tips meet at z=0 */
+            float close_ang = state->hands_open ? -0.070f : 0.133f;
             /* arm_idx 0 is at −Z: closing needs a negative Y rotation (moves −z toward 0).
              * arm_idx 1 is at +Z: closing needs a positive Y rotation (moves +z toward 0). */
             float fdir = (rm->arm_idx == 0) ? -1.0f : 1.0f;
