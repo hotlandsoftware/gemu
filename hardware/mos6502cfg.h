@@ -35,6 +35,7 @@ typedef enum {
     NES_DEVICE_ZAPPER,      /* NES Zapper light gun */
     NES_DEVICE_KEYBOARD,    /* Famicom Keyboard */
     NES_DEVICE_ROB,         /* R.O.B. (Robotic Operating Buddy) */
+    NES_DEVICE_ROB_FAMICOM, /* Family Computer Robot */
 } NesDeviceType;
 
 #define NES_PORTS 2

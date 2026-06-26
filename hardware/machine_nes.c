@@ -43,6 +43,10 @@ static const GemuActionDef nes_actions[NES_N_ACTIONS] = {
     { "Right",  GEMU_ACTION(7), "Right"       },  /* NES_BTN_RIGHT  = 0x80 */
 };
 
+static bool nes_device_is_rob(NesDeviceType dev) {
+    return dev == NES_DEVICE_ROB || dev == NES_DEVICE_ROB_FAMICOM;
+}
+
 /* GTK Debug > Hex Editor menu callback (body is no-op when GTK disabled). */
 static void nes_hex_toggle(void *ud) {
 #ifdef GEMU_GTK
@@ -851,7 +855,7 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
             return trigger | light;
         }
         if (s->cfg->ports[1] != NES_DEVICE_CONTROLLER &&
-            s->cfg->ports[1] != NES_DEVICE_ROB) return 0;
+            !nes_device_is_rob(s->cfg->ports[1])) return 0;
         if (s->ctrl_strobe) return (s->ctrl_state[1] & NES_BTN_A) ? 1u : 0u;
         uint8_t bit = s->ctrl_shift[1] & 1;
         s->ctrl_shift[1] = (s->ctrl_shift[1] >> 1) | 0x80u;
@@ -1542,9 +1546,10 @@ NesState *nes_create(const MosConfig *cfg) {
 
 #ifdef HAVE_ROB
     for (int p = 0; p < cfg->n_ports; p++) {
-        if (cfg->ports[p] == NES_DEVICE_ROB) {
+        if (nes_device_is_rob(cfg->ports[p])) {
             rob_init(&s->rob);
-            s->rob_window = rob_window_create("mdl/rob");
+            s->rob_window = rob_window_create("mdl/rob",
+                                              cfg->ports[p] == NES_DEVICE_ROB_FAMICOM);
             break;
         }
     }
@@ -1726,7 +1731,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                 gemu_vnc_update(s->vnc, s->ppu.pixels,
                                 RP2C02_WIDTH, RP2C02_HEIGHT);
 #ifdef HAVE_ROB
-            if (s->cfg->n_ports > 1 && s->cfg->ports[1] == NES_DEVICE_ROB) {
+            if (s->cfg->n_ports > 1 && nes_device_is_rob(s->cfg->ports[1])) {
                 rob_frame(&s->rob, s->ppu.pixels_argb, RP2C02_WIDTH, RP2C02_HEIGHT);
                 s->ctrl_state[1] = 0;
                 if (s->rob.btn_a) s->ctrl_state[1] |= NES_BTN_A;

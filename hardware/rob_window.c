@@ -216,6 +216,7 @@ struct RobWindow {
     float         cam_pitch;  /* vertical angle above horizontal (radians) */
     float         cam_dist;   /* distance from look-at target */
     bool          dragging;
+    bool          famicom_skin;
 };
 
 static void draw_cylinder(RobWindow *w, Mat4 pv, float x, float y, float z,
@@ -367,12 +368,20 @@ static void load_node(RobWindow *w, const struct aiScene *sc,
 
         if (strcmp(name, "Base and Head") == 0 ||
             strcmp(name, "Shoulders") == 0) {
-            rm->color[0] = 0.68f; rm->color[1] = 0.68f; rm->color[2] = 0.68f;
+            if (w->famicom_skin) {
+                rm->color[0] = 0.88f; rm->color[1] = 0.84f; rm->color[2] = 0.76f;
+            } else {
+                rm->color[0] = 0.68f; rm->color[1] = 0.68f; rm->color[2] = 0.68f;
+            }
         } else if (strcmp(name, "Spine") == 0) {
             rm->color[0] = 0.08f; rm->color[1] = 0.08f; rm->color[2] = 0.08f;
         } else if (strcmp(name, "Arms") == 0 ||
                    strcmp(name, "Arms.001") == 0) {
-            rm->color[0] = 0.36f; rm->color[1] = 0.36f; rm->color[2] = 0.34f;
+            if (w->famicom_skin) {
+                rm->color[0] = 0.62f; rm->color[1] = 0.03f; rm->color[2] = 0.02f;
+            } else {
+                rm->color[0] = 0.36f; rm->color[1] = 0.36f; rm->color[2] = 0.34f;
+            }
         }
 
         /* Translation from node transform (aiMatrix4x4 is row-major) */
@@ -400,7 +409,7 @@ static void load_node(RobWindow *w, const struct aiScene *sc,
 /* ── Public API ──────────────────────────────────────────────────────────── */
 static int SDLCALL rob_event_watch(void *ud, SDL_Event *e);
 
-RobWindow *rob_window_create(const char *model_dir) {
+RobWindow *rob_window_create(const char *model_dir, bool famicom_skin) {
     char path[512];
     snprintf(path, sizeof path, "%s/ROB.gltf", model_dir);
 
@@ -412,6 +421,7 @@ RobWindow *rob_window_create(const char *model_dir) {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
     RobWindow *w = calloc(1, sizeof *w);
+    w->famicom_skin = famicom_skin;
     w->win = SDL_CreateWindow("GEMU (R.O.B. Display)", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
                               ROB_WIN_W, ROB_WIN_H, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
     if (!w->win) {

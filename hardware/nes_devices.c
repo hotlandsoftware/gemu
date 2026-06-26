@@ -47,6 +47,15 @@ static const NesDeviceDesc devices[] = {
         .default_bindings= NULL,
         .ini_section     = NULL,
     },
+    {
+        .name            = "rob-famicom",
+        .desc            = "Family Computer Robot",
+        .type            = NES_DEVICE_ROB_FAMICOM,
+        .n_buttons       = 0,
+        .button_names    = NULL,
+        .default_bindings= NULL,
+        .ini_section     = NULL,
+    },
 };
 
 const NesDeviceDesc *nes_device_list(int *count) {
