@@ -16,6 +16,14 @@
 #include "input_menu.h"
 
 #define SDL_MAX_BINDINGS GEMU_DISPLAY_MAX_ACTIONS
+#define SDL_CONTROLLER_DEADZONE 16000
+
+typedef struct {
+    SDL_GameControllerButton button;
+    SDL_GameControllerAxis   axis;
+    int                      axis_dir;
+    uint32_t                 bit;
+} SdlControllerBinding;
 
 typedef struct {
     GemuVideoSdl *video;
@@ -24,6 +32,9 @@ typedef struct {
     /* key → action bit mapping, built from action table + INI overrides */
     struct { SDL_Keycode key; uint32_t bit; } bindings[SDL_MAX_BINDINGS];
     int n_bindings;
+    SdlControllerBinding controller_bindings[SDL_MAX_BINDINGS];
+    int n_controller_bindings;
+    SDL_GameController *controller;
 
     /* SDL_SCANCODE_TAB is intercepted for the rebind menu when Tab is not
      * bound to any game action. */
@@ -52,6 +63,7 @@ typedef struct {
 
 static void build_bindings(SdlBackend *b) {
     b->n_bindings   = 0;
+    b->n_controller_bindings = 0;
     b->tab_is_action = false;
 
     for (int i = 0; i < b->n_actions && b->n_bindings < SDL_MAX_BINDINGS; i++) {
@@ -60,6 +72,44 @@ static void build_bindings(SdlBackend *b) {
         if (b->ini_section)
             gemu_ini_read(b->ini_section, def->name, val, sizeof(val));
         const char *key_name = (val[0]) ? val : def->default_key;
+
+        if (strncmp(key_name, "Controller ", 11) == 0 &&
+            b->n_controller_bindings < SDL_MAX_BINDINGS) {
+            const char *name = key_name + 11;
+            size_t len = strlen(name);
+            int axis_dir = 0;
+            char axis_name[64];
+            snprintf(axis_name, sizeof(axis_name), "%s", name);
+            if (len > 1 && (axis_name[len - 1] == '+' || axis_name[len - 1] == '-')) {
+                axis_dir = axis_name[len - 1] == '-' ? -1 : 1;
+                axis_name[len - 1] = '\0';
+            }
+
+            if (axis_dir) {
+                SDL_GameControllerAxis axis = SDL_GameControllerGetAxisFromString(axis_name);
+                if (axis != SDL_CONTROLLER_AXIS_INVALID) {
+                    b->controller_bindings[b->n_controller_bindings++] = (SdlControllerBinding){
+                        .button = SDL_CONTROLLER_BUTTON_INVALID,
+                        .axis = axis,
+                        .axis_dir = axis_dir,
+                        .bit = def->bit,
+                    };
+                    continue;
+                }
+            } else {
+                SDL_GameControllerButton button = SDL_GameControllerGetButtonFromString(name);
+                if (button != SDL_CONTROLLER_BUTTON_INVALID) {
+                    b->controller_bindings[b->n_controller_bindings++] = (SdlControllerBinding){
+                        .button = button,
+                        .axis = SDL_CONTROLLER_AXIS_INVALID,
+                        .axis_dir = 0,
+                        .bit = def->bit,
+                    };
+                    continue;
+                }
+            }
+        }
+
         SDL_Keycode kc = SDL_GetKeyFromName(key_name);
         if (kc == SDLK_UNKNOWN) continue;
 
@@ -68,6 +118,36 @@ static void build_bindings(SdlBackend *b) {
         b->n_bindings++;
 
         if (kc == SDLK_TAB) b->tab_is_action = true;
+    }
+}
+
+static const char *default_controller_binding(const GemuActionDef *def) {
+    if (!def || !def->name) return NULL;
+    if (strcasecmp(def->name, "A") == 0)      return "Controller A";
+    if (strcasecmp(def->name, "B") == 0)      return "Controller B";
+    if (strcasecmp(def->name, "Select") == 0) return "Controller Back";
+    if (strcasecmp(def->name, "Start") == 0)  return "Controller Start";
+    if (strcasecmp(def->name, "Up") == 0)     return "Controller dpup";
+    if (strcasecmp(def->name, "Down") == 0)   return "Controller dpdown";
+    if (strcasecmp(def->name, "Left") == 0)   return "Controller dpleft";
+    if (strcasecmp(def->name, "Right") == 0)  return "Controller dpright";
+    return NULL;
+}
+
+static void build_default_controller_bindings(SdlBackend *b) {
+    if (b->n_controller_bindings > 0) return;
+    for (int i = 0; i < b->n_actions && b->n_controller_bindings < SDL_MAX_BINDINGS; i++) {
+        const char *binding = default_controller_binding(&b->action_defs[i]);
+        if (!binding) continue;
+        const char *name = binding + 11;
+        SDL_GameControllerButton button = SDL_GameControllerGetButtonFromString(name);
+        if (button == SDL_CONTROLLER_BUTTON_INVALID) continue;
+        b->controller_bindings[b->n_controller_bindings++] = (SdlControllerBinding){
+            .button = button,
+            .axis = SDL_CONTROLLER_AXIS_INVALID,
+            .axis_dir = 0,
+            .bit = b->action_defs[i].bit,
+        };
     }
 }
 
@@ -97,6 +177,36 @@ static uint32_t held_mask(const SdlBackend *b) {
     uint32_t m = 0;
     for (int i = 0; i < b->n_held; i++) m |= b->held[i].bits;
     return m;
+}
+
+static void open_first_controller(SdlBackend *b) {
+    if (b->controller) return;
+    int n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        b->controller = SDL_GameControllerOpen(i);
+        if (b->controller) {
+            SDL_Log("game controller: %s", SDL_GameControllerName(b->controller));
+            break;
+        }
+    }
+}
+
+static uint32_t controller_mask(const SdlBackend *b) {
+    if (!b->controller) return 0;
+    uint32_t mask = 0;
+    for (int i = 0; i < b->n_controller_bindings; i++) {
+        if (b->controller_bindings[i].button != SDL_CONTROLLER_BUTTON_INVALID) {
+            if (SDL_GameControllerGetButton(b->controller, b->controller_bindings[i].button))
+                mask |= b->controller_bindings[i].bit;
+        } else if (b->controller_bindings[i].axis != SDL_CONTROLLER_AXIS_INVALID) {
+            Sint16 v = SDL_GameControllerGetAxis(b->controller, b->controller_bindings[i].axis);
+            if ((b->controller_bindings[i].axis_dir < 0 && v < -SDL_CONTROLLER_DEADZONE) ||
+                (b->controller_bindings[i].axis_dir > 0 && v >  SDL_CONTROLLER_DEADZONE))
+                mask |= b->controller_bindings[i].bit;
+        }
+    }
+    return mask;
 }
 
 /* ── Raw key encoding: SDL keycode → UTF-32 codepoint (0 = ignore) ──────── */
@@ -148,6 +258,18 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         }
 
         switch (ev.type) {
+        case SDL_CONTROLLERDEVICEADDED:
+            open_first_controller(b);
+            break;
+
+        case SDL_CONTROLLERDEVICEREMOVED:
+            if (b->controller) {
+                SDL_GameControllerClose(b->controller);
+                b->controller = NULL;
+            }
+            open_first_controller(b);
+            break;
+
         case SDL_QUIT:
             d->quit = true;
             break;
@@ -249,7 +371,7 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         }
     }
 
-    return held_mask(b);
+    return held_mask(b) | controller_mask(b);
 }
 
 static bool sdl_do_is_key_held(GemuDisplay *d, const char *name) {
@@ -273,7 +395,9 @@ static void sdl_do_destroy(GemuDisplay *d) {
     SdlBackend *b = d->backend;
     if (!b) return;
     if (b->menu)  input_menu_destroy(b->menu);
+    if (b->controller) SDL_GameControllerClose(b->controller);
     if (b->video) gemu_video_sdl_destroy(b->video);
+    SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
     free(b);
     d->backend = NULL;
 }
@@ -309,8 +433,14 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     });
     if (!b->video) { free(b); return NULL; }
 
+    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0) {
+        SDL_GameControllerEventState(SDL_ENABLE);
+        open_first_controller(b);
+    }
+
     /* Build action→key binding table */
     build_bindings(b);
+    build_default_controller_bindings(b);
 
     /* InputMenu: create whenever ini_section is set so Tab always opens a menu
      * (at minimum: Reset / Close Menu / Quit).  When no_rebind is set or there
