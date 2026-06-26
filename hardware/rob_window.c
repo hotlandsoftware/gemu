@@ -199,6 +199,38 @@ static float arm_step_to_angle_for_view(int arm_step) {
     return (float)arm_step * (2.0f * 3.14159265f / ROB_ARM_STEPS);
 }
 
+static float arm_pos_to_angle_for_view(float arm_pos) {
+    int a = (int)floorf(arm_pos);
+    float t = arm_pos - (float)a;
+    if (a < 0) a = 0;
+    int b = (a + 1) % ROB_ARM_STEPS;
+    float aa = arm_step_to_angle_for_view(a);
+    float bb = arm_step_to_angle_for_view(b);
+    float d = bb - aa;
+    if (d > 3.14159265f)
+        d -= 2.0f * 3.14159265f;
+    if (d < -3.14159265f)
+        d += 2.0f * 3.14159265f;
+    return aa + d * t;
+}
+
+static void arm_pos_to_gyro_pos(float arm_pos, float *x, float *z) {
+    int a = (int)floorf(arm_pos);
+    float t = arm_pos - (float)a;
+    if (a < 0) a = 0;
+    int b = (a + 1) % ROB_ARM_STEPS;
+    int ca = arm_step_to_column_for_view(a);
+    int cb = arm_step_to_column_for_view(b);
+    if (ca >= 0 && ca < 5 && cb >= 0 && cb < 5) {
+        *x = GYRO_COL_POS[ca].x + (GYRO_COL_POS[cb].x - GYRO_COL_POS[ca].x) * t;
+        *z = GYRO_COL_POS[ca].z + (GYRO_COL_POS[cb].z - GYRO_COL_POS[ca].z) * t;
+    } else {
+        float ang = arm_pos_to_angle_for_view(arm_pos);
+        *x = 0.13f * cosf(ang);
+        *z = -0.13f * sinf(ang);
+    }
+}
+
 /* ── Window ──────────────────────────────────────────────────────────────── */
 struct RobWindow {
     SDL_Window   *win;
@@ -508,7 +540,6 @@ RobWindow *rob_window_create(const char *model_dir, bool famicom_skin) {
 }
 
 void rob_window_render(RobWindow *w, const RobState *rob) {
-    const RobMotorState *state = &rob->state;
     SDL_GL_MakeCurrent(w->win, w->ctx);
 
     glViewport(0, 0, ROB_WIN_W, ROB_WIN_H);
@@ -528,7 +559,7 @@ void rob_window_render(RobWindow *w, const RobState *rob) {
     float lx = 0.3f, ly = 1.2f, lz = 1.0f;
 
     /* Vertical offset: 5 height steps × 14mm = 70mm total travel (matches reference) */
-    float vert_off = (float)state->arm_height * 0.014f;
+    float vert_off = rob->arm_height_pos * 0.014f;
 
     glUseProgram(w->prog);
     glUniform3f(w->u_light, lx, ly, lz);
@@ -542,7 +573,7 @@ void rob_window_render(RobWindow *w, const RobState *rob) {
 
         if (rm->arm_idx >= 0) {
             /* Both gripper fingers rotate together as one arm assembly */
-            float angle = arm_step_to_angle_for_view(state->arm_step);
+            float angle = arm_pos_to_angle_for_view(rob->arm_pos);
             Mat4 rot = mat4_rotate_y(angle);
             model = mat4_mul(model, rot);
 
@@ -551,7 +582,7 @@ void rob_window_render(RobWindow *w, const RobState *rob) {
              * θ = atan(0.020/0.149) ≈ 0.133 rad ≈ 7.6°.
              * The old 0.436 rad used the bounding-box extent (z=±0.075) which
              * is the arm BASE, not the tip — that triple-overshot and crossed. */
-            float close_ang = state->hands_open ? -0.070f : 0.133f;
+            float close_ang = -0.070f + (1.0f - rob->hands_open_pos) * 0.203f;
             /* arm_idx 0 is at −Z: closing needs a negative Y rotation (moves −z toward 0).
              * arm_idx 1 is at +Z: closing needs a positive Y rotation (moves +z toward 0). */
             float fdir = (rm->arm_idx == 0) ? -1.0f : 1.0f;
@@ -614,16 +645,8 @@ void rob_window_render(RobWindow *w, const RobState *rob) {
         const float *top_col = gyro_top;
 
         if (i == rob->held_gyro) {
-            int col_idx = arm_step_to_column_for_view(state->arm_step);
-            if (col_idx >= 0 && col_idx < 5) {
-                gx = GYRO_COL_POS[col_idx].x;
-                gz = GYRO_COL_POS[col_idx].z;
-            } else {
-                float ang = arm_step_to_angle_for_view(state->arm_step);
-                gx = 0.13f * cosf(ang);
-                gz = -0.13f * sinf(ang);
-            }
-            gy = held_gyro_y + (float)state->arm_height * 0.014f;
+            arm_pos_to_gyro_pos(rob->arm_pos, &gx, &gz);
+            gy = held_gyro_y + rob->arm_height_pos * 0.014f;
             top_col = gyro_top;
         } else if (g->toppled) {
             /* Toppled: stay at last column, drop to floor height */

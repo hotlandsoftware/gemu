@@ -56,38 +56,38 @@ static int extract_command(uint16_t bits) {
 }
 
 /* ROB command table (Gyromite protocol, 0-indexed) */
-static void apply_command(RobMotorState *st, int cmd) {
+static void apply_command(RobMotorState *target, int cmd) {
     switch (cmd) {
     case 1: /* Reset — arm rises to full height, rotation to 0, hands open */
-        st->arm_step   = 0;
-        st->arm_height = ROB_HEIGHT_MAX;
-        st->hands_open = true;
+        target->arm_step   = 0;
+        target->arm_height = ROB_HEIGHT_MAX;
+        target->hands_open = true;
         break;
     case 2: /* Down one */
-        if (st->arm_height > 0) st->arm_height--;
+        if (target->arm_height > 0) target->arm_height--;
         break;
     case 4: /* Left — rotate arm assembly one step counterclockwise */
-        st->arm_step = (st->arm_step + 1) % ROB_ARM_STEPS;
+        target->arm_step = (target->arm_step + 1) % ROB_ARM_STEPS;
         break;
     case 5: /* Up two */
-        st->arm_height += 2;
-        if (st->arm_height > ROB_HEIGHT_MAX) st->arm_height = ROB_HEIGHT_MAX;
+        target->arm_height += 2;
+        if (target->arm_height > ROB_HEIGHT_MAX) target->arm_height = ROB_HEIGHT_MAX;
         break;
     case 6: /* Close arms */
-        st->hands_open = false;
+        target->hands_open = false;
         break;
     case 8: /* Right — rotate arm assembly one step clockwise */
-        st->arm_step = (st->arm_step - 1 + ROB_ARM_STEPS) % ROB_ARM_STEPS;
+        target->arm_step = (target->arm_step - 1 + ROB_ARM_STEPS) % ROB_ARM_STEPS;
         break;
     case 10: /* Open arms */
-        st->hands_open = true;
+        target->hands_open = true;
         break;
     case 12: /* Up one */
-        if (st->arm_height < ROB_HEIGHT_MAX) st->arm_height++;
+        if (target->arm_height < ROB_HEIGHT_MAX) target->arm_height++;
         break;
     case 13: /* Down two */
-        st->arm_height -= 2;
-        if (st->arm_height < 0) st->arm_height = 0;
+        target->arm_height -= 2;
+        if (target->arm_height < 0) target->arm_height = 0;
         break;
     /* 0=Blink LED, 9=LED on: visual-only, no motor action */
     default: break;
@@ -144,14 +144,67 @@ static void rob_debug_state(const char *tag, const RobState *rob) {
 
     fprintf(stderr,
             "rob: %s step=%d col=%s(%d) height=%d hands=%s held=%s "
+            "target={step=%d,height=%d,hands=%s} "
             "gyro1={col=%s(%d),toppled=%d} gyro2={col=%s(%d),toppled=%d}\n",
             tag,
             rob->state.arm_step, rob_col_name(col), col,
             rob->state.arm_height,
             rob->state.hands_open ? "open" : "closed",
             held_buf,
+            rob->target.arm_step,
+            rob->target.arm_height,
+            rob->target.hands_open ? "open" : "closed",
             rob_col_name(rob->gyros[0].column), rob->gyros[0].column, rob->gyros[0].toppled,
             rob_col_name(rob->gyros[1].column), rob->gyros[1].column, rob->gyros[1].toppled);
+}
+
+static float move_toward(float cur, float target, float step) {
+    float d = target - cur;
+    if (d > -step && d < step)
+        return target;
+    return cur + (d < 0.0f ? -step : step);
+}
+
+static float move_step_circular(float cur, int target_step, float step) {
+    float target = (float)target_step;
+    float d = target - cur;
+    if (d > ROB_ARM_STEPS * 0.5f)
+        d -= ROB_ARM_STEPS;
+    if (d < -ROB_ARM_STEPS * 0.5f)
+        d += ROB_ARM_STEPS;
+    if (d > -step && d < step)
+        cur = target;
+    else
+        cur += (d < 0.0f ? -step : step);
+    while (cur < 0.0f) cur += (float)ROB_ARM_STEPS;
+    while (cur >= (float)ROB_ARM_STEPS) cur -= (float)ROB_ARM_STEPS;
+    return cur;
+}
+
+static bool nearly(float a, float b) {
+    float d = a - b;
+    return d > -0.001f && d < 0.001f;
+}
+
+static void rob_motion_tick(RobState *rob) {
+    const float arm_speed = 0.007f;
+    const float height_speed = 0.011f;
+    const float hand_speed = 0.020f;
+
+    rob->arm_pos = move_step_circular(rob->arm_pos, rob->target.arm_step, arm_speed);
+    rob->arm_height_pos = move_toward(rob->arm_height_pos,
+                                      (float)rob->target.arm_height,
+                                      height_speed);
+    rob->hands_open_pos = move_toward(rob->hands_open_pos,
+                                      rob->target.hands_open ? 1.0f : 0.0f,
+                                      hand_speed);
+
+    if (nearly(rob->arm_pos, (float)rob->target.arm_step))
+        rob->state.arm_step = rob->target.arm_step;
+    if (nearly(rob->arm_height_pos, (float)rob->target.arm_height))
+        rob->state.arm_height = rob->target.arm_height;
+    if (nearly(rob->hands_open_pos, rob->target.hands_open ? 1.0f : 0.0f))
+        rob->state.hands_open = rob->target.hands_open;
 }
 
 static void rob_update_buttons(RobState *rob) {
@@ -208,6 +261,10 @@ static void rob_gyro_tick(RobState *rob) {
 void rob_init(RobState *rob) {
     memset(rob, 0, sizeof *rob);
     rob->state.hands_open   = true;
+    rob->target             = rob->state;
+    rob->arm_pos            = (float)rob->state.arm_step;
+    rob->arm_height_pos     = (float)rob->state.arm_height;
+    rob->hands_open_pos     = rob->state.hands_open ? 1.0f : 0.0f;
     rob->gyros[0].column    = ROB_COL_TRAY1;
     rob->gyros[1].column    = ROB_COL_TRAY2;
     rob->held_gyro          = -1;
@@ -225,8 +282,10 @@ void rob_frame(RobState *rob, const uint32_t *pixels_argb, int w, int h) {
         int cmd = extract_command(rob->bits);
         rob->bits = 0x1fff; /* saturate to prevent immediate re-trigger */
         fprintf(stderr, "rob: cmd=%d\n", cmd);
-        apply_command(&rob->state, cmd);
-        rob_gyro_tick(rob);
+        apply_command(&rob->target, cmd);
         rob_debug_state("state", rob);
     }
+
+    rob_motion_tick(rob);
+    rob_gyro_tick(rob);
 }

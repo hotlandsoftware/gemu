@@ -28,6 +28,10 @@ typedef struct {
 
 typedef struct {
     RobMotorState state;
+    RobMotorState target;
+    float         arm_pos;          /* animated 0..11 step position */
+    float         arm_height_pos;   /* animated 0..ROB_HEIGHT_MAX height */
+    float         hands_open_pos;   /* animated 0=closed, 1=open */
     uint16_t      bits;              /* 13-bit shift register (bit 0 = newest frame) */
     RobGyroState  gyros[ROB_GYRO_COUNT];
     int           held_gyro;        /* 0 or 1 while carrying, -1 otherwise */
