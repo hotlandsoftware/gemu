@@ -569,9 +569,9 @@ void rob_window_render(RobWindow *w, const RobState *rob) {
     draw_cylinder(w, pv, -0.065f, 0.086f, -0.11258f,
                   0.025f, 0.006f, prop_grey);
     draw_cylinder(w, pv, 0.130f, 0.0525f, 0.0f,
-                  0.018f, 0.016f, prop_red);
-    draw_cylinder(w, pv, 0.065f, 0.0525f, -0.11258f,
                   0.018f, 0.016f, prop_blue);
+    draw_cylinder(w, pv, 0.065f, 0.0525f, -0.11258f,
+                  0.018f, 0.016f, prop_red);
     draw_cylinder(w, pv, 0.065f, 0.058f, 0.11258f,
                   0.020f, 0.016f, prop_black);
     draw_cylinder(w, pv, -0.065f, 0.058f, 0.11258f,
