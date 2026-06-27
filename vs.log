@@ -1,0 +1,1201 @@
+vs: loaded PRG roms/suprmrio/mds-sm4-4__1aor6a_e.1a or 6a -> prg:6000
+vs: loaded PRG roms/suprmrio/mds-sm4-4__1bor6b_e.1b or 6b -> prg:4000
+vs: loaded PRG roms/suprmrio/mds-sm4-4__1cor6c_e.1c or 6c -> prg:2000
+vs: loaded PRG roms/suprmrio/mds-sm4-4__1dor6d_e.1d or 6d -> prg:0000
+vs: loaded CHR roms/suprmrio/mds-sm4-4__2bor8b_e.2b or 8b -> gfx1:0000
+vs: loaded CHR roms/suprmrio/mds-sm4-4__2aor8a_e.2a or 8a -> gfx1:2000
+vs: loaded 2C04 palette roms/suprmrio/rp2c04-0004.pal
+vs: reset pc=8000 nmi=810A reset=8000 irq=81FE prgfffc=8000 dip=10
+vs: write 2000 <- 10 pc=8007 frame=0 sl=261 dot=39
+vs: frame=1 pc=800D a=10 x=FF y=00 p=24 sp=FF ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=2 pc=800F a=10 x=FF y=00 p=24 sp=FF ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=3 pc=9767 a=00 x=07 y=7F p=25 sp=FD ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=4 pc=976F a=00 x=01 y=08 p=A4 sp=FD ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2001 <- 06 pc=803A frame=4 sl=42 dot=156
+vs: write 2000 <- 10 pc=91A8 frame=4 sl=51 dot=297
+vs: write 2006 <- 24 pc=90E7 frame=4 sl=52 dot=22
+vs: write 2006 <- 00 pc=90EC frame=4 sl=52 dot=40
+vs: write 2005 <- 00 pc=91A1 frame=4 sl=133 dot=208
+vs: write 2005 <- 00 pc=91A4 frame=4 sl=133 dot=220
+vs: write 2006 <- 20 pc=90E7 frame=4 sl=133 dot=256
+vs: write 2006 <- 00 pc=90EC frame=4 sl=133 dot=274
+vs: write 2005 <- 00 pc=91A1 frame=4 sl=215 dot=101
+vs: write 2005 <- 00 pc=91A4 frame=4 sl=215 dot=113
+vs: write 4016 <- 06 pc=8058 strobe 0->0 chr=02000
+vs: write 2006 <- 1E pc=805D frame=4 sl=249 dot=174
+vs: write 2006 <- 00 pc=8062 frame=4 sl=249 dot=192
+vs: frame=5 pc=806A a=7F x=00 y=D8 p=25 sp=FF ctrl=10 mask=06 status=00 chr=02000/03000 nmi=0 irq=0
+vs: write 4016 <- 02 pc=8075 strobe 0->0 chr=00000
+vs: write 2000 <- 90 pc=91A8 frame=5 sl=7 dot=301
+vs: write 2000 <- 10 pc=8117 frame=5 sl=241 dot=67
+vs: write 2001 <- 00 pc=812E frame=5 sl=241 dot=136
+vs: write 2005 <- 00 pc=91A1 frame=5 sl=241 dot=184
+vs: write 2005 <- 00 pc=91A4 frame=5 sl=241 dot=196
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2005 <- 00 pc=91A1 frame=5 sl=246 dot=201
+vs: write 2005 <- 00 pc=91A4 frame=5 sl=246 dot=213
+vs: write 2001 <- 00 pc=816C frame=5 sl=247 dot=7
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: frame=6 pc=81BC a=00 x=03 y=04 p=26 sp=FC ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2005 <- 00 pc=81E4 frame=6 sl=0 dot=195
+vs: write 2005 <- 00 pc=81EA frame=6 sl=0 dot=219
+vs: write 2000 <- 10 pc=81F1 frame=6 sl=0 dot=252
+vs: write 2000 <- 90 pc=81FD frame=6 sl=2 dot=41
+vs: write 2000 <- 10 pc=8117 frame=6 sl=241 dot=61
+vs: write 2001 <- 00 pc=812E frame=6 sl=241 dot=130
+vs: write 2005 <- 00 pc=91A1 frame=6 sl=241 dot=178
+vs: write 2005 <- 00 pc=91A4 frame=6 sl=241 dot=190
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2005 <- 00 pc=91A1 frame=6 sl=246 dot=195
+vs: write 2005 <- 00 pc=91A4 frame=6 sl=246 dot=207
+vs: write 2001 <- 00 pc=816C frame=6 sl=247 dot=1
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=6 sl=260 dot=314
+vs: write 2005 <- 00 pc=81EA frame=6 sl=260 dot=338
+vs: write 2000 <- 10 pc=81F1 frame=6 sl=261 dot=30
+vs: frame=7 pc=90C6 a=51 x=07 y=03 p=24 sp=F9 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=8 pc=976D a=00 x=00 y=FC p=A4 sp=F5 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=9 pc=976B a=00 x=01 y=E9 p=A5 sp=F7 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 4016 <- 06 pc=AB87 strobe 0->0 chr=02000
+vs: write 2006 <- 00 pc=AB8F frame=9 sl=82 dot=79
+vs: write 2006 <- 00 pc=AB94 frame=9 sl=82 dot=100
+vs: write 2006 <- 02 pc=ABC5 frame=9 sl=87 dot=150
+vs: write 2006 <- 14 pc=ABCB frame=9 sl=87 dot=174
+vs: write 2006 <- 0C pc=ABF8 frame=9 sl=88 dot=19
+vs: write 2006 <- 20 pc=ABFE frame=9 sl=88 dot=46
+vs: frame=10 pc=AC09 a=E0 x=FF y=D2 p=A5 sp=F7 ctrl=10 mask=00 status=00 chr=02000/03000 nmi=0 irq=0
+vs: write 4016 <- 02 pc=AC76 strobe 0->0 chr=00000
+vs: write 2000 <- 90 pc=81FD frame=10 sl=247 dot=190
+vs: frame=11 pc=808B a=90 x=FF y=01 p=A4 sp=FF ctrl=90 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2000 <- 10 pc=8117 frame=11 sl=241 dot=64
+vs: write 2001 <- 00 pc=812E frame=11 sl=241 dot=133
+vs: write 2005 <- 00 pc=91A1 frame=11 sl=241 dot=181
+vs: write 2005 <- 00 pc=91A4 frame=11 sl=241 dot=193
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2005 <- 00 pc=91A1 frame=11 sl=246 dot=198
+vs: write 2005 <- 00 pc=91A4 frame=11 sl=246 dot=210
+vs: write 2001 <- 00 pc=816C frame=11 sl=247 dot=4
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=11 sl=260 dot=314
+vs: write 2005 <- 00 pc=81EA frame=11 sl=260 dot=338
+vs: write 2000 <- 10 pc=81F1 frame=11 sl=261 dot=30
+vs: frame=12 pc=90C6 a=48 x=07 y=05 p=24 sp=F9 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2000 <- 10 pc=91A8 frame=12 sl=10 dot=4
+vs: write 2006 <- 24 pc=90E7 frame=12 sl=10 dot=70
+vs: write 2006 <- 00 pc=90EC frame=12 sl=10 dot=88
+vs: write 2005 <- 00 pc=91A1 frame=12 sl=91 dot=256
+vs: write 2005 <- 00 pc=91A4 frame=12 sl=91 dot=268
+vs: write 2006 <- 20 pc=90E7 frame=12 sl=91 dot=304
+vs: write 2006 <- 00 pc=90EC frame=12 sl=91 dot=322
+vs: write 2005 <- 00 pc=91A1 frame=12 sl=173 dot=149
+vs: write 2005 <- 00 pc=91A4 frame=12 sl=173 dot=161
+vs: write 2000 <- 90 pc=81FD frame=12 sl=173 dot=287
+vs: write 2000 <- 10 pc=8117 frame=12 sl=241 dot=64
+vs: write 2001 <- 00 pc=812E frame=12 sl=241 dot=133
+vs: write 2005 <- 00 pc=91A1 frame=12 sl=241 dot=181
+vs: write 2005 <- 00 pc=91A4 frame=12 sl=241 dot=193
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2005 <- 00 pc=91A1 frame=12 sl=246 dot=198
+vs: write 2005 <- 00 pc=91A4 frame=12 sl=246 dot=210
+vs: write 2001 <- 00 pc=816C frame=12 sl=247 dot=4
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=12 sl=260 dot=317
+vs: write 2005 <- 00 pc=81EA frame=12 sl=261 dot=0
+vs: write 2000 <- 10 pc=81F1 frame=12 sl=261 dot=33
+vs: frame=13 pc=90C6 a=48 x=07 y=05 p=24 sp=F9 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2000 <- 90 pc=81FD frame=13 sl=2 dot=281
+vs: write 2000 <- 10 pc=8117 frame=13 sl=241 dot=67
+vs: write 2001 <- 00 pc=812E frame=13 sl=241 dot=136
+vs: write 2005 <- 00 pc=91A1 frame=13 sl=241 dot=184
+vs: write 2005 <- 00 pc=91A4 frame=13 sl=241 dot=196
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 3F pc=914D frame=13 sl=246 dot=204
+vs: write 2006 <- 10 pc=9153 frame=13 sl=246 dot=237
+vs: write 2000 <- 10 pc=91A8 frame=13 sl=246 dot=333
+vs: write 2006 <- 3F pc=918A frame=13 sl=248 dot=11
+vs: write 2006 <- 00 pc=918F frame=13 sl=248 dot=29
+vs: write 2006 <- 00 pc=9192 frame=13 sl=248 dot=41
+vs: write 2006 <- 00 pc=9195 frame=13 sl=248 dot=53
+vs: write 2005 <- 00 pc=91A1 frame=13 sl=248 dot=104
+vs: write 2005 <- 00 pc=91A4 frame=13 sl=248 dot=116
+vs: write 2001 <- 00 pc=816C frame=13 sl=248 dot=251
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: frame=14 pc=81BC a=00 x=02 y=05 p=26 sp=FC ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2005 <- 00 pc=81E4 frame=14 sl=0 dot=219
+vs: write 2005 <- 00 pc=81EA frame=14 sl=0 dot=243
+vs: write 2000 <- 10 pc=81F1 frame=14 sl=0 dot=276
+vs: write 2000 <- 90 pc=81FD frame=14 sl=9 dot=300
+vs: write 2000 <- 10 pc=8117 frame=14 sl=241 dot=61
+vs: write 2001 <- 00 pc=812E frame=14 sl=241 dot=130
+vs: write 2005 <- 00 pc=91A1 frame=14 sl=241 dot=178
+vs: write 2005 <- 00 pc=91A4 frame=14 sl=241 dot=190
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 20 pc=914D frame=14 sl=246 dot=198
+vs: write 2006 <- 43 pc=9153 frame=14 sl=246 dot=231
+vs: write 2000 <- 10 pc=91A8 frame=14 sl=246 dot=327
+vs: write 2006 <- 3F pc=918A frame=14 sl=248 dot=59
+vs: write 2006 <- 00 pc=918F frame=14 sl=248 dot=77
+vs: write 2006 <- 00 pc=9192 frame=14 sl=248 dot=89
+vs: write 2006 <- 00 pc=9195 frame=14 sl=248 dot=101
+vs: write 2006 <- 20 pc=914D frame=14 sl=248 dot=155
+vs: write 2006 <- 52 pc=9153 frame=14 sl=248 dot=188
+vs: write 2000 <- 10 pc=91A8 frame=14 sl=248 dot=284
+vs: write 2006 <- 3F pc=918A frame=14 sl=250 dot=340
+vs: write 2006 <- 00 pc=918F frame=14 sl=251 dot=17
+vs: write 2006 <- 00 pc=9192 frame=14 sl=251 dot=29
+vs: write 2006 <- 00 pc=9195 frame=14 sl=251 dot=41
+vs: write 2006 <- 20 pc=914D frame=14 sl=251 dot=95
+vs: write 2006 <- 68 pc=9153 frame=14 sl=251 dot=128
+vs: write 2000 <- 10 pc=91A8 frame=14 sl=251 dot=224
+vs: write 2006 <- 3F pc=918A frame=14 sl=252 dot=297
+vs: write 2006 <- 00 pc=918F frame=14 sl=252 dot=315
+vs: write 2006 <- 00 pc=9192 frame=14 sl=252 dot=327
+vs: write 2006 <- 00 pc=9195 frame=14 sl=252 dot=339
+vs: write 2006 <- 23 pc=914D frame=14 sl=253 dot=52
+vs: write 2006 <- C0 pc=9153 frame=14 sl=253 dot=85
+vs: write 2000 <- 10 pc=91A8 frame=14 sl=253 dot=181
+vs: frame=15 pc=9177 a=AA x=08 y=03 p=25 sp=FA ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2006 <- 3F pc=918A frame=15 sl=1 dot=136
+vs: write 2006 <- 00 pc=918F frame=15 sl=1 dot=154
+vs: write 2006 <- 00 pc=9192 frame=15 sl=1 dot=166
+vs: write 2006 <- 00 pc=9195 frame=15 sl=1 dot=178
+vs: write 2006 <- 23 pc=914D frame=15 sl=1 dot=232
+vs: write 2006 <- C2 pc=9153 frame=15 sl=1 dot=265
+vs: write 2000 <- 10 pc=91A8 frame=15 sl=2 dot=20
+vs: write 2006 <- 3F pc=918A frame=15 sl=2 dot=218
+vs: write 2006 <- 00 pc=918F frame=15 sl=2 dot=236
+vs: write 2006 <- 00 pc=9192 frame=15 sl=2 dot=248
+vs: write 2006 <- 00 pc=9195 frame=15 sl=2 dot=260
+vs: write 2005 <- 00 pc=91A1 frame=15 sl=2 dot=311
+vs: write 2005 <- 00 pc=91A4 frame=15 sl=2 dot=323
+vs: write 2001 <- 00 pc=816C frame=15 sl=3 dot=117
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=15 sl=17 dot=89
+vs: write 2005 <- 00 pc=81EA frame=15 sl=17 dot=113
+vs: write 2000 <- 10 pc=81F1 frame=15 sl=17 dot=146
+vs: write 2000 <- 90 pc=81FD frame=15 sl=23 dot=317
+vs: write 2000 <- 10 pc=8117 frame=15 sl=241 dot=64
+vs: write 2001 <- 00 pc=812E frame=15 sl=241 dot=133
+vs: write 2005 <- 00 pc=91A1 frame=15 sl=241 dot=181
+vs: write 2005 <- 00 pc=91A4 frame=15 sl=241 dot=193
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 20 pc=914D frame=15 sl=246 dot=201
+vs: write 2006 <- 6D pc=9153 frame=15 sl=246 dot=234
+vs: write 2000 <- 10 pc=91A8 frame=15 sl=246 dot=330
+vs: write 2006 <- 3F pc=918A frame=15 sl=247 dot=295
+vs: write 2006 <- 00 pc=918F frame=15 sl=247 dot=313
+vs: write 2006 <- 00 pc=9192 frame=15 sl=247 dot=325
+vs: write 2006 <- 00 pc=9195 frame=15 sl=247 dot=337
+vs: write 2006 <- 20 pc=914D frame=15 sl=248 dot=50
+vs: write 2006 <- 62 pc=9153 frame=15 sl=248 dot=83
+vs: write 2000 <- 10 pc=91A8 frame=15 sl=248 dot=179
+vs: write 2006 <- 3F pc=918A frame=15 sl=249 dot=306
+vs: write 2006 <- 00 pc=918F frame=15 sl=249 dot=324
+vs: write 2006 <- 00 pc=9192 frame=15 sl=249 dot=336
+vs: write 2006 <- 00 pc=9195 frame=15 sl=250 dot=7
+vs: write 2006 <- 20 pc=914D frame=15 sl=250 dot=61
+vs: write 2006 <- 73 pc=9153 frame=15 sl=250 dot=94
+vs: write 2000 <- 10 pc=91A8 frame=15 sl=250 dot=190
+vs: write 2006 <- 3F pc=918A frame=15 sl=251 dot=155
+vs: write 2006 <- 00 pc=918F frame=15 sl=251 dot=173
+vs: write 2006 <- 00 pc=9192 frame=15 sl=251 dot=185
+vs: write 2006 <- 00 pc=9195 frame=15 sl=251 dot=197
+vs: write 2005 <- 00 pc=91A1 frame=15 sl=251 dot=248
+vs: write 2005 <- 00 pc=91A4 frame=15 sl=251 dot=260
+vs: write 2001 <- 00 pc=816C frame=15 sl=252 dot=54
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: frame=16 pc=926D a=00 x=09 y=03 p=26 sp=FA ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2005 <- 00 pc=81E4 frame=16 sl=4 dot=22
+vs: write 2005 <- 00 pc=81EA frame=16 sl=4 dot=46
+vs: write 2000 <- 10 pc=81F1 frame=16 sl=4 dot=79
+vs: write 2000 <- 90 pc=81FD frame=16 sl=6 dot=39
+vs: write 2000 <- 10 pc=8117 frame=16 sl=241 dot=64
+vs: write 2001 <- 00 pc=812E frame=16 sl=241 dot=133
+vs: write 2005 <- 00 pc=91A1 frame=16 sl=241 dot=181
+vs: write 2005 <- 00 pc=91A4 frame=16 sl=241 dot=193
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2005 <- 00 pc=91A1 frame=16 sl=246 dot=198
+vs: write 2005 <- 00 pc=91A4 frame=16 sl=246 dot=210
+vs: write 2001 <- 00 pc=816C frame=16 sl=247 dot=4
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=16 sl=260 dot=317
+vs: write 2005 <- 00 pc=81EA frame=16 sl=261 dot=0
+vs: write 2000 <- 10 pc=81F1 frame=16 sl=261 dot=33
+vs: frame=17 pc=90C6 a=48 x=07 y=05 p=24 sp=F9 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2000 <- 90 pc=81FD frame=17 sl=0 dot=306
+vs: write 2000 <- 10 pc=8117 frame=17 sl=241 dot=67
+vs: write 2001 <- 00 pc=812E frame=17 sl=241 dot=136
+vs: write 2005 <- 00 pc=91A1 frame=17 sl=241 dot=184
+vs: write 2005 <- 00 pc=91A4 frame=17 sl=241 dot=196
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2005 <- 00 pc=91A1 frame=17 sl=246 dot=201
+vs: write 2005 <- 00 pc=91A4 frame=17 sl=246 dot=213
+vs: write 2001 <- 00 pc=816C frame=17 sl=247 dot=7
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=17 sl=260 dot=317
+vs: write 2005 <- 00 pc=81EA frame=17 sl=261 dot=0
+vs: write 2000 <- 10 pc=81F1 frame=17 sl=261 dot=33
+vs: frame=18 pc=90C6 a=48 x=07 y=05 p=24 sp=F9 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2000 <- 90 pc=81FD frame=18 sl=129 dot=231
+vs: write 2000 <- 10 pc=8117 frame=18 sl=241 dot=61
+vs: write 2001 <- 00 pc=812E frame=18 sl=241 dot=130
+vs: write 2005 <- 00 pc=91A1 frame=18 sl=241 dot=178
+vs: write 2005 <- 00 pc=91A4 frame=18 sl=241 dot=190
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 20 pc=914D frame=18 sl=246 dot=198
+vs: write 2006 <- 80 pc=9153 frame=18 sl=246 dot=231
+vs: write 2000 <- 14 pc=91A8 frame=18 sl=246 dot=324
+vs: write 2006 <- 3F pc=918A frame=18 sl=251 dot=167
+vs: write 2006 <- 00 pc=918F frame=18 sl=251 dot=185
+vs: write 2006 <- 00 pc=9192 frame=18 sl=251 dot=197
+vs: write 2006 <- 00 pc=9195 frame=18 sl=251 dot=209
+vs: write 2006 <- 20 pc=914D frame=18 sl=251 dot=263
+vs: write 2006 <- 81 pc=9153 frame=18 sl=251 dot=296
+vs: write 2000 <- 14 pc=91A8 frame=18 sl=252 dot=48
+vs: write 2006 <- 3F pc=918A frame=18 sl=256 dot=232
+vs: write 2006 <- 00 pc=918F frame=18 sl=256 dot=250
+vs: write 2006 <- 00 pc=9192 frame=18 sl=256 dot=262
+vs: write 2006 <- 00 pc=9195 frame=18 sl=256 dot=274
+vs: write 2006 <- 20 pc=914D frame=18 sl=256 dot=328
+vs: write 2006 <- 82 pc=9153 frame=18 sl=257 dot=20
+vs: write 2000 <- 14 pc=91A8 frame=18 sl=257 dot=113
+vs: write 2006 <- 3F pc=918A frame=18 sl=261 dot=297
+vs: write 2006 <- 00 pc=918F frame=18 sl=261 dot=315
+vs: write 2006 <- 00 pc=9192 frame=18 sl=261 dot=327
+vs: write 2006 <- 00 pc=9195 frame=18 sl=261 dot=339
+vs: frame=19 pc=9195 a=00 x=00 y=1C p=26 sp=FA ctrl=14 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2006 <- 20 pc=914D frame=19 sl=0 dot=49
+vs: write 2006 <- 83 pc=9153 frame=19 sl=0 dot=82
+vs: write 2000 <- 14 pc=91A8 frame=19 sl=0 dot=175
+vs: write 2006 <- 3F pc=918A frame=19 sl=5 dot=18
+vs: write 2006 <- 00 pc=918F frame=19 sl=5 dot=36
+vs: write 2006 <- 00 pc=9192 frame=19 sl=5 dot=48
+vs: write 2006 <- 00 pc=9195 frame=19 sl=5 dot=60
+vs: write 2006 <- 23 pc=914D frame=19 sl=5 dot=114
+vs: write 2006 <- C8 pc=9153 frame=19 sl=5 dot=147
+vs: write 2000 <- 10 pc=91A8 frame=19 sl=5 dot=243
+vs: write 2006 <- 3F pc=918A frame=19 sl=6 dot=100
+vs: write 2006 <- 00 pc=918F frame=19 sl=6 dot=118
+vs: write 2006 <- 00 pc=9192 frame=19 sl=6 dot=130
+vs: write 2006 <- 00 pc=9195 frame=19 sl=6 dot=142
+vs: write 2006 <- 23 pc=914D frame=19 sl=6 dot=196
+vs: write 2006 <- D0 pc=9153 frame=19 sl=6 dot=229
+vs: write 2000 <- 10 pc=91A8 frame=19 sl=6 dot=325
+vs: write 2006 <- 3F pc=918A frame=19 sl=7 dot=182
+vs: write 2006 <- 00 pc=918F frame=19 sl=7 dot=200
+vs: write 2006 <- 00 pc=9192 frame=19 sl=7 dot=212
+vs: write 2006 <- 00 pc=9195 frame=19 sl=7 dot=224
+vs: write 2006 <- 23 pc=914D frame=19 sl=7 dot=278
+vs: write 2006 <- D8 pc=9153 frame=19 sl=7 dot=311
+vs: write 2000 <- 10 pc=91A8 frame=19 sl=8 dot=66
+vs: write 2006 <- 3F pc=918A frame=19 sl=8 dot=264
+vs: write 2006 <- 00 pc=918F frame=19 sl=8 dot=282
+vs: write 2006 <- 00 pc=9192 frame=19 sl=8 dot=294
+vs: write 2006 <- 00 pc=9195 frame=19 sl=8 dot=306
+vs: write 2006 <- 23 pc=914D frame=19 sl=9 dot=19
+vs: write 2006 <- E0 pc=9153 frame=19 sl=9 dot=52
+vs: write 2000 <- 10 pc=91A8 frame=19 sl=9 dot=148
+vs: write 2006 <- 3F pc=918A frame=19 sl=10 dot=5
+vs: write 2006 <- 00 pc=918F frame=19 sl=10 dot=23
+vs: write 2006 <- 00 pc=9192 frame=19 sl=10 dot=35
+vs: write 2006 <- 00 pc=9195 frame=19 sl=10 dot=47
+vs: write 2006 <- 23 pc=914D frame=19 sl=10 dot=101
+vs: write 2006 <- E8 pc=9153 frame=19 sl=10 dot=134
+vs: write 2000 <- 10 pc=91A8 frame=19 sl=10 dot=230
+vs: write 2006 <- 3F pc=918A frame=19 sl=11 dot=87
+vs: write 2006 <- 00 pc=918F frame=19 sl=11 dot=105
+vs: write 2006 <- 00 pc=9192 frame=19 sl=11 dot=117
+vs: write 2006 <- 00 pc=9195 frame=19 sl=11 dot=129
+vs: write 2006 <- 23 pc=914D frame=19 sl=11 dot=183
+vs: write 2006 <- F0 pc=9153 frame=19 sl=11 dot=216
+vs: write 2000 <- 10 pc=91A8 frame=19 sl=11 dot=312
+vs: write 2006 <- 3F pc=918A frame=19 sl=12 dot=169
+vs: write 2006 <- 00 pc=918F frame=19 sl=12 dot=187
+vs: write 2006 <- 00 pc=9192 frame=19 sl=12 dot=199
+vs: write 2006 <- 00 pc=9195 frame=19 sl=12 dot=211
+vs: write 2006 <- 23 pc=914D frame=19 sl=12 dot=265
+vs: write 2006 <- F8 pc=9153 frame=19 sl=12 dot=298
+vs: write 2000 <- 10 pc=91A8 frame=19 sl=13 dot=53
+vs: write 2006 <- 3F pc=918A frame=19 sl=13 dot=251
+vs: write 2006 <- 00 pc=918F frame=19 sl=13 dot=269
+vs: write 2006 <- 00 pc=9192 frame=19 sl=13 dot=281
+vs: write 2006 <- 00 pc=9195 frame=19 sl=13 dot=293
+vs: write 2005 <- 00 pc=91A1 frame=19 sl=14 dot=3
+vs: write 2005 <- 00 pc=91A4 frame=19 sl=14 dot=15
+vs: write 2001 <- 00 pc=816C frame=19 sl=14 dot=153
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=19 sl=28 dot=122
+vs: write 2005 <- 00 pc=81EA frame=19 sl=28 dot=146
+vs: write 2000 <- 10 pc=81F1 frame=19 sl=28 dot=179
+vs: write 2000 <- 90 pc=81FD frame=19 sl=153 dot=94
+vs: write 2000 <- 10 pc=8117 frame=19 sl=241 dot=62
+vs: write 2001 <- 00 pc=812E frame=19 sl=241 dot=131
+vs: write 2005 <- 00 pc=91A1 frame=19 sl=241 dot=179
+vs: write 2005 <- 00 pc=91A4 frame=19 sl=241 dot=191
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 20 pc=914D frame=19 sl=246 dot=199
+vs: write 2006 <- 84 pc=9153 frame=19 sl=246 dot=232
+vs: write 2000 <- 14 pc=91A8 frame=19 sl=246 dot=325
+vs: write 2006 <- 3F pc=918A frame=19 sl=251 dot=168
+vs: write 2006 <- 00 pc=918F frame=19 sl=251 dot=186
+vs: write 2006 <- 00 pc=9192 frame=19 sl=251 dot=198
+vs: write 2006 <- 00 pc=9195 frame=19 sl=251 dot=210
+vs: write 2006 <- 20 pc=914D frame=19 sl=251 dot=264
+vs: write 2006 <- 85 pc=9153 frame=19 sl=251 dot=297
+vs: write 2000 <- 14 pc=91A8 frame=19 sl=252 dot=49
+vs: write 2006 <- 3F pc=918A frame=19 sl=256 dot=233
+vs: write 2006 <- 00 pc=918F frame=19 sl=256 dot=251
+vs: write 2006 <- 00 pc=9192 frame=19 sl=256 dot=263
+vs: write 2006 <- 00 pc=9195 frame=19 sl=256 dot=275
+vs: write 2006 <- 20 pc=914D frame=19 sl=256 dot=329
+vs: write 2006 <- 86 pc=9153 frame=19 sl=257 dot=21
+vs: write 2000 <- 14 pc=91A8 frame=19 sl=257 dot=114
+vs: write 2006 <- 3F pc=918A frame=19 sl=261 dot=298
+vs: write 2006 <- 00 pc=918F frame=19 sl=261 dot=316
+vs: write 2006 <- 00 pc=9192 frame=19 sl=261 dot=328
+vs: write 2006 <- 00 pc=9195 frame=19 sl=261 dot=340
+vs: frame=20 pc=9195 a=00 x=00 y=1C p=26 sp=FA ctrl=14 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2006 <- 20 pc=914D frame=20 sl=0 dot=49
+vs: write 2006 <- 87 pc=9153 frame=20 sl=0 dot=82
+vs: write 2000 <- 14 pc=91A8 frame=20 sl=0 dot=175
+vs: write 2006 <- 3F pc=918A frame=20 sl=5 dot=18
+vs: write 2006 <- 00 pc=918F frame=20 sl=5 dot=36
+vs: write 2006 <- 00 pc=9192 frame=20 sl=5 dot=48
+vs: write 2006 <- 00 pc=9195 frame=20 sl=5 dot=60
+vs: write 2006 <- 23 pc=914D frame=20 sl=5 dot=114
+vs: write 2006 <- C9 pc=9153 frame=20 sl=5 dot=147
+vs: write 2000 <- 10 pc=91A8 frame=20 sl=5 dot=243
+vs: write 2006 <- 3F pc=918A frame=20 sl=6 dot=100
+vs: write 2006 <- 00 pc=918F frame=20 sl=6 dot=118
+vs: write 2006 <- 00 pc=9192 frame=20 sl=6 dot=130
+vs: write 2006 <- 00 pc=9195 frame=20 sl=6 dot=142
+vs: write 2006 <- 23 pc=914D frame=20 sl=6 dot=196
+vs: write 2006 <- D1 pc=9153 frame=20 sl=6 dot=229
+vs: write 2000 <- 10 pc=91A8 frame=20 sl=6 dot=325
+vs: write 2006 <- 3F pc=918A frame=20 sl=7 dot=182
+vs: write 2006 <- 00 pc=918F frame=20 sl=7 dot=200
+vs: write 2006 <- 00 pc=9192 frame=20 sl=7 dot=212
+vs: write 2006 <- 00 pc=9195 frame=20 sl=7 dot=224
+vs: write 2006 <- 23 pc=914D frame=20 sl=7 dot=278
+vs: write 2006 <- D9 pc=9153 frame=20 sl=7 dot=311
+vs: write 2000 <- 10 pc=91A8 frame=20 sl=8 dot=66
+vs: write 2006 <- 3F pc=918A frame=20 sl=8 dot=264
+vs: write 2006 <- 00 pc=918F frame=20 sl=8 dot=282
+vs: write 2006 <- 00 pc=9192 frame=20 sl=8 dot=294
+vs: write 2006 <- 00 pc=9195 frame=20 sl=8 dot=306
+vs: write 2006 <- 23 pc=914D frame=20 sl=9 dot=19
+vs: write 2006 <- E1 pc=9153 frame=20 sl=9 dot=52
+vs: write 2000 <- 10 pc=91A8 frame=20 sl=9 dot=148
+vs: write 2006 <- 3F pc=918A frame=20 sl=10 dot=5
+vs: write 2006 <- 00 pc=918F frame=20 sl=10 dot=23
+vs: write 2006 <- 00 pc=9192 frame=20 sl=10 dot=35
+vs: write 2006 <- 00 pc=9195 frame=20 sl=10 dot=47
+vs: write 2006 <- 23 pc=914D frame=20 sl=10 dot=101
+vs: write 2006 <- E9 pc=9153 frame=20 sl=10 dot=134
+vs: write 2000 <- 10 pc=91A8 frame=20 sl=10 dot=230
+vs: write 2006 <- 3F pc=918A frame=20 sl=11 dot=87
+vs: write 2006 <- 00 pc=918F frame=20 sl=11 dot=105
+vs: write 2006 <- 00 pc=9192 frame=20 sl=11 dot=117
+vs: write 2006 <- 00 pc=9195 frame=20 sl=11 dot=129
+vs: write 2006 <- 23 pc=914D frame=20 sl=11 dot=183
+vs: write 2006 <- F1 pc=9153 frame=20 sl=11 dot=216
+vs: write 2000 <- 10 pc=91A8 frame=20 sl=11 dot=312
+vs: write 2006 <- 3F pc=918A frame=20 sl=12 dot=169
+vs: write 2006 <- 00 pc=918F frame=20 sl=12 dot=187
+vs: write 2006 <- 00 pc=9192 frame=20 sl=12 dot=199
+vs: write 2006 <- 00 pc=9195 frame=20 sl=12 dot=211
+vs: write 2006 <- 23 pc=914D frame=20 sl=12 dot=265
+vs: write 2006 <- F9 pc=9153 frame=20 sl=12 dot=298
+vs: write 2000 <- 10 pc=91A8 frame=20 sl=13 dot=53
+vs: write 2006 <- 3F pc=918A frame=20 sl=13 dot=251
+vs: write 2006 <- 00 pc=918F frame=20 sl=13 dot=269
+vs: write 2006 <- 00 pc=9192 frame=20 sl=13 dot=281
+vs: write 2006 <- 00 pc=9195 frame=20 sl=13 dot=293
+vs: write 2005 <- 00 pc=91A1 frame=20 sl=14 dot=3
+vs: write 2005 <- 00 pc=91A4 frame=20 sl=14 dot=15
+vs: write 2001 <- 00 pc=816C frame=20 sl=14 dot=153
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=20 sl=28 dot=125
+vs: write 2005 <- 00 pc=81EA frame=20 sl=28 dot=149
+vs: write 2000 <- 10 pc=81F1 frame=20 sl=28 dot=182
+vs: write 2000 <- 90 pc=81FD frame=20 sl=153 dot=97
+vs: write 2000 <- 10 pc=8117 frame=20 sl=241 dot=65
+vs: write 2001 <- 00 pc=812E frame=20 sl=241 dot=134
+vs: write 2005 <- 00 pc=91A1 frame=20 sl=241 dot=182
+vs: write 2005 <- 00 pc=91A4 frame=20 sl=241 dot=194
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 20 pc=914D frame=20 sl=246 dot=202
+vs: write 2006 <- 88 pc=9153 frame=20 sl=246 dot=235
+vs: write 2000 <- 14 pc=91A8 frame=20 sl=246 dot=328
+vs: write 2006 <- 3F pc=918A frame=20 sl=251 dot=171
+vs: write 2006 <- 00 pc=918F frame=20 sl=251 dot=189
+vs: write 2006 <- 00 pc=9192 frame=20 sl=251 dot=201
+vs: write 2006 <- 00 pc=9195 frame=20 sl=251 dot=213
+vs: write 2006 <- 20 pc=914D frame=20 sl=251 dot=267
+vs: write 2006 <- 89 pc=9153 frame=20 sl=251 dot=300
+vs: write 2000 <- 14 pc=91A8 frame=20 sl=252 dot=52
+vs: write 2006 <- 3F pc=918A frame=20 sl=256 dot=236
+vs: write 2006 <- 00 pc=918F frame=20 sl=256 dot=254
+vs: write 2006 <- 00 pc=9192 frame=20 sl=256 dot=266
+vs: write 2006 <- 00 pc=9195 frame=20 sl=256 dot=278
+vs: write 2006 <- 20 pc=914D frame=20 sl=256 dot=332
+vs: write 2006 <- 8A pc=9153 frame=20 sl=257 dot=24
+vs: write 2000 <- 14 pc=91A8 frame=20 sl=257 dot=117
+vs: write 2006 <- 3F pc=918A frame=20 sl=261 dot=301
+vs: write 2006 <- 00 pc=918F frame=20 sl=261 dot=319
+vs: write 2006 <- 00 pc=9192 frame=20 sl=261 dot=331
+vs: frame=21 pc=9192 a=00 x=00 y=1C p=26 sp=FA ctrl=14 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2006 <- 00 pc=9195 frame=21 sl=0 dot=0
+vs: write 2006 <- 20 pc=914D frame=21 sl=0 dot=54
+vs: write 2006 <- 8B pc=9153 frame=21 sl=0 dot=87
+vs: write 2000 <- 14 pc=91A8 frame=21 sl=0 dot=180
+vs: write 2006 <- 3F pc=918A frame=21 sl=5 dot=23
+vs: write 2006 <- 00 pc=918F frame=21 sl=5 dot=41
+vs: write 2006 <- 00 pc=9192 frame=21 sl=5 dot=53
+vs: write 2006 <- 00 pc=9195 frame=21 sl=5 dot=65
+vs: write 2006 <- 23 pc=914D frame=21 sl=5 dot=119
+vs: write 2006 <- CA pc=9153 frame=21 sl=5 dot=152
+vs: write 2000 <- 10 pc=91A8 frame=21 sl=5 dot=248
+vs: write 2006 <- 3F pc=918A frame=21 sl=6 dot=105
+vs: write 2006 <- 00 pc=918F frame=21 sl=6 dot=123
+vs: write 2006 <- 00 pc=9192 frame=21 sl=6 dot=135
+vs: write 2006 <- 00 pc=9195 frame=21 sl=6 dot=147
+vs: write 2006 <- 23 pc=914D frame=21 sl=6 dot=201
+vs: write 2006 <- D2 pc=9153 frame=21 sl=6 dot=234
+vs: write 2000 <- 10 pc=91A8 frame=21 sl=6 dot=330
+vs: write 2006 <- 3F pc=918A frame=21 sl=7 dot=187
+vs: write 2006 <- 00 pc=918F frame=21 sl=7 dot=205
+vs: write 2006 <- 00 pc=9192 frame=21 sl=7 dot=217
+vs: write 2006 <- 00 pc=9195 frame=21 sl=7 dot=229
+vs: write 2006 <- 23 pc=914D frame=21 sl=7 dot=283
+vs: write 2006 <- DA pc=9153 frame=21 sl=7 dot=316
+vs: write 2000 <- 10 pc=91A8 frame=21 sl=8 dot=71
+vs: write 2006 <- 3F pc=918A frame=21 sl=8 dot=269
+vs: write 2006 <- 00 pc=918F frame=21 sl=8 dot=287
+vs: write 2006 <- 00 pc=9192 frame=21 sl=8 dot=299
+vs: write 2006 <- 00 pc=9195 frame=21 sl=8 dot=311
+vs: write 2006 <- 23 pc=914D frame=21 sl=9 dot=24
+vs: write 2006 <- E2 pc=9153 frame=21 sl=9 dot=57
+vs: write 2000 <- 10 pc=91A8 frame=21 sl=9 dot=153
+vs: write 2006 <- 3F pc=918A frame=21 sl=10 dot=10
+vs: write 2006 <- 00 pc=918F frame=21 sl=10 dot=28
+vs: write 2006 <- 00 pc=9192 frame=21 sl=10 dot=40
+vs: write 2006 <- 00 pc=9195 frame=21 sl=10 dot=52
+vs: write 2006 <- 23 pc=914D frame=21 sl=10 dot=106
+vs: write 2006 <- EA pc=9153 frame=21 sl=10 dot=139
+vs: write 2000 <- 10 pc=91A8 frame=21 sl=10 dot=235
+vs: write 2006 <- 3F pc=918A frame=21 sl=11 dot=92
+vs: write 2006 <- 00 pc=918F frame=21 sl=11 dot=110
+vs: write 2006 <- 00 pc=9192 frame=21 sl=11 dot=122
+vs: write 2006 <- 00 pc=9195 frame=21 sl=11 dot=134
+vs: write 2006 <- 23 pc=914D frame=21 sl=11 dot=188
+vs: write 2006 <- F2 pc=9153 frame=21 sl=11 dot=221
+vs: write 2000 <- 10 pc=91A8 frame=21 sl=11 dot=317
+vs: write 2006 <- 3F pc=918A frame=21 sl=12 dot=174
+vs: write 2006 <- 00 pc=918F frame=21 sl=12 dot=192
+vs: write 2006 <- 00 pc=9192 frame=21 sl=12 dot=204
+vs: write 2006 <- 00 pc=9195 frame=21 sl=12 dot=216
+vs: write 2006 <- 23 pc=914D frame=21 sl=12 dot=270
+vs: write 2006 <- FA pc=9153 frame=21 sl=12 dot=303
+vs: write 2000 <- 10 pc=91A8 frame=21 sl=13 dot=58
+vs: write 2006 <- 3F pc=918A frame=21 sl=13 dot=256
+vs: write 2006 <- 00 pc=918F frame=21 sl=13 dot=274
+vs: write 2006 <- 00 pc=9192 frame=21 sl=13 dot=286
+vs: write 2006 <- 00 pc=9195 frame=21 sl=13 dot=298
+vs: write 2005 <- 00 pc=91A1 frame=21 sl=14 dot=8
+vs: write 2005 <- 00 pc=91A4 frame=21 sl=14 dot=20
+vs: write 2001 <- 00 pc=816C frame=21 sl=14 dot=158
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=21 sl=28 dot=130
+vs: write 2005 <- 00 pc=81EA frame=21 sl=28 dot=154
+vs: write 2000 <- 10 pc=81F1 frame=21 sl=28 dot=187
+vs: write 2000 <- 90 pc=81FD frame=21 sl=153 dot=102
+vs: write 2000 <- 10 pc=8117 frame=21 sl=241 dot=61
+vs: write 2001 <- 00 pc=812E frame=21 sl=241 dot=130
+vs: write 2005 <- 00 pc=91A1 frame=21 sl=241 dot=178
+vs: write 2005 <- 00 pc=91A4 frame=21 sl=241 dot=190
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 20 pc=914D frame=21 sl=246 dot=198
+vs: write 2006 <- 8C pc=9153 frame=21 sl=246 dot=231
+vs: write 2000 <- 14 pc=91A8 frame=21 sl=246 dot=324
+vs: write 2006 <- 3F pc=918A frame=21 sl=251 dot=167
+vs: write 2006 <- 00 pc=918F frame=21 sl=251 dot=185
+vs: write 2006 <- 00 pc=9192 frame=21 sl=251 dot=197
+vs: write 2006 <- 00 pc=9195 frame=21 sl=251 dot=209
+vs: write 2006 <- 20 pc=914D frame=21 sl=251 dot=263
+vs: write 2006 <- 8D pc=9153 frame=21 sl=251 dot=296
+vs: write 2000 <- 14 pc=91A8 frame=21 sl=252 dot=48
+vs: write 2006 <- 3F pc=918A frame=21 sl=256 dot=232
+vs: write 2006 <- 00 pc=918F frame=21 sl=256 dot=250
+vs: write 2006 <- 00 pc=9192 frame=21 sl=256 dot=262
+vs: write 2006 <- 00 pc=9195 frame=21 sl=256 dot=274
+vs: write 2006 <- 20 pc=914D frame=21 sl=256 dot=328
+vs: write 2006 <- 8E pc=9153 frame=21 sl=257 dot=20
+vs: write 2000 <- 14 pc=91A8 frame=21 sl=257 dot=113
+vs: write 2006 <- 3F pc=918A frame=21 sl=261 dot=297
+vs: write 2006 <- 00 pc=918F frame=21 sl=261 dot=315
+vs: write 2006 <- 00 pc=9192 frame=21 sl=261 dot=327
+vs: write 2006 <- 00 pc=9195 frame=21 sl=261 dot=339
+vs: frame=22 pc=9195 a=00 x=00 y=1C p=26 sp=FA ctrl=14 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2006 <- 20 pc=914D frame=22 sl=0 dot=49
+vs: write 2006 <- 8F pc=9153 frame=22 sl=0 dot=82
+vs: write 2000 <- 14 pc=91A8 frame=22 sl=0 dot=175
+vs: write 2006 <- 3F pc=918A frame=22 sl=5 dot=18
+vs: write 2006 <- 00 pc=918F frame=22 sl=5 dot=36
+vs: write 2006 <- 00 pc=9192 frame=22 sl=5 dot=48
+vs: write 2006 <- 00 pc=9195 frame=22 sl=5 dot=60
+vs: write 2006 <- 23 pc=914D frame=22 sl=5 dot=114
+vs: write 2006 <- CB pc=9153 frame=22 sl=5 dot=147
+vs: write 2000 <- 10 pc=91A8 frame=22 sl=5 dot=243
+vs: write 2006 <- 3F pc=918A frame=22 sl=6 dot=100
+vs: write 2006 <- 00 pc=918F frame=22 sl=6 dot=118
+vs: write 2006 <- 00 pc=9192 frame=22 sl=6 dot=130
+vs: write 2006 <- 00 pc=9195 frame=22 sl=6 dot=142
+vs: write 2006 <- 23 pc=914D frame=22 sl=6 dot=196
+vs: write 2006 <- D3 pc=9153 frame=22 sl=6 dot=229
+vs: write 2000 <- 10 pc=91A8 frame=22 sl=6 dot=325
+vs: write 2006 <- 3F pc=918A frame=22 sl=7 dot=182
+vs: write 2006 <- 00 pc=918F frame=22 sl=7 dot=200
+vs: write 2006 <- 00 pc=9192 frame=22 sl=7 dot=212
+vs: write 2006 <- 00 pc=9195 frame=22 sl=7 dot=224
+vs: write 2006 <- 23 pc=914D frame=22 sl=7 dot=278
+vs: write 2006 <- DB pc=9153 frame=22 sl=7 dot=311
+vs: write 2000 <- 10 pc=91A8 frame=22 sl=8 dot=66
+vs: write 2006 <- 3F pc=918A frame=22 sl=8 dot=264
+vs: write 2006 <- 00 pc=918F frame=22 sl=8 dot=282
+vs: write 2006 <- 00 pc=9192 frame=22 sl=8 dot=294
+vs: write 2006 <- 00 pc=9195 frame=22 sl=8 dot=306
+vs: write 2006 <- 23 pc=914D frame=22 sl=9 dot=19
+vs: write 2006 <- E3 pc=9153 frame=22 sl=9 dot=52
+vs: write 2000 <- 10 pc=91A8 frame=22 sl=9 dot=148
+vs: write 2006 <- 3F pc=918A frame=22 sl=10 dot=5
+vs: write 2006 <- 00 pc=918F frame=22 sl=10 dot=23
+vs: write 2006 <- 00 pc=9192 frame=22 sl=10 dot=35
+vs: write 2006 <- 00 pc=9195 frame=22 sl=10 dot=47
+vs: write 2006 <- 23 pc=914D frame=22 sl=10 dot=101
+vs: write 2006 <- EB pc=9153 frame=22 sl=10 dot=134
+vs: write 2000 <- 10 pc=91A8 frame=22 sl=10 dot=230
+vs: write 2006 <- 3F pc=918A frame=22 sl=11 dot=87
+vs: write 2006 <- 00 pc=918F frame=22 sl=11 dot=105
+vs: write 2006 <- 00 pc=9192 frame=22 sl=11 dot=117
+vs: write 2006 <- 00 pc=9195 frame=22 sl=11 dot=129
+vs: write 2006 <- 23 pc=914D frame=22 sl=11 dot=183
+vs: write 2006 <- F3 pc=9153 frame=22 sl=11 dot=216
+vs: write 2000 <- 10 pc=91A8 frame=22 sl=11 dot=312
+vs: write 2006 <- 3F pc=918A frame=22 sl=12 dot=169
+vs: write 2006 <- 00 pc=918F frame=22 sl=12 dot=187
+vs: write 2006 <- 00 pc=9192 frame=22 sl=12 dot=199
+vs: write 2006 <- 00 pc=9195 frame=22 sl=12 dot=211
+vs: write 2006 <- 23 pc=914D frame=22 sl=12 dot=265
+vs: write 2006 <- FB pc=9153 frame=22 sl=12 dot=298
+vs: write 2000 <- 10 pc=91A8 frame=22 sl=13 dot=53
+vs: write 2006 <- 3F pc=918A frame=22 sl=13 dot=251
+vs: write 2006 <- 00 pc=918F frame=22 sl=13 dot=269
+vs: write 2006 <- 00 pc=9192 frame=22 sl=13 dot=281
+vs: write 2006 <- 00 pc=9195 frame=22 sl=13 dot=293
+vs: write 2005 <- 00 pc=91A1 frame=22 sl=14 dot=3
+vs: write 2005 <- 00 pc=91A4 frame=22 sl=14 dot=15
+vs: write 2001 <- 00 pc=816C frame=22 sl=14 dot=153
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=22 sl=28 dot=125
+vs: write 2005 <- 00 pc=81EA frame=22 sl=28 dot=149
+vs: write 2000 <- 10 pc=81F1 frame=22 sl=28 dot=182
+vs: write 2000 <- 90 pc=81FD frame=22 sl=153 dot=97
+vs: write 2000 <- 10 pc=8117 frame=22 sl=241 dot=65
+vs: write 2001 <- 00 pc=812E frame=22 sl=241 dot=134
+vs: write 2005 <- 00 pc=91A1 frame=22 sl=241 dot=182
+vs: write 2005 <- 00 pc=91A4 frame=22 sl=241 dot=194
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 20 pc=914D frame=22 sl=246 dot=202
+vs: write 2006 <- 90 pc=9153 frame=22 sl=246 dot=235
+vs: write 2000 <- 14 pc=91A8 frame=22 sl=246 dot=328
+vs: write 2006 <- 3F pc=918A frame=22 sl=251 dot=171
+vs: write 2006 <- 00 pc=918F frame=22 sl=251 dot=189
+vs: write 2006 <- 00 pc=9192 frame=22 sl=251 dot=201
+vs: write 2006 <- 00 pc=9195 frame=22 sl=251 dot=213
+vs: write 2006 <- 20 pc=914D frame=22 sl=251 dot=267
+vs: write 2006 <- 91 pc=9153 frame=22 sl=251 dot=300
+vs: write 2000 <- 14 pc=91A8 frame=22 sl=252 dot=52
+vs: write 2006 <- 3F pc=918A frame=22 sl=256 dot=236
+vs: write 2006 <- 00 pc=918F frame=22 sl=256 dot=254
+vs: write 2006 <- 00 pc=9192 frame=22 sl=256 dot=266
+vs: write 2006 <- 00 pc=9195 frame=22 sl=256 dot=278
+vs: write 2006 <- 20 pc=914D frame=22 sl=256 dot=332
+vs: write 2006 <- 92 pc=9153 frame=22 sl=257 dot=24
+vs: write 2000 <- 14 pc=91A8 frame=22 sl=257 dot=117
+vs: write 2006 <- 3F pc=918A frame=22 sl=261 dot=301
+vs: write 2006 <- 00 pc=918F frame=22 sl=261 dot=319
+vs: write 2006 <- 00 pc=9192 frame=22 sl=261 dot=331
+vs: frame=23 pc=9192 a=00 x=00 y=1C p=26 sp=FA ctrl=14 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2006 <- 00 pc=9195 frame=23 sl=0 dot=0
+vs: write 2006 <- 20 pc=914D frame=23 sl=0 dot=54
+vs: write 2006 <- 93 pc=9153 frame=23 sl=0 dot=87
+vs: write 2000 <- 14 pc=91A8 frame=23 sl=0 dot=180
+vs: write 2006 <- 3F pc=918A frame=23 sl=5 dot=23
+vs: write 2006 <- 00 pc=918F frame=23 sl=5 dot=41
+vs: write 2006 <- 00 pc=9192 frame=23 sl=5 dot=53
+vs: write 2006 <- 00 pc=9195 frame=23 sl=5 dot=65
+vs: write 2006 <- 23 pc=914D frame=23 sl=5 dot=119
+vs: write 2006 <- CC pc=9153 frame=23 sl=5 dot=152
+vs: write 2000 <- 10 pc=91A8 frame=23 sl=5 dot=248
+vs: write 2006 <- 3F pc=918A frame=23 sl=6 dot=105
+vs: write 2006 <- 00 pc=918F frame=23 sl=6 dot=123
+vs: write 2006 <- 00 pc=9192 frame=23 sl=6 dot=135
+vs: write 2006 <- 00 pc=9195 frame=23 sl=6 dot=147
+vs: write 2006 <- 23 pc=914D frame=23 sl=6 dot=201
+vs: write 2006 <- D4 pc=9153 frame=23 sl=6 dot=234
+vs: write 2000 <- 10 pc=91A8 frame=23 sl=6 dot=330
+vs: write 2006 <- 3F pc=918A frame=23 sl=7 dot=187
+vs: write 2006 <- 00 pc=918F frame=23 sl=7 dot=205
+vs: write 2006 <- 00 pc=9192 frame=23 sl=7 dot=217
+vs: write 2006 <- 00 pc=9195 frame=23 sl=7 dot=229
+vs: write 2006 <- 23 pc=914D frame=23 sl=7 dot=283
+vs: write 2006 <- DC pc=9153 frame=23 sl=7 dot=316
+vs: write 2000 <- 10 pc=91A8 frame=23 sl=8 dot=71
+vs: write 2006 <- 3F pc=918A frame=23 sl=8 dot=269
+vs: write 2006 <- 00 pc=918F frame=23 sl=8 dot=287
+vs: write 2006 <- 00 pc=9192 frame=23 sl=8 dot=299
+vs: write 2006 <- 00 pc=9195 frame=23 sl=8 dot=311
+vs: write 2006 <- 23 pc=914D frame=23 sl=9 dot=24
+vs: write 2006 <- E4 pc=9153 frame=23 sl=9 dot=57
+vs: write 2000 <- 10 pc=91A8 frame=23 sl=9 dot=153
+vs: write 2006 <- 3F pc=918A frame=23 sl=10 dot=10
+vs: write 2006 <- 00 pc=918F frame=23 sl=10 dot=28
+vs: write 2006 <- 00 pc=9192 frame=23 sl=10 dot=40
+vs: write 2006 <- 00 pc=9195 frame=23 sl=10 dot=52
+vs: write 2006 <- 23 pc=914D frame=23 sl=10 dot=106
+vs: write 2006 <- EC pc=9153 frame=23 sl=10 dot=139
+vs: write 2000 <- 10 pc=91A8 frame=23 sl=10 dot=235
+vs: write 2006 <- 3F pc=918A frame=23 sl=11 dot=92
+vs: write 2006 <- 00 pc=918F frame=23 sl=11 dot=110
+vs: write 2006 <- 00 pc=9192 frame=23 sl=11 dot=122
+vs: write 2006 <- 00 pc=9195 frame=23 sl=11 dot=134
+vs: write 2006 <- 23 pc=914D frame=23 sl=11 dot=188
+vs: write 2006 <- F4 pc=9153 frame=23 sl=11 dot=221
+vs: write 2000 <- 10 pc=91A8 frame=23 sl=11 dot=317
+vs: write 2006 <- 3F pc=918A frame=23 sl=12 dot=174
+vs: write 2006 <- 00 pc=918F frame=23 sl=12 dot=192
+vs: write 2006 <- 00 pc=9192 frame=23 sl=12 dot=204
+vs: write 2006 <- 00 pc=9195 frame=23 sl=12 dot=216
+vs: write 2006 <- 23 pc=914D frame=23 sl=12 dot=270
+vs: write 2006 <- FC pc=9153 frame=23 sl=12 dot=303
+vs: write 2000 <- 10 pc=91A8 frame=23 sl=13 dot=58
+vs: write 2006 <- 3F pc=918A frame=23 sl=13 dot=256
+vs: write 2006 <- 00 pc=918F frame=23 sl=13 dot=274
+vs: write 2006 <- 00 pc=9192 frame=23 sl=13 dot=286
+vs: write 2006 <- 00 pc=9195 frame=23 sl=13 dot=298
+vs: write 2005 <- 00 pc=91A1 frame=23 sl=14 dot=8
+vs: write 2005 <- 00 pc=91A4 frame=23 sl=14 dot=20
+vs: write 2001 <- 00 pc=816C frame=23 sl=14 dot=158
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=23 sl=28 dot=130
+vs: write 2005 <- 00 pc=81EA frame=23 sl=28 dot=154
+vs: write 2000 <- 10 pc=81F1 frame=23 sl=28 dot=187
+vs: write 2000 <- 90 pc=81FD frame=23 sl=153 dot=102
+vs: write 2000 <- 10 pc=8117 frame=23 sl=241 dot=61
+vs: write 2001 <- 00 pc=812E frame=23 sl=241 dot=130
+vs: write 2005 <- 00 pc=91A1 frame=23 sl=241 dot=178
+vs: write 2005 <- 00 pc=91A4 frame=23 sl=241 dot=190
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 20 pc=914D frame=23 sl=246 dot=198
+vs: write 2006 <- 94 pc=9153 frame=23 sl=246 dot=231
+vs: write 2000 <- 14 pc=91A8 frame=23 sl=246 dot=324
+vs: write 2006 <- 3F pc=918A frame=23 sl=251 dot=167
+vs: write 2006 <- 00 pc=918F frame=23 sl=251 dot=185
+vs: write 2006 <- 00 pc=9192 frame=23 sl=251 dot=197
+vs: write 2006 <- 00 pc=9195 frame=23 sl=251 dot=209
+vs: write 2006 <- 20 pc=914D frame=23 sl=251 dot=263
+vs: write 2006 <- 95 pc=9153 frame=23 sl=251 dot=296
+vs: write 2000 <- 14 pc=91A8 frame=23 sl=252 dot=48
+vs: write 2006 <- 3F pc=918A frame=23 sl=256 dot=232
+vs: write 2006 <- 00 pc=918F frame=23 sl=256 dot=250
+vs: write 2006 <- 00 pc=9192 frame=23 sl=256 dot=262
+vs: write 2006 <- 00 pc=9195 frame=23 sl=256 dot=274
+vs: write 2006 <- 20 pc=914D frame=23 sl=256 dot=328
+vs: write 2006 <- 96 pc=9153 frame=23 sl=257 dot=20
+vs: write 2000 <- 14 pc=91A8 frame=23 sl=257 dot=113
+vs: write 2006 <- 3F pc=918A frame=23 sl=261 dot=297
+vs: write 2006 <- 00 pc=918F frame=23 sl=261 dot=315
+vs: write 2006 <- 00 pc=9192 frame=23 sl=261 dot=327
+vs: write 2006 <- 00 pc=9195 frame=23 sl=261 dot=339
+vs: frame=24 pc=9195 a=00 x=00 y=1C p=26 sp=FA ctrl=14 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2006 <- 20 pc=914D frame=24 sl=0 dot=49
+vs: write 2006 <- 97 pc=9153 frame=24 sl=0 dot=82
+vs: write 2000 <- 14 pc=91A8 frame=24 sl=0 dot=175
+vs: write 2006 <- 3F pc=918A frame=24 sl=5 dot=18
+vs: write 2006 <- 00 pc=918F frame=24 sl=5 dot=36
+vs: write 2006 <- 00 pc=9192 frame=24 sl=5 dot=48
+vs: write 2006 <- 00 pc=9195 frame=24 sl=5 dot=60
+vs: write 2006 <- 23 pc=914D frame=24 sl=5 dot=114
+vs: write 2006 <- CD pc=9153 frame=24 sl=5 dot=147
+vs: write 2000 <- 10 pc=91A8 frame=24 sl=5 dot=243
+vs: write 2006 <- 3F pc=918A frame=24 sl=6 dot=100
+vs: write 2006 <- 00 pc=918F frame=24 sl=6 dot=118
+vs: write 2006 <- 00 pc=9192 frame=24 sl=6 dot=130
+vs: write 2006 <- 00 pc=9195 frame=24 sl=6 dot=142
+vs: write 2006 <- 23 pc=914D frame=24 sl=6 dot=196
+vs: write 2006 <- D5 pc=9153 frame=24 sl=6 dot=229
+vs: write 2000 <- 10 pc=91A8 frame=24 sl=6 dot=325
+vs: write 2006 <- 3F pc=918A frame=24 sl=7 dot=182
+vs: write 2006 <- 00 pc=918F frame=24 sl=7 dot=200
+vs: write 2006 <- 00 pc=9192 frame=24 sl=7 dot=212
+vs: write 2006 <- 00 pc=9195 frame=24 sl=7 dot=224
+vs: write 2006 <- 23 pc=914D frame=24 sl=7 dot=278
+vs: write 2006 <- DD pc=9153 frame=24 sl=7 dot=311
+vs: write 2000 <- 10 pc=91A8 frame=24 sl=8 dot=66
+vs: write 2006 <- 3F pc=918A frame=24 sl=8 dot=264
+vs: write 2006 <- 00 pc=918F frame=24 sl=8 dot=282
+vs: write 2006 <- 00 pc=9192 frame=24 sl=8 dot=294
+vs: write 2006 <- 00 pc=9195 frame=24 sl=8 dot=306
+vs: write 2006 <- 23 pc=914D frame=24 sl=9 dot=19
+vs: write 2006 <- E5 pc=9153 frame=24 sl=9 dot=52
+vs: write 2000 <- 10 pc=91A8 frame=24 sl=9 dot=148
+vs: write 2006 <- 3F pc=918A frame=24 sl=10 dot=5
+vs: write 2006 <- 00 pc=918F frame=24 sl=10 dot=23
+vs: write 2006 <- 00 pc=9192 frame=24 sl=10 dot=35
+vs: write 2006 <- 00 pc=9195 frame=24 sl=10 dot=47
+vs: write 2006 <- 23 pc=914D frame=24 sl=10 dot=101
+vs: write 2006 <- ED pc=9153 frame=24 sl=10 dot=134
+vs: write 2000 <- 10 pc=91A8 frame=24 sl=10 dot=230
+vs: write 2006 <- 3F pc=918A frame=24 sl=11 dot=87
+vs: write 2006 <- 00 pc=918F frame=24 sl=11 dot=105
+vs: write 2006 <- 00 pc=9192 frame=24 sl=11 dot=117
+vs: write 2006 <- 00 pc=9195 frame=24 sl=11 dot=129
+vs: write 2006 <- 23 pc=914D frame=24 sl=11 dot=183
+vs: write 2006 <- F5 pc=9153 frame=24 sl=11 dot=216
+vs: write 2000 <- 10 pc=91A8 frame=24 sl=11 dot=312
+vs: write 2006 <- 3F pc=918A frame=24 sl=12 dot=169
+vs: write 2006 <- 00 pc=918F frame=24 sl=12 dot=187
+vs: write 2006 <- 00 pc=9192 frame=24 sl=12 dot=199
+vs: write 2006 <- 00 pc=9195 frame=24 sl=12 dot=211
+vs: write 2006 <- 23 pc=914D frame=24 sl=12 dot=265
+vs: write 2006 <- FD pc=9153 frame=24 sl=12 dot=298
+vs: write 2000 <- 10 pc=91A8 frame=24 sl=13 dot=53
+vs: write 2006 <- 3F pc=918A frame=24 sl=13 dot=251
+vs: write 2006 <- 00 pc=918F frame=24 sl=13 dot=269
+vs: write 2006 <- 00 pc=9192 frame=24 sl=13 dot=281
+vs: write 2006 <- 00 pc=9195 frame=24 sl=13 dot=293
+vs: write 2005 <- 00 pc=91A1 frame=24 sl=14 dot=3
+vs: write 2005 <- 00 pc=91A4 frame=24 sl=14 dot=15
+vs: write 2001 <- 00 pc=816C frame=24 sl=14 dot=153
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=24 sl=28 dot=125
+vs: write 2005 <- 00 pc=81EA frame=24 sl=28 dot=149
+vs: write 2000 <- 10 pc=81F1 frame=24 sl=28 dot=182
+vs: write 2000 <- 90 pc=81FD frame=24 sl=153 dot=97
+vs: write 2000 <- 10 pc=8117 frame=24 sl=241 dot=65
+vs: write 2001 <- 00 pc=812E frame=24 sl=241 dot=134
+vs: write 2005 <- 00 pc=91A1 frame=24 sl=241 dot=182
+vs: write 2005 <- 00 pc=91A4 frame=24 sl=241 dot=194
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 20 pc=914D frame=24 sl=246 dot=202
+vs: write 2006 <- 98 pc=9153 frame=24 sl=246 dot=235
+vs: write 2000 <- 14 pc=91A8 frame=24 sl=246 dot=328
+vs: write 2006 <- 3F pc=918A frame=24 sl=251 dot=171
+vs: write 2006 <- 00 pc=918F frame=24 sl=251 dot=189
+vs: write 2006 <- 00 pc=9192 frame=24 sl=251 dot=201
+vs: write 2006 <- 00 pc=9195 frame=24 sl=251 dot=213
+vs: write 2006 <- 20 pc=914D frame=24 sl=251 dot=267
+vs: write 2006 <- 99 pc=9153 frame=24 sl=251 dot=300
+vs: write 2000 <- 14 pc=91A8 frame=24 sl=252 dot=52
+vs: write 2006 <- 3F pc=918A frame=24 sl=256 dot=236
+vs: write 2006 <- 00 pc=918F frame=24 sl=256 dot=254
+vs: write 2006 <- 00 pc=9192 frame=24 sl=256 dot=266
+vs: write 2006 <- 00 pc=9195 frame=24 sl=256 dot=278
+vs: write 2006 <- 20 pc=914D frame=24 sl=256 dot=332
+vs: write 2006 <- 9A pc=9153 frame=24 sl=257 dot=24
+vs: write 2000 <- 14 pc=91A8 frame=24 sl=257 dot=117
+vs: write 2006 <- 3F pc=918A frame=24 sl=261 dot=301
+vs: write 2006 <- 00 pc=918F frame=24 sl=261 dot=319
+vs: write 2006 <- 00 pc=9192 frame=24 sl=261 dot=331
+vs: frame=25 pc=9192 a=00 x=00 y=1C p=26 sp=FA ctrl=14 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2006 <- 00 pc=9195 frame=25 sl=0 dot=0
+vs: write 2006 <- 20 pc=914D frame=25 sl=0 dot=54
+vs: write 2006 <- 9B pc=9153 frame=25 sl=0 dot=87
+vs: write 2000 <- 14 pc=91A8 frame=25 sl=0 dot=180
+vs: write 2006 <- 3F pc=918A frame=25 sl=5 dot=23
+vs: write 2006 <- 00 pc=918F frame=25 sl=5 dot=41
+vs: write 2006 <- 00 pc=9192 frame=25 sl=5 dot=53
+vs: write 2006 <- 00 pc=9195 frame=25 sl=5 dot=65
+vs: write 2006 <- 23 pc=914D frame=25 sl=5 dot=119
+vs: write 2006 <- CE pc=9153 frame=25 sl=5 dot=152
+vs: write 2000 <- 10 pc=91A8 frame=25 sl=5 dot=248
+vs: write 2006 <- 3F pc=918A frame=25 sl=6 dot=105
+vs: write 2006 <- 00 pc=918F frame=25 sl=6 dot=123
+vs: write 2006 <- 00 pc=9192 frame=25 sl=6 dot=135
+vs: write 2006 <- 00 pc=9195 frame=25 sl=6 dot=147
+vs: write 2006 <- 23 pc=914D frame=25 sl=6 dot=201
+vs: write 2006 <- D6 pc=9153 frame=25 sl=6 dot=234
+vs: write 2000 <- 10 pc=91A8 frame=25 sl=6 dot=330
+vs: write 2006 <- 3F pc=918A frame=25 sl=7 dot=187
+vs: write 2006 <- 00 pc=918F frame=25 sl=7 dot=205
+vs: write 2006 <- 00 pc=9192 frame=25 sl=7 dot=217
+vs: write 2006 <- 00 pc=9195 frame=25 sl=7 dot=229
+vs: write 2006 <- 23 pc=914D frame=25 sl=7 dot=283
+vs: write 2006 <- DE pc=9153 frame=25 sl=7 dot=316
+vs: write 2000 <- 10 pc=91A8 frame=25 sl=8 dot=71
+vs: write 2006 <- 3F pc=918A frame=25 sl=8 dot=269
+vs: write 2006 <- 00 pc=918F frame=25 sl=8 dot=287
+vs: write 2006 <- 00 pc=9192 frame=25 sl=8 dot=299
+vs: write 2006 <- 00 pc=9195 frame=25 sl=8 dot=311
+vs: write 2006 <- 23 pc=914D frame=25 sl=9 dot=24
+vs: write 2006 <- E6 pc=9153 frame=25 sl=9 dot=57
+vs: write 2000 <- 10 pc=91A8 frame=25 sl=9 dot=153
+vs: write 2006 <- 3F pc=918A frame=25 sl=10 dot=10
+vs: write 2006 <- 00 pc=918F frame=25 sl=10 dot=28
+vs: write 2006 <- 00 pc=9192 frame=25 sl=10 dot=40
+vs: write 2006 <- 00 pc=9195 frame=25 sl=10 dot=52
+vs: write 2006 <- 23 pc=914D frame=25 sl=10 dot=106
+vs: write 2006 <- EE pc=9153 frame=25 sl=10 dot=139
+vs: write 2000 <- 10 pc=91A8 frame=25 sl=10 dot=235
+vs: write 2006 <- 3F pc=918A frame=25 sl=11 dot=92
+vs: write 2006 <- 00 pc=918F frame=25 sl=11 dot=110
+vs: write 2006 <- 00 pc=9192 frame=25 sl=11 dot=122
+vs: write 2006 <- 00 pc=9195 frame=25 sl=11 dot=134
+vs: write 2006 <- 23 pc=914D frame=25 sl=11 dot=188
+vs: write 2006 <- F6 pc=9153 frame=25 sl=11 dot=221
+vs: write 2000 <- 10 pc=91A8 frame=25 sl=11 dot=317
+vs: write 2006 <- 3F pc=918A frame=25 sl=12 dot=174
+vs: write 2006 <- 00 pc=918F frame=25 sl=12 dot=192
+vs: write 2006 <- 00 pc=9192 frame=25 sl=12 dot=204
+vs: write 2006 <- 00 pc=9195 frame=25 sl=12 dot=216
+vs: write 2006 <- 23 pc=914D frame=25 sl=12 dot=270
+vs: write 2006 <- FE pc=9153 frame=25 sl=12 dot=303
+vs: write 2000 <- 10 pc=91A8 frame=25 sl=13 dot=58
+vs: write 2006 <- 3F pc=918A frame=25 sl=13 dot=256
+vs: write 2006 <- 00 pc=918F frame=25 sl=13 dot=274
+vs: write 2006 <- 00 pc=9192 frame=25 sl=13 dot=286
+vs: write 2006 <- 00 pc=9195 frame=25 sl=13 dot=298
+vs: write 2005 <- 00 pc=91A1 frame=25 sl=14 dot=8
+vs: write 2005 <- 00 pc=91A4 frame=25 sl=14 dot=20
+vs: write 2001 <- 00 pc=816C frame=25 sl=14 dot=158
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=25 sl=28 dot=127
+vs: write 2005 <- 00 pc=81EA frame=25 sl=28 dot=151
+vs: write 2000 <- 10 pc=81F1 frame=25 sl=28 dot=184
+vs: write 2000 <- 90 pc=81FD frame=25 sl=153 dot=174
+vs: write 2000 <- 10 pc=8117 frame=25 sl=241 dot=61
+vs: write 2001 <- 00 pc=812E frame=25 sl=241 dot=130
+vs: write 2005 <- 00 pc=91A1 frame=25 sl=241 dot=178
+vs: write 2005 <- 00 pc=91A4 frame=25 sl=241 dot=190
+vs: write 4014 <- 02 pc=813E dma
+vs: write 2006 <- 20 pc=914D frame=25 sl=246 dot=198
+vs: write 2006 <- 9C pc=9153 frame=25 sl=246 dot=231
+vs: write 2000 <- 14 pc=91A8 frame=25 sl=246 dot=324
+vs: write 2006 <- 3F pc=918A frame=25 sl=251 dot=167
+vs: write 2006 <- 00 pc=918F frame=25 sl=251 dot=185
+vs: write 2006 <- 00 pc=9192 frame=25 sl=251 dot=197
+vs: write 2006 <- 00 pc=9195 frame=25 sl=251 dot=209
+vs: write 2006 <- 20 pc=914D frame=25 sl=251 dot=263
+vs: write 2006 <- 9D pc=9153 frame=25 sl=251 dot=296
+vs: write 2000 <- 14 pc=91A8 frame=25 sl=252 dot=48
+vs: write 2006 <- 3F pc=918A frame=25 sl=256 dot=232
+vs: write 2006 <- 00 pc=918F frame=25 sl=256 dot=250
+vs: write 2006 <- 00 pc=9192 frame=25 sl=256 dot=262
+vs: write 2006 <- 00 pc=9195 frame=25 sl=256 dot=274
+vs: write 2006 <- 20 pc=914D frame=25 sl=256 dot=328
+vs: write 2006 <- 9E pc=9153 frame=25 sl=257 dot=20
+vs: write 2000 <- 14 pc=91A8 frame=25 sl=257 dot=113
+vs: write 2006 <- 3F pc=918A frame=25 sl=261 dot=297
+vs: write 2006 <- 00 pc=918F frame=25 sl=261 dot=315
+vs: write 2006 <- 00 pc=9192 frame=25 sl=261 dot=327
+vs: write 2006 <- 00 pc=9195 frame=25 sl=261 dot=339
+vs: frame=26 pc=9195 a=00 x=00 y=1C p=26 sp=FA ctrl=14 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: write 2006 <- 20 pc=914D frame=26 sl=0 dot=49
+vs: write 2006 <- 9F pc=9153 frame=26 sl=0 dot=82
+vs: write 2000 <- 14 pc=91A8 frame=26 sl=0 dot=175
+vs: write 2006 <- 3F pc=918A frame=26 sl=5 dot=18
+vs: write 2006 <- 00 pc=918F frame=26 sl=5 dot=36
+vs: write 2006 <- 00 pc=9192 frame=26 sl=5 dot=48
+vs: write 2006 <- 00 pc=9195 frame=26 sl=5 dot=60
+vs: write 2006 <- 23 pc=914D frame=26 sl=5 dot=114
+vs: write 2006 <- CF pc=9153 frame=26 sl=5 dot=147
+vs: write 2000 <- 10 pc=91A8 frame=26 sl=5 dot=243
+vs: write 2006 <- 3F pc=918A frame=26 sl=6 dot=100
+vs: write 2006 <- 00 pc=918F frame=26 sl=6 dot=118
+vs: write 2006 <- 00 pc=9192 frame=26 sl=6 dot=130
+vs: write 2006 <- 00 pc=9195 frame=26 sl=6 dot=142
+vs: write 2006 <- 23 pc=914D frame=26 sl=6 dot=196
+vs: write 2006 <- D7 pc=9153 frame=26 sl=6 dot=229
+vs: write 2000 <- 10 pc=91A8 frame=26 sl=6 dot=325
+vs: write 2006 <- 3F pc=918A frame=26 sl=7 dot=182
+vs: write 2006 <- 00 pc=918F frame=26 sl=7 dot=200
+vs: write 2006 <- 00 pc=9192 frame=26 sl=7 dot=212
+vs: write 2006 <- 00 pc=9195 frame=26 sl=7 dot=224
+vs: write 2006 <- 23 pc=914D frame=26 sl=7 dot=278
+vs: write 2006 <- DF pc=9153 frame=26 sl=7 dot=311
+vs: write 2000 <- 10 pc=91A8 frame=26 sl=8 dot=66
+vs: write 2006 <- 3F pc=918A frame=26 sl=8 dot=264
+vs: write 2006 <- 00 pc=918F frame=26 sl=8 dot=282
+vs: write 2006 <- 00 pc=9192 frame=26 sl=8 dot=294
+vs: write 2006 <- 00 pc=9195 frame=26 sl=8 dot=306
+vs: write 2006 <- 23 pc=914D frame=26 sl=9 dot=19
+vs: write 2006 <- E7 pc=9153 frame=26 sl=9 dot=52
+vs: write 2000 <- 10 pc=91A8 frame=26 sl=9 dot=148
+vs: write 2006 <- 3F pc=918A frame=26 sl=10 dot=5
+vs: write 2006 <- 00 pc=918F frame=26 sl=10 dot=23
+vs: write 2006 <- 00 pc=9192 frame=26 sl=10 dot=35
+vs: write 2006 <- 00 pc=9195 frame=26 sl=10 dot=47
+vs: write 2006 <- 23 pc=914D frame=26 sl=10 dot=101
+vs: write 2006 <- EF pc=9153 frame=26 sl=10 dot=134
+vs: write 2000 <- 10 pc=91A8 frame=26 sl=10 dot=230
+vs: write 2006 <- 3F pc=918A frame=26 sl=11 dot=87
+vs: write 2006 <- 00 pc=918F frame=26 sl=11 dot=105
+vs: write 2006 <- 00 pc=9192 frame=26 sl=11 dot=117
+vs: write 2006 <- 00 pc=9195 frame=26 sl=11 dot=129
+vs: write 2006 <- 23 pc=914D frame=26 sl=11 dot=183
+vs: write 2006 <- F7 pc=9153 frame=26 sl=11 dot=216
+vs: write 2000 <- 10 pc=91A8 frame=26 sl=11 dot=312
+vs: write 2006 <- 3F pc=918A frame=26 sl=12 dot=169
+vs: write 2006 <- 00 pc=918F frame=26 sl=12 dot=187
+vs: write 2006 <- 00 pc=9192 frame=26 sl=12 dot=199
+vs: write 2006 <- 00 pc=9195 frame=26 sl=12 dot=211
+vs: write 2006 <- 23 pc=914D frame=26 sl=12 dot=265
+vs: write 2006 <- FF pc=9153 frame=26 sl=12 dot=298
+vs: write 2000 <- 10 pc=91A8 frame=26 sl=13 dot=53
+vs: write 2006 <- 3F pc=918A frame=26 sl=13 dot=251
+vs: write 2006 <- 00 pc=918F frame=26 sl=13 dot=269
+vs: write 2006 <- 00 pc=9192 frame=26 sl=13 dot=281
+vs: write 2006 <- 00 pc=9195 frame=26 sl=13 dot=293
+vs: write 2005 <- 00 pc=91A1 frame=26 sl=14 dot=3
+vs: write 2005 <- 00 pc=91A4 frame=26 sl=14 dot=15
+vs: write 2001 <- 00 pc=816C frame=26 sl=14 dot=153
+vs: write 4016 <- 03 pc=9118 strobe 0->1 chr=00000
+vs: write 4016 <- 02 pc=911F strobe 1->0 chr=00000
+vs: write 2005 <- 00 pc=81E4 frame=26 sl=28 dot=122
+vs: write 2005 <- 00 pc=81EA frame=26 sl=28 dot=146
+vs: write 2000 <- 10 pc=81F1 frame=26 sl=28 dot=179
+vs: frame=27 pc=A460 a=00 x=00 y=78 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=28 pc=A41E a=02 x=00 y=28 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=29 pc=A3FE a=00 x=00 y=D8 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=30 pc=A46D a=FF x=01 y=86 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=31 pc=A487 a=00 x=01 y=36 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=32 pc=A424 a=00 x=01 y=E6 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=33 pc=A405 a=FF x=01 y=96 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=34 pc=A470 a=FF x=01 y=44 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=35 pc=A48D a=00 x=02 y=F4 p=A4 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=36 pc=A44F a=00 x=02 y=A4 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=37 pc=A408 a=FF x=02 y=55 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=38 pc=A3EF a=01 x=02 y=02 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=39 pc=A463 a=00 x=00 y=B2 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=40 pc=A460 a=00 x=00 y=62 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=41 pc=A41E a=02 x=00 y=12 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=42 pc=A3FE a=00 x=00 y=C2 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=43 pc=A468 a=FF x=01 y=70 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=44 pc=A487 a=00 x=01 y=20 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=45 pc=A422 a=00 x=01 y=D0 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=46 pc=A402 a=00 x=01 y=80 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=47 pc=A46E a=FF x=01 y=2E p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=48 pc=A48A a=00 x=02 y=DE p=A4 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=49 pc=A446 a=00 x=02 y=8E p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=50 pc=A407 a=FF x=02 y=3E p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=51 pc=A3EF a=01 x=02 y=EC p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=52 pc=A463 a=00 x=00 y=9C p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=53 pc=A45D a=00 x=00 y=4C p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=54 pc=A41E a=02 x=00 y=FC p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=55 pc=A3FC a=02 x=00 y=AC p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=56 pc=A465 a=00 x=01 y=5A p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=57 pc=A460 a=00 x=01 y=0A p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=58 pc=A420 a=00 x=01 y=BA p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=59 pc=A3FE a=00 x=01 y=6A p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=60 pc=A46D a=FF x=02 y=18 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=61 pc=A48A a=00 x=02 y=C8 p=A4 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=62 pc=A424 a=00 x=02 y=78 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=63 pc=A405 a=FF x=02 y=28 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=64 pc=A3ED a=01 x=02 y=D6 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=65 pc=A492 a=00 x=00 y=86 p=26 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=66 pc=A455 a=00 x=00 y=36 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=67 pc=A419 a=00 x=00 y=E6 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=68 pc=A3F9 a=02 x=00 y=96 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=69 pc=A463 a=00 x=01 y=44 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=70 pc=A460 a=00 x=01 y=F4 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=71 pc=A41E a=02 x=01 y=A4 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=72 pc=A3FE a=00 x=01 y=54 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=73 pc=A468 a=FF x=02 y=02 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=74 pc=A487 a=00 x=02 y=B2 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=75 pc=A422 a=00 x=02 y=62 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=76 pc=A402 a=00 x=02 y=12 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=77 pc=A3EB a=01 x=FF y=C0 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=78 pc=A48F a=00 x=00 y=70 p=26 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=79 pc=A452 a=00 x=00 y=20 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=80 pc=A418 a=00 x=00 y=D1 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=81 pc=A3F7 a=00 x=00 y=80 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=82 pc=A463 a=00 x=01 y=2E p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=83 pc=A460 a=00 x=01 y=DE p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=84 pc=A41E a=02 x=01 y=8E p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=85 pc=A3FC a=02 x=01 y=3E p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=86 pc=A468 a=FF x=02 y=EC p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=87 pc=A487 a=00 x=02 y=9C p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=88 pc=A420 a=00 x=02 y=4C p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=89 pc=A402 a=00 x=02 y=FC p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=90 pc=A478 a=01 x=FF y=AA p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=91 pc=A48D a=00 x=00 y=5A p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=92 pc=A452 a=00 x=00 y=0A p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=93 pc=A40B a=00 x=00 y=BB p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=94 pc=A3F4 a=00 x=00 y=68 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=95 pc=A492 a=00 x=01 y=18 p=26 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=96 pc=A45D a=00 x=01 y=C8 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=97 pc=A419 a=00 x=01 y=78 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=98 pc=A3F9 a=02 x=01 y=28 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=99 pc=A465 a=00 x=02 y=D6 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=100 pc=A460 a=00 x=02 y=86 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=101 pc=A41E a=02 x=02 y=36 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=102 pc=A3FE a=00 x=02 y=E6 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=103 pc=A476 a=01 x=FF y=94 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=104 pc=A48D a=00 x=00 y=44 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=105 pc=A452 a=00 x=00 y=F4 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=106 pc=A40A a=00 x=00 y=A5 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=107 pc=A3F4 a=00 x=00 y=52 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=108 pc=A48F a=00 x=01 y=02 p=26 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=109 pc=A455 a=00 x=01 y=B2 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=110 pc=A418 a=00 x=01 y=63 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=111 pc=A3F7 a=00 x=01 y=12 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=112 pc=A463 a=00 x=02 y=C0 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=113 pc=A460 a=00 x=02 y=70 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=114 pc=A41E a=02 x=02 y=20 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=115 pc=A3FE a=00 x=02 y=D0 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=116 pc=A473 a=FF x=FF y=7E p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=117 pc=A48A a=00 x=00 y=2E p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=118 pc=A44F a=00 x=00 y=DE p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=119 pc=A408 a=FF x=00 y=8F p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=120 pc=A3EF a=FF x=00 y=3C p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=121 pc=A48F a=00 x=01 y=EC p=26 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=122 pc=A452 a=00 x=01 y=9C p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=123 pc=A40B a=00 x=01 y=4D p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=124 pc=A3F7 a=00 x=01 y=FC p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=125 pc=A463 a=00 x=02 y=AA p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=126 pc=A45D a=00 x=02 y=5A p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=127 pc=A419 a=00 x=02 y=0A p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=128 pc=A3FC a=02 x=02 y=BA p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=129 pc=A46E a=FF x=FF y=68 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=130 pc=A48A a=00 x=00 y=18 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=131 pc=A446 a=00 x=00 y=C8 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=132 pc=A407 a=FF x=00 y=78 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=133 pc=A3ED a=FF x=00 y=26 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=134 pc=A48D a=00 x=01 y=D6 p=A4 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=135 pc=A452 a=00 x=01 y=86 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=136 pc=A40A a=00 x=01 y=37 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=137 pc=A3F4 a=00 x=01 y=E4 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=138 pc=A492 a=00 x=02 y=94 p=26 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=139 pc=A455 a=00 x=02 y=44 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=140 pc=A419 a=00 x=02 y=F4 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=141 pc=A3F9 a=02 x=02 y=A4 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=142 pc=A46D a=FF x=00 y=52 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=143 pc=A487 a=00 x=00 y=02 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=144 pc=A424 a=00 x=00 y=B2 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=145 pc=A405 a=FF x=00 y=62 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=146 pc=A470 a=FF x=00 y=10 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=147 pc=A48D a=00 x=01 y=C0 p=A4 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=148 pc=A44F a=00 x=01 y=70 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=149 pc=A408 a=FF x=01 y=21 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=150 pc=A3F4 a=00 x=01 y=CE p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=151 pc=A48F a=00 x=02 y=7E p=26 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=152 pc=A452 a=00 x=02 y=2E p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=153 pc=A418 a=00 x=02 y=DF p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=154 pc=A3F7 a=00 x=02 y=8E p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=155 pc=A468 a=FF x=00 y=3C p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=156 pc=A487 a=00 x=00 y=EC p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=157 pc=A422 a=00 x=00 y=9C p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=158 pc=A402 a=00 x=00 y=4C p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=159 pc=A470 a=FF x=00 y=FA p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=160 pc=A48A a=00 x=01 y=AA p=A4 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=161 pc=A446 a=00 x=01 y=5A p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=162 pc=A407 a=FF x=01 y=0A p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=163 pc=A3EF a=FF x=01 y=B8 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=164 pc=A48D a=00 x=02 y=68 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=165 pc=A452 a=00 x=02 y=18 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=166 pc=A40B a=00 x=02 y=C9 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=167 pc=A3F4 a=00 x=02 y=76 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=168 pc=A465 a=00 x=00 y=26 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=169 pc=A487 a=00 x=00 y=D6 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=170 pc=A420 a=00 x=00 y=86 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=171 pc=A3FE a=00 x=00 y=36 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=172 pc=A46E a=FF x=00 y=E4 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=173 pc=A48A a=00 x=01 y=94 p=A4 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=174 pc=A424 a=00 x=01 y=44 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=175 pc=A407 a=FF x=01 y=F4 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=176 pc=A3ED a=FF x=01 y=A2 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=177 pc=A48D a=00 x=02 y=52 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=178 pc=A44F a=00 x=02 y=02 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=179 pc=A40A a=00 x=02 y=B3 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=180 pc=A3F4 a=00 x=02 y=60 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=181 pc=A463 a=00 x=00 y=10 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=182 pc=A460 a=00 x=00 y=C0 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=183 pc=A41E a=02 x=00 y=70 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=184 pc=A3FE a=00 x=00 y=20 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=185 pc=A46D a=FF x=01 y=CE p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=186 pc=A487 a=00 x=01 y=7E p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=187 pc=A422 a=00 x=01 y=2E p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=188 pc=A405 a=FF x=01 y=DE p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=189 pc=A470 a=FF x=01 y=8C p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=190 pc=A48A a=00 x=02 y=3C p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=191 pc=A44F a=00 x=02 y=EC p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=192 pc=A408 a=FF x=02 y=9D p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=193 pc=A3EF a=01 x=02 y=4A p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=194 pc=A463 a=00 x=00 y=FA p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=195 pc=A460 a=00 x=00 y=AA p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=196 pc=A41E a=02 x=00 y=5A p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=197 pc=A3FC a=02 x=00 y=0A p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=198 pc=A468 a=FF x=01 y=B8 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=199 pc=A487 a=00 x=01 y=68 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=200 pc=A420 a=00 x=01 y=18 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=201 pc=A402 a=00 x=01 y=C8 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=202 pc=A46E a=FF x=01 y=76 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=203 pc=A48A a=00 x=02 y=26 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=204 pc=A446 a=00 x=02 y=D6 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=205 pc=A407 a=FF x=02 y=86 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=206 pc=A3ED a=01 x=02 y=34 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=207 pc=A463 a=00 x=00 y=E4 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=208 pc=A45D a=00 x=00 y=94 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=209 pc=A419 a=00 x=00 y=44 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=210 pc=A3FC a=02 x=00 y=F4 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=211 pc=A465 a=00 x=01 y=A2 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=212 pc=A460 a=00 x=01 y=52 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=213 pc=A41E a=02 x=01 y=02 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=214 pc=A3FE a=00 x=01 y=B2 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=215 pc=A46D a=FF x=02 y=60 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=216 pc=A487 a=00 x=02 y=10 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=217 pc=A424 a=00 x=02 y=C0 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=218 pc=A405 a=FF x=02 y=70 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=219 pc=A3EB a=01 x=FF y=1E p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=220 pc=A492 a=00 x=00 y=CE p=26 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=221 pc=A455 a=00 x=00 y=7E p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=222 pc=A418 a=00 x=00 y=2F p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=223 pc=A3F9 a=02 x=00 y=DE p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=224 pc=A463 a=00 x=01 y=8C p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=225 pc=A460 a=00 x=01 y=3C p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=226 pc=A41E a=02 x=01 y=EC p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=227 pc=A3FE a=00 x=01 y=9C p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=228 pc=A468 a=FF x=02 y=4A p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=229 pc=A487 a=00 x=02 y=FA p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=230 pc=A422 a=00 x=02 y=AA p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=231 pc=A402 a=00 x=02 y=5A p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=232 pc=A478 a=01 x=FF y=08 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=233 pc=A48F a=00 x=00 y=B8 p=26 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=234 pc=A452 a=00 x=00 y=68 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=235 pc=A40B a=00 x=00 y=19 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=236 pc=A3F7 a=00 x=00 y=C8 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=237 pc=A463 a=00 x=01 y=76 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=238 pc=A45D a=00 x=01 y=26 p=A4 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=239 pc=A41E a=02 x=01 y=D6 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=240 pc=A3FC a=02 x=01 y=86 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=241 pc=A465 a=00 x=02 y=34 p=24 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=242 pc=A487 a=00 x=02 y=E4 p=24 sp=F1 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=243 pc=A420 a=00 x=02 y=94 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0
+vs: frame=244 pc=A3FE a=00 x=02 y=44 p=26 sp=F3 ctrl=10 mask=00 status=00 chr=00000/01000 nmi=0 irq=0

@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <machine name="vssmb" family="mos" description="VS. Super Mario Bros. (arcade)"
-         alias="nes" tv="vs">
+         alias="nes" vga="rp2c04-0004" tv="vs">
     <!-- MAME suprmrio layout: offsets are relative to the named ROM region.
          PRG region offset 0 maps to CPU $8000. -->
     <rom name="1d" region="prg" addr="0x0000" sha256="dcab9a3c79ff99cd3366c85596a3677d346d65b859c77e89056ef9a62388adbe"/>

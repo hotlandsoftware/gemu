@@ -186,7 +186,8 @@ int mos_setup(int argc, char *argv[]) {
                 else if (strcmp(md->cpu, "2a03") == 0) cfg.cpu = MOS_CPU_2A03;
             }
             if (!args.vga && md->vga) {
-                if (strcmp(md->vga, "rp2c02") == 0) cfg.vga = MOS_VGA_RP2C02;
+                if      (strcmp(md->vga, "rp2c02")      == 0) cfg.vga = MOS_VGA_RP2C02;
+                else if (strcmp(md->vga, "rp2c04-0004") == 0) cfg.vga = MOS_VGA_RP2C04_0004;
             }
             break;
         }
@@ -199,7 +200,8 @@ int mos_setup(int argc, char *argv[]) {
     }
 
     if (args.vga) {
-        if (strcmp(args.vga, "rp2c02") == 0) cfg.vga = MOS_VGA_RP2C02;
+        if      (strcmp(args.vga, "rp2c02")      == 0) cfg.vga = MOS_VGA_RP2C02;
+        else if (strcmp(args.vga, "rp2c04-0004") == 0) cfg.vga = MOS_VGA_RP2C04_0004;
     }
 
     for (int i = 0; i < nrem; i++) {

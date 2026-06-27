@@ -19,6 +19,7 @@ typedef enum {
 typedef enum {
     MOS_VGA_NONE,
     MOS_VGA_RP2C02,  /* Ricoh RP2C02 — NES PPU */
+    MOS_VGA_RP2C04_0004,  /* Ricoh RP2C04-0004 — VS. System RGB PPU */
 } MosVgaType;
 
 typedef enum {

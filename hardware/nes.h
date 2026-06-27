@@ -157,6 +157,7 @@ typedef struct NesState {
     /* VS. System arcade */
     uint32_t vs_palette_rgb[64]; /* 2C04 palette; loaded from .pal file if present */
     uint8_t  vs_dip;          /* 8-bit DIP switch bank (SW1 1–8) */
+    uint8_t  vs_coin_counter; /* last value written/read through $4020-$5fff */
     int      vs_coin_latch[2]; /* coin pulse countdown in frames; >0 = coin signal active */
     bool     vs_coin_prev[2];  /* coin key state from previous frame (edge detection) */
     bool     vs_service;       /* service button state */

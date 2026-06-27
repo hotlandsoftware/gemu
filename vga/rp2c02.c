@@ -36,6 +36,8 @@ static uint16_t nt_mirror(const Rp2c02 *ppu, uint16_t addr) {
     uint8_t mode = ppu->mirror < 5 ? ppu->mirror : RP2C02_MIRROR_VERTICAL;
     uint16_t nt = (addr >> 10) & 3u;
     uint16_t off = addr & 0x03FFu;
+    if (mode == RP2C02_MIRROR_4SCREEN)
+        return (uint16_t)(nt * 0x400u + off);
     return (uint16_t)(((map[mode][nt] & 1u) * 0x400u) + off);
 }
 
@@ -509,7 +511,8 @@ void rp2c02_tick(Rp2c02 *ppu) {
         ppu->irq_scanline(ppu->irq_ud);
 
     ppu->dot++;
-    if (ppu->dot == 341 || (ppu->dot == 340 && prerender && ppu->odd_frame && rendering)) {
+    if (ppu->dot == 341 ||
+        (!ppu->no_odd_skip && ppu->dot == 340 && prerender && ppu->odd_frame && rendering)) {
         ppu->dot = 0;
         ppu->scanline++;
         if (ppu->scanline == ppu->lines_total) {

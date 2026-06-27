@@ -35,7 +35,7 @@
 #define RP2C02_MIRROR_4SCREEN     4
 
 typedef struct Rp2c02 {
-    uint8_t  vram[0x800];
+    uint8_t  vram[0x1000];
     uint8_t  oam[256];
     uint8_t  palette[32];
 
@@ -59,6 +59,7 @@ typedef struct Rp2c02 {
     int      vblank_line;  /* scanline where VBlank/NMI fires: 241 NTSC/PAL, 291 Dendy */
     uint64_t frame;
     bool     odd_frame;
+    bool     no_odd_skip;
 
     bool     nmi_pending;
 
