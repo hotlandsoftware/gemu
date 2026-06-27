@@ -8,7 +8,7 @@
 
 static const RomDbEntry rom_db[] = {
 #include "generated/romdb.inc"
-    { NULL, 0, NULL, NULL }
+    { NULL, 0, NULL, NULL, NULL }
 };
 
 const RomDbEntry *romdb_lookup(const char *sha256_hex) {
@@ -24,8 +24,9 @@ void romdb_print_needed(const char *machine_alias) {
     bool found = false;
     for (int i = 0; rom_db[i].sha256; i++) {
         if (strcmp(rom_db[i].machine, machine_alias) != 0) continue;
-        fprintf(stderr, "    %-32s  0x%04X  sha256=%s\n",
-                rom_db[i].label, (unsigned)rom_db[i].addr, rom_db[i].sha256);
+        fprintf(stderr, "    %-32s  %-8s  0x%04X  sha256=%s\n",
+                rom_db[i].label, rom_db[i].region ? rom_db[i].region : "",
+                (unsigned)rom_db[i].addr, rom_db[i].sha256);
         found = true;
     }
     if (!found)
@@ -75,9 +76,10 @@ int romdb_load_dir(const char *dir, const char *machine, RomDbAddFn fn, void *ud
             continue;
         }
 
-        printf("gemu: romdb matched %s (%s) → 0x%04X\n",
-               ent->d_name, e->label, (unsigned)e->addr);
-        if (!fn(path, e->addr, ud))
+        printf("gemu: romdb matched %s (%s) → %s:0x%04X\n",
+               ent->d_name, e->label, e->region ? e->region : "",
+               (unsigned)e->addr);
+        if (!fn(path, e->region, e->addr, ud))
             break;
         loaded++;
     }

@@ -15,8 +15,9 @@
 #include <string.h>
 #include <stdint.h>
 
-static bool romdb_add_rca(const char *path, uint32_t addr, void *ud) {
+static bool romdb_add_rca(const char *path, const char *region, uint32_t addr, void *ud) {
     RcaConfig *cfg = ud;
+    (void)region;
     if (cfg->n_roms >= RCA_MAX_ROM_LOADS) {
         fprintf(stderr, "gemu: too many ROMs (max %d)\n", RCA_MAX_ROM_LOADS);
         return false;

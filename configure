@@ -128,7 +128,8 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         name   = root.get('name')
         family = root.get('family')
         desc   = root.get('description', '')
-        roms   = [{'name': r.get('name'), 'addr': int(r.get('addr', '0'), 16),
+        roms   = [{'name': r.get('name'), 'region': r.get('region', ''),
+                   'addr': int(r.get('addr', '0'), 16),
                    'sha256': r.get('sha256', '')}
                   for r in root.findall('rom')]
         machines.append({
@@ -189,7 +190,8 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             if not r['sha256']:
                 continue
             romdb_lines.append(
-                f'    {{ "{r["sha256"]}", 0x{r["addr"]:04X}u, "{m["name"]}", "{r["name"]}" }},\n'
+                f'    {{ "{r["sha256"]}", 0x{r["addr"]:04X}u, '
+                f'{cstr(r["region"])}, "{m["name"]}", "{r["name"]}" }},\n'
             )
     with open(os.path.join(gen_dir, 'romdb.inc'), 'w', encoding='utf-8') as f:
         f.writelines(romdb_lines)

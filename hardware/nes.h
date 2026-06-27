@@ -154,6 +154,13 @@ typedef struct NesState {
     uint8_t  ctrl_inject_mask;        /* button bits to hold */
     int      ctrl_inject_frames;      /* frames remaining (counts down to 0) */
 
+    /* VS. System arcade */
+    uint32_t vs_palette_rgb[64]; /* 2C04 palette; loaded from .pal file if present */
+    uint8_t  vs_dip;          /* 8-bit DIP switch bank (SW1 1–8) */
+    int      vs_coin_latch[2]; /* coin pulse countdown in frames; >0 = coin signal active */
+    bool     vs_coin_prev[2];  /* coin key state from previous frame (edge detection) */
+    bool     vs_service;       /* service button state */
+
     /* Famicom Disk System */
     bool     fds_enabled;
     FdsState fds;

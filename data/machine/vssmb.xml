@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<machine name="vssmb" family="mos" description="VS. Super Mario Bros. (arcade)"
+         alias="nes" tv="vs">
+    <!-- MAME suprmrio layout: offsets are relative to the named ROM region.
+         PRG region offset 0 maps to CPU $8000. -->
+    <rom name="1d" region="prg" addr="0x0000" sha256="dcab9a3c79ff99cd3366c85596a3677d346d65b859c77e89056ef9a62388adbe"/>
+    <rom name="1c" region="prg" addr="0x2000" sha256="615c7b270bce31759b7aeeb966a4f0afccd04f76ba654d6f4f5fa05f92547386"/>
+    <rom name="1b" region="prg" addr="0x4000" sha256="e65bab1eb2d0747acbfe1b51be3e27ff5cd2893ad9e6f902fd37aced7ba86894"/>
+    <rom name="1a" region="prg" addr="0x6000" sha256="ff0e6090ddc0d10bce56a2ce8d6710d03a9015f535a76c9ee5341ede800b062b"/>
+    <!-- CHR VROM: 2x8 KB banks; 2b=bank0, 2a=bank1 selected by $4016 bit 2. -->
+    <rom name="2b" region="gfx1" addr="0x0000" sha256="bd5e7f307e1c3c3458b9cdfb3db7deb751f238079ee0db78ed75c20d60ff081d"/>
+    <rom name="2a" region="gfx1" addr="0x2000" sha256="b26ea7836d3bb370a9d4551471c096671ac074c7329b29076cec5ab366303cc0"/>
+    <rom name="rp2c04-0004.pal" region="ppu1:palette" addr="0x0000" sha256="705d33ac4b3197047b8c01ba3b6b96cd0fcea504de08c23efcd60e68337005a8"/>
+</machine>

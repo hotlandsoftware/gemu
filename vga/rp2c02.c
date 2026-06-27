@@ -490,7 +490,8 @@ void rp2c02_tick(Rp2c02 *ppu) {
         size_t idx = (size_t)sl * RP2C02_WIDTH + (size_t)(dot - 1);
         uint8_t color = output_pixel(ppu, dot - 1);
         ppu->pixels[idx] = color;
-        ppu->pixels_argb[idx] = rp2c02_palette_rgb[color & 0x3Fu];
+        const uint32_t *pal = ppu->alt_palette_rgb ? ppu->alt_palette_rgb : rp2c02_palette_rgb;
+        ppu->pixels_argb[idx] = pal[color & 0x3Fu];
     }
 
     if (rendering && visible && dot >= 1 && dot <= 256) {

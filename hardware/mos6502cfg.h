@@ -45,6 +45,7 @@ typedef enum {
 
 typedef struct {
     const char *path;
+    const char *region;
     uint32_t    addr;
 } MosRomLoad;
 
@@ -70,6 +71,7 @@ typedef struct MosConfig {
     bool            ppu_debug;
     bool            is_pal;      /* PAL/Dendy: 312 lines, ~50 Hz frame rate */
     bool            is_dendy;   /* Dendy Famiclone: NTSC-compatible PPU/APU within PAL 50 Hz */
+    bool            is_arcade;  /* NES-based arcade cabinet (VS. System, etc.) — coin-op, DIP switches */
     bool            kim_keyboard; /* KIM-1: -device kim-keypad → visual keypad overlay */
     bool            want_wozmon;  /* -device wozmon → patch wozmon into KIM-1 ROM at $1AA0 */
     const char     *tape_path;   /* KIM-1: cassette tape image (.kim binary), NULL = none */

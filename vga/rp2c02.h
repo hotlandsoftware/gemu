@@ -85,6 +85,10 @@ typedef struct Rp2c02 {
 
     uint8_t  pixels[RP2C02_WIDTH * RP2C02_HEIGHT];
     uint32_t pixels_argb[RP2C02_WIDTH * RP2C02_HEIGHT];
+
+    /* Optional alternate palette (e.g. 2C04-0004 for VS. System).
+     * If non-NULL, points to 64 ARGB values used instead of rp2c02_palette_rgb. */
+    const uint32_t *alt_palette_rgb;
     bool     dirty;
 
     uint8_t  mirror;

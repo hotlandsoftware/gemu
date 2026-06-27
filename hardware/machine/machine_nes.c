@@ -89,6 +89,127 @@ static const GemuActionDef nes_2p_actions[NES_2P_N_ACTIONS] = {
     { "P2 Right",  GEMU_ACTION(15), "" },
 };
 
+/* ── VS. System arcade actions ────────────────────────────────────────────── */
+/* Bit layout: 0-7 = P1 (NES_BTN_* order), 8-15 = P2, 16 = Coin1, 17 = Coin2, 18 = Svc */
+#define VS_NES_N_ACTIONS 19
+static const GemuActionDef vs_nes_actions[VS_NES_N_ACTIONS] = {
+    { "P1 A",     GEMU_ACTION(0),  "z"      },
+    { "P1 B",     GEMU_ACTION(1),  "x"      },
+    { "P1 Start", GEMU_ACTION(3),  "Return" },
+    { "P1 Up",    GEMU_ACTION(4),  "Up"     },
+    { "P1 Down",  GEMU_ACTION(5),  "Down"   },
+    { "P1 Left",  GEMU_ACTION(6),  "Left"   },
+    { "P1 Right", GEMU_ACTION(7),  "Right"  },
+    { "P2 A",     GEMU_ACTION(8),  "d"      },
+    { "P2 B",     GEMU_ACTION(9),  "f"      },
+    { "P2 Start", GEMU_ACTION(11), "g"      },
+    { "P2 Up",    GEMU_ACTION(12), "r"      },
+    { "P2 Down",  GEMU_ACTION(13), "v"      },
+    { "P2 Left",  GEMU_ACTION(14), "c"      },
+    { "P2 Right", GEMU_ACTION(15), "b"      },
+    { "Coin 1",   GEMU_ACTION(16), "5"      },
+    { "Coin 2",   GEMU_ACTION(17), "6"      },
+    { "Service",  GEMU_ACTION(18), "F2"     },
+};
+
+/* ── VS. SMB DIP switch table ────────────────────────────────────────────── */
+
+typedef struct { const char *value; const char *desc; uint8_t bits; } VsDipOption;
+typedef struct {
+    const char       *name, *desc;
+    uint8_t           mask;
+    const VsDipOption *options;
+    size_t             n_options;
+} VsDip;
+
+static const VsDipOption vs_coinage_opts[] = {
+    {"1c-1c",     "1 Coin / 1 Credit",  0x00},
+    {"3c-1c",     "3 Coins / 1 Credit", 0x02},
+    {"2c-1c",     "2 Coins / 1 Credit", 0x04},
+    {"1c-2c",     "1 Coin / 2 Credits", 0x06},
+    {"1c-3c",     "1 Coin / 3 Credits", 0x01},
+    {"1c-4c",     "1 Coin / 4 Credits", 0x05},
+    {"1c-5c",     "1 Coin / 5 Credits", 0x03},
+    {"free-play", "Free Play",          0x07},
+};
+static const VsDipOption vs_lives_opts[] = {
+    {"3", "3 lives", 0x00},
+    {"2", "2 lives", 0x08},
+};
+static const VsDipOption vs_bonus_opts[] = {
+    {"200", "200 coins",  0x10},
+    {"150", "150 coins",  0x20},
+    {"100", "100 coins",  0x00},
+    {"250", "250 coins",  0x30},
+};
+static const VsDipOption vs_speed_opts[] = {
+    {"slow", "Slow", 0x00},
+    {"fast", "Fast", 0x40},
+};
+static const VsDipOption vs_continue_opts[] = {
+    {"4", "4 lives on continue", 0x00},
+    {"3", "3 lives on continue", 0x80},
+};
+
+static const VsDip vs_dips[] = {
+    {"coinage",  "Coinage",        0x07, vs_coinage_opts,  8},
+    {"lives",    "Lives",          0x08, vs_lives_opts,    2},
+    {"bonus",    "Bonus coins",    0x30, vs_bonus_opts,    4},
+    {"timer",    "Timer speed",    0x40, vs_speed_opts,    2},
+    {"continue", "Continue lives", 0x80, vs_continue_opts, 2},
+};
+/* Default: 1c/1c, 3 lives, 200 coin bonus, slow timer, 4 continue lives */
+#define VS_DIP_DEFAULT 0x10u
+
+static const VsDip *vs_find_dip(const char *name) {
+    for (size_t i = 0; i < sizeof(vs_dips)/sizeof(vs_dips[0]); i++)
+        if (strcasecmp(name, vs_dips[i].name) == 0) return &vs_dips[i];
+    return NULL;
+}
+static const VsDipOption *vs_current_opt(const NesState *s, const VsDip *dip) {
+    uint8_t bits = s->vs_dip & dip->mask;
+    for (size_t i = 0; i < dip->n_options; i++)
+        if (dip->options[i].bits == bits) return &dip->options[i];
+    return NULL;
+}
+static void vs_list_dips(const NesState *s) {
+    printf("VS. SMB DIP switches (raw=0x%02X):\n", s->vs_dip);
+    for (size_t i = 0; i < sizeof(vs_dips)/sizeof(vs_dips[0]); i++) {
+        const VsDip *dip = &vs_dips[i];
+        const VsDipOption *cur = vs_current_opt(s, dip);
+        printf("  %-10s  %-16s  current: %s\n",
+               dip->name, dip->desc, cur ? cur->value : "?");
+        printf("             values:");
+        for (size_t j = 0; j < dip->n_options; j++) printf(" %s", dip->options[j].value);
+        printf("\n");
+    }
+}
+static bool vs_set_dip(NesState *s, const char *name, const char *value) {
+    const VsDip *dip = vs_find_dip(name);
+    if (!dip) { printf("unknown DIP '%s' (try 'dipswitch list')\n", name); return true; }
+    uint8_t bits = 0; bool found = false;
+    for (size_t i = 0; i < dip->n_options; i++)
+        if (strcasecmp(value, dip->options[i].value) == 0)
+            { bits = dip->options[i].bits; found = true; break; }
+    if (!found) {
+        char *end; unsigned long v = strtoul(value, &end, 0);
+        if (end && *end == '\0') { bits = (uint8_t)v & dip->mask; found = true; }
+    }
+    if (!found) { printf("invalid value '%s' for DIP '%s'\n", value, name); return true; }
+    s->vs_dip = (uint8_t)((s->vs_dip & ~dip->mask) | (bits & dip->mask));
+    const VsDipOption *cur = vs_current_opt(s, dip);
+    printf("DIP %s = %s\n", dip->name, cur ? cur->value : value);
+    return true;
+}
+static bool vs_dip_cmd(NesState *s, const char *args) {
+    while (*args == ' ' || *args == '\t') args++;
+    char buf[256]; snprintf(buf, sizeof(buf), "%s", args);
+    char *name = strtok(buf, " \t"), *val = strtok(NULL, " \t");
+    if (!name || strcasecmp(name, "list") == 0) { vs_list_dips(s); return true; }
+    if (!val) { printf("usage: dipswitch list | dipswitch <name> <value>\n"); return true; }
+    return vs_set_dip(s, name, val);
+}
+
 static bool nes_device_is_rob(NesDeviceType dev) {
     return dev == NES_DEVICE_ROB || dev == NES_DEVICE_ROB_FAMICOM;
 }
@@ -910,6 +1031,31 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
         return v;
     }
 
+    /* VS. System: DIP switches and coin signals layered onto $4016/$4017
+     * $4016 D0 = P1 shift reg | D2 = service | D3-D4 = DIP[0:1] | D5 = coin1 | D6 = coin2
+     * $4017 D0 = P2 shift reg | D2-D7 = DIP[2:7] */
+    if (s->cfg->is_arcade && addr == 0x4016) {
+        uint8_t bit;
+        if (s->ctrl_strobe)
+            s->ctrl_shift[0] = s->ctrl_state[0];
+        bit = s->ctrl_shift[0] & 1;
+        s->ctrl_shift[0] >>= 1;
+        return bit
+             | (s->vs_service           ? 0x04u : 0u)         /* D2: service */
+             | (uint8_t)((s->vs_dip & 0x03u) << 3)            /* D3-D4: DIP bits 0-1 */
+             | (s->vs_coin_latch[0] > 0 ? 0x20u : 0u)         /* D5: coin 1 */
+             | (s->vs_coin_latch[1] > 0 ? 0x40u : 0u);        /* D6: coin 2 */
+    }
+    if (s->cfg->is_arcade && addr == 0x4017) {
+        uint8_t bit;
+        if (s->ctrl_strobe)
+            s->ctrl_shift[1] = s->ctrl_state[1];
+        bit = s->ctrl_shift[1] & 1;
+        s->ctrl_shift[1] >>= 1;
+        return bit
+             | (uint8_t)(s->vs_dip & ~0x03u);                 /* D2-D7: DIP bits 2-7 */
+    }
+
     if (addr == 0x4016) {
         if (s->cfg->ports[0] != NES_DEVICE_CONTROLLER) return 0;
         if (s->ctrl_strobe) return (s->ctrl_state[0] & NES_BTN_A) ? 1u : 0u;
@@ -1056,11 +1202,22 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
 
     if (addr == 0x4016) {
         bool new_strobe = (val & 1) != 0;
-        if (s->ctrl_strobe && !new_strobe) {
+        if (s->cfg->is_arcade) {
+            if (new_strobe) {
+                s->ctrl_shift[0] = s->ctrl_state[0];
+                s->ctrl_shift[1] = s->ctrl_state[1];
+            }
+        } else if (s->ctrl_strobe && !new_strobe) {
             s->ctrl_shift[0] = s->ctrl_state[0];
             s->ctrl_shift[1] = s->ctrl_state[1];
         }
         s->ctrl_strobe = new_strobe;
+        /* VS. System: bit 2 selects 8KB VROM bank (0 = bank 2b at offset 0, 1 = bank 2a at 0x2000) */
+        if (s->cfg->is_arcade && !s->chr_is_ram) {
+            uint32_t bank_off = (val & 0x04u) ? 0x2000u : 0u;
+            s->chr_offsets[0] = bank_off;
+            s->chr_offsets[1] = bank_off + 0x1000u;
+        }
         return;
     }
 
@@ -1338,6 +1495,26 @@ static void nes_media_status(void *ud, char *buf, size_t buf_len) {
 
 /* held: bitmask returned by gemu_display_poll() this frame (0 if headless) */
 static void nes_handle_keys(NesState *s, uint32_t held) {
+    if (s->cfg->is_arcade) {
+        /* VS. arcade: bits 0-7 = P1, 8-15 = P2, 16 = Coin1, 17 = Coin2, 18 = Service */
+        if (s->display) {
+            s->ctrl_state[0] = (uint8_t)(held & 0xFFu);
+            s->ctrl_state[1] = (uint8_t)((held >> 8) & 0xFFu);
+            bool coin1 = (held >> 16) & 1;
+            bool coin2 = (held >> 17) & 1;
+            s->vs_service = (held >> 18) & 1;
+            if (coin1 && !s->vs_coin_prev[0]) s->vs_coin_latch[0] = 15;
+            if (coin2 && !s->vs_coin_prev[1]) s->vs_coin_latch[1] = 15;
+            s->vs_coin_prev[0] = coin1;
+            s->vs_coin_prev[1] = coin2;
+        }
+        if (s->ctrl_inject_frames > 0) {
+            s->ctrl_state[0] |= s->ctrl_inject_mask;
+            s->ctrl_inject_frames--;
+        }
+        return;
+    }
+
     if (!s->display) {
         /* Headless: clear state unless VNC is feeding us events */
         if (!s->vnc) { s->ctrl_state[0] = 0; s->ctrl_state[1] = 0; }
@@ -1507,6 +1684,134 @@ static void nes_reset(NesState *s) {
     apu2a03_reset(&s->apu);
 }
 
+/* ── Arcade ROM chip assembler ───────────────────────────────────────────── */
+/* Builds a NROM-256 cartridge in memory from individual chip files:
+ *   region "prg"  = PRG chips at MAME region offsets 0x0000-0x7FFF
+ *   region "gfx1" = CHR chips at MAME region offsets 0x0000-0x3FFF
+ *   region "ppu1:palette" = 2C04 palette LUT.
+ * Legacy manual loads without a region still accept PRG CPU addresses
+ * 0x8000-0xFFFF, CHR at 0x10000-0x1FFFF, and metadata >= 0x20000. */
+static bool nes_arcade_assemble(NesState *s, const MosConfig *cfg) {
+    uint8_t *prg = calloc(1, 32768);
+    uint8_t *chr = calloc(1, 16384); /* 2 × 8 KB VROM banks */
+    if (!prg || !chr) { free(prg); free(chr); return false; }
+
+    bool has_prg = false, has_chr = false;
+
+    /* Load PRG chips directly at their declared CPU offset.  VS. sockets are
+     * 8 KB; keeping that boundary exact catches missing/swapped chips early. */
+    for (int i = 0; i < cfg->n_roms; i++) {
+        uint32_t a = cfg->roms[i].addr;
+        bool is_prg = cfg->roms[i].region
+                   ? strcmp(cfg->roms[i].region, "prg") == 0
+                   : (a >= 0x8000 && a < 0x10000);
+        if (!is_prg) continue;
+        size_t off = cfg->roms[i].region ? a : a - 0x8000u;
+        if (off > 32768u - 0x2000u) {
+            fprintf(stderr, "arcade: PRG chip '%s' offset 0x%zX is out of range\n",
+                    cfg->roms[i].path, off);
+            free(prg); free(chr); return false;
+        }
+        FILE *f = fopen(cfg->roms[i].path, "rb");
+        if (!f) continue;
+        size_t n = fread(prg + off, 1, 0x2000u, f);
+        fclose(f);
+        if (n != 0x2000u) {
+            fprintf(stderr, "arcade: PRG chip '%s' is %zu bytes, expected 8192\n",
+                    cfg->roms[i].path, n);
+            free(prg); free(chr); return false;
+        }
+        has_prg = true;
+    }
+
+    /* Collect CHR chips, sort by addr, concatenate into the two 8KB VROM banks. */
+    struct ChrChip { uint32_t addr; const char *path; } cc[16];
+    int ncc = 0;
+    for (int i = 0; i < cfg->n_roms && ncc < 16; i++) {
+        uint32_t a = cfg->roms[i].addr;
+        bool is_chr = cfg->roms[i].region
+                   ? strcmp(cfg->roms[i].region, "gfx1") == 0
+                   : (a >= 0x10000 && a < 0x20000);
+        if (is_chr) {
+            cc[ncc].addr = cfg->roms[i].region ? a : a - 0x10000u;
+            cc[ncc].path = cfg->roms[i].path;
+            ncc++;
+        }
+    }
+    /* insertion sort by addr (tiny n) */
+    for (int i = 1; i < ncc; i++) {
+        struct ChrChip t = cc[i]; int j = i - 1;
+        for (; j >= 0 && cc[j].addr > t.addr; j--) cc[j+1] = cc[j];
+        cc[j+1] = t;
+    }
+    size_t chr_fill = 0;
+    for (int i = 0; i < ncc && chr_fill < 16384; i++) {
+        FILE *f = fopen(cc[i].path, "rb");
+        if (!f) continue;
+        fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
+        size_t to = (size_t)sz < 16384 - chr_fill ? (size_t)sz : 16384 - chr_fill;
+        chr_fill += fread(chr + chr_fill, 1, to, f);
+        fclose(f);
+        if (to != 0x2000u) {
+            fprintf(stderr, "arcade: CHR chip '%s' is %zu bytes, expected 8192\n",
+                    cc[i].path, to);
+            free(prg); free(chr); return false;
+        }
+        has_chr = true;
+    }
+
+    if (!has_prg) {
+        fprintf(stderr, "arcade: no PRG ROM chips found in ROM set\n");
+        free(prg); free(chr); return false;
+    }
+
+    s->cart.prg_banks   = 2;   /* 2 × 16KB = 32KB */
+    s->cart.chr_banks   = has_chr ? 2 : 0; /* 2 × 8KB VROM banks */
+    s->cart.mapper      = 0;
+    s->cart.mirror      = RP2C02_MIRROR_HORIZONTAL;
+    s->cart.has_battery = false;
+
+    s->prg = prg;
+    if (has_chr) {
+        s->chr = chr;
+        s->chr_is_ram = false;
+    } else {
+        free(chr);
+        s->chr = calloc(1, 8192);
+        s->chr_is_ram = true;
+    }
+
+    /* Mapper 0 fixed windows: $8000–$BFFF → prg[0], $C000–$FFFF → prg[16KB] */
+    s->prg_offsets[0] = 0;
+    s->prg_offsets[1] = 0x4000;
+    s->chr_offsets[0] = 0;
+    s->chr_offsets[1] = 0x1000;
+
+    /* Load 2C04 palette file if present.  MAME .pal files are 64 palette
+     * indexes stored as RGB-looking triples; each first byte selects one of
+     * the normal NES RGB entries. */
+    for (int i = 0; i < cfg->n_roms; i++) {
+        bool is_palette = cfg->roms[i].region
+                       ? strcmp(cfg->roms[i].region, "ppu1:palette") == 0
+                       : cfg->roms[i].addr >= 0x20000;
+        if (!is_palette) continue;
+        FILE *pf = fopen(cfg->roms[i].path, "rb");
+        if (!pf) continue;
+        uint8_t rgb[192];
+        size_t n = fread(rgb, 1, sizeof(rgb), pf);
+        fclose(pf);
+        if (n == 192) {
+            for (int j = 0; j < 64; j++)
+                s->vs_palette_rgb[j] = rp2c02_palette_rgb[rgb[j * 3] & 0x3Fu];
+            /* ppu not initialised yet; pointer set after rp2c02_init in nes_create */
+        }
+        break;
+    }
+
+    snprintf(s->cart_path_buf, sizeof(s->cart_path_buf), "vssmb");
+    return true;
+}
+
 NesState *nes_create(const MosConfig *cfg) {
     NesState *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -1545,15 +1850,22 @@ NesState *nes_create(const MosConfig *cfg) {
         }
     } else {
         if (!cfg->cart_path) {
-            fprintf(stderr, "nes: no cartridge specified — use -cartridge FILE.nes\n");
-            free(s); return NULL;
+            if (cfg->is_arcade && cfg->n_roms > 0) {
+                if (!nes_arcade_assemble(s, cfg)) { free(s); return NULL; }
+            } else {
+                fprintf(stderr, "nes: no cartridge specified — use -cartridge FILE.nes\n");
+                free(s); return NULL;
+            }
+        } else {
+            if (!ines_load(s, cfg->cart_path)) { free(s); return NULL; }
         }
-        if (!ines_load(s, cfg->cart_path)) { free(s); return NULL; }
     }
 
     /* Wire up PPU CHR bus */
     rp2c02_init(&s->ppu, cfg->is_pal);
     if (cfg->is_dendy) s->ppu.vblank_line = 291;  /* Dendy: 50 extra post-render lines */
+    if (cfg->is_arcade && s->vs_palette_rgb[0])    /* 2C04 palette present */
+        s->ppu.alt_palette_rgb = s->vs_palette_rgb;
     s->ppu.chr_read  = nes_chr_read;
     s->ppu.chr_write = nes_chr_write;
     s->ppu.chr_ud    = s;
@@ -1636,8 +1948,15 @@ NesState *nes_create(const MosConfig *cfg) {
         int                   n_acts    = NES_N_ACTIONS;
         const GemuInputPage  *act_pages = NULL;
         int                   n_pages   = 0;
-        if (two_controllers) { acts = nes_2p_actions;    n_acts = NES_2P_N_ACTIONS;    }
-        if (has_fc2_mic)     {
+        const char           *ini_sec   = "nes-controller";
+        if (cfg->is_arcade) {
+            acts    = vs_nes_actions;
+            n_acts  = VS_NES_N_ACTIONS;
+            ini_sec = "vssmb";
+        } else if (two_controllers) {
+            acts   = nes_2p_actions;
+            n_acts = NES_2P_N_ACTIONS;
+        } else if (has_fc2_mic) {
             acts      = nes_fc2mic_actions; n_acts  = NES_FC2MIC_N_ACTIONS;
             act_pages = nes_fc2mic_pages;   n_pages = 2;
         }
@@ -1650,7 +1969,7 @@ NesState *nes_create(const MosConfig *cfg) {
                 .renderer    = cfg->display_renderer,
                 .actions     = acts,
                 .n_actions   = n_acts,
-                .ini_section = "nes-controller",
+                .ini_section = ini_sec,
                 .pages       = act_pages,
                 .n_pages     = n_pages,
                 .gtk         = &(GemuDisplayGtkExtras){
@@ -1685,13 +2004,14 @@ NesState *nes_create(const MosConfig *cfg) {
     if (cfg->vnc_addr) {
         s->vnc = gemu_vnc_create(cfg->vnc_addr, RP2C02_WIDTH, RP2C02_HEIGHT);
         if (s->vnc)
-            gemu_vnc_set_palette(s->vnc, rp2c02_palette_rgb, 64);
+            gemu_vnc_set_palette(s->vnc,
+                                 s->ppu.alt_palette_rgb ? s->ppu.alt_palette_rgb
+                                                        : rp2c02_palette_rgb,
+                                 64);
         else
             fprintf(stderr, "nes: failed to start VNC at %s\n", cfg->vnc_addr);
     }
     gemu_monitor_set_vnc(s->monitor, s->vnc);
-
-    nes_reset(s);
 
 #ifdef HAVE_ROB
     for (int p = 0; p < cfg->n_ports; p++) {
@@ -1703,6 +2023,11 @@ NesState *nes_create(const MosConfig *cfg) {
         }
     }
 #endif
+
+    if (cfg->is_arcade)
+        s->vs_dip = VS_DIP_DEFAULT;
+
+    nes_reset(s);
 
     return s;
 }
@@ -1764,7 +2089,11 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             else if (cmd == GEMU_MON_CUSTOM) {
                 const char *text = gemu_monitor_command_text(s->monitor);
                 while (*text == ' ' || *text == '\t') text++;
-                if (strncasecmp(text, "gamegenie", 9) == 0 &&
+                if (s->cfg->is_arcade &&
+                    strncasecmp(text, "dipswitch", 9) == 0 &&
+                    (text[9] == '\0' || text[9] == ' ' || text[9] == '\t'))
+                    vs_dip_cmd(s, text + 9);
+                else if (strncasecmp(text, "gamegenie", 9) == 0 &&
                     (text[9] == '\0' || text[9] == ' ' || text[9] == '\t'))
                     nes_gamegenie_cmd(s, text);
                 else if (strncasecmp(text, "sendkey", 7) == 0 &&
@@ -1845,6 +2174,10 @@ void nes_run(NesState *s, const MosConfig *cfg) {
 
         /* Input: display action bits + VNC events */
         nes_handle_keys(s, held);
+        if (s->cfg->is_arcade) {
+            if (s->vs_coin_latch[0] > 0) s->vs_coin_latch[0]--;
+            if (s->vs_coin_latch[1] > 0) s->vs_coin_latch[1]--;
+        }
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             /* Run one full frame (until PPU marks frame complete) */

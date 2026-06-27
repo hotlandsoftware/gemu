@@ -32,6 +32,7 @@ static const MachineDef machine_defs[] = {
 
 static const GemuDevDesc machines[] = {
     {"dendy",   "Dendy NES Famiclone (PAL 50 Hz, NTSC-compatible PPU/APU timing)"},
+    {"vssmb",   "VS. Super Mario Bros. (coin-op arcade cabinet, DIP switches)"},
     {"famicom", "Nintendo Family Computer (Ricoh 2A03 + RP2C02, alias for nes)"},
     {"kim1",    "MOS KIM-1 single-board computer (6502, 1 KB RAM, 2x 6530 RRIOT)"},
     {"mos",     "Generic MOS-compatible machine (flat 64 KB, ROM at user-specified address)"},
@@ -110,11 +111,12 @@ static bool add_rom(MosConfig *cfg, uint32_t addr, const char *path) {
     }
     cfg->roms[cfg->n_roms].addr = addr;
     cfg->roms[cfg->n_roms].path = path;
+    cfg->roms[cfg->n_roms].region = NULL;
     cfg->n_roms++;
     return true;
 }
 
-static bool romdb_add_mos(const char *path, uint32_t addr, void *ud) {
+static bool romdb_add_mos(const char *path, const char *region, uint32_t addr, void *ud) {
     MosConfig *cfg = ud;
     if (cfg->n_roms >= MOS_MAX_ROM_LOADS) {
         fprintf(stderr, "gemu: too many ROMs (max %d)\n", MOS_MAX_ROM_LOADS);
@@ -124,6 +126,7 @@ static bool romdb_add_mos(const char *path, uint32_t addr, void *ud) {
     if (!p) return false;
     cfg->roms[cfg->n_roms].path = p;
     cfg->roms[cfg->n_roms].addr = addr;
+    cfg->roms[cfg->n_roms].region = region;
     cfg->n_roms++;
     return true;
 }
@@ -175,6 +178,7 @@ int mos_setup(int argc, char *argv[]) {
             else if (strcmp(canon, "kim1") == 0) cfg.machine = MOS_MACHINE_KIM1;
             else if (strcmp(canon, "nes")  == 0) cfg.machine = MOS_MACHINE_NES;
             cfg.is_dendy = md->tv && strcmp(md->tv, "dendy") == 0;
+            cfg.is_arcade = md->tv && strcmp(md->tv, "vs") == 0;
             cfg.is_pal   = cfg.is_dendy || (md->tv && strcmp(md->tv, "pal") == 0);
             if (!args.cpu && md->cpu) {
                 if      (strcmp(md->cpu, "6501") == 0) cfg.cpu = MOS_CPU_6501;
@@ -363,8 +367,14 @@ int mos_setup(int argc, char *argv[]) {
 
     if (cfg.machine == MOS_MACHINE_NES) {
         if (!cfg.cart_path && !cfg.fds_enabled) {
-            fprintf(stderr, "gemu: NES requires -cartridge FILE.nes or -device fds\n");
-            return 1;
+            bool have_chips = cfg.is_arcade && cfg.n_roms > 0;
+            if (!have_chips) {
+                if (cfg.is_arcade)
+                    fprintf(stderr, "gemu: arcade machine requires a ROM set: -rom /path/to/roms/\n");
+                else
+                    fprintf(stderr, "gemu: NES requires -cartridge FILE.nes or -device fds\n");
+                return 1;
+            }
         }
         if (cfg.fda_path && !cfg.fds_enabled) {
             fprintf(stderr, "gemu: -fda requires -device fds\n");
