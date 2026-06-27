@@ -68,7 +68,8 @@ typedef struct MosConfig {
     NesDeviceType   ports[NES_PORTS]; /* devices on controller ports 1–2 */
     int             n_ports;          /* how many ports were explicitly assigned */
     bool            ppu_debug;
-    bool            is_pal;      /* PAL mode: 312 lines, ~50 Hz, slower CPU clock */
+    bool            is_pal;      /* PAL/Dendy: 312 lines, ~50 Hz frame rate */
+    bool            is_dendy;   /* Dendy Famiclone: NTSC-compatible PPU/APU within PAL 50 Hz */
     bool            kim_keyboard; /* KIM-1: -device kim-keypad → visual keypad overlay */
     bool            want_wozmon;  /* -device wozmon → patch wozmon into KIM-1 ROM at $1AA0 */
     const char     *tape_path;   /* KIM-1: cassette tape image (.kim binary), NULL = none */

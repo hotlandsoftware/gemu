@@ -1553,6 +1553,7 @@ NesState *nes_create(const MosConfig *cfg) {
 
     /* Wire up PPU CHR bus */
     rp2c02_init(&s->ppu, cfg->is_pal);
+    if (cfg->is_dendy) s->ppu.vblank_line = 291;  /* Dendy: 50 extra post-render lines */
     s->ppu.chr_read  = nes_chr_read;
     s->ppu.chr_write = nes_chr_write;
     s->ppu.chr_ud    = s;
@@ -1566,7 +1567,9 @@ NesState *nes_create(const MosConfig *cfg) {
 
     /* APU — only initialise when sound is enabled */
     if (cfg->sound == MOS_SOUND_2A03) {
-        uint32_t apu_clock = cfg->is_pal ? 1662607u : 1789773u;
+        uint32_t apu_clock = cfg->is_dendy ? 1773448u
+                           : cfg->is_pal   ? 1662607u
+                                           : 1789773u;
         if (!apu2a03_init(&s->apu, apu_clock))
             fprintf(stderr, "nes: APU audio init failed (continuing silently)\n");
         s->apu.mem_read = nes_cpu_read;

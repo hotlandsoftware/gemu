@@ -31,6 +31,7 @@ static const MachineDef machine_defs[] = {
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
+    {"dendy",   "Dendy NES Famiclone (PAL 50 Hz, NTSC-compatible PPU/APU timing)"},
     {"famicom", "Nintendo Family Computer (Ricoh 2A03 + RP2C02, alias for nes)"},
     {"kim1",    "MOS KIM-1 single-board computer (6502, 1 KB RAM, 2x 6530 RRIOT)"},
     {"mos",     "Generic MOS-compatible machine (flat 64 KB, ROM at user-specified address)"},
@@ -173,7 +174,8 @@ int mos_setup(int argc, char *argv[]) {
             if      (strcmp(canon, "mos")  == 0) cfg.machine = MOS_MACHINE_GENERIC;
             else if (strcmp(canon, "kim1") == 0) cfg.machine = MOS_MACHINE_KIM1;
             else if (strcmp(canon, "nes")  == 0) cfg.machine = MOS_MACHINE_NES;
-            cfg.is_pal = md->tv && strcmp(md->tv, "pal") == 0;
+            cfg.is_dendy = md->tv && strcmp(md->tv, "dendy") == 0;
+            cfg.is_pal   = cfg.is_dendy || (md->tv && strcmp(md->tv, "pal") == 0);
             if (!args.cpu && md->cpu) {
                 if      (strcmp(md->cpu, "6501") == 0) cfg.cpu = MOS_CPU_6501;
                 else if (strcmp(md->cpu, "6502") == 0) cfg.cpu = MOS_CPU_6502;

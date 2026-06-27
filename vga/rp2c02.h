@@ -55,7 +55,8 @@ typedef struct Rp2c02 {
 
     int      scanline;
     int      dot;
-    int      lines_total;  /* 262 NTSC, 312 PAL */
+    int      lines_total;  /* 262 NTSC, 312 PAL/Dendy */
+    int      vblank_line;  /* scanline where VBlank/NMI fires: 241 NTSC/PAL, 291 Dendy */
     uint64_t frame;
     bool     odd_frame;
 

@@ -28,7 +28,7 @@ Shows the list of commands.
 
 Quits the emulator.
 
-> ``reset`` / ``system_Reset``
+> ``reset`` / ``system_reset``
 
 Hard resets the emulator (equivalent to pressing the reset button on a PC)
 
@@ -40,14 +40,25 @@ Halts the emulator (does not quit)
 
 Resumes the emulator if it was stopped or halted.
 
-> ``step`` / ``s``
+> ``reset keys``
 
-Executes one instruction
+Resets all input bindings to default
 
-> ``media``
+> ``step [count]`` / ``s``
 
-Lists the media devices registered by the active machine, such as ``tape`` or
-``cartridge``.
+Steps through (x) instructions, defaults to 1 if no count specified
+
+> ``info block``
+
+Lists block devices
+
+> ``info breakpoints``
+
+Lists active breakpoints
+
+> ``info roms``
+
+Lists loaded ROM images
 
 > ``dipswitch list``
 
@@ -67,9 +78,15 @@ or ``change tape program.bin`` on COSMAC VIP.
 
 Passes an address-qualified file argument to devices that support it. For example, the COSMAC VIP tape accepts this form, for example ``change tape 0x0200:program.bin``.
 
+> ``change vnc password``
+Change/set VNC password, if VNC server is enabled
+
 > ``eject (device)``
 
 Ejects media from a registered device. 
+
+> ``flip (device)``
+Flips disk media to the next side, useful for i.e. Famicom floppies or dual-sided DVDs
 
 > ``screendump (image name)``
 
@@ -86,3 +103,15 @@ Lists active Game Genie codes. Only supported on: ``nes``, ``snes`` (future), ``
 > ``gamegenie delete (code)``
 
 Deletes a Game Genie code. Only supported on: ``nes``, ``snes`` (future), ``gameboy`` (future), ``genesis`` (future), and ``gamegear`` (future)
+
+> ``break / b <addr>``
+Set exec breakpoint
+
+> ``delete [N]``
+Delete breakpoint N, or all if N is omitted
+
+> ``watch <addr>``
+Set read+write watchpoint
+
+> ``wwatch <addr>``
+Set write watchpoint

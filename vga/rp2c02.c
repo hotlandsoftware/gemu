@@ -457,7 +457,7 @@ void rp2c02_tick(Rp2c02 *ppu) {
     bool prerender = sl == ppu->lines_total - 1;
     bool active = visible || prerender;
 
-    if (sl == 241 && dot == 1) {
+    if (sl == ppu->vblank_line && dot == 1) {
         ppu->ppustatus |= PPUSTAT_VBLANK;
         if (ppu->ppuctrl & PPUCTRL_NMI_EN) {
             ppu->nmi_pending = true;
@@ -561,7 +561,8 @@ void rp2c02_reset(Rp2c02 *ppu) {
 
 void rp2c02_init(Rp2c02 *ppu, bool is_pal) {
     memset(ppu, 0, sizeof(*ppu));
-    ppu->mirror     = RP2C02_MIRROR_VERTICAL;
+    ppu->mirror      = RP2C02_MIRROR_VERTICAL;
     ppu->lines_total = is_pal ? 312 : 262;
+    ppu->vblank_line = 241;   /* overridden to 291 by caller for Dendy */
     rp2c02_reset(ppu);
 }

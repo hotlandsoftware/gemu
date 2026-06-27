@@ -15,16 +15,20 @@
 ## Sound Cards
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|
-| 2a03 | `Ricoh 2A03` | imperfect | supports MIDI playback via `2a03,output=midi` |
+| 2a03 | `Ricoh 2A03` | working | supports MIDI playback via `2a03,output=midi` |
 
 ## Devices
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|
 | fds | `Famicom Disk System` | working |  |
 | famicom-keyboard | `Famicom 72-key Keyboard` | working |  |
+| famicom-mic | `Famicom Microphone Controller` | working | no proper mic detection yet, can send mic sound by pressing M (default) |
+| rob | `R.O.B. (Robotic Operating Buddy)` | working | opens in a second window, 3D simulation of ROB |
+| rob-famicom | `Family Computer Robot (Famicom R.O.B.)` | working | |
 | kim-keypad | `KIM-1 hex keypad` | working |  |
 | nes-controller | `NES/Famicom Standard Controller` | working |  |
 | vt100 | `DEC VT100 serial terminal` | working |  |
+| wozmon | `Wozniak 'Woz' Monitor` | working |  |
 | zapper | `NES Zapper (light gun)` | working |  |
 
 # Machines
@@ -33,9 +37,10 @@ Simulated machines include:
 ## Implemented
 | Name   | Full Name     | Year | Graphics  | Input | Sound | Status |
 |--------|---------------|---------|---------|-------|-------|-------|
+| dendy | `Dendy Famiclone` | 1992 | 🟢 | 🟢 | 🟢 | imperfect | 
 | famicom | `Nintendo Family Computer` | 1983  | 🟢 | 🟢 | 🟢 | imperfect | 
 | generic | `Generic MOS-compatible machine` | N/A | 🔴 | 🔴 | 🔴 | imperfect | 
-| kim1 | `MOS KIM-1` | 1976 | 🟠 | 🔴 | 🔴 | imperfect | 
+| kim1 | `MOS KIM-1` | 1976 | 🟢 | 🟢 | 🔴 | imperfect | 
 | nes | `Nintendo Entertainment System (NTSC)` | 1985 | 🟢 | 🟢 | 🟢 | imperfect | 
 | nespal | `Nintendo Entertainment System (PAL)` | 1986 | 🟢 | 🟢 | 🟢 | imperfect | 
 
