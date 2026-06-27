@@ -841,7 +841,8 @@ static uint8_t nes_chr_read(uint16_t addr, void *ud) {
         }
         return data;
     }
-    if (s->cart.mapper >= 1 && s->cart.mapper != 7) {
+    if ((s->cart.mapper >= 1 && s->cart.mapper != 7) ||
+        (s->cfg->is_arcade && !s->chr_is_ram)) {
         uint8_t slot = addr >= 0x1000 ? 1 : 0;
         return s->chr[s->chr_offsets[slot] + (addr & 0x0FFF)];
     }
@@ -1065,15 +1066,18 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
         return v;
     }
 
-    /* VS. System: DIP switches and coin signals layered onto $4016/$4017
-     * $4016 D0 = P1 shift reg | D2 = service | D3-D4 = DIP[0:1] | D5 = coin1 | D6 = coin2
-     * $4017 D0 = P2 shift reg | D2-D7 = DIP[2:7] */
+    /* VS. System: DIP switches and coin signals layered onto $4016/$4017.
+     * Hardware wiring: left stick → $4017, right stick → $4016.
+     * VS. SMB P1 uses left stick ($4017) and P2 uses right stick ($4016),
+     * so ctrl_state[0] (P1 keys) feeds $4017 and ctrl_state[1] (P2 keys) feeds $4016.
+     * $4016 D0 = P2 shift reg | D2 = service | D3-D4 = DIP[0:1] | D5 = coin1 | D6 = coin2
+     * $4017 D0 = P1 shift reg | D2-D7 = DIP[2:7] */
     if (s->cfg->is_arcade && addr == 0x4016) {
         uint8_t bit;
         if (s->ctrl_strobe)
-            s->ctrl_shift[0] = s->ctrl_state[0];
-        bit = s->ctrl_shift[0] & 1;
-        s->ctrl_shift[0] >>= 1;
+            s->ctrl_shift[1] = s->ctrl_state[1];
+        bit = s->ctrl_shift[1] & 1;
+        s->ctrl_shift[1] >>= 1;
         uint8_t v = bit
              | (s->vs_service           ? 0x04u : 0u)         /* D2: service */
              | (uint8_t)((s->vs_dip & 0x03u) << 3)            /* D3-D4: DIP bits 0-1 */
@@ -1088,9 +1092,9 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
     if (s->cfg->is_arcade && addr == 0x4017) {
         uint8_t bit;
         if (s->ctrl_strobe)
-            s->ctrl_shift[1] = s->ctrl_state[1];
-        bit = s->ctrl_shift[1] & 1;
-        s->ctrl_shift[1] >>= 1;
+            s->ctrl_shift[0] = s->ctrl_state[0];
+        bit = s->ctrl_shift[0] & 1;
+        s->ctrl_shift[0] >>= 1;
         uint8_t v = bit
              | (uint8_t)(s->vs_dip & ~0x03u);                 /* D2-D7: DIP bits 2-7 */
         return v;
@@ -1160,7 +1164,8 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
         if (s->cart.mapper == 5)
             return s->prg_ram[addr & 0x1FFFu]; /* $5113 always maps RAM here */
         if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
-            s->cart.mapper == 4 || s->cart.mapper == 178)
+            s->cart.mapper == 4 || s->cart.mapper == 178 ||
+            s->cfg->is_arcade)
             return s->prg_ram[addr & 0x1FFF];
         return 0;
     }
@@ -1352,7 +1357,8 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
         if (s->fds_enabled) { s->fds.ram[addr - 0x6000u] = val; return; }
         if (s->cart.mapper == 5) { s->prg_ram[addr & 0x1FFFu] = val; return; }
         if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
-            s->cart.mapper == 4 || s->cart.mapper == 178)
+            s->cart.mapper == 4 || s->cart.mapper == 178 ||
+            s->cfg->is_arcade)
             s->prg_ram[addr & 0x1FFF] = val;
         return;
     }
