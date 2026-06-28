@@ -110,23 +110,26 @@ static const GemuActionDef nes_2p_actions[NES_2P_N_ACTIONS] = {
 };
 
 /* ── VS. System arcade actions ────────────────────────────────────────────── */
-/* Bit layout: 0-7 = P1 (NES_BTN_* order), 8-15 = P2, 16 = Coin1, 17 = Coin2, 18 = Svc */
+/* VS wiring: bit 2 is the cabinet Select/Start button, not NES Start (bit 3). */
+#define VS_BTN_START NES_BTN_SELECT
+
+/* Bit layout: 0-7 = P1 VS_UNI_JOYSTICK bits, 8-15 = P2, 16 = Coin1, 17 = Coin2, 18 = Svc */
 #define VS_NES_N_ACTIONS 19
 static const GemuActionDef vs_nes_actions[VS_NES_N_ACTIONS] = {
-    { "P1 A",     GEMU_ACTION(0),  "z"      },
-    { "P1 B",     GEMU_ACTION(1),  "x"      },
-    { "P1 Start", GEMU_ACTION(3),  "Return" },
-    { "P1 Up",    GEMU_ACTION(4),  "Up"     },
-    { "P1 Down",  GEMU_ACTION(5),  "Down"   },
-    { "P1 Left",  GEMU_ACTION(6),  "Left"   },
-    { "P1 Right", GEMU_ACTION(7),  "Right"  },
-    { "P2 A",     GEMU_ACTION(8),  "d"      },
-    { "P2 B",     GEMU_ACTION(9),  "f"      },
-    { "P2 Start", GEMU_ACTION(11), "g"      },
-    { "P2 Up",    GEMU_ACTION(12), "r"      },
-    { "P2 Down",  GEMU_ACTION(13), "v"      },
-    { "P2 Left",  GEMU_ACTION(14), "c"      },
-    { "P2 Right", GEMU_ACTION(15), "b"      },
+    { "P1 A",     GEMU_ACTION(8),  "z"      },
+    { "P1 B",     GEMU_ACTION(9),  "x"      },
+    { "P1 Start", GEMU_ACTION(10), "Return" },
+    { "P1 Up",    GEMU_ACTION(12), "Up"     },
+    { "P1 Down",  GEMU_ACTION(13), "Down"   },
+    { "P1 Left",  GEMU_ACTION(14), "Left"   },
+    { "P1 Right", GEMU_ACTION(15), "Right"  },
+    { "P2 A",     GEMU_ACTION(0),  "d"      },
+    { "P2 B",     GEMU_ACTION(1),  "f"      },
+    { "P2 Start", GEMU_ACTION(2),  "g"      },
+    { "P2 Up",    GEMU_ACTION(4),  "r"      },
+    { "P2 Down",  GEMU_ACTION(5),  "v"      },
+    { "P2 Left",  GEMU_ACTION(6),  "c"      },
+    { "P2 Right", GEMU_ACTION(7),  "b"      },
     { "Coin 1",   GEMU_ACTION(16), "5"      },
     { "Coin 2",   GEMU_ACTION(17), "6"      },
     { "Service",  GEMU_ACTION(18), "F2"     },
@@ -1070,7 +1073,7 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
      * Hardware wiring: left stick → $4017, right stick → $4016.
      * VS. SMB P1 uses left stick ($4017) and P2 uses right stick ($4016),
      * so ctrl_state[0] (P1 keys) feeds $4017 and ctrl_state[1] (P2 keys) feeds $4016.
-     * $4016 D0 = P2 shift reg | D2 = service | D3-D4 = DIP[0:1] | D5 = coin1 | D6 = coin2
+     * $4016 D0 = P2 shift reg | D2 = coin1 | D3 = coin2 | D4-D5 = DIP[0:1] | D6 = service
      * $4017 D0 = P1 shift reg | D2-D7 = DIP[2:7] */
     if (s->cfg->is_arcade && addr == 0x4016) {
         uint8_t bit;
@@ -1079,10 +1082,10 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
         bit = s->ctrl_shift[1] & 1;
         s->ctrl_shift[1] >>= 1;
         uint8_t v = bit
-             | (s->vs_service           ? 0x04u : 0u)         /* D2: service */
-             | (uint8_t)((s->vs_dip & 0x03u) << 3)            /* D3-D4: DIP bits 0-1 */
-             | (s->vs_coin_latch[0] > 0 ? 0x20u : 0u)         /* D5: coin 1 */
-             | (s->vs_coin_latch[1] > 0 ? 0x40u : 0u);        /* D6: coin 2 */
+             | (s->vs_coin_latch[0] > 0 ? 0x04u : 0u)         /* D2: coin 1 */
+             | (s->vs_coin_latch[1] > 0 ? 0x08u : 0u)         /* D3: coin 2 */
+             | (uint8_t)((s->vs_dip & 0x03u) << 4)             /* D4-D5: DIP bits 0-1 */
+             | (s->vs_service           ? 0x40u : 0u);         /* D6: service */
         if (s->vs_service || s->vs_coin_latch[0] > 0 || s->vs_coin_latch[1] > 0)
             VS_DEBUG(s, "read 4016 -> %02X pc=%04X strobe=%d dip=%02X coin=%d/%d\n",
                      v, s->cpu.PC, s->ctrl_strobe ? 1 : 0, s->vs_dip,
@@ -1588,20 +1591,20 @@ static void nes_handle_keys(NesState *s, uint32_t held) {
                 uint8_t btn = 0;
                 int page = 0;
                 switch (ev.keysym) {
-                case 'z': case 'Z': btn = NES_BTN_A;     break;
-                case 'x': case 'X': btn = NES_BTN_B;     break;
-                case XK_Return:     btn = NES_BTN_START; break;
-                case XK_Up:         btn = NES_BTN_UP;    break;
-                case XK_Down:       btn = NES_BTN_DOWN;  break;
-                case XK_Left:       btn = NES_BTN_LEFT;  break;
-                case XK_Right:      btn = NES_BTN_RIGHT; break;
-                case 'd': case 'D': btn = NES_BTN_A;     page = 1; break;
-                case 'f': case 'F': btn = NES_BTN_B;     page = 1; break;
-                case 'g': case 'G': btn = NES_BTN_START; page = 1; break;
-                case 'r': case 'R': btn = NES_BTN_UP;    page = 1; break;
-                case 'v': case 'V': btn = NES_BTN_DOWN;  page = 1; break;
-                case 'c': case 'C': btn = NES_BTN_LEFT;  page = 1; break;
-                case 'b': case 'B': btn = NES_BTN_RIGHT; page = 1; break;
+                case 'z': case 'Z': btn = NES_BTN_A;     page = 1; break;
+                case 'x': case 'X': btn = NES_BTN_B;     page = 1; break;
+                case XK_Return:     btn = VS_BTN_START;  page = 1; break;
+                case XK_Up:         btn = NES_BTN_UP;    page = 1; break;
+                case XK_Down:       btn = NES_BTN_DOWN;  page = 1; break;
+                case XK_Left:       btn = NES_BTN_LEFT;  page = 1; break;
+                case XK_Right:      btn = NES_BTN_RIGHT; page = 1; break;
+                case 'd': case 'D': btn = NES_BTN_A;     break;
+                case 'f': case 'F': btn = NES_BTN_B;     break;
+                case 'g': case 'G': btn = VS_BTN_START;  break;
+                case 'r': case 'R': btn = NES_BTN_UP;    break;
+                case 'v': case 'V': btn = NES_BTN_DOWN;  break;
+                case 'c': case 'C': btn = NES_BTN_LEFT;  break;
+                case 'b': case 'B': btn = NES_BTN_RIGHT; break;
                 case '5':
                     if (ev.down) s->vs_coin_latch[0] = 15;
                     break;
@@ -2237,7 +2240,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                     uint8_t btn = 0;
                     if      (strncasecmp(p, "a",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = NES_BTN_A;
                     else if (strncasecmp(p, "b",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = NES_BTN_B;
-                    else if (strncasecmp(p, "start",  5) == 0) btn = NES_BTN_START;
+                    else if (strncasecmp(p, "start",  5) == 0) btn = s->cfg->is_arcade ? VS_BTN_START : NES_BTN_START;
                     else if (strncasecmp(p, "select", 6) == 0) btn = NES_BTN_SELECT;
                     else if (strncasecmp(p, "up",     2) == 0) btn = NES_BTN_UP;
                     else if (strncasecmp(p, "down",   4) == 0) btn = NES_BTN_DOWN;
