@@ -33,7 +33,8 @@ static const MachineDef machine_defs[] = {
 
 static const GemuDevDesc machines[] = {
     {"dendy",   "Dendy NES Famiclone (PAL 50 Hz, NTSC-compatible PPU/APU timing)"},
-    {"vssmb",   "VS. Super Mario Bros. (coin-op arcade cabinet, DIP switches)"},
+    {"vssmb",       "VS. Super Mario Bros. (coin-op arcade cabinet, DIP switches)"},
+    {"vsskatekids", "VS. Skate Kid Bros. (arcade hack of VS. SMB)"},
     {"famicom", "Nintendo Family Computer (Ricoh 2A03 + RP2C02, alias for nes)"},
     {"kim1",    "MOS KIM-1 single-board computer (6502, 1 KB RAM, 2x 6530 RRIOT)"},
     {"mos",     "Generic MOS-compatible machine (flat 64 KB, ROM at user-specified address)"},

@@ -3,6 +3,7 @@
 #endif
 #include "nes.h"
 #include "fds.h"
+#include "romdb.h"
 #include "fds_hle.h"
 #include "apu2a03.h"
 #include "gemu/memory.h"
@@ -2064,6 +2065,7 @@ static bool nes_arcade_assemble(NesState *s, const MosConfig *cfg) {
 
     if (!has_prg) {
         fprintf(stderr, "arcade: no PRG ROM chips found in ROM set\n");
+        romdb_print_needed("vssmb");
         free(prg); free(chr); return false;
     }
 

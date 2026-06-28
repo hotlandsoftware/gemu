@@ -17,5 +17,7 @@
   { "alias": "sm1200",    "name": "Sheen M-1200",                           "year": 1978, "cpu": "RCA CDP1802", "family": "rca",   "status": "working",  "gfx": true,  "sound": true,  "notes": "Studio II clone by Sheen"     },
   { "alias": "mpt02",     "name": "Soundic MPT-02",                         "year": 1978, "cpu": "RCA CDP1802", "family": "rca",   "status": "working",  "gfx": true,  "sound": true,  "notes": "Studio II clone by Soundic"   },
   { "alias": "mos",       "name": "Generic MOS 6502",                       "year": 1975, "cpu": "MOS 6502",    "family": "mos",   "status": "skeleton", "gfx": false, "sound": false, "notes": "Flat 64 KB, generic machine"  },
-  { "alias": "visicom",   "name": "Visicom COM-100",                        "year": 1978, "cpu": "RCA CDP1802", "family": "rca",   "status": "working",  "gfx": true,  "sound": true,  "notes": "Studio II clone by Toshiba"   }
+  { "alias": "visicom",   "name": "Visicom COM-100",                        "year": 1978, "cpu": "RCA CDP1802", "family": "rca",   "status": "working",  "gfx": true,  "sound": true,  "notes": "Studio II clone by Toshiba"   },
+  { "alias": "vsskatekids",     "name": "VS. Skate Kid Bros (arcade hack)", "year": 1988, "cpu": "MOS 6502", "family": "mos",   "status": "working",  "gfx": true,  "sound": true,  "notes": "Sprite hack of VS. Super Mario Bros"   },
+  { "alias": "vssmb",     "name": "VS. Super Mario Bros (arcade)",          "year": 1986, "cpu": "MOS 6502", "family": "mos",   "status": "working",  "gfx": true,  "sound": true,  "notes": ""   }
 ]
