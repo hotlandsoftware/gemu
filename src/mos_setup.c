@@ -19,13 +19,14 @@ typedef struct {
     const char *canonical;
     const char *cpu;
     const char *vga;
+    const char *soundhw;
     const char *tv;
     const char *ram;
 } MachineDef;
 
 static const MachineDef machine_defs[] = {
 #include "generated/machine_defaults.inc"
-    { NULL, NULL, NULL, NULL, NULL, NULL }
+    { NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
 /* ── Device registry ─────────────────────────────────────────────────────── */
@@ -100,6 +101,24 @@ static uint32_t parse_size(const char *s) {
         return 0;
     }
     return v;
+}
+
+static bool parse_soundhw(const char *hw, MosSoundType *out) {
+    if (strcmp(hw, "none") == 0) {
+        *out = MOS_SOUND_NONE;
+        return true;
+    }
+    if (strcmp(hw, "2a03") == 0) {
+        *out = MOS_SOUND_2A03;
+        return true;
+    }
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
+    if (strcmp(hw, "2a03,output=midi") == 0) {
+        *out = MOS_SOUND_2A03_MIDI;
+        return true;
+    }
+#endif
+    return false;
 }
 
 /* ── ROM argument parsing ────────────────────────────────────────────────── */
@@ -188,6 +207,11 @@ int mos_setup(int argc, char *argv[]) {
             if (!args.vga && md->vga) {
                 if      (strcmp(md->vga, "rp2c02")      == 0) cfg.vga = MOS_VGA_RP2C02;
                 else if (strcmp(md->vga, "rp2c04-0004") == 0) cfg.vga = MOS_VGA_RP2C04_0004;
+            }
+            if (md->soundhw && !parse_soundhw(md->soundhw, &cfg.sound)) {
+                fprintf(stderr, "gemu: machine '%s' has unknown default soundhw '%s'\n",
+                        md->name, md->soundhw);
+                return 1;
             }
             break;
         }
@@ -315,15 +339,11 @@ int mos_setup(int argc, char *argv[]) {
                 printf("  none               Disable sound output\n");
                 SDL_Quit(); return 0;
             }
-            if      (strcmp(hw, "none") == 0) { cfg.sound = MOS_SOUND_NONE; cfg.sound_explicit = true; }
-            else if (strcmp(hw, "2a03") == 0) { cfg.sound = MOS_SOUND_2A03; cfg.sound_explicit = true; }
-#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
-            else if (strcmp(hw, "2a03,output=midi") == 0) { cfg.sound = MOS_SOUND_2A03_MIDI; cfg.sound_explicit = true; }
-#endif
-            else {
+            if (!parse_soundhw(hw, &cfg.sound)) {
                 fprintf(stderr, "gemu: unknown -soundhw '%s' (use -soundhw ? to list)\n", hw);
                 return 1;
             }
+            cfg.sound_explicit = true;
         } else if (strcmp(rem[i], "-ppu-debug") == 0) {
             cfg.ppu_debug = true;
         } else {
@@ -360,11 +380,11 @@ int mos_setup(int argc, char *argv[]) {
     }
 
     if (cfg.machine == MOS_MACHINE_NES && !cfg.sound_explicit &&
-        (cfg.cart_path || cfg.fds_enabled)) {
+        cfg.sound != MOS_SOUND_NONE) {
         bool has_output = (cfg.display_type == GEMU_DISPLAY_SDL ||
                            cfg.display_type == GEMU_DISPLAY_GTK);
-        if (has_output)
-            cfg.sound = MOS_SOUND_2A03;
+        if (!has_output)
+            cfg.sound = MOS_SOUND_NONE;
     }
 
     if (cfg.machine == MOS_MACHINE_NES) {

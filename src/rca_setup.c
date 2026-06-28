@@ -35,13 +35,14 @@ typedef struct {
     const char *canonical;
     const char *cpu;
     const char *vga;
+    const char *soundhw;
     const char *tv;
     const char *ram;
 } MachineDef;
 
 static const MachineDef machine_defs[] = {
 #include "generated/machine_defaults.inc"
-    { NULL, NULL, NULL, NULL, NULL, NULL }
+    { NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
 /* ── Device registry ─────────────────────────────────────────────────────── */
@@ -181,7 +182,7 @@ int rca_setup(int argc, char *argv[]) {
         .cpu           = RCA_CPU_CDP1802,
         .vga           = RCA_VGA_CDP1861,
         .keyboard      = RCA_KEYBOARD_VP601,
-        .sound_hw      = RCA_SOUND_PCSPK,
+        .sound_hw      = RCA_SOUND_NONE,
         .display_type  = GEMU_DISPLAY_SDL,
         .display_scale = 4,
     };
@@ -214,6 +215,11 @@ int rca_setup(int argc, char *argv[]) {
                 if      (strcmp(md->vga, "cdp1861") == 0) cfg.vga = RCA_VGA_CDP1861;
                 else if (strcmp(md->vga, "cdp1869") == 0) cfg.vga = RCA_VGA_CDP1869;
                 else if (strcmp(md->vga, "none")    == 0) cfg.vga = RCA_VGA_NONE;
+            }
+            if (md->soundhw && !parse_soundhw(md->soundhw, &cfg.sound_hw)) {
+                fprintf(stderr, "gemu: machine '%s' has unknown default soundhw '%s'\n",
+                        md->name, md->soundhw);
+                return 1;
             }
             break;
         }

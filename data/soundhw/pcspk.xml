@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<soundhw name="pcspk" description="PC speaker / one-bit loudspeaker" requires="rca">
+<soundhw name="pcspk" description="PC speaker" requires="rca">
     <machine name="vip"/>
     <machine name="studio2"/>
     <machine name="pecom32"/>

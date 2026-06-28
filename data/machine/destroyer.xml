@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <machine name="destroyer" family="rca" description="Cidelsa Destroyer arcade board"
-         cpu="cdp1802" vga="cdp1869" tv="pal">
+         cpu="cdp1802" vga="cdp1869" soundhw="pcspk" tv="pal">
     <rom name="des d c2.ic4" addr="0x0000" sha256="7a07c1f2afa8f54aed3cd25d9dcdbcc003b54ef4712956b5b2cae14c0ecf6ad2"/>
     <rom name="des d c2.ic5" addr="0x0800" sha256="e80f8cf4fa4f1e6637b50232c621289387fd70b9c02bc5e1653e7b13970cbd88"/>
     <rom name="des d c2.ic6" addr="0x1000" sha256="824637bfab544ffe56e5cd7ab4e9fcae840316c482e7a3ba56af169b5a5cf53a"/>

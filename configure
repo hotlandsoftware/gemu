@@ -140,13 +140,14 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             'alias':  root.get('alias',  ''),
             'cpu':    root.get('cpu',    ''),
             'vga':    root.get('vga',    ''),
+            'soundhw': root.get('soundhw', ''),
             'tv':     root.get('tv',     ''),
             'ram':    root.get('ram',    ''),
         })
         machine_family[name] = family
     machines.sort(key=lambda m: m['name'])
 
-    # Resolve alias inheritance: aliases inherit cpu/vga from their canonical
+    # Resolve alias inheritance: aliases inherit cpu/vga/soundhw from their canonical
     # (but not tv — that is machine-specific) and fill in canonical name.
     name_to_m = {m['name']: m for m in machines}
     for m in machines:
@@ -154,6 +155,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             canon = name_to_m.get(m['alias'], {})
             if not m['cpu'] and canon.get('cpu'): m['cpu'] = canon['cpu']
             if not m['vga'] and canon.get('vga'): m['vga'] = canon['vga']
+            if not m['soundhw'] and canon.get('soundhw'): m['soundhw'] = canon['soundhw']
             m['canonical'] = m['alias']
         else:
             m['canonical'] = m['name']
@@ -178,7 +180,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         dlines.append(
             f'    {{ "{m["name"]}", "{m["canonical"]}", '
             f'{cstr(m["cpu"])}, {cstr(m["vga"])}, '
-            f'"{tv}", {cstr(m["ram"])} }},\n'
+            f'{cstr(m["soundhw"])}, "{tv}", {cstr(m["ram"])} }},\n'
         )
     with open(os.path.join(gen_dir, 'machine_defaults.inc'), 'w', encoding='utf-8') as f:
         f.writelines(dlines)

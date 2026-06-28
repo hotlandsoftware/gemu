@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
 <machine name="nes" family="mos" description="Nintendo Entertainment System (NTSC)"
-         cpu="2a03" vga="rp2c02" tv="ntsc">
+         cpu="2a03" vga="rp2c02" soundhw="2a03" tv="ntsc">
     <rom name="disksys.rom" addr="0xE000" sha256="99c18490ed9002d9c6d999b9d8d15be5c051bdfa7cc7e73318053c9a994b0178"/>
 </machine>
