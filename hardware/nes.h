@@ -113,6 +113,32 @@ typedef struct NesState {
     bool     m9_latch_l;     /* false=FD side, true=FE side */
     bool     m9_latch_r;
 
+    /* Mapper 24/26 (Konami VRC6a/VRC6b) -- shares mmc3_prg_offsets[0-3] and mmc3_chr_offsets[0-7] */
+    uint8_t  vrc6_irq_latch;
+    uint8_t  vrc6_irq_counter;
+    bool     vrc6_irq_enabled;     /* E: enable IRQ counting immediately */
+    bool     vrc6_irq_after;       /* A: enable after next acknowledge */
+    bool     vrc6_irq_mode;        /* 0=scanline (341 CPU cycles), 1=CPU cycle */
+    int      vrc6_prescaler;       /* counts up to 341 for scanline mode */
+    /* Expansion audio */
+    uint8_t  vrc6_p1_ctrl;         /* $9000: bit7=mode, bits6:4=duty, bits3:0=vol */
+    uint16_t vrc6_p1_period;       /* $9001-$9002[3:0]: 12-bit timer period */
+    bool     vrc6_p1_en;           /* $9002[7] */
+    uint16_t vrc6_p1_timer;
+    uint8_t  vrc6_p1_seq;          /* 0-15 duty sequence position */
+    uint8_t  vrc6_p2_ctrl;
+    uint16_t vrc6_p2_period;
+    bool     vrc6_p2_en;
+    uint16_t vrc6_p2_timer;
+    uint8_t  vrc6_p2_seq;
+    uint8_t  vrc6_saw_rate;        /* $B000[5:0]: 6-bit accumulator rate */
+    uint16_t vrc6_saw_period;
+    bool     vrc6_saw_en;          /* $B002[7] */
+    uint16_t vrc6_saw_timer;
+    uint8_t  vrc6_saw_accum;
+    uint8_t  vrc6_saw_step;        /* 0-13; resets at 14 */
+    bool     vrc6_halt;            /* $9003[0]: freeze all VRC6 audio channels */
+
     /* Mapper 178 (WaixingFS) */
     uint8_t  m178_mode;    /* $4800: bits[2:1]=PRG mode, bit[0]=mirror */
     uint8_t  m178_prg_lo;  /* $4801: PRG A16..A14 (inner 16KB bank) */

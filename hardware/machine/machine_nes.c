@@ -429,7 +429,8 @@ static bool ines_load(NesState *s, const char *path) {
     else                  s->cart.mirror = RP2C02_MIRROR_HORIZONTAL;
 
     switch (s->cart.mapper) {
-    case 0: case 1: case 2: case 4: case 5: case 7: case 9: case 66: case 178: case 228: break;
+    case 0: case 1: case 2: case 4: case 5: case 7: case 9: case 24: case 26:
+    case 66: case 178: case 228: break;
     default:
         fprintf(stderr, "nes: mapper %u not supported!\n",
                 s->cart.mapper);
@@ -812,6 +813,156 @@ static void mmc5_irq_scanline(void *ud) {
     }
 }
 
+/* ── Mapper 24/26 (Konami VRC6a/VRC6b) ──────────────────────────────────── */
+
+/* Advance all VRC6 state by one CPU cycle: handles IRQ and audio timers.
+ * Returns current expansion audio output level (for apu.fds_in). */
+static float vrc6_tick(NesState *s) {
+    /* IRQ: prescaler counts CPU cycles; fires at 341 in scanline mode, each cycle in CPU mode */
+    if (s->vrc6_irq_enabled) {
+        bool fire = false;
+        if (!s->vrc6_irq_mode) {
+            if (++s->vrc6_prescaler >= 341) { s->vrc6_prescaler = 0; fire = true; }
+        } else { fire = true; }
+        if (fire) {
+            if (s->vrc6_irq_counter == 0xFF) {
+                s->vrc6_irq_counter = s->vrc6_irq_latch;
+                s->cpu.irq = true;
+            } else { s->vrc6_irq_counter++; }
+        }
+    }
+
+    if (s->vrc6_halt) return 0.0f;
+
+    /* Pulse 1 */
+    float p1 = 0.0f;
+    if (s->vrc6_p1_en) {
+        if (s->vrc6_p1_timer == 0) {
+            s->vrc6_p1_timer = s->vrc6_p1_period;
+            s->vrc6_p1_seq   = (s->vrc6_p1_seq + 1u) & 15u;
+        } else { s->vrc6_p1_timer--; }
+        uint8_t vol = s->vrc6_p1_ctrl & 0x0Fu;
+        if ((s->vrc6_p1_ctrl & 0x80u) || s->vrc6_p1_seq <= ((s->vrc6_p1_ctrl >> 4) & 7u))
+            p1 = (float)vol;
+    }
+
+    /* Pulse 2 */
+    float p2 = 0.0f;
+    if (s->vrc6_p2_en) {
+        if (s->vrc6_p2_timer == 0) {
+            s->vrc6_p2_timer = s->vrc6_p2_period;
+            s->vrc6_p2_seq   = (s->vrc6_p2_seq + 1u) & 15u;
+        } else { s->vrc6_p2_timer--; }
+        uint8_t vol = s->vrc6_p2_ctrl & 0x0Fu;
+        if ((s->vrc6_p2_ctrl & 0x80u) || s->vrc6_p2_seq <= ((s->vrc6_p2_ctrl >> 4) & 7u))
+            p2 = (float)vol;
+    }
+
+    /* Sawtooth: 6 accumulator additions per 14-clock cycle (even steps 2,4,6,8,10,12) */
+    float saw = 0.0f;
+    if (s->vrc6_saw_en) {
+        if (s->vrc6_saw_timer == 0) {
+            s->vrc6_saw_timer = s->vrc6_saw_period;
+            s->vrc6_saw_step++;
+            if (s->vrc6_saw_step >= 14u) {
+                s->vrc6_saw_step  = 0;
+                s->vrc6_saw_accum = 0;
+            } else if ((s->vrc6_saw_step & 1u) == 0u) {
+                s->vrc6_saw_accum += s->vrc6_saw_rate;
+            }
+        } else { s->vrc6_saw_timer--; }
+        saw = (float)(s->vrc6_saw_accum >> 3);
+    }
+
+    /* Mix: VRC6 pulses use same nonlinear formula as 2A03 (vol 0-15 = same units).
+     * Sawtooth scaled to roughly match one 2A03 pulse at full volume. */
+    float pulse = (p1 + p2 > 0.0f) ? 95.88f / (8128.0f / (p1 + p2) + 100.0f) : 0.0f;
+    return pulse + saw * (0.15f / 31.0f);
+}
+
+static void vrc6_cpu_write(NesState *s, uint16_t addr, uint8_t val) {
+    /* Mapper 26 (VRC6b) swaps address pins A0 and A1 */
+    if (s->cart.mapper == 26) {
+        uint8_t a01 = addr & 3u;
+        addr = (uint16_t)((addr & ~3u) | ((a01 & 1u) << 1) | ((a01 >> 1) & 1u));
+    }
+    uint32_t prg_8k = (uint32_t)s->cart.prg_banks * 2u;
+    uint32_t chr_1k = (uint32_t)s->cart.chr_banks * 8u;
+
+    if (addr < 0x9000) {
+        /* $8000: 16KB PRG bank at $8000-$BFFF (bits 3:0) */
+        uint32_t bank = (uint32_t)(val & 0x0Fu) % s->cart.prg_banks;
+        s->mmc3_prg_offsets[0] = bank * 0x4000u;
+        s->mmc3_prg_offsets[1] = bank * 0x4000u + 0x2000u;
+    } else if (addr < 0xA000) {
+        switch (addr & 3u) {
+        case 0: s->vrc6_p1_ctrl   = val; break;
+        case 1: s->vrc6_p1_period = (s->vrc6_p1_period & 0xFF00u) | val; break;
+        case 2:
+            s->vrc6_p1_period = (s->vrc6_p1_period & 0x00FFu) | ((uint16_t)(val & 0x0Fu) << 8);
+            s->vrc6_p1_en     = (val >> 7) & 1;
+            break;
+        case 3: s->vrc6_halt = val & 1; break;
+        }
+    } else if (addr < 0xB000) {
+        switch (addr & 3u) {
+        case 0: s->vrc6_p2_ctrl   = val; break;
+        case 1: s->vrc6_p2_period = (s->vrc6_p2_period & 0xFF00u) | val; break;
+        case 2:
+            s->vrc6_p2_period = (s->vrc6_p2_period & 0x00FFu) | ((uint16_t)(val & 0x0Fu) << 8);
+            s->vrc6_p2_en     = (val >> 7) & 1;
+            break;
+        }
+    } else if (addr < 0xC000) {
+        switch (addr & 3u) {
+        case 0: s->vrc6_saw_rate   = val & 0x3Fu; break;
+        case 1: s->vrc6_saw_period = (s->vrc6_saw_period & 0xFF00u) | val; break;
+        case 2:
+            s->vrc6_saw_period = (s->vrc6_saw_period & 0x00FFu) | ((uint16_t)(val & 0x0Fu) << 8);
+            s->vrc6_saw_en     = (val >> 7) & 1;
+            break;
+        case 3:
+            switch ((val >> 2) & 3u) {
+            case 0: s->ppu.mirror = RP2C02_MIRROR_VERTICAL;   break;
+            case 1: s->ppu.mirror = RP2C02_MIRROR_HORIZONTAL; break;
+            case 2: s->ppu.mirror = RP2C02_MIRROR_SINGLE_A;   break;
+            case 3: s->ppu.mirror = RP2C02_MIRROR_SINGLE_B;   break;
+            }
+            break;
+        }
+    } else if (addr < 0xD000) {
+        /* $C000: 8KB PRG bank at $C000-$DFFF (bits 4:0) */
+        if ((addr & 3u) == 0)
+            s->mmc3_prg_offsets[2] = ((uint32_t)(val & 0x1Fu) % prg_8k) * 0x2000u;
+    } else if (addr < 0xE000) {
+        /* $D000-$D003: CHR 1KB banks for PPU $0000-$0FFF */
+        if (chr_1k) s->mmc3_chr_offsets[addr & 3u] = ((uint32_t)val % chr_1k) * 0x400u;
+    } else if (addr < 0xF000) {
+        /* $E000-$E003: CHR 1KB banks for PPU $1000-$1FFF */
+        if (chr_1k) s->mmc3_chr_offsets[4u + (addr & 3u)] = ((uint32_t)val % chr_1k) * 0x400u;
+    } else {
+        /* $F000-$F002: IRQ */
+        switch (addr & 3u) {
+        case 0: s->vrc6_irq_latch = val; break;
+        case 1:
+            s->vrc6_irq_after   = val & 1u;
+            s->vrc6_irq_enabled = (val >> 1) & 1u;
+            s->vrc6_irq_mode    = (val >> 2) & 1u;
+            if (s->vrc6_irq_enabled) {
+                s->vrc6_irq_counter = s->vrc6_irq_latch;
+                s->vrc6_prescaler   = 0;
+            } else { s->cpu.irq = false; }
+            break;
+        case 2:
+            s->cpu.irq          = false;
+            s->vrc6_irq_counter = s->vrc6_irq_latch;
+            s->vrc6_irq_enabled = s->vrc6_irq_after;
+            s->vrc6_prescaler   = 0;
+            break;
+        }
+    }
+}
+
 /* ── CHR bus callbacks (PPU address space 0x0000–0x1FFF) ─────────────────── */
 
 static uint8_t nes_chr_read(uint16_t addr, void *ud) {
@@ -822,6 +973,8 @@ static uint8_t nes_chr_read(uint16_t addr, void *ud) {
         if (s->chr_is_ram) return s->chr[addr & 0x1FFF];
         return s->chr[s->mmc3_chr_offsets[addr >> 10] + (addr & 0x3FF)];
     }
+    if (s->cart.mapper == 24 || s->cart.mapper == 26)
+        return s->chr[s->mmc3_chr_offsets[addr >> 10] + (addr & 0x3FFu)];
     if (s->cart.mapper == 9) {
         /* MMC2: 4 KB CHR windows with latch-based bank selection.
          * Latch updates AFTER the fetch — the triggering tile ($FD/$FE)
@@ -856,6 +1009,9 @@ static void nes_chr_write(uint16_t addr, uint8_t val, void *ud) {
     NesState *s = ud;
     if (!s->chr_is_ram) return;
     if (s->cart.mapper == 4) { s->chr[addr & 0x1FFF] = val; return; }
+    if (s->cart.mapper == 24 || s->cart.mapper == 26) {
+        s->chr[s->mmc3_chr_offsets[addr >> 10] + (addr & 0x3FFu)] = val; return;
+    }
     if (s->cart.mapper >= 1 && s->cart.mapper != 7) {
         uint8_t slot = addr >= 0x1000 ? 1 : 0;
         s->chr[s->chr_offsets[slot] + (addr & 0x0FFF)] = val;
@@ -916,7 +1072,7 @@ static uint8_t nes_prg_direct(const NesState *s, uint16_t addr) {
         else                bank8 = prg8k - 1u;
         return s->prg[bank8 * 0x2000u + (addr & 0x1FFFu)];
     }
-    if (s->cart.mapper == 4) {
+    if (s->cart.mapper == 4 || s->cart.mapper == 24 || s->cart.mapper == 26) {
         uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
         return s->prg[s->mmc3_prg_offsets[slot] + (addr & 0x1FFFu)];
     }
@@ -1167,8 +1323,8 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
         if (s->cart.mapper == 5)
             return s->prg_ram[addr & 0x1FFFu]; /* $5113 always maps RAM here */
         if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
-            s->cart.mapper == 4 || s->cart.mapper == 178 ||
-            s->cfg->is_arcade)
+            s->cart.mapper == 4 || s->cart.mapper == 24 || s->cart.mapper == 26 ||
+            s->cart.mapper == 178 || s->cfg->is_arcade)
             return s->prg_ram[addr & 0x1FFF];
         return 0;
     }
@@ -1196,7 +1352,7 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
                 rom = s->prg_ram[(s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)) & 0x1FFFu];
             else
                 rom = s->prg[s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)];
-        } else if (s->cart.mapper == 4) {
+        } else if (s->cart.mapper == 4 || s->cart.mapper == 24 || s->cart.mapper == 26) {
             uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
             rom = s->prg[s->mmc3_prg_offsets[slot] + (addr & 0x1FFFu)];
         } else if (s->cart.mapper >= 1) {
@@ -1360,8 +1516,8 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
         if (s->fds_enabled) { s->fds.ram[addr - 0x6000u] = val; return; }
         if (s->cart.mapper == 5) { s->prg_ram[addr & 0x1FFFu] = val; return; }
         if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
-            s->cart.mapper == 4 || s->cart.mapper == 178 ||
-            s->cfg->is_arcade)
+            s->cart.mapper == 4 || s->cart.mapper == 24 || s->cart.mapper == 26 ||
+            s->cart.mapper == 178 || s->cfg->is_arcade)
             s->prg_ram[addr & 0x1FFF] = val;
         return;
     }
@@ -1458,6 +1614,8 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
 
             s->ppu.mirror = mirror ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
         }
+        else if (s->cart.mapper == 24 || s->cart.mapper == 26)
+            vrc6_cpu_write(s, addr, val);
     }
 }
 
@@ -1793,6 +1951,27 @@ static void nes_reset(NesState *s) {
         s->mmc3_irq_enabled = false;
         s->cpu.irq          = false;
         mmc3_update_banks(s);
+    } else if (s->cart.mapper == 24 || s->cart.mapper == 26) {
+        uint32_t n8k = (uint32_t)s->cart.prg_banks * 2u;
+        s->mmc3_prg_offsets[0] = 0;
+        s->mmc3_prg_offsets[1] = 0x2000u;
+        s->mmc3_prg_offsets[2] = 0;
+        s->mmc3_prg_offsets[3] = (n8k - 1u) * 0x2000u;  /* $E000: fixed last 8KB */
+        memset(s->mmc3_chr_offsets, 0, sizeof(s->mmc3_chr_offsets));
+        s->vrc6_irq_latch   = 0;
+        s->vrc6_irq_counter = 0;
+        s->vrc6_irq_enabled = false;
+        s->vrc6_irq_after   = false;
+        s->vrc6_irq_mode    = false;
+        s->vrc6_prescaler   = 0;
+        s->vrc6_p1_ctrl  = 0; s->vrc6_p1_period = 0; s->vrc6_p1_en = false;
+        s->vrc6_p1_timer = 0; s->vrc6_p1_seq    = 0;
+        s->vrc6_p2_ctrl  = 0; s->vrc6_p2_period = 0; s->vrc6_p2_en = false;
+        s->vrc6_p2_timer = 0; s->vrc6_p2_seq    = 0;
+        s->vrc6_saw_rate = 0; s->vrc6_saw_period = 0; s->vrc6_saw_en = false;
+        s->vrc6_saw_timer = 0; s->vrc6_saw_accum = 0; s->vrc6_saw_step = 0;
+        s->vrc6_halt    = false;
+        s->cpu.irq      = false;
     }
 
     mos6502_reset(&s->cpu);
@@ -2325,13 +2504,15 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                 mos6502_step(&s->cpu);
                 uint64_t delta = s->cpu.cycle_count - prev;
 
-                /* APU: one tick per CPU cycle */
-                if (s->apu.audio_dev)
-                    for (uint64_t i = 0; i < delta; i++) {
-                        if (s->fds_enabled)
-                            s->apu.fds_in = fds_audio_tick(&s->fds);
-                        apu2a03_tick(&s->apu);
-                    }
+                /* APU + VRC6: one tick per CPU cycle */
+                bool is_vrc6 = s->cart.mapper == 24 || s->cart.mapper == 26;
+                for (uint64_t i = 0; i < delta; i++) {
+                    if (is_vrc6)
+                        s->apu.fds_in = vrc6_tick(s);
+                    else if (s->apu.audio_dev && s->fds_enabled)
+                        s->apu.fds_in = fds_audio_tick(&s->fds);
+                    if (s->apu.audio_dev) apu2a03_tick(&s->apu);
+                }
                 if (s->apu.fc_irq || s->apu.dmc.irq_flag)
                     s->cpu.irq = true;
 
