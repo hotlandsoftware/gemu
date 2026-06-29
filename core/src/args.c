@@ -35,6 +35,7 @@ static void print_usage(const GemuArgsDef *def) {
         printf("  %-14s VNC server (use -vnc ? for address format)\n", "-vnc ADDR");
     printf("  %-14s Monitor: stdio | none | telnet:HOST:PORT,server,nowait\n",
            "-monitor SPEC");
+    printf("  %-14s GMP/QMP-compatible monitor over TCP (alias: -qmp)\n", "-gmp ADDR");
     printf("  %-14s Show this help\n", "-h, -help");
     if (def->extra_help && def->extra_help[0])
         printf("%s", def->extra_help);
@@ -80,7 +81,8 @@ static void print_monitor_help(void) {
     printf("Monitor backends:\n"
            "  stdio                                      console monitor on stdin/stdout\n"
            "  none                                       disable monitor\n"
-           "  telnet:127.0.0.1:4444,server,nowait       listen for one telnet client\n");
+           "  telnet:127.0.0.1:4444,server,nowait       listen for one telnet client\n"
+           "  gmp:127.0.0.1:4444                        listen for GMP/QMP JSON clients\n");
 }
 
 /* ── Validation helpers ──────────────────────────────────────────────────── */
@@ -265,6 +267,20 @@ bool gemu_args_parse(int argc, char **argv,
             const char *v = argv[++i];
             if (is_help(v)) { print_monitor_help(); exit(0); }
             out->monitor_spec = v;
+            continue;
+        }
+
+        /* ── -gmp ADDR / -qmp ADDR ── */
+        if (strcmp(a, "-gmp") == 0 || strcmp(a, "-qmp") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: %s requires an argument\n", def->prog, a);
+                return false;
+            }
+            const char *v = argv[++i];
+            if (is_help(v)) { print_monitor_help(); exit(0); }
+            static char gmp_spec[256];
+            snprintf(gmp_spec, sizeof(gmp_spec), "gmp:%s", v);
+            out->monitor_spec = gmp_spec;
             continue;
         }
 

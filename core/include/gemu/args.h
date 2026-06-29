@@ -8,7 +8,7 @@
  *
  * Each binary registers its supported devices and flags via GemuArgsDef.
  * gemu_args_parse() handles -M, -cpu, -vga, -display, -scale, -vnc,
- * -monitor, and -h.
+ * -monitor, -gmp/-qmp, and -h.
  * Binary-specific flags (e.g. chip8's -hz) are returned unmodified in
  * rem_argv[0..(*rem_argc)-1]; rem_argv must be pre-allocated to argc entries.
  * Pass NULL/NULL for rem_argc/rem_argv if no binary-specific flags exist.

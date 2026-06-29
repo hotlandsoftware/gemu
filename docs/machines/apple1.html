@@ -91,10 +91,8 @@
 
             <div class="section-title">Run</div>
             <div class="run-block">./bin/gemu -M apple1
-./bin/gemu -M apple1 -rom roms/apple1
-./bin/gemu -M apple1 -rom roms/apple1 -cg cm2140
-./bin/gemu -M apple1 -rom roms/apple1 -rom 0xFF00:wozmon.bin -cg cm2140
-./bin/gemu -M apple1 -display none</div>
+./bin/gemu -M apple1 -rom roms/apple1 -rom 0xE000:roms/basic.bin
+./bin/gemu -M apple1 -display curses # runs in terminal</div>
         </div>
     </div>
 </div>

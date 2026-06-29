@@ -70,6 +70,7 @@ typedef enum {
     MON_BACKEND_STDIO,
     MON_BACKEND_NONE,
     MON_BACKEND_TELNET,
+    MON_BACKEND_GMP,
 } MonBackend;
 
 struct GemuMonitor {
@@ -160,6 +161,12 @@ static bool parse_monitor_spec(GemuMonitor *mon, const char *spec) {
 
     const char *prefix = "telnet:";
     size_t prefix_len = strlen(prefix);
+    bool is_gmp = false;
+    if (strncasecmp(spec, "gmp:", 4) == 0) {
+        prefix = "gmp:";
+        prefix_len = 4;
+        is_gmp = true;
+    }
     if (strncasecmp(spec, prefix, prefix_len) == 0) {
         char target[128];
         const char *addr = spec + prefix_len;
@@ -175,7 +182,8 @@ static bool parse_monitor_spec(GemuMonitor *mon, const char *spec) {
 
         char *colon = strrchr(target, ':');
         if (!colon || colon == target || colon[1] == '\0') {
-            fprintf(stderr, "monitor: expected telnet:HOST:PORT,server,nowait\n");
+            fprintf(stderr, "monitor: expected %sHOST:PORT%s\n",
+                    prefix, is_gmp ? "" : ",server,nowait");
             mon->backend = MON_BACKEND_NONE;
             return false;
         }
@@ -194,7 +202,7 @@ static bool parse_monitor_spec(GemuMonitor *mon, const char *spec) {
         }
         snprintf(mon->telnet_host, sizeof(mon->telnet_host), "%s", target);
         mon->telnet_port = (int)port;
-        mon->backend = MON_BACKEND_TELNET;
+        mon->backend = is_gmp ? MON_BACKEND_GMP : MON_BACKEND_TELNET;
         return true;
     }
 
@@ -243,7 +251,8 @@ static bool monitor_open_telnet(GemuMonitor *mon) {
         return false;
     }
 
-    fprintf(stderr, "monitor: telnet listening on %s:%d\n",
+    fprintf(stderr, "monitor: %s listening on %s:%d\n",
+            mon->backend == MON_BACKEND_GMP ? "gmp" : "telnet",
             mon->telnet_host, mon->telnet_port);
     return true;
 }
@@ -778,13 +787,152 @@ static void monitor_telnet_loop(GemuMonitor *mon) {
     }
 }
 
+static const char *skip_json_ws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+        p++;
+    return p;
+}
+
+static void json_escape(char *out, size_t out_len, const char *in) {
+    size_t o = 0;
+    if (out_len == 0) return;
+    for (size_t i = 0; in && in[i] && o + 1 < out_len; i++) {
+        unsigned char ch = (unsigned char)in[i];
+        if ((ch == '"' || ch == '\\') && o + 2 < out_len) {
+            out[o++] = '\\';
+            out[o++] = (char)ch;
+        } else if (ch >= 0x20) {
+            out[o++] = (char)ch;
+        }
+    }
+    out[o] = '\0';
+}
+
+static void qmp_send_error(GemuMonitor *mon, const char *klass, const char *desc) {
+    char esc[512];
+    json_escape(esc, sizeof(esc), desc);
+    char buf[768];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"error\":{\"class\":\"%s\",\"desc\":\"%s\"}}\r\n",
+                     klass ? klass : "GenericError", esc);
+    if (n > 0)
+        sendall(mon->client_fd, buf,
+                (size_t)((n < (int)sizeof(buf)) ? n : (int)sizeof(buf) - 1));
+}
+
+static void qmp_invalid_keyword(GemuMonitor *mon, const char *line) {
+    const char *p = skip_json_ws(line);
+    char word[64];
+    size_t n = 0;
+    while (p[n] && !isspace((unsigned char)p[n]) && n + 1 < sizeof(word))
+        n++;
+    memcpy(word, p, n);
+    word[n] = '\0';
+
+    char desc[160];
+    snprintf(desc, sizeof(desc), "JSON parse error, invalid keyword '%s'", word);
+    qmp_send_error(mon, "GenericError", desc);
+}
+
+static bool qmp_json_well_formed_object(const char *line) {
+    const char *p = skip_json_ws(line);
+    if (*p != '{') return false;
+
+    int depth = 0;
+    bool in_string = false;
+    bool escape = false;
+    for (; *p; p++) {
+        char ch = *p;
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (ch == '\\') {
+                escape = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{' || ch == '[') {
+            depth++;
+        } else if (ch == '}' || ch == ']') {
+            depth--;
+            if (depth < 0) return false;
+        }
+    }
+    return depth == 0 && !in_string && !escape;
+}
+
+static void monitor_gmp_loop(GemuMonitor *mon) {
+    static const char greeting[] =
+        "{\r\n"
+        "   \"QMP\":{\r\n"
+        "      \"version\":{\r\n"
+        "         \"qemu\":{\r\n"
+        "            \"micro\":0,\r\n"
+        "            \"minor\":6,\r\n"
+        "            \"major\":1\r\n"
+        "         },\r\n"
+        "         \"gemu\":{\r\n"
+        "            \"micro\":0,\r\n"
+        "            \"minor\":0,\r\n"
+        "            \"major\":1\r\n"
+        "         },\r\n"
+        "         \"package\":\"\"\r\n"
+        "      },\r\n"
+        "      \"capabilities\":[\r\n"
+        "         \r\n"
+        "      ]\r\n"
+        "   }\r\n"
+        "}\r\n";
+
+    while (mon->running) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(mon->listen_fd, &rfds);
+        struct timeval tv = {1, 0};
+        int rc = select((int)mon->listen_fd + 1, &rfds, NULL, NULL, &tv);
+        if (rc <= 0) continue;
+
+        sock_t client = accept(mon->listen_fd, NULL, NULL);
+        if (client == INVALID_SOCK) continue;
+        mon->client_fd = client;
+        sendall(client, greeting, sizeof(greeting) - 1);
+
+        char line[512];
+        while (mon->running && telnet_read_line(client, line, sizeof(line))) {
+            trim_line(line);
+            const char *p = skip_json_ws(line);
+            if (*p == '\0')
+                continue;
+            if (*p != '{') {
+                qmp_invalid_keyword(mon, line);
+                continue;
+            }
+            if (!qmp_json_well_formed_object(line)) {
+                qmp_send_error(mon, "GenericError", "JSON parse error");
+                continue;
+            }
+            qmp_send_error(mon, "GenericError", "QMP commands are not implemented yet");
+        }
+
+        sock_close(client);
+        mon->client_fd = INVALID_SOCK;
+    }
+}
+
 static void *monitor_thread(void *arg) {
     GemuMonitor *mon = arg;
 
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
 
-    if (mon->backend == MON_BACKEND_TELNET)
+    if (mon->backend == MON_BACKEND_GMP)
+        monitor_gmp_loop(mon);
+    else if (mon->backend == MON_BACKEND_TELNET)
         monitor_telnet_loop(mon);
     else
         monitor_stdio_loop(mon);
@@ -843,7 +991,8 @@ void gemu_monitor_start(GemuMonitor *mon) {
     if (!mon || mon->backend == MON_BACKEND_NONE) return;
     if (mon->backend == MON_BACKEND_STDIO && !isatty(STDIN_FILENO))
         return; /* no console, stay silent */
-    if (mon->backend == MON_BACKEND_TELNET && !monitor_open_telnet(mon))
+    if ((mon->backend == MON_BACKEND_TELNET || mon->backend == MON_BACKEND_GMP) &&
+        !monitor_open_telnet(mon))
         return;
     mon->running = true;
     if (pthread_create(&mon->thread, NULL, monitor_thread, mon) == 0) {
