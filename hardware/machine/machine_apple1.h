@@ -25,6 +25,7 @@ typedef struct Apple1State {
     uint8_t          key_data;
     bool             have_monitor_rom;
     bool             native_monitor;
+    bool             quit_requested;
     bool             key_ready;
 } Apple1State;
 

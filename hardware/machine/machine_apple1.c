@@ -39,6 +39,7 @@ struct Apple1Display {
     int           row;
     int           col;
     bool          dirty;
+    bool          cursor_phase;
     bool          quit;
     uint8_t       kbuf[64];
     int           khead;
@@ -132,7 +133,11 @@ static int apple1_glyph_index(uint8_t ch) {
 }
 
 static void apple1_display_render(Apple1Display *d) {
-    if (!d || !d->renderer || !d->dirty) return;
+    if (!d || !d->renderer) return;
+    bool cursor_phase = ((SDL_GetTicks() / 500u) & 1u) != 0;
+    if (!d->dirty && d->cursor_phase == cursor_phase) return;
+    d->cursor_phase = cursor_phase;
+
     SDL_SetRenderDrawColor(d->renderer, 0, 0, 0, 255);
     SDL_RenderClear(d->renderer);
     SDL_SetRenderDrawColor(d->renderer, 255, 255, 255, 255);
@@ -140,7 +145,10 @@ static void apple1_display_render(Apple1Display *d) {
     const uint8_t *font = apple1_display_font(d);
     for (int row = 0; row < A1_ROWS; row++) {
         for (int col = 0; col < A1_COLS; col++) {
-            int idx = apple1_glyph_index(d->screen[row][col]);
+            uint8_t ch = d->screen[row][col];
+            if (cursor_phase && row == d->row && col == d->col)
+                ch = '@';
+            int idx = apple1_glyph_index(ch);
             if (idx < 0) continue;
             const uint8_t *glyph = &font[idx * 8];
             int x0 = A1_BORDER + col * A1_CELL_W * A1_SCALE;
@@ -327,9 +335,13 @@ static void apple1_update_vnc(Apple1State *s) {
 
     memset(s->vnc_fb, 0, (size_t)A1_FB_W * A1_FB_H);
     const uint8_t *font = apple1_display_font(s->display);
+    bool cursor_phase = ((SDL_GetTicks() / 500u) & 1u) != 0;
     for (int row = 0; row < A1_ROWS; row++) {
         for (int col = 0; col < A1_COLS; col++) {
-            int idx = apple1_glyph_index(s->display->screen[row][col]);
+            uint8_t ch = s->display->screen[row][col];
+            if (cursor_phase && row == s->display->row && col == s->display->col)
+                ch = '@';
+            int idx = apple1_glyph_index(ch);
             if (idx < 0) continue;
             const uint8_t *glyph = &font[idx * 8];
             int x0 = col * A1_CELL_W;
@@ -402,6 +414,10 @@ static void apple1_monitor_hex16(Apple1State *s, uint16_t v) {
     apple1_monitor_hex8(s, (uint8_t)v);
 }
 
+static void apple1_monitor_prompt(Apple1State *s) {
+    apple1_monitor_puts(s, "\\\r");
+}
+
 static const char *apple1_monitor_skip_ws(const char *p) {
     while (*p == ' ' || *p == '\t') p++;
     return p;
@@ -447,8 +463,11 @@ static void apple1_monitor_store(Apple1State *s, uint16_t addr, const char *p) {
 
 static void apple1_monitor_dump(Apple1State *s, uint16_t start, uint16_t end) {
     uint16_t addr = start;
+    bool first = true;
     for (;;) {
-        apple1_write_display(s, '\r');
+        if (!first)
+            apple1_write_display(s, '\r');
+        first = false;
         apple1_monitor_hex16(s, addr);
         apple1_monitor_puts(s, ": ");
         for (int i = 0; i < 8; i++) {
@@ -469,12 +488,15 @@ static void apple1_monitor_execute(Apple1State *s, const char *line) {
 
     if (!have_addr) {
         if (*p == '\0') return;
+        if (toupper((unsigned char)*p) == 'Q' && p[1] == '\0') {
+            s->quit_requested = true;
+            return;
+        }
         if (toupper((unsigned char)*p) == 'R') {
             s->cpu.PC = s->mon_last_addr;
             s->native_monitor = false;
             return;
         }
-        apple1_monitor_puts(s, "?\r");
         return;
     }
 
@@ -495,7 +517,7 @@ static void apple1_monitor_execute(Apple1State *s, const char *line) {
     } else if (*p == '\0') {
         apple1_monitor_dump(s, addr, addr);
     } else {
-        apple1_monitor_puts(s, "?\r");
+        apple1_monitor_dump(s, addr, addr);
     }
 }
 
@@ -513,8 +535,8 @@ static void apple1_monitor_key(Apple1State *s, uint8_t ch) {
         s->mon_line[s->mon_len] = '\0';
         apple1_monitor_execute(s, s->mon_line);
         s->mon_len = 0;
-        if (s->native_monitor)
-            apple1_monitor_puts(s, "\\");
+        if (s->native_monitor && !s->quit_requested)
+            apple1_monitor_prompt(s);
         return;
     }
     if (ch < ' ' || ch > '_')
@@ -664,7 +686,7 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     if (cfg->has_start_addr)
         s->cpu.PC = cfg->start_addr;
     if (s->native_monitor)
-        apple1_monitor_puts(s, "\\");
+        apple1_monitor_prompt(s);
     apple1_update_vnc(s);
 
     return s;
@@ -690,6 +712,8 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
         if (ser && ser->should_quit(ser->ud))
             quit = true;
         if (s->display && s->display->quit)
+            quit = true;
+        if (s->quit_requested)
             quit = true;
 
         if (s->native_monitor) {
