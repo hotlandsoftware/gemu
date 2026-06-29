@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/select.h>
+#include <unistd.h>
+#endif
 
 #define APPLE1_KBD     0xD010u
 #define APPLE1_KBDCR   0xD011u
@@ -23,6 +27,8 @@
 #define A1_BORDER      14
 #define A1_WIN_W       (A1_COLS * A1_CELL_W * A1_SCALE + A1_BORDER * 2)
 #define A1_WIN_H       (A1_ROWS * A1_CELL_H * A1_SCALE + A1_BORDER * 2)
+#define A1_FB_W        (A1_COLS * A1_CELL_W)
+#define A1_FB_H        (A1_ROWS * A1_CELL_H)
 #define A1_CHARGEN_SIZE 512u
 
 /*
@@ -70,6 +76,7 @@ struct Apple1Display {
 };
 
 static void apple1_display_kpush(Apple1Display *d, uint8_t ch) {
+    if (!d) return;
     int n = (d->khead + 1) & 63;
     if (n != d->ktail) {
         d->kbuf[d->khead] = ch;
@@ -139,20 +146,28 @@ static uint32_t apple1_renderer_flags(GemuRendererType renderer) {
     }
 }
 
+static const uint8_t *apple1_display_font(const Apple1Display *d) {
+    return (d && d->cg == MOS_CG_CM2140 && d->have_chargen)
+         ? d->chargen : cm2140_fallback;
+}
+
+static int apple1_glyph_index(uint8_t ch) {
+    ch &= 0x7Fu;
+    if (ch >= '@' && ch <= '_') return ch - '@';
+    if (ch >= ' ' && ch <= '?') return 32 + (ch - ' ');
+    return -1;
+}
+
 static void apple1_display_render(Apple1Display *d) {
     if (!d || !d->renderer || !d->dirty) return;
     SDL_SetRenderDrawColor(d->renderer, 0, 0, 0, 255);
     SDL_RenderClear(d->renderer);
     SDL_SetRenderDrawColor(d->renderer, 255, 255, 255, 255);
 
-    const uint8_t *font = (d->cg == MOS_CG_CM2140 && d->have_chargen)
-                        ? d->chargen : cm2140_fallback;
+    const uint8_t *font = apple1_display_font(d);
     for (int row = 0; row < A1_ROWS; row++) {
         for (int col = 0; col < A1_COLS; col++) {
-            uint8_t ch = d->screen[row][col] & 0x7Fu;
-            int idx = -1;
-            if (ch >= '@' && ch <= '_') idx = ch - '@';
-            else if (ch >= ' ' && ch <= '?') idx = 32 + (ch - ' ');
+            int idx = apple1_glyph_index(d->screen[row][col]);
             if (idx < 0) continue;
             const uint8_t *glyph = &font[idx * 8];
             int x0 = A1_BORDER + col * A1_CELL_W * A1_SCALE;
@@ -177,14 +192,6 @@ static void apple1_display_render(Apple1Display *d) {
 }
 
 static Apple1Display *apple1_display_create(const MosConfig *cfg) {
-    if (cfg->display_type == GEMU_DISPLAY_NONE)
-        return NULL;
-    if (!(SDL_WasInit(SDL_INIT_VIDEO) & SDL_INIT_VIDEO) &&
-        SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
-        fprintf(stderr, "apple1: SDL video init failed: %s\n", SDL_GetError());
-        return NULL;
-    }
-
     Apple1Display *d = calloc(1, sizeof(*d));
     if (!d) return NULL;
     d->cg = cfg->char_gen;
@@ -193,13 +200,22 @@ static Apple1Display *apple1_display_create(const MosConfig *cfg) {
     memset(d->screen, ' ', sizeof(d->screen));
     d->dirty = true;
 
+    if (cfg->display_type == GEMU_DISPLAY_NONE ||
+        cfg->display_type == GEMU_DISPLAY_CURSES)
+        return d;
+
+    if (!(SDL_WasInit(SDL_INIT_VIDEO) & SDL_INIT_VIDEO) &&
+        SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
+        fprintf(stderr, "apple1: SDL video init failed: %s\n", SDL_GetError());
+        return d;
+    }
+
     d->window = SDL_CreateWindow("GEMU (Apple I)",
         SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
         A1_WIN_W, A1_WIN_H, SDL_WINDOW_SHOWN);
     if (!d->window) {
         fprintf(stderr, "apple1: SDL_CreateWindow failed: %s\n", SDL_GetError());
-        free(d);
-        return NULL;
+        return d;
     }
     d->window_id = SDL_GetWindowID(d->window);
     d->renderer = SDL_CreateRenderer(d->window, -1,
@@ -209,8 +225,9 @@ static Apple1Display *apple1_display_create(const MosConfig *cfg) {
     if (!d->renderer) {
         fprintf(stderr, "apple1: SDL_CreateRenderer failed: %s\n", SDL_GetError());
         SDL_DestroyWindow(d->window);
-        free(d);
-        return NULL;
+        d->window = NULL;
+        d->window_id = 0;
+        return d;
     }
     SDL_StartTextInput();
     apple1_display_render(d);
@@ -219,7 +236,7 @@ static Apple1Display *apple1_display_create(const MosConfig *cfg) {
 
 static void apple1_display_destroy(Apple1Display *d) {
     if (!d) return;
-    SDL_StopTextInput();
+    if (d->window) SDL_StopTextInput();
     if (d->renderer) SDL_DestroyRenderer(d->renderer);
     if (d->window) SDL_DestroyWindow(d->window);
     free(d);
@@ -256,7 +273,7 @@ static void apple1_display_putc(Apple1Display *d, uint8_t ch) {
 }
 
 static void apple1_display_poll(Apple1Display *d) {
-    if (!d) return;
+    if (!d || !d->renderer) return;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT) {
@@ -285,14 +302,75 @@ static uint8_t apple1_normalize_key(uint8_t ch) {
     return (uint8_t)(ch | 0x80u);
 }
 
+static void apple1_poll_curses_keyboard(Apple1State *s) {
+#ifndef _WIN32
+    if (!s->display || s->cfg->display_type != GEMU_DISPLAY_CURSES)
+        return;
+
+    fd_set rfds;
+    struct timeval tv = {0, 0};
+    FD_ZERO(&rfds);
+    FD_SET(STDIN_FILENO, &rfds);
+    if (select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv) <= 0)
+        return;
+
+    unsigned char ch = 0;
+    if (read(STDIN_FILENO, &ch, 1) == 1)
+        apple1_display_kpush(s->display, ch);
+#else
+    (void)s;
+#endif
+}
+
+static void apple1_poll_vnc_keyboard(Apple1State *s) {
+    GemuVncKeyEvent ev;
+    while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
+        if (!ev.down || !s->display)
+            continue;
+        uint32_t sym = ev.keysym;
+        if (sym == 0xFF0D || sym == 0xFF8D)
+            apple1_display_kpush(s->display, '\r');
+        else if (sym == 0xFF08 || sym == 0xFFFF)
+            apple1_display_kpush(s->display, 0x7F);
+        else if (sym >= ' ' && sym <= 0x7F)
+            apple1_display_kpush(s->display, (uint8_t)sym);
+    }
+}
+
+static void apple1_update_vnc(Apple1State *s) {
+    if (!s || !s->vnc || !s->display || !s->vnc_fb)
+        return;
+
+    memset(s->vnc_fb, 0, (size_t)A1_FB_W * A1_FB_H);
+    const uint8_t *font = apple1_display_font(s->display);
+    for (int row = 0; row < A1_ROWS; row++) {
+        for (int col = 0; col < A1_COLS; col++) {
+            int idx = apple1_glyph_index(s->display->screen[row][col]);
+            if (idx < 0) continue;
+            const uint8_t *glyph = &font[idx * 8];
+            int x0 = col * A1_CELL_W;
+            int y0 = row * A1_CELL_H;
+            for (int gy = 0; gy < A1_CELL_H; gy++) {
+                uint8_t bits = glyph[gy];
+                for (int gx = 0; gx < 5; gx++) {
+                    if (bits & (uint8_t)(0x10u >> gx))
+                        s->vnc_fb[(y0 + gy) * A1_FB_W + x0 + gx] = 1;
+                }
+            }
+        }
+    }
+    gemu_vnc_update(s->vnc, s->vnc_fb, A1_FB_W, A1_FB_H);
+}
+
 static void apple1_poll_keyboard(Apple1State *s) {
     if (s->display) {
         apple1_display_poll(s->display);
+        apple1_poll_curses_keyboard(s);
+        apple1_poll_vnc_keyboard(s);
         if (!s->key_ready && apple1_display_key_available(s->display)) {
             s->key_data = apple1_normalize_key(apple1_display_read_key(s->display));
             s->key_ready = true;
         }
-        return;
     }
 
     GemuSerial *ser = s->cfg->serial;
@@ -307,7 +385,8 @@ static void apple1_poll_keyboard(Apple1State *s) {
 static void apple1_write_display(Apple1State *s, uint8_t val) {
     if (s->display) {
         apple1_display_putc(s->display, val);
-        return;
+        if (s->cfg->display_type != GEMU_DISPLAY_CURSES)
+            return;
     }
 
     GemuSerial *ser = s->cfg->serial;
@@ -424,6 +503,16 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     s->display = apple1_display_create(cfg);
     if (cfg->display_type != GEMU_DISPLAY_NONE && !s->display)
         fprintf(stderr, "apple1: display unavailable, falling back to stdio\n");
+    if (cfg->vnc_addr) {
+        s->vnc = gemu_vnc_create(cfg->vnc_addr, A1_FB_W, A1_FB_H);
+        if (s->vnc) {
+            gemu_vnc_set_colors(s->vnc, 0xFFFFFFu, 0x000000u);
+            s->vnc_fb = malloc((size_t)A1_FB_W * A1_FB_H);
+            if (!s->vnc_fb)
+                fprintf(stderr, "apple1: failed to allocate VNC framebuffer\n");
+        }
+    }
+    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     memcpy(&s->mem[APPLE1_ROM], apple1_boot_rom, sizeof(apple1_boot_rom));
     memset(&s->rom_map[APPLE1_ROM], 1, sizeof(apple1_boot_rom));
@@ -445,6 +534,7 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     mos6502_reset(&s->cpu);
     if (cfg->has_start_addr)
         s->cpu.PC = cfg->start_addr;
+    apple1_update_vnc(s);
 
     return s;
 }
@@ -452,7 +542,9 @@ Apple1State *apple1_create(const MosConfig *cfg) {
 void apple1_destroy(Apple1State *s) {
     if (!s) return;
     gemu_monitor_destroy(s->monitor);
+    gemu_vnc_destroy(s->vnc);
     apple1_display_destroy(s->display);
+    free(s->vnc_fb);
     free(s);
 }
 
@@ -475,6 +567,8 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
             if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
             mos6502_step(&s->cpu);
         }
+        apple1_display_render(s->display);
+        apple1_update_vnc(s);
 
         Uint32 dt = SDL_GetTicks() - t0;
         Uint32 frame_ms = 1000u / APPLE1_FPS;
