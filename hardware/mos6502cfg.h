@@ -6,6 +6,7 @@
 
 typedef enum {
     MOS_MACHINE_GENERIC,
+    MOS_MACHINE_APPLE1, /* Apple I */
     MOS_MACHINE_NES,    /* Nintendo Entertainment System */
     MOS_MACHINE_KIM1,   /* MOS KIM-1 single-board computer */
 } MosMachineType;

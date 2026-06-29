@@ -37,9 +37,10 @@ Simulated machines include:
 ## Implemented
 | Name   | Full Name     | Year | Graphics  | Input | Sound | Status |
 |--------|---------------|---------|---------|-------|-------|-------|
+| apple1 | `Apple I` | 1976 | 🟢 | 🔴 | 🔴 | preliminary | 
 | dendy | `Dendy Famiclone` | 1992 | 🟢 | 🟢 | 🟢 | imperfect | 
 | famicom | `Nintendo Family Computer` | 1983  | 🟢 | 🟢 | 🟢 | imperfect | 
-| generic | `Generic MOS-compatible machine` | N/A | 🔴 | 🔴 | 🔴 | imperfect | 
+| generic | `Generic MOS-compatible machine` | N/A | 🔴 | 🔴 | 🔴 | preliminary | 
 | kim1 | `MOS KIM-1` | 1976 | 🟢 | 🟢 | 🔴 | imperfect | 
 | nes | `Nintendo Entertainment System (NTSC)` | 1985 | 🟢 | 🟢 | 🟢 | imperfect | 
 | nespal | `Nintendo Entertainment System (PAL)` | 1986 | 🟢 | 🟢 | 🟢 | imperfect | 
@@ -58,7 +59,6 @@ Simulated machines include:
 | atari5200 | `Atari 5200` | 1982 |
 | atari5200 | `Atari 7800` | 1986 |
 | atarilynx | `Atari Lynx` | 1989 |
-| apple1 | `Apple I` | 1976 |
 | apple2 | `Apple II` | 1977 |
 | apple2plus | `Apple II Plus` | 1979 |
 | apple2e | `Apple IIe` | 1983 |

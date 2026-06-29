@@ -1,5 +1,6 @@
 #include "mos6502cfg.h"
 #include "machine_mos.h"
+#include "machine_apple1.h"
 #include "nes.h"
 #include "kim1.h"
 #include "vt100.h"
@@ -32,6 +33,7 @@ static const MachineDef machine_defs[] = {
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
+    {"apple1",  "Apple I (MOS 6502, Woz-style terminal I/O)"},
     {"dendy",   "Dendy NES Famiclone (PAL 50 Hz, NTSC-compatible PPU/APU timing)"},
     {"vssmb",       "VS. Super Mario Bros. (coin-op arcade cabinet, DIP switches)"},
     {"vsskatekids", "VS. Skate Kid Bros. (arcade hack of VS. SMB)"},
@@ -215,7 +217,8 @@ int mos_setup(int argc, char *argv[]) {
             if (strcmp(args.machine, machine_defs[i].name) != 0) continue;
             const MachineDef *md = &machine_defs[i];
             const char *canon = md->canonical;
-            if      (strcmp(canon, "mos")  == 0) cfg.machine = MOS_MACHINE_GENERIC;
+            if      (strcmp(canon, "apple1") == 0) cfg.machine = MOS_MACHINE_APPLE1;
+            else if (strcmp(canon, "mos")  == 0) cfg.machine = MOS_MACHINE_GENERIC;
             else if (strcmp(canon, "kim1") == 0) cfg.machine = MOS_MACHINE_KIM1;
             else if (strcmp(canon, "nes")  == 0) cfg.machine = MOS_MACHINE_NES;
             cfg.is_dendy = md->tv && strcmp(md->tv, "dendy") == 0;
@@ -385,7 +388,9 @@ int mos_setup(int argc, char *argv[]) {
     cfg.display_scale = args.display_scale;
     cfg.vnc_addr      = args.vnc_addr;
 
-    if ((cfg.machine == MOS_MACHINE_NES || cfg.machine == MOS_MACHINE_KIM1)
+    if ((cfg.machine == MOS_MACHINE_APPLE1 ||
+         cfg.machine == MOS_MACHINE_NES ||
+         cfg.machine == MOS_MACHINE_KIM1)
         && !cfg.vnc_addr && !args.display_explicit) {
 #ifdef GEMU_GTK
         cfg.display_type = GEMU_DISPLAY_GTK;
@@ -427,7 +432,7 @@ int mos_setup(int argc, char *argv[]) {
             fprintf(stderr, "gemu: -fda requires -device fds\n");
             return 1;
         }
-    } else {
+    } else if (cfg.machine != MOS_MACHINE_APPLE1) {
         if (cfg.n_roms == 0) {
             fprintf(stderr, "gemu: no ROM specified\n"
                             "  Load a single file:  -rom ADDR:FILE\n"
@@ -441,6 +446,10 @@ int mos_setup(int argc, char *argv[]) {
         return 1;
     }
 
+    if (cfg.machine == MOS_MACHINE_APPLE1 &&
+        cfg.display_type != GEMU_DISPLAY_NONE && !want_vt100)
+        want_vt100 = true;
+
     if (cfg.want_wozmon) {
         if (!cfg.has_start_addr) {
             cfg.start_addr     = 0x1AA0u;
@@ -453,7 +462,9 @@ int mos_setup(int argc, char *argv[]) {
     Vt100State *vt100 = NULL;
     GemuSerial  vt100_serial;
     if (want_vt100) {
-        const char *vt_title = cfg.want_wozmon ? "GEMU (Wozniak Monitor)" : NULL;
+        const char *vt_title = cfg.machine == MOS_MACHINE_APPLE1 ? "GEMU (Apple I)"
+                             : cfg.want_wozmon ? "GEMU (Wozniak Monitor)"
+                             : NULL;
         vt100 = vt100_create(cfg.display_type, vt_title);
         if (!vt100) { SDL_Quit(); return 1; }
         vt100_as_serial(vt100, &vt100_serial);
@@ -467,6 +478,11 @@ int mos_setup(int argc, char *argv[]) {
         s->ppu.debug = cfg.ppu_debug;
         nes_run(s, &cfg);
         nes_destroy(s);
+    } else if (cfg.machine == MOS_MACHINE_APPLE1) {
+        Apple1State *s = apple1_create(&cfg);
+        if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
+        apple1_run(s, &cfg);
+        apple1_destroy(s);
     } else if (cfg.machine == MOS_MACHINE_KIM1) {
         Kim1State *s = kim1_create(&cfg);
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
