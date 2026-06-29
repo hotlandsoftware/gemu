@@ -187,7 +187,8 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
     s->cpu.mem_read        = generic_mem_read;
     s->cpu.mem_write       = generic_mem_write;
     s->cpu.mem_ud          = s;
-    s->cpu.decimal_disable = (cfg->cpu == MOS_CPU_2A03);
+    s->cpu.decimal_disable = (cfg->cpu == MOS_CPU_2A03 ||
+                              cfg->cpu == MOS_CPU_2A07);
 
     s->monitor = gemu_monitor_create();
 

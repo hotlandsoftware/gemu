@@ -2185,13 +2185,12 @@ NesState *nes_create(const MosConfig *cfg) {
     s->cpu.mem_read        = nes_cpu_read;
     s->cpu.mem_write       = nes_cpu_write;
     s->cpu.mem_ud          = s;
-    s->cpu.decimal_disable = (cfg->cpu != MOS_CPU_6502);
+    s->cpu.decimal_disable = (cfg->cpu == MOS_CPU_2A03 ||
+                              cfg->cpu == MOS_CPU_2A07);
 
     /* APU — only initialise when sound is enabled */
     if (cfg->sound == MOS_SOUND_2A03) {
-        uint32_t apu_clock = cfg->is_dendy ? 1773448u
-                           : cfg->is_pal   ? 1662607u
-                                           : 1789773u;
+        uint32_t apu_clock = cfg->cpu == MOS_CPU_2A07 ? 1662607u : 1789773u;
         if (!apu2a03_init(&s->apu, apu_clock))
             fprintf(stderr, "nes: APU audio init failed (continuing silently)\n");
         s->apu.mem_read = nes_cpu_read;

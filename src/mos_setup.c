@@ -39,12 +39,13 @@ static const GemuDevDesc machines[] = {
     {"kim1",    "MOS KIM-1 single-board computer (6502, 1 KB RAM, 2x 6530 RRIOT)"},
     {"mos",     "Generic MOS-compatible machine (flat 64 KB, ROM at user-specified address)"},
     {"nes",     "Nintendo Entertainment System (Ricoh 2A03 + RP2C02, NTSC)"},
-    {"nespal",  "Nintendo Entertainment System (Ricoh 2A03 + RP2C02, PAL)"},
+    {"nespal",  "Nintendo Entertainment System (Ricoh 2A07 + RP2C02, PAL)"},
 };
 static const GemuDevDesc cpus[] = {
     {"6501", "MOS Technology 6501"},
     {"6502", "MOS Technology 6502"},
     {"2a03", "Ricoh 2A03 (6502-like, no decimal mode)"},
+    {"2a07", "Ricoh 2A07 (PAL NES CPU/APU, no decimal mode)"},
 };
 static const GemuDevDesc vgas[] = {
 #include "generated/vgas_mos.inc"
@@ -119,6 +120,26 @@ static bool parse_soundhw(const char *hw, MosSoundType *out) {
         return true;
     }
 #endif
+    return false;
+}
+
+static bool parse_cpu(const char *name, MosCpuType *out) {
+    if (strcmp(name, "6501") == 0) {
+        *out = MOS_CPU_6501;
+        return true;
+    }
+    if (strcmp(name, "6502") == 0) {
+        *out = MOS_CPU_6502;
+        return true;
+    }
+    if (strcmp(name, "2a03") == 0) {
+        *out = MOS_CPU_2A03;
+        return true;
+    }
+    if (strcmp(name, "2a07") == 0) {
+        *out = MOS_CPU_2A07;
+        return true;
+    }
     return false;
 }
 
@@ -201,9 +222,11 @@ int mos_setup(int argc, char *argv[]) {
             cfg.is_arcade = md->tv && strcmp(md->tv, "vs") == 0;
             cfg.is_pal   = cfg.is_dendy || (md->tv && strcmp(md->tv, "pal") == 0);
             if (!args.cpu && md->cpu) {
-                if      (strcmp(md->cpu, "6501") == 0) cfg.cpu = MOS_CPU_6501;
-                else if (strcmp(md->cpu, "6502") == 0) cfg.cpu = MOS_CPU_6502;
-                else if (strcmp(md->cpu, "2a03") == 0) cfg.cpu = MOS_CPU_2A03;
+                if (!parse_cpu(md->cpu, &cfg.cpu)) {
+                    fprintf(stderr, "gemu: machine '%s' has unknown default cpu '%s'\n",
+                            md->name, md->cpu);
+                    return 1;
+                }
             }
             if (!args.vga && md->vga) {
                 if      (strcmp(md->vga, "rp2c02")      == 0) cfg.vga = MOS_VGA_RP2C02;
@@ -219,9 +242,10 @@ int mos_setup(int argc, char *argv[]) {
     }
 
     if (args.cpu) {
-        if      (strcmp(args.cpu, "6501") == 0) cfg.cpu = MOS_CPU_6501;
-        else if (strcmp(args.cpu, "6502") == 0) cfg.cpu = MOS_CPU_6502;
-        else if (strcmp(args.cpu, "2a03") == 0) cfg.cpu = MOS_CPU_2A03;
+        if (!parse_cpu(args.cpu, &cfg.cpu)) {
+            fprintf(stderr, "gemu: unknown -cpu '%s' (use -cpu ? to list)\n", args.cpu);
+            return 1;
+        }
     }
 
     if (args.vga) {

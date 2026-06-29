@@ -13,6 +13,7 @@ typedef enum {
 typedef enum {
     MOS_CPU_6502,
     MOS_CPU_2A03,   /* Ricoh 2A03: 6502 without decimal mode, built into NES */
+    MOS_CPU_2A07,   /* Ricoh 2A07: PAL NES CPU/APU, no decimal mode */
     MOS_CPU_6501,   /* 6800-pinout predecessor; same ISA as 6502 */
 } MosCpuType;
 
