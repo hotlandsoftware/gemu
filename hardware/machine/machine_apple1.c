@@ -617,6 +617,23 @@ static bool apple1_load_roms(Apple1State *s, const MosConfig *cfg) {
                    cfg->roms[i].path);
             continue;
         }
+        if (region && strcmp(region, "cffa") == 0) {
+            uint32_t addr = cfg->roms[i].addr ? (cfg->roms[i].addr & 0xFFFFu) : 0x9000u;
+            GemuMemory tmp = {.data = s->mem + addr, .size = 0x10000u - addr};
+            size_t len = 0;
+            if (!gemu_mem_load_file(&tmp, 0, cfg->roms[i].path, &len)) {
+                fprintf(stderr, "apple1: failed to load CFFA ROM '%s'\n",
+                        cfg->roms[i].path);
+                return false;
+            }
+            if (addr == 0x9000u && len > 0x1FE0u)
+                len = 0x1FE0u;
+            memset(s->rom_map + addr, 1, len);
+            printf("apple1: CFFA ROM %zu bytes @ 0x%04X <- %s\n",
+                   len, (unsigned)addr, cfg->roms[i].path);
+            gemu_monitor_register_rom(s->monitor, addr, (uint32_t)len, cfg->roms[i].path);
+            continue;
+        }
         if (region && region[0] && strcmp(region, "main") != 0) {
             printf("apple1: recognized auxiliary ROM %s (%s)\n",
                    cfg->roms[i].path, region);

@@ -6,5 +6,5 @@
     <rom name="apple-a3.3"  region="video-prom" addr="0x0200" sha256="4fe331a23805c21f0cb78701e1c7f94db56c207674daeb6487fa76ba97f6a78f"/>
     <rom name="apple-a4.4"  region="video-prom" addr="0x0300" sha256="97823e77042574e1ae0d9211e094444176a028e6fbcd83732a6ad998535d4acc"/>
     <rom name="s2513.d2"    region="chargen"    addr="0x0000" sha256="b0d8828d90f126edc08b1b251c955db832b8da68d2c202be588100ae87f691f1"/>
-    <rom name="cffaromv1.1.bin" region="cffa"   addr="0xE020" sha256="ada5c4c1a918b924a708eb1ac4ac726d3a712f395ff177a6945e1585b7b2dae8"/>
+    <rom name="cffaromv1.1.bin" region="cffa"   addr="0x9000" sha256="ada5c4c1a918b924a708eb1ac4ac726d3a712f395ff177a6945e1585b7b2dae8"/>
 </machine>
