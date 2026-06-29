@@ -142,13 +142,14 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             'cpu':    root.get('cpu',    ''),
             'vga':    root.get('vga',    ''),
             'soundhw': root.get('soundhw', ''),
+            'chargen': root.get('chargen', ''),
             'tv':     root.get('tv',     ''),
             'ram':    root.get('ram',    ''),
         })
         machine_family[name] = family
     machines.sort(key=lambda m: m['name'])
 
-    # Resolve alias inheritance: aliases inherit cpu/vga/soundhw from their canonical
+    # Resolve alias inheritance: aliases inherit cpu/vga/soundhw/chargen from their canonical
     # (but not tv — that is machine-specific) and fill in canonical name.
     name_to_m = {m['name']: m for m in machines}
     for m in machines:
@@ -157,6 +158,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             if not m['cpu'] and canon.get('cpu'): m['cpu'] = canon['cpu']
             if not m['vga'] and canon.get('vga'): m['vga'] = canon['vga']
             if not m['soundhw'] and canon.get('soundhw'): m['soundhw'] = canon['soundhw']
+            if not m['chargen'] and canon.get('chargen'): m['chargen'] = canon['chargen']
             m['canonical'] = m['alias']
         else:
             m['canonical'] = m['name']
@@ -181,7 +183,8 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         dlines.append(
             f'    {{ "{m["name"]}", "{m["canonical"]}", '
             f'{cstr(m["cpu"])}, {cstr(m["vga"])}, '
-            f'{cstr(m["soundhw"])}, "{tv}", {cstr(m["ram"])} }},\n'
+            f'{cstr(m["soundhw"])}, {cstr(m["chargen"])}, '
+            f'"{tv}", {cstr(m["ram"])} }},\n'
         )
     with open(os.path.join(gen_dir, 'machine_defaults.inc'), 'w', encoding='utf-8') as f:
         f.writelines(dlines)
@@ -245,6 +248,24 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     with open(os.path.join(gen_dir, 'soundhw.inc'), 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
+    # ── Parse character generator XMLs ───────────────────────────────────────
+    cg_lines = {fam: ['// Auto-generated from data/chargen/*.xml — do not edit\n']
+                for fam in active}
+    for path in _xml_files('data/chargen/*.xml'):
+        root = ET.parse(path).getroot()
+        name = root.get('name')
+        desc = root.get('description', '').replace('"', '\\"')
+        req  = root.get('requires', '')
+        if req and req not in active:
+            continue
+        families = [req] if req else list(active)
+        for fam in families:
+            if fam in cg_lines:
+                cg_lines[fam].append(f'    {{ "{name}", "{desc}" }},\n')
+    for fam, flines in cg_lines.items():
+        with open(os.path.join(gen_dir, f'chargens_{fam}.inc'), 'w', encoding='utf-8') as f:
+            f.writelines(flines)
+
     # ── Parse VGA XMLs ────────────────────────────────────────────────────────
     # Generates one include per family: vgas_mos.inc, vgas_rca.inc, etc.
     vga_lines = {fam: ['// Auto-generated from data/vga/*.xml — do not edit\n']
@@ -262,7 +283,8 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             f.writelines(flines)
 
     return _xml_files('data/machine/*.xml', 'data/device/*.xml',
-                      'data/soundhw/*.xml', 'data/vga/*.xml')
+                      'data/soundhw/*.xml', 'data/chargen/*.xml',
+                      'data/vga/*.xml')
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 

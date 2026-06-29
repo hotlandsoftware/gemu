@@ -15,6 +15,16 @@
 #define APPLE1_FPS     60u
 #define APPLE1_CPF     (APPLE1_HZ / APPLE1_FPS)
 
+#define A1_COLS        40
+#define A1_ROWS        24
+#define A1_CELL_W      7
+#define A1_CELL_H      8
+#define A1_SCALE       3
+#define A1_BORDER      14
+#define A1_WIN_W       (A1_COLS * A1_CELL_W * A1_SCALE + A1_BORDER * 2)
+#define A1_WIN_H       (A1_ROWS * A1_CELL_H * A1_SCALE + A1_BORDER * 2)
+#define A1_CHARGEN_SIZE 512u
+
 /*
  * Tiny GEMU boot monitor, used when no CPU-visible Apple I ROM is supplied.
  * It prints '\' and echoes keyboard input through the Apple I PIA addresses.
@@ -42,6 +52,233 @@ static const uint8_t apple1_boot_rom[0x100] = {
              0x00, 0xFF,          /* IRQ/BRK          */
 };
 
+struct Apple1Display {
+    SDL_Window   *window;
+    SDL_Renderer *renderer;
+    uint32_t      window_id;
+    uint8_t       screen[A1_ROWS][A1_COLS];
+    int           row;
+    int           col;
+    bool          dirty;
+    bool          quit;
+    uint8_t       kbuf[64];
+    int           khead;
+    int           ktail;
+    uint8_t       chargen[A1_CHARGEN_SIZE];
+    bool          have_chargen;
+    MosCharGenType cg;
+};
+
+static void apple1_display_kpush(Apple1Display *d, uint8_t ch) {
+    int n = (d->khead + 1) & 63;
+    if (n != d->ktail) {
+        d->kbuf[d->khead] = ch;
+        d->khead = n;
+    }
+}
+
+static bool apple1_display_key_available(Apple1Display *d) {
+    return d && d->khead != d->ktail;
+}
+
+static uint8_t apple1_display_read_key(Apple1Display *d) {
+    if (!apple1_display_key_available(d)) return 0;
+    uint8_t ch = d->kbuf[d->ktail];
+    d->ktail = (d->ktail + 1) & 63;
+    return ch;
+}
+
+static const uint8_t cm2140_fallback[A1_CHARGEN_SIZE] = {
+    /* @ */
+    0x00,0x0E,0x11,0x15,0x17,0x16,0x10,0x0F,
+    /* A-Z */
+    0x00,0x04,0x0A,0x11,0x11,0x1F,0x11,0x11, 0x00,0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E,
+    0x00,0x0E,0x11,0x10,0x10,0x10,0x11,0x0E, 0x00,0x1E,0x11,0x11,0x11,0x11,0x11,0x1E,
+    0x00,0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F, 0x00,0x1F,0x10,0x10,0x1E,0x10,0x10,0x10,
+    0x00,0x0F,0x10,0x10,0x10,0x13,0x11,0x0F, 0x00,0x11,0x11,0x11,0x1F,0x11,0x11,0x11,
+    0x00,0x0E,0x04,0x04,0x04,0x04,0x04,0x0E, 0x00,0x01,0x01,0x01,0x01,0x01,0x11,0x0E,
+    0x00,0x11,0x12,0x14,0x18,0x14,0x12,0x11, 0x00,0x10,0x10,0x10,0x10,0x10,0x10,0x1F,
+    0x00,0x11,0x1B,0x15,0x15,0x11,0x11,0x11, 0x00,0x11,0x11,0x19,0x15,0x13,0x11,0x11,
+    0x00,0x0E,0x11,0x11,0x11,0x11,0x11,0x0E, 0x00,0x1E,0x11,0x11,0x1E,0x10,0x10,0x10,
+    0x00,0x0E,0x11,0x11,0x11,0x15,0x12,0x0D, 0x00,0x1E,0x11,0x11,0x1E,0x14,0x12,0x11,
+    0x00,0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E, 0x00,0x1F,0x04,0x04,0x04,0x04,0x04,0x04,
+    0x00,0x11,0x11,0x11,0x11,0x11,0x11,0x0E, 0x00,0x11,0x11,0x11,0x11,0x0A,0x0A,0x04,
+    0x00,0x11,0x11,0x11,0x15,0x15,0x1B,0x11, 0x00,0x11,0x11,0x0A,0x04,0x0A,0x11,0x11,
+    0x00,0x11,0x11,0x0A,0x04,0x04,0x04,0x04, 0x00,0x1F,0x01,0x02,0x04,0x08,0x10,0x1F,
+    /* [ \ ] ^ _ */
+    0x00,0x0E,0x08,0x08,0x08,0x08,0x08,0x0E, 0x00,0x10,0x08,0x04,0x02,0x01,0x00,0x00,
+    0x00,0x0E,0x02,0x02,0x02,0x02,0x02,0x0E, 0x00,0x04,0x0A,0x11,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x1F,
+    /* space ! " # $ % & ' */
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x04,0x04,0x04,0x04,0x00,0x04,0x00,
+    0x00,0x0A,0x0A,0x00,0x00,0x00,0x00,0x00, 0x00,0x0A,0x0A,0x1F,0x0A,0x1F,0x0A,0x0A,
+    0x00,0x04,0x0F,0x14,0x0E,0x05,0x1E,0x04, 0x00,0x18,0x19,0x02,0x04,0x08,0x13,0x03,
+    0x00,0x0C,0x12,0x14,0x08,0x15,0x12,0x0D, 0x00,0x04,0x04,0x00,0x00,0x00,0x00,0x00,
+    /* ( ) * + , - . / */
+    0x00,0x02,0x04,0x08,0x08,0x08,0x04,0x02, 0x00,0x08,0x04,0x02,0x02,0x02,0x04,0x08,
+    0x00,0x00,0x04,0x15,0x0E,0x15,0x04,0x00, 0x00,0x00,0x04,0x04,0x1F,0x04,0x04,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x04,0x04,0x08, 0x00,0x00,0x00,0x00,0x1F,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x04,0x00, 0x00,0x01,0x02,0x04,0x08,0x10,0x00,0x00,
+    /* 0-9 : ; < = > ? */
+    0x00,0x0E,0x11,0x13,0x15,0x19,0x11,0x0E, 0x00,0x04,0x0C,0x04,0x04,0x04,0x04,0x0E,
+    0x00,0x0E,0x11,0x01,0x02,0x04,0x08,0x1F, 0x00,0x1F,0x02,0x04,0x02,0x01,0x11,0x0E,
+    0x00,0x02,0x06,0x0A,0x12,0x1F,0x02,0x02, 0x00,0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E,
+    0x00,0x06,0x08,0x10,0x1E,0x11,0x11,0x0E, 0x00,0x1F,0x01,0x02,0x04,0x08,0x08,0x08,
+    0x00,0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E, 0x00,0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C,
+    0x00,0x00,0x04,0x00,0x00,0x04,0x00,0x00, 0x00,0x00,0x04,0x00,0x00,0x04,0x04,0x08,
+    0x00,0x02,0x04,0x08,0x10,0x08,0x04,0x02, 0x00,0x00,0x00,0x1F,0x00,0x1F,0x00,0x00,
+    0x00,0x08,0x04,0x02,0x01,0x02,0x04,0x08, 0x00,0x0E,0x11,0x01,0x02,0x04,0x00,0x04,
+};
+
+static uint32_t apple1_renderer_flags(GemuRendererType renderer) {
+    switch (renderer) {
+    case GEMU_RENDERER_SOFTWARE: return SDL_RENDERER_SOFTWARE;
+    case GEMU_RENDERER_ACCELERATED: return SDL_RENDERER_ACCELERATED;
+    case GEMU_RENDERER_AUTO:
+    default: return SDL_RENDERER_ACCELERATED;
+    }
+}
+
+static void apple1_display_render(Apple1Display *d) {
+    if (!d || !d->renderer || !d->dirty) return;
+    SDL_SetRenderDrawColor(d->renderer, 0, 0, 0, 255);
+    SDL_RenderClear(d->renderer);
+    SDL_SetRenderDrawColor(d->renderer, 255, 255, 255, 255);
+
+    const uint8_t *font = (d->cg == MOS_CG_CM2140 && d->have_chargen)
+                        ? d->chargen : cm2140_fallback;
+    for (int row = 0; row < A1_ROWS; row++) {
+        for (int col = 0; col < A1_COLS; col++) {
+            uint8_t ch = d->screen[row][col] & 0x7Fu;
+            int idx = -1;
+            if (ch >= '@' && ch <= '_') idx = ch - '@';
+            else if (ch >= ' ' && ch <= '?') idx = 32 + (ch - ' ');
+            if (idx < 0) continue;
+            const uint8_t *glyph = &font[idx * 8];
+            int x0 = A1_BORDER + col * A1_CELL_W * A1_SCALE;
+            int y0 = A1_BORDER + row * A1_CELL_H * A1_SCALE;
+            for (int gy = 0; gy < 8; gy++) {
+                uint8_t bits = glyph[gy];
+                for (int gx = 0; gx < 5; gx++) {
+                    if (!(bits & (uint8_t)(0x10u >> gx))) continue;
+                    SDL_Rect r = {
+                        x0 + gx * A1_SCALE,
+                        y0 + gy * A1_SCALE,
+                        A1_SCALE,
+                        A1_SCALE
+                    };
+                    SDL_RenderFillRect(d->renderer, &r);
+                }
+            }
+        }
+    }
+    SDL_RenderPresent(d->renderer);
+    d->dirty = false;
+}
+
+static Apple1Display *apple1_display_create(const MosConfig *cfg) {
+    if (cfg->display_type == GEMU_DISPLAY_NONE)
+        return NULL;
+    if (!(SDL_WasInit(SDL_INIT_VIDEO) & SDL_INIT_VIDEO) &&
+        SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
+        fprintf(stderr, "apple1: SDL video init failed: %s\n", SDL_GetError());
+        return NULL;
+    }
+
+    Apple1Display *d = calloc(1, sizeof(*d));
+    if (!d) return NULL;
+    d->cg = cfg->char_gen;
+    if (d->cg == MOS_CG_AUTO)
+        d->cg = MOS_CG_CM2140_COMPAT;
+    memset(d->screen, ' ', sizeof(d->screen));
+    d->dirty = true;
+
+    d->window = SDL_CreateWindow("GEMU (Apple I)",
+        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+        A1_WIN_W, A1_WIN_H, SDL_WINDOW_SHOWN);
+    if (!d->window) {
+        fprintf(stderr, "apple1: SDL_CreateWindow failed: %s\n", SDL_GetError());
+        free(d);
+        return NULL;
+    }
+    d->window_id = SDL_GetWindowID(d->window);
+    d->renderer = SDL_CreateRenderer(d->window, -1,
+                                     apple1_renderer_flags(cfg->display_renderer));
+    if (!d->renderer)
+        d->renderer = SDL_CreateRenderer(d->window, -1, SDL_RENDERER_SOFTWARE);
+    if (!d->renderer) {
+        fprintf(stderr, "apple1: SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(d->window);
+        free(d);
+        return NULL;
+    }
+    SDL_StartTextInput();
+    apple1_display_render(d);
+    return d;
+}
+
+static void apple1_display_destroy(Apple1Display *d) {
+    if (!d) return;
+    SDL_StopTextInput();
+    if (d->renderer) SDL_DestroyRenderer(d->renderer);
+    if (d->window) SDL_DestroyWindow(d->window);
+    free(d);
+}
+
+static void apple1_display_scroll(Apple1Display *d) {
+    memmove(d->screen[0], d->screen[1], (A1_ROWS - 1) * A1_COLS);
+    memset(d->screen[A1_ROWS - 1], ' ', A1_COLS);
+    d->row = A1_ROWS - 1;
+    d->dirty = true;
+}
+
+static void apple1_display_putc(Apple1Display *d, uint8_t ch) {
+    if (!d) return;
+    ch &= 0x7Fu;
+    if (ch == '\n') return;
+    if (ch == '\r') {
+        d->col = 0;
+        d->row++;
+        if (d->row >= A1_ROWS) apple1_display_scroll(d);
+        d->dirty = true;
+        return;
+    }
+    if (ch >= 'a' && ch <= 'z') ch = (uint8_t)toupper(ch);
+    if (ch < ' ' || ch > '_') ch = ' ';
+    d->screen[d->row][d->col] = ch;
+    d->dirty = true;
+    d->col++;
+    if (d->col >= A1_COLS) {
+        d->col = 0;
+        d->row++;
+        if (d->row >= A1_ROWS) apple1_display_scroll(d);
+    }
+}
+
+static void apple1_display_poll(Apple1Display *d) {
+    if (!d) return;
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_QUIT) {
+            d->quit = true;
+        } else if (ev.type == SDL_WINDOWEVENT &&
+                   ev.window.windowID == d->window_id &&
+                   ev.window.event == SDL_WINDOWEVENT_CLOSE) {
+            d->quit = true;
+        } else if (ev.type == SDL_TEXTINPUT) {
+            for (int i = 0; ev.text.text[i]; i++)
+                apple1_display_kpush(d, (uint8_t)ev.text.text[i]);
+        } else if (ev.type == SDL_KEYDOWN) {
+            if (ev.key.keysym.sym == SDLK_RETURN)
+                apple1_display_kpush(d, '\r');
+            else if (ev.key.keysym.sym == SDLK_BACKSPACE ||
+                     ev.key.keysym.sym == SDLK_DELETE)
+                apple1_display_kpush(d, 0x7F);
+        }
+    }
+    apple1_display_render(d);
+}
+
 static uint8_t apple1_normalize_key(uint8_t ch) {
     if (ch == '\n') ch = '\r';
     if (ch >= 'a' && ch <= 'z') ch = (uint8_t)toupper(ch);
@@ -49,6 +286,15 @@ static uint8_t apple1_normalize_key(uint8_t ch) {
 }
 
 static void apple1_poll_keyboard(Apple1State *s) {
+    if (s->display) {
+        apple1_display_poll(s->display);
+        if (!s->key_ready && apple1_display_key_available(s->display)) {
+            s->key_data = apple1_normalize_key(apple1_display_read_key(s->display));
+            s->key_ready = true;
+        }
+        return;
+    }
+
     GemuSerial *ser = s->cfg->serial;
     if (!ser) return;
     ser->poll(ser->ud);
@@ -59,6 +305,11 @@ static void apple1_poll_keyboard(Apple1State *s) {
 }
 
 static void apple1_write_display(Apple1State *s, uint8_t val) {
+    if (s->display) {
+        apple1_display_putc(s->display, val);
+        return;
+    }
+
     GemuSerial *ser = s->cfg->serial;
     val &= 0x7Fu;
     if (val == '\r') {
@@ -113,6 +364,31 @@ static void apple1_write(uint16_t addr, uint8_t val, void *ud) {
 static bool apple1_load_roms(Apple1State *s, const MosConfig *cfg) {
     for (int i = 0; i < cfg->n_roms; i++) {
         const char *region = cfg->roms[i].region;
+        if (region && strcmp(region, "chargen") == 0) {
+            FILE *f = fopen(cfg->roms[i].path, "rb");
+            if (!f) {
+                fprintf(stderr, "apple1: failed to open chargen '%s'\n", cfg->roms[i].path);
+                return false;
+            }
+            uint8_t buf[A1_CHARGEN_SIZE];
+            size_t n = fread(buf, 1, sizeof(buf), f);
+            fclose(f);
+            if (n != sizeof(buf)) {
+                fprintf(stderr, "apple1: chargen '%s' is %zu bytes, expected %u\n",
+                        cfg->roms[i].path, n, (unsigned)A1_CHARGEN_SIZE);
+                return false;
+            }
+            if (s->display) {
+                memcpy(s->display->chargen, buf, sizeof(buf));
+                s->display->have_chargen = true;
+                if (s->display->cg == MOS_CG_CM2140_COMPAT && cfg->char_gen == MOS_CG_AUTO)
+                    s->display->cg = MOS_CG_CM2140;
+                s->display->dirty = true;
+            }
+            printf("apple1: loaded Signetics 2513 chargen <- %s\n",
+                   cfg->roms[i].path);
+            continue;
+        }
         if (region && region[0] && strcmp(region, "main") != 0) {
             printf("apple1: recognized auxiliary ROM %s (%s)\n",
                    cfg->roms[i].path, region);
@@ -145,6 +421,10 @@ Apple1State *apple1_create(const MosConfig *cfg) {
         return NULL;
     }
 
+    s->display = apple1_display_create(cfg);
+    if (cfg->display_type != GEMU_DISPLAY_NONE && !s->display)
+        fprintf(stderr, "apple1: display unavailable, falling back to stdio\n");
+
     memcpy(&s->mem[APPLE1_ROM], apple1_boot_rom, sizeof(apple1_boot_rom));
     memset(&s->rom_map[APPLE1_ROM], 1, sizeof(apple1_boot_rom));
     gemu_monitor_register_rom(s->monitor, APPLE1_ROM,
@@ -154,6 +434,8 @@ Apple1State *apple1_create(const MosConfig *cfg) {
         apple1_destroy(s);
         return NULL;
     }
+    if (s->display && cfg->char_gen == MOS_CG_CM2140 && !s->display->have_chargen)
+        fprintf(stderr, "apple1: -cg cm2140 requested but no chargen ROM was loaded; using built-in cm2140-compat fallback\n");
 
     mos6502_init(&s->cpu);
     s->cpu.mem_read = apple1_read;
@@ -170,6 +452,7 @@ Apple1State *apple1_create(const MosConfig *cfg) {
 void apple1_destroy(Apple1State *s) {
     if (!s) return;
     gemu_monitor_destroy(s->monitor);
+    apple1_display_destroy(s->display);
     free(s);
 }
 
@@ -181,12 +464,9 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
     while (!quit) {
         Uint32 t0 = SDL_GetTicks();
         GemuSerial *ser = s->cfg->serial;
-
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) quit = true;
-        }
         if (ser && ser->should_quit(ser->ud))
+            quit = true;
+        if (s->display && s->display->quit)
             quit = true;
 
         apple1_poll_keyboard(s);

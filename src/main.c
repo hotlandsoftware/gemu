@@ -105,6 +105,7 @@ static void print_usage(const char *prog) {
 
     fprintf(f, "Machine options:\n");
     OPT("-m SIZE",            "RAM size — plain number = KB, or suffix K/M (e.g. 32K, 1M)");
+    OPT("-cg NAME",           "Character generator, if selectable (use -cg ? to list)");
     OPT("-device NAME",       "Attach a device (use -device ? to list all)");
     OPT("-soundhw NAME",      "Sound hardware (use -soundhw ? to list all)");
     OPT("-renderer MODE",     "SDL renderer: auto | software | accelerated");

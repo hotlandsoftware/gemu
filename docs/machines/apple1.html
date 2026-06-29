@@ -87,11 +87,12 @@
         </aside>
         <div>
             <p class="description">The Apple I was, as its name suggests, the first computer ever developed by Apple. It was released in 1976 at $666.66 (~$3774 in 2026) and was built around a MOS 6502 and a simple keyboard/display interface. It can also be modified to run with a Motorola 6800 (not currently supported by GEMU.)<br><br>
-            The ROM database recognizes the video PROMs, character generator, and CFFA ROM files in a ROM directory. Full shift-register video hardware and stock WozMon ROM loading are still early work.</p>
+            The ROM database recognizes the video PROMs, character generator, and CFFA ROM files in a ROM directory. The display renders a 40×24 text screen with 7×8 character cells. If the Signetics 2513 CM2140 character generator ROM is loaded, GEMU renders from it directly; otherwise it falls back to built-in CM2140-compatible glyphs. Full shift-register video hardware and stock WozMon ROM loading are still early work.</p>
 
             <div class="section-title">Run</div>
             <div class="run-block">./bin/gemu -M apple1
 ./bin/gemu -M apple1 -rom roms/apple1
+./bin/gemu -M apple1 -rom roms/apple1 -cg cm2140
 ./bin/gemu -M apple1 -display none</div>
         </div>
     </div>

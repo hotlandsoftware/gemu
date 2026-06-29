@@ -42,6 +42,12 @@ typedef enum {
     NES_DEVICE_FC2_MIC,     /* Famicom Controller 2 with built-in microphone */
 } NesDeviceType;
 
+typedef enum {
+    MOS_CG_AUTO,
+    MOS_CG_CM2140,
+    MOS_CG_CM2140_COMPAT,
+} MosCharGenType;
+
 #define NES_PORTS 2
 
 #define MOS_MAX_ROM_LOADS 8
@@ -69,6 +75,8 @@ typedef struct MosConfig {
     const char     *fda_path;    /* FDS disk image path (NULL = no disk)    */
     MosSoundType    sound;
     bool            sound_explicit; /* user passed -soundhw; skip auto-default */
+    MosCharGenType  char_gen;
+    bool            char_gen_explicit;
     NesDeviceType   ports[NES_PORTS]; /* devices on controller ports 1–2 */
     int             n_ports;          /* how many ports were explicitly assigned */
     bool            ppu_debug;

@@ -36,13 +36,14 @@ typedef struct {
     const char *cpu;
     const char *vga;
     const char *soundhw;
+    const char *chargen;
     const char *tv;
     const char *ram;
 } MachineDef;
 
 static const MachineDef machine_defs[] = {
 #include "generated/machine_defaults.inc"
-    { NULL, NULL, NULL, NULL, NULL, NULL, NULL }
+    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
 /* ── Device registry ─────────────────────────────────────────────────────── */

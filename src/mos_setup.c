@@ -21,13 +21,14 @@ typedef struct {
     const char *cpu;
     const char *vga;
     const char *soundhw;
+    const char *chargen;
     const char *tv;
     const char *ram;
 } MachineDef;
 
 static const MachineDef machine_defs[] = {
 #include "generated/machine_defaults.inc"
-    { NULL, NULL, NULL, NULL, NULL, NULL, NULL }
+    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
 /* ── Device registry ─────────────────────────────────────────────────────── */
@@ -51,6 +52,9 @@ static const GemuDevDesc cpus[] = {
 };
 static const GemuDevDesc vgas[] = {
 #include "generated/vgas_mos.inc"
+};
+static const GemuDevDesc chargens[] = {
+#include "generated/chargens_mos.inc"
 };
 
 static const GemuArgsDef def = {
@@ -78,6 +82,8 @@ static const GemuArgsDef def = {
         "  -cartridge FILE    Insert a cartridge\n"
         "  -fda FILE          Insert a floppy disk image\n"
         "  -tape FILE         Insert a casette tape\n"
+        "  -cg NAME           Character generator\n"
+        "  -vga NAME          Graphics card\n"
         "  -renderer MODE     Set SDL renderer: auto | software | accelerated (default: auto)\n"
         "  -soundhw CHIP      Insert a sound card"
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
@@ -140,6 +146,23 @@ static bool parse_cpu(const char *name, MosCpuType *out) {
     }
     if (strcmp(name, "2a07") == 0) {
         *out = MOS_CPU_2A07;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_cg(const char *name, MosCharGenType *out) {
+    if (strcmp(name, "auto") == 0) {
+        *out = MOS_CG_AUTO;
+        return true;
+    }
+    if (strcmp(name, "cm2140") == 0 || strcmp(name, "s2513") == 0 ||
+        strcmp(name, "signetics2513") == 0) {
+        *out = MOS_CG_CM2140;
+        return true;
+    }
+    if (strcmp(name, "cm2140-compat") == 0) {
+        *out = MOS_CG_CM2140_COMPAT;
         return true;
     }
     return false;
@@ -240,6 +263,11 @@ int mos_setup(int argc, char *argv[]) {
                         md->name, md->soundhw);
                 return 1;
             }
+            if (md->chargen && !parse_cg(md->chargen, &cfg.char_gen)) {
+                fprintf(stderr, "gemu: machine '%s' has unknown default chargen '%s'\n",
+                        md->name, md->chargen);
+                return 1;
+            }
             break;
         }
     }
@@ -291,6 +319,25 @@ int mos_setup(int argc, char *argv[]) {
         } else if (strcmp(rem[i], "-tape") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -tape requires an argument\n"); return 1; }
             cfg.tape_path = rem[++i];
+        } else if (strcmp(rem[i], "-cg") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cg requires an argument\n"); return 1; }
+            const char *name = rem[++i];
+            if (strcmp(name, "?") == 0) {
+                printf("Available character generators:\n");
+                int maxw = 0;
+                for (int c = 0; c < (int)GEMU_ARRAY_LEN(chargens); c++) {
+                    int w = (int)strlen(chargens[c].name);
+                    if (w > maxw) maxw = w;
+                }
+                for (int c = 0; c < (int)GEMU_ARRAY_LEN(chargens); c++)
+                    printf("  %-*s  %s\n", maxw, chargens[c].name, chargens[c].desc);
+                SDL_Quit(); return 0;
+            }
+            if (!parse_cg(name, &cfg.char_gen)) {
+                fprintf(stderr, "gemu: unknown -cg '%s' (use -cg ? to list)\n", name);
+                return 1;
+            }
+            cfg.char_gen_explicit = true;
         } else if (strcmp(rem[i], "-renderer") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -renderer requires an argument\n"); return 1; }
             const char *mode = rem[++i];
@@ -446,10 +493,6 @@ int mos_setup(int argc, char *argv[]) {
         return 1;
     }
 
-    if (cfg.machine == MOS_MACHINE_APPLE1 &&
-        cfg.display_type != GEMU_DISPLAY_NONE && !want_vt100)
-        want_vt100 = true;
-
     if (cfg.want_wozmon) {
         if (!cfg.has_start_addr) {
             cfg.start_addr     = 0x1AA0u;
@@ -462,7 +505,7 @@ int mos_setup(int argc, char *argv[]) {
     Vt100State *vt100 = NULL;
     GemuSerial  vt100_serial;
     if (want_vt100) {
-        const char *vt_title = cfg.machine == MOS_MACHINE_APPLE1 ? "GEMU (Apple I)"
+        const char *vt_title = cfg.machine == MOS_MACHINE_APPLE1 ? "GEMU"
                              : cfg.want_wozmon ? "GEMU (Wozniak Monitor)"
                              : NULL;
         vt100 = vt100_create(cfg.display_type, vt_title);

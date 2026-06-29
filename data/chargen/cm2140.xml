@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<chargen name="cm2140" description="Signetics 2513 CM2140 character generator" requires="mos">
+    <machine name="apple1"/>
+</chargen>
