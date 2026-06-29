@@ -276,6 +276,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
             } else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
         }
         if (quit) break;
+        gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));
 
         if (gemu_monitor_is_paused(s->monitor)) {
             chip8_sleep_frame();

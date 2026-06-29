@@ -2,6 +2,7 @@
 #include "gemu/video.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_syswm.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
@@ -400,6 +401,12 @@ static void sdl_do_reset_input_bindings(GemuDisplay *d) {
     build_bindings(b);
 }
 
+static void sdl_do_set_title(GemuDisplay *d, const char *title) {
+    SdlBackend *b = d->backend;
+    SDL_Window *win = b && b->video ? gemu_video_sdl_get_window(b->video) : NULL;
+    if (win) SDL_SetWindowTitle(win, title ? title : "GEMU");
+}
+
 static void sdl_do_destroy(GemuDisplay *d) {
     SdlBackend *b = d->backend;
     if (!b) return;
@@ -499,7 +506,9 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     d->do_is_key_held = sdl_do_is_key_held;
     d->do_open_rebind = sdl_do_open_rebind;
     d->do_reset_input_bindings = sdl_do_reset_input_bindings;
+    d->do_set_title   = sdl_do_set_title;
     d->do_destroy     = sdl_do_destroy;
+    snprintf(d->title, sizeof(d->title), "%s", cfg->title ? cfg->title : "GEMU");
     d->pointer.x = d->pointer.y = -1;
 
 #ifdef _WIN32

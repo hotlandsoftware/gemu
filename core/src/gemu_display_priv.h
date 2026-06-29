@@ -21,6 +21,8 @@ struct GemuDisplay {
     /* Lifecycle flags */
     bool quit;
     bool reset;
+    bool paused_title;
+    char title[128];
 
     /* Backend vtable */
     void     (*do_render)     (struct GemuDisplay *, const uint32_t *, int, int);
@@ -28,6 +30,7 @@ struct GemuDisplay {
     bool     (*do_is_key_held)(struct GemuDisplay *, const char *);
     void     (*do_open_rebind)(struct GemuDisplay *);
     void     (*do_reset_input_bindings)(struct GemuDisplay *);
+    void     (*do_set_title)   (struct GemuDisplay *, const char *);
     void     (*do_destroy)    (struct GemuDisplay *);
     void      *backend;
 };

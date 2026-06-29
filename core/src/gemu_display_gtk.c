@@ -3,6 +3,7 @@
 #include "gemu/video.h"
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -209,6 +210,12 @@ static void gtk_do_destroy(GemuDisplay *d) {
     d->backend = NULL;
 }
 
+static void gtk_do_set_title(GemuDisplay *d, const char *title) {
+    GtkBackend *b = d->backend;
+    GtkWidget *win = b && b->video ? gemu_video_gtk_window(b->video) : NULL;
+    if (win) gtk_window_set_title(GTK_WINDOW(win), title ? title : "GEMU");
+}
+
 /* ── Create ──────────────────────────────────────────────────────────────── */
 
 GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
@@ -245,7 +252,9 @@ GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
     d->backend   = b;
     d->do_render = gtk_do_render;
     d->do_poll   = gtk_do_poll;
+    d->do_set_title = gtk_do_set_title;
     d->do_destroy = gtk_do_destroy;
+    snprintf(d->title, sizeof(d->title), "%s", cfg->title ? cfg->title : "GEMU");
     d->pointer.x = d->pointer.y = -1;
     b->parent = d;
 

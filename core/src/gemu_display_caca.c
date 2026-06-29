@@ -1,6 +1,7 @@
 #ifdef HAVE_CACA
 #include "gemu_display_priv.h"
 #include <caca.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -162,6 +163,12 @@ static void caca_do_destroy(GemuDisplay *d) {
     d->backend = NULL;
 }
 
+static void caca_do_set_title(GemuDisplay *d, const char *title) {
+    CacaBackend *b = d->backend;
+    if (b && b->dp)
+        caca_set_display_title(b->dp, title ? title : "GEMU");
+}
+
 /* ── Create ──────────────────────────────────────────────────────────────── */
 
 GemuDisplay *gemu_display_caca_create(const GemuDisplayConfig *cfg) {
@@ -195,7 +202,9 @@ GemuDisplay *gemu_display_caca_create(const GemuDisplayConfig *cfg) {
     d->backend   = b;
     d->do_render = caca_do_render;
     d->do_poll   = caca_do_poll;
+    d->do_set_title = caca_do_set_title;
     d->do_destroy = caca_do_destroy;
+    snprintf(d->title, sizeof(d->title), "%s", cfg->title ? cfg->title : "GEMU");
     d->pointer.x = d->pointer.y = -1;
     return d;
 }

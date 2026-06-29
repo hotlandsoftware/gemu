@@ -2488,6 +2488,8 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             }
         }
         if (quit) break;
+        if (s->display)
+            gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
 
         /* Input: display action bits + VNC events */
         nes_handle_keys(s, held);

@@ -94,6 +94,16 @@ void gemu_display_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
     if (d && argb) d->do_render(d, argb, w, h);
 }
 
+void gemu_display_set_paused(GemuDisplay *d, bool paused) {
+    if (!d || !d->do_set_title || d->paused_title == paused) return;
+    char title[160];
+    snprintf(title, sizeof(title), "%s%s",
+             d->title[0] ? d->title : "GEMU",
+             paused ? " [Paused]" : "");
+    d->do_set_title(d, title);
+    d->paused_title = paused;
+}
+
 uint32_t gemu_display_poll(GemuDisplay *d) {
     if (!d) return 0;
     d->held_prev   = d->held;

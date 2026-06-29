@@ -1518,6 +1518,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
             else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
         }
         if (quit) break;
+        gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             uint64_t target = s->cpu.cycle_count + KIM1_CYCLES_PER_FRAME;

@@ -597,6 +597,7 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
                 gemu_monitor_unknown_command(s->monitor);
         }
         if (quit) break;
+        gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));
 
         if (gemu_monitor_is_paused(s->monitor)) { vip_sleep_ms(frame_ms); continue; }
 

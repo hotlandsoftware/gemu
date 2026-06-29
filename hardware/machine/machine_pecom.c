@@ -512,6 +512,7 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
             else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
         }
         if (quit) break;
+        gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             for (unsigned i = 0; i < PECOM32_MCYCLES_PER_FRAME; i++) {

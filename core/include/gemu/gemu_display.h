@@ -116,6 +116,7 @@ void         gemu_display_destroy(GemuDisplay *d);
  * parameters to support machines that switch resolution mid-run (e.g. SCHIP).
  */
 void gemu_display_render(GemuDisplay *d, const uint32_t *argb, int w, int h);
+void gemu_display_set_paused(GemuDisplay *d, bool paused);
 
 /*
  * Drain the backend's event queue (non-blocking).  Must be called once per

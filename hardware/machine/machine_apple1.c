@@ -40,6 +40,7 @@ struct Apple1Display {
     int           col;
     bool          dirty;
     bool          cursor_phase;
+    bool          title_paused;
     bool          quit;
     uint8_t       kbuf[64];
     int           khead;
@@ -132,9 +133,16 @@ static int apple1_glyph_index(uint8_t ch) {
     return -1;
 }
 
-static void apple1_display_render(Apple1Display *d) {
+static void apple1_display_set_paused(Apple1Display *d, bool paused) {
+    if (!d || !d->window || d->title_paused == paused) return;
+    SDL_SetWindowTitle(d->window, paused ? "GEMU [Paused]" : "GEMU");
+    d->title_paused = paused;
+}
+
+static void apple1_display_render(Apple1Display *d, bool paused) {
     if (!d || !d->renderer) return;
-    bool cursor_phase = ((SDL_GetTicks() / 500u) & 1u) != 0;
+    bool cursor_phase = paused ? d->cursor_phase
+                               : ((SDL_GetTicks() / 500u) & 1u) != 0;
     if (!d->dirty && d->cursor_phase == cursor_phase) return;
     d->cursor_phase = cursor_phase;
 
@@ -211,8 +219,17 @@ static Apple1Display *apple1_display_create(const MosConfig *cfg) {
         return d;
     }
     SDL_StartTextInput();
-    apple1_display_render(d);
+    apple1_display_render(d, false);
     return d;
+}
+
+static void apple1_display_clear(Apple1Display *d) {
+    if (!d) return;
+    memset(d->screen, ' ', sizeof(d->screen));
+    d->row = 0;
+    d->col = 0;
+    d->khead = d->ktail = 0;
+    d->dirty = true;
 }
 
 static void apple1_display_destroy(Apple1Display *d) {
@@ -274,7 +291,7 @@ static void apple1_display_poll(Apple1Display *d) {
                 apple1_display_kpush(d, 0x7F);
         }
     }
-    apple1_display_render(d);
+    apple1_display_render(d, false);
 }
 
 static uint8_t apple1_normalize_key(uint8_t ch) {
@@ -329,13 +346,14 @@ static void apple1_poll_input_devices(Apple1State *s) {
     if (ser) ser->poll(ser->ud);
 }
 
-static void apple1_update_vnc(Apple1State *s) {
+static void apple1_update_vnc(Apple1State *s, bool paused) {
     if (!s || !s->vnc || !s->display || !s->vnc_fb)
         return;
 
     memset(s->vnc_fb, 0, (size_t)A1_FB_W * A1_FB_H);
     const uint8_t *font = apple1_display_font(s->display);
-    bool cursor_phase = ((SDL_GetTicks() / 500u) & 1u) != 0;
+    bool cursor_phase = paused ? s->display->cursor_phase
+                               : ((SDL_GetTicks() / 500u) & 1u) != 0;
     for (int row = 0; row < A1_ROWS; row++) {
         for (int col = 0; col < A1_COLS; col++) {
             uint8_t ch = s->display->screen[row][col];
@@ -705,9 +723,10 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     mos6502_reset(&s->cpu);
     if (cfg->has_start_addr)
         s->cpu.PC = cfg->start_addr;
+    apple1_display_clear(s->display);
     if (s->native_monitor)
         apple1_monitor_prompt(s);
-    apple1_update_vnc(s);
+    apple1_update_vnc(s, false);
 
     return s;
 }
@@ -745,6 +764,7 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
                 mos6502_reset(&s->cpu);
                 s->native_monitor = !s->have_monitor_rom;
                 s->quit_requested = false;
+                apple1_display_clear(s->display);
                 if (s->native_monitor)
                     apple1_monitor_prompt(s);
             } else if (cmd == GEMU_MON_CUSTOM) {
@@ -752,15 +772,13 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
             }
         }
 
+        bool paused = gemu_monitor_is_paused(s->monitor);
+        apple1_display_set_paused(s->display, paused);
+
         if (s->native_monitor) {
-            if (gemu_monitor_is_paused(s->monitor)) {
-                Uint32 dt = SDL_GetTicks() - t0;
-                Uint32 frame_ms = 1000u / APPLE1_FPS;
-                if (dt < frame_ms) SDL_Delay(frame_ms - dt);
-                continue;
-            }
-            apple1_monitor_poll(s);
-        } else if (!gemu_monitor_is_paused(s->monitor)) {
+            if (!paused)
+                apple1_monitor_poll(s);
+        } else if (!paused) {
             apple1_poll_keyboard(s);
             uint64_t target = s->cpu.cycle_count + APPLE1_CPF;
             while (!quit && s->cpu.cycle_count < target) {
@@ -768,8 +786,8 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
                 mos6502_step(&s->cpu);
             }
         }
-        apple1_display_render(s->display);
-        apple1_update_vnc(s);
+        apple1_display_render(s->display, paused);
+        apple1_update_vnc(s, paused);
 
         Uint32 dt = SDL_GetTicks() - t0;
         Uint32 frame_ms = 1000u / APPLE1_FPS;

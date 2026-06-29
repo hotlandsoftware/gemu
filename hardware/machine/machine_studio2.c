@@ -445,6 +445,7 @@ void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
         if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
 
         if (reset) { rca_studio2_reset(s, cfg); continue; }
+        gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             for (unsigned i = 0; i < mcycles_per_frame; i++) {

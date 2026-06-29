@@ -607,6 +607,7 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
             }
         }
         if (quit) break;
+        gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             for (unsigned i = 0; i < DESTROYER_MCYCLES_PER_FRAME; i++) {
