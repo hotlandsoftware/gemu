@@ -13,6 +13,8 @@
 #  include <ws2tcpip.h>
 #  define isatty(fd)   _isatty(fd)
 #  define STDIN_FILENO 0
+#  define STDOUT_FILENO 1
+#  define STDERR_FILENO 2
 #  define strcasecmp   _stricmp
 #  define strncasecmp  _strnicmp
 typedef SOCKET sock_t;
@@ -71,6 +73,7 @@ typedef enum {
     MON_BACKEND_NONE,
     MON_BACKEND_TELNET,
     MON_BACKEND_GMP,
+    MON_BACKEND_GMP_STDIO,
 } MonBackend;
 
 struct GemuMonitor {
@@ -105,12 +108,39 @@ struct GemuMonitor {
 };
 
 static char default_monitor_spec[256] = "stdio";
+static FILE *qmp_stdio_out;
+static bool  qmp_stdio_redirected;
 
 /* ── Transport helpers ───────────────────────────────────────────────────── */
 
 void gemu_monitor_set_default(const char *spec) {
     snprintf(default_monitor_spec, sizeof(default_monitor_spec), "%s",
              (spec && spec[0]) ? spec : "stdio");
+
+    if (strcasecmp(default_monitor_spec, "gmp-stdio") == 0 &&
+        !qmp_stdio_redirected) {
+        fflush(stdout);
+#ifdef _WIN32
+        int qmp_fd = _dup(_fileno(stdout));
+        if (qmp_fd >= 0) {
+            qmp_stdio_out = _fdopen(qmp_fd, "w");
+            if (qmp_stdio_out)
+                setvbuf(qmp_stdio_out, NULL, _IONBF, 0);
+            _dup2(_fileno(stderr), _fileno(stdout));
+            setvbuf(stdout, NULL, _IONBF, 0);
+        }
+#else
+        int qmp_fd = dup(fileno(stdout));
+        if (qmp_fd >= 0) {
+            qmp_stdio_out = fdopen(qmp_fd, "w");
+            if (qmp_stdio_out)
+                setvbuf(qmp_stdio_out, NULL, _IONBF, 0);
+            freopen("/dev/stderr", "w", stdout);
+            setvbuf(stdout, NULL, _IONBF, 0);
+        }
+#endif
+        qmp_stdio_redirected = true;
+    }
 }
 
 static bool sendall(sock_t fd, const void *buf, size_t n) {
@@ -154,6 +184,10 @@ static bool parse_monitor_spec(GemuMonitor *mon, const char *spec) {
 
     if (strcasecmp(spec, "stdio") == 0)
         return true;
+    if (strcasecmp(spec, "gmp-stdio") == 0) {
+        mon->backend = MON_BACKEND_GMP_STDIO;
+        return true;
+    }
     if (strcasecmp(spec, "none") == 0) {
         mon->backend = MON_BACKEND_NONE;
         return true;
@@ -801,6 +835,15 @@ static void json_escape(char *out, size_t out_len, const char *in) {
         if ((ch == '"' || ch == '\\') && o + 2 < out_len) {
             out[o++] = '\\';
             out[o++] = (char)ch;
+        } else if (ch == '\n' && o + 2 < out_len) {
+            out[o++] = '\\';
+            out[o++] = 'n';
+        } else if (ch == '\r' && o + 2 < out_len) {
+            out[o++] = '\\';
+            out[o++] = 'r';
+        } else if (ch == '\t' && o + 2 < out_len) {
+            out[o++] = '\\';
+            out[o++] = 't';
         } else if (ch >= 0x20) {
             out[o++] = (char)ch;
         }
@@ -815,9 +858,74 @@ static void qmp_send_error(GemuMonitor *mon, const char *klass, const char *desc
     int n = snprintf(buf, sizeof(buf),
                      "{\"error\":{\"class\":\"%s\",\"desc\":\"%s\"}}\r\n",
                      klass ? klass : "GenericError", esc);
-    if (n > 0)
-        sendall(mon->client_fd, buf,
-                (size_t)((n < (int)sizeof(buf)) ? n : (int)sizeof(buf) - 1));
+    if (n <= 0) return;
+    size_t len = (size_t)((n < (int)sizeof(buf)) ? n : (int)sizeof(buf) - 1);
+    if (mon->backend == MON_BACKEND_GMP_STDIO) {
+        FILE *out = qmp_stdio_out ? qmp_stdio_out : stdout;
+        fwrite(buf, 1, len, out);
+        fflush(out);
+    } else {
+        sendall(mon->client_fd, buf, len);
+    }
+}
+
+static void qmp_send_error_id(GemuMonitor *mon, const char *klass,
+                              const char *desc, long id) {
+    char esc[512];
+    json_escape(esc, sizeof(esc), desc);
+    char buf[768];
+    int n;
+    if (id >= 0) {
+        n = snprintf(buf, sizeof(buf),
+                     "{\"error\":{\"class\":\"%s\",\"desc\":\"%s\"},\"id\":%ld}\r\n",
+                     klass ? klass : "GenericError", esc, id);
+    } else {
+        n = snprintf(buf, sizeof(buf),
+                     "{\"error\":{\"class\":\"%s\",\"desc\":\"%s\"}}\r\n",
+                     klass ? klass : "GenericError", esc);
+    }
+    if (n <= 0) return;
+    size_t len = (size_t)((n < (int)sizeof(buf)) ? n : (int)sizeof(buf) - 1);
+    if (mon->backend == MON_BACKEND_GMP_STDIO) {
+        FILE *out = qmp_stdio_out ? qmp_stdio_out : stdout;
+        fwrite(buf, 1, len, out);
+        fflush(out);
+    } else {
+        sendall(mon->client_fd, buf, len);
+    }
+}
+
+static void qmp_write(GemuMonitor *mon, const char *buf, size_t len) {
+    if (mon->backend == MON_BACKEND_GMP_STDIO) {
+        FILE *out = qmp_stdio_out ? qmp_stdio_out : stdout;
+        fwrite(buf, 1, len, out);
+        fflush(out);
+    } else {
+        sendall(mon->client_fd, buf, len);
+    }
+}
+
+static void qmp_send_return(GemuMonitor *mon, const char *result, long id) {
+    char buf[768];
+    int n;
+    if (id >= 0) {
+        n = snprintf(buf, sizeof(buf), "{\"return\":%s,\"id\":%ld}\r\n",
+                     result ? result : "{}", id);
+    } else {
+        n = snprintf(buf, sizeof(buf), "{\"return\":%s}\r\n",
+                     result ? result : "{}");
+    }
+    if (n <= 0) return;
+    qmp_write(mon, buf,
+              (size_t)((n < (int)sizeof(buf)) ? n : (int)sizeof(buf) - 1));
+}
+
+static void qmp_send_return_string(GemuMonitor *mon, const char *result, long id) {
+    char esc[2048];
+    json_escape(esc, sizeof(esc), result ? result : "");
+    char quoted[2300];
+    snprintf(quoted, sizeof(quoted), "\"%s\"", esc);
+    qmp_send_return(mon, quoted, id);
 }
 
 static void qmp_invalid_keyword(GemuMonitor *mon, const char *line) {
@@ -832,6 +940,138 @@ static void qmp_invalid_keyword(GemuMonitor *mon, const char *line) {
     char desc[160];
     snprintf(desc, sizeof(desc), "JSON parse error, invalid keyword '%s'", word);
     qmp_send_error(mon, "GenericError", desc);
+}
+
+static bool qmp_get_string(const char *line, const char *key,
+                           char *out, size_t out_len) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(line, needle);
+    if (!p) return false;
+    p += strlen(needle);
+    p = skip_json_ws(p);
+    if (*p != ':') return false;
+    p = skip_json_ws(p + 1);
+    if (*p != '"') return false;
+    p++;
+
+    size_t n = 0;
+    bool escape = false;
+    while (*p && (escape || *p != '"')) {
+        if (escape) {
+            if (n + 1 < out_len)
+                out[n++] = *p;
+            escape = false;
+        } else if (*p == '\\') {
+            escape = true;
+        } else if (n + 1 < out_len) {
+            out[n++] = *p;
+        }
+        p++;
+    }
+    if (*p != '"') return false;
+    if (out_len)
+        out[n] = '\0';
+    return true;
+}
+
+static long qmp_get_id(const char *line) {
+    const char *p = strstr(line, "\"id\"");
+    if (!p) return -1;
+    p += 4;
+    p = skip_json_ws(p);
+    if (*p != ':') return -1;
+    p = skip_json_ws(p + 1);
+    if (*p == '"') p++;
+    char *end = NULL;
+    long id = strtol(p, &end, 10);
+    return (end && end != p) ? id : -1;
+}
+
+static void appendf(char *out, size_t out_len, const char *fmt, ...) {
+    if (!out || out_len == 0) return;
+    size_t used = strlen(out);
+    if (used >= out_len - 1) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(out + used, out_len - used, fmt, ap);
+    va_end(ap);
+}
+
+static void qmp_human_monitor_command(GemuMonitor *mon, const char *cmd,
+                                      long id) {
+    char out[2048] = "";
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", cmd ? cmd : "");
+    trim_line(buf);
+
+    char *p = buf;
+    char *verb = next_token(&p);
+    if (!verb) {
+        qmp_send_return_string(mon, "", id);
+        return;
+    }
+
+    if (strcasecmp(verb, "info") == 0) {
+        char *sub = next_token(&p);
+        if (!sub || strcasecmp(sub, "block") == 0) {
+            if (!mon || mon->n_media == 0) {
+                appendf(out, sizeof(out), "No block devices.\n");
+            } else {
+                for (int i = 0; i < mon->n_media; i++) {
+                    const GemuMediaDevice *dev = &mon->media[i];
+                    const char *type      = dev->kind ? dev->kind : dev->name;
+                    int         removable = dev->eject ? 1 : 0;
+                    int         flippable = dev->flip ? 1 : 0;
+                    const char *file      = dev->file[0] ? dev->file : "(none)";
+                    appendf(out, sizeof(out),
+                            "%s: type=%s removable=%d flippable=%d file=%s\n",
+                            dev->name, type, removable, flippable, file);
+                }
+            }
+        } else if (strcasecmp(sub, "roms") == 0) {
+            if (!mon || mon->n_rom_entries == 0) {
+                appendf(out, sizeof(out), "No ROMs loaded.\n");
+            } else {
+                for (int i = 0; i < mon->n_rom_entries; i++) {
+                    const MonRomEntry *e = &mon->rom_entries[i];
+                    appendf(out, sizeof(out),
+                            "addr=0x%04x size=0x%04x file=%s\n",
+                            e->addr, e->size, e->file);
+                }
+            }
+        } else if (strcasecmp(sub, "breakpoints") == 0 ||
+                   strcasecmp(sub, "bp") == 0) {
+            if (!mon || mon->n_bps == 0) {
+                appendf(out, sizeof(out), "No breakpoints set.\n");
+            } else {
+                for (int i = 0; i < mon->n_bps; i++) {
+                    const MonBpEntry *e = &mon->bp_entries[i];
+                    const char *type;
+                    if      (e->type == GEMU_BP_EXEC)  type = "exec ";
+                    else if (e->type == GEMU_BP_READ)  type = "read ";
+                    else if (e->type == GEMU_BP_WRITE) type = "write";
+                    else                               type = "rw   ";
+                    appendf(out, sizeof(out), "  %2d  %s  0x%04x\n",
+                            e->id, type, e->addr);
+                }
+            }
+        } else {
+            appendf(out, sizeof(out),
+                    "info: unknown subcommand '%s' (try 'info block', 'info roms', 'info breakpoints')\n",
+                    sub);
+        }
+        qmp_send_return_string(mon, out, id);
+        return;
+    }
+
+    GemuMonCmd ignored = GEMU_MON_NONE;
+    if (dispatch_media(mon, cmd, &ignored)) {
+        qmp_send_return_string(mon, "", id);
+        return;
+    }
+
+    qmp_send_return_string(mon, "", id);
 }
 
 static bool qmp_json_well_formed_object(const char *line) {
@@ -866,29 +1106,70 @@ static bool qmp_json_well_formed_object(const char *line) {
     return depth == 0 && !in_string && !escape;
 }
 
-static void monitor_gmp_loop(GemuMonitor *mon) {
-    static const char greeting[] =
-        "{\r\n"
-        "   \"QMP\":{\r\n"
-        "      \"version\":{\r\n"
-        "         \"qemu\":{\r\n"
-        "            \"micro\":0,\r\n"
-        "            \"minor\":6,\r\n"
-        "            \"major\":1\r\n"
-        "         },\r\n"
-        "         \"gemu\":{\r\n"
-        "            \"micro\":0,\r\n"
-        "            \"minor\":0,\r\n"
-        "            \"major\":1\r\n"
-        "         },\r\n"
-        "         \"package\":\"\"\r\n"
-        "      },\r\n"
-        "      \"capabilities\":[\r\n"
-        "         \r\n"
-        "      ]\r\n"
-        "   }\r\n"
-        "}\r\n";
+static void qmp_handle_line(GemuMonitor *mon, char *line) {
+    trim_line(line);
+    const char *p = skip_json_ws(line);
+    if (*p == '\0')
+        return;
+    if (*p != '{') {
+        qmp_invalid_keyword(mon, line);
+        return;
+    }
+    if (!qmp_json_well_formed_object(line)) {
+        qmp_send_error(mon, "GenericError", "JSON parse error");
+        return;
+    }
 
+    char execute[96];
+    long id = qmp_get_id(line);
+    if (!qmp_get_string(line, "execute", execute, sizeof(execute))) {
+        qmp_send_error_id(mon, "GenericError", "QMP command is missing execute", id);
+        return;
+    }
+
+    if (strcmp(execute, "qmp_capabilities") == 0) {
+        qmp_send_return(mon, "{}", id);
+    } else if (strcmp(execute, "system_reset") == 0) {
+        enqueue(mon, GEMU_MON_RESET, 0);
+        qmp_send_return(mon, "{}", id);
+    } else if (strcmp(execute, "cont") == 0) {
+        enqueue(mon, GEMU_MON_CONT, 0);
+        qmp_send_return(mon, "{}", id);
+    } else if (strcmp(execute, "stop") == 0) {
+        enqueue(mon, GEMU_MON_STOP, 0);
+        qmp_send_return(mon, "{}", id);
+    } else if (strcmp(execute, "human-monitor-command") == 0) {
+        char command[256];
+        qmp_get_string(line, "command-line", command, sizeof(command));
+        qmp_human_monitor_command(mon, command, id);
+    } else {
+        qmp_send_error_id(mon, "CommandNotFound",
+                          "The command has not been found", id);
+    }
+}
+
+static void qmp_send_greeting(GemuMonitor *mon) {
+    static const char greeting[] =
+        "{\"QMP\":{\"version\":{\"qemu\":{\"micro\":0,\"minor\":6,\"major\":1},"
+        "\"gemu\":{\"micro\":0,\"minor\":0,\"major\":1},\"package\":\"\"},"
+        "\"capabilities\":[]}}\r\n";
+    if (mon->backend == MON_BACKEND_GMP_STDIO) {
+        FILE *out = qmp_stdio_out ? qmp_stdio_out : stdout;
+        fputs(greeting, out);
+        fflush(out);
+    } else {
+        sendall(mon->client_fd, greeting, sizeof(greeting) - 1);
+    }
+}
+
+static void monitor_gmp_stdio_loop(GemuMonitor *mon) {
+    qmp_send_greeting(mon);
+    char line[512];
+    while (mon->running && fgets(line, sizeof(line), stdin))
+        qmp_handle_line(mon, line);
+}
+
+static void monitor_gmp_loop(GemuMonitor *mon) {
     while (mon->running) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -900,23 +1181,11 @@ static void monitor_gmp_loop(GemuMonitor *mon) {
         sock_t client = accept(mon->listen_fd, NULL, NULL);
         if (client == INVALID_SOCK) continue;
         mon->client_fd = client;
-        sendall(client, greeting, sizeof(greeting) - 1);
+        qmp_send_greeting(mon);
 
         char line[512];
         while (mon->running && telnet_read_line(client, line, sizeof(line))) {
-            trim_line(line);
-            const char *p = skip_json_ws(line);
-            if (*p == '\0')
-                continue;
-            if (*p != '{') {
-                qmp_invalid_keyword(mon, line);
-                continue;
-            }
-            if (!qmp_json_well_formed_object(line)) {
-                qmp_send_error(mon, "GenericError", "JSON parse error");
-                continue;
-            }
-            qmp_send_error(mon, "GenericError", "QMP commands are not implemented yet");
+            qmp_handle_line(mon, line);
         }
 
         sock_close(client);
@@ -930,7 +1199,9 @@ static void *monitor_thread(void *arg) {
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
 
-    if (mon->backend == MON_BACKEND_GMP)
+    if (mon->backend == MON_BACKEND_GMP_STDIO)
+        monitor_gmp_stdio_loop(mon);
+    else if (mon->backend == MON_BACKEND_GMP)
         monitor_gmp_loop(mon);
     else if (mon->backend == MON_BACKEND_TELNET)
         monitor_telnet_loop(mon);
