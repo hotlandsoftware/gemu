@@ -53,6 +53,7 @@ void         gemu_monitor_set_default(const char *spec);
 /* Enqueue a reset or quit command from non-stdin sources (e.g. a GTK menu). */
 void         gemu_monitor_enqueue_reset(GemuMonitor *mon);
 void         gemu_monitor_enqueue_quit(GemuMonitor *mon);
+void         gemu_monitor_shutdown_or_pause(GemuMonitor *mon, bool no_shutdown);
 
 bool         gemu_monitor_register_media(GemuMonitor *mon,
                                          const GemuMediaDevice *dev);

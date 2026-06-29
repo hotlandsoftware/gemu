@@ -50,6 +50,7 @@ typedef struct {
     const char     *vnc_addr;      /* NULL = no VNC */
     const char     *monitor_spec;  /* NULL = stdio */
     bool            display_explicit; /* true if -display was given */
+    bool            no_shutdown;   /* -no-shutdown: pause instead of monitor-quit */
 } GemuArgs;
 
 /*

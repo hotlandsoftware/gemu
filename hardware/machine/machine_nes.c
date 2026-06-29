@@ -2393,7 +2393,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
         /* Monitor commands */
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-            if      (cmd == GEMU_MON_QUIT)   { quit = true; break; }
+            if      (cmd == GEMU_MON_QUIT)   { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else { quit = true; break; } }
             else if (cmd == GEMU_MON_RESET)  { nes_save_persistent(s); nes_reset(s); }
             else if (cmd == GEMU_MON_CUSTOM) {
                 const char *text = gemu_monitor_command_text(s->monitor);

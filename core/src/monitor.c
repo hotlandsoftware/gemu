@@ -967,6 +967,18 @@ void gemu_monitor_enqueue_quit(GemuMonitor *mon) {
     if (mon) enqueue(mon, GEMU_MON_QUIT, 0);
 }
 
+void gemu_monitor_shutdown_or_pause(GemuMonitor *mon, bool no_shutdown) {
+    if (!no_shutdown) {
+        gemu_monitor_enqueue_quit(mon);
+        return;
+    }
+    if (mon) {
+        pthread_mutex_lock(&mon->lock);
+        mon->paused = true;
+        pthread_mutex_unlock(&mon->lock);
+    }
+}
+
 bool gemu_monitor_register_media(GemuMonitor *mon,
                                  const GemuMediaDevice *dev) {
     if (!mon || !dev || !dev->name || mon->n_media >= MEDIA_DEVICE_MAX)

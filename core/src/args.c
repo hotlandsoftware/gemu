@@ -33,6 +33,7 @@ static void print_usage(const GemuArgsDef *def) {
     printf("  %-14s Window scale factor\n", "-scale N");
     if (def->vnc_support)
         printf("  %-14s VNC server (use -vnc ? for address format)\n", "-vnc ADDR");
+    printf("  %-14s Pause/halt instead of exiting on monitor shutdown\n", "-no-shutdown");
     printf("  %-14s Monitor: stdio | none | telnet:HOST:PORT,server,nowait\n",
            "-monitor SPEC");
     printf("  %-14s GMP/QMP-compatible monitor over TCP (alias: -qmp)\n", "-gmp ADDR");
@@ -74,6 +75,7 @@ static void print_vnc_help(void) {
     printf("VNC address format:\n"
            "  :N            listen on all interfaces, port 5900+N\n"
            "  host:N        listen on host, port 5900+N\n"
+           "  unix:/path    listen on a Unix domain socket (POSIX only)\n"
            "Examples:  :0   127.0.0.1:0   0.0.0.0:1\n");
 }
 
@@ -141,6 +143,11 @@ bool gemu_args_parse(int argc, char **argv,
             strcmp(a, "--help") == 0) {
             print_usage(def);
             exit(0);
+        }
+
+        if (strcmp(a, "-no-shutdown") == 0) {
+            out->no_shutdown = true;
+            continue;
         }
 
         /* ── -M TYPE ── */

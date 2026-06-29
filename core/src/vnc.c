@@ -20,6 +20,7 @@ typedef SOCKET sock_t;
 #  include <unistd.h>
 #  include <sys/select.h>
 #  include <sys/socket.h>
+#  include <sys/un.h>
 #  include <netinet/in.h>
 #  include <arpa/inet.h>
 typedef int sock_t;
@@ -49,6 +50,8 @@ struct GemuVncServer {
     int             n_colors;
     bool            password_set;
     char            password[9];
+    bool            unix_socket;
+    char            unix_path[108];
 };
 
 /* X11 keysyms matching the SDL/GTK CHIP-8 keypad layout:
@@ -376,7 +379,22 @@ static void *vnc_thread(void *arg) {
 
 /* ── Address parsing ─────────────────────────────────────────────────────── */
 
-static bool parse_vnc_addr(const char *s, char host[64], int *port) {
+static bool parse_vnc_addr(const char *s, char host[64], int *port,
+                           bool *unix_socket, char unix_path[108]) {
+    *unix_socket = false;
+    unix_path[0] = '\0';
+    if (strncmp(s, "unix:", 5) == 0) {
+#ifdef _WIN32
+        (void)unix_path;
+        return false;
+#else
+        const char *path = s + 5;
+        if (!*path || strlen(path) >= 108) return false;
+        *unix_socket = true;
+        snprintf(unix_path, 108, "%s", path);
+        return true;
+#endif
+    }
     const char *colon = strrchr(s, ':');
     if (!colon) return false;
     *port = 5900 + atoi(colon + 1);
@@ -391,21 +409,43 @@ static bool parse_vnc_addr(const char *s, char host[64], int *port) {
 
 GemuVncServer *gemu_vnc_create(const char *addr, int fb_w, int fb_h) {
     char host[64]; int port;
-    if (!parse_vnc_addr(addr, host, &port)) {
-        fprintf(stderr, "vnc: bad address '%s' — use host:N or :N\n", addr); return NULL;
+    bool unix_socket = false;
+    char unix_path[108];
+    if (!parse_vnc_addr(addr, host, &port, &unix_socket, unix_path)) {
+        fprintf(stderr, "vnc: bad address '%s' — use host:N, :N, or unix:/path\n", addr); return NULL;
     }
 #ifdef _WIN32
     { WSADATA d; WSAStartup(MAKEWORD(2, 2), &d); }
 #endif
-    sock_t lfd = socket(AF_INET, SOCK_STREAM, 0);
+    sock_t lfd;
+#ifdef _WIN32
+    lfd = socket(AF_INET, SOCK_STREAM, 0);
+#else
+    lfd = socket(unix_socket ? AF_UNIX : AF_INET, SOCK_STREAM, 0);
+#endif
     if (lfd == INVALID_SOCK) { perror("vnc: socket"); return NULL; }
     int opt = 1;
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, (int)sizeof(opt));
-    struct sockaddr_in sa = {0};
-    sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
-    inet_pton(AF_INET, host, &sa.sin_addr);
-    if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        perror("vnc: bind"); sock_close(lfd); return NULL;
+    if (unix_socket) {
+#ifdef _WIN32
+        sock_close(lfd);
+        return NULL;
+#else
+        struct sockaddr_un sa = {0};
+        sa.sun_family = AF_UNIX;
+        snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", unix_path);
+        unlink(unix_path);
+        if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+            perror("vnc: bind"); sock_close(lfd); return NULL;
+        }
+#endif
+    } else {
+        struct sockaddr_in sa = {0};
+        sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
+        inet_pton(AF_INET, host, &sa.sin_addr);
+        if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+            perror("vnc: bind"); sock_close(lfd); return NULL;
+        }
     }
     listen(lfd, 1);
     GemuVncServer *vnc = calloc(1, sizeof(*vnc));
@@ -413,10 +453,16 @@ GemuVncServer *gemu_vnc_create(const char *addr, int fb_w, int fb_h) {
     vnc->fb_w = fb_w; vnc->fb_h = fb_h;
     vnc->fg_rgb = 0xFFFFFFu;
     vnc->bg_rgb = 0x000000u;
+    vnc->unix_socket = unix_socket;
+    if (unix_socket)
+        snprintf(vnc->unix_path, sizeof(vnc->unix_path), "%s", unix_path);
     vnc->running = true;
     pthread_mutex_init(&vnc->lock, NULL);
     pthread_create(&vnc->thread, NULL, vnc_thread, vnc);
-    printf("vnc: listening on %s:%d (display :%d)\n", host, port, port - 5900);
+    if (unix_socket)
+        printf("vnc: listening on unix:%s\n", unix_path);
+    else
+        printf("vnc: listening on %s:%d (display :%d)\n", host, port, port - 5900);
     return vnc;
 }
 
@@ -459,6 +505,10 @@ void gemu_vnc_destroy(GemuVncServer *vnc) {
     vnc->running = false;
     pthread_join(vnc->thread, NULL);
     sock_close(vnc->listen_fd);
+#ifndef _WIN32
+    if (vnc->unix_socket && vnc->unix_path[0])
+        unlink(vnc->unix_path);
+#endif
     pthread_mutex_destroy(&vnc->lock);
     free(vnc->fb);
     free(vnc);

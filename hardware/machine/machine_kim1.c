@@ -1510,7 +1510,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
 
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-            if      (cmd == GEMU_MON_QUIT)   { quit = true; break; }
+            if      (cmd == GEMU_MON_QUIT)   { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else { quit = true; break; } }
             else if (cmd == GEMU_MON_RESET) {
                 mos6502_reset(&s->cpu);
                 kim1_reset_rriots(s);

@@ -75,6 +75,7 @@ int chip8_setup(int argc, char *argv[]) {
     cfg.display_type = args.display_type;
     cfg.display_scale = args.display_scale;
     cfg.vnc_addr     = args.vnc_addr;
+    cfg.no_shutdown  = args.no_shutdown;
 
     for (int i = 0; i < nrem; i++) {
         if ((strcmp(rem[i], "-hz") == 0 || strcmp(rem[i], "-speed") == 0) && i + 1 < nrem) {

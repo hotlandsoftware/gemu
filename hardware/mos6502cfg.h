@@ -68,6 +68,7 @@ typedef struct MosConfig {
     GemuRendererType display_renderer;
     int             display_scale;
     const char     *vnc_addr;
+    bool            no_shutdown;
     bool            has_start_addr;
     uint16_t        start_addr;
     const char     *cart_path;   /* iNES .nes cartridge file (NES machine) */

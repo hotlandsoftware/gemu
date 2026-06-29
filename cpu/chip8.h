@@ -105,6 +105,7 @@ typedef struct Chip8Config {
     bool             quirk_shift;
     bool             quirk_jump;
     const char      *vnc_addr;
+    bool             no_shutdown;
     Chip8MachineType machine;
     uint32_t         fg_argb;     /* on-pixel color  (default: Octo yellow) */
     uint32_t         bg_argb;     /* off-pixel color (default: black) */

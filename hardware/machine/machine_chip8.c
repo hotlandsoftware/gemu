@@ -177,7 +177,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
         while (running) {
             GemuMonCmd cmd;
             while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-                if      (cmd == GEMU_MON_QUIT)  running = false;
+                if      (cmd == GEMU_MON_QUIT)  { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else running = false; }
                 else if (cmd == GEMU_MON_RESET) chip8_machine_reset(s, cfg);
                 else if (cmd == GEMU_MON_STEP) {
                     uint32_t n = gemu_monitor_step_count(s->monitor);
@@ -268,7 +268,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
         bool quit = false;
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-            if      (cmd == GEMU_MON_QUIT)  { quit = true; break; }
+            if      (cmd == GEMU_MON_QUIT)  { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else { quit = true; break; } }
             else if (cmd == GEMU_MON_RESET) chip8_machine_reset(s, cfg);
             else if (cmd == GEMU_MON_STEP) {
                 uint32_t n = gemu_monitor_step_count(s->monitor);

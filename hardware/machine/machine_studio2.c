@@ -440,7 +440,7 @@ void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
 
         /* Monitor commands */
         GemuMonCmd cmd = gemu_monitor_poll(s->monitor);
-        if (cmd == GEMU_MON_QUIT)   { quit = true; continue; }
+        if (cmd == GEMU_MON_QUIT)   { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else { quit = true; continue; } }
         if (cmd == GEMU_MON_RESET)  reset = true;
         if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
 

@@ -507,7 +507,7 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
 
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-            if      (cmd == GEMU_MON_QUIT)  quit = true;
+            if      (cmd == GEMU_MON_QUIT)  { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else quit = true; }
             else if (cmd == GEMU_MON_RESET) rca_pecom32_reset(s, cfg);
             else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
         }

@@ -489,7 +489,10 @@ static void apple1_monitor_execute(Apple1State *s, const char *line) {
     if (!have_addr) {
         if (*p == '\0') return;
         if (toupper((unsigned char)*p) == 'Q' && p[1] == '\0') {
-            s->quit_requested = true;
+            if (s->cfg->no_shutdown)
+                gemu_monitor_shutdown_or_pause(s->monitor, true);
+            else
+                s->quit_requested = true;
             return;
         }
         if (toupper((unsigned char)*p) == 'R') {
@@ -733,9 +736,31 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
         if (s->quit_requested)
             quit = true;
 
+        GemuMonCmd cmd;
+        while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
+            if (cmd == GEMU_MON_QUIT) {
+                if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true);
+                else { quit = true; break; }
+            } else if (cmd == GEMU_MON_RESET) {
+                mos6502_reset(&s->cpu);
+                s->native_monitor = !s->have_monitor_rom;
+                s->quit_requested = false;
+                if (s->native_monitor)
+                    apple1_monitor_prompt(s);
+            } else if (cmd == GEMU_MON_CUSTOM) {
+                gemu_monitor_unknown_command(s->monitor);
+            }
+        }
+
         if (s->native_monitor) {
+            if (gemu_monitor_is_paused(s->monitor)) {
+                Uint32 dt = SDL_GetTicks() - t0;
+                Uint32 frame_ms = 1000u / APPLE1_FPS;
+                if (dt < frame_ms) SDL_Delay(frame_ms - dt);
+                continue;
+            }
             apple1_monitor_poll(s);
-        } else {
+        } else if (!gemu_monitor_is_paused(s->monitor)) {
             apple1_poll_keyboard(s);
             uint64_t target = s->cpu.cycle_count + APPLE1_CPF;
             while (!quit && s->cpu.cycle_count < target) {

@@ -435,6 +435,7 @@ int mos_setup(int argc, char *argv[]) {
     cfg.display_type  = args.display_type;
     cfg.display_scale = args.display_scale;
     cfg.vnc_addr      = args.vnc_addr;
+    cfg.no_shutdown   = args.no_shutdown;
 
     if ((cfg.machine == MOS_MACHINE_APPLE1 ||
          cfg.machine == MOS_MACHINE_NES ||
