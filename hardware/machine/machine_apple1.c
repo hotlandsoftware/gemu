@@ -31,33 +31,6 @@
 #define A1_FB_H        (A1_ROWS * A1_CELL_H)
 #define A1_CHARGEN_SIZE 512u
 
-/*
- * Tiny GEMU boot monitor, used when no CPU-visible Apple I ROM is supplied.
- * It prints '\' and echoes keyboard input through the Apple I PIA addresses.
- * Real WozMon can replace it by loading a 256-byte ROM at $FF00.
- */
-static const uint8_t apple1_boot_rom[0x100] = {
-    0xD8,                         /* FF00: CLD        */
-    0xA2, 0xFF,                   /*       LDX #$FF   */
-    0x9A,                         /*       TXS        */
-    0xA9, 0x5C,                   /*       LDA #'\'   */
-    0x20, 0x20, 0xFF,             /*       JSR ECHO   */
-    0xA9, 0x0D,                   /*       LDA #CR    */
-    0x20, 0x20, 0xFF,             /*       JSR ECHO   */
-    0x20, 0x30, 0xFF,             /* FF0E: JSR GETKEY */
-    0x20, 0x20, 0xFF,             /*       JSR ECHO   */
-    0x4C, 0x0E, 0xFF,             /*       JMP $FF0E  */
-    [0x20] = 0x8D, 0x12, 0xD0,    /* FF20: STA $D012  */
-             0x60,                /*       RTS        */
-    [0x30] = 0xAD, 0x11, 0xD0,    /* FF30: LDA $D011  */
-             0x10, 0xFB,          /*       BPL $FF30  */
-             0xAD, 0x10, 0xD0,    /*       LDA $D010  */
-             0x60,                /*       RTS        */
-    [0xFA] = 0x00, 0xFF,          /* NMI              */
-             0x00, 0xFF,          /* RESET            */
-             0x00, 0xFF,          /* IRQ/BRK          */
-};
-
 struct Apple1Display {
     SDL_Window   *window;
     SDL_Renderer *renderer;
@@ -210,7 +183,7 @@ static Apple1Display *apple1_display_create(const MosConfig *cfg) {
         return d;
     }
 
-    d->window = SDL_CreateWindow("GEMU (Apple I)",
+    d->window = SDL_CreateWindow("GEMU",
         SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
         A1_WIN_W, A1_WIN_H, SDL_WINDOW_SHOWN);
     if (!d->window) {
@@ -328,13 +301,24 @@ static void apple1_poll_vnc_keyboard(Apple1State *s) {
         if (!ev.down || !s->display)
             continue;
         uint32_t sym = ev.keysym;
-        if (sym == 0xFF0D || sym == 0xFF8D)
+        if (sym == '\n' || sym == '\r' || sym == 0xFF0D || sym == 0xFF8D)
             apple1_display_kpush(s->display, '\r');
         else if (sym == 0xFF08 || sym == 0xFFFF)
             apple1_display_kpush(s->display, 0x7F);
         else if (sym >= ' ' && sym <= 0x7F)
             apple1_display_kpush(s->display, (uint8_t)sym);
     }
+}
+
+static void apple1_poll_input_devices(Apple1State *s) {
+    if (s->display) {
+        apple1_display_poll(s->display);
+        apple1_poll_curses_keyboard(s);
+        apple1_poll_vnc_keyboard(s);
+    }
+
+    GemuSerial *ser = s->cfg->serial;
+    if (ser) ser->poll(ser->ud);
 }
 
 static void apple1_update_vnc(Apple1State *s) {
@@ -363,20 +347,14 @@ static void apple1_update_vnc(Apple1State *s) {
 }
 
 static void apple1_poll_keyboard(Apple1State *s) {
-    if (s->display) {
-        apple1_display_poll(s->display);
-        apple1_poll_curses_keyboard(s);
-        apple1_poll_vnc_keyboard(s);
-        if (!s->key_ready && apple1_display_key_available(s->display)) {
-            s->key_data = apple1_normalize_key(apple1_display_read_key(s->display));
-            s->key_ready = true;
-        }
+    apple1_poll_input_devices(s);
+    if (s->display && !s->key_ready && apple1_display_key_available(s->display)) {
+        s->key_data = apple1_normalize_key(apple1_display_read_key(s->display));
+        s->key_ready = true;
     }
 
     GemuSerial *ser = s->cfg->serial;
-    if (!ser) return;
-    ser->poll(ser->ud);
-    if (!s->key_ready && ser->key_available(ser->ud)) {
+    if (ser && !s->key_ready && ser->key_available(ser->ud)) {
         s->key_data = apple1_normalize_key(ser->read_byte(ser->ud));
         s->key_ready = true;
     }
@@ -406,6 +384,155 @@ static void apple1_write_display(Apple1State *s, uint8_t val) {
         putchar(val);
         fflush(stdout);
     }
+}
+
+static void apple1_monitor_puts(Apple1State *s, const char *text) {
+    while (*text)
+        apple1_write_display(s, (uint8_t)*text++);
+}
+
+static void apple1_monitor_hex8(Apple1State *s, uint8_t v) {
+    static const char hex[] = "0123456789ABCDEF";
+    apple1_write_display(s, (uint8_t)hex[v >> 4]);
+    apple1_write_display(s, (uint8_t)hex[v & 0x0F]);
+}
+
+static void apple1_monitor_hex16(Apple1State *s, uint16_t v) {
+    apple1_monitor_hex8(s, (uint8_t)(v >> 8));
+    apple1_monitor_hex8(s, (uint8_t)v);
+}
+
+static const char *apple1_monitor_skip_ws(const char *p) {
+    while (*p == ' ' || *p == '\t') p++;
+    return p;
+}
+
+static int apple1_monitor_hex_digit(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    return -1;
+}
+
+static bool apple1_monitor_parse_hex(const char **pp, uint16_t *out) {
+    const char *p = apple1_monitor_skip_ws(*pp);
+    uint32_t v = 0;
+    int n = 0;
+    for (;;) {
+        int d = apple1_monitor_hex_digit(*p);
+        if (d < 0) break;
+        v = ((v << 4) | (uint32_t)d) & 0xFFFFu;
+        p++;
+        n++;
+    }
+    if (!n) return false;
+    *pp = p;
+    *out = (uint16_t)v;
+    return true;
+}
+
+static void apple1_monitor_store(Apple1State *s, uint16_t addr, const char *p) {
+    uint16_t value = 0;
+    bool any = false;
+    while (apple1_monitor_parse_hex(&p, &value)) {
+        if (!s->rom_map[addr])
+            s->mem[addr] = (uint8_t)value;
+        s->mon_last_addr = addr++;
+        any = true;
+        p = apple1_monitor_skip_ws(p);
+    }
+    if (!any)
+        apple1_monitor_puts(s, "?\r");
+}
+
+static void apple1_monitor_dump(Apple1State *s, uint16_t start, uint16_t end) {
+    uint16_t addr = start;
+    for (;;) {
+        apple1_write_display(s, '\r');
+        apple1_monitor_hex16(s, addr);
+        apple1_monitor_puts(s, ": ");
+        for (int i = 0; i < 8; i++) {
+            apple1_monitor_hex8(s, s->mem[addr]);
+            s->mon_last_addr = addr;
+            if (addr == end) return;
+            addr++;
+            apple1_write_display(s, ' ');
+        }
+    }
+}
+
+static void apple1_monitor_execute(Apple1State *s, const char *line) {
+    const char *p = apple1_monitor_skip_ws(line);
+    uint16_t addr = s->mon_last_addr;
+    bool have_addr = apple1_monitor_parse_hex(&p, &addr);
+    p = apple1_monitor_skip_ws(p);
+
+    if (!have_addr) {
+        if (*p == '\0') return;
+        if (toupper((unsigned char)*p) == 'R') {
+            s->cpu.PC = s->mon_last_addr;
+            s->native_monitor = false;
+            return;
+        }
+        apple1_monitor_puts(s, "?\r");
+        return;
+    }
+
+    s->mon_last_addr = addr;
+    if (*p == ':') {
+        apple1_monitor_store(s, addr, p + 1);
+    } else if (*p == '.') {
+        p++;
+        uint16_t end = addr;
+        if (!apple1_monitor_parse_hex(&p, &end)) {
+            apple1_monitor_puts(s, "?\r");
+            return;
+        }
+        apple1_monitor_dump(s, addr, end);
+    } else if (toupper((unsigned char)*p) == 'R') {
+        s->cpu.PC = addr;
+        s->native_monitor = false;
+    } else if (*p == '\0') {
+        apple1_monitor_dump(s, addr, addr);
+    } else {
+        apple1_monitor_puts(s, "?\r");
+    }
+}
+
+static void apple1_monitor_key(Apple1State *s, uint8_t ch) {
+    ch &= 0x7Fu;
+    if (ch == '\n') ch = '\r';
+    if (ch >= 'a' && ch <= 'z') ch = (uint8_t)toupper(ch);
+    if (ch == 0x7F || ch == '\b') {
+        if (s->mon_len > 0)
+            s->mon_len--;
+        return;
+    }
+    if (ch == '\r') {
+        apple1_write_display(s, '\r');
+        s->mon_line[s->mon_len] = '\0';
+        apple1_monitor_execute(s, s->mon_line);
+        s->mon_len = 0;
+        if (s->native_monitor)
+            apple1_monitor_puts(s, "\\");
+        return;
+    }
+    if (ch < ' ' || ch > '_')
+        return;
+    if (s->mon_len < (int)sizeof(s->mon_line) - 1) {
+        s->mon_line[s->mon_len++] = (char)ch;
+        apple1_write_display(s, ch);
+    }
+}
+
+static void apple1_monitor_poll(Apple1State *s) {
+    apple1_poll_input_devices(s);
+    while (s->display && apple1_display_key_available(s->display))
+        apple1_monitor_key(s, apple1_display_read_key(s->display));
+
+    GemuSerial *ser = s->cfg->serial;
+    while (ser && ser->key_available(ser->ud))
+        apple1_monitor_key(s, ser->read_byte(ser->ud));
 }
 
 static uint8_t apple1_read(uint16_t addr, void *ud) {
@@ -482,6 +609,8 @@ static bool apple1_load_roms(Apple1State *s, const MosConfig *cfg) {
             return false;
         }
         memset(s->rom_map + addr, 1, len);
+        if (addr <= APPLE1_ROM && addr + len > APPLE1_ROM)
+            s->have_monitor_rom = true;
         printf("apple1: %zu bytes @ 0x%04X <- %s\n",
                len, (unsigned)addr, cfg->roms[i].path);
         gemu_monitor_register_rom(s->monitor, addr, (uint32_t)len, cfg->roms[i].path);
@@ -514,14 +643,14 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     }
     gemu_monitor_set_vnc(s->monitor, s->vnc);
 
-    memcpy(&s->mem[APPLE1_ROM], apple1_boot_rom, sizeof(apple1_boot_rom));
-    memset(&s->rom_map[APPLE1_ROM], 1, sizeof(apple1_boot_rom));
-    gemu_monitor_register_rom(s->monitor, APPLE1_ROM,
-                              sizeof(apple1_boot_rom), "apple1 built-in boot ROM");
-
     if (!apple1_load_roms(s, cfg)) {
         apple1_destroy(s);
         return NULL;
+    }
+    if (!s->have_monitor_rom) {
+        s->native_monitor = true;
+        fprintf(stderr,
+                "apple1: no CPU monitor ROM at $FF00; using built-in ROMless monitor\n");
     }
     if (s->display && cfg->char_gen == MOS_CG_CM2140 && !s->display->have_chargen)
         fprintf(stderr, "apple1: -cg cm2140 requested but no chargen ROM was loaded; using built-in cm2140-compat fallback\n");
@@ -534,6 +663,8 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     mos6502_reset(&s->cpu);
     if (cfg->has_start_addr)
         s->cpu.PC = cfg->start_addr;
+    if (s->native_monitor)
+        apple1_monitor_puts(s, "\\");
     apple1_update_vnc(s);
 
     return s;
@@ -561,11 +692,15 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
         if (s->display && s->display->quit)
             quit = true;
 
-        apple1_poll_keyboard(s);
-        uint64_t target = s->cpu.cycle_count + APPLE1_CPF;
-        while (!quit && s->cpu.cycle_count < target) {
-            if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-            mos6502_step(&s->cpu);
+        if (s->native_monitor) {
+            apple1_monitor_poll(s);
+        } else {
+            apple1_poll_keyboard(s);
+            uint64_t target = s->cpu.cycle_count + APPLE1_CPF;
+            while (!quit && s->cpu.cycle_count < target) {
+                if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
+                mos6502_step(&s->cpu);
+            }
         }
         apple1_display_render(s->display);
         apple1_update_vnc(s);

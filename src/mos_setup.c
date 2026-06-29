@@ -34,7 +34,7 @@ static const MachineDef machine_defs[] = {
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
-    {"apple1",  "Apple I (MOS 6502, Woz-style terminal I/O)"},
+    {"apple1",  "Apple I (MOS 6502, keyboard/display terminal)"},
     {"dendy",   "Dendy NES Famiclone (PAL 50 Hz, NTSC-compatible PPU/APU timing)"},
     {"vssmb",       "VS. Super Mario Bros. (coin-op arcade cabinet, DIP switches)"},
     {"vsskatekids", "VS. Skate Kid Bros. (arcade hack of VS. SMB)"},
@@ -229,6 +229,7 @@ int mos_setup(int argc, char *argv[]) {
         .display_type  = cfg.display_type,
         .display_scale = cfg.display_scale,
     };
+    const char *romdb_machine = "mos";
 
     char *rem[32]; int nrem = 0;
     if (!gemu_args_parse(argc, argv, &def, &args, &nrem, rem))
@@ -240,6 +241,7 @@ int mos_setup(int argc, char *argv[]) {
             if (strcmp(args.machine, machine_defs[i].name) != 0) continue;
             const MachineDef *md = &machine_defs[i];
             const char *canon = md->canonical;
+            romdb_machine = canon;
             if      (strcmp(canon, "apple1") == 0) cfg.machine = MOS_MACHINE_APPLE1;
             else if (strcmp(canon, "mos")  == 0) cfg.machine = MOS_MACHINE_GENERIC;
             else if (strcmp(canon, "kim1") == 0) cfg.machine = MOS_MACHINE_KIM1;
@@ -295,12 +297,11 @@ int mos_setup(int argc, char *argv[]) {
             const char *val = rem[++i];
             struct stat st;
             if (stat(val, &st) == 0 && S_ISDIR(st.st_mode)) {
-                const char *alias = args.machine ? args.machine : "mos";
-                int n = romdb_load_dir(val, alias, romdb_add_mos, &cfg);
+                int n = romdb_load_dir(val, romdb_machine, romdb_add_mos, &cfg);
                 if (n < 0) return 1;
                 if (n == 0) {
                     fprintf(stderr, "gemu: no known ROMs in '%s' for machine '%s'\n",
-                            val, alias);
+                            val, romdb_machine);
                     return 1;
                 }
             } else {
@@ -490,6 +491,11 @@ int mos_setup(int argc, char *argv[]) {
 
     if (SDL_Init(0) < 0) {
         fprintf(stderr, "gemu: SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    if (cfg.want_wozmon && cfg.machine != MOS_MACHINE_KIM1) {
+        fprintf(stderr, "gemu: -device wozmon is currently supported by KIM-1 only\n");
         return 1;
     }
 
