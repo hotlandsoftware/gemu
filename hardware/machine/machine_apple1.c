@@ -693,7 +693,9 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     if (cfg->display_type != GEMU_DISPLAY_NONE && !s->display)
         fprintf(stderr, "apple1: display unavailable, falling back to stdio\n");
     if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, A1_FB_W, A1_FB_H);
+        s->vnc = gemu_vnc_create(cfg->vnc_addr,
+                                 A1_FB_W * cfg->display_scale,
+                                 A1_FB_H * cfg->display_scale);
         if (s->vnc) {
             gemu_vnc_set_colors(s->vnc, 0xFFFFFFu, 0x000000u);
             s->vnc_fb = malloc((size_t)A1_FB_W * A1_FB_H);

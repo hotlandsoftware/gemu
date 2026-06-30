@@ -2311,7 +2311,9 @@ NesState *nes_create(const MosConfig *cfg) {
     }
 
     if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, RP2C02_WIDTH, RP2C02_HEIGHT);
+        s->vnc = gemu_vnc_create(cfg->vnc_addr,
+                                 RP2C02_WIDTH  * cfg->display_scale,
+                                 RP2C02_HEIGHT * cfg->display_scale);
         if (s->vnc)
             gemu_vnc_set_palette(s->vnc,
                                  s->ppu.alt_palette_rgb ? s->ppu.alt_palette_rgb

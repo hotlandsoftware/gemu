@@ -1431,7 +1431,9 @@ Kim1State *kim1_create(const MosConfig *cfg) {
 #endif
 
     if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, KIM1_PRESENT_WIDTH, KIM1_PRESENT_HEIGHT);
+        s->vnc = gemu_vnc_create(cfg->vnc_addr,
+                                 KIM1_PRESENT_WIDTH  * cfg->display_scale,
+                                 KIM1_PRESENT_HEIGHT * cfg->display_scale);
         if (s->vnc)
             gemu_vnc_set_palette(s->vnc, kim1_vnc_palette,
                                  (int)(sizeof(kim1_vnc_palette) / sizeof(kim1_vnc_palette[0])));

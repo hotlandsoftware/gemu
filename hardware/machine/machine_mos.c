@@ -193,7 +193,8 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
     s->monitor = gemu_monitor_create();
 
     if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, 320, 200);
+        s->vnc = gemu_vnc_create(cfg->vnc_addr, 320 * cfg->display_scale,
+                                 200 * cfg->display_scale);
         if (!s->vnc)
             fprintf(stderr, "gemu-6502: failed to start VNC server at %s\n",
                     cfg->vnc_addr);
