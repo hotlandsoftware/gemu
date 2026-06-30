@@ -24,11 +24,12 @@ typedef struct {
     const char *chargen;
     const char *tv;
     const char *ram;
+    const char *devices;
 } MachineDef;
 
 static const MachineDef machine_defs[] = {
 #include "generated/machine_defaults.inc"
-    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
+    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
 /* ── Device registry ─────────────────────────────────────────────────────── */
@@ -81,7 +82,7 @@ static const GemuArgsDef def = {
         "  -start ADDR        Override reset vector and start execution at ADDR\n"
         "  -cartridge FILE    Insert a cartridge\n"
         "  -fda FILE          Insert a floppy disk image\n"
-        "  -tape FILE         Insert a casette tape\n"
+        "  -tape [ADDR:]FILE  Insert a cassette tape\n"
         "  -cg NAME           Character generator\n"
         "  -vga NAME          Graphics card\n"
         "  -renderer MODE     Set SDL renderer: auto | software | accelerated (default: auto)\n"
@@ -166,6 +167,66 @@ static bool parse_cg(const char *name, MosCharGenType *out) {
         return true;
     }
     return false;
+}
+
+static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
+                          bool quiet) {
+    if (strcmp(name, "fds") == 0) {
+        cfg->fds_enabled = true;
+        return true;
+    }
+    if (strcmp(name, "vt100") == 0) {
+        *want_vt100 = true;
+        return true;
+    }
+    if (strcmp(name, "wozmon") == 0) {
+        cfg->want_wozmon = true;
+        return true;
+    }
+    if (strcmp(name, "a1ci") == 0) {
+        cfg->a1ci = true;
+        return true;
+    }
+    if (strcmp(name, "kim-keypad") == 0 || strcmp(name, "keypad") == 0) {
+        cfg->kim_keyboard = true;
+        return true;
+    }
+
+    static const struct { const char *name; NesDeviceType type; } nes_devs[] = {
+        {"nes-controller",   NES_DEVICE_CONTROLLER},
+        {"zapper",           NES_DEVICE_ZAPPER},
+        {"famicom-keyboard", NES_DEVICE_KEYBOARD},
+        {"rob",              NES_DEVICE_ROB},
+        {"rob-famicom",      NES_DEVICE_ROB_FAMICOM},
+        {"famicom-mic",      NES_DEVICE_FC2_MIC},
+    };
+    NesDeviceType type = NES_DEVICE_NONE;
+    for (int d = 0; d < (int)(sizeof(nes_devs)/sizeof(nes_devs[0])); d++)
+        if (strcmp(name, nes_devs[d].name) == 0) { type = nes_devs[d].type; break; }
+    if (type == NES_DEVICE_NONE) {
+        if (!quiet) fprintf(stderr, "gemu: unknown device '%s' (try -device ?)\n", name);
+        return false;
+    }
+    if (cfg->n_ports >= NES_PORTS) {
+        if (!quiet) fprintf(stderr, "gemu: all %d controller ports are already occupied\n", NES_PORTS);
+        return false;
+    }
+    cfg->ports[cfg->n_ports++] = type;
+    return true;
+}
+
+static bool attach_default_devices(MosConfig *cfg, bool *want_vt100,
+                                   const char *devices) {
+    if (!devices || !devices[0]) return true;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", devices);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (*tok && !attach_device(cfg, want_vt100, tok, false))
+            return false;
+    }
+    return true;
 }
 
 /* ── ROM argument parsing ────────────────────────────────────────────────── */
@@ -275,6 +336,8 @@ int mos_setup(int argc, char *argv[]) {
                 if (!sz) return 1;
                 cfg.mem_size = sz;
             }
+            if (!attach_default_devices(&cfg, &want_vt100, md->devices))
+                return 1;
             break;
         }
     }
@@ -324,7 +387,11 @@ int mos_setup(int argc, char *argv[]) {
             cfg.fda_path = rem[++i];
         } else if (strcmp(rem[i], "-tape") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -tape requires an argument\n"); return 1; }
-            cfg.tape_path = rem[++i];
+            const char *path = NULL;
+            uint32_t addr = 0;
+            if (gemu_parse_addr_arg("gemu", rem[++i], &addr, &path) < 0) return 1;
+            cfg.tape_addr = (uint16_t)addr;
+            cfg.tape_path = path;
         } else if (strcmp(rem[i], "-cg") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cg requires an argument\n"); return 1; }
             const char *name = rem[++i];
@@ -378,36 +445,7 @@ int mos_setup(int argc, char *argv[]) {
                     printf("  %-*s  %s\n", maxw, devs[d].name, devs[d].desc);
                 SDL_Quit(); return 0;
             }
-            if (strcmp(name, "fds") == 0) {
-                cfg.fds_enabled = true;
-            } else if (strcmp(name, "vt100") == 0) {
-                want_vt100 = true;
-            } else if (strcmp(name, "wozmon") == 0) {
-                cfg.want_wozmon = true;
-            } else if (strcmp(name, "kim-keypad") == 0 || strcmp(name, "keypad") == 0) {
-                cfg.kim_keyboard = true;
-            } else {
-                static const struct { const char *name; NesDeviceType type; } nes_devs[] = {
-                    {"nes-controller",   NES_DEVICE_CONTROLLER},
-                    {"zapper",           NES_DEVICE_ZAPPER},
-                    {"famicom-keyboard", NES_DEVICE_KEYBOARD},
-                    {"rob",              NES_DEVICE_ROB},
-                    {"rob-famicom",      NES_DEVICE_ROB_FAMICOM},
-                    {"famicom-mic",      NES_DEVICE_FC2_MIC},
-                };
-                NesDeviceType type = NES_DEVICE_NONE;
-                for (int d = 0; d < (int)(sizeof(nes_devs)/sizeof(nes_devs[0])); d++)
-                    if (strcmp(name, nes_devs[d].name) == 0) { type = nes_devs[d].type; break; }
-                if (type == NES_DEVICE_NONE) {
-                    fprintf(stderr, "gemu: unknown device '%s' (try -device ?)\n", name);
-                    return 1;
-                }
-                if (cfg.n_ports >= NES_PORTS) {
-                    fprintf(stderr, "gemu: all %d controller ports are already occupied\n", NES_PORTS);
-                    return 1;
-                }
-                cfg.ports[cfg.n_ports++] = type;
-            }
+            if (!attach_device(&cfg, &want_vt100, name, false)) return 1;
         } else if (strcmp(rem[i], "-soundhw") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -soundhw requires an argument\n"); return 1; }
             const char *hw = rem[++i];
@@ -502,6 +540,14 @@ int mos_setup(int argc, char *argv[]) {
 
     if (cfg.want_wozmon && cfg.machine != MOS_MACHINE_KIM1) {
         fprintf(stderr, "gemu: -device wozmon is currently supported by KIM-1 only\n");
+        return 1;
+    }
+    if (cfg.a1ci && cfg.machine != MOS_MACHINE_APPLE1) {
+        fprintf(stderr, "gemu: -device a1ci is supported by Apple I only\n");
+        return 1;
+    }
+    if (cfg.tape_path && cfg.machine == MOS_MACHINE_APPLE1 && !cfg.a1ci) {
+        fprintf(stderr, "gemu: Apple I -tape requires -device a1ci\n");
         return 1;
     }
 

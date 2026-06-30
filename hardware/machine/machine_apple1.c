@@ -1,7 +1,9 @@
 #include "machine_apple1.h"
+#include "gemu/args.h"
 #include "gemu/memory.h"
 #include <SDL2/SDL.h>
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -686,6 +688,85 @@ static bool apple1_sendkey(Apple1State *s, const char *text) {
     return true;
 }
 
+static GemuMediaResult apple1_tape_change(void *ud, const char *arg,
+                                          char *err, size_t err_len) {
+    Apple1State *s = ud;
+    uint32_t addr = 0;
+    const char *path = NULL;
+    if (!strchr(arg ? arg : "", ':')) {
+        snprintf(err, err_len, "expected ADDR:FILE for raw Apple I tape");
+        return GEMU_MEDIA_ERR;
+    }
+    if (gemu_parse_addr_arg("apple1", arg, &addr, &path) < 0) {
+        snprintf(err, err_len, "expected ADDR:FILE for raw Apple I tape");
+        return GEMU_MEDIA_ERR;
+    }
+    if (!path || !*path) {
+        snprintf(err, err_len, "expected ADDR:FILE for raw Apple I tape");
+        return GEMU_MEDIA_ERR;
+    }
+    if (addr >= s->ram_size) {
+        snprintf(err, err_len, "load address $%04X is outside RAM", (unsigned)addr);
+        return GEMU_MEDIA_ERR;
+    }
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        snprintf(err, err_len, "cannot open '%s': %s", path, strerror(errno));
+        return GEMU_MEDIA_ERR;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        snprintf(err, err_len, "cannot seek '%s'", path);
+        return GEMU_MEDIA_ERR;
+    }
+    long sz = ftell(fp);
+    if (sz <= 0) {
+        fclose(fp);
+        snprintf(err, err_len, "empty tape '%s'", path);
+        return GEMU_MEDIA_ERR;
+    }
+    rewind(fp);
+    if ((uint64_t)addr + (uint64_t)sz > s->ram_size) {
+        fclose(fp);
+        snprintf(err, err_len, "tape does not fit in RAM at $%04X", (unsigned)addr);
+        return GEMU_MEDIA_ERR;
+    }
+    size_t got = fread(s->mem + addr, 1, (size_t)sz, fp);
+    fclose(fp);
+    if (got != (size_t)sz) {
+        snprintf(err, err_len, "read error on '%s'", path);
+        return GEMU_MEDIA_ERR;
+    }
+
+    snprintf(s->tape_path, sizeof(s->tape_path), "%s", path);
+    s->tape_addr = (uint16_t)addr;
+    s->tape_size = (uint32_t)sz;
+    printf("apple1: tape loaded $%04X-$%04X <- %s\n",
+           (unsigned)addr, (unsigned)(addr + (uint32_t)sz - 1u), path);
+    return GEMU_MEDIA_OK;
+}
+
+static GemuMediaResult apple1_tape_eject(void *ud, char *err, size_t err_len) {
+    (void)err; (void)err_len;
+    Apple1State *s = ud;
+    s->tape_path[0] = '\0';
+    s->tape_addr = 0;
+    s->tape_size = 0;
+    printf("apple1: tape ejected\n");
+    return GEMU_MEDIA_OK;
+}
+
+static void apple1_tape_status(void *ud, char *buf, size_t buf_len) {
+    Apple1State *s = ud;
+    if (!s->tape_path[0])
+        snprintf(buf, buf_len, "empty");
+    else
+        snprintf(buf, buf_len, "$%04X-$%04X",
+                 (unsigned)s->tape_addr,
+                 (unsigned)(s->tape_addr + s->tape_size - 1u));
+}
+
 static uint8_t apple1_read(uint16_t addr, void *ud) {
     Apple1State *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
@@ -833,6 +914,35 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     }
     if (s->display && cfg->char_gen == MOS_CG_CM2140 && !s->display->have_chargen)
         fprintf(stderr, "apple1: -cg cm2140 requested but no chargen ROM was loaded; using built-in cm2140-compat fallback\n");
+
+    if (cfg->a1ci) {
+        GemuMediaDevice tape_dev = {
+            .name = "tape",
+            .kind = "a1ci",
+            .ud = s,
+            .change = apple1_tape_change,
+            .eject = apple1_tape_eject,
+            .status = apple1_tape_status,
+        };
+        if (cfg->tape_path)
+            snprintf(tape_dev.file, sizeof(tape_dev.file), "%s", cfg->tape_path);
+        gemu_monitor_register_media(s->monitor, &tape_dev);
+
+        if (cfg->tape_path) {
+            char arg[640], err[256] = "";
+            snprintf(arg, sizeof(arg), "0x%04X:%s",
+                     (unsigned)cfg->tape_addr, cfg->tape_path);
+            if (apple1_tape_change(s, arg, err, sizeof(err)) != GEMU_MEDIA_OK) {
+                fprintf(stderr, "apple1: tape: %s\n", err[0] ? err : "load failed");
+                apple1_destroy(s);
+                return NULL;
+            }
+        }
+    } else if (cfg->tape_path) {
+        fprintf(stderr, "apple1: -tape requires -device a1ci\n");
+        apple1_destroy(s);
+        return NULL;
+    }
 
     mos6502_init(&s->cpu);
     s->cpu.mem_read = apple1_read;

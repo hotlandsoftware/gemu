@@ -133,6 +133,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
                    'addr': int(r.get('addr', '0'), 16),
                    'sha256': r.get('sha256', '')}
                   for r in root.findall('rom')]
+        devices = [d.get('name') for d in root.findall('device') if d.get('name')]
         machines.append({
             'name':   name,
             'family': family,
@@ -145,6 +146,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             'chargen': root.get('chargen', ''),
             'tv':     root.get('tv',     ''),
             'ram':    root.get('ram',    ''),
+            'devices': ','.join(devices),
         })
         machine_family[name] = family
     machines.sort(key=lambda m: m['name'])
@@ -184,7 +186,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             f'    {{ "{m["name"]}", "{m["canonical"]}", '
             f'{cstr(m["cpu"])}, {cstr(m["vga"])}, '
             f'{cstr(m["soundhw"])}, {cstr(m["chargen"])}, '
-            f'"{tv}", {cstr(m["ram"])} }},\n'
+            f'"{tv}", {cstr(m["ram"])}, {cstr(m["devices"])} }},\n'
         )
     with open(os.path.join(gen_dir, 'machine_defaults.inc'), 'w', encoding='utf-8') as f:
         f.writelines(dlines)

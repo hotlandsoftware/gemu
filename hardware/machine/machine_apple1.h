@@ -20,6 +20,9 @@ typedef struct Apple1State {
     uint8_t          mem[0x10000];
     uint8_t          rom_map[0x10000];
     uint32_t         ram_size;
+    char             tape_path[512];
+    uint16_t         tape_addr;
+    uint32_t         tape_size;
     char             mon_line[128];
     int              mon_len;
     uint16_t         mon_last_addr;

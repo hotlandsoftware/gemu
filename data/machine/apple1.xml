@@ -1,6 +1,7 @@
 <?xml version="1.0"?>
 <machine name="apple1" family="mos" description="Apple I"
          cpu="6502" chargen="auto" tv="ntsc" ram="8K">
+    <device name="a1ci"/>
     <rom name="apple-a1.a1" region="video-prom" addr="0x0000" sha256="58865000ea5f2e36ec926498b0a3f2a050a4243f44c07a2aa6689d410471cfc1"/>
     <rom name="apple-a2.a2" region="video-prom" addr="0x0100" sha256="8effff65112e40a5397575da351fc99c11e2e421da440413404445dab93057e7"/>
     <rom name="apple-a3.3"  region="video-prom" addr="0x0200" sha256="4fe331a23805c21f0cb78701e1c7f94db56c207674daeb6487fa76ba97f6a78f"/>
