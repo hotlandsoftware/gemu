@@ -270,6 +270,11 @@ int mos_setup(int argc, char *argv[]) {
                         md->name, md->chargen);
                 return 1;
             }
+            if (md->ram && md->ram[0]) {
+                uint32_t sz = parse_size(md->ram);
+                if (!sz) return 1;
+                cfg.mem_size = sz;
+            }
             break;
         }
     }

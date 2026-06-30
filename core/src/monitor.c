@@ -1071,6 +1071,7 @@ static void qmp_human_monitor_command(GemuMonitor *mon, const char *cmd,
         return;
     }
 
+    enqueue_text(mon, cmd);
     qmp_send_return_string(mon, "", id);
 }
 

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #ifndef _WIN32
 #include <sys/select.h>
 #include <unistd.h>
@@ -15,9 +16,12 @@
 #define APPLE1_DSP     0xD012u
 #define APPLE1_DSPCR   0xD013u
 #define APPLE1_ROM     0xFF00u
+#define APPLE1_WOZ_ECHO 0xFFEFu
+#define APPLE1_MAX_RAM 0xD000u
 #define APPLE1_HZ      1000000u
 #define APPLE1_FPS     60u
 #define APPLE1_CPF     (APPLE1_HZ / APPLE1_FPS)
+#define APPLE1_ECHO_CYCLES (APPLE1_HZ / 30u) /* 300 baud, 10 bits/char */
 
 #define A1_COLS        40
 #define A1_ROWS        24
@@ -49,6 +53,9 @@ struct Apple1Display {
     bool          have_chargen;
     MosCharGenType cg;
 };
+
+static void apple1_monitor_prompt(Apple1State *s);
+static uint8_t apple1_read(uint16_t addr, void *ud);
 
 static void apple1_display_kpush(Apple1Display *d, uint8_t ch) {
     if (!d) return;
@@ -230,6 +237,15 @@ static void apple1_display_clear(Apple1Display *d) {
     d->col = 0;
     d->khead = d->ktail = 0;
     d->dirty = true;
+}
+
+static void apple1_reset_machine(Apple1State *s) {
+    mos6502_reset(&s->cpu);
+    s->native_monitor = !s->have_monitor_rom;
+    s->quit_requested = false;
+    apple1_display_clear(s->display);
+    if (s->native_monitor)
+        apple1_monitor_prompt(s);
 }
 
 static void apple1_display_destroy(Apple1Display *d) {
@@ -416,6 +432,22 @@ static void apple1_write_display(Apple1State *s, uint8_t val) {
     }
 }
 
+static bool apple1_romless_woz_trap(Apple1State *s) {
+    if (!s || s->have_monitor_rom || s->cpu.PC != APPLE1_WOZ_ECHO)
+        return false;
+
+    apple1_write_display(s, s->cpu.A);
+    s->cpu.SP++;
+    uint8_t lo = apple1_read((uint16_t)(0x0100u | s->cpu.SP), s);
+    s->cpu.SP++;
+    uint8_t hi = apple1_read((uint16_t)(0x0100u | s->cpu.SP), s);
+    s->cpu.PC = (uint16_t)(((uint16_t)hi << 8) | lo);
+    s->cpu.PC++;
+    s->cpu.cycle_count += APPLE1_ECHO_CYCLES;
+    s->cpu.insn_count++;
+    return true;
+}
+
 static void apple1_monitor_puts(Apple1State *s, const char *text) {
     while (*text)
         apple1_write_display(s, (uint8_t)*text++);
@@ -465,11 +497,15 @@ static bool apple1_monitor_parse_hex(const char **pp, uint16_t *out) {
     return true;
 }
 
+static uint8_t apple1_peek_mem(const Apple1State *s, uint16_t addr) {
+    return (s->rom_map[addr] || addr < s->ram_size) ? s->mem[addr] : 0x00u;
+}
+
 static void apple1_monitor_store(Apple1State *s, uint16_t addr, const char *p) {
     uint16_t value = 0;
     bool any = false;
     while (apple1_monitor_parse_hex(&p, &value)) {
-        if (!s->rom_map[addr])
+        if (!s->rom_map[addr] && addr < s->ram_size)
             s->mem[addr] = (uint8_t)value;
         s->mon_last_addr = addr++;
         any = true;
@@ -489,7 +525,7 @@ static void apple1_monitor_dump(Apple1State *s, uint16_t start, uint16_t end) {
         apple1_monitor_hex16(s, addr);
         apple1_monitor_puts(s, ": ");
         for (int i = 0; i < 8; i++) {
-            apple1_monitor_hex8(s, s->mem[addr]);
+            apple1_monitor_hex8(s, apple1_peek_mem(s, addr));
             s->mon_last_addr = addr;
             if (addr == end) return;
             addr++;
@@ -506,13 +542,6 @@ static void apple1_monitor_execute(Apple1State *s, const char *line) {
 
     if (!have_addr) {
         if (*p == '\0') return;
-        if (toupper((unsigned char)*p) == 'Q' && p[1] == '\0') {
-            if (s->cfg->no_shutdown)
-                gemu_monitor_shutdown_or_pause(s->monitor, true);
-            else
-                s->quit_requested = true;
-            return;
-        }
         if (toupper((unsigned char)*p) == 'R') {
             s->cpu.PC = s->mon_last_addr;
             s->native_monitor = false;
@@ -578,6 +607,85 @@ static void apple1_monitor_poll(Apple1State *s) {
         apple1_monitor_key(s, ser->read_byte(ser->ud));
 }
 
+static bool token_eq(const char *a, const char *b) {
+    return strcasecmp(a, b) == 0;
+}
+
+static bool apple1_sendkey_token(Apple1State *s, const char *tok) {
+    if (!tok || !*tok) return true;
+    if (token_eq(tok, "reset")) {
+        apple1_reset_machine(s);
+        return true;
+    }
+    if (token_eq(tok, "cls") || token_eq(tok, "clear")) {
+        apple1_display_clear(s->display);
+        return true;
+    }
+    if (token_eq(tok, "enter") || token_eq(tok, "return")) {
+        apple1_display_kpush(s->display, '\r');
+        return true;
+    }
+    if (token_eq(tok, "space")) {
+        apple1_display_kpush(s->display, ' ');
+        return true;
+    }
+    if (token_eq(tok, "tab")) {
+        apple1_display_kpush(s->display, '\t');
+        return true;
+    }
+    if (token_eq(tok, "backspace") || token_eq(tok, "bs") ||
+        token_eq(tok, "delete") || token_eq(tok, "del")) {
+        apple1_display_kpush(s->display, 0x7F);
+        return true;
+    }
+    if (token_eq(tok, "dash") || token_eq(tok, "minus")) {
+        apple1_display_kpush(s->display, '-');
+        return true;
+    }
+
+    size_t len = strlen(tok);
+    if (len == 1) {
+        apple1_display_kpush(s->display, (uint8_t)tok[0]);
+        return true;
+    }
+    if (len >= 2 && tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
+        char *end = NULL;
+        long v = strtol(tok, &end, 16);
+        if (end && *end == '\0' && v >= 0 && v <= 0x7F) {
+            apple1_display_kpush(s->display, (uint8_t)v);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool apple1_sendkey(Apple1State *s, const char *text) {
+    while (*text == ' ' || *text == '\t') text++;
+    if (strncasecmp(text, "sendkey", 7) != 0 ||
+        (text[7] != '\0' && text[7] != ' ' && text[7] != '\t'))
+        return false;
+    const char *p = text + 7;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) {
+        printf("sendkey: usage: sendkey a-b-c-enter | reset | cls\n");
+        return true;
+    }
+
+    char seq[256];
+    snprintf(seq, sizeof(seq), "%s", p);
+    char *tok = seq;
+    while (tok && *tok) {
+        char *next = strchr(tok, '-');
+        if (next) *next++ = '\0';
+        if (!apple1_sendkey_token(s, tok)) {
+            printf("sendkey: unknown key '%s'\n", tok);
+            return true;
+        }
+        tok = next;
+    }
+    return true;
+}
+
 static uint8_t apple1_read(uint16_t addr, void *ud) {
     Apple1State *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
@@ -592,6 +700,8 @@ static uint8_t apple1_read(uint16_t addr, void *ud) {
     if (addr == APPLE1_DSPCR)
         return 0x80u;
 
+    if (!s->rom_map[addr] && addr >= s->ram_size)
+        return 0x00u;
     return s->mem[addr];
 }
 
@@ -606,7 +716,7 @@ static void apple1_write(uint16_t addr, uint8_t val, void *ud) {
     if (addr >= APPLE1_KBD && addr <= APPLE1_DSPCR)
         return;
 
-    if (!s->rom_map[addr])
+    if (!s->rom_map[addr] && addr < s->ram_size)
         s->mem[addr] = val;
 }
 
@@ -683,6 +793,13 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     if (!s) return NULL;
 
     s->cfg = cfg;
+    s->ram_size = cfg->mem_size ? cfg->mem_size : (8u * 1024u);
+    if (s->ram_size > APPLE1_MAX_RAM) {
+        fprintf(stderr, "apple1: RAM size must be 1K-52K (got %uK)\n",
+                s->ram_size / 1024u);
+        free(s);
+        return NULL;
+    }
     s->monitor = gemu_monitor_create();
     if (!s->monitor) {
         free(s);
@@ -763,14 +880,10 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
                 if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true);
                 else { quit = true; break; }
             } else if (cmd == GEMU_MON_RESET) {
-                mos6502_reset(&s->cpu);
-                s->native_monitor = !s->have_monitor_rom;
-                s->quit_requested = false;
-                apple1_display_clear(s->display);
-                if (s->native_monitor)
-                    apple1_monitor_prompt(s);
+                apple1_reset_machine(s);
             } else if (cmd == GEMU_MON_CUSTOM) {
-                gemu_monitor_unknown_command(s->monitor);
+                if (!apple1_sendkey(s, gemu_monitor_command_text(s->monitor)))
+                    gemu_monitor_unknown_command(s->monitor);
             }
         }
 
@@ -785,6 +898,7 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
             uint64_t target = s->cpu.cycle_count + APPLE1_CPF;
             while (!quit && s->cpu.cycle_count < target) {
                 if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
+                if (apple1_romless_woz_trap(s)) continue;
                 mos6502_step(&s->cpu);
             }
         }

@@ -76,7 +76,7 @@
                 <div class="info-header">Details</div>
                 <table>
 <tr><td>CPU</td><td>MOS 6502 @ 1 MHz or Motorola 6800</td></tr>
-<tr><td>RAM</td><td>4 KB (up to 52 KB)</td></tr>
+<tr><td>RAM</td><td>8 KB default (up to 52 KB)</td></tr>
 <tr><td>I/O</td><td>PIA keyboard/display</td></tr>
 <tr><td>Family</td><td>mos/motorola</td></tr>
 <tr><td>Status</td><td><span class="badge badge-partial">Preliminary</span></td></tr>
@@ -87,11 +87,12 @@
         </aside>
         <div>
             <p class="description">The Apple I was, as its name suggests, the first computer ever developed by Apple. It was released in 1976 at $666.66 (~$3774 in 2026) and was built around a MOS 6502 and a simple keyboard/display interface. It can also be modified to run with a Motorola 6800 (not currently supported by GEMU.)<br><br>
-            This system supports both a ROM and ROMless boot.</p>
+            GEMU supports both a ROM and ROMless boot - though certain programs may not run without the Woz Monitor ROM.</p>
 
             <div class="section-title">Run</div>
             <div class="run-block">./bin/gemu -M apple1
 ./bin/gemu -M apple1 -rom roms/apple1 -rom 0xE000:roms/basic.bin
+./bin/gemu -M apple1 -m 52
 ./bin/gemu -M apple1 -display curses # runs in terminal</div>
         </div>
     </div>
