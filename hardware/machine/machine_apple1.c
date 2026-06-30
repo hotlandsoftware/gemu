@@ -691,18 +691,18 @@ static bool apple1_sendkey(Apple1State *s, const char *text) {
 static GemuMediaResult apple1_tape_change(void *ud, const char *arg,
                                           char *err, size_t err_len) {
     Apple1State *s = ud;
-    uint32_t addr = 0;
+    uint32_t addr = 0x0280u;
     const char *path = NULL;
-    if (!strchr(arg ? arg : "", ':')) {
-        snprintf(err, err_len, "expected ADDR:FILE for raw Apple I tape");
-        return GEMU_MEDIA_ERR;
-    }
-    if (gemu_parse_addr_arg("apple1", arg, &addr, &path) < 0) {
-        snprintf(err, err_len, "expected ADDR:FILE for raw Apple I tape");
-        return GEMU_MEDIA_ERR;
+    if (strchr(arg ? arg : "", ':')) {
+        if (gemu_parse_addr_arg("apple1", arg, &addr, &path) < 0) {
+            snprintf(err, err_len, "expected [ADDR:]FILE for raw Apple I tape");
+            return GEMU_MEDIA_ERR;
+        }
+    } else {
+        path = arg;
     }
     if (!path || !*path) {
-        snprintf(err, err_len, "expected ADDR:FILE for raw Apple I tape");
+        snprintf(err, err_len, "expected [ADDR:]FILE for raw Apple I tape");
         return GEMU_MEDIA_ERR;
     }
     if (addr >= s->ram_size) {

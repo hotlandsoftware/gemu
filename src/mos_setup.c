@@ -389,7 +389,13 @@ int mos_setup(int argc, char *argv[]) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -tape requires an argument\n"); return 1; }
             const char *path = NULL;
             uint32_t addr = 0;
-            if (gemu_parse_addr_arg("gemu", rem[++i], &addr, &path) < 0) return 1;
+            const char *arg = rem[++i];
+            if (cfg.machine == MOS_MACHINE_APPLE1 && !strchr(arg, ':')) {
+                addr = 0x0280u;
+                path = arg;
+            } else if (gemu_parse_addr_arg("gemu", arg, &addr, &path) < 0) {
+                return 1;
+            }
             cfg.tape_addr = (uint16_t)addr;
             cfg.tape_path = path;
         } else if (strcmp(rem[i], "-cg") == 0) {
