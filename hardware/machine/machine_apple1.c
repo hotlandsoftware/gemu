@@ -1,6 +1,8 @@
 #include "machine_apple1.h"
 #include "gemu/args.h"
 #include "gemu/memory.h"
+#include "gemu/sha256.h"
+#include "romdb.h"
 #include <SDL2/SDL.h>
 #include <ctype.h>
 #include <errno.h>
@@ -692,8 +694,9 @@ static GemuMediaResult apple1_tape_change(void *ud, const char *arg,
                                           char *err, size_t err_len) {
     Apple1State *s = ud;
     uint32_t addr = 0x0280u;
+    bool explicit_addr = strchr(arg ? arg : "", ':') != NULL;
     const char *path = NULL;
-    if (strchr(arg ? arg : "", ':')) {
+    if (explicit_addr) {
         if (gemu_parse_addr_arg("apple1", arg, &addr, &path) < 0) {
             snprintf(err, err_len, "expected [ADDR:]FILE for raw Apple I tape");
             return GEMU_MEDIA_ERR;
@@ -703,10 +706,6 @@ static GemuMediaResult apple1_tape_change(void *ud, const char *arg,
     }
     if (!path || !*path) {
         snprintf(err, err_len, "expected [ADDR:]FILE for raw Apple I tape");
-        return GEMU_MEDIA_ERR;
-    }
-    if (addr >= s->ram_size) {
-        snprintf(err, err_len, "load address $%04X is outside RAM", (unsigned)addr);
         return GEMU_MEDIA_ERR;
     }
 
@@ -727,21 +726,56 @@ static GemuMediaResult apple1_tape_change(void *ud, const char *arg,
         return GEMU_MEDIA_ERR;
     }
     rewind(fp);
-    if ((uint64_t)addr + (uint64_t)sz > s->ram_size) {
+
+    uint8_t *buf = malloc((size_t)sz);
+    if (!buf) {
         fclose(fp);
-        snprintf(err, err_len, "tape does not fit in RAM at $%04X", (unsigned)addr);
+        snprintf(err, err_len, "out of memory reading '%s'", path);
         return GEMU_MEDIA_ERR;
     }
-    size_t got = fread(s->mem + addr, 1, (size_t)sz, fp);
+    size_t got = fread(buf, 1, (size_t)sz, fp);
     fclose(fp);
     if (got != (size_t)sz) {
+        free(buf);
         snprintf(err, err_len, "read error on '%s'", path);
         return GEMU_MEDIA_ERR;
     }
 
+    /* Real Apple I cassettes carry no address header -- it was typed into the
+     * Woz Monitor by hand before pressing play. Recognise known dumps by
+     * content hash (same romdb used for ROM images) so common tapes don't
+     * need an explicit ADDR: prefix; fall back to the $0280 BASIC default
+     * otherwise. */
+    const RomDbEntry *match = NULL;
+    if (!explicit_addr) {
+        uint8_t digest[GEMU_SHA256_DIGEST_LEN];
+        GemuSha256Ctx ctx;
+        gemu_sha256_init(&ctx);
+        gemu_sha256_update(&ctx, buf, (size_t)sz);
+        gemu_sha256_final(&ctx, digest);
+        char hex[65];
+        gemu_sha256_hex(digest, hex);
+        const RomDbEntry *e = romdb_lookup(hex);
+        if (e && e->region && strcmp(e->region, "tape") == 0) {
+            addr  = e->addr;
+            match = e;
+        }
+    }
+
+    if (addr >= s->ram_size || (uint64_t)addr + (uint64_t)sz > s->ram_size) {
+        free(buf);
+        snprintf(err, err_len, "tape does not fit in RAM at $%04X", (unsigned)addr);
+        return GEMU_MEDIA_ERR;
+    }
+    memcpy(s->mem + addr, buf, (size_t)sz);
+    free(buf);
+
     snprintf(s->tape_path, sizeof(s->tape_path), "%s", path);
     s->tape_addr = (uint16_t)addr;
     s->tape_size = (uint32_t)sz;
+    if (match)
+        printf("apple1: tape '%s' matched known dump '%s' -> $%04X\n",
+               path, match->label, (unsigned)addr);
     printf("apple1: tape loaded $%04X-$%04X <- %s\n",
            (unsigned)addr, (unsigned)(addr + (uint32_t)sz - 1u), path);
     return GEMU_MEDIA_OK;
@@ -930,8 +964,11 @@ Apple1State *apple1_create(const MosConfig *cfg) {
 
         if (cfg->tape_path) {
             char arg[640], err[256] = "";
-            snprintf(arg, sizeof(arg), "0x%04X:%s",
-                     (unsigned)cfg->tape_addr, cfg->tape_path);
+            if (cfg->tape_addr_explicit)
+                snprintf(arg, sizeof(arg), "0x%04X:%s",
+                         (unsigned)cfg->tape_addr, cfg->tape_path);
+            else
+                snprintf(arg, sizeof(arg), "%s", cfg->tape_path);
             if (apple1_tape_change(s, arg, err, sizeof(err)) != GEMU_MEDIA_OK) {
                 fprintf(stderr, "apple1: tape: %s\n", err[0] ? err : "load failed");
                 apple1_destroy(s);

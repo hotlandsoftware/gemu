@@ -89,6 +89,7 @@ typedef struct MosConfig {
     bool            a1ci;         /* Apple I Cassette Interface attached */
     const char     *tape_path;   /* KIM-1: cassette tape image (.kim binary), NULL = none */
     uint16_t        tape_addr;   /* Apple I/COSMAC helper load address for raw tapes */
+    bool            tape_addr_explicit; /* Apple I: true if -tape gave ADDR:FILE explicitly */
     GemuSerial     *serial;      /* serial terminal attached to this machine (NULL = none) */
     uint32_t        mem_size;  /* generic machine RAM in bytes (0 = default 64KB) */
 } MosConfig;
