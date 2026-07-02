@@ -119,6 +119,10 @@ void gemu_video_sdl_present_argb(GemuVideoSdl *v, const uint32_t *pixels,
         SDL_GetRendererOutputSize(v->renderer, &ow, &oh);
         int scale = (v->width > 0) ? (ow / v->width) : 1;
         if (scale < 1) scale = 1;
+        /* Cap independent of the emulated framebuffer's pixel scale — low-res
+         * cores (e.g. CHIP-8 at scale 10) would otherwise blow the menu font
+         * up to the point of being unreadable/comically oversized. */
+        if (scale > 4) scale = 4;
         SDL_RenderSetLogicalSize(v->renderer, 0, 0);
         v->overlay_cb(v->overlay_ud, v->renderer, scale);
         SDL_RenderSetLogicalSize(v->renderer, v->width, v->height);
