@@ -111,6 +111,11 @@ static const uint8_t font_data[] = {
 #define FONT_H  8
 #define FONT_GLYPH(c)  (&font_data[((unsigned)(c) - 32u) * FONT_W])
 
+const uint8_t *gemu_font_glyph(char ch) {
+    if (ch < 32 || ch > 122) ch = '?';
+    return FONT_GLYPH(ch);
+}
+
 /* ── INI path ──────────────────────────────────────────────────────────── */
 
 static void build_ini_path(char *out, size_t len) {

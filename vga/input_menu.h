@@ -1,6 +1,14 @@
 #pragma once
 #include <SDL2/SDL.h>
 #include <stdbool.h>
+#include <stdint.h>
+
+/* Shared 6×8 bitmap font (ASCII 32–122), reused by other overlay renderers
+ * (e.g. the NES Lua scripting gui.text binding). Each byte is one glyph
+ * column, LSB = top row; out-of-range characters fall back to '?'. */
+#define GEMU_FONT_W 6
+#define GEMU_FONT_H 8
+const uint8_t *gemu_font_glyph(char ch);
 
 typedef struct InputMenu InputMenu;
 

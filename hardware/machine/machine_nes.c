@@ -1620,6 +1620,32 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
     }
 }
 
+#ifdef HAVE_LUA
+/* Only installed as cpu.mem_read/mem_write when -lua is active, so a script
+ * with no memory.register{read,write}() hooks costs nothing on the hot path. */
+static uint8_t nes_cpu_read_lua(uint16_t addr, void *ud) {
+    NesState *s = ud;
+    uint8_t val = nes_cpu_read(addr, ud);
+    nes_lua_notify_read(s->lua, addr, val);
+    return val;
+}
+static void nes_cpu_write_lua(uint16_t addr, uint8_t val, void *ud) {
+    NesState *s = ud;
+    nes_cpu_write(addr, val, ud);
+    nes_lua_notify_write(s->lua, addr, val);
+}
+static uint64_t nes_lua_get_framecount(void *ud) {
+    NesState *s = ud;
+    return s->ppu.frame;
+}
+static void nes_lua_get_zapper(void *ud, int *x, int *y, int *click) {
+    NesState *s = ud;
+    *x = s->zapper_x;
+    *y = s->zapper_y;
+    *click = (s->zapper_trigger_ttl > 0) ? 1 : 0;
+}
+#endif
+
 /* ── FDS media device ────────────────────────────────────────────────────── */
 
 static GemuMediaResult fds_media_change(void *ud, const char *arg,
@@ -2338,6 +2364,24 @@ NesState *nes_create(const MosConfig *cfg) {
     if (cfg->is_arcade)
         s->vs_dip = VS_DIP_DEFAULT;
 
+#ifdef HAVE_LUA
+    if (cfg->lua_path) {
+        NesLuaBus bus = {
+            .mem_read       = nes_cpu_read,
+            .mem_write      = nes_cpu_write,
+            .get_framecount = nes_lua_get_framecount,
+            .get_zapper     = nes_lua_get_zapper,
+            .ud             = s,
+            .rom_path       = s->cart_path_buf[0] ? s->cart_path_buf : NULL,
+        };
+        s->lua = nes_lua_create(cfg->lua_path, &bus);
+        if (s->lua) {
+            s->cpu.mem_read  = nes_cpu_read_lua;
+            s->cpu.mem_write = nes_cpu_write_lua;
+        }
+    }
+#endif
+
     nes_reset(s);
 
     return s;
@@ -2345,6 +2389,9 @@ NesState *nes_create(const MosConfig *cfg) {
 
 void nes_destroy(NesState *s) {
     nes_save_persistent(s);
+#ifdef HAVE_LUA
+    nes_lua_destroy(s->lua);
+#endif
     if (s->fds_enabled) { free(s->fds.raw_disk); }
 #ifdef GEMU_GTK
     hex_editor_destroy(s->hex_editor);
@@ -2495,6 +2542,9 @@ void nes_run(NesState *s, const MosConfig *cfg) {
 
         /* Input: display action bits + VNC events */
         nes_handle_keys(s, held);
+#ifdef HAVE_LUA
+        nes_lua_pre_frame(s->lua, s->ctrl_state);
+#endif
         if (s->cfg->is_arcade) {
             if (s->vs_coin_latch[0] > 0) s->vs_coin_latch[0]--;
             if (s->vs_coin_latch[1] > 0) s->vs_coin_latch[1]--;
@@ -2505,6 +2555,9 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             s->ppu.dirty = false;
             while (!s->ppu.dirty) {
                 if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
+#ifdef HAVE_LUA
+                if (s->lua) nes_lua_notify_exec(s->lua, s->cpu.PC);
+#endif
                 uint64_t prev = s->cpu.cycle_count;
                 mos6502_step(&s->cpu);
                 uint64_t delta = s->cpu.cycle_count - prev;
@@ -2534,6 +2587,12 @@ void nes_run(NesState *s, const MosConfig *cfg) {
 
             /* Flush APU samples to SDL audio */
             apu2a03_flush(&s->apu);
+
+#ifdef HAVE_LUA
+            /* Resume the script for this frame; gui.* draws straight into
+             * pixels_argb so overlays show up in both the display and VNC. */
+            nes_lua_run_frame(s->lua, s->ppu.pixels_argb, RP2C02_WIDTH, RP2C02_HEIGHT);
+#endif
 
             /* Render completed frame (PPU already builds pixels_argb) */
             if (s->display)

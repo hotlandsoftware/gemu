@@ -83,6 +83,9 @@ static const GemuArgsDef def = {
         "  -cartridge FILE    Insert a cartridge\n"
         "  -fda FILE          Insert a floppy disk image\n"
         "  -tape [ADDR:]FILE  Insert a cassette tape\n"
+#ifdef HAVE_LUA
+        "  -lua FILE          Run an FCEUX-Lua-subset script (NES only)\n"
+#endif
         "  -cg NAME           Character generator\n"
         "  -vga NAME          Graphics card\n"
         "  -renderer MODE     Set SDL renderer: auto | software | accelerated (default: auto)\n"
@@ -96,7 +99,11 @@ static const GemuArgsDef def = {
         "  ./bin/gemu -M mos -rom 0xE000:rom.bin\n"
         "  ./bin/gemu -M mos -rom 0x0000:6502_functional_test.bin -start 0x0400\n"
         "  ./bin/gemu -M nes -cartridge game.nes -vnc :1\n"
-        "  ./bin/gemu -M nes -device fds -fda game.fds -device nes-controller\n",
+        "  ./bin/gemu -M nes -device fds -fda game.fds -device nes-controller\n"
+#ifdef HAVE_LUA
+        "  ./bin/gemu -M nes -cartridge game.nes -lua script.lua\n"
+#endif
+        ,
 };
 
 /* ── Memory size parsing ─────────────────────────────────────────────────── */
@@ -382,6 +389,13 @@ int mos_setup(int argc, char *argv[]) {
         } else if (strcmp(rem[i], "-cartridge") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cartridge requires an argument\n"); return 1; }
             cfg.cart_path = rem[++i];
+        } else if (strcmp(rem[i], "-lua") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -lua requires an argument\n"); return 1; }
+            cfg.lua_path = rem[++i];
+#ifndef HAVE_LUA
+            fprintf(stderr, "gemu: -lua: this build was compiled without Lua 5.1 support\n");
+            return 1;
+#endif
         } else if (strcmp(rem[i], "-fda") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -fda requires an argument\n"); return 1; }
             cfg.fda_path = rem[++i];

@@ -17,6 +17,9 @@
 #  include "rob.h"
 #  include "rob_window.h"
 #endif
+#ifdef HAVE_LUA
+#  include "nes_lua.h"
+#endif
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -200,6 +203,10 @@ typedef struct NesState {
 #ifdef HAVE_ROB
     RobState    rob;
     RobWindow  *rob_window;
+#endif
+
+#ifdef HAVE_LUA
+    NesLua *lua;   /* -lua FILE: FCEUX-Lua-subset script, NULL if none loaded */
 #endif
 } NesState;
 

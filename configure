@@ -84,6 +84,10 @@ FAMILY_SRC_ROB = {
     'mos': ['hardware/device/rob.c', 'hardware/device/rob_window.c'],
 }
 
+FAMILY_SRC_LUA = {
+    'mos': ['hardware/device/nes_lua.c'],
+}
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def run(cmd):
@@ -401,6 +405,17 @@ def main():
             assimp_libs = lf or ['-lassimp']
             gl_libs     = gl or ['-lGL']
 
+    have_lua    = False
+    lua_cflags  = []
+    lua_libs    = []
+    if 'mos' in targets:
+        cf = pkg('lua5.1', '--cflags', *pkg_flags)
+        lf = pkg('lua5.1', '--libs',   *pkg_flags)
+        if check('Lua 5.1 (NES -lua scripting)', lf):
+            have_lua   = True
+            lua_cflags = cf or []
+            lua_libs   = lf or ['-llua5.1']
+
     have_caca   = False
     caca_cflags = []
     caca_libs   = []
@@ -464,11 +479,13 @@ def main():
     if have_winmidi: defs_list.append('HAVE_WINMIDI')
     if have_rob:     defs_list.append('HAVE_ROB')
     if have_caca:    defs_list.append('HAVE_CACA')
+    if have_lua:     defs_list.append('HAVE_LUA')
     defs = ' '.join(f'-D{d}' for d in defs_list)
 
     cflags_parts = ['$CFLAGS_BASE', inc_flags] + sdl2_cflags
     if want_gtk:  cflags_parts += gtk_cflags + epoxy_cflags
     if have_caca: cflags_parts += caca_cflags
+    if have_lua:  cflags_parts += lua_cflags
     if defs:      cflags_parts.append(defs)
     unified_cflags = ' '.join(cflags_parts)
 
@@ -485,6 +502,8 @@ def main():
             ld_parts += alsa_libs
         if have_rob:
             ld_parts += assimp_libs + gl_libs + ['-lepoxy', '-lm']
+        if have_lua:
+            ld_parts += lua_libs
     if on_windows:
         ld_parts += ['-lws2_32', '-mconsole']
         if have_winmidi:
@@ -524,6 +543,9 @@ def main():
                 add(src)
         if have_rob:
             for src in FAMILY_SRC_ROB.get(tname, []):
+                add(src)
+        if have_lua:
+            for src in FAMILY_SRC_LUA.get(tname, []):
                 add(src)
 
     add('src/main.c')
@@ -610,6 +632,7 @@ def main():
         else:
             print(f'  ALSA MIDI : {"yes" if have_alsa else "no (MIDI output disabled)"}')
         print(f'  ROB 3D    : {"yes (assimp + OpenGL)" if have_rob else "no (assimp or OpenGL not found)"}')
+        print(f'  Lua script: {"yes (-lua for NES)" if have_lua else "no (lua5.1 not found)"}')
     print(f'  debug     : {"yes (-O0 -g)" if args.debug else "no (-O2)"}')
     print(f'  build dir : {build_dir}/')
     print(f'  bin dir   : {bin_dir}/')
