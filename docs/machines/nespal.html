@@ -98,6 +98,8 @@
         <div>
             <p class="description">The PAL Nintendo Entertainment System is the European and Australian release of Nintendo's 8-bit console, sold from 1986 onwards. It runs at 50 Hz instead of 60 Hz and uses the Ricoh 2A07 CPU (identical to the 2A03 but clocked for PAL). Many NTSC games run noticeably slower on PAL hardware due to the timing difference.<br><br>
             GEMU's PAL emulation uses the correct 50 Hz frame rate and adjusted CPU/PPU clock ratios. This system does not require a ROM to boot.</p>
+            <br>
+            If GEMU is built with Lua support, this system supports FCEUX scripts by using the -lua command (some scripts may not work)
 
             <div class="section-title">Run</div>
             <div class="run-block">./bin/gemu -M nespal -cartridge /path/to/cartridge.nes</div>
