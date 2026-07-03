@@ -2,6 +2,7 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "5clown.h"
+#include "gemu/screendump.h"
 #include <SDL2/SDL.h>
 #include <errno.h>
 #include <stdio.h>
@@ -296,6 +297,24 @@ static void fiveclown_render(FiveClownState *s) {
     }
 }
 
+/* ── Screendump ──────────────────────────────────────────────────────────── */
+
+static bool fiveclown_screendump(void *ud, const char *path) {
+    FiveClownState *s = ud;
+    int w = FIVECLOWN_FB_WIDTH, h = FIVECLOWN_FB_HEIGHT;
+    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
+    if (!rgb) return false;
+    for (int i = 0; i < w * h; i++) {
+        uint32_t c = s->pixels_argb[i];
+        rgb[i * 3 + 0] = (uint8_t)(c >> 16);
+        rgb[i * 3 + 1] = (uint8_t)(c >> 8);
+        rgb[i * 3 + 2] = (uint8_t)(c);
+    }
+    bool ok = gemu_screendump(path, rgb, w, h);
+    free(rgb);
+    return ok;
+}
+
 /* ── NVRAM persistence ───────────────────────────────────────────────────── */
 
 static void fiveclown_build_sav_path(char *out, size_t len) {
@@ -444,6 +463,7 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
     s->pia1.write_pb  = pia1_write_pb;
 
     s->monitor = gemu_monitor_create();
+    gemu_monitor_set_screendump_cb(s->monitor, fiveclown_screendump, s);
 
     fiveclown_build_sav_path(s->sav_path, sizeof(s->sav_path));
     fiveclown_nvram_load(s);
