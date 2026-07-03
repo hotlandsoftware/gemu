@@ -3,6 +3,7 @@
 #include "machine_apple1.h"
 #include "nes.h"
 #include "kim1.h"
+#include "5clown.h"
 #include "vt100.h"
 #include "romdb.h"
 #include "gemu/gemu.h"
@@ -35,6 +36,7 @@ static const MachineDef machine_defs[] = {
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
+    {"5clown",  "Five Clown (IGS, 1993) — dual-6502 video poker arcade board"},
     {"apple1",  "Apple I (MOS 6502, keyboard/display terminal)"},
     {"dendy",   "Dendy NES Famiclone (PAL 50 Hz, NTSC-compatible PPU/APU timing)"},
     {"vssmb",       "VS. Super Mario Bros. (coin-op arcade cabinet, DIP switches)"},
@@ -103,6 +105,7 @@ static const GemuArgsDef def = {
 #ifdef HAVE_LUA
         "  ./bin/gemu -M nes -cartridge game.nes -lua script.lua\n"
 #endif
+        "  ./bin/gemu -M 5clown -rom roms/5clown\n"
         ,
 };
 
@@ -121,9 +124,10 @@ static uint32_t parse_size(const char *s) {
     return v;
 }
 
-static bool parse_soundhw(const char *hw, MosSoundType *out) {
+static bool parse_soundhw(const char *hw, MosSoundType *out, uint32_t *mask) {
     if (strcmp(hw, "none") == 0) {
         *out = MOS_SOUND_NONE;
+        *mask = 0;
         return true;
     }
     if (strcmp(hw, "2a03") == 0) {
@@ -136,7 +140,22 @@ static bool parse_soundhw(const char *hw, MosSoundType *out) {
         return true;
     }
 #endif
-    return false;
+    /* Composable arcade sound cards (QEMU -soundhw-style: comma-separated,
+     * independently present chips that OR together, e.g. "ay8910,oki6295"
+     * for 5clown's onboard PSG + ADPCM). Unlike the exact-string cases
+     * above, these don't replace *out — they only ever set *mask. */
+    char buf[128];
+    if (snprintf(buf, sizeof(buf), "%s", hw) >= (int)sizeof(buf)) return false;
+    uint32_t new_mask = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        if      (strcmp(tok, "ay8910")  == 0) new_mask |= MOS_SOUNDHW_AY8910;
+        else if (strcmp(tok, "oki6295") == 0) new_mask |= MOS_SOUNDHW_OKI6295;
+        else return false;
+    }
+    if (new_mask == 0) return false;
+    *mask = new_mask;
+    return true;
 }
 
 static bool parse_cpu(const char *name, MosCpuType *out) {
@@ -314,6 +333,7 @@ int mos_setup(int argc, char *argv[]) {
             else if (strcmp(canon, "mos")  == 0) cfg.machine = MOS_MACHINE_GENERIC;
             else if (strcmp(canon, "kim1") == 0) cfg.machine = MOS_MACHINE_KIM1;
             else if (strcmp(canon, "nes")  == 0) cfg.machine = MOS_MACHINE_NES;
+            else if (strcmp(canon, "5clown") == 0) cfg.machine = MOS_MACHINE_5CLOWN;
             cfg.is_dendy = md->tv && strcmp(md->tv, "dendy") == 0;
             cfg.is_arcade = md->tv && strcmp(md->tv, "vs") == 0;
             cfg.is_pal   = cfg.is_dendy || (md->tv && strcmp(md->tv, "pal") == 0);
@@ -328,7 +348,7 @@ int mos_setup(int argc, char *argv[]) {
                 if      (strcmp(md->vga, "rp2c02")      == 0) cfg.vga = MOS_VGA_RP2C02;
                 else if (strcmp(md->vga, "rp2c04-0004") == 0) cfg.vga = MOS_VGA_RP2C04_0004;
             }
-            if (md->soundhw && !parse_soundhw(md->soundhw, &cfg.sound)) {
+            if (md->soundhw && !parse_soundhw(md->soundhw, &cfg.sound, &cfg.sound_hw_mask)) {
                 fprintf(stderr, "gemu: machine '%s' has unknown default soundhw '%s'\n",
                         md->name, md->soundhw);
                 return 1;
@@ -480,9 +500,12 @@ int mos_setup(int argc, char *argv[]) {
                 printf("  2a03,output=midi   Ricoh 2A03 APU -> MIDI output\n");
 #endif
                 printf("  none               Disable sound output\n");
+                printf("  ay8910             General Instrument AY-3-8910 PSG (5clown; stub, no synthesis yet)\n");
+                printf("  oki6295            OKI6295 ADPCM (5clown; stub, no synthesis yet)\n");
+                printf("                     ay8910/oki6295 are composable: -soundhw ay8910,oki6295\n");
                 SDL_Quit(); return 0;
             }
-            if (!parse_soundhw(hw, &cfg.sound)) {
+            if (!parse_soundhw(hw, &cfg.sound, &cfg.sound_hw_mask)) {
                 fprintf(stderr, "gemu: unknown -soundhw '%s' (use -soundhw ? to list)\n", hw);
                 return 1;
             }
@@ -506,7 +529,8 @@ int mos_setup(int argc, char *argv[]) {
 
     if ((cfg.machine == MOS_MACHINE_APPLE1 ||
          cfg.machine == MOS_MACHINE_NES ||
-         cfg.machine == MOS_MACHINE_KIM1)
+         cfg.machine == MOS_MACHINE_KIM1 ||
+         cfg.machine == MOS_MACHINE_5CLOWN)
         && !cfg.vnc_addr && !args.display_explicit) {
 #ifdef GEMU_GTK
         cfg.display_type = GEMU_DISPLAY_GTK;
@@ -613,6 +637,11 @@ int mos_setup(int argc, char *argv[]) {
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
         kim1_run(s, &cfg);
         kim1_destroy(s);
+    } else if (cfg.machine == MOS_MACHINE_5CLOWN) {
+        FiveClownState *s = fiveclown_create(&cfg);
+        if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
+        fiveclown_run(s, &cfg);
+        fiveclown_destroy(s);
     } else {
         MosGenericState *s = mos_generic_create(&cfg);
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }

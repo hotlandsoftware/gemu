@@ -1,4 +1,5 @@
 [
+  { "alias": "5clown",    "name": "Five Clown",                             "year": 1993, "cpu": "MOS 6502",    "family": "mos",   "status": "working", "gfx": true, "sound": false, "notes": "" },
   { "alias": "apple1",    "name": "Apple I",                                "year": 1976, "cpu": "MOS 6502",    "family": "mos",   "status": "working", "gfx": true, "sound": false, "notes": "PIA terminal I/O and built-in starter monitor" },
   { "alias": "apollo80",  "name": "Apollo 80",                              "year": 1978, "cpu": "RCA CDP1802", "family": "rca",   "status": "working",  "gfx": true,  "sound": true,  "notes": "Studio II clone by Academy"   },
   { "alias": "chip8",     "name": "CHIP-8 (Generic)",                       "year": 1977, "cpu": "CHIP-8",      "family": "chip8", "status": "working",  "gfx": true,  "sound": false, "notes": ""                             },

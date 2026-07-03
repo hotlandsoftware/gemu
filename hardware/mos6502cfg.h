@@ -9,6 +9,7 @@ typedef enum {
     MOS_MACHINE_APPLE1, /* Apple I */
     MOS_MACHINE_NES,    /* Nintendo Entertainment System */
     MOS_MACHINE_KIM1,   /* MOS KIM-1 single-board computer */
+    MOS_MACHINE_5CLOWN, /* IGS "Five Clown" arcade video poker (dual 6502) */
 } MosMachineType;
 
 typedef enum {
@@ -31,6 +32,13 @@ typedef enum {
     MOS_SOUND_2A03_MIDI,        /* Ricoh 2A03 built-in APU → MIDI output */
 #endif
 } MosSoundType;
+
+/* Composable arcade sound cards (QEMU -soundhw-style: a comma-separated set
+ * of independently present chips, ORed into MosConfig.sound_hw_mask — unlike
+ * MosSoundType above, which is a single mutually-exclusive NES/Famicom APU
+ * choice). Currently 5clown-only; both chips are stubbed (no synthesis). */
+#define MOS_SOUNDHW_AY8910  0x01u
+#define MOS_SOUNDHW_OKI6295 0x02u
 
 typedef enum {
     NES_DEVICE_NONE = 0,
@@ -76,6 +84,7 @@ typedef struct MosConfig {
     const char     *fda_path;    /* FDS disk image path (NULL = no disk)    */
     MosSoundType    sound;
     bool            sound_explicit; /* user passed -soundhw; skip auto-default */
+    uint32_t        sound_hw_mask; /* MOS_SOUNDHW_* bits (5clown: AY8910/OKI6295) */
     MosCharGenType  char_gen;
     bool            char_gen_explicit;
     NesDeviceType   ports[NES_PORTS]; /* devices on controller ports 1–2 */
