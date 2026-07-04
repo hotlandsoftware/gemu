@@ -1,6 +1,9 @@
 #include "gemu/video.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef HAVE_SDL_IMAGE
+#include <SDL2/SDL_image.h>
+#endif
 
 struct GemuVideoSdl {
     SDL_Window     *window;
@@ -57,6 +60,18 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         ww, wh, win_flags);
     if (!v->window) goto fail;
+
+#ifdef HAVE_SDL_IMAGE
+    /* Best-effort: gemu.png lives at the repo root, same as every other
+     * relative path this project uses (ROMs, gemu.ini via $HOME aside).
+     * Missing/unreadable icon is not fatal — just falls back to the
+     * platform default window icon. */
+    SDL_Surface *icon = IMG_Load("gemu.png");
+    if (icon) {
+        SDL_SetWindowIcon(v->window, icon);
+        SDL_FreeSurface(icon);
+    }
+#endif
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
 

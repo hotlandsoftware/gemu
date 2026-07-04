@@ -346,6 +346,19 @@ def main():
         sdl2_cflags = cf
         sdl2_libs   = lf
 
+    have_sdl_image  = False
+    sdl_image_cflags = []
+    sdl_image_libs   = []
+    if args.sdl:
+        cf = pkg('SDL2_image', '--cflags', *pkg_flags)
+        lf = pkg('SDL2_image', '--libs',   *pkg_flags)
+        if check('SDL2_image (window icon)', lf):
+            have_sdl_image   = True
+            sdl_image_cflags = cf or []
+            sdl_image_libs   = lf
+        else:
+            print('  (SDL2_image not found — window icon disabled)')
+
     gtk_cflags = gtk_libs = []
     epoxy_cflags = epoxy_libs = []
     want_gtk = args.gtk
@@ -481,16 +494,19 @@ def main():
     if have_rob:     defs_list.append('HAVE_ROB')
     if have_caca:    defs_list.append('HAVE_CACA')
     if have_lua:     defs_list.append('HAVE_LUA')
+    if have_sdl_image: defs_list.append('HAVE_SDL_IMAGE')
     defs = ' '.join(f'-D{d}' for d in defs_list)
 
     cflags_parts = ['$CFLAGS_BASE', inc_flags] + sdl2_cflags
     if want_gtk:  cflags_parts += gtk_cflags + epoxy_cflags
     if have_caca: cflags_parts += caca_cflags
     if have_lua:  cflags_parts += lua_cflags
+    if have_sdl_image: cflags_parts += sdl_image_cflags
     if defs:      cflags_parts.append(defs)
     unified_cflags = ' '.join(cflags_parts)
 
     ld_parts = [base_ldflags] + sdl2_libs + crypto_libs
+    if have_sdl_image: ld_parts += sdl_image_libs
     if want_gtk:  ld_parts += gtk_libs + epoxy_libs
     if have_caca: ld_parts += caca_libs
     elif have_curses: ld_parts += curses_flags
@@ -624,6 +640,7 @@ def main():
     print(f'  binary    : {binary}')
     print(f'  families  : {", ".join(targets)}')
     print(f'  SDL2      : {"yes" if args.sdl else "no"}')
+    print(f'  Window icon: {"yes (SDL2_image)" if have_sdl_image else "no"}')
     print(f'  GTK 3     : {"yes" if want_gtk else "no"}')
     print(f'  libcaca   : {"yes (enhanced terminal)" if have_caca else "no"}')
     print(f'  ncursesw  : {"yes" if have_curses else ("n/a (libcaca used)" if have_caca else "no")}')

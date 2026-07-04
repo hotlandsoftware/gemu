@@ -281,6 +281,11 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     gtk_window_set_title(GTK_WINDOW(v->window),
                          spec->title ? spec->title : "GEMU");
     gtk_window_set_resizable(GTK_WINDOW(v->window), v->resizable);
+    /* Best-effort: gemu.png at the repo root, same convention as every other
+     * relative path in this project. gdk-pixbuf (part of GTK) handles the
+     * PNG decode, so no extra dependency is needed here. Missing/unreadable
+     * icon just falls back to the platform default. */
+    gtk_window_set_icon_from_file(GTK_WINDOW(v->window), "gemu.png", NULL);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(v->window), vbox);
