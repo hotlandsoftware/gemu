@@ -107,7 +107,7 @@ static uint8_t audio_read(uint16_t addr, void *ud) {
     FiveClownState *s = ud;
     if (addr < 0x0800) return s->audio_ram[addr];
     if (addr == 0x0C06) /* OKI6295 busy status */
-        return (s->cfg->sound_hw_mask & MOS_SOUNDHW_OKI6295) ? 0x00 : 0xFF;
+        return s->oki.audio_dev ? oki6295_read(&s->oki) : 0xFF;
     if (addr == 0x0E06) return s->main_latch_d800;
     if (addr >= 0xE000) return s->audio_prg[addr - 0xE000];
     return 0xFF;
@@ -126,7 +126,7 @@ static void audio_write(uint16_t addr, uint8_t val, void *ud) {
         return;
     }
     if (addr == 0x0A02) { s->snd_latch_0a02 = val; return; }
-    if (addr == 0x0C04) return; /* OKI6295 write: stub, no-op */
+    if (addr == 0x0C04) { if (s->oki.audio_dev) oki6295_write(&s->oki, val); return; }
     /* ROM region: no effect */
 }
 
@@ -418,6 +418,12 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
     }
     s->oki_rom = oki_raw;
 
+    if (s->oki_rom && (cfg->sound_hw_mask & MOS_SOUNDHW_OKI6295)) {
+        if (!oki6295_init(&s->oki, FIVECLOWN_CPU_HZ, FIVECLOWN_OKI_NATIVE_HZ,
+                          s->oki_rom, FIVECLOWN_OKI_SIZE))
+            fprintf(stderr, "5clown: OKI6295 audio init failed (continuing silently)\n");
+    }
+
     for (int i = 0; i < 256; i++) {
         uint8_t v = proms_raw[i];
         int bk = (v >> 3) & 1;
@@ -499,6 +505,7 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
 void fiveclown_destroy(FiveClownState *s) {
     if (!s) return;
     fiveclown_nvram_save(s);
+    oki6295_destroy(&s->oki);
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
@@ -581,8 +588,15 @@ void fiveclown_run(FiveClownState *s, const MosConfig *cfg) {
             }
 
             uint64_t audio_target = s->audiocpu.cycle_count + FIVECLOWN_CYCLES_PER_FRAME;
-            while (s->audiocpu.cycle_count < audio_target)
+            while (s->audiocpu.cycle_count < audio_target) {
+                uint64_t prev = s->audiocpu.cycle_count;
                 mos6502_step(&s->audiocpu);
+                if (s->oki.audio_dev) {
+                    uint64_t delta = s->audiocpu.cycle_count - prev;
+                    for (uint64_t i = 0; i < delta; i++) oki6295_tick(&s->oki);
+                }
+            }
+            if (s->oki.audio_dev) oki6295_flush(&s->oki);
 
             fiveclown_render(s);
             s->frame++;

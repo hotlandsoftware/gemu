@@ -141,16 +141,18 @@ static bool parse_soundhw(const char *hw, MosSoundType *out, uint32_t *mask) {
     }
 #endif
     /* Composable arcade sound cards (QEMU -soundhw-style: comma-separated,
-     * independently present chips that OR together, e.g. "ay8910,oki6295"
+     * independently present chips that OR together, e.g. "ay8910,msm6295"
      * for 5clown's onboard PSG + ADPCM). Unlike the exact-string cases
-     * above, these don't replace *out — they only ever set *mask. */
+     * above, these don't replace *out — they only ever set *mask.
+     * "msm6295" is the official chip name; the source/internal symbols
+     * still say OKI6295/okim6295.c (OKI is just the manufacturer). */
     char buf[128];
     if (snprintf(buf, sizeof(buf), "%s", hw) >= (int)sizeof(buf)) return false;
     uint32_t new_mask = 0;
     char *save = NULL;
     for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         if      (strcmp(tok, "ay8910")  == 0) new_mask |= MOS_SOUNDHW_AY8910;
-        else if (strcmp(tok, "oki6295") == 0) new_mask |= MOS_SOUNDHW_OKI6295;
+        else if (strcmp(tok, "msm6295") == 0) new_mask |= MOS_SOUNDHW_OKI6295;
         else return false;
     }
     if (new_mask == 0) return false;
@@ -501,8 +503,8 @@ int mos_setup(int argc, char *argv[]) {
 #endif
                 printf("  none               Disable sound output\n");
                 printf("  ay8910             General Instrument AY-3-8910 PSG (5clown; stub, no synthesis yet)\n");
-                printf("  oki6295            OKI6295 ADPCM (5clown; stub, no synthesis yet)\n");
-                printf("                     ay8910/oki6295 are composable: -soundhw ay8910,oki6295\n");
+                printf("  msm6295            OKI MSM6295 ADPCM (5clown)\n");
+                printf("                     ay8910/msm6295 are composable: -soundhw ay8910,msm6295\n");
                 SDL_Quit(); return 0;
             }
             if (!parse_soundhw(hw, &cfg.sound, &cfg.sound_hw_mask)) {

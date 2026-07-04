@@ -2,6 +2,7 @@
 #include "mos6502.h"
 #include "mos6502cfg.h"
 #include "pia6821.h"
+#include "okim6295.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
 #include "gemu/vnc.h"
@@ -43,6 +44,12 @@
  */
 
 #define FIVECLOWN_CPU_HZ        1250000u
+
+/* OKI6295: 10MHz XTAL / 12, PIN7_LOW ("6.5kHz family" -> clock/165), per the
+ * MAME driver's OKIM6295(config, "oki6295", 10_MHz_XTAL / 12, PIN7_LOW). This
+ * is a separate clock line from the CPUs' own 10MHz/8. */
+#define FIVECLOWN_OKI_CLOCK_HZ  (10000000u / 12u)
+#define FIVECLOWN_OKI_NATIVE_HZ (FIVECLOWN_OKI_CLOCK_HZ / 165u)
 #define FIVECLOWN_CYCLES_PER_FRAME 24960u /* 1,250,000 / 50.08 */
 
 #define FIVECLOWN_FB_WIDTH  256
@@ -101,6 +108,7 @@ typedef struct FiveClownState {
     uint8_t crtc_regs[32];
 
     Pia6821 pia0, pia1;
+    Okim6295 oki;      /* only ticked/used when cfg->sound_hw_mask & MOS_SOUNDHW_OKI6295 */
 
     uint8_t mux_data;         /* PIA1 port B: input mux select (inverted) */
     uint8_t main_latch_d800;  /* main -> sound command latch */

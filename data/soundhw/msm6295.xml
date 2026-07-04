@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<soundhw name="msm6295" description="OKI MSM6295 ADPCM" requires="mos">
+    <machine name="5clown"/>
+</soundhw>

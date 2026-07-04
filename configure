@@ -50,7 +50,7 @@ FAMILY_SRC = {
     'mos': [
         'cpu/mos6502.c',
         'vga/rp2c02.c', 'vga/input_menu.c',
-        'audio/apu2a03.c',
+        'audio/apu2a03.c', 'audio/okim6295.c',
         'hardware/machine/machine_mos.c', 'hardware/machine/machine_apple1.c',
         'hardware/machine/machine_nes.c', 'hardware/machine/machine_kim1.c',
         'hardware/machine/machine_5clown.c', 'hardware/device/pia6821.c',
