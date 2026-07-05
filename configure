@@ -347,6 +347,18 @@ def main():
         sdl2_cflags = cf
         sdl2_libs   = lf
 
+    have_libzip  = False
+    libzip_cflags = []
+    libzip_libs   = []
+    cf = pkg('libzip', '--cflags', *pkg_flags)
+    lf = pkg('libzip', '--libs',   *pkg_flags)
+    if check('libzip (-rom FILE.zip)', lf):
+        have_libzip   = True
+        libzip_cflags = cf or []
+        libzip_libs   = lf or ['-lzip']
+    else:
+        print('  (libzip not found — -rom cannot point directly at a .zip)')
+
     have_sdl_image  = False
     sdl_image_cflags = []
     sdl_image_libs   = []
@@ -496,6 +508,7 @@ def main():
     if have_caca:    defs_list.append('HAVE_CACA')
     if have_lua:     defs_list.append('HAVE_LUA')
     if have_sdl_image: defs_list.append('HAVE_SDL_IMAGE')
+    if have_libzip:    defs_list.append('HAVE_LIBZIP')
     defs = ' '.join(f'-D{d}' for d in defs_list)
 
     cflags_parts = ['$CFLAGS_BASE', inc_flags] + sdl2_cflags
@@ -503,11 +516,13 @@ def main():
     if have_caca: cflags_parts += caca_cflags
     if have_lua:  cflags_parts += lua_cflags
     if have_sdl_image: cflags_parts += sdl_image_cflags
+    if have_libzip:    cflags_parts += libzip_cflags
     if defs:      cflags_parts.append(defs)
     unified_cflags = ' '.join(cflags_parts)
 
     ld_parts = [base_ldflags] + sdl2_libs + crypto_libs
     if have_sdl_image: ld_parts += sdl_image_libs
+    if have_libzip:    ld_parts += libzip_libs
     if want_gtk:  ld_parts += gtk_libs + epoxy_libs
     if have_caca: ld_parts += caca_libs
     elif have_curses: ld_parts += curses_flags
@@ -642,6 +657,7 @@ def main():
     print(f'  families  : {", ".join(targets)}')
     print(f'  SDL2      : {"yes" if args.sdl else "no"}')
     print(f'  Window icon: {"yes (SDL2_image)" if have_sdl_image else "no"}')
+    print(f'  -rom *.zip  : {"yes (libzip)" if have_libzip else "no"}')
     print(f'  GTK 3     : {"yes" if want_gtk else "no"}')
     print(f'  libcaca   : {"yes (enhanced terminal)" if have_caca else "no"}')
     print(f'  ncursesw  : {"yes" if have_curses else ("n/a (libcaca used)" if have_caca else "no")}')

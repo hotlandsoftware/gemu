@@ -83,6 +83,9 @@ static const GemuArgsDef def = {
         "  -rom ADDR:FILE     Load a ROM image at CPU address ADDR\n"
         "  -rom FILE          Load a ROM image (or optional FDS BIOS with -device fds)\n"
         "  -rom DIR           Directory containing ROM files (identified by SHA256)\n"
+#ifdef HAVE_LIBZIP
+        "  -rom FILE.zip      Zip file containing ROM files (identified by SHA256)\n"
+#endif
         "  -start ADDR        Override reset vector and start execution at ADDR\n"
         "  -cartridge FILE    Insert a cartridge\n"
         "  -fda FILE          Insert a floppy disk image\n"
@@ -107,8 +110,6 @@ static const GemuArgsDef def = {
 #ifdef HAVE_LUA
         "  ./bin/gemu -M nes -cartridge game.nes -lua script.lua\n"
 #endif
-        "  ./bin/gemu -M 5clown -rom roms/5clown\n"
-        "  ./bin/gemu -M 7mezzo -rom roms/7mezzo\n"
         ,
 };
 
@@ -337,7 +338,11 @@ int mos_setup(int argc, char *argv[]) {
             if (strcmp(args.machine, machine_defs[i].name) != 0) continue;
             const MachineDef *md = &machine_defs[i];
             const char *canon = md->canonical;
-            romdb_machine = canon;
+            /* ROM sets are registered per specific machine name (e.g.
+             * "vssmb"), not per canonical dispatch target (e.g. "nes") —
+             * aliased machines have their own distinct ROM sets even
+             * though they share the same C code path. */
+            romdb_machine = md->name;
             if      (strcmp(canon, "apple1") == 0) cfg.machine = MOS_MACHINE_APPLE1;
             else if (strcmp(canon, "mos")  == 0) cfg.machine = MOS_MACHINE_GENERIC;
             else if (strcmp(canon, "kim1") == 0) cfg.machine = MOS_MACHINE_KIM1;
@@ -401,7 +406,7 @@ int mos_setup(int argc, char *argv[]) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -rom requires an argument\n"); return 1; }
             const char *val = rem[++i];
             struct stat st;
-            if (stat(val, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if ((stat(val, &st) == 0 && S_ISDIR(st.st_mode)) || romdb_is_zip(val)) {
                 int n = romdb_load_dir(val, romdb_machine, romdb_add_mos, &cfg);
                 if (n < 0) return 1;
                 if (n == 0) {

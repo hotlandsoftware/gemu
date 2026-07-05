@@ -1880,8 +1880,10 @@ static bool nes_screendump(void *ud, const char *path) {
     int w = RP2C02_WIDTH, h = RP2C02_HEIGHT;
     uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
     if (!rgb) return false;
+    const uint32_t *palette = s->ppu.alt_palette_rgb ? s->ppu.alt_palette_rgb
+                                                     : rp2c02_palette_rgb;
     for (int i = 0; i < w * h; i++) {
-        uint32_t c    = rp2c02_palette_rgb[s->ppu.pixels[i] & 0x3F];
+        uint32_t c    = palette[s->ppu.pixels[i] & 0x3F];
         rgb[i*3+0]    = (uint8_t)(c >> 16);
         rgb[i*3+1]    = (uint8_t)(c >>  8);
         rgb[i*3+2]    = (uint8_t)(c      );

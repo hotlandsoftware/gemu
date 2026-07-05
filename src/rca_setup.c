@@ -240,7 +240,7 @@ int rca_setup(int argc, char *argv[]) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -rom requires an argument\n"); return 1; }
             const char *val = rem[++i];
             struct stat st;
-            if (stat(val, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if ((stat(val, &st) == 0 && S_ISDIR(st.st_mode)) || romdb_is_zip(val)) {
                 const char *alias = args.machine ? args.machine : "studio2";
                 int n = romdb_load_dir(val, alias, romdb_add_rca, &cfg);
                 if (n < 0) return 1;
