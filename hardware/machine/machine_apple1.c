@@ -1,6 +1,7 @@
 #include "machine_apple1.h"
 #include "gemu/args.h"
 #include "gemu/memory.h"
+#include "gemu/screendump.h"
 #include "gemu/sha256.h"
 #include "romdb.h"
 #include <SDL2/SDL.h>
@@ -394,6 +395,39 @@ static void apple1_update_vnc(Apple1State *s, bool paused) {
         }
     }
     gemu_vnc_update(s->vnc, s->vnc_fb, A1_FB_W, A1_FB_H);
+}
+
+static bool apple1_screendump(void *ud, const char *path) {
+    Apple1State *s = ud;
+    int w = A1_FB_W, h = A1_FB_H;
+    uint8_t *rgb = calloc((size_t)w * (size_t)h * 3, 1); /* pre-zeroed = black bg */
+    if (!rgb) return false;
+
+    const uint8_t *font = apple1_display_font(s->display);
+    bool cursor_phase = s->display && s->display->cursor_phase;
+    for (int row = 0; row < A1_ROWS; row++) {
+        for (int col = 0; col < A1_COLS; col++) {
+            uint8_t ch = s->display->screen[row][col];
+            if (cursor_phase && row == s->display->row && col == s->display->col)
+                ch = '@';
+            int idx = apple1_glyph_index(ch);
+            if (idx < 0) continue;
+            const uint8_t *glyph = &font[idx * 8];
+            int x0 = col * A1_CELL_W;
+            int y0 = row * A1_CELL_H;
+            for (int gy = 0; gy < 8; gy++) {
+                uint8_t bits = glyph[gy];
+                for (int gx = 0; gx < 5; gx++) {
+                    if (!(bits & (uint8_t)(0x10u >> gx))) continue;
+                    uint8_t *p = &rgb[(size_t)(y0 + gy) * w * 3 + (size_t)(x0 + gx) * 3];
+                    p[0] = p[1] = p[2] = 255;
+                }
+            }
+        }
+    }
+    bool ok = gemu_screendump(path, rgb, w, h);
+    free(rgb);
+    return ok;
 }
 
 static void apple1_poll_keyboard(Apple1State *s) {
@@ -920,6 +954,7 @@ Apple1State *apple1_create(const MosConfig *cfg) {
         free(s);
         return NULL;
     }
+    gemu_monitor_set_screendump_cb(s->monitor, apple1_screendump, s);
 
     s->display = apple1_display_create(cfg);
     if (cfg->display_type != GEMU_DISPLAY_NONE && !s->display)
