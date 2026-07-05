@@ -4,6 +4,7 @@
 #include "nes.h"
 #include "kim1.h"
 #include "5clown.h"
+#include "7mezzo.h"
 #include "vt100.h"
 #include "romdb.h"
 #include "gemu/gemu.h"
@@ -36,7 +37,8 @@ static const MachineDef machine_defs[] = {
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
-    {"5clown",  "Five Clown (IGS, 1993) — dual-6502 video poker arcade board"},
+    {"5clown",  "Five Clown"},
+    {"7mezzo",  "7 e Mezzo"},
     {"apple1",  "Apple I (MOS 6502, keyboard/display terminal)"},
     {"dendy",   "Dendy NES Famiclone (PAL 50 Hz, NTSC-compatible PPU/APU timing)"},
     {"vssmb",       "VS. Super Mario Bros. (coin-op arcade cabinet, DIP switches)"},
@@ -106,6 +108,7 @@ static const GemuArgsDef def = {
         "  ./bin/gemu -M nes -cartridge game.nes -lua script.lua\n"
 #endif
         "  ./bin/gemu -M 5clown -rom roms/5clown\n"
+        "  ./bin/gemu -M 7mezzo -rom roms/7mezzo\n"
         ,
 };
 
@@ -132,6 +135,10 @@ static bool parse_soundhw(const char *hw, MosSoundType *out, uint32_t *mask) {
     }
     if (strcmp(hw, "2a03") == 0) {
         *out = MOS_SOUND_2A03;
+        return true;
+    }
+    if (strcmp(hw, "pcspk") == 0) {
+        *out = MOS_SOUND_PCSPK;
         return true;
     }
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
@@ -336,6 +343,7 @@ int mos_setup(int argc, char *argv[]) {
             else if (strcmp(canon, "kim1") == 0) cfg.machine = MOS_MACHINE_KIM1;
             else if (strcmp(canon, "nes")  == 0) cfg.machine = MOS_MACHINE_NES;
             else if (strcmp(canon, "5clown") == 0) cfg.machine = MOS_MACHINE_5CLOWN;
+            else if (strcmp(canon, "7mezzo") == 0) cfg.machine = MOS_MACHINE_7MEZZO;
             cfg.is_dendy = md->tv && strcmp(md->tv, "dendy") == 0;
             cfg.is_arcade = md->tv && strcmp(md->tv, "vs") == 0;
             cfg.is_pal   = cfg.is_dendy || (md->tv && strcmp(md->tv, "pal") == 0);
@@ -505,6 +513,7 @@ int mos_setup(int argc, char *argv[]) {
                 printf("  ay8910             General Instrument AY-3-8910 PSG (5clown; stub, no synthesis yet)\n");
                 printf("  msm6295            OKI MSM6295 ADPCM (5clown)\n");
                 printf("                     ay8910/msm6295 are composable: -soundhw ay8910,msm6295\n");
+                printf("  pcspk              Primitive 1-bit speaker (7mezzo)\n");
                 SDL_Quit(); return 0;
             }
             if (!parse_soundhw(hw, &cfg.sound, &cfg.sound_hw_mask)) {
@@ -532,7 +541,8 @@ int mos_setup(int argc, char *argv[]) {
     if ((cfg.machine == MOS_MACHINE_APPLE1 ||
          cfg.machine == MOS_MACHINE_NES ||
          cfg.machine == MOS_MACHINE_KIM1 ||
-         cfg.machine == MOS_MACHINE_5CLOWN)
+         cfg.machine == MOS_MACHINE_5CLOWN ||
+         cfg.machine == MOS_MACHINE_7MEZZO)
         && !cfg.vnc_addr && !args.display_explicit) {
 #ifdef GEMU_GTK
         cfg.display_type = GEMU_DISPLAY_GTK;
@@ -644,6 +654,11 @@ int mos_setup(int argc, char *argv[]) {
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
         fiveclown_run(s, &cfg);
         fiveclown_destroy(s);
+    } else if (cfg.machine == MOS_MACHINE_7MEZZO) {
+        Mezzo7State *s = mezzo7_create(&cfg);
+        if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
+        mezzo7_run(s, &cfg);
+        mezzo7_destroy(s);
     } else {
         MosGenericState *s = mos_generic_create(&cfg);
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }

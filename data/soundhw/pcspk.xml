@@ -1,7 +1,8 @@
 <?xml version="1.0"?>
-<soundhw name="pcspk" description="PC speaker" requires="rca">
+<soundhw name="pcspk" description="Primitive 1-bit speaker">
     <machine name="vip"/>
     <machine name="studio2"/>
     <machine name="pecom32"/>
     <machine name="destroyer"/>
+    <machine name="7mezzo"/>
 </soundhw>

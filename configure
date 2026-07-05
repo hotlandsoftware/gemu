@@ -54,6 +54,7 @@ FAMILY_SRC = {
         'hardware/machine/machine_mos.c', 'hardware/machine/machine_apple1.c',
         'hardware/machine/machine_nes.c', 'hardware/machine/machine_kim1.c',
         'hardware/machine/machine_5clown.c', 'hardware/device/pia6821.c',
+        'hardware/machine/machine_7mezzo.c',
         'hardware/device/fds.c', 'hardware/device/fds_hle.c',
         'hardware/device/vt100.c', 'hardware/romdb.c',
         'src/mos_setup.c',

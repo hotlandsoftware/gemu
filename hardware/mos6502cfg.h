@@ -10,6 +10,7 @@ typedef enum {
     MOS_MACHINE_NES,    /* Nintendo Entertainment System */
     MOS_MACHINE_KIM1,   /* MOS KIM-1 single-board computer */
     MOS_MACHINE_5CLOWN, /* IGS "Five Clown" arcade video poker (dual 6502) */
+    MOS_MACHINE_7MEZZO, /* "7 e Mezzo" arcade video poker (magicfly hardware) */
 } MosMachineType;
 
 typedef enum {
@@ -31,6 +32,7 @@ typedef enum {
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     MOS_SOUND_2A03_MIDI,        /* Ricoh 2A03 built-in APU → MIDI output */
 #endif
+    MOS_SOUND_PCSPK,            /* 7mezzo: 1-bit delta-sigma bitstream DAC */
 } MosSoundType;
 
 /* Composable arcade sound cards (QEMU -soundhw-style: a comma-separated set
