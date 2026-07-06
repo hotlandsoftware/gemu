@@ -9,8 +9,8 @@ typedef enum {
     MOS_MACHINE_APPLE1, /* Apple I */
     MOS_MACHINE_NES,    /* Nintendo Entertainment System */
     MOS_MACHINE_KIM1,   /* MOS KIM-1 single-board computer */
-    MOS_MACHINE_5CLOWN, /* IGS "Five Clown" arcade video poker (dual 6502) */
-    MOS_MACHINE_7MEZZO, /* "7 e Mezzo" arcade video poker (magicfly hardware) */
+    MOS_MACHINE_5CLOWN,  /* IGS "Five Clown" arcade video poker (dual 6502) */
+    MOS_MACHINE_MAGICFLY, /* misc/magicfly.cpp hardware: Magic Fly, 7 e Mezzo */
 } MosMachineType;
 
 typedef enum {
@@ -32,7 +32,7 @@ typedef enum {
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     MOS_SOUND_2A03_MIDI,        /* Ricoh 2A03 built-in APU → MIDI output */
 #endif
-    MOS_SOUND_PCSPK,            /* 7mezzo: 1-bit delta-sigma bitstream DAC */
+    MOS_SOUND_PCSPK,            /* magicfly/7mezzo: 1-bit delta-sigma bitstream DAC */
 } MosSoundType;
 
 /* Composable arcade sound cards (QEMU -soundhw-style: a comma-separated set
@@ -95,6 +95,7 @@ typedef struct MosConfig {
     bool            is_pal;      /* PAL/Dendy: 312 lines, ~50 Hz frame rate */
     bool            is_dendy;   /* Dendy Famiclone: NTSC-compatible PPU/APU within PAL 50 Hz */
     bool            is_arcade;  /* NES-based arcade cabinet (VS. System, etc.) — coin-op, DIP switches */
+    bool            is_7mezzo;  /* MOS_MACHINE_MAGICFLY game variant: "7 e Mezzo" vs Magic Fly */
     bool            kim_keyboard; /* KIM-1: -device kim-keypad → visual keypad overlay */
     bool            want_wozmon;  /* -device wozmon → patch wozmon into KIM-1 ROM at $1AA0 */
     bool            a1ci;         /* Apple I Cassette Interface attached */

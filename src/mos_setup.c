@@ -4,7 +4,7 @@
 #include "nes.h"
 #include "kim1.h"
 #include "5clown.h"
-#include "7mezzo.h"
+#include "magicfly.h"
 #include "vt100.h"
 #include "romdb.h"
 #include "gemu/gemu.h"
@@ -38,6 +38,7 @@ static const MachineDef machine_defs[] = {
 
 static const GemuDevDesc machines[] = {
     {"5clown",  "Five Clown"},
+    {"magicfly", "Magic Fly"},
     {"7mezzo",  "7 e Mezzo"},
     {"apple1",  "Apple I (MOS 6502, keyboard/display terminal)"},
     {"dendy",   "Dendy NES Famiclone (PAL 50 Hz, NTSC-compatible PPU/APU timing)"},
@@ -348,10 +349,11 @@ int mos_setup(int argc, char *argv[]) {
             else if (strcmp(canon, "kim1") == 0) cfg.machine = MOS_MACHINE_KIM1;
             else if (strcmp(canon, "nes")  == 0) cfg.machine = MOS_MACHINE_NES;
             else if (strcmp(canon, "5clown") == 0) cfg.machine = MOS_MACHINE_5CLOWN;
-            else if (strcmp(canon, "7mezzo") == 0) cfg.machine = MOS_MACHINE_7MEZZO;
+            else if (strcmp(canon, "magicfly") == 0) cfg.machine = MOS_MACHINE_MAGICFLY;
             cfg.is_dendy = md->tv && strcmp(md->tv, "dendy") == 0;
             cfg.is_arcade = md->tv && strcmp(md->tv, "vs") == 0;
             cfg.is_pal   = cfg.is_dendy || (md->tv && strcmp(md->tv, "pal") == 0);
+            cfg.is_7mezzo = strcmp(md->name, "7mezzo") == 0;
             if (!args.cpu && md->cpu) {
                 if (!parse_cpu(md->cpu, &cfg.cpu)) {
                     fprintf(stderr, "gemu: machine '%s' has unknown default cpu '%s'\n",
@@ -518,7 +520,7 @@ int mos_setup(int argc, char *argv[]) {
                 printf("  ay8910             General Instrument AY-3-8910 PSG (5clown; stub, no synthesis yet)\n");
                 printf("  msm6295            OKI MSM6295 ADPCM (5clown)\n");
                 printf("                     ay8910/msm6295 are composable: -soundhw ay8910,msm6295\n");
-                printf("  pcspk              Primitive 1-bit speaker (7mezzo)\n");
+                printf("  pcspk              Primitive 1-bit speaker (magicfly, 7mezzo)\n");
                 SDL_Quit(); return 0;
             }
             if (!parse_soundhw(hw, &cfg.sound, &cfg.sound_hw_mask)) {
@@ -547,7 +549,7 @@ int mos_setup(int argc, char *argv[]) {
          cfg.machine == MOS_MACHINE_NES ||
          cfg.machine == MOS_MACHINE_KIM1 ||
          cfg.machine == MOS_MACHINE_5CLOWN ||
-         cfg.machine == MOS_MACHINE_7MEZZO)
+         cfg.machine == MOS_MACHINE_MAGICFLY)
         && !cfg.vnc_addr && !args.display_explicit) {
 #ifdef GEMU_GTK
         cfg.display_type = GEMU_DISPLAY_GTK;
@@ -659,11 +661,11 @@ int mos_setup(int argc, char *argv[]) {
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
         fiveclown_run(s, &cfg);
         fiveclown_destroy(s);
-    } else if (cfg.machine == MOS_MACHINE_7MEZZO) {
-        Mezzo7State *s = mezzo7_create(&cfg);
+    } else if (cfg.machine == MOS_MACHINE_MAGICFLY) {
+        MagicflyState *s = magicfly_create(&cfg);
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
-        mezzo7_run(s, &cfg);
-        mezzo7_destroy(s);
+        magicfly_run(s, &cfg);
+        magicfly_destroy(s);
     } else {
         MosGenericState *s = mos_generic_create(&cfg);
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }

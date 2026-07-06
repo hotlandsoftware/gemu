@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<machine name="magicfly" family="mos" description="Magic Fly (P&amp;A Games, 198?)"
+         cpu="6502" soundhw="pcspk">
+    <rom name="magicfly3_3.bin" region="maincpu" addr="0x0000" sha256="d0ac5978bcd5735ce31e6513bc98eea35d3d2a80a72fcfb1deadadba0d33b21c"/>
+    <rom name="magicfly2.bin"   region="gfx2"    addr="0x0000" sha256="b074bc691ab03a871237b1534beab842a691eaef1d536edc3b1c7a570205eeed"/>
+    <rom name="magicfly1.bin"   region="gfx1"    addr="0x0000" sha256="c9638a534c59945e5c2eb6cf12acd9568d34ed9fc1a7d687bf929298a93105b0"/>
+    <rom name="magicfly0.bin"   region="gfx0"    addr="0x0000" sha256="338dd93b4fe2d8f082533a7f8271625c46419ec91a1c3085a1f7c381abedf1fa"/>
+</machine>
