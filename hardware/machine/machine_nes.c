@@ -1642,7 +1642,12 @@ static void nes_lua_get_zapper(void *ud, int *x, int *y, int *click) {
     NesState *s = ud;
     *x = s->zapper_x;
     *y = s->zapper_y;
-    *click = (s->zapper_trigger_ttl > 0) ? 1 : 0;
+    /* Report the live mouse-button state, not the Zapper's decaying 10-frame
+     * hardware trigger pulse (nes_handle_keys()) — a Lua drag-and-drop
+     * script needs "still held" to stay true for as long as the button is
+     * actually down, not just the first 10 frames of the click. */
+    GemuPointerState ptr = gemu_display_get_pointer(s->display);
+    *click = ptr.button ? 1 : 0;
 }
 #endif
 
@@ -1831,14 +1836,21 @@ static void nes_handle_keys(NesState *s, uint32_t held) {
             s->ctrl_state[1] = 0;
         if (s->cfg->ports[1] == NES_DEVICE_FC2_MIC)
             s->mic_noise = (held & GEMU_ACTION(16)) != 0;
+        /* Track host pointer position unconditionally (not just when a real
+         * NES Zapper is attached) so Lua scripts using input.get()/
+         * zapper.read() for mouse-driven GUIs (drag-and-drop tools, etc.)
+         * see live coordinates even on a plain controller-only setup. */
+        GemuPointerState ptr = gemu_display_get_pointer(s->display);
+        s->zapper_x = ptr.x;
+        s->zapper_y = ptr.y;
         if (s->cfg->ports[1] == NES_DEVICE_ZAPPER) {
-            GemuPointerState ptr = gemu_display_get_pointer(s->display);
+            /* Real light-gun games need the trigger held "on" for a short
+             * pulse for the CRT light-sensing to register — a single-frame
+             * click would be invisible to the game's polling loop. */
             if (ptr.button && s->zapper_trigger_ttl == 0)
                 s->zapper_trigger_ttl = 10; /* 10-frame trigger pulse */
             if (s->zapper_trigger_ttl > 0)
                 s->zapper_trigger_ttl--;
-            s->zapper_x = ptr.x;
-            s->zapper_y = ptr.y;
         }
     }
 
