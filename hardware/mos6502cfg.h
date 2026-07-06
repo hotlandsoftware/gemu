@@ -52,6 +52,7 @@ typedef enum {
     NES_DEVICE_ROB,         /* R.O.B. (Robotic Operating Buddy) */
     NES_DEVICE_ROB_FAMICOM, /* Family Computer Robot */
     NES_DEVICE_FC2_MIC,     /* Famicom Controller 2 with built-in microphone */
+    NES_DEVICE_MOUSE,       /* Subor Mouse (24-bit reply via the standard $4016 shift register) */
 } NesDeviceType;
 
 typedef enum {

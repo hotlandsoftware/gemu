@@ -26,6 +26,7 @@ void ppu_sh6578_reset(Sh6578Ppu *ppu) {
     ppu->frame = 0;
     ppu->dirty = false;
     ppu->nmi_pending = false;
+    ppu->scanline_tick = false;
 }
 
 uint8_t ppu_sh6578_read(Sh6578Ppu *ppu, uint8_t reg) {
@@ -300,6 +301,7 @@ void ppu_sh6578_tick(Sh6578Ppu *ppu) {
         render_scanline(ppu, ppu->scanline);
 
     ppu->scanline++;
+    ppu->scanline_tick = true;
 
     if (ppu->scanline == ppu->vblank_line) {
         ppu->ppustatus |= PPUSTAT_VBLANK;

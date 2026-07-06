@@ -39,6 +39,79 @@ static uint8_t um6578_joypad_byte(uint32_t held) {
     return v;
 }
 
+/* Subor Mouse 24-bit reply — see the protocol table in um6578.h. Computed
+ * fresh on every strobe from the accumulated host-pointer delta since the
+ * last strobe (s->mouse_px/py), matching how a real Subor Mouse reports
+ * relative movement each time it's polled. */
+static uint32_t um6578_subor_mouse_word(Um6578State *s) {
+    if (!s->display) return 0;
+    GemuPointerState ptr = gemu_display_get_pointer(s->display);
+    if (ptr.x < 0 || ptr.y < 0) return 0;
+
+    int dx = ptr.x - s->mouse_px;
+    int dy = ptr.y - s->mouse_py;
+    s->mouse_px = ptr.x;
+    s->mouse_py = ptr.y;
+
+    int ax = dx < 0 ? -dx : dx;
+    int ay = dy < 0 ? -dy : dy;
+    if (ax > 127) ax = 127;
+    if (ay > 127) ay = 127;
+
+    uint32_t v = 0;
+    if (ptr.button)         v |= (1u << 23); /* left button */
+    /* no right-button tracking available (GemuPointerState is left-only) */
+    v |= (1u << 21);                          /* E: some real units keep this always set */
+    if (dy < 0) v |= (1u << 19);              /* up */
+    if (dy > 0) v |= (1u << 18);              /* down */
+    if (dx < 0) v |= (1u << 17);              /* left */
+    if (dx > 0) v |= (1u << 16);              /* right */
+    v |= ((uint32_t)ax & 0x7Fu) << 8;         /* X magnitude, bits 14-8 */
+    v |= ((uint32_t)ay & 0x7Fu);              /* Y magnitude, bits 6-0 */
+    return v;
+}
+
+/* ── IRQ mux ($4032/4033) ────────────────────────────────────────────────── */
+
+#define UM6578_IRQ_TIMER    0x80u
+#define UM6578_IRQ_MOUSE    0x40u
+#define UM6578_IRQ_KEYBOARD 0x20u
+
+static void irq_recompute(Um6578State *s) {
+    s->cpu.irq = (s->irq_pending & (uint8_t)~s->irq_mask) != 0;
+}
+
+static void irq_raise(Um6578State *s, uint8_t bit) {
+    s->irq_pending |= bit;
+    irq_recompute(s);
+}
+
+/* ── Timer ($4034/4035/4036) ─────────────────────────────────────────────── */
+
+static void timer_tick(Um6578State *s) {
+    if (!(s->timer_ctrl & 0x80)) return; /* E: not enabled */
+    uint8_t prescale = s->timer_ctrl & 0x07;
+    s->timer_prescale_acc++;
+    if (s->timer_prescale_acc < (1u << prescale)) return;
+    s->timer_prescale_acc = 0;
+
+    if (s->timer_count == 0) {
+        irq_raise(s, UM6578_IRQ_TIMER);
+        if (s->timer_ctrl & 0x40) /* R: repeat */
+            s->timer_count = s->timer_preset;
+        else
+            s->timer_ctrl &= (uint8_t)~0x80; /* one-shot: clear E on underflow */
+    } else {
+        s->timer_count--;
+    }
+}
+
+static void timer_maybe_tick(Um6578State *s, bool is_scanline_edge) {
+    bool source_is_scanline = (s->timer_ctrl & 0x20) != 0; /* S bit */
+    if (source_is_scanline == is_scanline_edge)
+        timer_tick(s);
+}
+
 /* ── CPU bus ─────────────────────────────────────────────────────────────── */
 
 static uint8_t um6578_read(uint16_t addr, void *ud);
@@ -90,13 +163,21 @@ static uint8_t um6578_read(uint16_t addr, void *ud) {
 
     if (addr == 0x4015) return apu2a03_read(&s->apu, addr);
     if (addr == 0x4016) {
-        uint8_t v = s->iolatch & 1u;
-        s->iolatch >>= 1;
+        uint8_t v;
+        if (s->io_mouse_active) {
+            v = (uint8_t)((s->iolatch >> 23) & 1u); /* Subor Mouse: MSB (bit23) first */
+            s->iolatch <<= 1;
+        } else {
+            v = (uint8_t)(s->iolatch & 1u);         /* standard pad: LSB first */
+            s->iolatch >>= 1;
+        }
         return v;
     }
     if (addr == 0x4017) return 0; /* IN1: unused on every title we support */
+    if (addr == 0x4020) return 0xFF; /* keyboard byte queue: empty (no keyboard modelled) */
     if (addr == 0x4026) return 0; /* EXT: unmodelled input, stubbed to 0 */
-    if (addr == 0x4033) return 0; /* IRQ status: unimplemented upstream too */
+    if (addr == 0x4033) return s->irq_pending;
+    if (addr == 0x4036) return s->timer_count;
 
     if (addr >= 0x4040 && addr <= 0x4047) return s->bankswitch[addr - 0x4040];
     if (addr >= 0x4048 && addr <= 0x404F) {
@@ -134,29 +215,42 @@ static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
         return;
     }
     if (addr == 0x4016) {
-        bool has_pad = s->cfg->n_ports > 0 && s->cfg->ports[0] == NES_DEVICE_CONTROLLER;
-        if ((s->prev_io & 1) && !(val & 1))
-            s->iolatch = has_pad ? um6578_joypad_byte(s->held_actions) : 0;
+        bool has_pad   = s->cfg->n_ports > 0 && s->cfg->ports[0] == NES_DEVICE_CONTROLLER;
+        bool has_mouse = s->cfg->n_ports > 0 && s->cfg->ports[0] == NES_DEVICE_MOUSE;
+        if ((s->prev_io & 1) && !(val & 1)) {
+            if (has_mouse) {
+                s->io_mouse_active = true;
+                s->iolatch = um6578_subor_mouse_word(s);
+            } else {
+                s->io_mouse_active = false;
+                s->iolatch = has_pad ? um6578_joypad_byte(s->held_actions) : 0;
+            }
+        }
         s->prev_io = val;
         return;
     }
     if (addr >= 0x4000 && addr <= 0x4017) { apu2a03_write(&s->apu, addr, val); return; }
 
-    if (addr == 0x4020) return; /* timing setting control: stub */
+    if (addr == 0x4020) return; /* keyboard-related write, unmodelled */
     if (addr == 0x4026) return; /* EXT write: stub */
     if (addr == 0x4027) return; /* DAC data register: unmodelled */
     if (addr == 0x4031) return; /* startup protection sequence: logging-only upstream too */
     if (addr == 0x4032) {
-        s->irqmask = val;
-        if (val & 0x80) s->cpu.irq = false;
+        s->irq_mask = val;
+        s->irq_pending &= (uint8_t)~val; /* a 1 bit acknowledges (clears) that pending line */
+        irq_recompute(s);
         return;
     }
     if (addr == 0x4034) {
-        if ((val & 0x80) && (val & 0x20)) s->timer_armed = true;
-        else { s->timer_armed = false; s->timer_scanlines_left = 0; }
+        s->timer_ctrl = val;
+        s->timer_prescale_acc = 0;
         return;
     }
-    if (addr == 0x4035) { s->timer_scanlines_left = val; return; }
+    if (addr == 0x4035) {
+        s->timer_preset = val;
+        s->timer_count = val; /* writing the preset also resets the live count */
+        return;
+    }
 
     if (addr >= 0x4040 && addr <= 0x4047) { s->bankswitch[addr - 0x4040] = val; return; }
     if (addr >= 0x4048 && addr <= 0x404F) {
@@ -242,20 +336,20 @@ static bool um6578_screendump(void *ud, const char *path) {
 static void um6578_sync_ppu(Um6578State *s, uint64_t cpu_cycle) {
     while (s->ppu_synced_cpu_cycle < cpu_cycle) {
         s->ppu_synced_cpu_cycle++;
+
+        timer_maybe_tick(s, false); /* Timer source = CPU M2 */
+
         ppu_sh6578_tick(&s->ppu);
         if (s->ppu.nmi_pending) {
             s->cpu.nmi = true;
             s->ppu.nmi_pending = false;
         }
-        if (s->ppu.dirty) {
-            /* one scanline-count IRQ timer tick per PPU scanline crossed */
-            if (s->timer_armed && s->timer_scanlines_left > 0) {
-                s->timer_scanlines_left--;
-                if (s->timer_scanlines_left == 0 && !(s->irqmask & 0x80))
-                    s->cpu.irq = true;
-            }
-            return;
+        if (s->ppu.scanline_tick) {
+            s->ppu.scanline_tick = false;
+            timer_maybe_tick(s, true); /* Timer source = Scanline */
         }
+        if (s->ppu.dirty)
+            return;
     }
 }
 

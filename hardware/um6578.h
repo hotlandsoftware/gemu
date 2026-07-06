@@ -31,20 +31,59 @@
  *   $4000-$4013  APU registers (2A03, reused from audio/apu2a03.c)
  *   $4014        OAM DMA (write page -> 256-byte sprite RAM copy)
  *   $4015        APU status
- *   $4016        Joypad shift register read/write (strobe)
+ *   $4016        Joypad shift register read/write (strobe) — also where a
+ *                Subor Mouse (-device subor-mouse) is read, see below
  *   $4017        Joypad 2 / EXT-adjacent read (unused here, returns 0)
- *   $4020        Timing setting control (write-only, stubbed)
+ *   $4020        Keyboard byte queue (read; a real keyboard peripheral,
+ *                not modelled — always reports empty, matching how even
+ *                Furbtendulator's own keyboard feed is stubbed out)
  *   $4026        EXT port read/write
  *   $4031        Initial startup protection sequence (write-only, logged only
  *                upstream — genuinely has no gating effect, safe to no-op)
- *   $4032        IRQ mask (bit7 clear enables the scanline timer IRQ)
- *   $4033        IRQ status (read-only, stubbed)
- *   $4034        Timer config (arms/disarms the scanline-count IRQ timer)
- *   $4035        Timer reload value (in scanlines)
+ *   $4032        IRQ mask/ack (write): 1=acknowledge+block that source going
+ *                forward, 0=unblock. Bit7=Timer, bit6=Mouse, bit5=Keyboard
+ *                (see nesdev.org/wiki/UM6576/UM6578 — IRQ). We never raise
+ *                the Keyboard/Mouse bits ourselves (no source models them).
+ *   $4033        IRQ status (read): which sources currently have a pending,
+ *                unacknowledged request
+ *   $4034        Timer control [ERS. .PPP]: E=enable, R=repeat (else clear E
+ *                on underflow), S=source (0=CPU M2 cycles, 1=PPU scanlines),
+ *                PPP=prescaler (tick every 2^PPP source ticks)
+ *   $4035        Timer preset (write) — also resets the live count to this
+ *                value immediately
+ *   $4036        Timer count (read)
  *   $4040-$4047  Bankswitch registers: 4KB window N -> ROM page N*0x1000
  *   $4048-$404F  DMA controller (control/bank/src/dst/length)
  *   $5000-$7FFF  RAM (12KB, no mirroring)
  *   $8000-$FFFF  8 x 4KB banked ROM windows
+ *
+ * Mouse (-device subor-mouse): this is a "Subor Mouse" (nesdev.org/wiki/
+ * Subor_Mouse) — a real, documented third-party NES/Famicom peripheral, NOT
+ * chip-specific. It reuses the plain $4016 controller strobe/shift protocol
+ * (no separate registers at all) with a wider 24-bit reply instead of 8:
+ *
+ *   bit23 = left button          bit19 = up            bit20 = unused (0)
+ *   bit22 = right button         bit18 = down           bit15 = unused (0)
+ *   bit21 = E (magnitude valid   bit17 = left (X-)       bit7 = unused (0)
+ *           flag; some real       bit16 = right (X+)
+ *           units keep this
+ *           always set)
+ *   bits14-8 = X movement magnitude, 0-127 (valid when E=1)
+ *   bits6-0  = Y movement magnitude, 0-127 (valid when E=1)
+ *
+ * Bits shift out MSB-first (bit23 first), same direction as a standard
+ * controller — by design, the first 8 bits alone already look like a
+ * plausible controller reply, so code that only reads 8 bits (unaware of
+ * the mouse) still gets sane input. This is genuinely unverified for THIS
+ * specific chip/game (gogoconniechan.bin) — no MAME driver, no fork of
+ * Nintendulator (mainline or the community VT/OneBus-focused "Furbtendulator"
+ * fork, which has real working UM6578 PPU/APU/DMA emulation but leaves its
+ * own keyboard *and* mouse input unimplemented) supports it. It's the most
+ * concretely-documented candidate protocol available, reusing infrastructure
+ * ($4016) this ROM is confirmed (via runtime tracing, not just static
+ * disassembly of the banked, sometimes self-modified ROM) to actually poll
+ * every frame — but whether this specific title's mouse detection actually
+ * lives behind that same read is not confirmed.
  */
 
 #define UM6578_CPU_HZ      1789772.667  /* NTSC_APU_CLOCK: 21.477272MHz XTAL / 12 */
@@ -86,12 +125,25 @@ typedef struct Um6578State {
     uint8_t dma_dest[2];
     uint8_t dma_length[2];
 
-    uint8_t irqmask;
-    int     timer_scanlines_left;
-    bool    timer_armed;
+    /* IRQ mux ($4032/4033): bit7=Timer, bit6=Mouse, bit5=Keyboard */
+    uint8_t irq_mask;      /* $4032: 1=acked/blocked, 0=passthrough */
+    uint8_t irq_pending;   /* $4033: raw pending flags, regardless of mask */
 
-    uint8_t prev_io;
-    uint8_t iolatch;
+    /* Timer ($4034/4035/4036) */
+    uint8_t  timer_ctrl;      /* raw $4034 value */
+    uint8_t  timer_preset;    /* $4035 */
+    uint8_t  timer_count;     /* live count, readable via $4036 */
+    uint32_t timer_prescale_acc; /* source ticks accumulated toward next decrement */
+
+    /* Subor Mouse (-device subor-mouse), read via the standard $4016 shift
+     * register — see um6578.h's top-of-file comment for the protocol. */
+    int      mouse_px, mouse_py; /* host pointer position as of the last strobe */
+
+    uint8_t  prev_io;
+    uint32_t iolatch;   /* wide enough for the Subor Mouse's 24-bit reply
+                         * (standard controller replies only need 8 bits) */
+    bool     io_mouse_active; /* true: $4016 shifts iolatch MSB-first (Subor,
+                               * 24 bits); false: LSB-first (standard pad, 8 bits) */
     uint32_t held_actions;
 
     uint64_t ppu_synced_cpu_cycle;

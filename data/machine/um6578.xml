@@ -1,6 +1,8 @@
 <?xml version="1.0"?>
 <machine name="um6578" family="mos" description="UM6578 Enhanced Famiclone"
          cpu="6502" vga="sh6578" soundhw="2a03">
-    <rom name="tv game1.bin" region="maincpu" addr="0x0000" sha256="b05b01a76db1781abbfca31c9315cfe088a5b6c902bf0b601fb0f50d34278e01"/>
+         
+    <rom name="colortest-sh6578.bin" region="maincpu" addr="0x0000" sha256="967e0044c00495715689740ecc179c3266d51753deb9c61575017f280ee5d32c"/>
     <rom name="gogoconniechan.bin" region="maincpu" addr="0x0000" sha256="66c254482eeae9cc36a9c32bc8da3fd010922e1a25087433eaf2c9f521abfbca"/>
+    <rom name="tv game1.bin" region="maincpu" addr="0x0000" sha256="b05b01a76db1781abbfca31c9315cfe088a5b6c902bf0b601fb0f50d34278e01"/>
 </machine>

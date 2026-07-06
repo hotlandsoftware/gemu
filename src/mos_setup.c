@@ -238,6 +238,7 @@ static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
         {"rob",              NES_DEVICE_ROB},
         {"rob-famicom",      NES_DEVICE_ROB_FAMICOM},
         {"famicom-mic",      NES_DEVICE_FC2_MIC},
+        {"subor-mouse",      NES_DEVICE_MOUSE},
     };
     NesDeviceType type = NES_DEVICE_NONE;
     for (int d = 0; d < (int)(sizeof(nes_devs)/sizeof(nes_devs[0])); d++)

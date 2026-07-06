@@ -85,6 +85,9 @@ typedef struct Sh6578Ppu {
     uint64_t frame;
     bool     dirty;          /* set for one tick when a frame completes */
     bool     nmi_pending;    /* edge-triggered: fires once, caller clears */
+    bool     scanline_tick;  /* set for one tick on every scanline advance (not
+                               * just frame-complete) — drives the $4034 timer's
+                               * "Source=Scanline" mode; caller clears it. */
 
     uint8_t  pixels[SH6578_WIDTH * SH6578_HEIGHT];
     uint32_t pixels_argb[SH6578_WIDTH * SH6578_HEIGHT];
