@@ -614,5 +614,7 @@ void fiveclown_run(FiveClownState *s, const MosConfig *cfg) {
 
     fiveclown_nvram_save(s);
     gemu_monitor_stop(s->monitor);
-    printf("5clown: %llu frames\n", (unsigned long long)s->frame);
+    printf("5clown: %llu frames, %llu cpu cycles (main), %llu cpu cycles (audio)\n",
+           (unsigned long long)s->frame, (unsigned long long)s->cpu.cycle_count,
+           (unsigned long long)s->audiocpu.cycle_count);
 }

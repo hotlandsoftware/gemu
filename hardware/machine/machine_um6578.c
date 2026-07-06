@@ -433,5 +433,6 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
     }
 
     gemu_monitor_stop(s->monitor);
-    printf("um6578: %llu frames\n", (unsigned long long)s->frame);
+    printf("um6578: %llu frames, %llu cpu cycles\n",
+           (unsigned long long)s->frame, (unsigned long long)s->cpu.cycle_count);
 }

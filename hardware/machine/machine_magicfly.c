@@ -604,5 +604,6 @@ void magicfly_run(MagicflyState *s, const MosConfig *cfg) {
 
     magicfly_nvram_save(s);
     gemu_monitor_stop(s->monitor);
-    printf("%s: %llu frames\n", name, (unsigned long long)s->frame);
+    printf("%s: %llu frames, %llu cpu cycles\n",
+           name, (unsigned long long)s->frame, (unsigned long long)s->cpu.cycle_count);
 }
