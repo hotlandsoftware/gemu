@@ -2,4 +2,5 @@
 <device name="nes-controller" description="NES/Famicom Standard Controller">
     <machine name="nes"/>
     <machine name="famicom"/>
+    <machine name="um6578"/>
 </device>

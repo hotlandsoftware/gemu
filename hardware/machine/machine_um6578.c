@@ -10,15 +10,17 @@
 
 /* ── Input action table ─────────────────────────────────────────────────── */
 
+/* Names/keys match nes_actions[] in machine_nes.c exactly (same physical
+ * device, same gemu.ini [nes-controller] section — see .ini_section below). */
 static const GemuActionDef um6578_actions[UM6578_NUM_ACTIONS] = {
-    { "a",      GEMU_ACTION(UM6578_ACT_A),      "z"      },
-    { "b",      GEMU_ACTION(UM6578_ACT_B),      "x"      },
-    { "select", GEMU_ACTION(UM6578_ACT_SELECT), "Right Shift" },
-    { "start",  GEMU_ACTION(UM6578_ACT_START),  "Return" },
-    { "up",     GEMU_ACTION(UM6578_ACT_UP),     "Up"     },
-    { "down",   GEMU_ACTION(UM6578_ACT_DOWN),   "Down"   },
-    { "left",   GEMU_ACTION(UM6578_ACT_LEFT),   "Left"   },
-    { "right",  GEMU_ACTION(UM6578_ACT_RIGHT),  "Right"  },
+    { "A",      GEMU_ACTION(UM6578_ACT_A),      "z"           },
+    { "B",      GEMU_ACTION(UM6578_ACT_B),      "x"           },
+    { "Select", GEMU_ACTION(UM6578_ACT_SELECT), "Right Shift" },
+    { "Start",  GEMU_ACTION(UM6578_ACT_START),  "Return"      },
+    { "Up",     GEMU_ACTION(UM6578_ACT_UP),     "Up"          },
+    { "Down",   GEMU_ACTION(UM6578_ACT_DOWN),   "Down"        },
+    { "Left",   GEMU_ACTION(UM6578_ACT_LEFT),   "Left"        },
+    { "Right",  GEMU_ACTION(UM6578_ACT_RIGHT),  "Right"       },
 };
 
 /* MAME's nes_sh6578 INPUT_PORTS: bit0=Button2(B), bit1=Button1(A), bit2=Select,
@@ -132,8 +134,9 @@ static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
         return;
     }
     if (addr == 0x4016) {
+        bool has_pad = s->cfg->n_ports > 0 && s->cfg->ports[0] == NES_DEVICE_CONTROLLER;
         if ((s->prev_io & 1) && !(val & 1))
-            s->iolatch = um6578_joypad_byte(s->held_actions);
+            s->iolatch = has_pad ? um6578_joypad_byte(s->held_actions) : 0;
         s->prev_io = val;
         return;
     }
@@ -332,6 +335,11 @@ Um6578State *um6578_create(const MosConfig *cfg) {
     }
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
+        /* Same physical device as NES's standard controller — share its
+         * gemu.ini section (and the "nes-controller" heading shown at the
+         * top of the Tab key-binding overlay) rather than inventing a
+         * separate, machine-specific one. */
+        bool has_pad = cfg->n_ports > 0 && cfg->ports[0] == NES_DEVICE_CONTROLLER;
         s->display = gemu_display_create(cfg->display_type, &(GemuDisplayConfig){
             .title       = "GEMU",
             .fb_width    = SH6578_WIDTH,
@@ -340,7 +348,7 @@ Um6578State *um6578_create(const MosConfig *cfg) {
             .renderer    = cfg->display_renderer,
             .actions     = um6578_actions,
             .n_actions   = UM6578_NUM_ACTIONS,
-            .ini_section = "um6578",
+            .ini_section = has_pad ? "nes-controller" : "um6578",
         });
     }
 

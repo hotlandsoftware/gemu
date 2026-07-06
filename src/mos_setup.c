@@ -572,6 +572,12 @@ int mos_setup(int argc, char *argv[]) {
             cfg.ports[0] = NES_DEVICE_CONTROLLER;
             cfg.n_ports  = 2;
         }
+    } else if (cfg.machine == MOS_MACHINE_UM6578) {
+        /* SH6578 only wires up a single $4016 joypad shift register — no
+         * second port, no zapper/keyboard latch like real NES — so just
+         * default port 0 to a standard controller, same as NES does. */
+        if (cfg.n_ports == 0)
+            cfg.ports[cfg.n_ports++] = NES_DEVICE_CONTROLLER;
     }
 
     if (cfg.machine == MOS_MACHINE_NES && !cfg.sound_explicit &&
