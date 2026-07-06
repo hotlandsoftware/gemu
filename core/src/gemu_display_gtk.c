@@ -147,13 +147,19 @@ static gboolean on_delete(GtkWidget *w, GdkEvent *ev, gpointer ud) {
     return TRUE;
 }
 
-static void gtk_pointer_update(GtkBackend *b, double x, double y, bool button, bool pressed) {
+static void gtk_pointer_update(GtkBackend *b, double x, double y,
+                               bool button, bool pressed,
+                               bool right_button, bool right_pressed) {
     GemuDisplay *d = b->parent;
     GtkWidget *area = gemu_video_gtk_drawing_area(b->video);
     int aw = gtk_widget_get_allocated_width(area);
     int ah = gtk_widget_get_allocated_height(area);
     if (aw <= 0 || ah <= 0 || x < 0.0 || y < 0.0 || x >= aw || y >= ah) {
-        d->pointer = (GemuPointerState){ .x = -1, .y = -1, .button = button, .pressed = pressed };
+        d->pointer = (GemuPointerState){
+            .x = -1, .y = -1,
+            .button = button, .pressed = pressed,
+            .right_button = right_button, .right_pressed = right_pressed,
+        };
         return;
     }
 
@@ -161,12 +167,15 @@ static void gtk_pointer_update(GtkBackend *b, double x, double y, bool button, b
     d->pointer.y = (int)(y * (double)b->fb_height / (double)ah);
     d->pointer.button = button;
     d->pointer.pressed = d->pointer.pressed || pressed;
+    d->pointer.right_button = right_button;
+    d->pointer.right_pressed = d->pointer.right_pressed || right_pressed;
 }
 
 static gboolean on_pointer_motion(GtkWidget *w, GdkEventMotion *ev, gpointer ud) {
     GtkBackend *b = ud;
     bool button = (ev->state & GDK_BUTTON1_MASK) != 0;
-    gtk_pointer_update(b, ev->x, ev->y, button, false);
+    bool right_button = (ev->state & GDK_BUTTON3_MASK) != 0;
+    gtk_pointer_update(b, ev->x, ev->y, button, false, right_button, false);
     (void)w;
     return FALSE;
 }
@@ -175,6 +184,12 @@ static gboolean on_button(GtkWidget *w, GdkEventButton *ev, gpointer ud) {
     GtkBackend *b = ud;
     if (ev->button == 1)
         gtk_pointer_update(b, ev->x, ev->y,
+                           ev->type == GDK_BUTTON_PRESS,
+                           ev->type == GDK_BUTTON_PRESS,
+                           b->parent->pointer.right_button, false);
+    else if (ev->button == 3)
+        gtk_pointer_update(b, ev->x, ev->y,
+                           b->parent->pointer.button, false,
                            ev->type == GDK_BUTTON_PRESS,
                            ev->type == GDK_BUTTON_PRESS);
     (void)w;

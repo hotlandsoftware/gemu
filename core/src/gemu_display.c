@@ -108,6 +108,7 @@ uint32_t gemu_display_poll(GemuDisplay *d) {
     if (!d) return 0;
     d->held_prev   = d->held;
     d->pointer.pressed = false;
+    d->pointer.right_pressed = false;
     d->held        = d->do_poll(d);
     d->last_pressed = d->held & ~d->held_prev;
     return d->held;

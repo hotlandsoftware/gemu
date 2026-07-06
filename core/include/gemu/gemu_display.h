@@ -52,6 +52,8 @@ typedef struct {
     int  x, y;      /* position in logical (framebuffer) pixels; -1 if outside */
     bool button;
     bool pressed;   /* true for one poll when the primary button went down */
+    bool right_button;
+    bool right_pressed; /* true for one poll when the secondary button went down */
 } GemuPointerState;
 
 /* ── GTK-specific extras ─────────────────────────────────────────────────────

@@ -238,6 +238,7 @@ static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
         {"rob",              NES_DEVICE_ROB},
         {"rob-famicom",      NES_DEVICE_ROB_FAMICOM},
         {"famicom-mic",      NES_DEVICE_FC2_MIC},
+        {"mouse",            NES_DEVICE_MOUSE},
         {"subor-mouse",      NES_DEVICE_MOUSE},
     };
     NesDeviceType type = NES_DEVICE_NONE;
@@ -303,6 +304,21 @@ static bool parse_rom_arg(MosConfig *cfg, const char *arg) {
     const char *path;
     if (gemu_parse_addr_arg("gemu", arg, &addr, &path) < 0) return false;
     return add_rom(cfg, addr, path);
+}
+
+static bool load_rom_arg(MosConfig *cfg, const char *arg, const char *romdb_machine) {
+    struct stat st;
+    if ((stat(arg, &st) == 0 && S_ISDIR(st.st_mode)) || romdb_is_zip(arg)) {
+        int n = romdb_load_dir(arg, romdb_machine, romdb_add_mos, cfg);
+        if (n < 0) return false;
+        if (n == 0) {
+            fprintf(stderr, "gemu: no known ROMs in '%s' for machine '%s'\n",
+                    arg, romdb_machine);
+            return false;
+        }
+        return true;
+    }
+    return parse_rom_arg(cfg, arg);
 }
 
 /* ── mos_setup ───────────────────────────────────────────────────────────── */
@@ -412,19 +428,7 @@ int mos_setup(int argc, char *argv[]) {
             cfg.mem_size = sz;
         } else if (strcmp(rem[i], "-rom") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -rom requires an argument\n"); return 1; }
-            const char *val = rem[++i];
-            struct stat st;
-            if ((stat(val, &st) == 0 && S_ISDIR(st.st_mode)) || romdb_is_zip(val)) {
-                int n = romdb_load_dir(val, romdb_machine, romdb_add_mos, &cfg);
-                if (n < 0) return 1;
-                if (n == 0) {
-                    fprintf(stderr, "gemu: no known ROMs in '%s' for machine '%s'\n",
-                            val, romdb_machine);
-                    return 1;
-                }
-            } else {
-                if (!parse_rom_arg(&cfg, val)) return 1;
-            }
+            if (!load_rom_arg(&cfg, rem[++i], romdb_machine)) return 1;
         } else if (strcmp(rem[i], "-start") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -start requires an argument\n"); return 1; }
             cfg.start_addr     = (uint16_t)strtoul(rem[++i], NULL, 0);
@@ -543,7 +547,7 @@ int mos_setup(int argc, char *argv[]) {
     }
 
     if (args.rom_path) {
-        if (!add_rom(&cfg, 0x0000u, args.rom_path)) return 1;
+        if (!load_rom_arg(&cfg, args.rom_path, romdb_machine)) return 1;
     }
 
     cfg.display_type  = args.display_type;

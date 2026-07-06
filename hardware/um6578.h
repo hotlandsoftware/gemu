@@ -31,8 +31,8 @@
  *   $4000-$4013  APU registers (2A03, reused from audio/apu2a03.c)
  *   $4014        OAM DMA (write page -> 256-byte sprite RAM copy)
  *   $4015        APU status
- *   $4016        Joypad shift register read/write (strobe) — also where a
- *                Subor Mouse (-device subor-mouse) is read, see below
+ *   $4016        Joypad shift register read/write (strobe) — also where the
+ *                UM6578 mouse (-device mouse) is read, see below
  *   $4017        Joypad 2 / EXT-adjacent read (unused here, returns 0)
  *   $4020        Keyboard byte queue (read; a real keyboard peripheral,
  *                not modelled — always reports empty, matching how even
@@ -57,10 +57,12 @@
  *   $5000-$7FFF  RAM (12KB, no mirroring)
  *   $8000-$FFFF  8 x 4KB banked ROM windows
  *
- * Mouse (-device subor-mouse): this is a "Subor Mouse" (nesdev.org/wiki/
- * Subor_Mouse) — a real, documented third-party NES/Famicom peripheral, NOT
- * chip-specific. It reuses the plain $4016 controller strobe/shift protocol
- * (no separate registers at all) with a wider 24-bit reply instead of 8:
+ * Mouse (-device mouse, legacy alias -device subor-mouse): Go! Go!
+ * Connie-chan! Asobou Mouse ships with a removable two-button PS/2 ball
+ * mouse. The host-facing PS/2 serial details are handled by the UM6578-side
+ * console hardware; software polls the mouse through the same $4016
+ * controller strobe/shift path used by the documented Subor Mouse protocol,
+ * with a wider 24-bit reply instead of 8:
  *
  *   bit23 = left button          bit19 = up            bit20 = unused (0)
  *   bit22 = right button         bit18 = down           bit15 = unused (0)
@@ -82,8 +84,7 @@
  * concretely-documented candidate protocol available, reusing infrastructure
  * ($4016) this ROM is confirmed (via runtime tracing, not just static
  * disassembly of the banked, sometimes self-modified ROM) to actually poll
- * every frame — but whether this specific title's mouse detection actually
- * lives behind that same read is not confirmed.
+ * every frame.
  */
 
 #define UM6578_CPU_HZ      1789772.667  /* NTSC_APU_CLOCK: 21.477272MHz XTAL / 12 */
@@ -135,16 +136,28 @@ typedef struct Um6578State {
     uint8_t  timer_count;     /* live count, readable via $4036 */
     uint32_t timer_prescale_acc; /* source ticks accumulated toward next decrement */
 
-    /* Subor Mouse (-device subor-mouse), read via the standard $4016 shift
+    /* UM6578 mouse (-device mouse), read via the standard $4016 shift
      * register — see um6578.h's top-of-file comment for the protocol. */
     int      mouse_px, mouse_py; /* host pointer position as of the last strobe */
+    bool     mouse_have_pos;
+    bool     mouse_synth_active;
+    int      mouse_synth_x, mouse_synth_y;
+    bool     mouse_synth_left, mouse_synth_right;
+    bool     mouse_prev_left, mouse_prev_right;
+    uint8_t  mouse_queue[16];
+    uint8_t  mouse_qhead, mouse_qtail;
 
     uint8_t  prev_io;
-    uint32_t iolatch;   /* wide enough for the Subor Mouse's 24-bit reply
+    uint32_t iolatch;   /* wide enough for the mouse's 24-bit reply
                          * (standard controller replies only need 8 bits) */
     bool     io_mouse_active; /* true: $4016 shifts iolatch MSB-first (Subor,
                                * 24 bits); false: LSB-first (standard pad, 8 bits) */
     uint32_t held_actions;
+    bool     trace_io;
+    bool     trace_4016;
+    bool     trace_timer;
+    uint32_t input_inject_mask;
+    int      input_inject_frames;
 
     uint64_t ppu_synced_cpu_cycle;
 

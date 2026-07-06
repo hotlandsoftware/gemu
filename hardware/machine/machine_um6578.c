@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* ── Input action table ─────────────────────────────────────────────────── */
 
@@ -39,29 +40,45 @@ static uint8_t um6578_joypad_byte(uint32_t held) {
     return v;
 }
 
-/* Subor Mouse 24-bit reply — see the protocol table in um6578.h. Computed
+static GemuPointerState um6578_pointer_state(Um6578State *s) {
+    if (s->mouse_synth_active) {
+        return (GemuPointerState){
+            .x = s->mouse_synth_x,
+            .y = s->mouse_synth_y,
+            .button = s->mouse_synth_left,
+            .right_button = s->mouse_synth_right,
+        };
+    }
+    if (!s->display) return (GemuPointerState){ .x = -1, .y = -1 };
+    return gemu_display_get_pointer(s->display);
+}
+
+static void um6578_queue_ps2_mouse_packet(Um6578State *s, int dx, int dy,
+                                          bool left, bool right);
+
+/* UM6578 mouse 24-bit reply — see the protocol table in um6578.h. Computed
  * fresh on every strobe from the accumulated host-pointer delta since the
- * last strobe (s->mouse_px/py), matching how a real Subor Mouse reports
+ * last strobe (s->mouse_px/py), matching how the mouse reports
  * relative movement each time it's polled. */
 static uint32_t um6578_subor_mouse_word(Um6578State *s) {
-    if (!s->display) return 0;
-    GemuPointerState ptr = gemu_display_get_pointer(s->display);
-    if (ptr.x < 0 || ptr.y < 0) return 0;
+    uint32_t v = (1u << 21);                    /* E: some real units keep this always set */
+    GemuPointerState ptr = um6578_pointer_state(s);
+    if (ptr.x < 0 || ptr.y < 0) return v;
 
-    int dx = ptr.x - s->mouse_px;
-    int dy = ptr.y - s->mouse_py;
+    int dx = s->mouse_have_pos ? ptr.x - s->mouse_px : 0;
+    int dy = s->mouse_have_pos ? ptr.y - s->mouse_py : 0;
     s->mouse_px = ptr.x;
     s->mouse_py = ptr.y;
+    s->mouse_have_pos = true;
+    um6578_queue_ps2_mouse_packet(s, dx, dy, ptr.button, ptr.right_button);
 
     int ax = dx < 0 ? -dx : dx;
     int ay = dy < 0 ? -dy : dy;
     if (ax > 127) ax = 127;
     if (ay > 127) ay = 127;
 
-    uint32_t v = 0;
     if (ptr.button)         v |= (1u << 23); /* left button */
-    /* no right-button tracking available (GemuPointerState is left-only) */
-    v |= (1u << 21);                          /* E: some real units keep this always set */
+    if (ptr.right_button)   v |= (1u << 22); /* right button */
     if (dy < 0) v |= (1u << 19);              /* up */
     if (dy > 0) v |= (1u << 18);              /* down */
     if (dx < 0) v |= (1u << 17);              /* left */
@@ -84,6 +101,63 @@ static void irq_recompute(Um6578State *s) {
 static void irq_raise(Um6578State *s, uint8_t bit) {
     s->irq_pending |= bit;
     irq_recompute(s);
+}
+
+static bool mouse_queue_empty(const Um6578State *s) {
+    return s->mouse_qhead == s->mouse_qtail;
+}
+
+static void mouse_queue_push(Um6578State *s, uint8_t v) {
+    uint8_t next = (uint8_t)((s->mouse_qtail + 1u) & 0x0Fu);
+    if (next == s->mouse_qhead)
+        s->mouse_qhead = (uint8_t)((s->mouse_qhead + 1u) & 0x0Fu);
+    s->mouse_queue[s->mouse_qtail] = v;
+    s->mouse_qtail = next;
+}
+
+static uint8_t mouse_queue_pop(Um6578State *s) {
+    if (mouse_queue_empty(s)) return 0xFFu;
+    uint8_t v = s->mouse_queue[s->mouse_qhead];
+    s->mouse_qhead = (uint8_t)((s->mouse_qhead + 1u) & 0x0Fu);
+    if (mouse_queue_empty(s)) {
+        s->irq_pending &= (uint8_t)~UM6578_IRQ_KEYBOARD;
+        irq_recompute(s);
+    } else {
+        irq_raise(s, UM6578_IRQ_KEYBOARD);
+    }
+    return v;
+}
+
+static int clamp_ps2_delta(int v) {
+    if (v < -127) return -127;
+    if (v > 127) return 127;
+    return v;
+}
+
+static void um6578_queue_ps2_mouse_packet(Um6578State *s, int dx, int dy,
+                                          bool left, bool right) {
+    if (dx == 0 && dy == 0 &&
+        left == s->mouse_prev_left && right == s->mouse_prev_right)
+        return;
+
+    int ps2_dx = clamp_ps2_delta(dx);
+    int ps2_dy = clamp_ps2_delta(-dy); /* host Y grows downward; PS/2 Y grows upward */
+    uint8_t flags = 0x08u;
+    if (left) flags |= 0x01u;
+    if (right) flags |= 0x02u;
+    if (ps2_dx < 0) flags |= 0x10u;
+    if (ps2_dy < 0) flags |= 0x20u;
+
+    mouse_queue_push(s, flags);
+    mouse_queue_push(s, (uint8_t)ps2_dx);
+    mouse_queue_push(s, (uint8_t)ps2_dy);
+    if (s->trace_io)
+        fprintf(stderr, "um6578: queue mouse ps2 %02X %02X %02X dx=%d dy=%d pc=%04X\n",
+                flags, (uint8_t)ps2_dx, (uint8_t)ps2_dy, dx, dy, s->cpu.PC);
+    s->mouse_prev_left = left;
+    s->mouse_prev_right = right;
+    /* Connie-chan's IRQ handler services the PS/2 byte queue on bit $20. */
+    irq_raise(s, UM6578_IRQ_KEYBOARD);
 }
 
 /* ── Timer ($4034/4035/4036) ─────────────────────────────────────────────── */
@@ -165,18 +239,40 @@ static uint8_t um6578_read(uint16_t addr, void *ud) {
     if (addr == 0x4016) {
         uint8_t v;
         if (s->io_mouse_active) {
-            v = (uint8_t)((s->iolatch >> 23) & 1u); /* Subor Mouse: MSB (bit23) first */
+            v = (uint8_t)((s->iolatch >> 23) & 1u); /* mouse: MSB (bit23) first */
             s->iolatch <<= 1;
         } else {
             v = (uint8_t)(s->iolatch & 1u);         /* standard pad: LSB first */
             s->iolatch >>= 1;
         }
+        if (s->trace_4016)
+            fprintf(stderr, "um6578: read  $4016 -> %02X pc=%04X mouse=%d latch=%06X\n",
+                    v, s->cpu.PC, s->io_mouse_active ? 1 : 0,
+                    (unsigned)(s->iolatch & 0xFFFFFFu));
         return v;
     }
     if (addr == 0x4017) return 0; /* IN1: unused on every title we support */
-    if (addr == 0x4020) return 0xFF; /* keyboard byte queue: empty (no keyboard modelled) */
-    if (addr == 0x4026) return 0; /* EXT: unmodelled input, stubbed to 0 */
-    if (addr == 0x4033) return s->irq_pending;
+    if (addr == 0x4020) {
+        uint8_t v = mouse_queue_pop(s);
+        if (s->trace_io)
+            fprintf(stderr, "um6578: read  $4020 -> %02X pc=%04X\n", v, s->cpu.PC);
+        return v; /* keyboard/mouse byte queue; empty reads as 0xFF */
+    }
+    if (addr == 0x4026) {
+        GemuPointerState ptr = um6578_pointer_state(s);
+        uint8_t v = 0x09u; /* bits 0/3 are active-low mouse buttons */
+        if (ptr.button) v &= (uint8_t)~0x01u;
+        if (ptr.right_button) v &= (uint8_t)~0x08u;
+        if (s->trace_io)
+            fprintf(stderr, "um6578: read  $4026 -> %02X pc=%04X\n", v, s->cpu.PC);
+        return v;
+    }
+    if (addr == 0x4033) {
+        if (s->trace_io && s->irq_pending &&
+            (s->trace_timer || (s->irq_pending & (UM6578_IRQ_MOUSE | UM6578_IRQ_KEYBOARD)) != 0))
+            fprintf(stderr, "um6578: read  $4033 -> %02X pc=%04X\n", s->irq_pending, s->cpu.PC);
+        return s->irq_pending;
+    }
     if (addr == 0x4036) return s->timer_count;
 
     if (addr >= 0x4040 && addr <= 0x4047) return s->bankswitch[addr - 0x4040];
@@ -225,28 +321,55 @@ static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
                 s->io_mouse_active = false;
                 s->iolatch = has_pad ? um6578_joypad_byte(s->held_actions) : 0;
             }
+            if (s->trace_4016)
+                fprintf(stderr, "um6578: latch $4016 pc=%04X mouse=%d value=%06X\n",
+                        s->cpu.PC, s->io_mouse_active ? 1 : 0,
+                        (unsigned)(s->iolatch & 0xFFFFFFu));
         }
+        if (s->trace_4016)
+            fprintf(stderr, "um6578: write $4016 <- %02X pc=%04X\n", val, s->cpu.PC);
         s->prev_io = val;
         return;
     }
     if (addr >= 0x4000 && addr <= 0x4017) { apu2a03_write(&s->apu, addr, val); return; }
 
-    if (addr == 0x4020) return; /* keyboard-related write, unmodelled */
-    if (addr == 0x4026) return; /* EXT write: stub */
+    if (addr == 0x4020) {
+        if (s->trace_io)
+            fprintf(stderr, "um6578: write $4020 <- %02X pc=%04X\n", val, s->cpu.PC);
+        return; /* keyboard-related write, unmodelled */
+    }
+    if (addr == 0x4022) {
+        if (s->trace_io)
+            fprintf(stderr, "um6578: write $4022 <- %02X pc=%04X\n", val, s->cpu.PC);
+        return;
+    }
+    if (addr == 0x4026) {
+        if (s->trace_io)
+            fprintf(stderr, "um6578: write $4026 <- %02X pc=%04X\n", val, s->cpu.PC);
+        return; /* EXT write: stub */
+    }
     if (addr == 0x4027) return; /* DAC data register: unmodelled */
     if (addr == 0x4031) return; /* startup protection sequence: logging-only upstream too */
     if (addr == 0x4032) {
+        if (s->trace_io &&
+            (s->trace_timer || (s->irq_pending & (UM6578_IRQ_MOUSE | UM6578_IRQ_KEYBOARD)) != 0))
+            fprintf(stderr, "um6578: write $4032 <- %02X pc=%04X pending=%02X\n",
+                    val, s->cpu.PC, s->irq_pending);
         s->irq_mask = val;
         s->irq_pending &= (uint8_t)~val; /* a 1 bit acknowledges (clears) that pending line */
         irq_recompute(s);
         return;
     }
     if (addr == 0x4034) {
+        if (s->trace_io)
+            fprintf(stderr, "um6578: write $4034 <- %02X pc=%04X\n", val, s->cpu.PC);
         s->timer_ctrl = val;
         s->timer_prescale_acc = 0;
         return;
     }
     if (addr == 0x4035) {
+        if (s->trace_io)
+            fprintf(stderr, "um6578: write $4035 <- %02X pc=%04X\n", val, s->cpu.PC);
         s->timer_preset = val;
         s->timer_count = val; /* writing the preset also resets the live count */
         return;
@@ -311,6 +434,13 @@ static void um6578_handle_keys(Um6578State *s, uint32_t held) {
             else         s->held_actions &= ~bit;
         }
     }
+
+    if (s->input_inject_frames > 0) {
+        s->held_actions |= s->input_inject_mask;
+        s->input_inject_frames--;
+    } else {
+        s->input_inject_mask = 0;
+    }
 }
 
 /* ── Screendump ──────────────────────────────────────────────────────────── */
@@ -329,6 +459,118 @@ static bool um6578_screendump(void *ud, const char *path) {
     bool ok = gemu_screendump(path, rgb, w, h);
     free(rgb);
     return ok;
+}
+
+static bool parse_int_token(const char **p, int *out) {
+    while (**p == ' ' || **p == '\t') (*p)++;
+    if (!**p) return false;
+
+    char *end = NULL;
+    long v = strtol(*p, &end, 0);
+    if (end == *p) return false;
+    *out = (int)v;
+    *p = end;
+    return true;
+}
+
+static bool parse_button_token(const char **p, const char *name) {
+    size_t n = strlen(name);
+    while (**p == ' ' || **p == '\t') (*p)++;
+    if (strncasecmp(*p, name, n) != 0)
+        return false;
+    char c = (*p)[n];
+    if (c && c != ' ' && c != '\t')
+        return false;
+    *p += n;
+    return true;
+}
+
+static bool um6578_mouse_command(Um6578State *s, const char *text) {
+    const char *p = text;
+    while (*p == ' ' || *p == '\t') p++;
+
+    if (strncasecmp(p, "mouseclear", 10) == 0) {
+        p += 10;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p) return false;
+        s->mouse_synth_active = false;
+        s->mouse_have_pos = false;
+        printf("mouse: using host pointer\n");
+        return true;
+    }
+
+    bool relative = false;
+    if (strncasecmp(p, "mousemove", 9) == 0) {
+        p += 9;
+        relative = true;
+    } else if (strncasecmp(p, "mouse", 5) == 0) {
+        p += 5;
+    } else {
+        return false;
+    }
+
+    int x = 0, y = 0;
+    if (!parse_int_token(&p, &x) || !parse_int_token(&p, &y))
+        return false;
+
+    bool left = s->mouse_synth_left;
+    bool right = s->mouse_synth_right;
+    while (true) {
+        if (parse_button_token(&p, "left")) {
+            left = true;
+        } else if (parse_button_token(&p, "right")) {
+            right = true;
+        } else if (parse_button_token(&p, "none")) {
+            left = right = false;
+        } else {
+            break;
+        }
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p) return false;
+
+    if (relative && s->mouse_synth_active) {
+        x += s->mouse_synth_x;
+        y += s->mouse_synth_y;
+    }
+    s->mouse_synth_active = true;
+    s->mouse_synth_x = x;
+    s->mouse_synth_y = y;
+    s->mouse_synth_left = left;
+    s->mouse_synth_right = right;
+    printf("mouse: x=%d y=%d left=%d right=%d\n", x, y, left ? 1 : 0, right ? 1 : 0);
+    return true;
+}
+
+static bool um6578_sendkey_command(Um6578State *s, const char *text) {
+    const char *p = text;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncasecmp(p, "sendkey", 7) != 0 || (p[7] && p[7] != ' ' && p[7] != '\t'))
+        return false;
+    p += 7;
+    while (*p == ' ' || *p == '\t') p++;
+
+    uint32_t btn = 0;
+    if      (strncasecmp(p, "a",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = GEMU_ACTION(UM6578_ACT_A);
+    else if (strncasecmp(p, "b",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = GEMU_ACTION(UM6578_ACT_B);
+    else if (strncasecmp(p, "start",  5) == 0) btn = GEMU_ACTION(UM6578_ACT_START);
+    else if (strncasecmp(p, "select", 6) == 0) btn = GEMU_ACTION(UM6578_ACT_SELECT);
+    else if (strncasecmp(p, "up",     2) == 0) btn = GEMU_ACTION(UM6578_ACT_UP);
+    else if (strncasecmp(p, "down",   4) == 0) btn = GEMU_ACTION(UM6578_ACT_DOWN);
+    else if (strncasecmp(p, "left",   4) == 0) btn = GEMU_ACTION(UM6578_ACT_LEFT);
+    else if (strncasecmp(p, "right",  5) == 0) btn = GEMU_ACTION(UM6578_ACT_RIGHT);
+    if (!btn) {
+        printf("sendkey: unknown button (a b start select up down left right)\n");
+        return true;
+    }
+
+    while (*p && *p != ' ' && *p != '\t') p++;
+    while (*p == ' ' || *p == '\t') p++;
+    int frames = (*p >= '1' && *p <= '9') ? (int)strtol(p, NULL, 10) : 5;
+    s->input_inject_mask = btn;
+    s->input_inject_frames = frames;
+    printf("sendkey: holding 0x%08X for %d frame(s)\n", btn, frames);
+    return true;
 }
 
 /* ── PPU/CPU cycle sync ──────────────────────────────────────────────────── */
@@ -359,6 +601,10 @@ Um6578State *um6578_create(const MosConfig *cfg) {
     Um6578State *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->cfg = cfg;
+    const char *trace_io = getenv("GEMU_UM6578_TRACE_IO");
+    s->trace_io = trace_io != NULL;
+    s->trace_4016 = trace_io && (strcmp(trace_io, "4016") == 0 || strcmp(trace_io, "all") == 0);
+    s->trace_timer = trace_io && strcmp(trace_io, "all") == 0;
 
     const char *rom_path = NULL;
     for (int i = 0; i < cfg->n_roms; i++) {
@@ -490,7 +736,10 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
                 for (int i = 0; i < 8; i++) s->bankswitch[i] = (uint8_t)i;
                 mos6502_reset(&s->cpu);
             } else if (cmd == GEMU_MON_CUSTOM) {
-                gemu_monitor_unknown_command(s->monitor);
+                const char *text = gemu_monitor_command_text(s->monitor);
+                if (!um6578_mouse_command(s, text) &&
+                    !um6578_sendkey_command(s, text))
+                    gemu_monitor_unknown_command(s->monitor);
             }
         }
         if (quit) break;

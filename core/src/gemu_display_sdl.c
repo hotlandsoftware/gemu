@@ -316,6 +316,15 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
                 d->pointer.button = false;
                 SDL_CaptureMouse(SDL_FALSE);
             }
+            if (ev.type == SDL_MOUSEBUTTONDOWN &&
+                ev.button.button == SDL_BUTTON_RIGHT) {
+                d->pointer.right_button = true;
+                d->pointer.right_pressed = true;
+            }
+            if (ev.type == SDL_MOUSEBUTTONUP &&
+                ev.button.button == SDL_BUTTON_RIGHT) {
+                d->pointer.right_button = false;
+            }
             break;
 
         case SDL_KEYDOWN: {
