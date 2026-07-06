@@ -302,10 +302,20 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
                 ev.button.button == SDL_BUTTON_LEFT) {
                 d->pointer.button = true;
                 d->pointer.pressed = true;
+                /* Capture the mouse for the duration of the drag so a Lua
+                 * GUI script (input.get()/zapper.read()) keeps receiving
+                 * motion/button-up events even if the cursor slips past the
+                 * window edge mid-drag — SDL_GetMouseState keeps reporting
+                 * window-relative coordinates (including negative/out-of-
+                 * bounds ones) while captured, so gemu_video_sdl_mouse_logical
+                 * needs no changes to handle it. */
+                SDL_CaptureMouse(SDL_TRUE);
             }
             if (ev.type == SDL_MOUSEBUTTONUP &&
-                ev.button.button == SDL_BUTTON_LEFT)
+                ev.button.button == SDL_BUTTON_LEFT) {
                 d->pointer.button = false;
+                SDL_CaptureMouse(SDL_FALSE);
+            }
             break;
 
         case SDL_KEYDOWN: {

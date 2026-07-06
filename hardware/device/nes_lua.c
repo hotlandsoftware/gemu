@@ -316,6 +316,25 @@ static int l_zapper_read(lua_State *L) {
     return 1;
 }
 
+/* ── input (FCEUX mouse/keyboard state, distinct from the zapper table —
+ * used by GUI-tool scripts like x_interface.lua for drag/click widgets
+ * drawn with gui.*). We only have host mouse position + one click button
+ * wired up (the same source as zapper.read()); right/middle click and
+ * keyboard key state are not tracked, so they always read false. ── */
+
+static int l_input_get(lua_State *L) {
+    NesLua *lua = CTX(L);
+    int x = 0, y = 0, click = 0;
+    if (lua->bus.get_zapper) lua->bus.get_zapper(lua->bus.ud, &x, &y, &click);
+    lua_newtable(L);
+    lua_pushinteger(L, x); lua_setfield(L, -2, "xmouse");
+    lua_pushinteger(L, y); lua_setfield(L, -2, "ymouse");
+    lua_pushboolean(L, click != 0); lua_setfield(L, -2, "leftclick");
+    lua_pushboolean(L, 0); lua_setfield(L, -2, "rightclick");
+    lua_pushboolean(L, 0); lua_setfield(L, -2, "middleclick");
+    return 1;
+}
+
 /* ── gui ─────────────────────────────────────────────────────────────────── */
 
 /* Numeric colors are 0xRRGGBB (opaque) or 0xRRGGBBAA (alpha-blended). */
@@ -632,6 +651,11 @@ static void register_api(lua_State *L, NesLua *lua) {
     int zap = lua_gettop(L);
     reg_fn(L, zap, lua, "read", l_zapper_read);
     lua_setglobal(L, "zapper");
+
+    lua_newtable(L);
+    int inp = lua_gettop(L);
+    reg_fn(L, inp, lua, "get", l_input_get);
+    lua_setglobal(L, "input");
 
     lua_newtable(L);
     int gui = lua_gettop(L);
