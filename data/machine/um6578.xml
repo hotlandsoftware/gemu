@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<machine name="um6578" family="mos" description="UM6578 Enhanced Famiclone"
+         cpu="6502" vga="sh6578" soundhw="2a03">
+    <rom name="tv game1.bin" region="maincpu" addr="0x0000" sha256="b05b01a76db1781abbfca31c9315cfe088a5b6c902bf0b601fb0f50d34278e01"/>
+</machine>

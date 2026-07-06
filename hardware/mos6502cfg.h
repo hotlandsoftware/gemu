@@ -11,6 +11,7 @@ typedef enum {
     MOS_MACHINE_KIM1,   /* MOS KIM-1 single-board computer */
     MOS_MACHINE_5CLOWN,  /* IGS "Five Clown" arcade video poker (dual 6502) */
     MOS_MACHINE_MAGICFLY, /* misc/magicfly.cpp hardware: Magic Fly, 7 e Mezzo */
+    MOS_MACHINE_UM6578,  /* UM6578/SH6578/NT6578 NES-clone-on-a-chip (plug & play TV games) */
 } MosMachineType;
 
 typedef enum {
@@ -24,6 +25,7 @@ typedef enum {
     MOS_VGA_NONE,
     MOS_VGA_RP2C02,  /* Ricoh RP2C02 — NES PPU */
     MOS_VGA_RP2C04_0004,  /* Ricoh RP2C04-0004 — VS. System RGB PPU */
+    MOS_VGA_SH6578,       /* UM6578/SH6578 PPU — 256x256 pages, attribute-in-tile, no separate AT table */
 } MosVgaType;
 
 typedef enum {

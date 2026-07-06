@@ -5,6 +5,7 @@
 #include "kim1.h"
 #include "5clown.h"
 #include "magicfly.h"
+#include "um6578.h"
 #include "vt100.h"
 #include "romdb.h"
 #include "gemu/gemu.h"
@@ -40,6 +41,7 @@ static const GemuDevDesc machines[] = {
     {"5clown",  "Five Clown"},
     {"magicfly", "Magic Fly"},
     {"7mezzo",  "7 e Mezzo"},
+    {"um6578",  "UM6578/SH6578/NT6578 NES-clone"},
     {"apple1",  "Apple I (MOS 6502, keyboard/display terminal)"},
     {"dendy",   "Dendy NES Famiclone (PAL 50 Hz, NTSC-compatible PPU/APU timing)"},
     {"vssmb",       "VS. Super Mario Bros. (coin-op arcade cabinet, DIP switches)"},
@@ -350,6 +352,7 @@ int mos_setup(int argc, char *argv[]) {
             else if (strcmp(canon, "nes")  == 0) cfg.machine = MOS_MACHINE_NES;
             else if (strcmp(canon, "5clown") == 0) cfg.machine = MOS_MACHINE_5CLOWN;
             else if (strcmp(canon, "magicfly") == 0) cfg.machine = MOS_MACHINE_MAGICFLY;
+            else if (strcmp(canon, "um6578") == 0) cfg.machine = MOS_MACHINE_UM6578;
             cfg.is_dendy = md->tv && strcmp(md->tv, "dendy") == 0;
             cfg.is_arcade = md->tv && strcmp(md->tv, "vs") == 0;
             cfg.is_pal   = cfg.is_dendy || (md->tv && strcmp(md->tv, "pal") == 0);
@@ -364,6 +367,7 @@ int mos_setup(int argc, char *argv[]) {
             if (!args.vga && md->vga) {
                 if      (strcmp(md->vga, "rp2c02")      == 0) cfg.vga = MOS_VGA_RP2C02;
                 else if (strcmp(md->vga, "rp2c04-0004") == 0) cfg.vga = MOS_VGA_RP2C04_0004;
+                else if (strcmp(md->vga, "sh6578")      == 0) cfg.vga = MOS_VGA_SH6578;
             }
             if (md->soundhw && !parse_soundhw(md->soundhw, &cfg.sound, &cfg.sound_hw_mask)) {
                 fprintf(stderr, "gemu: machine '%s' has unknown default soundhw '%s'\n",
@@ -396,6 +400,7 @@ int mos_setup(int argc, char *argv[]) {
     if (args.vga) {
         if      (strcmp(args.vga, "rp2c02")      == 0) cfg.vga = MOS_VGA_RP2C02;
         else if (strcmp(args.vga, "rp2c04-0004") == 0) cfg.vga = MOS_VGA_RP2C04_0004;
+        else if (strcmp(args.vga, "sh6578")      == 0) cfg.vga = MOS_VGA_SH6578;
     }
 
     for (int i = 0; i < nrem; i++) {
@@ -549,7 +554,8 @@ int mos_setup(int argc, char *argv[]) {
          cfg.machine == MOS_MACHINE_NES ||
          cfg.machine == MOS_MACHINE_KIM1 ||
          cfg.machine == MOS_MACHINE_5CLOWN ||
-         cfg.machine == MOS_MACHINE_MAGICFLY)
+         cfg.machine == MOS_MACHINE_MAGICFLY ||
+         cfg.machine == MOS_MACHINE_UM6578)
         && !cfg.vnc_addr && !args.display_explicit) {
 #ifdef GEMU_GTK
         cfg.display_type = GEMU_DISPLAY_GTK;
@@ -666,6 +672,11 @@ int mos_setup(int argc, char *argv[]) {
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
         magicfly_run(s, &cfg);
         magicfly_destroy(s);
+    } else if (cfg.machine == MOS_MACHINE_UM6578) {
+        Um6578State *s = um6578_create(&cfg);
+        if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
+        um6578_run(s, &cfg);
+        um6578_destroy(s);
     } else {
         MosGenericState *s = mos_generic_create(&cfg);
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }

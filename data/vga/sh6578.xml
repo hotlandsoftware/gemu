@@ -1,0 +1,2 @@
+<?xml version="1.0"?>
+<vga name="sh6578" description="UM6578/SH6578/NT6578 Famiclone PPU (NES-clone, 256x256 px pages, attribute-in-tile)" requires="mos"/>
