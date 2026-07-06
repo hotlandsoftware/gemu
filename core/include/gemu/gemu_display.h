@@ -50,6 +50,7 @@ typedef struct {
 /* ── Pointer state (light-gun / mouse) ───────────────────────────────────── */
 typedef struct {
     int  x, y;      /* position in logical (framebuffer) pixels; -1 if outside */
+    int  rel_x, rel_y; /* relative motion accumulated during the latest poll */
     bool button;
     bool pressed;   /* true for one poll when the primary button went down */
     bool right_button;
@@ -94,6 +95,7 @@ typedef struct {
     /* Optional per-device pages; NULL means all actions on one page (ini_section). */
     const GemuInputPage *pages;
     int                  n_pages;
+    bool                 capture_pointer; /* SDL: VM-style relative mouse capture */
 
     /* GTK extras — NULL for non-GTK builds / backends */
     const GemuDisplayGtkExtras *gtk;

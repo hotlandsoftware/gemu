@@ -563,7 +563,10 @@ int mos_setup(int argc, char *argv[]) {
          cfg.machine == MOS_MACHINE_UM6578)
         && !cfg.vnc_addr && !args.display_explicit) {
 #ifdef GEMU_GTK
-        cfg.display_type = GEMU_DISPLAY_GTK;
+        bool um6578_mouse = cfg.machine == MOS_MACHINE_UM6578 &&
+                            cfg.n_ports > 0 &&
+                            cfg.ports[0] == NES_DEVICE_MOUSE;
+        cfg.display_type = um6578_mouse ? GEMU_DISPLAY_SDL : GEMU_DISPLAY_GTK;
 #else
         cfg.display_type = GEMU_DISPLAY_SDL;
 #endif

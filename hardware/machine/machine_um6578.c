@@ -63,22 +63,35 @@ static void um6578_queue_ps2_mouse_packet(Um6578State *s, int dx, int dy,
 static uint32_t um6578_subor_mouse_word(Um6578State *s) {
     uint32_t v = (1u << 21);                    /* E: some real units keep this always set */
     GemuPointerState ptr = um6578_pointer_state(s);
-    if (ptr.x < 0 || ptr.y < 0) return v;
 
-    int dx = s->mouse_have_pos ? ptr.x - s->mouse_px : 0;
-    int dy = s->mouse_have_pos ? ptr.y - s->mouse_py : 0;
-    s->mouse_px = ptr.x;
-    s->mouse_py = ptr.y;
-    s->mouse_have_pos = true;
-    um6578_queue_ps2_mouse_packet(s, dx, dy, ptr.button, ptr.right_button);
+    int dx = ptr.rel_x;
+    int dy = ptr.rel_y;
+    if (dx == 0 && dy == 0) {
+        if (ptr.x < 0 || ptr.y < 0) return v;
+        dx = s->mouse_have_pos ? ptr.x - s->mouse_px : 0;
+        dy = s->mouse_have_pos ? ptr.y - s->mouse_py : 0;
+    }
+    if (ptr.x >= 0 && ptr.y >= 0) {
+        s->mouse_px = ptr.x;
+        s->mouse_py = ptr.y;
+        s->mouse_have_pos = true;
+    }
+    bool left = ptr.button || ptr.pressed;
+    bool right = ptr.right_button || ptr.right_pressed;
+    if (s->trace_io && (dx != 0 || dy != 0 || left || right))
+        fprintf(stderr,
+                "um6578: mouse sample x=%d y=%d rel=%d,%d dx=%d dy=%d left=%d right=%d pc=%04X\n",
+                ptr.x, ptr.y, ptr.rel_x, ptr.rel_y, dx, dy,
+                left ? 1 : 0, right ? 1 : 0, s->cpu.PC);
+    um6578_queue_ps2_mouse_packet(s, dx, dy, left, right);
 
     int ax = dx < 0 ? -dx : dx;
     int ay = dy < 0 ? -dy : dy;
     if (ax > 127) ax = 127;
     if (ay > 127) ay = 127;
 
-    if (ptr.button)         v |= (1u << 23); /* left button */
-    if (ptr.right_button)   v |= (1u << 22); /* right button */
+    if (left)               v |= (1u << 23); /* left button */
+    if (right)              v |= (1u << 22); /* right button */
     if (dy < 0) v |= (1u << 19);              /* up */
     if (dy > 0) v |= (1u << 18);              /* down */
     if (dx < 0) v |= (1u << 17);              /* left */
@@ -261,8 +274,8 @@ static uint8_t um6578_read(uint16_t addr, void *ud) {
     if (addr == 0x4026) {
         GemuPointerState ptr = um6578_pointer_state(s);
         uint8_t v = 0x09u; /* bits 0/3 are active-low mouse buttons */
-        if (ptr.button) v &= (uint8_t)~0x01u;
-        if (ptr.right_button) v &= (uint8_t)~0x08u;
+        if (ptr.button || ptr.pressed) v &= (uint8_t)~0x01u;
+        if (ptr.right_button || ptr.right_pressed) v &= (uint8_t)~0x08u;
         if (s->trace_io)
             fprintf(stderr, "um6578: read  $4026 -> %02X pc=%04X\n", v, s->cpu.PC);
         return v;
@@ -358,6 +371,8 @@ static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
         s->irq_mask = val;
         s->irq_pending &= (uint8_t)~val; /* a 1 bit acknowledges (clears) that pending line */
         irq_recompute(s);
+        if (!mouse_queue_empty(s))
+            irq_raise(s, UM6578_IRQ_KEYBOARD);
         return;
     }
     if (addr == 0x4034) {
@@ -680,6 +695,7 @@ Um6578State *um6578_create(const MosConfig *cfg) {
          * top of the Tab key-binding overlay) rather than inventing a
          * separate, machine-specific one. */
         bool has_pad = cfg->n_ports > 0 && cfg->ports[0] == NES_DEVICE_CONTROLLER;
+        bool has_mouse = cfg->n_ports > 0 && cfg->ports[0] == NES_DEVICE_MOUSE;
         s->display = gemu_display_create(cfg->display_type, &(GemuDisplayConfig){
             .title       = "GEMU",
             .fb_width    = SH6578_WIDTH,
@@ -689,6 +705,7 @@ Um6578State *um6578_create(const MosConfig *cfg) {
             .actions     = um6578_actions,
             .n_actions   = UM6578_NUM_ACTIONS,
             .ini_section = has_pad ? "nes-controller" : "um6578",
+            .capture_pointer = has_mouse,
         });
     }
 
@@ -756,8 +773,6 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
                 uint64_t delta = s->cpu.cycle_count - prev;
                 for (uint64_t i = 0; i < delta; i++)
                     if (s->apu.audio_dev) apu2a03_tick(&s->apu);
-                if (s->apu.fc_irq || s->apu.dmc.irq_flag)
-                    s->cpu.irq = true;
                 um6578_sync_ppu(s, s->cpu.cycle_count);
                 if (gemu_monitor_is_paused(s->monitor)) break;
             }

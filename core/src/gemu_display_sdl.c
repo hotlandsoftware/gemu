@@ -58,6 +58,9 @@ typedef struct {
     int    pending_snap_w;
     int    pending_snap_h;
     Uint32 pending_snap_t;
+    bool   mouse_captured;
+    bool   capture_pointer;
+    bool   saw_mouse_motion;
 } SdlBackend;
 
 /* ── Binding table ───────────────────────────────────────────────────────── */
@@ -298,28 +301,51 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         case SDL_MOUSEBUTTONUP:
             gemu_video_sdl_mouse_logical(b->video,
                                          &d->pointer.x, &d->pointer.y);
+            if (ev.type == SDL_MOUSEMOTION) {
+                d->pointer.rel_x += ev.motion.xrel;
+                d->pointer.rel_y += ev.motion.yrel;
+                b->saw_mouse_motion = true;
+            }
+            if (ev.type == SDL_MOUSEBUTTONDOWN &&
+                ev.button.button == SDL_BUTTON_MIDDLE) {
+                bool ctrl = (SDL_GetModState() & KMOD_CTRL) != 0;
+                if (ctrl && b->mouse_captured) {
+                    SDL_SetRelativeMouseMode(SDL_FALSE);
+                    SDL_CaptureMouse(SDL_FALSE);
+                    b->mouse_captured = false;
+                } else if (!ctrl && !b->mouse_captured) {
+                    SDL_SetRelativeMouseMode(SDL_TRUE);
+                    SDL_CaptureMouse(SDL_TRUE);
+                    b->mouse_captured = true;
+                }
+            }
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_LEFT) {
                 d->pointer.button = true;
                 d->pointer.pressed = true;
-                /* Capture the mouse for the duration of the drag so a Lua
-                 * GUI script (input.get()/zapper.read()) keeps receiving
-                 * motion/button-up events even if the cursor slips past the
-                 * window edge mid-drag — SDL_GetMouseState keeps reporting
-                 * window-relative coordinates (including negative/out-of-
-                 * bounds ones) while captured, so gemu_video_sdl_mouse_logical
-                 * needs no changes to handle it. */
-                SDL_CaptureMouse(SDL_TRUE);
+                if (b->capture_pointer && !b->mouse_captured) {
+                    SDL_SetRelativeMouseMode(SDL_TRUE);
+                    SDL_CaptureMouse(SDL_TRUE);
+                    b->mouse_captured = true;
+                } else if (!b->capture_pointer) {
+                    SDL_CaptureMouse(SDL_TRUE);
+                }
             }
             if (ev.type == SDL_MOUSEBUTTONUP &&
                 ev.button.button == SDL_BUTTON_LEFT) {
                 d->pointer.button = false;
-                SDL_CaptureMouse(SDL_FALSE);
+                if (!b->capture_pointer && !b->mouse_captured)
+                    SDL_CaptureMouse(SDL_FALSE);
             }
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
                 d->pointer.right_button = true;
                 d->pointer.right_pressed = true;
+                if (b->capture_pointer && !b->mouse_captured) {
+                    SDL_SetRelativeMouseMode(SDL_TRUE);
+                    SDL_CaptureMouse(SDL_TRUE);
+                    b->mouse_captured = true;
+                }
             }
             if (ev.type == SDL_MOUSEBUTTONUP &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
@@ -380,6 +406,14 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             break;
         }
     }
+
+    if (b->capture_pointer && !b->saw_mouse_motion) {
+        int rx = 0, ry = 0;
+        SDL_GetRelativeMouseState(&rx, &ry);
+        d->pointer.rel_x += rx;
+        d->pointer.rel_y += ry;
+    }
+    b->saw_mouse_motion = false;
 
     /* Check InputMenu for quit / reset requests */
     if (b->menu) {
@@ -452,6 +486,7 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     b->action_defs = cfg->actions;
     b->n_actions   = cfg->n_actions;
     b->ini_section = cfg->ini_section;
+    b->capture_pointer = cfg->capture_pointer;
 
     int w = cfg->fb_width,  h = cfg->fb_height;
     int ww = cfg->window_width  ? cfg->window_width  : w * (cfg->scale ? cfg->scale : 2);

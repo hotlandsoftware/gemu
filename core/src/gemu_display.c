@@ -107,6 +107,8 @@ void gemu_display_set_paused(GemuDisplay *d, bool paused) {
 uint32_t gemu_display_poll(GemuDisplay *d) {
     if (!d) return 0;
     d->held_prev   = d->held;
+    d->pointer.rel_x = 0;
+    d->pointer.rel_y = 0;
     d->pointer.pressed = false;
     d->pointer.right_pressed = false;
     d->held        = d->do_poll(d);
