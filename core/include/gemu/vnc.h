@@ -9,6 +9,15 @@ typedef struct {
     bool     down;
 } GemuVncKeyEvent;
 
+typedef struct {
+    int  x, y;
+    int  rel_x, rel_y;
+    bool button;
+    bool pressed;
+    bool right_button;
+    bool right_pressed;
+} GemuVncPointerState;
+
 /* addr: "host:display" or ":display"  (port = 5900 + display)
  * fb_w/fb_h: framebuffer dimensions in pixels                */
 GemuVncServer *gemu_vnc_create(const char *addr, int fb_w, int fb_h);
@@ -35,3 +44,6 @@ uint32_t       gemu_vnc_pop_keysym(GemuVncServer *vnc);
 /* Return one queued RFB key press/release event. */
 bool           gemu_vnc_pop_key_event(GemuVncServer *vnc,
                                       GemuVncKeyEvent *event);
+
+/* Return current pointer state and clear one-frame relative/pressed fields. */
+GemuVncPointerState gemu_vnc_get_pointer(GemuVncServer *vnc);

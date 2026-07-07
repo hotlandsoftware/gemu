@@ -49,6 +49,19 @@ static GemuPointerState um6578_pointer_state(Um6578State *s) {
             .right_button = s->mouse_synth_right,
         };
     }
+    if (!s->display && s->vnc) {
+        GemuVncPointerState p = gemu_vnc_get_pointer(s->vnc);
+        return (GemuPointerState){
+            .x = p.x,
+            .y = p.y,
+            .rel_x = p.rel_x,
+            .rel_y = p.rel_y,
+            .button = p.button,
+            .pressed = p.pressed,
+            .right_button = p.right_button,
+            .right_pressed = p.right_pressed,
+        };
+    }
     if (!s->display) return (GemuPointerState){ .x = -1, .y = -1 };
     return gemu_display_get_pointer(s->display);
 }
@@ -268,8 +281,11 @@ static void um6578_mouse_device_command(Um6578State *s, uint8_t val) {
 static void um6578_mouse_frame_tick(Um6578State *s) {
     if (!s->mouse_stream_enabled)
         return;
-    if (s->ram_lo[0x36] != 0 || s->ram_lo[0x37] != 1 || !mouse_queue_empty(s))
+    if (s->ram_lo[0x36] != 0 || s->ram_lo[0x37] != 1 || !mouse_queue_empty(s)) {
+        if (!s->display && s->vnc)
+            (void)gemu_vnc_get_pointer(s->vnc);
         return;
+    }
 
     GemuPointerState ptr = um6578_pointer_state(s);
 
@@ -413,10 +429,7 @@ static uint8_t um6578_read(uint16_t addr, void *ud) {
         return v; /* keyboard/mouse byte queue; empty reads as 0xFF */
     }
     if (addr == 0x4026) {
-        GemuPointerState ptr = um6578_pointer_state(s);
-        uint8_t v = 0xFFu; /* bits 0/3 are active-low mouse buttons; leave unknown EXT/status lines high */
-        if (ptr.button || ptr.pressed) v &= (uint8_t)~0x01u;
-        if (ptr.right_button || ptr.right_pressed) v &= (uint8_t)~0x08u;
+        uint8_t v = 0xFFu; /* EXT/status lines idle high; mouse buttons arrive in PS/2 packets */
         if (s->trace_io)
             fprintf(stderr, "um6578: read  $4026 -> %02X pc=%04X\n", v, s->cpu.PC);
         return v;

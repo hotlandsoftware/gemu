@@ -44,6 +44,11 @@ struct GemuVncServer {
     unsigned        key_head, key_count;
     uint32_t        held_keysyms[GEMU_VNC_KEY_QUEUE_CAP];
     unsigned        held_count;
+    int             pointer_x, pointer_y;
+    int             pointer_rel_x, pointer_rel_y;
+    bool            pointer_have_pos;
+    bool            pointer_button, pointer_pressed;
+    bool            pointer_right_button, pointer_right_pressed;
     uint32_t        fg_rgb;
     uint32_t        bg_rgb;
     uint32_t        palette[256];
@@ -101,6 +106,8 @@ static void release_held_keys(GemuVncServer *vnc) {
         enqueue_key_event(vnc, vnc->held_keysyms[i], false);
     vnc->held_count = 0;
     memset(vnc->keys, 0, sizeof(vnc->keys));
+    vnc->pointer_button = false;
+    vnc->pointer_right_button = false;
     pthread_mutex_unlock(&vnc->lock);
 }
 
@@ -339,7 +346,30 @@ static void vnc_handle_client(GemuVncServer *vnc, sock_t fd) {
             pthread_mutex_unlock(&vnc->lock);
             break;
         }
-        case 5: { uint8_t b[5]; if (!recvall(fd, b, 5)) return; break; } /* PointerEvent */
+        case 5: { /* PointerEvent: 1 button-mask + 2 x + 2 y */
+            uint8_t b[5]; if (!recvall(fd, b, 5)) return;
+            uint16_t x, y;
+            memcpy(&x, b + 1, 2); x = ntohs(x);
+            memcpy(&y, b + 3, 2); y = ntohs(y);
+            bool left = (b[0] & 0x01u) != 0;
+            bool right = (b[0] & 0x04u) != 0;
+            pthread_mutex_lock(&vnc->lock);
+            if (vnc->pointer_have_pos) {
+                vnc->pointer_rel_x += (int)x - vnc->pointer_x;
+                vnc->pointer_rel_y += (int)y - vnc->pointer_y;
+            }
+            vnc->pointer_x = (int)x;
+            vnc->pointer_y = (int)y;
+            vnc->pointer_have_pos = true;
+            if (left && !vnc->pointer_button)
+                vnc->pointer_pressed = true;
+            if (right && !vnc->pointer_right_button)
+                vnc->pointer_right_pressed = true;
+            vnc->pointer_button = left;
+            vnc->pointer_right_button = right;
+            pthread_mutex_unlock(&vnc->lock);
+            break;
+        }
         case 6: { /* ClientCutText */
             uint8_t b[7]; if (!recvall(fd, b, 7)) return;
             uint32_t len; memcpy(&len, b+3, 4); len = ntohl(len);
@@ -451,6 +481,7 @@ GemuVncServer *gemu_vnc_create(const char *addr, int fb_w, int fb_h) {
     GemuVncServer *vnc = calloc(1, sizeof(*vnc));
     vnc->listen_fd = lfd;
     vnc->fb_w = fb_w; vnc->fb_h = fb_h;
+    vnc->pointer_x = vnc->pointer_y = -1;
     vnc->fg_rgb = 0xFFFFFFu;
     vnc->bg_rgb = 0x000000u;
     vnc->unix_socket = unix_socket;
@@ -545,6 +576,27 @@ bool gemu_vnc_pop_key_event(GemuVncServer *vnc, GemuVncKeyEvent *event) {
     vnc->key_count--;
     pthread_mutex_unlock(&vnc->lock);
     return true;
+}
+
+GemuVncPointerState gemu_vnc_get_pointer(GemuVncServer *vnc) {
+    if (!vnc) return (GemuVncPointerState){ .x = -1, .y = -1 };
+    pthread_mutex_lock(&vnc->lock);
+    GemuVncPointerState p = {
+        .x = vnc->pointer_have_pos ? vnc->pointer_x : -1,
+        .y = vnc->pointer_have_pos ? vnc->pointer_y : -1,
+        .rel_x = vnc->pointer_rel_x,
+        .rel_y = vnc->pointer_rel_y,
+        .button = vnc->pointer_button,
+        .pressed = vnc->pointer_pressed,
+        .right_button = vnc->pointer_right_button,
+        .right_pressed = vnc->pointer_right_pressed,
+    };
+    vnc->pointer_rel_x = 0;
+    vnc->pointer_rel_y = 0;
+    vnc->pointer_pressed = false;
+    vnc->pointer_right_pressed = false;
+    pthread_mutex_unlock(&vnc->lock);
+    return p;
 }
 
 void gemu_vnc_update(GemuVncServer *vnc,
