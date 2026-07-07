@@ -225,6 +225,37 @@ static uint32_t sdl_to_raw(SDL_Keycode kc) {
 
 /* ── Backend callbacks ───────────────────────────────────────────────────── */
 
+static void sdl_do_set_title(GemuDisplay *d, const char *title);
+
+/* Reflect mouse-capture state in the window title — capturing hides the OS
+ * cursor and grabs it, which is confusing without a visible hint for how to
+ * get it back. */
+static void sdl_update_capture_title(GemuDisplay *d, SdlBackend *b) {
+    char title[200];
+    if (b->mouse_captured)
+        snprintf(title, sizeof(title), "%s - Press Ctrl-Middle Click To Release Input",
+                 d->title[0] ? d->title : "GEMU");
+    else
+        snprintf(title, sizeof(title), "%s", d->title[0] ? d->title : "GEMU");
+    sdl_do_set_title(d, title);
+}
+
+static void sdl_set_mouse_captured(GemuDisplay *d, SdlBackend *b, bool captured) {
+    SDL_SetRelativeMouseMode(captured ? SDL_TRUE : SDL_FALSE);
+    SDL_CaptureMouse(captured ? SDL_TRUE : SDL_FALSE);
+    b->mouse_captured = captured;
+    if (!captured) {
+        d->pointer.x = d->pointer.y = -1;
+        d->pointer.rel_x = d->pointer.rel_y = 0;
+        d->pointer.button = false;
+        d->pointer.pressed = false;
+        d->pointer.right_button = false;
+        d->pointer.right_pressed = false;
+        SDL_GetRelativeMouseState(NULL, NULL); /* drop any pending warp/grab delta */
+    }
+    sdl_update_capture_title(d, b);
+}
+
 static void sdl_do_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
     SdlBackend *b = d->backend;
     gemu_video_sdl_present_argb(b->video, argb, w, h);
@@ -232,6 +263,8 @@ static void sdl_do_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
 
 static uint32_t sdl_do_poll(GemuDisplay *d) {
     SdlBackend *b = d->backend;
+    SDL_Window *win = gemu_video_sdl_get_window(b->video);
+    bool focused = win && (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0;
 
     /* Apply debounced resize snap: fire 150ms after the last RESIZED event.
      * We never snap mid-drag because calling SDL_SetWindowSize while the WM
@@ -299,9 +332,13 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         case SDL_MOUSEMOTION:
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
-            gemu_video_sdl_mouse_logical(b->video,
-                                         &d->pointer.x, &d->pointer.y);
-            if (ev.type == SDL_MOUSEMOTION) {
+            if (!b->capture_pointer || b->mouse_captured)
+                gemu_video_sdl_mouse_logical(b->video,
+                                             &d->pointer.x, &d->pointer.y);
+            else
+                d->pointer.x = d->pointer.y = -1;
+            if (ev.type == SDL_MOUSEMOTION && focused &&
+                (!b->capture_pointer || b->mouse_captured)) {
                 d->pointer.rel_x += ev.motion.xrel;
                 d->pointer.rel_y += ev.motion.yrel;
                 b->saw_mouse_motion = true;
@@ -310,26 +347,20 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
                 ev.button.button == SDL_BUTTON_MIDDLE) {
                 bool ctrl = (SDL_GetModState() & KMOD_CTRL) != 0;
                 if (ctrl && b->mouse_captured) {
-                    SDL_SetRelativeMouseMode(SDL_FALSE);
-                    SDL_CaptureMouse(SDL_FALSE);
-                    b->mouse_captured = false;
+                    sdl_set_mouse_captured(d, b, false);
                 } else if (!ctrl && !b->mouse_captured) {
-                    SDL_SetRelativeMouseMode(SDL_TRUE);
-                    SDL_CaptureMouse(SDL_TRUE);
-                    b->mouse_captured = true;
+                    sdl_set_mouse_captured(d, b, true);
                 }
             }
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_LEFT) {
-                d->pointer.button = true;
-                d->pointer.pressed = true;
                 if (b->capture_pointer && !b->mouse_captured) {
-                    SDL_SetRelativeMouseMode(SDL_TRUE);
-                    SDL_CaptureMouse(SDL_TRUE);
-                    b->mouse_captured = true;
+                    sdl_set_mouse_captured(d, b, true);
                 } else if (!b->capture_pointer) {
                     SDL_CaptureMouse(SDL_TRUE);
                 }
+                d->pointer.button = true;
+                d->pointer.pressed = true;
             }
             if (ev.type == SDL_MOUSEBUTTONUP &&
                 ev.button.button == SDL_BUTTON_LEFT) {
@@ -339,13 +370,11 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             }
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
+                if (b->capture_pointer && !b->mouse_captured) {
+                    sdl_set_mouse_captured(d, b, true);
+                }
                 d->pointer.right_button = true;
                 d->pointer.right_pressed = true;
-                if (b->capture_pointer && !b->mouse_captured) {
-                    SDL_SetRelativeMouseMode(SDL_TRUE);
-                    SDL_CaptureMouse(SDL_TRUE);
-                    b->mouse_captured = true;
-                }
             }
             if (ev.type == SDL_MOUSEBUTTONUP &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
@@ -407,11 +436,15 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         }
     }
 
-    if (b->capture_pointer && !b->saw_mouse_motion) {
+    if (b->capture_pointer) {
         int rx = 0, ry = 0;
-        SDL_GetRelativeMouseState(&rx, &ry);
-        d->pointer.rel_x += rx;
-        d->pointer.rel_y += ry;
+        SDL_GetRelativeMouseState(&rx, &ry); /* always drain, even unfocused,
+                                              * so focus regaining doesn't
+                                              * deliver a stale motion burst */
+        if (!b->saw_mouse_motion && focused && b->mouse_captured) {
+            d->pointer.rel_x += rx;
+            d->pointer.rel_y += ry;
+        }
     }
     b->saw_mouse_motion = false;
 
@@ -586,17 +619,6 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
         }
     }
 #endif
-
-    /* Engage relative-mouse capture immediately for pointer-driven machines
-     * (e.g. um6578 mouse) instead of waiting for a first click. Without this,
-     * the real OS cursor is unbounded screen coordinates: it pins against the
-     * desktop edge (or leaves the window entirely) after a short move, and
-     * sustained directional motion silently stops generating deltas. */
-    if (b->capture_pointer) {
-        SDL_SetRelativeMouseMode(SDL_TRUE);
-        SDL_CaptureMouse(SDL_TRUE);
-        b->mouse_captured = true;
-    }
 
     return d;
 }

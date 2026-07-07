@@ -181,6 +181,8 @@ static void um6578_queue_ps2_mouse_packet(Um6578State *s, int dx, int dy,
     if (right) flags |= 0x02u;
     if (ps2_dx < 0) flags |= 0x10u;
     if (ps2_dy < 0) flags |= 0x20u;
+    if (dx < -127 || dx > 127) flags |= 0x40u;
+    if (-dy < -127 || -dy > 127) flags |= 0x80u;
 
     mouse_queue_push(s, flags);
     mouse_queue_push(s, (uint8_t)ps2_dx);
@@ -274,7 +276,8 @@ static void um6578_mouse_frame_tick(Um6578State *s) {
     int dx = ptr.rel_x;
     int dy = ptr.rel_y;
     if (dx == 0 && dy == 0) {
-        if (ptr.x < 0 || ptr.y < 0) return;
+        if (!s->mouse_synth_active)
+            return;
         dx = s->mouse_have_pos ? ptr.x - s->mouse_px : 0;
         dy = s->mouse_have_pos ? ptr.y - s->mouse_py : 0;
     }
