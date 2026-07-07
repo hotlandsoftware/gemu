@@ -31,25 +31,16 @@
  *   $4000-$4013  APU registers (2A03, reused from audio/apu2a03.c)
  *   $4014        OAM DMA (write page -> 256-byte sprite RAM copy)
  *   $4015        APU status
- *   $4016        Joypad shift register read/write (strobe) — also where the
- *                UM6578 mouse (-device mouse) is read, see below
+ *   $4016        Joypad shift register read/write (strobe). A legacy
+ *                24-bit mouse reply is also implemented for Subor-style
+ *                devices, but Connie-chan's PS/2 mouse movement does not use
+ *                this path once the PS/2 stream is enabled.
  *   $4017        Joypad 2 / EXT-adjacent read (unused here, returns 0)
- *   $4020        Keyboard byte queue (read; a real keyboard peripheral,
- *                not modelled — always reports empty, matching how even
- *                Furbtendulator's own keyboard feed is stubbed out) — ALSO
- *                where mouse packets are drained, see "Mouse" below. The
- *                SH6578 datasheet (roms/colortest-sh6578/src/sh6578.inc)
- *                documents a separate, dedicated Mouse Port at $4024 instead
- *                — tried that, but gogoconniechan.bin never once touches
- *                $4023/$4024 (confirmed by tracing), while it reliably
- *                drains exactly what we push via $4020. SH6578 is a distinct,
- *                only loosely related chip (different manufacturer) from our
- *                actual target UM6578, and the datasheet says as much
- *                ("SH6578 is the only version that has a readily available
- *                datasheet") — evidently UM6578 doesn't have that dedicated
- *                port and multiplexes mouse data through the keyboard queue
- *                instead. Trust the trace over the datasheet here.
- *   $4026        EXT port read/write
+ *   $4020        Keyboard byte queue. Connie-chan also drains PS/2 mouse
+ *                command replies and movement packets here.
+ *   $4021        PS/2-style mouse command byte for Connie-chan.
+ *   $4022        Keyboard/mouse queue control/acknowledge.
+ *   $4026        EXT/status port; idle high for Connie-chan.
  *   $4031        Initial startup protection sequence (write-only, logged only
  *                upstream — genuinely has no gating effect, safe to no-op)
  *   $4032        IRQ mask/ack (write): 1=acknowledge+block that source going
@@ -70,17 +61,13 @@
  *   $5000-$7FFF  RAM (12KB, no mirroring)
  *   $8000-$FFFF  8 x 4KB banked ROM windows
  *
- * Mouse (-device mouse, legacy alias -device subor-mouse): Go! Go!
- * Connie-chan! Asobou Mouse ships with a removable two-button PS/2 ball
- * mouse. The ROM sends PS/2-style device commands through $4021 (notably
- * reset, which must reply FA AA 00), then drains 3-byte motion packets
- * (flags, dx, dy) through the $4020 byte queue on the Keyboard IRQ bit.
- * The visible title-screen cursor has been verified to move from synthetic
- * monitor input after the reset handshake.
+ * Mouse (-device mouse, legacy alias -device subor-mouse): Connie-chan uses
+ * a removable two-button PS/2 ball mouse. The ROM sends PS/2-style commands
+ * through $4021, then drains command replies and 3-byte movement packets
+ * through the $4020 byte queue on the Keyboard IRQ bit.
  *
- * $4016 also independently replies with a 24-bit Subor-style mouse word
- * (below) when mouse mode is strobed. This ROM polls it continuously but
- * the working Connie-chan path is the $4021-command/$4020-byte queue.
+ * $4016 can also return a 24-bit Subor-style mouse word when mouse mode is
+ * strobed. Keep this separate from the Connie-chan PS/2 stream.
  *
  * $4016 reply when mouse mode is active — 24-bit word, MSB-first (bit23
  * first, same shift direction as a standard controller, so 8-bit-only

@@ -69,10 +69,8 @@ static GemuPointerState um6578_pointer_state(Um6578State *s) {
 static void um6578_queue_ps2_mouse_packet(Um6578State *s, int dx, int dy,
                                           bool left, bool right);
 
-/* UM6578 mouse 24-bit reply — see the protocol table in um6578.h. Computed
- * fresh on every strobe from the accumulated host-pointer delta since the
- * last strobe (s->mouse_legacy_px/py), matching how the mouse reports
- * relative movement each time it's polled. */
+/* Legacy Subor-style $4016 mouse reply. Connie-chan uses the PS/2 stream
+ * below after reset, so this path idles once streaming is enabled. */
 static uint32_t um6578_subor_mouse_word(Um6578State *s) {
     uint32_t v = (1u << 21);                    /* E: some real units keep this always set */
     if (s->mouse_stream_enabled)
@@ -205,10 +203,7 @@ static void um6578_queue_ps2_mouse_packet(Um6578State *s, int dx, int dy,
                 flags, (uint8_t)ps2_dx, (uint8_t)ps2_dy, dx, dy, s->cpu.PC);
     s->mouse_prev_left = left;
     s->mouse_prev_right = right;
-    /* Connie-chan's IRQ handler services the PS/2 byte queue on bit $20
-     * (Keyboard) — confirmed by tracing real reads; UM6578 apparently has
-     * no separate dedicated Mouse Port/IRQ the way the (different, only
-     * loosely related) SH6578 datasheet describes. See um6578.h. */
+    /* Connie-chan services PS/2 bytes through the keyboard byte IRQ. */
     irq_raise(s, UM6578_IRQ_KEYBOARD);
 }
 
@@ -275,9 +270,8 @@ static void um6578_mouse_device_command(Um6578State *s, uint8_t val) {
     }
 }
 
-/* Sample the host pointer once per frame, independent of $4016 strobing —
- * a real PS/2 mouse streams movement to the SH6578's Mouse Port ($4024)
- * asynchronously, not on demand from a controller-shift read. */
+/* Sample the host/VNC pointer once per frame and queue PS/2 packets when
+ * Connie-chan's byte parser is ready for a new movement packet. */
 static void um6578_mouse_frame_tick(Um6578State *s) {
     if (!s->mouse_stream_enabled)
         return;

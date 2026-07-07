@@ -13,8 +13,8 @@ python configure && ninja -j$(nproc)
 python configure --enable-gtk && ninja -j$(nproc) # for GTK support
 ```
 
-# Targets
-See https://hotlandsoftware.github.io/gemu/
+# Targets & Documentation
+See https://gemu.mirhaeze.org/
 
 # Transparency
 This entire program is vibe coded - though I have some experience with programming which helps make it not completely horrible. I mainly started this as a way to see how far AI agents have come, and now I'm curious how many machines I can make AI emulate with little reference (manuals if necessary are allowed.)
