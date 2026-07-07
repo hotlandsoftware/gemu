@@ -414,7 +414,7 @@ static uint8_t um6578_read(uint16_t addr, void *ud) {
     }
     if (addr == 0x4026) {
         GemuPointerState ptr = um6578_pointer_state(s);
-        uint8_t v = 0x09u; /* bits 0/3 are active-low mouse buttons */
+        uint8_t v = 0xFFu; /* bits 0/3 are active-low mouse buttons; leave unknown EXT/status lines high */
         if (ptr.button || ptr.pressed) v &= (uint8_t)~0x01u;
         if (ptr.right_button || ptr.right_pressed) v &= (uint8_t)~0x08u;
         if (s->trace_io)
