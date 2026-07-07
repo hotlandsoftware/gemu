@@ -587,5 +587,16 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     }
 #endif
 
+    /* Engage relative-mouse capture immediately for pointer-driven machines
+     * (e.g. um6578 mouse) instead of waiting for a first click. Without this,
+     * the real OS cursor is unbounded screen coordinates: it pins against the
+     * desktop edge (or leaves the window entirely) after a short move, and
+     * sustained directional motion silently stops generating deltas. */
+    if (b->capture_pointer) {
+        SDL_SetRelativeMouseMode(SDL_TRUE);
+        SDL_CaptureMouse(SDL_TRUE);
+        b->mouse_captured = true;
+    }
+
     return d;
 }

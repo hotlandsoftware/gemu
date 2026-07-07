@@ -36,14 +36,27 @@
  *   $4017        Joypad 2 / EXT-adjacent read (unused here, returns 0)
  *   $4020        Keyboard byte queue (read; a real keyboard peripheral,
  *                not modelled — always reports empty, matching how even
- *                Furbtendulator's own keyboard feed is stubbed out)
+ *                Furbtendulator's own keyboard feed is stubbed out) — ALSO
+ *                where mouse packets are drained, see "Mouse" below. The
+ *                SH6578 datasheet (roms/colortest-sh6578/src/sh6578.inc)
+ *                documents a separate, dedicated Mouse Port at $4024 instead
+ *                — tried that, but gogoconniechan.bin never once touches
+ *                $4023/$4024 (confirmed by tracing), while it reliably
+ *                drains exactly what we push via $4020. SH6578 is a distinct,
+ *                only loosely related chip (different manufacturer) from our
+ *                actual target UM6578, and the datasheet says as much
+ *                ("SH6578 is the only version that has a readily available
+ *                datasheet") — evidently UM6578 doesn't have that dedicated
+ *                port and multiplexes mouse data through the keyboard queue
+ *                instead. Trust the trace over the datasheet here.
  *   $4026        EXT port read/write
  *   $4031        Initial startup protection sequence (write-only, logged only
  *                upstream — genuinely has no gating effect, safe to no-op)
  *   $4032        IRQ mask/ack (write): 1=acknowledge+block that source going
  *                forward, 0=unblock. Bit7=Timer, bit6=Mouse, bit5=Keyboard
- *                (see nesdev.org/wiki/UM6576/UM6578 — IRQ). We never raise
- *                the Keyboard/Mouse bits ourselves (no source models them).
+ *                (see nesdev.org/wiki/UM6576/UM6578 — IRQ). Mouse packets
+ *                raise the Keyboard bit (see above); we never raise the
+ *                Mouse bit ourselves (no confirmed source models it).
  *   $4033        IRQ status (read): which sources currently have a pending,
  *                unacknowledged request
  *   $4034        Timer control [ERS. .PPP]: E=enable, R=repeat (else clear E
@@ -59,10 +72,19 @@
  *
  * Mouse (-device mouse, legacy alias -device subor-mouse): Go! Go!
  * Connie-chan! Asobou Mouse ships with a removable two-button PS/2 ball
- * mouse. The host-facing PS/2 serial details are handled by the UM6578-side
- * console hardware; software polls the mouse through the same $4016
- * controller strobe/shift path used by the documented Subor Mouse protocol,
- * with a wider 24-bit reply instead of 8:
+ * mouse. The ROM sends PS/2-style device commands through $4021 (notably
+ * reset, which must reply FA AA 00), then drains 3-byte motion packets
+ * (flags, dx, dy) through the $4020 byte queue on the Keyboard IRQ bit.
+ * The visible title-screen cursor has been verified to move from synthetic
+ * monitor input after the reset handshake.
+ *
+ * $4016 also independently replies with a 24-bit Subor-style mouse word
+ * (below) when mouse mode is strobed. This ROM polls it continuously but
+ * the working Connie-chan path is the $4021-command/$4020-byte queue.
+ *
+ * $4016 reply when mouse mode is active — 24-bit word, MSB-first (bit23
+ * first, same shift direction as a standard controller, so 8-bit-only
+ * readers still see a plausible controller reply):
  *
  *   bit23 = left button          bit19 = up            bit20 = unused (0)
  *   bit22 = right button         bit18 = down           bit15 = unused (0)
@@ -72,19 +94,6 @@
  *           always set)
  *   bits14-8 = X movement magnitude, 0-127 (valid when E=1)
  *   bits6-0  = Y movement magnitude, 0-127 (valid when E=1)
- *
- * Bits shift out MSB-first (bit23 first), same direction as a standard
- * controller — by design, the first 8 bits alone already look like a
- * plausible controller reply, so code that only reads 8 bits (unaware of
- * the mouse) still gets sane input. This is genuinely unverified for THIS
- * specific chip/game (gogoconniechan.bin) — no MAME driver, no fork of
- * Nintendulator (mainline or the community VT/OneBus-focused "Furbtendulator"
- * fork, which has real working UM6578 PPU/APU/DMA emulation but leaves its
- * own keyboard *and* mouse input unimplemented) supports it. It's the most
- * concretely-documented candidate protocol available, reusing infrastructure
- * ($4016) this ROM is confirmed (via runtime tracing, not just static
- * disassembly of the banked, sometimes self-modified ROM) to actually poll
- * every frame.
  */
 
 #define UM6578_CPU_HZ      1789772.667  /* NTSC_APU_CLOCK: 21.477272MHz XTAL / 12 */
@@ -136,14 +145,21 @@ typedef struct Um6578State {
     uint8_t  timer_count;     /* live count, readable via $4036 */
     uint32_t timer_prescale_acc; /* source ticks accumulated toward next decrement */
 
-    /* UM6578 mouse (-device mouse), read via the standard $4016 shift
-     * register — see um6578.h's top-of-file comment for the protocol. */
-    int      mouse_px, mouse_py; /* host pointer position as of the last strobe */
+    /* UM6578 mouse (-device mouse), a PS/2-style byte queue drained via
+     * $4020 (see um6578.h's top-of-file comment for the protocol). Sampled
+     * once per frame, independent of $4016 strobing. */
+    int      mouse_px, mouse_py; /* host pointer position as of the last PS/2 sample */
+    int      mouse_legacy_px, mouse_legacy_py; /* last $4016 legacy sample */
     bool     mouse_have_pos;
+    bool     mouse_legacy_have_pos;
     bool     mouse_synth_active;
     int      mouse_synth_x, mouse_synth_y;
     bool     mouse_synth_left, mouse_synth_right;
     bool     mouse_prev_left, mouse_prev_right;
+    bool     mouse_stream_enabled;
+    uint8_t  mouse_param_cmd;
+    uint8_t  mouse_cmd_resp[4];
+    uint8_t  mouse_cmd_resp_len, mouse_cmd_resp_pos;
     uint8_t  mouse_queue[16];
     uint8_t  mouse_qhead, mouse_qtail;
 
@@ -156,6 +172,7 @@ typedef struct Um6578State {
     bool     trace_io;
     bool     trace_4016;
     bool     trace_timer;
+    bool     trace_mouse_state;
     uint32_t input_inject_mask;
     int      input_inject_frames;
 

@@ -58,32 +58,34 @@ static void um6578_queue_ps2_mouse_packet(Um6578State *s, int dx, int dy,
 
 /* UM6578 mouse 24-bit reply — see the protocol table in um6578.h. Computed
  * fresh on every strobe from the accumulated host-pointer delta since the
- * last strobe (s->mouse_px/py), matching how the mouse reports
+ * last strobe (s->mouse_legacy_px/py), matching how the mouse reports
  * relative movement each time it's polled. */
 static uint32_t um6578_subor_mouse_word(Um6578State *s) {
     uint32_t v = (1u << 21);                    /* E: some real units keep this always set */
+    if (s->mouse_stream_enabled)
+        return v;
+
     GemuPointerState ptr = um6578_pointer_state(s);
 
     int dx = ptr.rel_x;
     int dy = ptr.rel_y;
     if (dx == 0 && dy == 0) {
         if (ptr.x < 0 || ptr.y < 0) return v;
-        dx = s->mouse_have_pos ? ptr.x - s->mouse_px : 0;
-        dy = s->mouse_have_pos ? ptr.y - s->mouse_py : 0;
+        dx = s->mouse_legacy_have_pos ? ptr.x - s->mouse_legacy_px : 0;
+        dy = s->mouse_legacy_have_pos ? ptr.y - s->mouse_legacy_py : 0;
     }
     if (ptr.x >= 0 && ptr.y >= 0) {
-        s->mouse_px = ptr.x;
-        s->mouse_py = ptr.y;
-        s->mouse_have_pos = true;
+        s->mouse_legacy_px = ptr.x;
+        s->mouse_legacy_py = ptr.y;
+        s->mouse_legacy_have_pos = true;
     }
     bool left = ptr.button || ptr.pressed;
     bool right = ptr.right_button || ptr.right_pressed;
     if (s->trace_io && (dx != 0 || dy != 0 || left || right))
         fprintf(stderr,
-                "um6578: mouse sample x=%d y=%d rel=%d,%d dx=%d dy=%d left=%d right=%d pc=%04X\n",
+                "um6578: mouse sample (legacy $4016) x=%d y=%d rel=%d,%d dx=%d dy=%d left=%d right=%d pc=%04X\n",
                 ptr.x, ptr.y, ptr.rel_x, ptr.rel_y, dx, dy,
                 left ? 1 : 0, right ? 1 : 0, s->cpu.PC);
-    um6578_queue_ps2_mouse_packet(s, dx, dy, left, right);
 
     int ax = dx < 0 ? -dx : dx;
     int ay = dy < 0 ? -dy : dy;
@@ -141,6 +143,25 @@ static uint8_t mouse_queue_pop(Um6578State *s) {
     return v;
 }
 
+static void mouse_queue_byte(Um6578State *s, uint8_t v) {
+    mouse_queue_push(s, v);
+    irq_raise(s, UM6578_IRQ_KEYBOARD);
+}
+
+static void mouse_set_command_response(Um6578State *s, const uint8_t *bytes, uint8_t len) {
+    if (len > sizeof(s->mouse_cmd_resp))
+        len = (uint8_t)sizeof(s->mouse_cmd_resp);
+    memcpy(s->mouse_cmd_resp, bytes, len);
+    s->mouse_cmd_resp_len = len;
+    s->mouse_cmd_resp_pos = 0;
+}
+
+static void mouse_maybe_queue_command_response(Um6578State *s) {
+    if (s->mouse_cmd_resp_pos >= s->mouse_cmd_resp_len || !mouse_queue_empty(s))
+        return;
+    mouse_queue_byte(s, s->mouse_cmd_resp[s->mouse_cmd_resp_pos++]);
+}
+
 static int clamp_ps2_delta(int v) {
     if (v < -127) return -127;
     if (v > 127) return 127;
@@ -169,8 +190,109 @@ static void um6578_queue_ps2_mouse_packet(Um6578State *s, int dx, int dy,
                 flags, (uint8_t)ps2_dx, (uint8_t)ps2_dy, dx, dy, s->cpu.PC);
     s->mouse_prev_left = left;
     s->mouse_prev_right = right;
-    /* Connie-chan's IRQ handler services the PS/2 byte queue on bit $20. */
+    /* Connie-chan's IRQ handler services the PS/2 byte queue on bit $20
+     * (Keyboard) — confirmed by tracing real reads; UM6578 apparently has
+     * no separate dedicated Mouse Port/IRQ the way the (different, only
+     * loosely related) SH6578 datasheet describes. See um6578.h. */
     irq_raise(s, UM6578_IRQ_KEYBOARD);
+}
+
+static void um6578_mouse_device_command(Um6578State *s, uint8_t val) {
+    if (s->trace_io)
+        fprintf(stderr, "um6578: mouse cmd %02X pc=%04X\n", val, s->cpu.PC);
+
+    if (s->mouse_param_cmd) {
+        static const uint8_t ack[] = { 0xFAu };
+        mouse_set_command_response(s, ack, (uint8_t)sizeof(ack));
+        s->mouse_param_cmd = 0;
+        return;
+    }
+
+    switch (val) {
+    case 0xFF: /* Reset */
+    {
+        static const uint8_t reset_resp[] = { 0xFAu, 0xAAu, 0x00u };
+        s->mouse_stream_enabled = true;
+        s->mouse_prev_left = false;
+        s->mouse_prev_right = false;
+        s->mouse_have_pos = false;
+        s->mouse_legacy_have_pos = false;
+        s->mouse_qhead = s->mouse_qtail = 0;
+        s->irq_pending &= (uint8_t)~UM6578_IRQ_KEYBOARD;
+        irq_recompute(s);
+        mouse_set_command_response(s, reset_resp, (uint8_t)sizeof(reset_resp));
+        break;
+    }
+    case 0xF4: /* Enable data reporting */
+    {
+        static const uint8_t ack[] = { 0xFAu };
+        s->mouse_stream_enabled = true;
+        mouse_set_command_response(s, ack, (uint8_t)sizeof(ack));
+        break;
+    }
+    case 0xF5: /* Disable data reporting */
+    {
+        static const uint8_t ack[] = { 0xFAu };
+        s->mouse_stream_enabled = false;
+        mouse_set_command_response(s, ack, (uint8_t)sizeof(ack));
+        break;
+    }
+    case 0xF3: /* Set sample rate, parameter follows */
+    case 0xE8: /* Set resolution, parameter follows */
+    {
+        static const uint8_t ack[] = { 0xFAu };
+        s->mouse_param_cmd = val;
+        mouse_set_command_response(s, ack, (uint8_t)sizeof(ack));
+        break;
+    }
+    case 0xF2: /* Read device type */
+    {
+        static const uint8_t type_resp[] = { 0xFAu, 0x00u };
+        mouse_set_command_response(s, type_resp, (uint8_t)sizeof(type_resp));
+        break;
+    }
+    default:
+    {
+        static const uint8_t ack[] = { 0xFAu };
+        mouse_set_command_response(s, ack, (uint8_t)sizeof(ack));
+        break;
+    }
+    }
+}
+
+/* Sample the host pointer once per frame, independent of $4016 strobing —
+ * a real PS/2 mouse streams movement to the SH6578's Mouse Port ($4024)
+ * asynchronously, not on demand from a controller-shift read. */
+static void um6578_mouse_frame_tick(Um6578State *s) {
+    if (!s->mouse_stream_enabled)
+        return;
+    if (s->ram_lo[0x36] != 0 || s->ram_lo[0x37] != 1 || !mouse_queue_empty(s))
+        return;
+
+    GemuPointerState ptr = um6578_pointer_state(s);
+
+    int dx = ptr.rel_x;
+    int dy = ptr.rel_y;
+    if (dx == 0 && dy == 0) {
+        if (ptr.x < 0 || ptr.y < 0) return;
+        dx = s->mouse_have_pos ? ptr.x - s->mouse_px : 0;
+        dy = s->mouse_have_pos ? ptr.y - s->mouse_py : 0;
+    }
+    if (ptr.x >= 0 && ptr.y >= 0) {
+        s->mouse_px = ptr.x;
+        s->mouse_py = ptr.y;
+        s->mouse_have_pos = true;
+    }
+    bool left = ptr.button || ptr.pressed;
+    bool right = ptr.right_button || ptr.right_pressed;
+    if (dx == 0 && dy == 0 && left == s->mouse_prev_left && right == s->mouse_prev_right)
+        return;
+    if (s->trace_io && (dx != 0 || dy != 0 || left || right))
+        fprintf(stderr,
+                "um6578: mouse port sample x=%d y=%d rel=%d,%d dx=%d dy=%d left=%d right=%d\n",
+                ptr.x, ptr.y, ptr.rel_x, ptr.rel_y, dx, dy,
+                left ? 1 : 0, right ? 1 : 0);
+    um6578_queue_ps2_mouse_packet(s, dx, dy, left, right);
 }
 
 /* ── Timer ($4034/4035/4036) ─────────────────────────────────────────────── */
@@ -203,6 +325,22 @@ static void timer_maybe_tick(Um6578State *s, bool is_scanline_edge) {
 
 static uint8_t um6578_read(uint16_t addr, void *ud);
 static void    um6578_write(uint16_t addr, uint8_t val, void *ud);
+
+static bool um6578_mouse_ram_addr(uint16_t addr) {
+    switch (addr) {
+    case 0x06: case 0x07: case 0x08: case 0x09:
+    case 0x28: case 0x29: case 0x2a: case 0x2b:
+    case 0x2c: case 0x2d: case 0x2e: case 0x2f:
+    case 0x30: case 0x31: case 0x32: case 0x33:
+    case 0x34: case 0x35: case 0x36: case 0x37: case 0x38:
+    case 0x60: case 0x67:
+    case 0x68: case 0x69: case 0x6a: case 0x6b:
+    case 0x6c: case 0x6d: case 0x6e: case 0x6f:
+        return true;
+    default:
+        return false;
+    }
+}
 
 static uint8_t bank_read(Um6578State *s, int bank, uint16_t offset) {
     uint32_t address = (offset & 0x0FFFu) | ((uint32_t)s->bankswitch[bank] << 12);
@@ -311,7 +449,12 @@ static uint8_t um6578_read(uint16_t addr, void *ud) {
 static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
     Um6578State *s = ud;
 
-    if (addr < 0x2000) { s->ram_lo[addr] = val; return; }
+    if (addr < 0x2000) {
+        if (s->trace_mouse_state && um6578_mouse_ram_addr(addr) && s->ram_lo[addr] != val)
+            fprintf(stderr, "um6578: z%02X <- %02X pc=%04X\n", addr, val, s->cpu.PC);
+        s->ram_lo[addr] = val;
+        return;
+    }
     if (addr >= 0x2000 && addr <= 0x2007) { ppu_sh6578_write(&s->ppu, (uint8_t)addr, val); return; }
     if (addr == 0x2008) { ppu_sh6578_write_ext(&s->ppu, val); return; }
     if (addr >= 0x2040 && addr <= 0x207F) { ppu_sh6578_palette_write(&s->ppu, (uint8_t)(addr - 0x2040), val); return; }
@@ -351,9 +494,20 @@ static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
             fprintf(stderr, "um6578: write $4020 <- %02X pc=%04X\n", val, s->cpu.PC);
         return; /* keyboard-related write, unmodelled */
     }
+    if (addr == 0x4021) {
+        if (s->cfg->n_ports > 0 && s->cfg->ports[0] == NES_DEVICE_MOUSE) {
+            um6578_mouse_device_command(s, val);
+        } else if (s->trace_io) {
+            fprintf(stderr, "um6578: write $4021 <- %02X pc=%04X\n", val, s->cpu.PC);
+        }
+        return;
+    }
     if (addr == 0x4022) {
         if (s->trace_io)
             fprintf(stderr, "um6578: write $4022 <- %02X pc=%04X\n", val, s->cpu.PC);
+        if (val == 0x80 && s->cfg->n_ports > 0 && s->cfg->ports[0] == NES_DEVICE_MOUSE &&
+            !(s->cpu.PC >= 0xDCF1 && s->cpu.PC <= 0xDD50))
+            mouse_maybe_queue_command_response(s);
         return;
     }
     if (addr == 0x4026) {
@@ -510,6 +664,7 @@ static bool um6578_mouse_command(Um6578State *s, const char *text) {
         if (*p) return false;
         s->mouse_synth_active = false;
         s->mouse_have_pos = false;
+        s->mouse_legacy_have_pos = false;
         printf("mouse: using host pointer\n");
         return true;
     }
@@ -544,9 +699,18 @@ static bool um6578_mouse_command(Um6578State *s, const char *text) {
     while (*p == ' ' || *p == '\t') p++;
     if (*p) return false;
 
-    if (relative && s->mouse_synth_active) {
+    bool was_synthetic = s->mouse_synth_active;
+    if (relative && was_synthetic) {
         x += s->mouse_synth_x;
         y += s->mouse_synth_y;
+    }
+    if (!was_synthetic) {
+        s->mouse_px = x;
+        s->mouse_py = y;
+        s->mouse_have_pos = true;
+        s->mouse_legacy_px = x;
+        s->mouse_legacy_py = y;
+        s->mouse_legacy_have_pos = true;
     }
     s->mouse_synth_active = true;
     s->mouse_synth_x = x;
@@ -554,6 +718,33 @@ static bool um6578_mouse_command(Um6578State *s, const char *text) {
     s->mouse_synth_left = left;
     s->mouse_synth_right = right;
     printf("mouse: x=%d y=%d left=%d right=%d\n", x, y, left ? 1 : 0, right ? 1 : 0);
+    return true;
+}
+
+static bool um6578_mousestate_command(Um6578State *s, const char *text) {
+    const char *p = text;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncasecmp(p, "mousestate", 10) != 0 || (p[10] && p[10] != ' ' && p[10] != '\t'))
+        return false;
+    p += 10;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p) return false;
+
+    printf("mouse-state: host=%s x=%d y=%d left=%d right=%d stream=%d q=%u/%u\n",
+           s->mouse_synth_active ? "synthetic" : "display",
+           s->mouse_synth_x, s->mouse_synth_y,
+           s->mouse_synth_left ? 1 : 0, s->mouse_synth_right ? 1 : 0,
+           s->mouse_stream_enabled ? 1 : 0,
+           (unsigned)s->mouse_qhead, (unsigned)s->mouse_qtail);
+    printf("mouse-state: z20=%02X z21=%02X bounds x=%02X..%02X y=%02X..%02X pos=%02X,%02X parsed=%02X/%02X/%02X last=%02X/%02X changed=%02X hist=%02X idx=%02X raw=%02X stage=%02X busy=%02X flag=%02X\n",
+           s->ram_lo[0x20], s->ram_lo[0x21],
+           s->ram_lo[0x28], s->ram_lo[0x2a],
+           s->ram_lo[0x29], s->ram_lo[0x2b],
+           s->ram_lo[0x2c], s->ram_lo[0x2d],
+           s->ram_lo[0x31], s->ram_lo[0x32], s->ram_lo[0x33],
+           s->ram_lo[0x2f], s->ram_lo[0x60],
+           s->ram_lo[0x2e], s->ram_lo[0x68], s->ram_lo[0x67],
+           s->ram_lo[0x35], s->ram_lo[0x37], s->ram_lo[0x36], s->ram_lo[0x30]);
     return true;
 }
 
@@ -620,6 +811,7 @@ Um6578State *um6578_create(const MosConfig *cfg) {
     s->trace_io = trace_io != NULL;
     s->trace_4016 = trace_io && (strcmp(trace_io, "4016") == 0 || strcmp(trace_io, "all") == 0);
     s->trace_timer = trace_io && strcmp(trace_io, "all") == 0;
+    s->trace_mouse_state = getenv("GEMU_UM6578_TRACE_MOUSE") != NULL;
 
     const char *rom_path = NULL;
     for (int i = 0; i < cfg->n_roms; i++) {
@@ -755,6 +947,7 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
             } else if (cmd == GEMU_MON_CUSTOM) {
                 const char *text = gemu_monitor_command_text(s->monitor);
                 if (!um6578_mouse_command(s, text) &&
+                    !um6578_mousestate_command(s, text) &&
                     !um6578_sendkey_command(s, text))
                     gemu_monitor_unknown_command(s->monitor);
             }
@@ -763,6 +956,7 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
         if (s->display) gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
 
         um6578_handle_keys(s, held);
+        um6578_mouse_frame_tick(s);
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             s->ppu.dirty = false;
