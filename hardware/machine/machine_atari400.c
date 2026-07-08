@@ -189,6 +189,36 @@ static bool a400_sendkey_command(Atari400State *s, const char *text) {
     return true;
 }
 
+static void a400_cpu_state(void *ud, char *buf, size_t buf_len) {
+    const Atari400State *s = ud;
+    snprintf(buf, buf_len,
+             "atari400: pc=%04X a=%02X x=%02X y=%02X p=%02X sp=%02X "
+             "cycles=%llu insns=%llu frame=%llu line=%d "
+             "dmactl=%02X dlist=%04X nmien=%02X nmist=%02X "
+             "colpf=%02X,%02X,%02X,%02X colbk=%02X "
+             "irqen=%02X irqst=%02X skstat=%02X",
+             s->cpu.PC, s->cpu.A, s->cpu.X, s->cpu.Y, s->cpu.P, s->cpu.SP,
+             (unsigned long long)s->cpu.cycle_count,
+             (unsigned long long)s->cpu.insn_count,
+             (unsigned long long)s->frame, s->antic.scanline,
+             s->antic.dmactl, s->antic.dlist, s->antic.nmien, s->antic.nmist,
+             s->antic.colpf[0], s->antic.colpf[1], s->antic.colpf[2],
+             s->antic.colpf[3], s->antic.colbk, s->pokey.irqen,
+             (uint8_t)~s->pokey.irq_pending, s->pokey.skstat);
+}
+
+static bool a400_peek_command(Atari400State *s, const char *text) {
+    unsigned addr, len = 16;
+    if (!text || sscanf(text, "peek %x %x", &addr, &len) < 1) return false;
+    if (len > 128) len = 128;
+    for (unsigned i = 0; i < len; i++) {
+        if ((i & 15u) == 0) printf("%04X:", (addr + i) & 0xFFFFu);
+        printf(" %02X", a400_read((uint16_t)(addr + i), s));
+        if ((i & 15u) == 15u || i + 1 == len) printf("\n");
+    }
+    return true;
+}
+
 /* ── VNC keyboard ───────────────────────────────────────────────────────── */
 
 static void a400_poll_vnc(Atari400State *s) {
@@ -314,6 +344,7 @@ Atari400State *atari400_create(const MosConfig *cfg) {
 
     s->monitor = gemu_monitor_create();
     if (!s->monitor) { free(s); return NULL; }
+    gemu_monitor_set_cpu_state_cb(s->monitor, a400_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, a400_screendump, s);
 
     if (cfg->vnc_addr) {
@@ -387,7 +418,9 @@ void atari400_run(Atari400State *s, const MosConfig *cfg) {
             } else if (cmd == GEMU_MON_RESET) {
                 a400_reset(s);
             } else if (cmd == GEMU_MON_CUSTOM) {
-                if (!a400_sendkey_command(s, gemu_monitor_command_text(s->monitor)))
+                const char *text = gemu_monitor_command_text(s->monitor);
+                if (!a400_sendkey_command(s, text) &&
+                    !a400_peek_command(s, text))
                     gemu_monitor_unknown_command(s->monitor);
             }
         }

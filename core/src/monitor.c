@@ -102,6 +102,8 @@ struct GemuMonitor {
     int             next_bp_id;
     bool            has_exec_bp;
     bool            has_mem_bp;
+    void          (*cpu_state_cb)(void *ud, char *buf, size_t buf_len);
+    void           *cpu_state_ud;
     bool          (*screendump_cb)(void *ud, const char *path);
     void           *screendump_ud;
     MonBackend      backend;
@@ -376,6 +378,17 @@ static void info_breakpoints(const GemuMonitor *mon) {
     }
 }
 
+static void info_cpu(const GemuMonitor *mon) {
+    if (!mon || !mon->cpu_state_cb) {
+        mon_printf(mon, "CPU state is not available for this machine.\n");
+        return;
+    }
+    char buf[512];
+    mon->cpu_state_cb(mon->cpu_state_ud, buf, sizeof(buf));
+    buf[sizeof(buf) - 1] = '\0';
+    mon_printf(mon, "%s\n", buf);
+}
+
 static bool dispatch_media(GemuMonitor *mon, const char *line,
                            GemuMonCmd *out_cmd) {
     char buf[256];
@@ -384,6 +397,14 @@ static bool dispatch_media(GemuMonitor *mon, const char *line,
     char *p = buf;
     char *verb = next_token(&p);
     if (!verb) return false;
+
+    if (strcasecmp(verb, "cpu") == 0) {
+        char *extra = next_token(&p);
+        if (extra) mon_printf(mon, "usage: cpu\n");
+        else       info_cpu(mon);
+        *out_cmd = GEMU_MON_NONE;
+        return true;
+    }
 
     if (strcasecmp(verb, "screendump") == 0) {
         char *arg = unquote_arg(p);
@@ -421,10 +442,12 @@ static bool dispatch_media(GemuMonitor *mon, const char *line,
             info_block(mon);
         } else if (strcasecmp(sub, "roms") == 0) {
             info_roms(mon);
+        } else if (strcasecmp(sub, "cpu") == 0) {
+            info_cpu(mon);
         } else if (strcasecmp(sub, "breakpoints") == 0 || strcasecmp(sub, "bp") == 0) {
             info_breakpoints(mon);
         } else {
-            mon_printf(mon, "info: unknown subcommand '%s' (try 'info block', 'info roms', 'info breakpoints')\n", sub);
+            mon_printf(mon, "info: unknown subcommand '%s' (try 'info block', 'info cpu', 'info roms', 'info breakpoints')\n", sub);
         }
         *out_cmd = GEMU_MON_NONE;
         return true;
@@ -624,6 +647,7 @@ static bool monitor_handle_line(GemuMonitor *mon, char *line) {
         "  gamegenie delete [code] -- deletes game genie code\n"
         "  info block -- list block devices\n"
         "  info breakpoints -- list active breakpoints\n"
+        "  info cpu -- show machine CPU state (short: cpu)\n"
         "  info roms  -- list loaded ROM images\n"
         "  q / quit -- quits the machine immediately\n"
         "  reset -- reset the machine\n"
@@ -1391,6 +1415,16 @@ void gemu_monitor_register_rom(GemuMonitor *mon,
 
 void gemu_monitor_clear_roms(GemuMonitor *mon) {
     if (mon) mon->n_rom_entries = 0;
+}
+
+void gemu_monitor_set_cpu_state_cb(GemuMonitor *mon,
+                                   void (*cb)(void *ud,
+                                              char *buf,
+                                              size_t buf_len),
+                                   void *ud) {
+    if (!mon) return;
+    mon->cpu_state_cb = cb;
+    mon->cpu_state_ud = ud;
 }
 
 void gemu_monitor_set_screendump_cb(GemuMonitor *mon,

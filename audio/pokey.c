@@ -24,7 +24,7 @@ uint8_t pokey_read(Pokey *p, uint8_t reg) {
     case 0x00: case 0x01: case 0x02: case 0x03:
     case 0x04: case 0x05: case 0x06: case 0x07:
         return 228;                        /* POT0-7: paddles absent */
-    case 0x08: return 0;                   /* ALLPOT */
+    case 0x08: return 0xFF;                /* ALLPOT: all absent pots complete */
     case 0x09: return p->kbcode;           /* KBCODE */
     case 0x0A: return poly17_step(p);      /* RANDOM */
     case 0x0D: return 0;                   /* SERIN — line silent */
@@ -44,9 +44,10 @@ void pokey_write(Pokey *p, uint8_t reg, uint8_t v) {
     case 0x09: break;                      /* STIMER */
     case 0x0A: p->skstat |= 0xE0; break;   /* SKRES */
     case 0x0B: break;                      /* POTGO */
-    case 0x0D:                             /* SEROUT — byte "sent" instantly */
+    case 0x0D:                             /* SEROUT — no attached SIO target */
         p->serout = v;
-        p->irq_pending |= POKEY_IRQ_SEROR | POKEY_IRQ_SEROC;
+        p->irq_pending &= (uint8_t)~POKEY_IRQ_SEROC;
+        p->irq_pending |= POKEY_IRQ_SEROR;
         break;
     case 0x0E:                             /* IRQEN: 0-bits also clear pending */
         p->irqen = v;
@@ -58,11 +59,10 @@ void pokey_write(Pokey *p, uint8_t reg, uint8_t v) {
 }
 
 void pokey_tick(Pokey *p) {
-    /* The serial output register is always ready and every byte completes.
-     * SEROC is a level status on real POKEY (visible in IRQST even when
-     * disabled in IRQEN — the OS SIO polls it); SEROR re-arms while enabled
-     * so SIO's send loop never stalls. */
-    p->irq_pending |= POKEY_IRQ_SEROC | (p->irqen & POKEY_IRQ_SEROR);
+    /* With no SIO device attached, the transmit register is always ready.
+     * Do not keep raising SEROC here: the OS enables serial-complete IRQs
+     * during parts of SIO, and a level SEROC would trap it in the IRQ path. */
+    p->irq_pending |= (p->irqen & POKEY_IRQ_SEROR);
 }
 
 void pokey_key_down(Pokey *p, uint8_t code) {

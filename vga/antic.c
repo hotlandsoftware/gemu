@@ -9,21 +9,34 @@ uint32_t antic_palette_rgb[256];
 
 static void palette_init(void) {
     if (antic_palette_rgb[15]) return;
-    /* NTSC YUV approximation: hue 0 = grayscale, hues 1-15 spaced around
-     * the color wheel.  Constants follow the commonly used Atari800
-     * "default" palette generator closely enough for recognisable colors. */
+    /* Practical Atari hue/luma palette.  Hue 0 is grayscale; the remaining
+     * hues follow the 400/800 color order closely enough for OS screens and
+     * software defaults (notably COLOR2=$94, the normal blue background). */
+    static const double hue_deg[16] = {
+        0.0, 48.0, 36.0, 18.0, 355.0, 320.0, 285.0, 255.0,
+        235.0, 220.0, 195.0, 165.0, 125.0, 92.0, 72.0, 58.0
+    };
     for (int c = 0; c < 256; c++) {
         int hue = c >> 4, lum = c & 0x0F;
-        double y = lum / 15.0;
-        double u = 0.0, v = 0.0;
+        double v = 0.06 + (lum / 15.0) * 0.94;
+        double r = v, g = v, b = v;
         if (hue) {
-            double angle = ((double)(hue - 1) / 15.0) * 2.0 * M_PI + 0.7;
-            u = 0.28 * cos(angle);
-            v = 0.28 * sin(angle);
+            double h = hue_deg[hue] / 60.0;
+            int sector = (int)floor(h);
+            double f = h - sector;
+            double s = 0.70;
+            double p = v * (1.0 - s);
+            double q = v * (1.0 - s * f);
+            double t = v * (1.0 - s * (1.0 - f));
+            switch (sector % 6) {
+            case 0: r = v; g = t; b = p; break;
+            case 1: r = q; g = v; b = p; break;
+            case 2: r = p; g = v; b = t; break;
+            case 3: r = p; g = q; b = v; break;
+            case 4: r = t; g = p; b = v; break;
+            case 5: r = v; g = p; b = q; break;
+            }
         }
-        double r = y + 1.140 * v;
-        double g = y - 0.395 * u - 0.581 * v;
-        double b = y + 2.032 * u;
         #define CLAMP8(x) ((uint32_t)(((x) < 0 ? 0 : (x) > 1 ? 1 : (x)) * 255.0 + 0.5))
         antic_palette_rgb[c] = 0xFF000000u |
             (CLAMP8(r) << 16) | (CLAMP8(g) << 8) | CLAMP8(b);

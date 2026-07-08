@@ -61,6 +61,11 @@ void         gemu_monitor_set_vnc(GemuMonitor *mon, GemuVncServer *vnc);
 void         gemu_monitor_set_input_reset_cb(GemuMonitor *mon,
                                              void (*cb)(void *ud),
                                              void *ud);
+void         gemu_monitor_set_cpu_state_cb(GemuMonitor *mon,
+                                           void (*cb)(void *ud,
+                                                      char *buf,
+                                                      size_t buf_len),
+                                           void *ud);
 
 /* Register a loaded ROM image for display by 'info roms'.
  * Call once per ROM after a successful load.  addr and size are in the
