@@ -20,13 +20,16 @@
 ## Devices
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|
+| a1ci | `Apple I Cassette Interface` | working |  |
 | fds | `Famicom Disk System` | working |  |
 | famicom-keyboard | `Famicom 72-key Keyboard` | working |  |
 | famicom-mic | `Famicom Microphone Controller` | working | no proper mic detection yet, can send mic sound by pressing M (default) |
 | rob | `R.O.B. (Robotic Operating Buddy)` | working | opens in a second window, 3D simulation of ROB |
-| rob-famicom | `Family Computer Robot (Famicom R.O.B.)` | working | |
 | kim-keypad | `KIM-1 hex keypad` | working |  |
+| mouse | `Generic PS/2 mouse` | working |  |
 | nes-controller | `NES/Famicom Standard Controller` | working |  |
+| rob-famicom | `Family Computer Robot (Famicom R.O.B.)` | working | |
+| subor-mouse | `Subor Mouse` | working | |
 | vt100 | `DEC VT100 serial terminal` | working |  |
 | wozmon | `Wozniak 'Woz' Monitor` | working |  |
 | zapper | `NES Zapper (light gun)` | working |  |
@@ -37,20 +40,22 @@ Simulated machines include:
 ## Implemented
 | Name   | Full Name     | Year | Graphics  | Input | Sound | Status |
 |--------|---------------|---------|---------|-------|-------|-------|
-| apple1 | `Apple I` | 1976 | 🟢 | 🔴 | 🔴 | preliminary | 
+| apple1 | `Apple I` | 1976 | 🟢 | 🟢 | 🔴 | working | 
+| atari400 | `Atari 400` | 1979 | 🟢 | 🔴 | 🔴 | not working | 
 | dendy | `Dendy Famiclone` | 1992 | 🟢 | 🟢 | 🟢 | imperfect | 
 | famicom | `Nintendo Family Computer` | 1983  | 🟢 | 🟢 | 🟢 | imperfect | 
 | generic | `Generic MOS-compatible machine` | N/A | 🔴 | 🔴 | 🔴 | preliminary | 
 | kim1 | `MOS KIM-1` | 1976 | 🟢 | 🟢 | 🔴 | imperfect | 
 | nes | `Nintendo Entertainment System (NTSC)` | 1985 | 🟢 | 🟢 | 🟢 | imperfect | 
 | nespal | `Nintendo Entertainment System (PAL)` | 1986 | 🟢 | 🟢 | 🟢 | imperfect | 
+| um6578 | `UM6578 Enhanced Famiclone` | 199? | 🟢 | 🟢 | 🟢 | imperfect | 
+| vssmb | `VS. Super Mario Bros.` | 1986 | 🟢 | 🟢 | 🟢 | working | 
 
 ## Planned, not implemented yet
 | Name   | Full Name     | Year |
 |--------|---------------|---------------|
 | atom | `Acorn Atom` | 1980 |
 | electron | `Acorn Electron` | 1983 |
-| atari400 | `Atari 400` | 1979 |
 | atari130xe | `Atari 130XE` | 1983 |
 | atari65xe | `Atari 65XE` | 1983 |
 | atari800 | `Atari 800` | 1979 |
