@@ -41,7 +41,7 @@ Simulated machines include:
 | Name   | Full Name     | Year | Graphics  | Input | Sound | Status |
 |--------|---------------|---------|---------|-------|-------|-------|
 | apple1 | `Apple I` | 1976 | 🟢 | 🟢 | 🔴 | working | 
-| atari400 | `Atari 400` | 1979 | 🟢 | 🔴 | 🔴 | not working | 
+| atari400 | `Atari 400` | 1979 | 🟢 | 🟢 | 🟢 | preliminary | 
 | dendy | `Dendy Famiclone` | 1992 | 🟢 | 🟢 | 🟢 | imperfect | 
 | famicom | `Nintendo Family Computer` | 1983  | 🟢 | 🟢 | 🟢 | imperfect | 
 | generic | `Generic MOS-compatible machine` | N/A | 🔴 | 🔴 | 🔴 | preliminary | 
