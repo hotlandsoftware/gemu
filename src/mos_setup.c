@@ -6,6 +6,7 @@
 #include "5clown.h"
 #include "magicfly.h"
 #include "um6578.h"
+#include "atari400.h"
 #include "vt100.h"
 #include "romdb.h"
 #include "gemu/gemu.h"
@@ -358,6 +359,7 @@ int mos_setup(int argc, char *argv[]) {
             else if (strcmp(canon, "5clown") == 0) cfg.machine = MOS_MACHINE_5CLOWN;
             else if (strcmp(canon, "magicfly") == 0) cfg.machine = MOS_MACHINE_MAGICFLY;
             else if (strcmp(canon, "um6578") == 0) cfg.machine = MOS_MACHINE_UM6578;
+            else if (strcmp(canon, "atari400") == 0) cfg.machine = MOS_MACHINE_ATARI400;
             cfg.is_dendy = md->tv && strcmp(md->tv, "dendy") == 0;
             cfg.is_arcade = md->tv && strcmp(md->tv, "vs") == 0;
             cfg.is_pal   = cfg.is_dendy || (md->tv && strcmp(md->tv, "pal") == 0);
@@ -536,7 +538,8 @@ int mos_setup(int argc, char *argv[]) {
          cfg.machine == MOS_MACHINE_KIM1 ||
          cfg.machine == MOS_MACHINE_5CLOWN ||
          cfg.machine == MOS_MACHINE_MAGICFLY ||
-         cfg.machine == MOS_MACHINE_UM6578)
+         cfg.machine == MOS_MACHINE_UM6578 ||
+         cfg.machine == MOS_MACHINE_ATARI400)
         && !cfg.vnc_addr && !args.display_explicit) {
 #ifdef GEMU_GTK
         bool um6578_mouse = cfg.machine == MOS_MACHINE_UM6578 &&
@@ -667,6 +670,11 @@ int mos_setup(int argc, char *argv[]) {
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
         um6578_run(s, &cfg);
         um6578_destroy(s);
+    } else if (cfg.machine == MOS_MACHINE_ATARI400) {
+        Atari400State *s = atari400_create(&cfg);
+        if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
+        atari400_run(s, &cfg);
+        atari400_destroy(s);
     } else {
         MosGenericState *s = mos_generic_create(&cfg);
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }

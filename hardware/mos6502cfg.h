@@ -12,6 +12,7 @@ typedef enum {
     MOS_MACHINE_5CLOWN,  /* IGS "Five Clown" arcade video poker (dual 6502) */
     MOS_MACHINE_MAGICFLY, /* misc/magicfly.cpp hardware: Magic Fly, 7 e Mezzo */
     MOS_MACHINE_UM6578,  /* UM6578/SH6578/NT6578 NES-clone-on-a-chip (plug & play TV games) */
+    MOS_MACHINE_ATARI400, /* Atari 400 (6502 + ANTIC/GTIA/POKEY) */
 } MosMachineType;
 
 typedef enum {

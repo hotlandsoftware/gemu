@@ -56,6 +56,8 @@ FAMILY_SRC = {
         'hardware/machine/machine_5clown.c', 'hardware/device/pia6821.c',
         'hardware/machine/machine_magicfly.c',
         'hardware/machine/machine_um6578.c',
+        'hardware/machine/machine_atari400.c',
+        'vga/antic.c', 'audio/pokey.c',
         'hardware/device/fds.c', 'hardware/device/fds_hle.c',
         'hardware/device/vt100.c', 'hardware/romdb.c',
         'src/mos_setup.c',
@@ -535,7 +537,7 @@ def main():
     if defs:      cflags_parts.append(defs)
     unified_cflags = ' '.join(cflags_parts)
 
-    ld_parts = [base_ldflags] + sdl2_libs + crypto_libs
+    ld_parts = [base_ldflags] + sdl2_libs + crypto_libs + ['-lm']
     if have_sdl_image: ld_parts += sdl_image_libs
     if have_libzip:    ld_parts += libzip_libs
     if want_gtk:  ld_parts += gtk_libs + epoxy_libs
