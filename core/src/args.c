@@ -42,8 +42,8 @@ static void print_usage(const GemuArgsDef *def) {
         printf("%s", def->extra_help);
 }
 
-static void list_devices(const char *kind, const GemuDevDesc *devs, int n) {
-    printf("Available %s:\n", kind);
+void gemu_print_table(const char *heading, const GemuDevDesc *devs, int n) {
+    printf("%s:\n", heading);
     int maxw = 0;
     for (int i = 0; i < n; i++) {
         int w = (int)strlen(devs[i].name);
@@ -53,22 +53,33 @@ static void list_devices(const char *kind, const GemuDevDesc *devs, int n) {
         printf("  %-*s  %s\n", maxw, devs[i].name, devs[i].desc);
 }
 
-static void list_displays(unsigned mask) {
-    /* Build a temporary table of only the supported entries */
-    DispEntry tmp[N_DISPLAYS];
-    int n = 0;
-    for (int i = 0; i < N_DISPLAYS; i++)
-        if (mask & GEMU_DISP_F(display_table[i].type))
-            tmp[n++] = display_table[i];
-
-    printf("Available display backends:\n");
+void gemu_print_table3(const char *heading, const GemuDevDesc3 *devs, int n) {
+    printf("%s:\n", heading);
     int maxw = 0;
     for (int i = 0; i < n; i++) {
-        int w = (int)strlen(tmp[i].name);
+        int w = (int)strlen(devs[i].name);
         if (w > maxw) maxw = w;
     }
     for (int i = 0; i < n; i++)
-        printf("  %-*s  %s\n", maxw, tmp[i].name, tmp[i].desc);
+        printf("  %-*s  %s [%s]\n", maxw, devs[i].name, devs[i].desc,
+               devs[i].machines);
+}
+
+static void list_devices(const char *kind, const GemuDevDesc *devs, int n) {
+    char heading[64];
+    snprintf(heading, sizeof(heading), "Available %s", kind);
+    gemu_print_table(heading, devs, n);
+}
+
+static void list_displays(unsigned mask) {
+    /* Build a temporary table of only the supported entries */
+    GemuDevDesc tmp[N_DISPLAYS];
+    int n = 0;
+    for (int i = 0; i < N_DISPLAYS; i++)
+        if (mask & GEMU_DISP_F(display_table[i].type))
+            tmp[n++] = (GemuDevDesc){ display_table[i].name, display_table[i].desc };
+
+    gemu_print_table("Available display backends", tmp, n);
 }
 
 static void print_vnc_help(void) {

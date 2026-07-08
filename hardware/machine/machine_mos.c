@@ -216,7 +216,7 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
     return s;
 }
 
-void mos_generic_reset(MosGenericState *s, const MosConfig *cfg) {
+static void mos_generic_reset(MosGenericState *s, const MosConfig *cfg) {
     gemu_monitor_clear_roms(s->monitor);
     memset(s->rom_map, 0, s->mem_size);
     load_roms(s, cfg);

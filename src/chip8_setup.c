@@ -10,14 +10,14 @@
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
-    {"chip8", "Generic CHIP-8 interpreter (modern quirk mix, compatible with most ROMs)"},
+#include "generated/machines_chip8.inc"
 };
 static const GemuDevDesc cpus[] = {
     {"chip8", "CHIP-8 bytecode interpreter (TCG-accelerated)"},
 };
 static const GemuArgsDef def = {
     .prog       = "gemu",
-    .machines   = machines,  .n_machines = 1,
+    .machines   = machines,  .n_machines = (int)(sizeof machines / sizeof *machines),
     .cpus       = cpus,      .n_cpus     = 1,
     .vgas       = NULL,      .n_vgas     = 0,
     .display_mask = GEMU_DISP_F(GEMU_DISPLAY_SDL)

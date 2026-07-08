@@ -5,7 +5,7 @@
 
 /* ── PPM ─────────────────────────────────────────────────────────────────── */
 
-bool gemu_screendump_ppm(const char *path, const uint8_t *rgb, int w, int h) {
+static bool gemu_screendump_ppm(const char *path, const uint8_t *rgb, int w, int h) {
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "screendump: cannot open '%s'\n", path); return false; }
     fprintf(f, "P6\n%d %d\n255\n", w, h);
@@ -63,7 +63,7 @@ static void png_chunk(FILE *f, const char type[4],
     w32be(tmp, c ^ 0xFFFFFFFFu); fwrite(tmp, 1, 4, f);
 }
 
-bool gemu_screendump_png(const char *path, const uint8_t *rgb, int w, int h) {
+static bool gemu_screendump_png(const char *path, const uint8_t *rgb, int w, int h) {
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "screendump: cannot open '%s'\n", path); return false; }
 
@@ -138,4 +138,32 @@ bool gemu_screendump(const char *path, const uint8_t *rgb, int w, int h) {
     if (dot && strcmp(dot, ".png") == 0)
         return gemu_screendump_png(path, rgb, w, h);
     return gemu_screendump_ppm(path, rgb, w, h);
+}
+
+/* ── Framebuffer-format frontends ────────────────────────────────────────── */
+
+bool gemu_screendump_argb(const char *path, const uint32_t *argb, int w, int h) {
+    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
+    if (!rgb) return false;
+    for (int i = 0; i < w * h; i++) {
+        uint32_t c = argb[i];
+        rgb[i * 3 + 0] = (uint8_t)(c >> 16);
+        rgb[i * 3 + 1] = (uint8_t)(c >> 8);
+        rgb[i * 3 + 2] = (uint8_t)(c);
+    }
+    bool ok = gemu_screendump(path, rgb, w, h);
+    free(rgb);
+    return ok;
+}
+
+bool gemu_screendump_mono(const char *path, const uint8_t *pixels, int w, int h) {
+    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
+    if (!rgb) return false;
+    for (int i = 0; i < w * h; i++) {
+        uint8_t v = pixels[i] ? 0xFF : 0x00;
+        rgb[i*3+0] = v; rgb[i*3+1] = v; rgb[i*3+2] = v;
+    }
+    bool ok = gemu_screendump(path, rgb, w, h);
+    free(rgb);
+    return ok;
 }

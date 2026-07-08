@@ -56,6 +56,3 @@ bool input_menu_quit_requested(const InputMenu *menu);
 bool input_menu_reset_requested(const InputMenu *menu);
 void input_menu_clear_actions(InputMenu *menu);
 
-/* Translate a physical key to a button index (0..n_buttons-1) using current
- * bindings.  Returns -1 if the key is not bound. */
-int  input_menu_key_to_btn_index(const InputMenu *menu, SDL_Keycode key);

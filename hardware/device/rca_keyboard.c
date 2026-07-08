@@ -36,48 +36,7 @@ const char *rca_vip_keyboard_name(RcaKeyboardType keyboard) {
     }
 }
 
-int rca_vip_keypad_keycode_to_hex(SDL_Keycode sym) {
-    static const SDL_Keycode key_map[16] = {
-        SDLK_x, SDLK_1, SDLK_2, SDLK_3,
-        SDLK_q, SDLK_w, SDLK_e, SDLK_a,
-        SDLK_s, SDLK_d, SDLK_z, SDLK_c,
-        SDLK_4, SDLK_r, SDLK_f, SDLK_v,
-    };
-    for (int k = 0; k < 16; k++)
-        if (sym == key_map[k])
-            return k;
-    return -1;
-}
 
-int rca_vp601_sdl_key_to_ascii(SDL_Keycode sym, SDL_Keymod mod) {
-    bool shift = (mod & KMOD_SHIFT) != 0;
-
-    if (sym >= SDLK_a && sym <= SDLK_z)
-        return (int)('A' + (sym - SDLK_a));
-    if (sym >= SDLK_0 && sym <= SDLK_9) {
-        static const char shifted[] = ")!@#$%^&*(";
-        return shift ? shifted[sym - SDLK_0] : (int)('0' + (sym - SDLK_0));
-    }
-    if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) return '\r';
-    if (sym == SDLK_BACKSPACE) return '\b';
-    if (sym == SDLK_ESCAPE) return 0x1B;
-    if (sym == SDLK_SPACE) return ' ';
-
-    switch (sym) {
-    case SDLK_MINUS:        return shift ? '_' : '-';
-    case SDLK_EQUALS:       return shift ? '+' : '=';
-    case SDLK_LEFTBRACKET:  return shift ? '{' : '[';
-    case SDLK_RIGHTBRACKET: return shift ? '}' : ']';
-    case SDLK_BACKSLASH:    return shift ? '|' : '\\';
-    case SDLK_SEMICOLON:    return shift ? ':' : ';';
-    case SDLK_QUOTE:        return shift ? '"' : '\'';
-    case SDLK_COMMA:        return shift ? '<' : ',';
-    case SDLK_PERIOD:       return shift ? '>' : '.';
-    case SDLK_SLASH:        return shift ? '?' : '/';
-    default:                break;
-    }
-    return -1;
-}
 
 int rca_vp601_vnc_keysym_to_ascii(uint32_t sym) {
     if (sym >= 'a' && sym <= 'z') return (int)(sym - 32u);

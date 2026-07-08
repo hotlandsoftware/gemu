@@ -161,4 +161,3 @@ void       kim1_destroy(Kim1State *s);
 void       kim1_run    (Kim1State *s, const MosConfig *cfg);
 
 /* Render framebuffer: 7-segment digits + optional visual keypad + blink cursor. */
-void kim1_render_fb(Kim1State *s);

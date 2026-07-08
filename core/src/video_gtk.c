@@ -12,8 +12,6 @@ struct GemuVideoGtk {
     GtkWidget       *drawing_area;  /* kept for API compat */
     uint32_t        *frame_argb;    /* staging buffer — new pixels land here */
     bool             frame_dirty;   /* frame_argb has a frame not yet uploaded */
-    const uint32_t  *palette;
-    int              n_colors;
     int              width;
     int              height;
     int              scale;
@@ -261,8 +259,6 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
                                                 : v->width * v->scale;
     v->window_height = spec->window_height > 0 ? spec->window_height
                                                 : v->height * v->scale;
-    v->palette  = spec->palette;
-    v->n_colors = spec->n_colors;
 
     /* ARGB frame buffer for indexed/mono conversions */
     v->frame_argb = malloc((size_t)v->width * (size_t)v->height *
@@ -363,30 +359,6 @@ void gemu_video_gtk_present_argb(GemuVideoGtk *v, const uint32_t *pixels,
     gtk_gl_area_queue_render(GTK_GL_AREA(v->gl_area));
 }
 
-void gemu_video_gtk_present_indexed(GemuVideoGtk *v, const uint8_t *pixels,
-                                    int w, int h) {
-    if (!v || !pixels || w != v->width || h != v->height || !v->palette)
-        return;
-
-    /* Convert indexed → ARGB using palette, then copy rows via memcpy */
-    int total = w * h;
-    for (int i = 0; i < total; i++) {
-        uint8_t idx = pixels[i];
-        if (v->n_colors > 0 && idx >= v->n_colors)
-            idx = (uint8_t)(v->n_colors - 1);
-        v->frame_argb[i] = v->palette[idx];
-    }
-    gemu_video_gtk_present_argb(v, v->frame_argb, w, h);
-}
-
-void gemu_video_gtk_present_mono(GemuVideoGtk *v, const uint8_t *pixels,
-                                 int w, int h, uint32_t on, uint32_t off) {
-    if (!v || !pixels || w != v->width || h != v->height) return;
-    int total = w * h;
-    for (int i = 0; i < total; i++)
-        v->frame_argb[i] = pixels[i] ? on : off;
-    gemu_video_gtk_present_argb(v, v->frame_argb, w, h);
-}
 
 void gemu_video_gtk_poll(void) {
     while (gtk_events_pending())

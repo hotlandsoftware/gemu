@@ -2,6 +2,7 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "kim1.h"
+#include "gemu/util.h"
 #include "wozmon_rom.h"
 #ifdef GEMU_GTK
 #  include "../vga/hex_editor.h"
@@ -16,12 +17,7 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
-static inline void kim1_sleep_ms(unsigned ms) { Sleep(ms); }
 #else
-static inline void kim1_sleep_ms(unsigned ms) {
-    struct timespec ts = { (time_t)(ms / 1000u), (long)(ms % 1000u) * 1000000L };
-    nanosleep(&ts, NULL);
-}
 #endif
 
 static void kim1_reset_rriots(Kim1State *s);
@@ -909,7 +905,7 @@ static void kim1_panel_command(Kim1State *s, uint8_t key) {
 
 /* ── Framebuffer rendering ──────────────────────────────────────────────── */
 
-void kim1_render_fb(Kim1State *s) {
+static void kim1_render_fb(Kim1State *s) {
     uint32_t *fb = s->fb;
     int fw = KIM1_FB_WIDTH;
 
@@ -1548,7 +1544,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
         hex_editor_refresh(s->hex_editor);
 #endif
 
-        kim1_sleep_ms(KIM1_FRAME_MS);
+        gemu_sleep_ms(KIM1_FRAME_MS);
     }
 
     printf("gemu-kim1: %llu cycles, %llu instructions\n",

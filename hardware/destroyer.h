@@ -36,5 +36,4 @@ typedef struct RcaDestroyerState {
 
 RcaDestroyerState *rca_destroyer_create(const RcaConfig *cfg);
 void               rca_destroyer_destroy(RcaDestroyerState *s);
-void               rca_destroyer_reset(RcaDestroyerState *s, const RcaConfig *cfg);
 void               rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg);

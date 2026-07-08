@@ -2,6 +2,7 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "5clown.h"
+#include "gemu/util.h"
 #include "gemu/screendump.h"
 #include <SDL2/SDL.h>
 #include <errno.h>
@@ -9,14 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
-#  include <direct.h>
-#  define gemu_mkdir(p) _mkdir(p)
 #  define strcasecmp _stricmp
 #  define strncasecmp _strnicmp
 #else
 #  include <strings.h>
 #  include <sys/stat.h>
-#  define gemu_mkdir(p) mkdir((p), 0755)
 #endif
 
 /* ── Input action table ─────────────────────────────────────────────────── */
@@ -301,45 +299,11 @@ static void fiveclown_render(FiveClownState *s) {
 
 static bool fiveclown_screendump(void *ud, const char *path) {
     FiveClownState *s = ud;
-    int w = FIVECLOWN_FB_WIDTH, h = FIVECLOWN_FB_HEIGHT;
-    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
-    if (!rgb) return false;
-    for (int i = 0; i < w * h; i++) {
-        uint32_t c = s->pixels_argb[i];
-        rgb[i * 3 + 0] = (uint8_t)(c >> 16);
-        rgb[i * 3 + 1] = (uint8_t)(c >> 8);
-        rgb[i * 3 + 2] = (uint8_t)(c);
-    }
-    bool ok = gemu_screendump(path, rgb, w, h);
-    free(rgb);
-    return ok;
+    return gemu_screendump_argb(path, s->pixels_argb,
+                                FIVECLOWN_FB_WIDTH, FIVECLOWN_FB_HEIGHT);
 }
 
 /* ── NVRAM persistence ───────────────────────────────────────────────────── */
-
-static void fiveclown_build_sav_path(char *out, size_t len) {
-#ifdef _WIN32
-    const char *base = getenv("LOCALAPPDATA");
-    if (!base || !base[0]) base = getenv("APPDATA");
-    if (!base || !base[0]) base = "C:\\Users\\Default\\AppData\\Local";
-    snprintf(out, len, "%s\\gemu\\5clown.nvram", base);
-#else
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(out, len, "%s/.gemu/5clown.nvram", home);
-#endif
-}
-
-static void fiveclown_ensure_dir(const char *path) {
-    char dir[512];
-    snprintf(dir, sizeof(dir), "%s", path);
-    char *sep = strrchr(dir, '/');
-#ifdef _WIN32
-    char *sep2 = strrchr(dir, '\\');
-    if (sep2 > sep) sep = sep2;
-#endif
-    if (sep) { *sep = '\0'; gemu_mkdir(dir); }
-}
 
 static void fiveclown_nvram_load(FiveClownState *s) {
     FILE *f = fopen(s->sav_path, "rb");
@@ -350,7 +314,7 @@ static void fiveclown_nvram_load(FiveClownState *s) {
 }
 
 static void fiveclown_nvram_save(FiveClownState *s) {
-    fiveclown_ensure_dir(s->sav_path);
+    gemu_ensure_parent_dir(s->sav_path);
     FILE *f = fopen(s->sav_path, "wb");
     if (!f) { fprintf(stderr, "5clown: cannot write NVRAM '%s'\n", s->sav_path); return; }
     fwrite(s->nvram, 1, sizeof(s->nvram), f);
@@ -471,7 +435,7 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, fiveclown_screendump, s);
 
-    fiveclown_build_sav_path(s->sav_path, sizeof(s->sav_path));
+    gemu_config_path(s->sav_path, sizeof(s->sav_path), "5clown.nvram");
     fiveclown_nvram_load(s);
 
     if (cfg->vnc_addr) {

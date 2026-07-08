@@ -57,27 +57,3 @@ GemuTb *gemu_tb_insert(GemuTbCache *cache, uint32_t pc,
     cache->n_insns_total += n_insns;
     return tb;
 }
-
-void gemu_tb_invalidate_range(GemuTbCache *cache, uint32_t pc, uint32_t size) {
-    for (uint32_t i = 0; i < GEMU_TB_HASH_SIZE; i++) {
-        GemuTb **prev = &cache->buckets[i];
-        GemuTb  *tb   = *prev;
-        while (tb) {
-            uint32_t tb_end  = tb->guest_pc + tb->guest_size;
-            uint32_t inv_end = pc + size;
-            bool overlap = !(tb_end <= pc || tb->guest_pc >= inv_end);
-            if (overlap) {
-                *prev = tb->hash_next;
-                if (cache->free_insns && tb->insns)
-                    cache->free_insns(tb->insns);
-                cache->n_insns_total -= tb->n_insns;
-                cache->n_tbs--;
-                free(tb);
-                tb = *prev;
-            } else {
-                prev = &tb->hash_next;
-                tb   = tb->hash_next;
-            }
-        }
-    }
-}

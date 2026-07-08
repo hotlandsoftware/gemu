@@ -1,5 +1,9 @@
 #include "gemu/monitor.h"
 #include "gemu/vnc.h"
+
+static int  gemu_monitor_add_bp(GemuMonitor *mon, GemuBpType type, uint32_t addr);
+static bool gemu_monitor_del_bp(GemuMonitor *mon, int id);
+static void gemu_monitor_clear_bps(GemuMonitor *mon);
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1399,7 +1403,7 @@ void gemu_monitor_set_screendump_cb(GemuMonitor *mon,
 
 /* ── Breakpoints ─────────────────────────────────────────────────────────── */
 
-int gemu_monitor_add_bp(GemuMonitor *mon, GemuBpType type, uint32_t addr) {
+static int gemu_monitor_add_bp(GemuMonitor *mon, GemuBpType type, uint32_t addr) {
     if (!mon || mon->n_bps >= BP_MAX) return -1;
     MonBpEntry *e = &mon->bp_entries[mon->n_bps++];
     e->id   = ++mon->next_bp_id;
@@ -1410,7 +1414,7 @@ int gemu_monitor_add_bp(GemuMonitor *mon, GemuBpType type, uint32_t addr) {
     return e->id;
 }
 
-bool gemu_monitor_del_bp(GemuMonitor *mon, int id) {
+static bool gemu_monitor_del_bp(GemuMonitor *mon, int id) {
     if (!mon) return false;
     for (int i = 0; i < mon->n_bps; i++) {
         if (mon->bp_entries[i].id != id) continue;
@@ -1430,7 +1434,7 @@ bool gemu_monitor_del_bp(GemuMonitor *mon, int id) {
     return false;
 }
 
-void gemu_monitor_clear_bps(GemuMonitor *mon) {
+static void gemu_monitor_clear_bps(GemuMonitor *mon) {
     if (!mon) return;
     mon->n_bps       = 0;
     mon->has_exec_bp = false;

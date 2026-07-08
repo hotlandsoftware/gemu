@@ -2,6 +2,7 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "nes.h"
+#include "gemu/util.h"
 #include "fds.h"
 #include "romdb.h"
 #include "fds_hle.h"
@@ -16,13 +17,11 @@
 #include <ctype.h>
 #ifdef _WIN32
 #  include <direct.h>
-#  define gemu_mkdir(p)   _mkdir(p)
 #  define strcasecmp      _stricmp
 #  define strncasecmp     _strnicmp
 #else
 #  include <sys/stat.h>
 #  include <strings.h>
-#  define gemu_mkdir(p) mkdir((p), 0755)
 #endif
 #ifdef GEMU_GTK
 #  include <gtk/gtk.h>
@@ -280,40 +279,15 @@ static void nes_game_basename(const char *path, char *out, size_t len) {
 }
 
 static void nes_build_sav_path(const char *game, char *out, size_t len) {
-#ifdef _WIN32
-    const char *base = getenv("LOCALAPPDATA");
-    if (!base || !base[0]) base = getenv("APPDATA");
-    if (!base || !base[0]) base = "C:\\Users\\Default\\AppData\\Local";
-    snprintf(out, len, "%s\\gemu\\%s.sav", base, game);
-#else
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(out, len, "%s/.gemu/%s.sav", home, game);
-#endif
+    char file[300];
+    snprintf(file, sizeof(file), "%s.sav", game);
+    gemu_config_path(out, len, file);
 }
 
 static void nes_build_fds_sav_path(const char *game, char *out, size_t len) {
-#ifdef _WIN32
-    const char *base = getenv("LOCALAPPDATA");
-    if (!base || !base[0]) base = getenv("APPDATA");
-    if (!base || !base[0]) base = "C:\\Users\\Default\\AppData\\Local";
-    snprintf(out, len, "%s\\gemu\\%s.fds.sav", base, game);
-#else
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(out, len, "%s/.gemu/%s.fds.sav", home, game);
-#endif
-}
-
-static void nes_ensure_sav_dir(const char *sav_path) {
-    char dir[512];
-    snprintf(dir, sizeof(dir), "%s", sav_path);
-    char *sep = strrchr(dir, '/');
-#ifdef _WIN32
-    char *sep2 = strrchr(dir, '\\');
-    if (sep2 > sep) sep = sep2;
-#endif
-    if (sep) { *sep = '\0'; gemu_mkdir(dir); }
+    char file[300];
+    snprintf(file, sizeof(file), "%s.fds.sav", game);
+    gemu_config_path(out, len, file);
 }
 
 static bool nes_battery_prompt(void) {
@@ -359,7 +333,7 @@ static void nes_sav_load(NesState *s) {
 
 static void nes_sav_save(NesState *s) {
     if (!s->battery_autosave || !s->sav_path[0]) return;
-    nes_ensure_sav_dir(s->sav_path);
+    gemu_ensure_parent_dir(s->sav_path);
     FILE *f = fopen(s->sav_path, "wb");
     if (!f) { fprintf(stderr, "nes: cannot write save '%s'\n", s->sav_path); return; }
     fwrite(s->prg_ram, 1, sizeof(s->prg_ram), f);
@@ -370,7 +344,7 @@ static void nes_sav_save(NesState *s) {
 static void nes_fds_save(NesState *s) {
     if (!s->fds_enabled || !s->fds.dirty || !s->sav_path[0])
         return;
-    nes_ensure_sav_dir(s->sav_path);
+    gemu_ensure_parent_dir(s->sav_path);
     if (!fds_disk_save(&s->fds, s->sav_path))
         fprintf(stderr, "fds: cannot write save '%s'\n", s->sav_path);
 }

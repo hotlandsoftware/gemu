@@ -2,19 +2,17 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "magicfly.h"
+#include "gemu/util.h"
 #include "gemu/screendump.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
-#  include <direct.h>
-#  define gemu_mkdir(p) _mkdir(p)
 #  define strncasecmp _strnicmp
 #else
 #  include <strings.h>
 #  include <sys/stat.h>
-#  define gemu_mkdir(p) mkdir((p), 0755)
 #endif
 
 /* ── Input action tables (per game — different games, different controls) ── */
@@ -305,44 +303,16 @@ static void magicfly_handle_keys(MagicflyState *s, uint32_t held) {
 
 static bool magicfly_screendump(void *ud, const char *path) {
     MagicflyState *s = ud;
-    int w = MAGICFLY_FB_WIDTH, h = MAGICFLY_FB_HEIGHT;
-    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
-    if (!rgb) return false;
-    for (int i = 0; i < w * h; i++) {
-        uint32_t c = s->pixels_argb[i];
-        rgb[i * 3 + 0] = (uint8_t)(c >> 16);
-        rgb[i * 3 + 1] = (uint8_t)(c >> 8);
-        rgb[i * 3 + 2] = (uint8_t)(c);
-    }
-    bool ok = gemu_screendump(path, rgb, w, h);
-    free(rgb);
-    return ok;
+    return gemu_screendump_argb(path, s->pixels_argb,
+                                MAGICFLY_FB_WIDTH, MAGICFLY_FB_HEIGHT);
 }
 
 /* ── NVRAM persistence ───────────────────────────────────────────────────── */
 
 static void magicfly_build_sav_path(char *out, size_t len, const char *name) {
-#ifdef _WIN32
-    const char *base = getenv("LOCALAPPDATA");
-    if (!base || !base[0]) base = getenv("APPDATA");
-    if (!base || !base[0]) base = "C:\\Users\\Default\\AppData\\Local";
-    snprintf(out, len, "%s\\gemu\\%s.nvram", base, name);
-#else
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(out, len, "%s/.gemu/%s.nvram", home, name);
-#endif
-}
-
-static void magicfly_ensure_dir(const char *path) {
-    char dir[512];
-    snprintf(dir, sizeof(dir), "%s", path);
-    char *sep = strrchr(dir, '/');
-#ifdef _WIN32
-    char *sep2 = strrchr(dir, '\\');
-    if (sep2 > sep) sep = sep2;
-#endif
-    if (sep) { *sep = '\0'; gemu_mkdir(dir); }
+    char file[64];
+    snprintf(file, sizeof(file), "%s.nvram", name);
+    gemu_config_path(out, len, file);
 }
 
 static void magicfly_nvram_load(MagicflyState *s) {
@@ -354,7 +324,7 @@ static void magicfly_nvram_load(MagicflyState *s) {
 }
 
 static void magicfly_nvram_save(MagicflyState *s) {
-    magicfly_ensure_dir(s->sav_path);
+    gemu_ensure_parent_dir(s->sav_path);
     FILE *f = fopen(s->sav_path, "wb");
     if (!f) { fprintf(stderr, "magicfly: cannot write NVRAM '%s'\n", s->sav_path); return; }
     fwrite(s->nvram, 1, sizeof(s->nvram), f);

@@ -114,13 +114,11 @@ typedef struct Chip8Config {
 
 /* ── CPU/machine API ──────────────────────────────────────────────────────── */
 /* cpu.c */
-Chip8Insn chip8_decode(uint16_t opcode);
 GemuTb   *chip8_translate_block(Chip8State *s, uint16_t pc);
 void      chip8_execute_tb(Chip8State *s, GemuTb *tb);
 void      chip8_exec_single(Chip8State *s); /* monitor step */
 
 /* machine.c */
 Chip8State *chip8_machine_create(const Chip8Config *cfg);
-void        chip8_machine_reset(Chip8State *s, const Chip8Config *cfg);
 void        chip8_machine_run(Chip8State *s, const Chip8Config *cfg);
 void        chip8_machine_destroy(Chip8State *s);

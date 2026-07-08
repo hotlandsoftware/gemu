@@ -598,7 +598,7 @@ static void do_csi_final(Vt100State *t, uint8_t ch) {
 
 /* ── Main character processor ────────────────────────────────────────────── */
 
-void vt100_write(Vt100State *t, uint8_t ch) {
+static void vt100_write(Vt100State *t, uint8_t ch) {
     if (!t) return;
 
     switch (t->state) {
@@ -978,7 +978,7 @@ static void process_keydown(Vt100State *t, SDL_KeyboardEvent *ev) {
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-void vt100_poll(Vt100State *t) {
+static void vt100_poll(Vt100State *t) {
     if (!t) return;
 
     /*
@@ -1052,23 +1052,23 @@ void vt100_poll(Vt100State *t) {
     vt100_render(t);
 }
 
-bool vt100_key_available(Vt100State *t) {
+static bool vt100_key_available(Vt100State *t) {
     if (!t) return false;
     return t->key_head != t->key_tail;
 }
 
-uint8_t vt100_read_key(Vt100State *t) {
+static uint8_t vt100_read_key(Vt100State *t) {
     if (!t || t->key_head == t->key_tail) return 0;
     uint8_t ch = t->key_buf[t->key_tail];
     t->key_tail = (t->key_tail + 1) & (KEY_BUF_SIZE - 1);
     return ch;
 }
 
-bool vt100_should_quit(Vt100State *t) {
+static bool vt100_should_quit(Vt100State *t) {
     return t ? t->should_quit : true;
 }
 
-uint32_t vt100_pop_fwd_key(Vt100State *t) {
+static uint32_t vt100_pop_fwd_key(Vt100State *t) {
     if (!t || t->fwd_head == t->fwd_tail) return 0;
     uint8_t ch = t->fwd_buf[t->fwd_tail];
     t->fwd_tail = (t->fwd_tail + 1) & (KEY_BUF_SIZE - 1);
@@ -1110,8 +1110,8 @@ Vt100State *vt100_create(GemuDisplayType dtype, const char *title) {
 
     /* Load font from embedded data */
     SDL_RWops *rw = SDL_RWFromConstMem(
-        _home_admin_jemu_Reference_Hack_VT100_Regular_ttf,
-        (int)_home_admin_jemu_Reference_Hack_VT100_Regular_ttf_len);
+        vt100_font_ttf,
+        (int)vt100_font_ttf_len);
     if (!rw) {
         fprintf(stderr, "vt100: SDL_RWFromConstMem failed\n");
         free(t); TTF_Quit(); return NULL;
@@ -1315,7 +1315,7 @@ void vt100_destroy(Vt100State *t)
     free(t);
 }
 
-void vt100_write(Vt100State *t, uint8_t ch)
+static void vt100_write(Vt100State *t, uint8_t ch)
 {
 #ifndef _WIN32
     if (t->master_fd >= 0) { (void)write(t->master_fd, &ch, 1); return; }
@@ -1323,7 +1323,7 @@ void vt100_write(Vt100State *t, uint8_t ch)
     fputc((int)ch, stdout); fflush(stdout);
 }
 
-void vt100_poll(Vt100State *t)
+static void vt100_poll(Vt100State *t)
 {
 #ifndef _WIN32
     int fd = (t->master_fd >= 0) ? t->master_fd : STDIN_FILENO;
@@ -1335,9 +1335,9 @@ void vt100_poll(Vt100State *t)
 #endif
 }
 
-bool vt100_key_available(Vt100State *t) { return t->khead != t->ktail; }
+static bool vt100_key_available(Vt100State *t) { return t->khead != t->ktail; }
 
-uint8_t vt100_read_key(Vt100State *t)
+static uint8_t vt100_read_key(Vt100State *t)
 {
     if (!vt100_key_available(t)) return 0;
     uint8_t ch = t->kbuf[t->ktail];
@@ -1345,7 +1345,7 @@ uint8_t vt100_read_key(Vt100State *t)
     return ch;
 }
 
-bool vt100_should_quit(Vt100State *t)
+static bool vt100_should_quit(Vt100State *t)
 {
 #ifndef _WIN32
     if (t->master_fd >= 0 && t->xterm_pid > 0) {
@@ -1358,7 +1358,7 @@ bool vt100_should_quit(Vt100State *t)
     return t->quit;
 }
 
-uint32_t vt100_pop_fwd_key(Vt100State *t) { (void)t; return 0; }
+static uint32_t vt100_pop_fwd_key(Vt100State *t) { (void)t; return 0; }
 
 #endif /* HAVE_TTF */
 

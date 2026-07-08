@@ -1,24 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gemu_display_priv.h"
+#include "gemu/util.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
 /* ── INI reader ──────────────────────────────────────────────────────────── */
-
-static void ini_path(char *out, size_t len) {
-#ifdef _WIN32
-    const char *base = getenv("LOCALAPPDATA");
-    if (!base || !*base) base = getenv("APPDATA");
-    if (!base || !*base) base = "C:\\Users\\Default\\AppData\\Local";
-    snprintf(out, len, "%s\\gemu\\gemu.ini", base);
-#else
-    const char *home = getenv("HOME");
-    if (!home || !*home) home = "/tmp";
-    snprintf(out, len, "%s/.gemu/gemu.ini", home);
-#endif
-}
 
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -32,7 +20,7 @@ static char *trim(char *s) {
 bool gemu_ini_read(const char *section, const char *key,
                    char *buf, int bufsz) {
     char path[512];
-    ini_path(path, sizeof(path));
+    gemu_config_path(path, sizeof(path), "gemu.ini");
     FILE *f = fopen(path, "r");
     if (!f) return false;
 
@@ -144,9 +132,6 @@ bool gemu_display_is_key_held(GemuDisplay *d, const char *name) {
     return d->do_is_key_held(d, name);
 }
 
-void gemu_display_open_rebind_menu(GemuDisplay *d) {
-    if (d && d->do_open_rebind) d->do_open_rebind(d);
-}
 
 void gemu_display_reset_input_bindings(GemuDisplay *d) {
     if (d && d->do_reset_input_bindings) d->do_reset_input_bindings(d);

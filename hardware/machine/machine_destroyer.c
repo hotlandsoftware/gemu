@@ -2,6 +2,7 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "destroyer.h"
+#include "gemu/util.h"
 #include "pcspk.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
@@ -14,13 +15,8 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
-static inline void destroyer_sleep_ms(unsigned ms) { Sleep(ms); }
 #else
 #  include <time.h>
-static inline void destroyer_sleep_ms(unsigned ms) {
-    struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-}
 #endif
 
 #define DESTROYER_N_ACTIONS 8
@@ -410,16 +406,8 @@ static bool destroyer_screendump(void *ud, const char *path) {
     RcaDestroyerState *s = ud;
     const uint8_t *buf = (s->cfg->vga == RCA_VGA_CDP1869)
                          ? s->rotated_bitmap : s->vis.bitmap;
-    int w = CDP1869_VISIBLE_W, h = CDP1869_VISIBLE_H;
-    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
-    if (!rgb) return false;
-    for (int i = 0; i < w * h; i++) {
-        uint8_t v = buf[i] ? 0xFF : 0x00;
-        rgb[i*3+0] = v; rgb[i*3+1] = v; rgb[i*3+2] = v;
-    }
-    bool ok = gemu_screendump(path, rgb, w, h);
-    free(rgb);
-    return ok;
+    return gemu_screendump_mono(path, buf,
+                                CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
 }
 
 RcaDestroyerState *rca_destroyer_create(const RcaConfig *cfg) {
@@ -475,7 +463,7 @@ RcaDestroyerState *rca_destroyer_create(const RcaConfig *cfg) {
     return s;
 }
 
-void rca_destroyer_reset(RcaDestroyerState *s, const RcaConfig *cfg) {
+static void rca_destroyer_reset(RcaDestroyerState *s, const RcaConfig *cfg) {
     memset(s->mem + 0x2000, 0, 0x100);
     cdp1802_reset(&s->cpu);
     cdp1869_reset(&s->vis);
@@ -637,7 +625,7 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
 
         if (s->coin1_latch > 0) s->coin1_latch--;
         if (s->coin2_latch > 0) s->coin2_latch--;
-        destroyer_sleep_ms(frame_ms);
+        gemu_sleep_ms(frame_ms);
     }
 
     printf("gemu-rca: %llu machine cycles, %llu instructions\n",

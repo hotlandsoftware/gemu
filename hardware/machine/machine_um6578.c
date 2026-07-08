@@ -626,18 +626,8 @@ static void um6578_handle_keys(Um6578State *s, uint32_t held) {
 
 static bool um6578_screendump(void *ud, const char *path) {
     Um6578State *s = ud;
-    int w = SH6578_WIDTH, h = SH6578_HEIGHT;
-    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
-    if (!rgb) return false;
-    for (int i = 0; i < w * h; i++) {
-        uint32_t c = s->ppu.pixels_argb[i];
-        rgb[i * 3 + 0] = (uint8_t)(c >> 16);
-        rgb[i * 3 + 1] = (uint8_t)(c >> 8);
-        rgb[i * 3 + 2] = (uint8_t)(c);
-    }
-    bool ok = gemu_screendump(path, rgb, w, h);
-    free(rgb);
-    return ok;
+    return gemu_screendump_argb(path, s->ppu.pixels_argb,
+                                SH6578_WIDTH, SH6578_HEIGHT);
 }
 
 static bool parse_int_token(const char **p, int *out) {

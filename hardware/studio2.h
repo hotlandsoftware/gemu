@@ -43,6 +43,5 @@ typedef struct RcaStudio2State {
 } RcaStudio2State;
 
 RcaStudio2State *rca_studio2_create(const RcaConfig *cfg);
-void             rca_studio2_reset(RcaStudio2State *s, const RcaConfig *cfg);
 void             rca_studio2_destroy(RcaStudio2State *s);
 void             rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg);

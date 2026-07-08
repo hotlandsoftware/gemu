@@ -6,7 +6,7 @@
 
 /* ── Decoder ──────────────────────────────────────────────────────────────── */
 
-Chip8Insn chip8_decode(uint16_t op) {
+static Chip8Insn chip8_decode(uint16_t op) {
     Chip8Insn ins = {
         .x   = (op >> 8) & 0xF,
         .y   = (op >> 4) & 0xF,

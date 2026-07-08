@@ -42,4 +42,3 @@ void    gemu_tb_cache_flush(GemuTbCache *cache);
 GemuTb *gemu_tb_lookup(const GemuTbCache *cache, uint32_t pc);
 GemuTb *gemu_tb_insert(GemuTbCache *cache, uint32_t pc,
                        uint32_t guest_size, uint32_t n_insns, void *insns);
-void    gemu_tb_invalidate_range(GemuTbCache *cache, uint32_t pc, uint32_t size);

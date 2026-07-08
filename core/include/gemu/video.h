@@ -13,8 +13,6 @@ typedef struct {
     int               height;
     int               window_width;
     int               window_height;
-    const uint32_t   *palette;
-    int               n_colors;
     GemuRendererType  renderer;
     const char       *log_prefix;
 } GemuVideoSdlSpec;
@@ -24,13 +22,6 @@ void          gemu_video_sdl_destroy(GemuVideoSdl *v);
 
 void gemu_video_sdl_present_argb(GemuVideoSdl *v, const uint32_t *pixels,
                                  int w, int h);
-void gemu_video_sdl_present_indexed(GemuVideoSdl *v, const uint8_t *pixels,
-                                    int w, int h);
-void gemu_video_sdl_present_mono(GemuVideoSdl *v, const uint8_t *pixels,
-                                 int w, int h, uint32_t on, uint32_t off);
-void gemu_video_sdl_clear(GemuVideoSdl *v);
-
-bool gemu_video_sdl_is_software(const GemuVideoSdl *v);
 void gemu_video_sdl_mouse_logical(GemuVideoSdl *v, int *x, int *y);
 /* Snap window to nearest integer scale on resize (no-op for fixed-size windows). */
 void gemu_video_sdl_snap_resize(GemuVideoSdl *v, int new_w, int new_h);
@@ -57,8 +48,6 @@ typedef struct {
     int             scale;
     int             window_width;
     int             window_height;
-    const uint32_t *palette;
-    int             n_colors;
     GemuMonitor    *monitor;
     void          (*hex_toggle_cb)(void *);  /* optional: Debug > Hex Editor */
     void           *hex_toggle_ud;
@@ -69,10 +58,6 @@ void          gemu_video_gtk_destroy(GemuVideoGtk *v);
 
 void gemu_video_gtk_present_argb(GemuVideoGtk *v, const uint32_t *pixels,
                                  int w, int h);
-void gemu_video_gtk_present_indexed(GemuVideoGtk *v, const uint8_t *pixels,
-                                    int w, int h);
-void gemu_video_gtk_present_mono(GemuVideoGtk *v, const uint8_t *pixels,
-                                 int w, int h, uint32_t on, uint32_t off);
 void gemu_video_gtk_poll(void);
 
 GtkWidget *gemu_video_gtk_window(GemuVideoGtk *v);

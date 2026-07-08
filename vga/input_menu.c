@@ -3,13 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#ifdef _WIN32
-#  include <direct.h>
-#  define gemu_mkdir(p) _mkdir(p)
-#else
-#  include <sys/stat.h>
-#  define gemu_mkdir(p) mkdir((p), 0755)
-#endif
+#include "gemu/util.h"
 
 /* ── 6×8 bitmap font (ASCII 32–122, 91 glyphs, 6 bytes each) ─────────── */
 /* Each byte is one column, LSB top.  0 = background, 1 = foreground. */
@@ -119,27 +113,7 @@ const uint8_t *gemu_font_glyph(char ch) {
 /* ── INI path ──────────────────────────────────────────────────────────── */
 
 static void build_ini_path(char *out, size_t len) {
-#ifdef _WIN32
-    const char *base = getenv("LOCALAPPDATA");
-    if (!base || !base[0]) base = getenv("APPDATA");
-    if (!base || !base[0]) base = "C:\\Users\\Default\\AppData\\Local";
-    snprintf(out, len, "%s\\gemu\\gemu.ini", base);
-#else
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(out, len, "%s/.gemu/gemu.ini", home);
-#endif
-}
-
-static void ensure_ini_dir(const char *ini_path) {
-    char dir[512];
-    snprintf(dir, sizeof(dir), "%s", ini_path);
-    char *sep = strrchr(dir, '/');
-#ifdef _WIN32
-    char *sep2 = strrchr(dir, '\\');
-    if (sep2 > sep) sep = sep2;
-#endif
-    if (sep) { *sep = '\0'; gemu_mkdir(dir); }
+    gemu_config_path(out, len, "gemu.ini");
 }
 
 /* ── Menu state ─────────────────────────────────────────────────────────── */
@@ -518,7 +492,7 @@ static void save_section(const InputMenu *m, const char *section,
                          void (*write_section)(FILE *, const InputMenu *)) {
     char path[512];
     build_ini_path(path, sizeof(path));
-    ensure_ini_dir(path);
+    gemu_ensure_parent_dir(path);
 
     char *existing = NULL;
     long existing_len = 0;
@@ -1298,10 +1272,3 @@ void input_menu_clear_actions(InputMenu *m) {
     }
 }
 
-int input_menu_key_to_btn_index(const InputMenu *m, SDL_Keycode key) {
-    if (!m) return -1;
-    for (int i = 0; i < m->n_buttons; i++)
-        if (key == m->key_bindings[i].key)
-            return i;
-    return -1;
-}

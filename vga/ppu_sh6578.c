@@ -3,6 +3,8 @@
 
 #include <string.h>
 
+static void ppu_sh6578_reset(Sh6578Ppu *ppu);
+
 void ppu_sh6578_init(Sh6578Ppu *ppu, double cpu_clock_hz, double refresh_hz, int lines_total, int vblank_line) {
     memset(ppu, 0, sizeof(*ppu));
     ppu->lines_total          = lines_total;
@@ -11,7 +13,7 @@ void ppu_sh6578_init(Sh6578Ppu *ppu, double cpu_clock_hz, double refresh_hz, int
     ppu_sh6578_reset(ppu);
 }
 
-void ppu_sh6578_reset(Sh6578Ppu *ppu) {
+static void ppu_sh6578_reset(Sh6578Ppu *ppu) {
     ppu->v = ppu->t = 0;
     ppu->x = 0;
     ppu->w = false;

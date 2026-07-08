@@ -9,9 +9,6 @@ struct GemuVideoSdl {
     SDL_Window     *window;
     SDL_Renderer   *renderer;
     SDL_Texture    *texture;
-    uint32_t       *frame_argb;
-    const uint32_t *palette;
-    int             n_colors;
     int             width;
     int             height;
     bool            software;
@@ -20,12 +17,13 @@ struct GemuVideoSdl {
     void           *overlay_ud;
 };
 
+static void gemu_video_sdl_clear(GemuVideoSdl *v);
+
 static void video_sdl_free(GemuVideoSdl *v) {
     if (!v) return;
     if (v->texture)  SDL_DestroyTexture(v->texture);
     if (v->renderer) SDL_DestroyRenderer(v->renderer);
     if (v->window)   SDL_DestroyWindow(v->window);
-    free(v->frame_argb);
     free(v);
 }
 
@@ -41,12 +39,6 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
 
     v->width    = spec->width;
     v->height   = spec->height;
-    v->palette  = spec->palette;
-    v->n_colors = spec->n_colors;
-
-    v->frame_argb = malloc((size_t)v->width * (size_t)v->height *
-                           sizeof(*v->frame_argb));
-    if (!v->frame_argb) goto fail;
 
     /* Windows with an explicit fixed size (e.g. KIM-1 keypad) are not
      * resizable.  Scale-based windows (window_width == 0) are resizable and
@@ -145,37 +137,13 @@ void gemu_video_sdl_present_argb(GemuVideoSdl *v, const uint32_t *pixels,
     SDL_RenderPresent(v->renderer);
 }
 
-void gemu_video_sdl_present_indexed(GemuVideoSdl *v, const uint8_t *pixels,
-                                    int w, int h) {
-    if (!v || !pixels || w != v->width || h != v->height || !v->palette)
-        return;
-    for (int i = 0; i < w * h; i++) {
-        uint8_t idx = pixels[i];
-        if (v->n_colors > 0 && idx >= v->n_colors)
-            idx = (uint8_t)(v->n_colors - 1);
-        v->frame_argb[i] = v->palette[idx];
-    }
-    gemu_video_sdl_present_argb(v, v->frame_argb, w, h);
-}
-
-void gemu_video_sdl_present_mono(GemuVideoSdl *v, const uint8_t *pixels,
-                                 int w, int h, uint32_t on, uint32_t off) {
-    if (!v || !pixels || w != v->width || h != v->height) return;
-    for (int i = 0; i < w * h; i++)
-        v->frame_argb[i] = pixels[i] ? on : off;
-    gemu_video_sdl_present_argb(v, v->frame_argb, w, h);
-}
-
-void gemu_video_sdl_clear(GemuVideoSdl *v) {
+static void gemu_video_sdl_clear(GemuVideoSdl *v) {
     if (!v) return;
     SDL_SetRenderDrawColor(v->renderer, 0, 0, 0, 255);
     SDL_RenderClear(v->renderer);
     SDL_RenderPresent(v->renderer);
 }
 
-bool gemu_video_sdl_is_software(const GemuVideoSdl *v) {
-    return v && v->software;
-}
 
 void gemu_video_sdl_mouse_logical(GemuVideoSdl *v, int *x, int *y) {
     if (!v) { if (x) *x = -1; if (y) *y = -1; return; }

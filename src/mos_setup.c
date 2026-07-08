@@ -38,19 +38,7 @@ static const MachineDef machine_defs[] = {
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
-    {"5clown",  "Five Clown"},
-    {"magicfly", "Magic Fly"},
-    {"7mezzo",  "7 e Mezzo"},
-    {"um6578",  "UM6578/SH6578/NT6578 NES-clone"},
-    {"apple1",  "Apple I (MOS 6502, keyboard/display terminal)"},
-    {"dendy",   "Dendy NES Famiclone (PAL 50 Hz, NTSC-compatible PPU/APU timing)"},
-    {"vssmb",       "VS. Super Mario Bros. (coin-op arcade cabinet, DIP switches)"},
-    {"vsskatekids", "VS. Skate Kid Bros. (arcade hack of VS. SMB)"},
-    {"famicom", "Nintendo Family Computer (Ricoh 2A03 + RP2C02, alias for nes)"},
-    {"kim1",    "MOS KIM-1 single-board computer (6502, 1 KB RAM, 2x 6530 RRIOT)"},
-    {"mos",     "Generic MOS-compatible machine (flat 64 KB, ROM at user-specified address)"},
-    {"nes",     "Nintendo Entertainment System (Ricoh 2A03 + RP2C02, NTSC)"},
-    {"nespal",  "Nintendo Entertainment System (Ricoh 2A07 + RP2C02, PAL)"},
+#include "generated/machines_mos.inc"
 };
 static const GemuDevDesc cpus[] = {
     {"6501", "MOS Technology 6501"},
@@ -467,14 +455,8 @@ int mos_setup(int argc, char *argv[]) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cg requires an argument\n"); return 1; }
             const char *name = rem[++i];
             if (strcmp(name, "?") == 0) {
-                printf("Available character generators:\n");
-                int maxw = 0;
-                for (int c = 0; c < (int)GEMU_ARRAY_LEN(chargens); c++) {
-                    int w = (int)strlen(chargens[c].name);
-                    if (w > maxw) maxw = w;
-                }
-                for (int c = 0; c < (int)GEMU_ARRAY_LEN(chargens); c++)
-                    printf("  %-*s  %s\n", maxw, chargens[c].name, chargens[c].desc);
+                gemu_print_table("Available character generators",
+                                 chargens, (int)GEMU_ARRAY_LEN(chargens));
                 SDL_Quit(); return 0;
             }
             if (!parse_cg(name, &cfg.char_gen)) {
@@ -503,17 +485,11 @@ int mos_setup(int argc, char *argv[]) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -device requires an argument\n"); return 1; }
             const char *name = rem[++i];
             if (strcmp(name, "?") == 0) {
-                static const struct { const char *name; const char *desc; const char *machines; } devs[] = {
+                static const GemuDevDesc3 devs[] = {
 #include "generated/devices.inc"
                 };
-                int maxw = 0;
-                for (int d = 0; d < (int)(sizeof(devs)/sizeof(devs[0])); d++) {
-                    int w = (int)strlen(devs[d].name);
-                    if (w > maxw) maxw = w;
-                }
-                printf("Available devices:\n");
-                for (int d = 0; d < (int)(sizeof(devs)/sizeof(devs[0])); d++)
-                    printf("  %-*s  %s\n", maxw, devs[d].name, devs[d].desc);
+                gemu_print_table3("Available devices", devs,
+                                  (int)(sizeof devs / sizeof *devs));
                 SDL_Quit(); return 0;
             }
             if (!attach_device(&cfg, &want_vt100, name, false)) return 1;

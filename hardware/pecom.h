@@ -78,6 +78,5 @@ typedef struct RcaPecom32State {
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
 RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg);
-void             rca_pecom32_reset(RcaPecom32State *s, const RcaConfig *cfg);
 void             rca_pecom32_destroy(RcaPecom32State *s);
 void             rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg);

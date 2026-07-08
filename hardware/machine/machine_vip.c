@@ -2,6 +2,7 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "vip.h"
+#include "gemu/util.h"
 #include "rca_keyboard.h"
 #include "gemu/gemu.h"
 #include "gemu/memory.h"
@@ -16,13 +17,10 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
-static inline void vip_sleep_ms(unsigned ms) { Sleep(ms); }
 #else
-static inline void vip_sleep_ms(unsigned ms) {
-    struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-}
 #endif
+
+static void rca_vip_reset(RcaVipState *s, const RcaConfig *cfg);
 
 static RcaVipState *crash_state;
 
@@ -78,8 +76,8 @@ static void vip_dump_state(const RcaVipState *s, const char *reason) {
                 i + 2, c->R[i + 2], i + 3, c->R[i + 3]);
     }
 
-    fprintf(stderr, "pending: dma_in=%d dma_out=%d irq=%d dma_count=%u dma_head=%u\n",
-            c->dma_in_pending, c->dma_out_pending, c->irq_pending,
+    fprintf(stderr, "pending: dma_out=%d irq=%d dma_count=%u dma_head=%u\n",
+            c->dma_out_pending, c->irq_pending,
             c->dma_count, c->dma_head);
     fprintf(stderr, "pixie: display_on=%d line=%u mcycle=%u display_addr=%u int_fired=%d draw=%d vram_on=%u\n",
             s->vdc.display_on, s->vdc.line_counter, s->vdc.mcycle,
@@ -397,15 +395,7 @@ static bool vip_screendump(void *ud, const char *path) {
     } else {
         buf = s->vram;       w = CDP1861_DISPLAY_W; h = CDP1861_DISPLAY_H;
     }
-    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
-    if (!rgb) return false;
-    for (int i = 0; i < w * h; i++) {
-        uint8_t v = buf[i] ? 0xFF : 0x00;
-        rgb[i*3+0] = v; rgb[i*3+1] = v; rgb[i*3+2] = v;
-    }
-    bool ok = gemu_screendump(path, rgb, w, h);
-    free(rgb);
-    return ok;
+    return gemu_screendump_mono(path, buf, w, h);
 }
 
 RcaVipState *rca_vip_create(const RcaConfig *cfg) {
@@ -483,7 +473,7 @@ RcaVipState *rca_vip_create(const RcaConfig *cfg) {
     return s;
 }
 
-void rca_vip_reset(RcaVipState *s, const RcaConfig *cfg) {
+static void rca_vip_reset(RcaVipState *s, const RcaConfig *cfg) {
     cdp1802_reset(&s->cpu);
     rca_pcspk_set_gate(s->speaker, 0);
     cdp1861_reset(&s->vdc);
@@ -599,7 +589,7 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
         if (quit) break;
         gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));
 
-        if (gemu_monitor_is_paused(s->monitor)) { vip_sleep_ms(frame_ms); continue; }
+        if (gemu_monitor_is_paused(s->monitor)) { gemu_sleep_ms(frame_ms); continue; }
 
         /* ── Execute one frame worth of machine cycles ── */
         for (int i = 0; i < mcycles_per_frame; i++) {
@@ -631,7 +621,7 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
             }
         }
 
-        vip_sleep_ms(frame_ms);
+        gemu_sleep_ms(frame_ms);
     }
 
     printf("gemu-rca: %llu machine cycles, %llu instructions\n",

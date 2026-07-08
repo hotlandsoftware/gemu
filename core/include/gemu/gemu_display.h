@@ -192,13 +192,7 @@ uint32_t gemu_display_pop_raw_key(GemuDisplay *d);
  */
 bool gemu_display_is_key_held(GemuDisplay *d, const char *key_name);
 
-/* ── Key-rebinding overlay (SDL only) ────────────────────────────────────── */
+/* ── Input bindings ────────────────────────────────────── */
 
-/*
- * Opens the in-game key-rebinding overlay (wraps the existing InputMenu).
- * No-op on non-SDL backends.  On return, gemu.ini has been written.
- * The display's key map is reloaded from the updated INI automatically.
- */
-void gemu_display_open_rebind_menu(GemuDisplay *d);
 void gemu_display_reset_input_bindings(GemuDisplay *d);
 void gemu_display_reset_input_bindings_ud(void *d);

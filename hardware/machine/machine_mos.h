@@ -61,6 +61,5 @@ typedef struct MosGenericState {
 } MosGenericState;
 
 MosGenericState *mos_generic_create (const MosConfig *cfg);
-void             mos_generic_reset  (MosGenericState *s, const MosConfig *cfg);
 void             mos_generic_destroy(MosGenericState *s);
 void             mos_generic_run    (MosGenericState *s, const MosConfig *cfg);

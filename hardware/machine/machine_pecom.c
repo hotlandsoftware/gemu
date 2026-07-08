@@ -2,6 +2,7 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "pecom.h"
+#include "gemu/util.h"
 #include "gemu/gemu.h"
 #include "gemu/gemu_display.h"
 #include "gemu/memory.h"
@@ -12,15 +13,6 @@
 #if defined(_WIN32)
 #  include <windows.h>
 #endif
-
-static void pecom_sleep_ms(unsigned ms) {
-#if defined(_WIN32)
-    Sleep(ms);
-#else
-    struct timespec ts = { (time_t)(ms / 1000u), (long)(ms % 1000u) * 1000000L };
-    nanosleep(&ts, NULL);
-#endif
-}
 
 /* ── Palette ─────────────────────────────────────────────────────────────── */
 
@@ -343,7 +335,7 @@ RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg) {
     return s;
 }
 
-void rca_pecom32_reset(RcaPecom32State *s, const RcaConfig *cfg) {
+static void rca_pecom32_reset(RcaPecom32State *s, const RcaConfig *cfg) {
     cdp1802_reset(&s->cpu);
     cdp1869_reset(&s->vis);
     cdp1869_set_page_ram_mask(&s->vis, 0x3FFu);
@@ -544,7 +536,7 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
             (t1.tv_sec  - t0.tv_sec)  * 1000u +
             (t1.tv_nsec - t0.tv_nsec) / 1000000u);
         if (elapsed_ms < frame_ms)
-            pecom_sleep_ms(frame_ms - elapsed_ms);
+            gemu_sleep_ms(frame_ms - elapsed_ms);
     }
 
     printf("gemu-rca: %llu machine cycles, %llu instructions\n",

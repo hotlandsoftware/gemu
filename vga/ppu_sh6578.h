@@ -94,7 +94,6 @@ typedef struct Sh6578Ppu {
 } Sh6578Ppu;
 
 void    ppu_sh6578_init (Sh6578Ppu *ppu, double cpu_clock_hz, double refresh_hz, int lines_total, int vblank_line);
-void    ppu_sh6578_reset(Sh6578Ppu *ppu);
 
 uint8_t ppu_sh6578_read (Sh6578Ppu *ppu, uint8_t reg);
 void    ppu_sh6578_write(Sh6578Ppu *ppu, uint8_t reg, uint8_t val);

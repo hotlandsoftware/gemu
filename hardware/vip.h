@@ -42,6 +42,5 @@ typedef struct RcaVipState {
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
 RcaVipState *rca_vip_create(const RcaConfig *cfg);
-void         rca_vip_reset(RcaVipState *s, const RcaConfig *cfg);
 void         rca_vip_destroy(RcaVipState *s);
 void         rca_machine_run(RcaVipState *s, const RcaConfig *cfg);

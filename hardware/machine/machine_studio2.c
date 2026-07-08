@@ -2,6 +2,7 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "studio2.h"
+#include "gemu/util.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
 #include "gemu/gemu_display.h"
@@ -13,14 +14,11 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
-static inline void studio2_sleep_ms(unsigned ms) { Sleep(ms); }
 #else
 #  include <time.h>
-static inline void studio2_sleep_ms(unsigned ms) {
-    struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-}
 #endif
+
+static void rca_studio2_reset(RcaStudio2State *s, const RcaConfig *cfg);
 
 #define STUDIO2_FRAME_HZ       60u
 
@@ -223,16 +221,8 @@ static void studio2_media_status_cart(void *ud, char *buf, size_t buf_len) {
 
 static bool studio2_screendump(void *ud, const char *path) {
     RcaStudio2State *s = ud;
-    int w = STUDIO2_DISPLAY_W, h = STUDIO2_DISPLAY_H;
-    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
-    if (!rgb) return false;
-    for (int i = 0; i < w * h; i++) {
-        uint8_t v = s->vram[i] ? 0xFF : 0x00;
-        rgb[i*3+0] = v; rgb[i*3+1] = v; rgb[i*3+2] = v;
-    }
-    bool ok = gemu_screendump(path, rgb, w, h);
-    free(rgb);
-    return ok;
+    return gemu_screendump_mono(path, s->vram,
+                                STUDIO2_DISPLAY_W, STUDIO2_DISPLAY_H);
 }
 
 RcaStudio2State *rca_studio2_create(const RcaConfig *cfg) {
@@ -318,7 +308,7 @@ RcaStudio2State *rca_studio2_create(const RcaConfig *cfg) {
     return s;
 }
 
-void rca_studio2_reset(RcaStudio2State *s, const RcaConfig *cfg) {
+static void rca_studio2_reset(RcaStudio2State *s, const RcaConfig *cfg) {
     (void)cfg;
     memset(s->ram, 0, sizeof(s->ram));
     cdp1802_reset(&s->cpu);
@@ -468,7 +458,7 @@ void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
             }
         }
 
-        studio2_sleep_ms(frame_ms);
+        gemu_sleep_ms(frame_ms);
     }
 
     printf("gemu-rca: %llu machine cycles, %llu instructions\n",

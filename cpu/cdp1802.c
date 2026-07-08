@@ -60,44 +60,17 @@ void cdp1802_request_dma_out(Cdp1802 *c, uint16_t count,
     }
 }
 
-void cdp1802_request_dma_in(Cdp1802 *c, uint16_t count,
-                             void (*cb)(uint8_t*, void*), void *ud) {
-    if (!c->dma_in_pending) {
-        if ((uint32_t)c->dma_count + count > CDP1802_DMA_QUEUE_CAP) {
-            cdp1802_panic(c, "DMA-in queue overflow");
-            return;
-        }
-        c->dma_in_pending   = true;
-        c->next_dma_in.count = count;
-        c->next_dma_in.cb    = cb;
-        c->next_dma_in.ud    = ud;
-    }
-}
-
 void cdp1802_request_irq(Cdp1802 *c) {
     c->irq_pending = true;
 }
 
 /* Push N pending-request entries into the DMA ring then set state. */
 static void flush_requests(Cdp1802 *c) {
-    if (c->dma_in_pending) {
-        c->dma_in_pending = false;
-        for (uint16_t i = 0; i < c->next_dma_in.count; i++) {
-            unsigned idx = (c->dma_head + c->dma_count) & CDP1802_DMA_QUEUE_MASK;
-            c->dma_queue[idx] = (Cdp1802DmaEntry){
-                .is_out = false,
-                .cb = c->next_dma_in.cb,
-                .ud = c->next_dma_in.ud,
-            };
-            c->dma_count++;
-        }
-        c->state = CDP1802_S_DMA;
-    } else if (c->dma_out_pending) {
+    if (c->dma_out_pending) {
         c->dma_out_pending = false;
         for (uint16_t i = 0; i < c->next_dma_out.count; i++) {
             unsigned idx = (c->dma_head + c->dma_count) & CDP1802_DMA_QUEUE_MASK;
             c->dma_queue[idx] = (Cdp1802DmaEntry){
-                .is_out = true,
                 .cb = c->next_dma_out.cb,
                 .ud = c->next_dma_out.ud,
             };
@@ -132,7 +105,6 @@ void cdp1802_reset(Cdp1802 *c) {
     c->exec_left   = 0;
     c->idle        = false;
     c->init_pending  = true;
-    c->dma_in_pending  = false;
     c->dma_out_pending = false;
     c->irq_pending     = false;
     c->dma_head = c->dma_count = 0;
@@ -186,7 +158,7 @@ void cdp1802_step(Cdp1802 *c) {
 
         /* IDLE: stall until DMA or interrupt breaks out. */
         if (c->idle) {
-            if (c->dma_in_pending || c->dma_out_pending) {
+            if (c->dma_out_pending) {
                 c->idle = false;
                 flush_requests(c);
             } else if (c->irq_pending) {
@@ -424,15 +396,8 @@ void cdp1802_step(Cdp1802 *c) {
     /* ── DMA ── */
     case CDP1802_S_DMA: {
         Cdp1802DmaEntry *e = &c->dma_queue[c->dma_head];
-        uint8_t byte = 0;
-        if (e->is_out) {
-            byte = mr(c, c->R[0]);
-            e->cb(&byte, e->ud);
-        } else {
-            e->cb(&byte, e->ud);
-            mw(c, c->R[0], byte);
-            c->D = byte;
-        }
+        uint8_t byte = mr(c, c->R[0]);
+        e->cb(&byte, e->ud);
         c->R[0]++;
         c->dma_head = (c->dma_head + 1u) & CDP1802_DMA_QUEUE_MASK;
         c->dma_count--;

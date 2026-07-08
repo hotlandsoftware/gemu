@@ -19,6 +19,20 @@ typedef struct {
     const char *desc;
 } GemuDevDesc;
 
+/* Same shape as the generated devices.inc / soundhw.inc entries. */
+typedef struct {
+    const char *name;
+    const char *desc;
+    const char *machines;
+} GemuDevDesc3;
+
+/*
+ * Print "  <name>  <desc>" rows under a heading, with the name column
+ * auto-sized.  The 3-column variant appends " [<machines>]" to each row.
+ */
+void gemu_print_table (const char *heading, const GemuDevDesc  *devs, int n);
+void gemu_print_table3(const char *heading, const GemuDevDesc3 *devs, int n);
+
 /* Bitmask helper: GEMU_DISP_F(GEMU_DISPLAY_SDL) | GEMU_DISP_F(...) */
 #define GEMU_DISP_F(t) (1u << (unsigned)(t))
 

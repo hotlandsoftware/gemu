@@ -1,4 +1,5 @@
 #include "gemu/gemu.h"
+#include "gemu/args.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -28,50 +29,27 @@ static const MachineEntry MACHINES[] = {
 
 /* ── Global device / soundhw listings ───────────────────────────────────── */
 
-typedef struct { const char *name; const char *desc; const char *machines; } DevEntry;
-
 static void list_all_devices(void) {
-    static const DevEntry devs[] = {
+    static const GemuDevDesc3 devs[] = {
 #include "generated/devices.inc"
     };
-    int n = (int)(sizeof devs / sizeof *devs);
-    int maxw = 0;
-    for (int i = 0; i < n; i++) {
-        int w = (int)strlen(devs[i].name);
-        if (w > maxw) maxw = w;
-    }
-    printf("Available devices:\n");
-    for (int i = 0; i < n; i++)
-        printf("  %-*s  %s [%s]\n", maxw, devs[i].name, devs[i].desc, devs[i].machines);
+    gemu_print_table3("Available devices", devs, (int)(sizeof devs / sizeof *devs));
 }
 
 static void list_all_soundhw(void) {
-    typedef struct { const char *name; const char *desc; const char *machines; } SwEntry;
-    static const SwEntry hw[] = {
+    static const GemuDevDesc3 hw[] = {
 #include "generated/soundhw.inc"
     };
-    int n = (int)(sizeof hw / sizeof *hw);
-    int maxw = 0;
-    for (int i = 0; i < n; i++) {
-        int w = (int)strlen(hw[i].name);
-        if (w > maxw) maxw = w;
-    }
-    printf("Available sound hardware:\n");
-    for (int i = 0; i < n; i++)
-        printf("  %-*s  %s [%s]\n", maxw, hw[i].name, hw[i].desc, hw[i].machines);
+    gemu_print_table3("Available sound hardware", hw, (int)(sizeof hw / sizeof *hw));
 }
 
 /* ── Usage / machine listing ─────────────────────────────────────────────── */
 
-static void print_machines(FILE *f) {
-    fprintf(f, "Available machines (-M <machine>):\n");
-    int maxw = 0;
-    for (int i = 0; i < N_MACHINES; i++) {
-        int w = (int)strlen(MACHINES[i].name);
-        if (w > maxw) maxw = w;
-    }
+static void print_machines(void) {
+    GemuDevDesc tmp[N_MACHINES];
     for (int i = 0; i < N_MACHINES; i++)
-        fprintf(f, "  %-*s  %s\n", maxw, MACHINES[i].name, MACHINES[i].desc);
+        tmp[i] = (GemuDevDesc){ MACHINES[i].name, MACHINES[i].desc };
+    gemu_print_table("Available machines (-M <machine>)", tmp, N_MACHINES);
 }
 
 static void print_usage(const char *prog) {
@@ -149,7 +127,7 @@ int main(int argc, char *argv[]) {
 
     /* -M ? lists all machines */
     if (machine_name && strcmp(machine_name, "?") == 0) {
-        print_machines(stdout);
+        print_machines();
         return 0;
     }
 

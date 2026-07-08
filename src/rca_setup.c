@@ -50,20 +50,7 @@ static const MachineDef machine_defs[] = {
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
-    {"altair2",    "Cidelsa Altair II arcade board (CDP1802 + CDP1869 VIS, alias for destroyer)"},
-    {"apollo80",   "Academy Apollo 80 (alias for studio2)"},
-    {"cm1200",     "Conic M-1200 (alias for studio2)"},
-    {"vip",        "RCA COSMAC VIP (CDP1802 + CDP1861 Pixie, 2 KB RAM)"},
-    {"destroyer",  "Cidelsa Destroyer arcade board (CDP1802 + CDP1869 VIS)"},
-    {"rca",        "Generic RCA COSMAC (stub/not yet implemented)"},
-    {"mpt02",      "Victory MPT-02 (alias for studio2)"},
-    {"mpt02j",     "Hanimex MPT-02 (alias for studio2)"},
-    {"mtc9016",    "Mustang 9016 (alias for studio2)"},
-    {"pecom32",    "Pecom 32 (CDP1802 + CDP1869/1870 VIS-1870, 16 KB ROM, 32 KB RAM, PAL)"},
-    {"pecom64",    "Pecom 64 (CDP1802 + CDP1869/1870 VIS-1870, 16 KB ROM, 32 KB RAM, PAL, alias for pecom32)"},
-    {"studio2",    "RCA Studio II (CDP1802 + CDP1861 Pixie, cartridge-based)"},
-    {"sm1200",     "Sheen M1200 (alias for studio2)"},
-    {"visicom",    "Visicom COM-100 (alias for studio2)"},
+#include "generated/machines_rca.inc"
 };
 static const GemuDevDesc cpus[] = {
     {"cdp1802", "RCA CDP1802 COSMAC"},
@@ -153,14 +140,8 @@ static bool parse_rom_arg(RcaConfig *cfg, const char *arg) {
 }
 
 static void soundhw_list_print(void) {
-    printf("Available RCA sound hardware:\n");
-    int maxw = 0;
-    for (int i = 0; i < (int)(sizeof(soundhws) / sizeof(soundhws[0])); i++) {
-        int w = (int)strlen(soundhws[i].name);
-        if (w > maxw) maxw = w;
-    }
-    for (int i = 0; i < (int)(sizeof(soundhws) / sizeof(soundhws[0])); i++)
-        printf("  %-*s  %s\n", maxw, soundhws[i].name, soundhws[i].desc);
+    gemu_print_table("Available RCA sound hardware", soundhws,
+                     (int)(sizeof soundhws / sizeof *soundhws));
 }
 
 static bool parse_soundhw(const char *name, RcaSoundHwType *out) {
@@ -269,17 +250,11 @@ int rca_setup(int argc, char *argv[]) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -device requires an argument\n"); return 1; }
             const char *v = rem[++i];
             if (strcmp(v, "?") == 0 || strcmp(v, "help") == 0) {
-                static const struct { const char *name; const char *desc; const char *machines; } devs[] = {
+                static const GemuDevDesc3 devs[] = {
 #include "generated/devices.inc"
                 };
-                int maxw = 0;
-                for (int d = 0; d < (int)(sizeof(devs)/sizeof(devs[0])); d++) {
-                    int w = (int)strlen(devs[d].name);
-                    if (w > maxw) maxw = w;
-                }
-                printf("Available devices:\n");
-                for (int d = 0; d < (int)(sizeof(devs)/sizeof(devs[0])); d++)
-                    printf("  %-*s  %s\n", maxw, devs[d].name, devs[d].desc);
+                gemu_print_table3("Available devices", devs,
+                                  (int)(sizeof devs / sizeof *devs));
                 return 0;
             }
             static const struct { const char *name; RcaKeyboardType kb; } rca_devs[] = {

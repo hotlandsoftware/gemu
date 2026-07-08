@@ -92,6 +92,3 @@ void rca_pcspk_set_freq(RcaPcSpeaker *spk, unsigned frequency_hz) {
     SDL_UnlockAudioDevice(spk->dev);
 }
 
-bool rca_pcspk_is_active(const RcaPcSpeaker *spk) {
-    return spk && spk->active;
-}

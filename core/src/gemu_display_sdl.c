@@ -474,11 +474,6 @@ static bool sdl_do_is_key_held(GemuDisplay *d, const char *name) {
     return (int)sc < numkeys && state[sc];
 }
 
-static void sdl_do_open_rebind(GemuDisplay *d) {
-    SdlBackend *b = d->backend;
-    if (b->menu && !input_menu_is_open(b->menu))
-        input_menu_toggle(b->menu);
-}
 
 static void sdl_do_reset_input_bindings(GemuDisplay *d) {
     SdlBackend *b = d->backend;
@@ -591,7 +586,6 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     d->do_render      = sdl_do_render;
     d->do_poll        = sdl_do_poll;
     d->do_is_key_held = sdl_do_is_key_held;
-    d->do_open_rebind = sdl_do_open_rebind;
     d->do_reset_input_bindings = sdl_do_reset_input_bindings;
     d->do_set_title   = sdl_do_set_title;
     d->do_destroy     = sdl_do_destroy;

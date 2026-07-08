@@ -34,8 +34,7 @@ typedef enum {
 } Cdp1802CycleState;
 
 typedef struct {
-    bool   is_out;                    /* true = DMA-out (read mem→device) */
-    void (*cb)(uint8_t *byte, void *ud);
+    void (*cb)(uint8_t *byte, void *ud);   /* DMA-out: byte read mem→device */
     void  *ud;
 } Cdp1802DmaEntry;
 
@@ -61,10 +60,8 @@ typedef struct Cdp1802 {
     bool              init_pending; /* true = waiting for first execute after reset */
 
     /* Pending external requests */
-    bool dma_in_pending;
     bool dma_out_pending;
     bool irq_pending;
-    struct { uint16_t count; void(*cb)(uint8_t*,void*); void *ud; } next_dma_in;
     struct { uint16_t count; void(*cb)(uint8_t*,void*); void *ud; } next_dma_out;
 
     /* DMA ring buffer */
@@ -98,6 +95,4 @@ void cdp1802_step(Cdp1802 *cpu);   /* one machine cycle */
 /* Called by peripherals to queue requests */
 void cdp1802_request_dma_out(Cdp1802 *cpu, uint16_t count,
                               void (*cb)(uint8_t*, void*), void *ud);
-void cdp1802_request_dma_in(Cdp1802 *cpu, uint16_t count,
-                             void (*cb)(uint8_t*, void*), void *ud);
 void cdp1802_request_irq(Cdp1802 *cpu);

@@ -84,9 +84,6 @@ typedef enum {
     GEMU_BP_WRITE = 4,
 } GemuBpType;
 
-int  gemu_monitor_add_bp   (GemuMonitor *mon, GemuBpType type, uint32_t addr);
-bool gemu_monitor_del_bp   (GemuMonitor *mon, int id);
-void gemu_monitor_clear_bps(GemuMonitor *mon);
 
 bool gemu_monitor_check_exec (GemuMonitor *mon, uint32_t addr);
 bool gemu_monitor_check_read (GemuMonitor *mon, uint32_t addr);

@@ -43,16 +43,8 @@ static const uint8_t chip8_font[CHIP8_FONT_BYTES] = {
 
 static bool chip8_screendump(void *ud, const char *path) {
     Chip8State *s = ud;
-    int w = CHIP8_DISPLAY_W, h = CHIP8_DISPLAY_H;
-    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
-    if (!rgb) return false;
-    for (int i = 0; i < w * h; i++) {
-        uint8_t v  = s->vram[i] ? 0xFF : 0x00;
-        rgb[i*3+0] = v; rgb[i*3+1] = v; rgb[i*3+2] = v;
-    }
-    bool ok = gemu_screendump(path, rgb, w, h);
-    free(rgb);
-    return ok;
+    return gemu_screendump_mono(path, s->vram,
+                                CHIP8_DISPLAY_W, CHIP8_DISPLAY_H);
 }
 
 /* ── ROM loading (raw .ch8 or compiled .8o) ──────────────────────────────── */
@@ -120,7 +112,7 @@ Chip8State *chip8_machine_create(const Chip8Config *cfg) {
     return s;
 }
 
-void chip8_machine_reset(Chip8State *s, const Chip8Config *cfg) {
+static void chip8_machine_reset(Chip8State *s, const Chip8Config *cfg) {
     memset(s->V,         0, sizeof(s->V));
     memset(s->stack,     0, sizeof(s->stack));
     memset(s->vram,      0, sizeof(s->vram));
