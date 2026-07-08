@@ -8,9 +8,9 @@
  * Scope: everything the Atari 400/800 OS needs to boot and take keyboard
  * input — KBCODE + keyboard/BREAK IRQs, IRQEN/IRQST semantics, the 17-bit
  * polynomial RANDOM register, SKSTAT shift/key-down bits, and just enough
- * serial-port behavior (output-ready/output-complete IRQs fire whenever
- * enabled) for SIO's disk-boot attempt to run to its timeout instead of
- * hanging.  No audio synthesis yet (AUDF/AUDC are stored, not played) and
+ * serial-port behavior (SEROUT raises one-shot ready/complete IRQs) and
+ * coarse timer IRQs for SIO's disk-boot attempt to run to its timeout instead
+ * of hanging.  No audio synthesis yet (AUDF/AUDC are stored, not played) and
  * no paddle (POT) scanning.
  */
 
@@ -31,6 +31,8 @@ typedef struct Pokey {
     uint8_t skctl, skstat;
     uint8_t kbcode;
     uint8_t serout;
+    uint8_t serout_delay;
+    uint16_t timer_count[3]; /* IRQ timers 1, 2 and 4 */
     uint32_t poly17;       /* RANDOM LFSR state */
 } Pokey;
 
@@ -43,8 +45,8 @@ void pokey_key_down(Pokey *p, uint8_t code);
 void pokey_key_up  (Pokey *p);
 void pokey_break_key(Pokey *p);
 
-/* Call periodically (e.g. once per scanline): re-arms the serial output
- * IRQs so the OS's SIO loop always makes progress. */
+/* Call periodically (e.g. once per scanline): advances serial-complete delay
+ * and the coarse IRQ timers used by the OS timeout paths. */
 void pokey_tick(Pokey *p);
 
 static inline bool pokey_irq_asserted(const Pokey *p) {

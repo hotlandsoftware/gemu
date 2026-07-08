@@ -196,7 +196,7 @@ static void a400_cpu_state(void *ud, char *buf, size_t buf_len) {
              "cycles=%llu insns=%llu frame=%llu line=%d "
              "dmactl=%02X dlist=%04X nmien=%02X nmist=%02X "
              "colpf=%02X,%02X,%02X,%02X colbk=%02X "
-             "irqen=%02X irqst=%02X skstat=%02X",
+             "irqen=%02X irqst=%02X skstat=%02X audf=%02X,%02X,%02X,%02X",
              s->cpu.PC, s->cpu.A, s->cpu.X, s->cpu.Y, s->cpu.P, s->cpu.SP,
              (unsigned long long)s->cpu.cycle_count,
              (unsigned long long)s->cpu.insn_count,
@@ -204,7 +204,9 @@ static void a400_cpu_state(void *ud, char *buf, size_t buf_len) {
              s->antic.dmactl, s->antic.dlist, s->antic.nmien, s->antic.nmist,
              s->antic.colpf[0], s->antic.colpf[1], s->antic.colpf[2],
              s->antic.colpf[3], s->antic.colbk, s->pokey.irqen,
-             (uint8_t)~s->pokey.irq_pending, s->pokey.skstat);
+             (uint8_t)~s->pokey.irq_pending, s->pokey.skstat,
+             s->pokey.audf[0], s->pokey.audf[1], s->pokey.audf[2],
+             s->pokey.audf[3]);
 }
 
 static bool a400_peek_command(Atari400State *s, const char *text) {

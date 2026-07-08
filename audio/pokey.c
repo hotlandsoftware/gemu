@@ -19,6 +19,18 @@ static uint8_t poly17_step(Pokey *p) {
     return (uint8_t)s;
 }
 
+static uint16_t timer_reload(const Pokey *p, int timer) {
+    int idx = (timer == 2) ? 3 : timer;
+    uint16_t period = (uint16_t)p->audf[idx] + 1u;
+    return period < 2u ? 2u : period;
+}
+
+static void reload_timers(Pokey *p) {
+    p->timer_count[0] = timer_reload(p, 0);
+    p->timer_count[1] = timer_reload(p, 1);
+    p->timer_count[2] = timer_reload(p, 2);
+}
+
 uint8_t pokey_read(Pokey *p, uint8_t reg) {
     switch (reg & 0x0F) {
     case 0x00: case 0x01: case 0x02: case 0x03:
@@ -41,13 +53,14 @@ void pokey_write(Pokey *p, uint8_t reg, uint8_t v) {
     case 0x01: case 0x03: case 0x05: case 0x07:
         p->audc[(reg & 0x0F) >> 1] = v; break;
     case 0x08: p->audctl = v; break;
-    case 0x09: break;                      /* STIMER */
+    case 0x09: reload_timers(p); break;    /* STIMER */
     case 0x0A: p->skstat |= 0xE0; break;   /* SKRES */
     case 0x0B: break;                      /* POTGO */
     case 0x0D:                             /* SEROUT — no attached SIO target */
         p->serout = v;
         p->irq_pending &= (uint8_t)~POKEY_IRQ_SEROC;
         p->irq_pending |= POKEY_IRQ_SEROR;
+        p->serout_delay = 4;
         break;
     case 0x0E:                             /* IRQEN: 0-bits also clear pending */
         p->irqen = v;
@@ -59,10 +72,22 @@ void pokey_write(Pokey *p, uint8_t reg, uint8_t v) {
 }
 
 void pokey_tick(Pokey *p) {
-    /* With no SIO device attached, the transmit register is always ready.
-     * Do not keep raising SEROC here: the OS enables serial-complete IRQs
-     * during parts of SIO, and a level SEROC would trap it in the IRQ path. */
-    p->irq_pending |= (p->irqen & POKEY_IRQ_SEROR);
+    /* With no SIO device attached, SEROUT immediately raises one-shot ready
+     * and complete sources. Do not re-arm SEROR here; the OS has a real
+     * vector for that source and will spin if it is held pending forever. */
+    if (p->serout_delay && --p->serout_delay == 0)
+        p->irq_pending |= POKEY_IRQ_SEROC;
+
+    static const uint8_t irq_bits[3] = {
+        POKEY_IRQ_TIMER1, POKEY_IRQ_TIMER2, POKEY_IRQ_TIMER4
+    };
+    for (int i = 0; i < 3; i++) {
+        if (!p->timer_count[i]) p->timer_count[i] = timer_reload(p, i);
+        if (--p->timer_count[i] == 0) {
+            p->irq_pending |= irq_bits[i];
+            p->timer_count[i] = timer_reload(p, i);
+        }
+    }
 }
 
 void pokey_key_down(Pokey *p, uint8_t code) {
