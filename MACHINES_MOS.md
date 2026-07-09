@@ -4,18 +4,25 @@
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|
 | 2a03 | `Ricoh 2A03` | working |  |
+| 2a07 | `Ricoh 2A07` | working |  |
 | 6501 | `MOS Technology 6501` | working | Extremely rare early version of 6502,  pin-compatible with Motorola 6800 |
 | 6502 | `MOS Technology 6502` | working | |
 
 ## VGA
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|
-| 2c02 | `Ricoh RP2C02` | imperfect |
+| rp2c02 | `Ricoh RP2C02` | working |
+| rp2c02-0004 | `Ricoh RP2C02-0004 (VS. System RGB PPU)` | working |
+| sh6578 | `UM6578/SH6578/NT6578 Famiclone PPU` | working |
 
 ## Sound Cards
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|
 | 2a03 | `Ricoh 2A03` | working | supports MIDI playback via `2a03,output=midi` |
+| ay8910 | `General Instrument AY-3-8910 PSG` | preliminary |  |
+| msm6295 | `OKI MSM6295 ADPCM` | working |  |
+| none | `None (disable all sound output)` | working |  |
+| pcspk | `PC Speaker` | working |  |
 
 ## Devices
 | Name   | Full Name     | Status | Notes |
@@ -25,9 +32,11 @@
 | famicom-keyboard | `Famicom 72-key Keyboard` | working |  |
 | famicom-mic | `Famicom Microphone Controller` | working | no proper mic detection yet, can send mic sound by pressing M (default) |
 | rob | `R.O.B. (Robotic Operating Buddy)` | working | opens in a second window, 3D simulation of ROB |
+| keyboard | `Generic QWERTY Keyboard` | working |  |
 | kim-keypad | `KIM-1 hex keypad` | working |  |
 | mouse | `Generic PS/2 mouse` | working |  |
 | nes-controller | `NES/Famicom Standard Controller` | working |  |
+| none | `None (disable all default input devices)` | working |  |
 | rob-famicom | `Family Computer Robot (Famicom R.O.B.)` | working | |
 | subor-mouse | `Subor Mouse` | working | |
 | vt100 | `DEC VT100 serial terminal` | working |  |
@@ -41,7 +50,7 @@ Simulated machines include:
 | Name   | Full Name     | Year | Graphics  | Input | Sound | Status |
 |--------|---------------|---------|---------|-------|-------|-------|
 | apple1 | `Apple I` | 1976 | 🟢 | 🟢 | 🔴 | working | 
-| atari400 | `Atari 400` | 1979 | 🟢 | 🟢 | 🟢 | preliminary | 
+| atari400 | `Atari 400` | 1979 | 🟢 | 🟢 | 🟢 | imperfect | 
 | dendy | `Dendy Famiclone` | 1992 | 🟢 | 🟢 | 🟢 | imperfect | 
 | famicom | `Nintendo Family Computer` | 1983  | 🟢 | 🟢 | 🟢 | imperfect | 
 | generic | `Generic MOS-compatible machine` | N/A | 🔴 | 🔴 | 🔴 | preliminary | 
