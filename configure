@@ -62,6 +62,11 @@ FAMILY_SRC = {
         'vga/antic.c', 'audio/pokey.c',
         'hardware/device/fds.c', 'hardware/device/fds_hle.c',
         'hardware/device/vt100.c', 'hardware/romdb.c',
+        # Native Win32 hex editor: the whole file is wrapped in
+        # #if defined(_WIN32) && !defined(GEMU_GTK), so it compiles to an
+        # empty translation unit everywhere else (Linux, or --enable-gtk
+        # on Windows, which still uses the GTK implementation instead).
+        'vga/hex_editor_win32.c',
         'src/mos_setup.c',
     ],
     'rca': [
@@ -569,6 +574,12 @@ def main():
         ld_parts += ['-lws2_32', '-mconsole']
         if have_winmidi:
             ld_parts += ['-lwinmm']
+        if 'mos' in targets and not want_gtk:
+            # Native Win32 hex editor (vga/hex_editor_win32.c): tab control
+            # + SetWindowSubclass need comctl32, and the GDI text/bitmap
+            # calls need gdi32 — neither is in MinGW's default link set
+            # (user32, pulled in by the existing SDL File-menu code, is).
+            ld_parts += ['-lcomctl32', '-lgdi32']
     ldflags = ' '.join(ld_parts)
 
     # ── Collect source files ──────────────────────────────────────────────────

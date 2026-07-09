@@ -151,7 +151,7 @@ typedef struct Kim1State {
     uint8_t  *ext_ram;
     uint32_t  ext_ram_top;
 
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
     struct HexEditor *hex_editor;
 #endif
 } Kim1State;

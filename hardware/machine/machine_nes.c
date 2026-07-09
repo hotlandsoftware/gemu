@@ -251,9 +251,9 @@ static bool nes_device_is_rob(NesDeviceType dev) {
     return dev == NES_DEVICE_ROB || dev == NES_DEVICE_ROB_FAMICOM;
 }
 
-/* GTK Debug > Hex Editor menu callback (body is no-op when GTK disabled). */
+/* Debug > Hex Editor menu callback (GTK or native Win32; no-op otherwise). */
 static void nes_hex_toggle(void *ud) {
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
     NesState *s = ud;
     if (!s->hex_editor) return;
     if (hex_editor_is_visible(s->hex_editor))
@@ -2221,8 +2221,12 @@ NesState *nes_create(const MosConfig *cfg) {
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, nes_screendump, s);
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK)
     if (cfg->display_type == GEMU_DISPLAY_GTK) {
+#elif defined(_WIN32)
+    if (cfg->display_type == GEMU_DISPLAY_SDL) {
+#endif
+#if defined(GEMU_GTK) || defined(_WIN32)
         HexRegion nes_regions[] = {
             { "CPU RAM ($0000-$07FF)", s->ram,
               sizeof(s->ram), false, 0x0000 },
@@ -2235,7 +2239,7 @@ NesState *nes_create(const MosConfig *cfg) {
         };
         s->hex_editor = hex_editor_create(nes_regions, 3);
     }
-#endif
+#endif /* GEMU_GTK || _WIN32 */
     if (s->fds_enabled) {
         GemuMediaDevice floppy_dev = {
             .name   = "floppy",
@@ -2381,7 +2385,7 @@ void nes_destroy(NesState *s) {
     nes_lua_destroy(s->lua);
 #endif
     if (s->fds_enabled) { free(s->fds.raw_disk); }
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
     hex_editor_destroy(s->hex_editor);
 #endif
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
@@ -2507,11 +2511,11 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                     }
                     if (!shown) printf("(none)");
                     printf("\n");
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
                 } else if (strncasecmp(text, "hexeditor", 9) == 0 &&
                            (text[9] == '\0' || text[9] == ' ' || text[9] == '\t')) {
                     if (!s->hex_editor) {
-                        printf("hexeditor: GTK not available\n");
+                        printf("hexeditor: not available (needs GTK build or -display sdl on Windows)\n");
                     } else if (hex_editor_is_visible(s->hex_editor)) {
                         hex_editor_hide(s->hex_editor);
                         printf("hexeditor: closed\n");
@@ -2622,7 +2626,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                 SDL_Delay(frame_ms - elapsed);
         }
 
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
         hex_editor_refresh(s->hex_editor);
         /* GTK event pump is done inside gemu_display_poll() via the backend */
 #endif

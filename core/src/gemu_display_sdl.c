@@ -8,8 +8,9 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
-#  define IDM_FILE_RESET 0x0101
-#  define IDM_FILE_QUIT  0x0102
+#  define IDM_FILE_RESET    0x0101
+#  define IDM_FILE_QUIT     0x0102
+#  define IDM_DEBUG_HEXEDIT 0x0103
 #endif
 
 /* InputMenu lives in gemu-mos/src/vga/ but is included via the build's
@@ -61,6 +62,11 @@ typedef struct {
     bool   mouse_captured;
     bool   capture_pointer;
     bool   saw_mouse_motion;
+
+#ifdef _WIN32
+    void (*hex_toggle_cb)(void *ud);
+    void  *hex_toggle_ud;
+#endif
 } SdlBackend;
 
 /* ── Binding table ───────────────────────────────────────────────────────── */
@@ -426,6 +432,9 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
                 switch (LOWORD(ev.syswm.msg->msg.win.wParam)) {
                 case IDM_FILE_RESET: d->reset = true; break;
                 case IDM_FILE_QUIT:  d->quit  = true; break;
+                case IDM_DEBUG_HEXEDIT:
+                    if (b->hex_toggle_cb) b->hex_toggle_cb(b->hex_toggle_ud);
+                    break;
                 }
             }
             break;
@@ -593,7 +602,15 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     d->pointer.x = d->pointer.y = -1;
 
 #ifdef _WIN32
-    /* Attach a native Win32 menu bar (File > Reset / Quit). */
+    /* Attach a native Win32 menu bar: File > Reset / Quit, and (when the
+     * machine provides one — see GemuDisplayGtkExtras) Debug > Hex Editor.
+     * The "gtk" name is historical: this struct predates the native Win32
+     * menu and was originally GTK-only, but its fields are plain callbacks
+     * that any backend can use. */
+    if (cfg->gtk) {
+        b->hex_toggle_cb = cfg->gtk->hex_toggle_cb;
+        b->hex_toggle_ud = cfg->gtk->hex_toggle_ud;
+    }
     SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
     {
         SDL_SysWMinfo wm;
@@ -608,6 +625,11 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
             AppendMenuA(file, MF_SEPARATOR, 0,              NULL);
             AppendMenuA(file, MF_STRING,    IDM_FILE_QUIT,  "&Quit\tEsc");
             AppendMenuA(bar,  MF_POPUP, (UINT_PTR)file, "&File");
+            if (b->hex_toggle_cb) {
+                HMENU debug = CreatePopupMenu();
+                AppendMenuA(debug, MF_STRING, IDM_DEBUG_HEXEDIT, "&Hex Editor");
+                AppendMenuA(bar,   MF_POPUP, (UINT_PTR)debug, "&Debug");
+            }
             SetMenu(hwnd, bar);
             DrawMenuBar(hwnd);
         }

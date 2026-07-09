@@ -4,7 +4,7 @@
 #include "kim1.h"
 #include "gemu/util.h"
 #include "wozmon_rom.h"
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
 #  include "../vga/hex_editor.h"
 #endif
 #include <SDL2/SDL.h>
@@ -26,7 +26,7 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud);
 static void kim1_update_monitor_display(Kim1State *s);
 static void kim1_panel_command(Kim1State *s, uint8_t key);
 
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
 static void kim1_hex_toggle(void *ud) {
     Kim1State *s = ud;
     if (!s->hex_editor) return;
@@ -1360,7 +1360,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     }
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
         GemuDisplayGtkExtras gtk_extras = {
             .monitor       = s->monitor,
             .hex_toggle_cb = kim1_hex_toggle,
@@ -1380,7 +1380,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
                 .n_actions   = KIM1_NUM_ACTIONS,
                 .ini_section = "kim-keypad",
                 .no_rebind   = true,
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
                 .gtk         = &gtk_extras,
 #endif
             });
@@ -1403,8 +1403,12 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         }
     }
 
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK)
     if (cfg->display_type == GEMU_DISPLAY_GTK) {
+#elif defined(_WIN32)
+    if (cfg->display_type == GEMU_DISPLAY_SDL) {
+#endif
+#if defined(GEMU_GTK) || defined(_WIN32)
         HexRegion kim1_regions[5] = {
             { "RAM ($0000-$03FF)",      s->ram,      sizeof(s->ram),      false, 0x0000u },
             { "RRIOT RAM ($1780-$17FF)",s->rriot_ram,sizeof(s->rriot_ram),false, 0x1780u },
@@ -1413,9 +1417,8 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         };
         int n_regions = 4;
         if (s->ext_ram) {
-            /* Cap hex editor region to 4 KB to avoid allocating large GTK
-             * text buffers that exhaust GL resources before the display
-             * context is ready. */
+            /* Cap the hex editor's view of expansion RAM to 4 KB — plenty
+             * for hand-scrolling, and keeps startup allocation bounded. */
             size_t hex_sz = s->ext_ram_top - 0x0400u;
             if (hex_sz > 4096u) hex_sz = 4096u;
             kim1_regions[n_regions++] = (HexRegion){
@@ -1424,7 +1427,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         }
         s->hex_editor = hex_editor_create(kim1_regions, n_regions);
     }
-#endif
+#endif /* GEMU_GTK || _WIN32 */
 
     if (cfg->vnc_addr) {
         s->vnc = gemu_vnc_create(cfg->vnc_addr,
@@ -1449,7 +1452,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
 }
 
 void kim1_destroy(Kim1State *s) {
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
     hex_editor_destroy(s->hex_editor);
 #endif
     gemu_display_destroy(s->display);
@@ -1540,7 +1543,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
                 kim1_update_vnc(s);
         }
 
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
         hex_editor_refresh(s->hex_editor);
 #endif
 

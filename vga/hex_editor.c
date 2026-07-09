@@ -1,5 +1,6 @@
 #ifdef GEMU_GTK
 #include "hex_editor.h"
+#include <gtk/gtk.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>

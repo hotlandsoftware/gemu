@@ -10,7 +10,7 @@
 #endif
 #include "gemu/vnc.h"
 #include "gemu/monitor.h"
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
 #  include "../vga/hex_editor.h"
 #endif
 #ifdef HAVE_ROB
@@ -196,7 +196,7 @@ typedef struct NesState {
     FdsState fds;
 
     /* Hex editor (GTK only) */
-#ifdef GEMU_GTK
+#if defined(GEMU_GTK) || defined(_WIN32)
     HexEditor *hex_editor;
 #endif
 
