@@ -1,5 +1,6 @@
 #include "gemu/monitor.h"
 #include "gemu/vnc.h"
+#include "gemu/util.h"
 
 static int  gemu_monitor_add_bp(GemuMonitor *mon, GemuBpType type, uint32_t addr);
 static bool gemu_monitor_del_bp(GemuMonitor *mon, int id);
@@ -87,6 +88,9 @@ struct GemuMonitor {
     pthread_t       thread;
     bool            running;
     bool            thread_started;
+    volatile bool   thread_done;      /* reader thread has returned */
+    bool            thread_abandoned; /* Windows: reader stuck in console
+                                         read; leak mon instead of joining */
     bool            paused;
     char            last_text[256];
     uint32_t        last_step_count;
@@ -1241,6 +1245,7 @@ static void *monitor_thread(void *arg) {
     else
         monitor_stdio_loop(mon);
 
+    mon->thread_done = true;
     return NULL;
 }
 
@@ -1259,6 +1264,8 @@ GemuMonitor *gemu_monitor_create(void) {
 void gemu_monitor_destroy(GemuMonitor *mon) {
     if (!mon) return;
     gemu_monitor_stop(mon);
+    if (mon->thread_abandoned)
+        return;   /* reader may still touch mon — leak it, we're exiting */
     pthread_mutex_destroy(&mon->lock);
     free(mon);
 }
@@ -1311,6 +1318,7 @@ void gemu_monitor_start(GemuMonitor *mon) {
         !monitor_open_telnet(mon))
         return;
     mon->running = true;
+    mon->thread_done = false;
     if (pthread_create(&mon->thread, NULL, monitor_thread, mon) == 0) {
         mon->thread_started = true;
     } else {
@@ -1335,21 +1343,36 @@ void gemu_monitor_stop(GemuMonitor *mon) {
     }
 #ifdef _WIN32
     /* pthread_cancel doesn't interrupt fgets(stdin) on Windows.
-     * Inject a synthetic Enter key so the stdio loop unblocks, sees
-     * mon->running == false at the top of its while(), and exits. */
+     * Inject a synthetic Enter keypress (down+up, '\r' — the console's
+     * cooked line reader completes on carriage return, not linefeed) so
+     * the stdio loop unblocks, sees mon->running == false, and exits. */
     if (mon->backend == MON_BACKEND_STDIO) {
-        INPUT_RECORD ir = {0};
-        ir.EventType = KEY_EVENT;
-        ir.Event.KeyEvent.bKeyDown      = TRUE;
-        ir.Event.KeyEvent.wRepeatCount  = 1;
-        ir.Event.KeyEvent.wVirtualKeyCode = VK_RETURN;
-        ir.Event.KeyEvent.uChar.AsciiChar = '\n';
+        INPUT_RECORD ir[2] = {0};
+        for (int i = 0; i < 2; i++) {
+            ir[i].EventType = KEY_EVENT;
+            ir[i].Event.KeyEvent.bKeyDown        = (i == 0);
+            ir[i].Event.KeyEvent.wRepeatCount    = 1;
+            ir[i].Event.KeyEvent.wVirtualKeyCode = VK_RETURN;
+            ir[i].Event.KeyEvent.uChar.AsciiChar = '\r';
+        }
         DWORD written;
-        WriteConsoleInputA(GetStdHandle(STD_INPUT_HANDLE), &ir, 1, &written);
+        WriteConsoleInputA(GetStdHandle(STD_INPUT_HANDLE), &ir[0], 2, &written);
     }
-#endif
+    /* A console read can't be forcibly cancelled on Windows.  Give the
+     * reader a moment to notice, then abandon the thread rather than hang
+     * the shutdown path — the process is exiting and will reclaim it. */
+    for (int i = 0; i < 50 && !mon->thread_done; i++)
+        gemu_sleep_ms(10);
+    if (mon->thread_done) {
+        pthread_join(mon->thread, NULL);
+    } else {
+        mon->thread_abandoned = true;
+        fprintf(stderr, "monitor: console reader did not exit; abandoning it\n");
+    }
+#else
     pthread_cancel(mon->thread);
     pthread_join(mon->thread, NULL);
+#endif
     mon->thread_started = false;
     if (mon->backend == MON_BACKEND_STDIO)
         printf("\n"); /* tidy up any dangling prompt */

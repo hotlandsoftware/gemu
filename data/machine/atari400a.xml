@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="atari400a" family="mos" description="Atari 400 (OS rev A, alias for atari400)"
+<machine name="atari400a" family="mos" description="Atari 400 (OS rev A) (alias for atari400)"
          alias="atari400" tv="ntsc" ram="16K">
     <device name="keyboard"/>
     <rom name="co12399b.rom" region="maincpu" addr="0xD800" sha256="b1f7774bad07e02e03ef53ece3c29a5b7546fe967a42a73d0a4f65ce6248bde7"/>
