@@ -1,9 +1,13 @@
 #ifdef HAVE_CACA
 #include "gemu_display_priv.h"
 #include <caca.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
+#include <unistd.h>
 
 #define CACA_MAX_BINDINGS GEMU_DISPLAY_MAX_ACTIONS
 
@@ -59,6 +63,13 @@ typedef struct {
 
     int  fb_w, fb_h;
     bool use_halfblock;       /* true for mono/small framebuffers */
+    bool plain_text;          /* direct ANSI terminal, no alternate screen */
+    bool termios_active;
+    bool plain_started;
+    int  old_fl;
+    struct termios old_termios;
+    char *last_text;
+    int  last_text_rows, last_text_cols;
 
     struct { int key; uint32_t bit; } bindings[CACA_MAX_BINDINGS];
     int n_bindings;
@@ -86,6 +97,7 @@ static void build_bindings(CacaBackend *b, const GemuDisplayConfig *cfg) {
 
 static void caca_do_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
     CacaBackend *b = d->backend;
+    if (b->plain_text) return;
     int cw = caca_get_canvas_width(b->cv);
     int ch = caca_get_canvas_height(b->cv);
 
@@ -112,8 +124,65 @@ static void caca_do_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
     caca_refresh_display(b->dp);
 }
 
+static void caca_do_render_text(GemuDisplay *d, const char *text, int rows, int cols) {
+    CacaBackend *b = d->backend;
+    if (rows <= 0 || cols <= 0) return;
+    if (b->plain_text) {
+        size_t len = (size_t)rows * (size_t)cols;
+        if (b->last_text && b->last_text_rows == rows && b->last_text_cols == cols &&
+            memcmp(b->last_text, text, len) == 0)
+            return;
+        if (!b->last_text || b->last_text_rows != rows || b->last_text_cols != cols) {
+            char *next = realloc(b->last_text, len);
+            if (!next) return;
+            b->last_text = next;
+            b->last_text_rows = rows;
+            b->last_text_cols = cols;
+        }
+        memcpy(b->last_text, text, len);
+        if (!b->plain_started) {
+            fputs("\033[?25l\033[2J", stdout);
+            b->plain_started = true;
+        }
+        fputs("\033[H", stdout);
+        for (int y = 0; y < rows; y++) {
+            fwrite(text + y * cols, 1, (size_t)cols, stdout);
+            fputc('\n', stdout);
+        }
+        fflush(stdout);
+        return;
+    }
+    caca_set_canvas_size(b->cv, cols, rows);
+    caca_set_color_ansi(b->cv, CACA_LIGHTBLUE, CACA_BLACK);
+    caca_clear_canvas(b->cv);
+    for (int y = 0; y < rows; y++) {
+        for (int x = 0; x < cols; x++) {
+            unsigned char ch = (unsigned char)text[y * cols + x];
+            caca_put_char(b->cv, x, y, ch ? ch : ' ');
+        }
+    }
+    caca_refresh_display(b->dp);
+}
+
 static uint32_t caca_do_poll(GemuDisplay *d) {
     CacaBackend *b = d->backend;
+    if (b->plain_text) {
+        unsigned char buf[64];
+        for (;;) {
+            ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            if (n <= 0) break;
+            for (ssize_t i = 0; i < n; i++) {
+                unsigned char ch = buf[i];
+                if (ch == 3) { d->quit = true; continue; }
+                if (ch == 0x1b) continue;
+                if (ch == '\n') ch = '\r';
+                if (ch >= 0x20 || ch == '\r' || ch == '\b' || ch == '\t' || ch == 0x7f)
+                    gemu_display_push_raw(d, ch);
+            }
+        }
+        return 0;
+    }
     caca_event_t ev;
 
     /* caca doesn't give us key-up events, so we treat each frame's key set
@@ -159,6 +228,15 @@ static void caca_do_destroy(GemuDisplay *d) {
     if (b->dither) caca_free_dither(b->dither);
     if (b->dp)     caca_free_display(b->dp);
     if (b->cv)     caca_free_canvas(b->cv);
+    if (b->plain_text) {
+        if (b->plain_started)
+            fputs("\033[?25h\n", stdout);
+        if (b->termios_active)
+            tcsetattr(STDIN_FILENO, TCSANOW, &b->old_termios);
+        if (b->old_fl >= 0)
+            fcntl(STDIN_FILENO, F_SETFL, b->old_fl);
+        free(b->last_text);
+    }
     free(b);
     d->backend = NULL;
 }
@@ -177,13 +255,50 @@ GemuDisplay *gemu_display_caca_create(const GemuDisplayConfig *cfg) {
 
     b->fb_w = cfg->fb_width;
     b->fb_h = cfg->fb_height;
+    b->old_fl = -1;
+    b->plain_text = cfg->terminal_text;
 
     /* Use half-block rendering for small/mono displays (≤128 wide). */
     b->use_halfblock = (cfg->fb_width <= 128);
 
+    if (b->plain_text) {
+        struct termios tio;
+        if (tcgetattr(STDIN_FILENO, &b->old_termios) == 0) {
+            tio = b->old_termios;
+            tio.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+            tio.c_cc[VMIN] = 0;
+            tio.c_cc[VTIME] = 0;
+            if (tcsetattr(STDIN_FILENO, TCSANOW, &tio) == 0)
+                b->termios_active = true;
+        }
+        b->old_fl = fcntl(STDIN_FILENO, F_GETFL, 0);
+        if (b->old_fl >= 0)
+            fcntl(STDIN_FILENO, F_SETFL, b->old_fl | O_NONBLOCK);
+        build_bindings(b, cfg);
+        GemuDisplay *d = calloc(1, sizeof(*d));
+        if (!d) { caca_do_destroy(&(GemuDisplay){.backend=b}); return NULL; }
+        d->backend = b;
+        d->do_render = caca_do_render;
+        d->do_render_text = caca_do_render_text;
+        d->do_poll = caca_do_poll;
+        d->do_destroy = caca_do_destroy;
+        snprintf(d->title, sizeof(d->title), "%s", cfg->title ? cfg->title : "GEMU");
+        d->pointer.x = d->pointer.y = -1;
+        return d;
+    }
+
     b->cv = caca_create_canvas(0, 0);
-    b->dp = caca_create_display(b->cv);
-    if (!b->dp) { free(b); return NULL; }
+    const char *driver = getenv("CACA_DRIVER");
+    if (driver && driver[0]) {
+        b->dp = caca_create_display_with_driver(b->cv, driver);
+    } else {
+        static const char *terminal_drivers[] = { "ncurses", "slang", "ansi" };
+        for (size_t i = 0; i < sizeof(terminal_drivers) / sizeof(terminal_drivers[0]); i++) {
+            b->dp = caca_create_display_with_driver(b->cv, terminal_drivers[i]);
+            if (b->dp) break;
+        }
+    }
+    if (!b->dp) { caca_free_canvas(b->cv); free(b); return NULL; }
     caca_set_display_title(b->dp, cfg->title ? cfg->title : "GEMU");
 
     if (!b->use_halfblock) {
@@ -201,6 +316,7 @@ GemuDisplay *gemu_display_caca_create(const GemuDisplayConfig *cfg) {
     if (!d) { caca_do_destroy(&(GemuDisplay){.backend=b}); return NULL; }
     d->backend   = b;
     d->do_render = caca_do_render;
+    d->do_render_text = caca_do_render_text;
     d->do_poll   = caca_do_poll;
     d->do_set_title = caca_do_set_title;
     d->do_destroy = caca_do_destroy;

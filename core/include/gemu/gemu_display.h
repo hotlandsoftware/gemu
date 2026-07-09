@@ -96,6 +96,7 @@ typedef struct {
     const GemuInputPage *pages;
     int                  n_pages;
     bool                 capture_pointer; /* SDL: VM-style relative mouse capture */
+    bool                 terminal_text;   /* curses: plain selectable ANSI text */
 
     /* GTK extras — NULL for non-GTK builds / backends */
     const GemuDisplayGtkExtras *gtk;
@@ -120,6 +121,7 @@ void         gemu_display_destroy(GemuDisplay *d);
  * parameters to support machines that switch resolution mid-run (e.g. SCHIP).
  */
 void gemu_display_render(GemuDisplay *d, const uint32_t *argb, int w, int h);
+void gemu_display_render_text(GemuDisplay *d, const char *text, int rows, int cols);
 void gemu_display_set_paused(GemuDisplay *d, bool paused);
 
 /*

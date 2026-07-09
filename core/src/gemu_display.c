@@ -63,10 +63,22 @@ GemuDisplay *gemu_display_create(GemuDisplayType type,
     case GEMU_DISPLAY_GTK:
         return gemu_display_gtk_create(cfg);
 #endif
-#ifdef HAVE_CACA
-    case GEMU_DISPLAY_CURSES:
-        return gemu_display_caca_create(cfg);
+    case GEMU_DISPLAY_CURSES: {
+#ifndef _WIN32
+        /* Default: built-in ANSI truecolor half-block renderer (pixterm
+         * style).  GEMU_CURSES=caca selects the legacy libcaca dither, and
+         * text-terminal machines keep their plain selectable-text path. */
+        const char *env = getenv("GEMU_CURSES");
+        bool want_caca = env && strcmp(env, "caca") == 0;
+        if (!cfg->terminal_text && !want_caca)
+            return gemu_display_term_create(cfg);
 #endif
+#ifdef HAVE_CACA
+        return gemu_display_caca_create(cfg);
+#else
+        return NULL;
+#endif
+    }
     default:
         return NULL;
     }
@@ -80,6 +92,10 @@ void gemu_display_destroy(GemuDisplay *d) {
 
 void gemu_display_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
     if (d && argb) d->do_render(d, argb, w, h);
+}
+
+void gemu_display_render_text(GemuDisplay *d, const char *text, int rows, int cols) {
+    if (d && text && d->do_render_text) d->do_render_text(d, text, rows, cols);
 }
 
 void gemu_display_set_paused(GemuDisplay *d, bool paused) {

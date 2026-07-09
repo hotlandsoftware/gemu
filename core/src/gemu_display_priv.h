@@ -26,6 +26,7 @@ struct GemuDisplay {
 
     /* Backend vtable */
     void     (*do_render)     (struct GemuDisplay *, const uint32_t *, int, int);
+    void     (*do_render_text)(struct GemuDisplay *, const char *, int, int);
     uint32_t (*do_poll)       (struct GemuDisplay *);  /* returns new held mask */
     bool     (*do_is_key_held)(struct GemuDisplay *, const char *);
     void     (*do_reset_input_bindings)(struct GemuDisplay *);
@@ -41,6 +42,9 @@ GemuDisplay *gemu_display_gtk_create (const GemuDisplayConfig *cfg);
 #endif
 #ifdef HAVE_CACA
 GemuDisplay *gemu_display_caca_create(const GemuDisplayConfig *cfg);
+#endif
+#ifndef _WIN32
+GemuDisplay *gemu_display_term_create(const GemuDisplayConfig *cfg);
 #endif
 
 /* ── INI helper (implemented in gemu_display.c) ──────────────────────────── */

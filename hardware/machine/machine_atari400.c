@@ -181,6 +181,63 @@ static bool a400_screendump(void *ud, const char *path) {
                                 ANTIC_FB_W, ANTIC_FB_H);
 }
 
+static char a400_screen_to_ascii(uint8_t ch) {
+    ch &= 0x7Fu;
+    if (ch < 0x40) {
+        static const char *tab =
+            " !\"#$%&'()*+,-./0123456789:;<=>?"
+            "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_";
+        return tab[ch];
+    }
+    return ' ';
+}
+
+static void a400_render_curses_text(Atari400State *s) {
+    char out[24 * 40];
+    memset(out, ' ', sizeof(out));
+
+    uint16_t dl = s->antic.dlist;
+    uint16_t msc = 0;
+    int row = 0;
+    for (int safety = 0; safety < 1024 && row < 24; safety++) {
+        uint8_t op = a400_read(dl, s);
+        dl = (uint16_t)((dl & 0xFC00u) | ((dl + 1u) & 0x03FFu));
+        int mode = op & 0x0F;
+        if (mode == 0) continue;
+        if (mode == 1) {
+            uint8_t lo = a400_read(dl, s);
+            dl = (uint16_t)((dl & 0xFC00u) | ((dl + 1u) & 0x03FFu));
+            uint8_t hi = a400_read(dl, s);
+            if (op & 0x40) break;
+            dl = (uint16_t)(lo | ((uint16_t)hi << 8));
+            continue;
+        }
+        if (op & 0x40) {
+            uint8_t lo = a400_read(dl, s);
+            dl = (uint16_t)((dl & 0xFC00u) | ((dl + 1u) & 0x03FFu));
+            uint8_t hi = a400_read(dl, s);
+            dl = (uint16_t)((dl & 0xFC00u) | ((dl + 1u) & 0x03FFu));
+            msc = (uint16_t)(lo | ((uint16_t)hi << 8));
+        }
+
+        int cols = (mode == 6 || mode == 7) ? 20 : 40;
+        if ((mode >= 2 && mode <= 7) && row < 24) {
+            for (int col = 0; col < cols; col++) {
+                char c = a400_screen_to_ascii(a400_read(msc, s));
+                msc = (uint16_t)((msc & 0xF000u) | ((msc + 1u) & 0x0FFFu));
+                if (cols == 20) {
+                    out[row * 40 + col * 2] = c;
+                    out[row * 40 + col * 2 + 1] = ' ';
+                } else {
+                    out[row * 40 + col] = c;
+                }
+            }
+            row++;
+        }
+    }
+    gemu_display_render_text(s->display, out, 24, 40);
+}
+
 /* monitor: sendkey <text>  — queue each character (\n = Return) */
 static bool a400_sendkey_command(Atari400State *s, const char *text) {
     if (!text || strncmp(text, "sendkey ", 8) != 0) return false;
@@ -373,6 +430,7 @@ Atari400State *atari400_create(const MosConfig *cfg) {
             .actions     = a400_actions,
             .n_actions   = A400_NUM_ACTIONS,
             .ini_section = "atari400",
+            .terminal_text = cfg->display_type == GEMU_DISPLAY_CURSES,
         });
     }
 
@@ -469,9 +527,13 @@ void atari400_run(Atari400State *s, const MosConfig *cfg) {
             s->frame++;
         }
 
-        if (s->display)
-            gemu_display_render(s->display, s->antic.pixels_argb,
-                                ANTIC_FB_W, ANTIC_FB_H);
+        if (s->display) {
+            if (cfg->display_type == GEMU_DISPLAY_CURSES)
+                a400_render_curses_text(s);
+            else
+                gemu_display_render(s->display, s->antic.pixels_argb,
+                                    ANTIC_FB_W, ANTIC_FB_H);
+        }
         if (s->vnc)
             gemu_vnc_update(s->vnc, s->antic.pixels, ANTIC_FB_W, ANTIC_FB_H);
 

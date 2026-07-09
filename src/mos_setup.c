@@ -374,7 +374,8 @@ int mos_setup(int argc, char *argv[]) {
     char *rem[32]; int nrem = 0;
     if (!gemu_args_parse(argc, argv, &def, &args, &nrem, rem))
         return 1;
-    gemu_monitor_set_default(args.monitor_spec);
+    gemu_monitor_set_default((args.display_type == GEMU_DISPLAY_CURSES &&
+                              !args.monitor_spec) ? "none" : args.monitor_spec);
     cfg.devices_none = wants_no_default_devices(rem, nrem);
 
     if (args.machine) {
