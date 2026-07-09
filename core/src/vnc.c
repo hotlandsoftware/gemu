@@ -1,6 +1,8 @@
 #include "gemu/vnc.h"
-#include <openssl/rand.h>
-#include <openssl/des.h>
+#ifdef HAVE_CRYPTO
+#  include <openssl/rand.h>
+#  include <openssl/des.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -168,6 +170,7 @@ static void write_pixel(uint8_t *dst, uint32_t val, int bpp, bool be) {
 
 /* ── RFB handshake ───────────────────────────────────────────────────────── */
 
+#ifdef HAVE_CRYPTO
 static uint8_t reverse_bits(uint8_t v) {
     v = (uint8_t)(((v & 0xf0u) >> 4) | ((v & 0x0fu) << 4));
     v = (uint8_t)(((v & 0xccu) >> 2) | ((v & 0x33u) << 2));
@@ -213,6 +216,13 @@ static bool vnc_authenticate(GemuVncServer *vnc, sock_t fd) {
     if (!sendall(fd, &result, 4)) return false;
     return result == 0;
 }
+#else
+static bool vnc_authenticate(GemuVncServer *vnc, sock_t fd) {
+    /* Unreachable: without OpenSSL a password can never be set. */
+    (void)vnc; (void)fd;
+    return false;
+}
+#endif /* HAVE_CRYPTO */
 
 static bool vnc_handshake(GemuVncServer *vnc, sock_t fd) {
     if (!sendall(fd, "RFB 003.008\n", 12)) return false;
@@ -472,7 +482,7 @@ GemuVncServer *gemu_vnc_create(const char *addr, int fb_w, int fb_h) {
     } else {
         struct sockaddr_in sa = {0};
         sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
-        inet_pton(AF_INET, host, &sa.sin_addr);
+        sa.sin_addr.s_addr = inet_addr(host);   /* NT5-safe (inet_pton is Vista+) */
         if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
             perror("vnc: bind"); sock_close(lfd); return NULL;
         }
@@ -508,6 +518,17 @@ void gemu_vnc_set_colors(GemuVncServer *vnc, uint32_t fg_rgb, uint32_t bg_rgb) {
 
 void gemu_vnc_set_password(GemuVncServer *vnc, const char *password) {
     if (!vnc) return;
+#ifndef HAVE_CRYPTO
+    if (password && password[0]) {
+        fprintf(stderr, "vnc: built without OpenSSL — password auth "
+                        "unavailable, refusing connections\n");
+        pthread_mutex_lock(&vnc->lock);
+        vnc->password_set = true;   /* auth required but can never succeed */
+        vnc->password[0] = '\0';
+        pthread_mutex_unlock(&vnc->lock);
+        return;
+    }
+#endif
     pthread_mutex_lock(&vnc->lock);
     snprintf(vnc->password, sizeof(vnc->password), "%s", password ? password : "");
     vnc->password_set = vnc->password[0] != '\0';

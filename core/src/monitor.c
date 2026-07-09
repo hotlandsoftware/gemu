@@ -275,11 +275,15 @@ static bool monitor_open_telnet(GemuMonitor *mon) {
     if (strcmp(mon->telnet_host, "*") == 0 ||
         strcmp(mon->telnet_host, "0.0.0.0") == 0) {
         a.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else if (inet_pton(AF_INET, mon->telnet_host, &a.sin_addr) != 1) {
-        fprintf(stderr, "monitor: invalid listen host '%s'\n", mon->telnet_host);
-        sock_close(mon->listen_fd);
-        mon->listen_fd = INVALID_SOCK;
-        return false;
+    } else {
+        /* inet_addr instead of inet_pton: the latter is Vista+ on Windows */
+        a.sin_addr.s_addr = inet_addr(mon->telnet_host);
+        if (a.sin_addr.s_addr == INADDR_NONE) {
+            fprintf(stderr, "monitor: invalid listen host '%s'\n", mon->telnet_host);
+            sock_close(mon->listen_fd);
+            mon->listen_fd = INVALID_SOCK;
+            return false;
+        }
     }
 
     if (bind(mon->listen_fd, (struct sockaddr *)&a, sizeof(a)) < 0 ||

@@ -11,7 +11,8 @@ Options:
                        valid families: chip8, mos, rca
   --enable-gtk         build GTK3 UI (default: no)
   --disable-sdl        do not link SDL2 (rarely useful)
-  --disable-ttf        skip SDL2_ttf; VT100 terminal uses host stdin/stdout
+  --disable-ttf        skip SDL2_ttf
+  --disable-crypto     skip OpenSSL
   --cc=CC              C compiler (default: gcc)
   --extra-cflags=F     append extra compiler flags
   --extra-ldflags=F    append extra linker flags
@@ -327,6 +328,8 @@ def main():
     p.add_argument('--disable-sdl',   dest='sdl',  action='store_false')
     p.add_argument('--enable-ttf',    dest='ttf',  action='store_true',  default=True)
     p.add_argument('--disable-ttf',   dest='ttf',  action='store_false')
+    p.add_argument('--enable-crypto', dest='crypto', action='store_true',  default=True)
+    p.add_argument('--disable-crypto',dest='crypto', action='store_false')
     p.add_argument('--static',        action='store_true', default=False)
     p.add_argument('--debug',         action='store_true', default=False)
     p.add_argument('--cc',            default=os.environ.get('CC', 'gcc'))
@@ -489,12 +492,15 @@ def main():
                 curses_flags = ['-lncursesw']
 
     crypto_libs = []
-    if args.sdl:
+    have_crypto = False
+    if args.sdl and args.crypto:
         lf = pkg('libcrypto', '--libs', *pkg_flags)
         if check('OpenSSL libcrypto (VNC auth)', lf or ['-lcrypto']):
             crypto_libs = lf or ['-lcrypto']
+            have_crypto = True
         else:
-            die('OpenSSL libcrypto not found — install libssl-dev')
+            die('OpenSSL libcrypto not found — install libssl-dev '
+                'or pass --disable-crypto')
 
     print()
 
@@ -530,6 +536,7 @@ def main():
     if have_lua:     defs_list.append('HAVE_LUA')
     if have_sdl_image: defs_list.append('HAVE_SDL_IMAGE')
     if have_libzip:    defs_list.append('HAVE_LIBZIP')
+    if have_crypto:    defs_list.append('HAVE_CRYPTO')
     defs = ' '.join(f'-D{d}' for d in defs_list)
 
     cflags_parts = ['$CFLAGS_BASE', inc_flags] + sdl2_cflags

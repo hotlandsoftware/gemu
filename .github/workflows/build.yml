@@ -101,8 +101,14 @@ jobs:
             mingw-w64-i686-ninja
             mingw-w64-i686-python
 
+      # NT 5.2 (XP/2003/ReactOS) compatible build: no OpenSSL (it hard-imports
+      # Vista+ SRW locks), Windows headers pinned to 5.2 so Vista-only APIs
+      # fail at compile time, PE subsystem version set to 5.1.
       - name: Configure
-        run: python3 configure --target-list="chip8,mos,rca"
+        run: >-
+          python3 configure --target-list="chip8,mos,rca" --disable-crypto
+          --extra-cflags="-D_WIN32_WINNT=0x0502 -DWINVER=0x0502"
+          --extra-ldflags="-Wl,--major-subsystem-version=5 -Wl,--minor-subsystem-version=1"
 
       - name: Build
         run: ninja
@@ -126,6 +132,27 @@ jobs:
             done
           done
           echo "Bundled:"; ls -la bin/
+
+      - name: Verify NT 5.2 compatibility
+        # Fail loudly if any shipped binary statically imports a Vista+ API
+        # (GetProcAddress-style runtime lookups are fine and don't appear in
+        # the import table that objdump -p prints).
+        run: |
+          vista_apis='AcquireSRWLockExclusive|AcquireSRWLockShared|ReleaseSRWLockExclusive|ReleaseSRWLockShared|TryAcquireSRWLockExclusive|InitializeConditionVariable|SleepConditionVariableCS|SleepConditionVariableSRW|WakeConditionVariable|WakeAllConditionVariable|GetTickCount64|InitOnceExecuteOnce|inet_pton|inet_ntop|GetFileInformationByHandleEx|SetDefaultDllDirectories|AddDllDirectory|RegGetValueW|BCryptGenRandom|GetSystemTimePreciseAsFileTime'
+          rc=0
+          for f in bin/*.exe bin/*.dll; do
+            hits=$(objdump -p "$f" | grep -wE "($vista_apis)" || true)
+            if [ -n "$hits" ]; then
+              echo "ERROR: $f has Vista+ static imports:"; echo "$hits"
+              rc=1
+            fi
+            subsys=$(objdump -p "$f" | awk '/MajorSubsystemVersion/{print $2}')
+            if [ "${subsys:-0}" -gt 5 ] && [[ "$f" == *.exe ]]; then
+              echo "ERROR: $f MajorSubsystemVersion=$subsys (>5, will not load on NT5)"
+              rc=1
+            fi
+          done
+          exit $rc
 
       - name: Package
         shell: pwsh
