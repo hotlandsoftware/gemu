@@ -108,12 +108,24 @@ jobs:
         run: ninja
 
       - name: Gather runtime DLLs
+        # msys2's ldd is 64-bit and cannot trace i686 PE binaries, so walk
+        # the PE import tables with objdump instead (recursively, resolving
+        # against /mingw32/bin; system DLLs are not there and get skipped).
         run: |
-          for exe in bin/*.exe; do
-            { ldd "$exe" 2>/dev/null || true; } | awk '/mingw32/{print $3}' | while IFS= read -r dll; do
-              cp -n "$dll" bin/ 2>/dev/null || true
+          queue=(bin/*.exe)
+          seen=" "
+          while [ ${#queue[@]} -gt 0 ]; do
+            f="${queue[0]}"; queue=("${queue[@]:1}")
+            for dll in $(objdump -p "$f" | awk '/DLL Name:/{print $3}'); do
+              case "$seen" in *" $dll "*) continue;; esac
+              seen="$seen$dll "
+              if [ -f "/mingw32/bin/$dll" ]; then
+                cp -n "/mingw32/bin/$dll" bin/
+                queue+=("/mingw32/bin/$dll")
+              fi
             done
           done
+          echo "Bundled:"; ls -la bin/
 
       - name: Package
         shell: pwsh
