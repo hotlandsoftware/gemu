@@ -1,4 +1,6 @@
 <?xml version="1.0"?>
 <device name="keyboard" description="Generic ASCII/QWERTY keyboard">
+    <machine name="atari400"/>
+    <machine name="atari400a"/>
     <machine name="vip"/>
 </device>

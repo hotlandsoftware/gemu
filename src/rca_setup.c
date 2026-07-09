@@ -257,6 +257,10 @@ int rca_setup(int argc, char *argv[]) {
                                   (int)(sizeof devs / sizeof *devs));
                 return 0;
             }
+            if (strcmp(v, "none") == 0) {
+                cfg.keyboard = RCA_KEYBOARD_NONE;
+                continue;
+            }
             static const struct { const char *name; RcaKeyboardType kb; } rca_devs[] = {
                 {"vp601",      RCA_KEYBOARD_VP601},
                 {"vip-keypad", RCA_KEYBOARD_KEYPAD},

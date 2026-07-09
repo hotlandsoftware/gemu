@@ -184,6 +184,10 @@ static bool a400_screendump(void *ud, const char *path) {
 /* monitor: sendkey <text>  — queue each character (\n = Return) */
 static bool a400_sendkey_command(Atari400State *s, const char *text) {
     if (!text || strncmp(text, "sendkey ", 8) != 0) return false;
+    if (!s->cfg->generic_keyboard) {
+        printf("sendkey: keyboard device is not attached\n");
+        return true;
+    }
     for (const char *p = text + 8; *p; p++)
         a400_queue_char(s, *p == '\n' ? (uint32_t)'\r' : (uint32_t)*p);
     return true;
@@ -235,6 +239,7 @@ static void a400_poll_vnc(Atari400State *s) {
             else         s->vnc_console &= (uint8_t)~bit;
             continue;
         }
+        if (!s->cfg->generic_keyboard) continue;
         if (!ev.down) continue;
         switch (k) {
         case 0xFF0Du: case 0xFF8Du: a400_queue_char(s, '\r');  break;
@@ -404,10 +409,14 @@ void atari400_run(Atari400State *s, const MosConfig *cfg) {
                 a400_reset(s);
             }
             uint32_t cp;
-            while ((cp = gemu_display_pop_raw_key(s->display)) != 0)
+            while ((cp = gemu_display_pop_raw_key(s->display)) != 0) {
+                if (!s->cfg->generic_keyboard) continue;
                 a400_queue_char(s, cp);
-            a400_poll_cursor_keys(s);
-            if (gemu_display_last_pressed(s->display) & GEMU_ACTION(A400_ACT_BREAK))
+            }
+            if (s->cfg->generic_keyboard)
+                a400_poll_cursor_keys(s);
+            if (s->cfg->generic_keyboard &&
+                (gemu_display_last_pressed(s->display) & GEMU_ACTION(A400_ACT_BREAK)))
                 pokey_break_key(&s->pokey);
         }
         a400_poll_vnc(s);

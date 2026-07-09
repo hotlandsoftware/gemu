@@ -100,6 +100,8 @@ typedef struct MosConfig {
     bool            is_dendy;   /* Dendy Famiclone: NTSC-compatible PPU/APU within PAL 50 Hz */
     bool            is_arcade;  /* NES-based arcade cabinet (VS. System, etc.) — coin-op, DIP switches */
     bool            is_7mezzo;  /* MOS_MACHINE_MAGICFLY game variant: "7 e Mezzo" vs Magic Fly */
+    bool            devices_none;    /* -device none: suppress default input devices */
+    bool            generic_keyboard; /* -device keyboard: host ASCII/QWERTY keyboard */
     bool            kim_keyboard; /* KIM-1: -device kim-keypad → visual keypad overlay */
     bool            want_wozmon;  /* -device wozmon → patch wozmon into KIM-1 ROM at $1AA0 */
     bool            a1ci;         /* Apple I Cassette Interface attached */

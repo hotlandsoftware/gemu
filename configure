@@ -233,8 +233,11 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         root = ET.parse(path).getroot()
         name  = root.get('name')
         desc  = root.get('description', '')
-        mlist = [m.get('name') for m in root.findall('machine')]
-        mlist = [mn for mn in mlist if machine_family.get(mn, '') in active]
+        if root.get('scope') == 'all':
+            mlist = sorted(mn for mn, fam in machine_family.items() if fam in active)
+        else:
+            mlist = [m.get('name') for m in root.findall('machine')]
+            mlist = [mn for mn in mlist if machine_family.get(mn, '') in active]
         if not mlist:
             continue
         devices.append({'name': name, 'desc': desc, 'machines': mlist})

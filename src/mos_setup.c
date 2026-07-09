@@ -199,23 +199,48 @@ static bool parse_cg(const char *name, MosCharGenType *out) {
 
 static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
                           bool quiet) {
+    if (strcmp(name, "none") == 0) {
+        cfg->devices_none = true;
+        cfg->generic_keyboard = false;
+        cfg->kim_keyboard = false;
+        cfg->fds_enabled = false;
+        *want_vt100 = false;
+        cfg->want_wozmon = false;
+        cfg->a1ci = false;
+        cfg->n_ports = 0;
+        return true;
+    }
     if (strcmp(name, "fds") == 0) {
+        cfg->devices_none = false;
         cfg->fds_enabled = true;
         return true;
     }
     if (strcmp(name, "vt100") == 0) {
+        cfg->devices_none = false;
         *want_vt100 = true;
         return true;
     }
     if (strcmp(name, "wozmon") == 0) {
+        cfg->devices_none = false;
         cfg->want_wozmon = true;
         return true;
     }
     if (strcmp(name, "a1ci") == 0) {
+        cfg->devices_none = false;
         cfg->a1ci = true;
         return true;
     }
+    if (strcmp(name, "keyboard") == 0) {
+        if (cfg->machine != MOS_MACHINE_ATARI400) {
+            if (!quiet) fprintf(stderr, "gemu: -device keyboard is supported by atari400 only\n");
+            return false;
+        }
+        cfg->devices_none = false;
+        cfg->generic_keyboard = true;
+        return true;
+    }
     if (strcmp(name, "kim-keypad") == 0 || strcmp(name, "keypad") == 0) {
+        cfg->devices_none = false;
         cfg->kim_keyboard = true;
         return true;
     }
@@ -241,12 +266,14 @@ static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
         if (!quiet) fprintf(stderr, "gemu: all %d controller ports are already occupied\n", NES_PORTS);
         return false;
     }
+    cfg->devices_none = false;
     cfg->ports[cfg->n_ports++] = type;
     return true;
 }
 
 static bool attach_default_devices(MosConfig *cfg, bool *want_vt100,
                                    const char *devices) {
+    if (cfg->devices_none) return true;
     if (!devices || !devices[0]) return true;
     char buf[256];
     snprintf(buf, sizeof(buf), "%s", devices);
@@ -257,6 +284,13 @@ static bool attach_default_devices(MosConfig *cfg, bool *want_vt100,
             return false;
     }
     return true;
+}
+
+static bool wants_no_default_devices(char **rem, int nrem) {
+    for (int i = 0; i + 1 < nrem; i++)
+        if (strcmp(rem[i], "-device") == 0 && strcmp(rem[i + 1], "none") == 0)
+            return true;
+    return false;
 }
 
 /* ── ROM argument parsing ────────────────────────────────────────────────── */
@@ -341,6 +375,7 @@ int mos_setup(int argc, char *argv[]) {
     if (!gemu_args_parse(argc, argv, &def, &args, &nrem, rem))
         return 1;
     gemu_monitor_set_default(args.monitor_spec);
+    cfg.devices_none = wants_no_default_devices(rem, nrem);
 
     if (args.machine) {
         for (int i = 0; machine_defs[i].name; i++) {
@@ -552,9 +587,9 @@ int mos_setup(int argc, char *argv[]) {
     }
 
     if (cfg.machine == MOS_MACHINE_NES) {
-        if (cfg.n_ports == 0) {
+        if (!cfg.devices_none && cfg.n_ports == 0) {
             cfg.ports[cfg.n_ports++] = NES_DEVICE_CONTROLLER;
-        } else if (cfg.n_ports == 1 && cfg.ports[0] == NES_DEVICE_ZAPPER) {
+        } else if (!cfg.devices_none && cfg.n_ports == 1 && cfg.ports[0] == NES_DEVICE_ZAPPER) {
             cfg.ports[1] = NES_DEVICE_ZAPPER;
             cfg.ports[0] = NES_DEVICE_CONTROLLER;
             cfg.n_ports  = 2;
@@ -563,7 +598,7 @@ int mos_setup(int argc, char *argv[]) {
         /* SH6578 only wires up a single $4016 joypad shift register — no
          * second port, no zapper/keyboard latch like real NES — so just
          * default port 0 to a standard controller, same as NES does. */
-        if (cfg.n_ports == 0)
+        if (!cfg.devices_none && cfg.n_ports == 0)
             cfg.ports[cfg.n_ports++] = NES_DEVICE_CONTROLLER;
     }
 

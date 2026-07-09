@@ -1,6 +1,7 @@
 <?xml version="1.0"?>
 <machine name="atari400" family="mos" description="Atari 400 (6502 + ANTIC/GTIA/POKEY, OS rev B)"
          cpu="6502" tv="ntsc" ram="16K">
+    <device name="keyboard"/>
     <rom name="co12399b.rom" region="maincpu" addr="0xD800" sha256="b1f7774bad07e02e03ef53ece3c29a5b7546fe967a42a73d0a4f65ce6248bde7"/>
     <rom name="co12499b.rom" region="maincpu" addr="0xE000" sha256="7bb438a6f6f1d113acf314a9726aec4115869a87a22c0b03a472d4f71f1e5892"/>
     <rom name="co14599b.rom" region="maincpu" addr="0xF000" sha256="dbc3e97f9e9bbfd7632895f29584f0137aea4dc95f2430f04c8060fff5a6ca3b"/>
