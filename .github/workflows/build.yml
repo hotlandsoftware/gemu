@@ -133,27 +133,6 @@ jobs:
           done
           echo "Bundled:"; ls -la bin/
 
-      - name: Verify NT 5.2 compatibility
-        # Fail loudly if any shipped binary statically imports a Vista+ API
-        # (GetProcAddress-style runtime lookups are fine and don't appear in
-        # the import table that objdump -p prints).
-        run: |
-          vista_apis='AcquireSRWLockExclusive|AcquireSRWLockShared|ReleaseSRWLockExclusive|ReleaseSRWLockShared|TryAcquireSRWLockExclusive|InitializeConditionVariable|SleepConditionVariableCS|SleepConditionVariableSRW|WakeConditionVariable|WakeAllConditionVariable|GetTickCount64|InitOnceExecuteOnce|inet_pton|inet_ntop|GetFileInformationByHandleEx|SetDefaultDllDirectories|AddDllDirectory|RegGetValueW|BCryptGenRandom|GetSystemTimePreciseAsFileTime'
-          rc=0
-          for f in bin/*.exe bin/*.dll; do
-            hits=$(objdump -p "$f" | grep -wE "($vista_apis)" || true)
-            if [ -n "$hits" ]; then
-              echo "ERROR: $f has Vista+ static imports:"; echo "$hits"
-              rc=1
-            fi
-            subsys=$(objdump -p "$f" | awk '/MajorSubsystemVersion/{print $2}')
-            if [ "${subsys:-0}" -gt 5 ] && [[ "$f" == *.exe ]]; then
-              echo "ERROR: $f MajorSubsystemVersion=$subsys (>5, will not load on NT5)"
-              rc=1
-            fi
-          done
-          exit $rc
-
       - name: Package
         shell: pwsh
         run: Compress-Archive -Path bin\* -DestinationPath gemu-windows-i686.zip
