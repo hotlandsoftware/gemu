@@ -1,6 +1,11 @@
 #include "gemu/video.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#ifndef _WIN32
+#include <termios.h>
+#include <unistd.h>
+#endif
 #ifdef HAVE_SDL_IMAGE
 #include <SDL2/SDL_image.h>
 #endif
@@ -13,14 +18,47 @@ struct GemuVideoSdl {
     int             height;
     bool            software;
     bool            resizable;  /* true for scale-based windows (window_width==0) */
+#ifndef _WIN32
+    bool            termios_active;
+    struct termios  old_termios;
+#endif
     void          (*overlay_cb)(void *ud, SDL_Renderer *r, int pixel_scale);
     void           *overlay_ud;
 };
 
 static void gemu_video_sdl_clear(GemuVideoSdl *v);
 
+static bool video_sdl_is_kmsdrm(void) {
+    const char *driver = SDL_GetCurrentVideoDriver();
+    return driver && strcmp(driver, "KMSDRM") == 0;
+}
+
+static void video_sdl_mute_console_echo(GemuVideoSdl *v) {
+#ifndef _WIN32
+    if (!v || !isatty(STDIN_FILENO)) return;
+    struct termios tio;
+    if (tcgetattr(STDIN_FILENO, &v->old_termios) != 0) return;
+    tio = v->old_termios;
+    tio.c_lflag &= (tcflag_t)~ECHO;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &tio) == 0)
+        v->termios_active = true;
+#else
+    (void)v;
+#endif
+}
+
+static void video_sdl_restore_console(GemuVideoSdl *v) {
+#ifndef _WIN32
+    if (v && v->termios_active)
+        tcsetattr(STDIN_FILENO, TCSANOW, &v->old_termios);
+#else
+    (void)v;
+#endif
+}
+
 static void video_sdl_free(GemuVideoSdl *v) {
     if (!v) return;
+    video_sdl_restore_console(v);
     if (v->texture)  SDL_DestroyTexture(v->texture);
     if (v->renderer) SDL_DestroyRenderer(v->renderer);
     if (v->window)   SDL_DestroyWindow(v->window);
@@ -47,11 +85,25 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
     int ww = spec->window_width  > 0 ? spec->window_width  : spec->width;
     int wh = spec->window_height > 0 ? spec->window_height : spec->height;
     Uint32 win_flags = SDL_WINDOW_SHOWN | (v->resizable ? SDL_WINDOW_RESIZABLE : 0);
+    bool kmsdrm = video_sdl_is_kmsdrm();
+    int window_pos = kmsdrm ? SDL_WINDOWPOS_CENTERED_DISPLAY(0)
+                            : SDL_WINDOWPOS_CENTERED;
     v->window = SDL_CreateWindow(
         spec->title ? spec->title : "GEMU",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        window_pos, window_pos,
         ww, wh, win_flags);
     if (!v->window) goto fail;
+    if (kmsdrm) {
+        video_sdl_mute_console_echo(v);
+        SDL_RaiseWindow(v->window);
+        SDL_SetWindowGrab(v->window, SDL_TRUE);
+#if SDL_VERSION_ATLEAST(2, 0, 16)
+        SDL_SetWindowKeyboardGrab(v->window, SDL_TRUE);
+#endif
+#if SDL_VERSION_ATLEAST(2, 0, 5)
+        SDL_SetWindowInputFocus(v->window);
+#endif
+    }
 
 #ifdef HAVE_SDL_IMAGE
     /* Best-effort: gemu.png lives at the repo root, same as every other
