@@ -79,9 +79,9 @@ bool gemu_args_parse(int argc, char **argv,
 /*
  * Parse an "ADDR:FILE" or plain "FILE" argument.
  *
- * Returns  1: colon syntax found — *addr set from the hex/decimal prefix,
+ * Returns  1: colon syntax found - *addr set from the hex/decimal prefix,
  *             *path points to the character after the colon.
- * Returns  0: no colon — *addr is unchanged, *path == arg.
+ * Returns  0: no colon - *addr is unchanged, *path == arg.
  * Returns -1: malformed input (empty addr or empty path after colon);
  *             an error is printed to stderr using prog as the program name.
  */

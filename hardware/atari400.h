@@ -11,7 +11,7 @@
 #include <stdbool.h>
 
 /*
- * Atari 400 — 6502 @ 1.79 MHz, ANTIC + GTIA video, POKEY keyboard/sound,
+ * Atari 400 - 6502 @ 1.79 MHz, ANTIC + GTIA video, POKEY keyboard/sound,
  * 6520 PIA joystick ports, 10 KB OS ROM. Reference: MAME a400 driver,
  * Atari 400/800 OS listings (rev A/B), De Re Atari.
  *

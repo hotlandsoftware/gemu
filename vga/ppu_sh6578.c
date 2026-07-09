@@ -42,7 +42,7 @@ uint8_t ppu_sh6578_read(Sh6578Ppu *ppu, uint8_t reg) {
     case 4: /* OAMDATA */
         val = ppu->oam[ppu->oamaddr];
         break;
-    case 7: { /* PPUDATA — buffered read, delayed by one byte (no palette-in-space quirk here) */
+    case 7: { /* PPUDATA - buffered read, delayed by one byte (no palette-in-space quirk here) */
         val = ppu->read_buf;
         ppu->read_buf = ppu->vram[ppu->vram_addr];
         ppu->vram_addr = (uint16_t)(ppu->vram_addr + ((ppu->ppuctrl & PPUCTRL_VRAM_INC) ? 32 : 1));
@@ -68,7 +68,7 @@ void ppu_sh6578_write(Sh6578Ppu *ppu, uint8_t reg, uint8_t val) {
     case 3: /* OAMADDR */
         ppu->oamaddr = val;
         break;
-    case 4: /* OAMDATA — dropped while actively rendering, matching MAME's write_to_spriteram_with_increment */
+    case 4: /* OAMDATA - dropped while actively rendering, matching MAME's write_to_spriteram_with_increment */
         if (ppu->scanline > 239 || !(ppu->ppumask & (PPUMASK_SHOW_BG | PPUMASK_SHOW_SPR))) {
             ppu->oam[ppu->oamaddr] = val;
             ppu->oamaddr = (uint8_t)(ppu->oamaddr + 1);
@@ -83,7 +83,7 @@ void ppu_sh6578_write(Sh6578Ppu *ppu, uint8_t reg, uint8_t val) {
         }
         ppu->w = !ppu->w;
         break;
-    case 6: /* PPUADDR — full 16-bit here (SH6578 addresses up to 64KB of VRAM) */
+    case 6: /* PPUADDR - full 16-bit here (SH6578 addresses up to 64KB of VRAM) */
         if (ppu->w) {
             ppu->t = (uint16_t)((ppu->t & 0xFF00u) | val);
             ppu->v = ppu->t;

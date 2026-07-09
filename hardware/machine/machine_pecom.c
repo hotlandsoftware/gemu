@@ -289,7 +289,7 @@ RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg) {
     s->cpu.io_out    = pecom_io_out;
     s->cpu.q_out     = pecom_q_out;
     s->cpu.io_ud     = s;
-    /* on_sync not used — timing driven by pecom_video_timing in the run loop */
+    /* on_sync not used - timing driven by pecom_video_timing in the run loop */
 
     cdp1869_init(&s->vis);
     cdp1869_set_page_ram_mask(&s->vis, 0x3FFu);  /* 1 KB page RAM */

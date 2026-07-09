@@ -13,14 +13,14 @@ static const DispEntry display_table[] = {
     { GEMU_DISPLAY_SDL,    "sdl",    "SDL2 windowed display (hardware-accelerated)" },
     { GEMU_DISPLAY_GTK,    "gtk",    "GTK3 windowed display with menu bar" },
     { GEMU_DISPLAY_CURSES, "curses", "ncurses terminal (half-block Unicode characters)" },
-    { GEMU_DISPLAY_NONE,   "none",   "Headless — no display output (pair with -vnc)" },
+    { GEMU_DISPLAY_NONE,   "none",   "Headless - no display output (pair with -vnc)" },
 };
 #define N_DISPLAYS (int)(sizeof(display_table) / sizeof(display_table[0]))
 
 /* ── Help / listing helpers ──────────────────────────────────────────────── */
 
 static void print_usage(const GemuArgsDef *def) {
-    printf("GEMU v" GEMU_VERSION_STR " — Generic EMUlator\n"
+    printf("GEMU v" GEMU_VERSION_STR " - Generic EMUlator\n"
            "Usage: %s -M <machine> [options] [rom]\n\n"
            "Options:\n", def->prog);
     if (def->n_machines > 0)

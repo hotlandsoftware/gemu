@@ -10,7 +10,7 @@
 #include <stdbool.h>
 
 /*
- * IGS "Five Clown" (1993) — dual 6502 video poker arcade board.
+ * IGS "Five Clown" (1993) - dual 6502 video poker arcade board.
  * Hardware reference: MAME src/mame/igs/5clown.cpp.
  *
  * Main CPU memory map:

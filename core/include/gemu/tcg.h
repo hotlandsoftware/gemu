@@ -3,7 +3,7 @@
 #include <stddef.h>
 
 /*
- * Translation Block Cache — core of gemu's dynamic code translation.
+ * Translation Block Cache - core of gemu's dynamic code translation.
  *
  * Guest code is divided into basic blocks (TBs): a linear sequence of
  * instructions from a starting PC up to and including the first branch.

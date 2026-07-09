@@ -143,7 +143,7 @@ static bool parse_soundhw(const char *hw, MosSoundType *out, uint32_t *mask) {
     /* Composable arcade sound cards (QEMU -soundhw-style: comma-separated,
      * independently present chips that OR together, e.g. "ay8910,msm6295"
      * for 5clown's onboard PSG + ADPCM). Unlike the exact-string cases
-     * above, these don't replace *out — they only ever set *mask.
+     * above, these don't replace *out - they only ever set *mask.
      * "msm6295" is the official chip name; the source/internal symbols
      * still say OKI6295/okim6295.c (OKI is just the manufacturer). */
     char buf[128];
@@ -384,7 +384,7 @@ int mos_setup(int argc, char *argv[]) {
             const MachineDef *md = &machine_defs[i];
             const char *canon = md->canonical;
             /* ROM sets are registered per specific machine name (e.g.
-             * "vssmb"), not per canonical dispatch target (e.g. "nes") —
+             * "vssmb"), not per canonical dispatch target (e.g. "nes") -
              * aliased machines have their own distinct ROM sets even
              * though they share the same C code path. */
             romdb_machine = md->name;
@@ -596,8 +596,8 @@ int mos_setup(int argc, char *argv[]) {
             cfg.n_ports  = 2;
         }
     } else if (cfg.machine == MOS_MACHINE_UM6578) {
-        /* SH6578 only wires up a single $4016 joypad shift register — no
-         * second port, no zapper/keyboard latch like real NES — so just
+        /* SH6578 only wires up a single $4016 joypad shift register - no
+         * second port, no zapper/keyboard latch like real NES - so just
          * default port 0 to a standard controller, same as NES does. */
         if (!cfg.devices_none && cfg.n_ports == 0)
             cfg.ports[cfg.n_ports++] = NES_DEVICE_CONTROLLER;

@@ -10,7 +10,7 @@ struct GemuVideoGtk {
     GtkWidget       *window;
     GtkWidget       *gl_area;
     GtkWidget       *drawing_area;  /* kept for API compat */
-    uint32_t        *frame_argb;    /* staging buffer — new pixels land here */
+    uint32_t        *frame_argb;    /* staging buffer - new pixels land here */
     bool             frame_dirty;   /* frame_argb has a frame not yet uploaded */
     int              width;
     int              height;
@@ -166,7 +166,7 @@ static gboolean do_gtk_snap(gpointer data) {
 
     if (target_w == gl_w && target_h == gl_h) return G_SOURCE_REMOVE;
 
-    /* Resize window by the same delta the GL area needs to change — this
+    /* Resize window by the same delta the GL area needs to change - this
      * keeps the menu bar height out of the calculation entirely. */
     gtk_window_resize(GTK_WINDOW(v->window),
                       win_w + (target_w - gl_w),
@@ -211,7 +211,7 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *ctx, gpointer data) {
     GemuVideoGtk *v = data;
     if (!v->gl_ready) return TRUE;
 
-    /* Upload pending frame — must happen here where the GL context is current.
+    /* Upload pending frame - must happen here where the GL context is current.
      * GTK3 can leave GL_UNPACK_SKIP_ROWS non-zero after compositing widgets
      * in this same context; reset all unpack state so Mesa reads exactly the
      * right number of rows and doesn't overrun v->frame_argb. */
@@ -288,7 +288,7 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     gemu_gtk_add_action_menu(vbox, spec->monitor,
                               spec->hex_toggle_cb, spec->hex_toggle_ud);
 
-    /* GL area — must not be focusable: if it grabs focus, key events go to
+    /* GL area - must not be focusable: if it grabs focus, key events go to
      * the GL area (which has no key handler) and don't reliably propagate
      * back to the window where our on_key signal handler lives. */
     v->gl_area = gtk_gl_area_new();
@@ -313,7 +313,7 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     g_signal_connect(v->gl_area, "unrealize", G_CALLBACK(on_unrealize), v);
     g_signal_connect(v->gl_area, "render",    G_CALLBACK(on_render),    v);
 
-    /* For API compat — some callers expect a drawing_area widget */
+    /* For API compat - some callers expect a drawing_area widget */
     v->drawing_area = v->gl_area;
 
     gtk_widget_show_all(v->window);
@@ -329,7 +329,7 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
                           v->window_width,
                           v->window_height + (win_h - gl_h));
         gemu_video_gtk_poll();
-        /* Initial layout complete — future size-allocates are user resizes. */
+        /* Initial layout complete - future size-allocates are user resizes. */
         v->setup_done = true;
     }
 
@@ -350,7 +350,7 @@ void gemu_video_gtk_present_argb(GemuVideoGtk *v, const uint32_t *pixels,
     if (!v || !pixels || w != v->width || h != v->height || !v->gl_ready)
         return;
 
-    /* Stage the frame — upload happens in on_render where the GL context is
+    /* Stage the frame - upload happens in on_render where the GL context is
      * guaranteed to be current (GTK makes it current before the callback). */
     if (pixels != v->frame_argb)
         memcpy(v->frame_argb, pixels, (size_t)w * h * sizeof(*v->frame_argb));

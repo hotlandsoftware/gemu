@@ -1,4 +1,4 @@
-# GEMU — Generic EMUlator
+# GEMU - Generic EMUlator
 
 Single unified binary (`bin/gemu`) dispatching on `-M <machine>`. Three CPU
 families: CHIP-8, MOS 6502 (NES/KIM-1), RCA CDP1802 (COSMAC VIP / Studio II).
@@ -43,17 +43,17 @@ Run `./bin/gemu -M ?` for the full sorted list. Key entries:
 ./bin/gemu -M <machine> [options] [rom]
 ```
 
-- `-M ?` — list all machines
-- `-M <machine> -h` — machine-specific help and usage examples
-- `-device ?` — list all attachable devices (all families, alphabetical)
-- `-soundhw ?` — list all sound hardware options (all families)
-- `-rom [ADDR:]FILE` — load ROM image (or directory for SHA-256 scan)
-- `-cartridge FILE` — insert cartridge (NES .nes, Studio II)
-- `-tape [ADDR:]FILE` — load cassette tape (KIM-1, COSMAC VIP)
-- `-fda FILE` — Famicom Disk System image
-- `-m SIZE` — RAM size (e.g. `32K`, `1M`)
-- `-display TYPE` — sdl | gtk | curses | none
-- `-scale N` — window scale factor
+- `-M ?` - list all machines
+- `-M <machine> -h` - machine-specific help and usage examples
+- `-device ?` - list all attachable devices (all families, alphabetical)
+- `-soundhw ?` - list all sound hardware options (all families)
+- `-rom [ADDR:]FILE` - load ROM image (or directory for SHA-256 scan)
+- `-cartridge FILE` - insert cartridge (NES .nes, Studio II)
+- `-tape [ADDR:]FILE` - load cassette tape (KIM-1, COSMAC VIP)
+- `-fda FILE` - Famicom Disk System image
+- `-m SIZE` - RAM size (e.g. `32K`, `1M`)
+- `-display TYPE` - sdl | gtk | curses | none
+- `-scale N` - window scale factor
 
 ---
 
@@ -69,10 +69,10 @@ hardware/   Machine glue, devices, ROM databases
   nes_devices.c / kim_devices.c / vip_devices.c
   mos_romdb.c / rca_romdb.c
 src/        Entry points
-  main.c          — global -M dispatch, -device ?/-soundhw ? listing
-  chip8_setup.c   — CHIP-8 family setup
-  mos_setup.c     — MOS 6502 family setup
-  rca_setup.c     — RCA CDP1802 family setup
+  main.c          - global -M dispatch, -device ?/-soundhw ? listing
+  chip8_setup.c   - CHIP-8 family setup
+  mos_setup.c     - MOS 6502 family setup
+  rca_setup.c     - RCA CDP1802 family setup
 core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
 ```
 
@@ -80,15 +80,15 @@ core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
 
 ## Compile-time guards
 
-`HAVE_CHIP8`, `HAVE_MOS`, `HAVE_RCA` — set by configure based on
+`HAVE_CHIP8`, `HAVE_MOS`, `HAVE_RCA` - set by configure based on
 `--target-list`. Used in `src/main.c` and anywhere code is family-specific.
 
 ---
 
 ## Device / soundhw APIs
 
-- `nes_device_list()` / `kim_device_list()` — `hardware/nes_devices.h`, `hardware/kim_devices.h`
-- `rca_device_list()` / `rca_device_supported_machines()` — `hardware/vip_devices.h`
+- `nes_device_list()` / `kim_device_list()` - `hardware/nes_devices.h`, `hardware/kim_devices.h`
+- `rca_device_list()` / `rca_device_supported_machines()` - `hardware/vip_devices.h`
 - Cross-family listing: `list_all_devices()` / `list_all_soundhw()` in `src/main.c`
 
 ---

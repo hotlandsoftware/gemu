@@ -1,6 +1,6 @@
 #include "nes_lua.h"
-#include "input_menu.h"   /* gemu_font_glyph() — shared 6x8 bitmap font */
-#include "gemu/sha256.h"  /* rom.gethash() — SHA-256, not real FCEUX MD5 (see below) */
+#include "input_menu.h"   /* gemu_font_glyph() - shared 6x8 bitmap font */
+#include "gemu/sha256.h"  /* rom.gethash() - SHA-256, not real FCEUX MD5 (see below) */
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -17,7 +17,7 @@
 #define NES_LUA_MEM_HOOK_MAX 64
 
 /* NES controller shift-register bit order (hardware fact, not a GEMU
- * internal detail — kept in sync with NES_BTN_* in hardware/nes.h). */
+ * internal detail - kept in sync with NES_BTN_* in hardware/nes.h). */
 static const char   *joy_btn_names[8] = {
     "A", "B", "select", "start", "up", "down", "left", "right",
 };
@@ -31,10 +31,10 @@ typedef struct {
 } NesLuaMemHook;
 
 struct NesLua {
-    lua_State *L;       /* main state — owns globals, runs registerbefore/after */
+    lua_State *L;       /* main state - owns globals, runs registerbefore/after */
     lua_State *co;      /* coroutine running the script's top-level body */
     int        co_ref;  /* registry ref keeping the coroutine alive */
-    bool       finished; /* script body returned/errored — stop resuming it */
+    bool       finished; /* script body returned/errored - stop resuming it */
 
     NesLuaBus  bus;
 
@@ -55,11 +55,11 @@ struct NesLua {
     uint8_t joy_value[2];
     uint8_t last_ctrl_state[2]; /* what joypad.get() reports */
 
-    /* Valid only during nes_lua_run_frame()'s resume — gui.* draws here. */
+    /* Valid only during nes_lua_run_frame()'s resume - gui.* draws here. */
     uint32_t *draw_px;
     int       draw_w, draw_h;
 
-    /* rom.readbyte/readbytesigned/gethash — the raw cartridge file, header
+    /* rom.readbyte/readbytesigned/gethash - the raw cartridge file, header
      * included, loaded independently of NesState's parsed PRG/CHR banks. */
     uint8_t *rom_data;
     long     rom_size;
@@ -113,7 +113,7 @@ static int l_emu_framecount(lua_State *L) {
 }
 
 /* Stubs for the parts of emu/FCEU real scripts sometimes call but that need
- * host plumbing (pause/lifecycle/speed) we don't have hooked up yet — a
+ * host plumbing (pause/lifecycle/speed) we don't have hooked up yet - a
  * harmless no-op beats an "attempt to call nil" crash. */
 static int l_emu_noop(lua_State *L) { (void)L; return 0; }
 static int l_emu_false(lua_State *L) { lua_pushboolean(L, 0); return 1; }
@@ -123,7 +123,7 @@ static int l_emu_emptystr(lua_State *L) { lua_pushstring(L, ""); return 1; }
 static int l_print(lua_State *L) {
     int n = lua_gettop(L);
     fputs("[lua] ", stdout);
-    /* Route through the real Lua tostring() — lua_tostring() only converts
+    /* Route through the real Lua tostring() - lua_tostring() only converts
      * numbers/strings, but print() must also handle booleans, nil, tables
      * (and any __tostring metamethod) the way the language actually does. */
     lua_getglobal(L, "tostring");
@@ -241,7 +241,7 @@ static int l_rom_readbytesigned(lua_State *L) {
 
 /* Real FCEUX returns an MD5 hex digest; we don't carry an MD5 implementation,
  * so this returns a SHA-256 hex digest instead. Same purpose (a stable
- * per-ROM fingerprint script logic can compare against), different bytes —
+ * per-ROM fingerprint script logic can compare against), different bytes -
  * scripts hardcoding a real FCEUX MD5 string won't match this. */
 static int l_rom_gethash(lua_State *L) {
     NesLua *lua = CTX(L);
@@ -316,7 +316,7 @@ static int l_zapper_read(lua_State *L) {
     return 1;
 }
 
-/* ── input (FCEUX mouse/keyboard state, distinct from the zapper table —
+/* ── input (FCEUX mouse/keyboard state, distinct from the zapper table -
  * used by GUI-tool scripts like x_interface.lua for drag/click widgets
  * drawn with gui.*). We only have host mouse position + one click button
  * wired up (the same source as zapper.read()); right/middle click and
@@ -500,7 +500,7 @@ static int l_gui_box(lua_State *L) {
     for (int y = y1; y <= y2; y++) {
         for (int x = x1; x <= x2; x++) {
             bool edge = (x == x1 || x == x2 || y == y1 || y == y2);
-            /* With no separate outline color, fill covers the edges too —
+            /* With no separate outline color, fill covers the edges too -
              * e.g. gui.drawbox(x1,y1,x2,y2,"red") from real scripts expects
              * a solid box, not a filled interior with a transparent frame. */
             if (edge && has_outline) blend_pixel(lua, x, y, orgb, oalpha);
@@ -510,7 +510,7 @@ static int l_gui_box(lua_State *L) {
     return 0;
 }
 
-/* ── bit (Lua 5.1 has no bitwise operators — scripts rely on this) ─────────── */
+/* ── bit (Lua 5.1 has no bitwise operators - scripts rely on this) ─────────── */
 
 static int l_bit_band(lua_State *L) {
     int n = lua_gettop(L);
@@ -563,7 +563,7 @@ static void reg_plain(lua_State *L, int table_idx, const char *name, lua_CFuncti
     lua_setfield(L, table_idx, name);
 }
 
-/* Global AND/OR/XOR/BIT — the pre-"bit table" bitwise API older FCEUX
+/* Global AND/OR/XOR/BIT - the pre-"bit table" bitwise API older FCEUX
  * scripts use directly (variadic, per the official function list). */
 static int l_global_and(lua_State *L) { return l_bit_band(L); }
 static int l_global_or(lua_State *L)  { return l_bit_bor(L); }
@@ -601,7 +601,7 @@ static void register_api(lua_State *L, NesLua *lua) {
     reg_fn(L, emu, lua, "lagged",         l_emu_false);
     reg_fn(L, emu, lua, "getreadonly",    l_emu_false);
     /* poweron/softreset/speedmode/pause/message/setreadonly/setrenderplanes/
-     * setlagflag need host lifecycle plumbing we don't have yet — no-op
+     * setlagflag need host lifecycle plumbing we don't have yet - no-op
      * rather than crash. */
     reg_fn(L, emu, lua, "poweron",         l_emu_noop);
     reg_fn(L, emu, lua, "softreset",       l_emu_noop);
@@ -613,7 +613,7 @@ static void register_api(lua_State *L, NesLua *lua) {
     reg_fn(L, emu, lua, "setlagflag",      l_emu_noop);
     lua_setglobal(L, "emu");
 
-    /* FCEU.* is the pre-rebrand name for the same table — old scripts use
+    /* FCEU.* is the pre-rebrand name for the same table - old scripts use
      * it interchangeably with emu.*. */
     lua_getglobal(L, "emu");
     lua_setglobal(L, "FCEU");
@@ -706,7 +706,7 @@ static void register_api(lua_State *L, NesLua *lua) {
 
 /* Real FCEUX scripts routinely require() sibling helper modules that live
  * next to the main script, not next to wherever gemu happens to be run
- * from — so prepend the script's own directory to package.path. */
+ * from - so prepend the script's own directory to package.path. */
 static void add_script_dir_to_package_path(lua_State *L, const char *script_path) {
     const char *slash = strrchr(script_path, '/');
 #ifdef _WIN32

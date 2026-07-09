@@ -25,7 +25,7 @@ MidiOut *midi_out_open(void) {
     MIDIOUTCAPSA caps = {0};
     /* MIDI_MAPPER resolves to some device; show which one */
     if (ndevs > 0 && midiOutGetDevCapsA(MIDI_MAPPER, &caps, sizeof caps) == MMSYSERR_NOERROR)
-        fprintf(stderr, "midi: Windows MIDI out open — %s\n", caps.szPname);
+        fprintf(stderr, "midi: Windows MIDI out open - %s\n", caps.szPname);
     else
         fprintf(stderr, "midi: Windows MIDI out open\n");
 

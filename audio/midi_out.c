@@ -23,7 +23,7 @@ MidiOut *midi_out_open(void) {
         fprintf(stderr, "midi: port creation failed\n");
         snd_seq_close(m->seq); free(m); return NULL;
     }
-    fprintf(stderr, "midi: ALSA %d:0 ready — connect with:  aconnect %d:0 <synth:port>\n",
+    fprintf(stderr, "midi: ALSA %d:0 ready - connect with:  aconnect %d:0 <synth:port>\n",
             snd_seq_client_id(m->seq), snd_seq_client_id(m->seq));
     return m;
 }

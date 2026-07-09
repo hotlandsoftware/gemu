@@ -13,7 +13,7 @@
 } while (0)
 
 void fds_hle_build_rom(FdsState *f) {
-    /* Fill with RTS — games that JSR to unimplemented BIOS entries return cleanly */
+    /* Fill with RTS - games that JSR to unimplemented BIOS entries return cleanly */
     memset(f->bios, 0x60, FDS_BIOS_SIZE);
 
     /* ── NMI handler @ $E18B ──
@@ -121,14 +121,14 @@ void fds_hle_build_rom(FdsState *f) {
     );
 
     /* ── $E7A3: BIOS read one byte from disk (called in DATA mode) ──
-     * Real BIOS: IRQ-driven — JSR $E7A3 parks here, IRQ fires on transfer_flag,
+     * Real BIOS: IRQ-driven - JSR $E7A3 parks here, IRQ fires on transfer_flag,
      * IRQ handler does PLA/PLA/PLA to unwind both frames, then RTS to caller.
-     * HLE: synchronous — read $4031 directly, return byte in A.
+     * HLE: synchronous - read $4031 directly, return byte in A.
      * This avoids the IRQ stack-frame dance entirely. */
     ROM(0xE7A3,
-        0xAE, 0x31, 0x40,   /* LDX $4031  — read disk byte (clears transfer_flag) */
-        0x8D, 0x24, 0x40,   /* STA $4024  — echo write byte (nop in read mode) */
-        0x8A,               /* TXA        — result byte into A */
+        0xAE, 0x31, 0x40,   /* LDX $4031  - read disk byte (clears transfer_flag) */
+        0x8D, 0x24, 0x40,   /* STA $4024  - echo write byte (nop in read mode) */
+        0x8A,               /* TXA        - result byte into A */
         0x60                /* RTS */
     );
 
@@ -152,7 +152,7 @@ static void load_side(FdsState *f, uint8_t side, uint8_t *chr_ram) {
         return;
     }
     /* Print game name (bytes 16-19) */
-    fprintf(stderr, "fds-hle: side %u — %.4s\n", side, (char *)p + 16);
+    fprintf(stderr, "fds-hle: side %u - %.4s\n", side, (char *)p + 16);
     off += 56;
 
     /* Block $02: file count (2 bytes) */
@@ -194,7 +194,7 @@ static void load_side(FdsState *f, uint8_t side, uint8_t *chr_ram) {
                 fprintf(stderr, "fds-hle:   prg $%04X + $%04X bytes\n",
                         load_addr, file_size);
             } else {
-                fprintf(stderr, "fds-hle:   prg $%04X + $%04X — out of range, skip\n",
+                fprintf(stderr, "fds-hle:   prg $%04X + $%04X - out of range, skip\n",
                         load_addr, file_size);
             }
         } else if (file_type == 1) {

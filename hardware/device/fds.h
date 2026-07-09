@@ -19,7 +19,7 @@ typedef struct {
     uint32_t disk_change_cycles; /* transient no-disk pulse after side flip */
     bool     hle_mode;    /* true = no BIOS ROM, stub installed, files pre-loaded */
 
-    /* Timer IRQ — $4020/$4021 latch, $4022 control */
+    /* Timer IRQ - $4020/$4021 latch, $4022 control */
     uint16_t timer_latch;
     uint16_t timer_ctr;
     bool     timer_enabled;

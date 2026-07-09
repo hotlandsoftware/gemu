@@ -448,7 +448,7 @@ static bool ines_load(NesState *s, const char *path) {
 
     fclose(f);
     snprintf(s->cart_path_buf, sizeof(s->cart_path_buf), "%s", path);
-    printf("nes: loaded '%s' — mapper %u, %u×16KB PRG, %u×8KB CHR%s\n",
+    printf("nes: loaded '%s' - mapper %u, %u×16KB PRG, %u×8KB CHR%s\n",
            path, s->cart.mapper,
            s->cart.prg_banks, s->cart.chr_banks,
            s->chr_is_ram ? " (RAM)" : "");
@@ -621,7 +621,7 @@ static void m178_update_banks(NesState *s) {
         s->prg_offsets[0] = (outer + inner) % prg_size;
         s->prg_offsets[1] = (outer + inner) % prg_size;
         break;
-    default: /* mode 3: UNROM variant — treat as mode 1 */
+    default: /* mode 3: UNROM variant - treat as mode 1 */
         s->prg_offsets[0] = (outer + inner) % prg_size;
         s->prg_offsets[1] = (outer + 7u * 0x4000u) % prg_size;
         break;
@@ -952,7 +952,7 @@ static uint8_t nes_chr_read(uint16_t addr, void *ud) {
         return s->chr[s->mmc3_chr_offsets[addr >> 10] + (addr & 0x3FFu)];
     if (s->cart.mapper == 9) {
         /* MMC2: 4 KB CHR windows with latch-based bank selection.
-         * Latch updates AFTER the fetch — the triggering tile ($FD/$FE)
+         * Latch updates AFTER the fetch - the triggering tile ($FD/$FE)
          * renders with the old bank; the new bank takes effect next fetch. */
         if (s->chr_is_ram) return s->chr[addr & 0x1FFF];
         bool     is_right = (addr & 0x1000u) != 0;
@@ -1441,7 +1441,7 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
         case 0x4800: s->m178_mode   = val; break;
         case 0x4801: s->m178_prg_lo = val; break;
         case 0x4802: s->m178_prg_hi = val; break;
-        default: break; /* $4803: PRG-RAM bank — stored implicitly, single 8KB bank only */
+        default: break; /* $4803: PRG-RAM bank - stored implicitly, single 8KB bank only */
         }
         m178_update_banks(s);
         return;
@@ -1451,7 +1451,7 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
     if (s->cart.mapper == 5 && addr >= 0x5000 && addr < 0x6000) {
         if (addr == 0x5100) { s->mmc5_prg_mode = val & 3u; mmc5_update_prg_banks(s); return; }
         if (addr == 0x5101) { s->mmc5_chr_mode = val & 3u; return; }
-        /* $5102/$5103: PRG-RAM protect — always allow writes (not enforced) */
+        /* $5102/$5103: PRG-RAM protect - always allow writes (not enforced) */
         if (addr == 0x5104) { s->mmc5_exram_mode = val & 3u; return; }
         if (addr == 0x5105) { s->mmc5_nt_map = val; return; }
         if (addr == 0x5106) { s->mmc5_fill_tile = val; return; }
@@ -1551,7 +1551,7 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
                                                : RP2C02_MIRROR_SINGLE_A;
         }
         else if (s->cart.mapper == 228) {
-            /* Action 52 — NESdev register layout (address + data bus):
+            /* Action 52 - NESdev register layout (address + data bus):
              *   FEDCBA98 76543210  (full 16-bit address)
              *   1.MHHPPP PPS.CCCC
              * D(13)=mirror  C:B(12:11)=chip-sel  A→6(10:6)=page(5-bit)
@@ -1564,7 +1564,7 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
             uint8_t mirror   = (uint8_t)((addr >> 13) & 1u);
             uint8_t chr_bank = (uint8_t)((chr_hi << 2) | (val & 3u));
 
-            if (chip == 2u) return; /* open bus — no PRG chip, ignore */
+            if (chip == 2u) return; /* open bus - no PRG chip, ignore */
 
             uint32_t global_bank = (chip == 3u) ? (64u + page)
                                                  : ((uint32_t)chip * 32u + page);
@@ -1617,7 +1617,7 @@ static void nes_lua_get_zapper(void *ud, int *x, int *y, int *click) {
     *x = s->zapper_x;
     *y = s->zapper_y;
     /* Report the live mouse-button state, not the Zapper's decaying 10-frame
-     * hardware trigger pulse (nes_handle_keys()) — a Lua drag-and-drop
+     * hardware trigger pulse (nes_handle_keys()) - a Lua drag-and-drop
      * script needs "still held" to stay true for as long as the button is
      * actually down, not just the first 10 frames of the click. */
     GemuPointerState ptr = gemu_display_get_pointer(s->display);
@@ -1819,7 +1819,7 @@ static void nes_handle_keys(NesState *s, uint32_t held) {
         s->zapper_y = ptr.y;
         if (s->cfg->ports[1] == NES_DEVICE_ZAPPER) {
             /* Real light-gun games need the trigger held "on" for a short
-             * pulse for the CRT light-sensing to register — a single-frame
+             * pulse for the CRT light-sensing to register - a single-frame
              * click would be invisible to the game's polling loop. */
             if (ptr.button && s->zapper_trigger_ttl == 0)
                 s->zapper_trigger_ttl = 10; /* 10-frame trigger pulse */
@@ -2175,7 +2175,7 @@ NesState *nes_create(const MosConfig *cfg) {
             if (cfg->is_arcade && cfg->n_roms > 0) {
                 if (!nes_arcade_assemble(s, cfg)) { free(s); return NULL; }
             } else {
-                fprintf(stderr, "nes: no cartridge specified — use -cartridge FILE.nes\n");
+                fprintf(stderr, "nes: no cartridge specified - use -cartridge FILE.nes\n");
                 free(s); return NULL;
             }
         } else {
@@ -2202,7 +2202,7 @@ NesState *nes_create(const MosConfig *cfg) {
     s->cpu.decimal_disable = (cfg->cpu == MOS_CPU_2A03 ||
                               cfg->cpu == MOS_CPU_2A07);
 
-    /* APU — only initialise when sound is enabled */
+    /* APU - only initialise when sound is enabled */
     if (cfg->sound == MOS_SOUND_2A03) {
         uint32_t apu_clock = cfg->cpu == MOS_CPU_2A07 ? 1662607u : 1789773u;
         if (!apu2a03_init(&s->apu, apu_clock))

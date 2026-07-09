@@ -1,4 +1,4 @@
-/* octo.c — Octo (.8o) assembler for gemu-chip8 */
+/* octo.c - Octo (.8o) assembler for gemu-chip8 */
 
 #include "octo.h"
 #include <ctype.h>

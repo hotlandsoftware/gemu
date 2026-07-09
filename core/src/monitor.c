@@ -1265,7 +1265,7 @@ void gemu_monitor_destroy(GemuMonitor *mon) {
     if (!mon) return;
     gemu_monitor_stop(mon);
     if (mon->thread_abandoned)
-        return;   /* reader may still touch mon — leak it, we're exiting */
+        return;   /* reader may still touch mon - leak it, we're exiting */
     pthread_mutex_destroy(&mon->lock);
     free(mon);
 }
@@ -1343,7 +1343,7 @@ void gemu_monitor_stop(GemuMonitor *mon) {
     }
 #ifdef _WIN32
     /* pthread_cancel doesn't interrupt fgets(stdin) on Windows.
-     * Inject a synthetic Enter keypress (down+up, '\r' — the console's
+     * Inject a synthetic Enter keypress (down+up, '\r' - the console's
      * cooked line reader completes on carriage return, not linefeed) so
      * the stdio loop unblocks, sees mon->running == false, and exits. */
     if (mon->backend == MON_BACKEND_STDIO) {
@@ -1360,7 +1360,7 @@ void gemu_monitor_stop(GemuMonitor *mon) {
     }
     /* A console read can't be forcibly cancelled on Windows.  Give the
      * reader a moment to notice, then abandon the thread rather than hang
-     * the shutdown path — the process is exiting and will reclaim it. */
+     * the shutdown path - the process is exiting and will reclaim it. */
     for (int i = 0; i < 50 && !mon->thread_done; i++)
         gemu_sleep_ms(10);
     if (mon->thread_done) {

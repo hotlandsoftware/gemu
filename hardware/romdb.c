@@ -36,7 +36,7 @@ void romdb_print_needed(const char *machine_alias) {
         found = true;
     }
     if (!found)
-        fprintf(stderr, "    (no entries in database — use -rom ADDR:FILE)\n");
+        fprintf(stderr, "    (no entries in database - use -rom ADDR:FILE)\n");
     fprintf(stderr, "  Or point at a directory:  -rom /path/to/roms/\n");
 #ifdef HAVE_LIBZIP
     fprintf(stderr, "  Or a zip file:            -rom /path/to/roms.zip\n");
@@ -44,7 +44,7 @@ void romdb_print_needed(const char *machine_alias) {
 }
 
 #ifdef HAVE_LIBZIP
-/* Extracted once per -rom FILE.zip, cleaned up on normal process exit —
+/* Extracted once per -rom FILE.zip, cleaned up on normal process exit -
  * the extracted paths need to outlive this function (the machine's own
  * create() reads them later, after ROM-database matching is done). */
 static char zip_tmpdir[64];
@@ -67,7 +67,7 @@ static void romdb_zip_cleanup(void) {
     zip_tmpdir_active = false;
 }
 
-/* Extracts every regular file in the zip to a fresh temp directory (flat —
+/* Extracts every regular file in the zip to a fresh temp directory (flat -
  * subfolder structure inside the zip, if any, is discarded) and returns
  * that directory's path, or NULL on failure. */
 static const char *romdb_extract_zip(const char *zip_path) {

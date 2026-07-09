@@ -19,7 +19,7 @@ void romdb_print_needed(const char *machine_alias);
 /* Scan dir for files whose SHA256 matches machine_alias in the database.
  * Calls fn(path, region, addr, ud) for each match; fn returns false to stop early.
  * Returns number of successful fn calls, or -1 on directory/zip open error.
- * dir may also be a .zip file (see romdb_is_zip) when built with libzip —
+ * dir may also be a .zip file (see romdb_is_zip) when built with libzip -
  * its contents are extracted to a temp directory first, transparently. */
 typedef bool (*RomDbAddFn)(const char *path, const char *region, uint32_t addr, void *ud);
 int romdb_load_dir(const char *dir, const char *machine, RomDbAddFn fn, void *ud);

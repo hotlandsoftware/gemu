@@ -124,7 +124,7 @@ static gboolean on_key(GtkWidget *w, GdkEventKey *ev, gpointer ud) {
         return TRUE;
     }
 
-    /* Key not in action table — still update raw queue for VP-601 mode */
+    /* Key not in action table - still update raw queue for VP-601 mode */
     if (down) {
         guint32 ucp = gdk_keyval_to_unicode(ev->keyval);
         if (ucp >= 0x20 && ucp != 0x7f)

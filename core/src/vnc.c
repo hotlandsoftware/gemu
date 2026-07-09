@@ -452,7 +452,7 @@ GemuVncServer *gemu_vnc_create(const char *addr, int fb_w, int fb_h) {
     bool unix_socket = false;
     char unix_path[108];
     if (!parse_vnc_addr(addr, host, &port, &unix_socket, unix_path)) {
-        fprintf(stderr, "vnc: bad address '%s' — use host:N, :N, or unix:/path\n", addr); return NULL;
+        fprintf(stderr, "vnc: bad address '%s' - use host:N, :N, or unix:/path\n", addr); return NULL;
     }
 #ifdef _WIN32
     { WSADATA d; WSAStartup(MAKEWORD(2, 2), &d); }
@@ -520,7 +520,7 @@ void gemu_vnc_set_password(GemuVncServer *vnc, const char *password) {
     if (!vnc) return;
 #ifndef HAVE_CRYPTO
     if (password && password[0]) {
-        fprintf(stderr, "vnc: built without OpenSSL — password auth "
+        fprintf(stderr, "vnc: built without OpenSSL - password auth "
                         "unavailable, refusing connections\n");
         pthread_mutex_lock(&vnc->lock);
         vnc->password_set = true;   /* auth required but can never succeed */

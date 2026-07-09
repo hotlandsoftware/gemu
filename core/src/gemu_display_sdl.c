@@ -233,7 +233,7 @@ static uint32_t sdl_to_raw(SDL_Keycode kc) {
 
 static void sdl_do_set_title(GemuDisplay *d, const char *title);
 
-/* Reflect mouse-capture state in the window title — capturing hides the OS
+/* Reflect mouse-capture state in the window title - capturing hides the OS
  * cursor and grabs it, which is confusing without a visible hint for how to
  * get it back. */
 static void sdl_update_capture_title(GemuDisplay *d, SdlBackend *b) {
@@ -323,7 +323,7 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             if (ev.window.event == SDL_WINDOWEVENT_CLOSE) {
                 /* Only quit if it's the main (NES) window being closed.
                  * Closing a secondary window (e.g. ROB display) must not
-                 * terminate the emulator — that window handles itself. */
+                 * terminate the emulator - that window handles itself. */
                 SDL_Window *main_win = gemu_video_sdl_get_window(b->video);
                 if (!main_win ||
                     ev.window.windowID == SDL_GetWindowID(main_win))
@@ -603,7 +603,7 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
 
 #ifdef _WIN32
     /* Attach a native Win32 menu bar: File > Reset / Quit, and (when the
-     * machine provides one — see GemuDisplayGtkExtras) Debug > Hex Editor.
+     * machine provides one - see GemuDisplayGtkExtras) Debug > Hex Editor.
      * The "gtk" name is historical: this struct predates the native Win32
      * menu and was originally GTK-only, but its fields are plain callbacks
      * that any backend can use. */

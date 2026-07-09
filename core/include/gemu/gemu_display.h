@@ -1,6 +1,6 @@
 #pragma once
 /*
- * GemuDisplay — unified display + input interface for all GEMU emulators.
+ * GemuDisplay - unified display + input interface for all GEMU emulators.
  *
  * DESIGN
  * ──────
@@ -8,7 +8,7 @@
  * (GemuActionDef[]). The display core maps physical keys to those actions
  * (defaults in the table, overrides from gemu.ini) and returns a uint32_t
  * bitmask each frame.  The machine never sees SDL keycodes, caca keycodes,
- * or GDK keysyms — only its own action bits.
+ * or GDK keysyms - only its own action bits.
  *
  * The machine always owns the run loop. gemu_display_poll() is non-blocking;
  * it drains the backend's event queue and returns the current action bitmask.
@@ -98,7 +98,7 @@ typedef struct {
     bool                 capture_pointer; /* SDL: VM-style relative mouse capture */
     bool                 terminal_text;   /* curses: plain selectable ANSI text */
 
-    /* GTK extras — NULL for non-GTK builds / backends */
+    /* GTK extras - NULL for non-GTK builds / backends */
     const GemuDisplayGtkExtras *gtk;
 } GemuDisplayConfig;
 
@@ -185,7 +185,7 @@ uint32_t gemu_display_pop_raw_key(GemuDisplay *d);
  * the same SDL key-name vocabulary as GemuActionDef.default_key ("a", "Return",
  * "Left Shift", "Home", "Escape", …).
  *
- * SDL backend: queries SDL_GetKeyboardState() — always accurate after poll().
+ * SDL backend: queries SDL_GetKeyboardState() - always accurate after poll().
  * Other backends: return false (they don't support arbitrary key queries).
  *
  * Intended for machines with large keyboards that don't fit in 32 action bits

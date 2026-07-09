@@ -1,5 +1,5 @@
 /*
- * Atari 400 machine — see hardware/atari400.h for the memory map and the
+ * Atari 400 machine - see hardware/atari400.h for the memory map and the
  * modelling scope of each chip.
  */
 #include "atari400.h"
@@ -53,7 +53,7 @@ static uint8_t a400_char_to_code(uint32_t cp) {
 
 static void a400_queue_key(Atari400State *s, uint8_t code) {
     int next = (s->keyq_tail + 1) % A400_KEYQ_LEN;
-    if (next == s->keyq_head) return;    /* queue full — drop */
+    if (next == s->keyq_head) return;    /* queue full - drop */
     s->keyq[s->keyq_tail] = code;
     s->keyq_tail = next;
 }
@@ -238,7 +238,7 @@ static void a400_render_curses_text(Atari400State *s) {
     gemu_display_render_text(s->display, out, 24, 40);
 }
 
-/* monitor: sendkey <text>  — queue each character (\n = Return) */
+/* monitor: sendkey <text>  - queue each character (\n = Return) */
 static bool a400_sendkey_command(Atari400State *s, const char *text) {
     if (!text || strncmp(text, "sendkey ", 8) != 0) return false;
     if (!s->cfg->generic_keyboard) {
@@ -388,7 +388,7 @@ Atari400State *atari400_create(const MosConfig *cfg) {
         if (addr >= 0xD800u) have_os = true;
     }
     if (!have_os) {
-        fprintf(stderr, "atari400: missing OS ROMs — use -rom roms/a400.zip\n");
+        fprintf(stderr, "atari400: missing OS ROMs - use -rom roms/a400.zip\n");
         free(s);
         return NULL;
     }

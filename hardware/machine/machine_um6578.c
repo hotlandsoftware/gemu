@@ -12,7 +12,7 @@
 /* ── Input action table ─────────────────────────────────────────────────── */
 
 /* Names/keys match nes_actions[] in machine_nes.c exactly (same physical
- * device, same gemu.ini [nes-controller] section — see .ini_section below). */
+ * device, same gemu.ini [nes-controller] section - see .ini_section below). */
 static const GemuActionDef um6578_actions[UM6578_NUM_ACTIONS] = {
     { "A",      GEMU_ACTION(UM6578_ACT_A),      "z"           },
     { "B",      GEMU_ACTION(UM6578_ACT_B),      "x"           },
@@ -25,7 +25,7 @@ static const GemuActionDef um6578_actions[UM6578_NUM_ACTIONS] = {
 };
 
 /* MAME's nes_sh6578 INPUT_PORTS: bit0=Button2(B), bit1=Button1(A), bit2=Select,
- * bit3=Start, bit4=Up, bit5=Down, bit6=Left, bit7=Right — all IP_ACTIVE_HIGH
+ * bit3=Start, bit4=Up, bit5=Down, bit6=Left, bit7=Right - all IP_ACTIVE_HIGH
  * (1 = pressed, shifted out directly, no inversion). */
 static uint8_t um6578_joypad_byte(uint32_t held) {
     uint8_t v = 0;
@@ -821,7 +821,7 @@ Um6578State *um6578_create(const MosConfig *cfg) {
         }
     }
     if (!rom_path) {
-        fprintf(stderr, "um6578: missing ROM — use -rom roms/um6578\n");
+        fprintf(stderr, "um6578: missing ROM - use -rom roms/um6578\n");
         free(s);
         return NULL;
     }
@@ -858,7 +858,7 @@ Um6578State *um6578_create(const MosConfig *cfg) {
     s->cpu.mem_read  = um6578_read;
     s->cpu.mem_write = um6578_write;
     s->cpu.mem_ud    = s;
-    /* real M6502 core on this hardware — decimal mode stays enabled
+    /* real M6502 core on this hardware - decimal mode stays enabled
      * (decimal_disable defaults false), unlike the NES's 2A03. */
 
     s->monitor = gemu_monitor_create();
@@ -882,7 +882,7 @@ Um6578State *um6578_create(const MosConfig *cfg) {
     }
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
-        /* Same physical device as NES's standard controller — share its
+        /* Same physical device as NES's standard controller - share its
          * gemu.ini section (and the "nes-controller" heading shown at the
          * top of the Tab key-binding overlay) rather than inventing a
          * separate, machine-specific one. */

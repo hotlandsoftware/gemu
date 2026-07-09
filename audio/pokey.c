@@ -9,7 +9,7 @@ void pokey_init(Pokey *p) {
 
 static uint8_t poly17_step(Pokey *p) {
     /* 17-bit LFSR, taps 17 and 12 (XNOR form used by POKEY). Step a full
-     * byte's worth of bits per read — callers only care that it varies. */
+     * byte's worth of bits per read - callers only care that it varies. */
     uint32_t s = p->poly17;
     for (int i = 0; i < 8; i++) {
         uint32_t bit = (~((s >> 16) ^ (s >> 11))) & 1u;
@@ -39,7 +39,7 @@ uint8_t pokey_read(Pokey *p, uint8_t reg) {
     case 0x08: return 0xFF;                /* ALLPOT: all absent pots complete */
     case 0x09: return p->kbcode;           /* KBCODE */
     case 0x0A: return poly17_step(p);      /* RANDOM */
-    case 0x0D: return 0;                   /* SERIN — line silent */
+    case 0x0D: return 0;                   /* SERIN - line silent */
     case 0x0E: return (uint8_t)~p->irq_pending;  /* IRQST, active low */
     case 0x0F: return p->skstat;           /* SKSTAT */
     default:   return 0xFF;
@@ -56,7 +56,7 @@ void pokey_write(Pokey *p, uint8_t reg, uint8_t v) {
     case 0x09: reload_timers(p); break;    /* STIMER */
     case 0x0A: p->skstat |= 0xE0; break;   /* SKRES */
     case 0x0B: break;                      /* POTGO */
-    case 0x0D:                             /* SEROUT — no attached SIO target */
+    case 0x0D:                             /* SEROUT - no attached SIO target */
         p->serout = v;
         p->irq_pending &= (uint8_t)~POKEY_IRQ_SEROC;
         p->irq_pending |= POKEY_IRQ_SEROR;

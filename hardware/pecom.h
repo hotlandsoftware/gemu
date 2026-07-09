@@ -12,24 +12,24 @@
 
 /*
  * Pecom 32 memory map:
- *   0x0000–0x7FFF  RAM bank 1 (32 KB)         — ram1[]
- *   0x8000–0xBFFF  ROM (16 KB, read-only)      — rom[0x0000-0x3FFF]
- *   0xC000–0xF3FF  RAM bank 2 (13 KB)          — ram2[]
- *   0xF400–0xF7FF  VIS-1870 char RAM           — cdp1869 char RAM
- *   0xF800–0xFFFF  VIS-1870 page RAM           — cdp1869 page RAM
+ *   0x0000–0x7FFF  RAM bank 1 (32 KB)         - ram1[]
+ *   0x8000–0xBFFF  ROM (16 KB, read-only)      - rom[0x0000-0x3FFF]
+ *   0xC000–0xF3FF  RAM bank 2 (13 KB)          - ram2[]
+ *   0xF400–0xF7FF  VIS-1870 char RAM           - cdp1869 char RAM
+ *   0xF800–0xFFFF  VIS-1870 page RAM           - cdp1869 page RAM
  *
  * Pecom 64 memory map:
- *   0x0000–0x7FFF  RAM (32 KB)                 — ram1[]
- *   0x8000–0xBFFF  ROM chip 1 (16 KB)          — rom[0x0000-0x3FFF]
- *   0xC000–0xF3FF  ROM chip 2 (13 KB visible)  — rom[0x4000-0x73FF]
- *   0xF400–0xF7FF  VIS-1870 char RAM           — cdp1869 char RAM
- *   0xF800–0xFFFF  VIS-1870 page RAM           — cdp1869 page RAM
+ *   0x0000–0x7FFF  RAM (32 KB)                 - ram1[]
+ *   0x8000–0xBFFF  ROM chip 1 (16 KB)          - rom[0x0000-0x3FFF]
+ *   0xC000–0xF3FF  ROM chip 2 (13 KB visible)  - rom[0x4000-0x73FF]
+ *   0xF400–0xF7FF  VIS-1870 char RAM           - cdp1869 char RAM
+ *   0xF800–0xFFFF  VIS-1870 page RAM           - cdp1869 page RAM
  *
  * Bootstrap: ROM also appears at 0x0000–0x3FFF on reset until OUT 1 fires.
  * rom_size discriminates variants: <= 0x4000 = Pecom 32, > 0x4000 = Pecom 64.
  */
-#define PECOM32_ROM_SIZE      0x4000u   /* 16 KB — Pecom 32 ROM / first chip */
-#define PECOM64_ROM_SIZE      0x8000u   /* 32 KB — Pecom 64 ROM (two chips)  */
+#define PECOM32_ROM_SIZE      0x4000u   /* 16 KB - Pecom 32 ROM / first chip */
+#define PECOM64_ROM_SIZE      0x8000u   /* 32 KB - Pecom 64 ROM (two chips)  */
 #define PECOM32_RAM1_SIZE     0x8000u   /* 32 KB: 0x0000–0x7FFF */
 #define PECOM32_RAM2_SIZE     0x4000u   /* 16 KB: 0xC000–0xFFFF (Pecom 32 only) */
 #define PECOM32_CRAM_BASE     0xF400u   /* VIS-1870 char RAM start */
@@ -61,7 +61,7 @@ typedef struct RcaPecom32State {
      * EF4 = ESC. */
     uint8_t  keys[64];      /* key matrix read by ROM: live | latch */
     uint8_t  keys_live[64]; /* VNC: current physical state (down=1, up=0) */
-    uint8_t  keys_latch[64];/* VNC: set on key-down, cleared each poll — ensures
+    uint8_t  keys_latch[64];/* VNC: set on key-down, cleared each poll - ensures
                              *  a fast tap (down+up in same frame) is held for
                              *  at least one CPU frame so the ROM scan sees it */
 

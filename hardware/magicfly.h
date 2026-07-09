@@ -9,7 +9,7 @@
 #include <stdbool.h>
 
 /*
- * "magicfly" hardware — single-6502 video poker/gambling arcade board.
+ * "magicfly" hardware - single-6502 video poker/gambling arcade board.
  * Hardware reference: MAME src/mame/misc/magicfly.cpp, shared by:
  *   - Magic Fly       (P&A Games, 198?)  -- MOS_MACHINE_MAGICFLY, is_7mezzo=false
  *   - 7 e Mezzo       (unknown, 198?)    -- MOS_MACHINE_MAGICFLY, is_7mezzo=true
@@ -19,7 +19,7 @@
  * differ only in: the input matrix (different games, different controls),
  * the tile-attribute color mask and boot-check mirror bit, and the fixed
  * palette. All of that is handled at runtime in machine_magicfly.c based on
- * cfg->is_7mezzo — see MosConfig in mos6502cfg.h.
+ * cfg->is_7mezzo - see MosConfig in mos6502cfg.h.
  *
  * Despite superficial similarity to 5clown (6502 + MC6845 + tile video +
  * gambling I/O), this is a genuinely different, simpler, unrelated board:
@@ -32,7 +32,7 @@
  *   $0801        CRTC register (r/w)
  *   $1000-$13FF  video RAM (32x29 tiles used out of a 1KB window)
  *   $1800-$1BFF  color RAM
- *   $2800        input port (read) — multiplexed by the low nibble last
+ *   $2800        input port (read) - multiplexed by the low nibble last
  *                written to $3000; selector 0 reads the DIP switches
  *   $3000        output port (write): bits0-3 = input selector,
  *                bit4=Coin2, bit5=Payout, bit6=Coin1, bit7=DAC bitstream
@@ -45,7 +45,7 @@
  * Video: 32x29 8x8 tiles = 256x232 visible pixels. Two disjoint GFX decode
  * regions built from the combined gfx2+gfx1+gfx0 ROM blob at load time: a
  * 1bpp "chars" bank and a 3bpp "tiles" bank (see machine_magicfly.c for the
- * exact byte ranges — verified against the driver's ROM_COPY statements).
+ * exact byte ranges - verified against the driver's ROM_COPY statements).
  */
 
 #define MAGICFLY_CPU_HZ            625000u
@@ -109,7 +109,7 @@ typedef struct MagicflyState {
     uint8_t  pixels_idx[MAGICFLY_FB_WIDTH * MAGICFLY_FB_HEIGHT]; /* for VNC */
 
     /* 1-bit delta-sigma bitstream DAC (bit7 of $3000). Not a "PC speaker"
-     * gated tone — the CPU shapes the actual waveform by toggling this bit
+     * gated tone - the CPU shapes the actual waveform by toggling this bit
      * at high rate, so it needs true sample-accurate zero-order-hold
      * resampling like audio/apu2a03.c and audio/okim6295.c, not the
      * fixed-frequency-gate model in audio/pcspk.c. Exposed to the user

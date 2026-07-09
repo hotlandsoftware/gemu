@@ -3,10 +3,10 @@
 #include <stdbool.h>
 
 /*
- * POKEY (Atari C012294) — keyboard / IRQ / random-number model.
+ * POKEY (Atari C012294) - keyboard / IRQ / random-number model.
  *
  * Scope: everything the Atari 400/800 OS needs to boot and take keyboard
- * input — KBCODE + keyboard/BREAK IRQs, IRQEN/IRQST semantics, the 17-bit
+ * input - KBCODE + keyboard/BREAK IRQs, IRQEN/IRQST semantics, the 17-bit
  * polynomial RANDOM register, SKSTAT shift/key-down bits, and just enough
  * serial-port behavior (SEROUT raises one-shot ready/complete IRQs) and
  * coarse timer IRQs for SIO's disk-boot attempt to run to its timeout instead

@@ -4,9 +4,9 @@
 
 /* FCEUX-Lua-subset scripting for the NES machine.
  *
- * This does not aim for full FCEUX API parity — no IUP GUI toolkit, no real
+ * This does not aim for full FCEUX API parity - no IUP GUI toolkit, no real
  * savestates, no movie recording/playback, no host keyboard/mouse polling
- * (input.*) — it covers the subset real-world scripts use most: memory
+ * (input.*) - it covers the subset real-world scripts use most: memory
  * peek/poke + read/write/exec watchpoints, joypad read/override, a small
  * per-frame drawing overlay (with FCEUX's string/hex color syntax), and the
  * emu.frameadvance()/registerbefore/registerafter callback styles scripts
@@ -21,7 +21,7 @@ typedef struct NesLua NesLua;
 
 /* Host-supplied CPU bus access, used by memory.readbyte/writebyte. Must see
  * the same mapped view the CPU does (PPU/APU/mapper registers included).
- * get_framecount/get_zapper are optional (NULL is fine — callers get 0s). */
+ * get_framecount/get_zapper are optional (NULL is fine - callers get 0s). */
 typedef struct {
     uint8_t (*mem_read)(uint16_t addr, void *ud);
     void    (*mem_write)(uint16_t addr, uint8_t val, void *ud);
@@ -53,7 +53,7 @@ void nes_lua_run_frame(NesLua *lua, uint32_t *pixels_argb, int w, int h);
 /* Bus-access notifications for memory.register{read,write,exec}() hooks.
  * Cheap no-op (one branch) when nothing is registered at addr. Call
  * notify_exec once per instruction, right before it executes, with the PC
- * about to run (not routed through mem_read — that would also fire on
+ * about to run (not routed through mem_read - that would also fire on
  * plain data reads of the same address). */
 void nes_lua_notify_read (NesLua *lua, uint16_t addr, uint8_t val);
 void nes_lua_notify_write(NesLua *lua, uint16_t addr, uint8_t val);

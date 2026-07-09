@@ -54,7 +54,7 @@ static void print_machines(void) {
 
 static void print_usage(const char *prog) {
     FILE *f = stderr;
-    fprintf(f, "GEMU v" GEMU_VERSION_STR " — Generic EMUlator\n"
+    fprintf(f, "GEMU v" GEMU_VERSION_STR " - Generic EMUlator\n"
                "Usage: %s -M <machine> [options] [rom]\n\n", prog);
 
 #define OPT(name, desc) fprintf(f, "  %-26s %s\n", name, desc)
@@ -82,7 +82,7 @@ static void print_usage(const char *prog) {
     fprintf(f, "\n");
 
     fprintf(f, "Machine options:\n");
-    OPT("-m SIZE",            "RAM size — plain number = KB, or suffix K/M (e.g. 32K, 1M)");
+    OPT("-m SIZE",            "RAM size - plain number = KB, or suffix K/M (e.g. 32K, 1M)");
     OPT("-cg NAME",           "Character generator, if selectable (use -cg ? to list)");
     OPT("-device NAME",       "Attach a device (use -device ? to list all)");
     OPT("-soundhw NAME",      "Sound hardware (use -soundhw ? to list all)");
@@ -104,7 +104,7 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
     const char *prog = argv[0];
 
-    /* Global -device ? and -soundhw ? — list across all families without -M */
+    /* Global -device ? and -soundhw ? - list across all families without -M */
     for (int i = 1; i < argc - 1; i++) {
         if (strcmp(argv[i], "-device") == 0 && strcmp(argv[i + 1], "?") == 0) {
             list_all_devices();

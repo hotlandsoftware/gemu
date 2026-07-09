@@ -7,7 +7,7 @@
  *
  * gemu_screendump() takes a packed 24-bit RGB buffer (3 bytes per pixel,
  * row-major, top-to-bottom) and dispatches on the file extension:
- *   *.png  → PNG (uncompressed deflate — valid but larger than gzip)
+ *   *.png  → PNG (uncompressed deflate - valid but larger than gzip)
  *   anything else → PPM (P6 binary, trivial to open everywhere)
  *
  * The _argb and _mono variants convert common emulator framebuffer formats

@@ -103,7 +103,7 @@ bool fds_disk_load(FdsState *f, const char *path) {
     f->transfer_flag = false;
     f->disk_irq_ctr  = -1;
 
-    fprintf(stderr, "fds: loaded '%s' — %u side%s\n", path, sides, sides == 1 ? "" : "s");
+    fprintf(stderr, "fds: loaded '%s' - %u side%s\n", path, sides, sides == 1 ? "" : "s");
     return true;
 }
 
@@ -299,7 +299,7 @@ uint8_t fds_reg_read(FdsState *f, uint16_t addr) {
     case 0x4030: {
         /* Bit 1 = disk transfer IRQ (per FCEUX/nesdev); also mirrored in bit 7.
          * Bit 3 = mirror state (mirrors $4025 bit 3).
-         * Bit 4 = CRC error (never set — we don't emulate hardware CRC checker).
+         * Bit 4 = CRC error (never set - we don't emulate hardware CRC checker).
          * Bit 0 = timer IRQ.
          * Reading clears both the timer and transfer flags. */
         uint8_t v = 0;
@@ -332,7 +332,7 @@ uint8_t fds_reg_read(FdsState *f, uint16_t addr) {
             f->blk_addr++;
         }
         f->read_data = byte;
-        /* Schedule next transfer IRQ (real BIOS mode — HLE uses synchronous $E7A3) */
+        /* Schedule next transfer IRQ (real BIOS mode - HLE uses synchronous $E7A3) */
         if (!f->hle_mode)
             f->disk_irq_ctr = (int32_t)FDS_CYCLES_PER_BYTE;
         return byte;
@@ -435,7 +435,7 @@ void fds_reg_write(FdsState *f, uint16_t addr, uint8_t val) {
         break;
 
     case 0x4024:
-        /* Write disk byte — write mode only ($4025 bit 2 = 0).
+        /* Write disk byte - write mode only ($4025 bit 2 = 0).
          * First write after a block transition is discarded (sync byte equivalent).
          * Does NOT clear transfer_flag (per FCEUX: only $4025/$4030/$4031 do that). */
         {
@@ -443,7 +443,7 @@ void fds_reg_write(FdsState *f, uint16_t addr, uint8_t val) {
             if (!f->disk_inserted || !f->raw_disk || !write_mode) break;
 
             if (f->blk_access == 0) {
-                /* Discard first byte (sync marker — not stored in raw block data) */
+                /* Discard first byte (sync marker - not stored in raw block data) */
                 f->blk_access = 1;
                 break;
             }
@@ -492,7 +492,7 @@ void fds_reg_write(FdsState *f, uint16_t addr, uint8_t val) {
         break;
 
     case 0x4026:
-        /* External connector output — ignored */
+        /* External connector output - ignored */
         break;
     }
 }

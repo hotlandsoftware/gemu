@@ -11,12 +11,12 @@
 #include <stdbool.h>
 
 /*
- * UM6578/SH6578/NT6578 — "enhanced NES" clone-on-a-chip used in cheap
+ * UM6578/SH6578/NT6578 - "enhanced NES" clone-on-a-chip used in cheap
  * plug & play TV game cartridges/consoles (Senario Vs Maxx, dreamGEAR
  * Plug'N'Play, TimeTop, etc). Reference: MAME src/mame/nintendo/nes_sh6578.cpp.
  *
  * Single real M6502 (full decimal mode, unlike the NES's decimal-less
- * 2A03), a bespoke PPU (vga/ppu_sh6578.c — see that file for how its video
+ * 2A03), a bespoke PPU (vga/ppu_sh6578.c - see that file for how its video
  * differs from a plain NES PPU), the NES's own 2A03 APU reused verbatim for
  * sound, an 8-bank (4 KB each) ROM windowing scheme addressing up to 1 MB
  * (2 MB on some titles, selected by a coarse half-select bank not modelled
@@ -27,7 +27,7 @@
  *   $0000-$1FFF  RAM (8KB, no mirroring)
  *   $2000-$2007  PPU registers (standard NES-like PPUCTRL..PPUDATA)
  *   $2008        PPU extended register (nametable/sprite-page/4bpp select)
- *   $2040-$207F  PPU palette RAM (64 entries, direct — not in PPU space)
+ *   $2040-$207F  PPU palette RAM (64 entries, direct - not in PPU space)
  *   $4000-$4013  APU registers (2A03, reused from audio/apu2a03.c)
  *   $4014        OAM DMA (write page -> 256-byte sprite RAM copy)
  *   $4015        APU status
@@ -42,10 +42,10 @@
  *   $4022        Keyboard/mouse queue control/acknowledge.
  *   $4026        EXT/status port; idle high for Connie-chan.
  *   $4031        Initial startup protection sequence (write-only, logged only
- *                upstream — genuinely has no gating effect, safe to no-op)
+ *                upstream - genuinely has no gating effect, safe to no-op)
  *   $4032        IRQ mask/ack (write): 1=acknowledge+block that source going
  *                forward, 0=unblock. Bit7=Timer, bit6=Mouse, bit5=Keyboard
- *                (see nesdev.org/wiki/UM6576/UM6578 — IRQ). Mouse packets
+ *                (see nesdev.org/wiki/UM6576/UM6578 - IRQ). Mouse packets
  *                raise the Keyboard bit (see above); we never raise the
  *                Mouse bit ourselves (no confirmed source models it).
  *   $4033        IRQ status (read): which sources currently have a pending,
@@ -53,7 +53,7 @@
  *   $4034        Timer control [ERS. .PPP]: E=enable, R=repeat (else clear E
  *                on underflow), S=source (0=CPU M2 cycles, 1=PPU scanlines),
  *                PPP=prescaler (tick every 2^PPP source ticks)
- *   $4035        Timer preset (write) — also resets the live count to this
+ *   $4035        Timer preset (write) - also resets the live count to this
  *                value immediately
  *   $4036        Timer count (read)
  *   $4040-$4047  Bankswitch registers: 4KB window N -> ROM page N*0x1000
@@ -69,7 +69,7 @@
  * $4016 can also return a 24-bit Subor-style mouse word when mouse mode is
  * strobed. Keep this separate from the Connie-chan PS/2 stream.
  *
- * $4016 reply when mouse mode is active — 24-bit word, MSB-first (bit23
+ * $4016 reply when mouse mode is active - 24-bit word, MSB-first (bit23
  * first, same shift direction as a standard controller, so 8-bit-only
  * readers still see a plausible controller reply):
  *

@@ -24,9 +24,9 @@ typedef enum {
 
 typedef enum {
     MOS_VGA_NONE,
-    MOS_VGA_RP2C02,  /* Ricoh RP2C02 — NES PPU */
-    MOS_VGA_RP2C04_0004,  /* Ricoh RP2C04-0004 — VS. System RGB PPU */
-    MOS_VGA_SH6578,       /* UM6578/SH6578 PPU — 256x256 pages, attribute-in-tile, no separate AT table */
+    MOS_VGA_RP2C02,  /* Ricoh RP2C02 - NES PPU */
+    MOS_VGA_RP2C04_0004,  /* Ricoh RP2C04-0004 - VS. System RGB PPU */
+    MOS_VGA_SH6578,       /* UM6578/SH6578 PPU - 256x256 pages, attribute-in-tile, no separate AT table */
 } MosVgaType;
 
 typedef enum {
@@ -39,7 +39,7 @@ typedef enum {
 } MosSoundType;
 
 /* Composable arcade sound cards (QEMU -soundhw-style: a comma-separated set
- * of independently present chips, ORed into MosConfig.sound_hw_mask — unlike
+ * of independently present chips, ORed into MosConfig.sound_hw_mask - unlike
  * MosSoundType above, which is a single mutually-exclusive NES/Famicom APU
  * choice). Currently 5clown-only; both chips are stubbed (no synthesis). */
 #define MOS_SOUNDHW_AY8910  0x01u
@@ -98,7 +98,7 @@ typedef struct MosConfig {
     bool            ppu_debug;
     bool            is_pal;      /* PAL/Dendy: 312 lines, ~50 Hz frame rate */
     bool            is_dendy;   /* Dendy Famiclone: NTSC-compatible PPU/APU within PAL 50 Hz */
-    bool            is_arcade;  /* NES-based arcade cabinet (VS. System, etc.) — coin-op, DIP switches */
+    bool            is_arcade;  /* NES-based arcade cabinet (VS. System, etc.) - coin-op, DIP switches */
     bool            is_7mezzo;  /* MOS_MACHINE_MAGICFLY game variant: "7 e Mezzo" vs Magic Fly */
     bool            devices_none;    /* -device none: suppress default input devices */
     bool            generic_keyboard; /* -device keyboard: host ASCII/QWERTY keyboard */

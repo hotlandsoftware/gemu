@@ -1,4 +1,4 @@
-/* WozMon KIM-1 adaptation (Hans Otten, 2024) — 327 bytes @ $1AA0 */
+/* WozMon KIM-1 adaptation (Hans Otten, 2024) - 327 bytes @ $1AA0 */
 #pragma once
 #include <stdint.h>
 #define WOZMON_LOAD_ADDR 0x1AA0u

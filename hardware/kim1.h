@@ -22,7 +22,7 @@
  *   $2000–$FFFF  mirrors of $0000–$1FFF
  *
  * CPU vectors ($FFFA–$FFFF) are decoded to $1FFA–$1FFF thanks to
- * incomplete address decoding — no explicit mirror needed.
+ * incomplete address decoding - no explicit mirror needed.
  *
  * Framebuffer layout (when visual keypad is enabled via -device kim-keypad):
  *   ┌──────────────────────────────────────┐

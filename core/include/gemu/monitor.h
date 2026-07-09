@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 /*
- * GEMU monitor — QEMU-style interactive console on stdin.
+ * GEMU monitor - QEMU-style interactive console on stdin.
  *
  * A background thread reads lines from stdin and enqueues commands.
  * The emulator's run loop drains the queue each frame via gemu_monitor_poll().

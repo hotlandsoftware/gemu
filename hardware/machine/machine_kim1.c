@@ -140,14 +140,14 @@ static const uint8_t font_data[128][FONT_H] = {
 /* ── 7-segment segment geometry (scaled for KIM1_DIGIT_W=72, KIM1_DIGIT_H=110) */
 
 static const struct { int x, y, w, h; } seg_rects[8] = {
-    {12,   4, 48, 10},  /* a — top horizontal       */
-    {58,  12,  8, 42},  /* b — top right vertical    */
-    {58,  60,  8, 42},  /* c — bottom right vertical */
-    {12, 100, 48, 10},  /* d — bottom horizontal     */
-    { 6,  60,  8, 42},  /* e — bottom left vertical  */
-    { 6,  12,  8, 42},  /* f — top left vertical     */
-    {12,  52, 48, 10},  /* g — middle horizontal     */
-    {66, 100,  8,  8},  /* dp — decimal point        */
+    {12,   4, 48, 10},  /* a - top horizontal       */
+    {58,  12,  8, 42},  /* b - top right vertical    */
+    {58,  60,  8, 42},  /* c - bottom right vertical */
+    {12, 100, 48, 10},  /* d - bottom horizontal     */
+    { 6,  60,  8, 42},  /* e - bottom left vertical  */
+    { 6,  12,  8, 42},  /* f - top left vertical     */
+    {12,  52, 48, 10},  /* g - middle horizontal     */
+    {66, 100,  8,  8},  /* dp - decimal point        */
 };
 
 /* ── Colours (0xAARRGGBB) ───────────────────────────────────────────────── */
@@ -1050,7 +1050,7 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
     Kim1State *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
 
-    /* RRIOT I/O and ROM use incomplete address decoding — present at every
+    /* RRIOT I/O and ROM use incomplete address decoding - present at every
      * $2000 mirror. Check these first via masked address so they shadow
      * expansion RAM at mirrored positions (including the CPU vectors at
      * $FFFA–$FFFF, which mirror to ROM at $1FFA–$1FFF). */
@@ -1123,25 +1123,25 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
             s->cpu.PC = 0x1F8Fu;
             return 0xEAu;
         }
-        /* DUMPT: CPU about to execute at $1800 — save memory block to tape */
+        /* DUMPT: CPU about to execute at $1800 - save memory block to tape */
         if (a == 0x1800u) {
             kim1_tape_save(s);
             s->cpu.PC = 0x1C4Fu;
             return 0xEAu;
         }
-        /* LOADT: CPU about to execute at $1873 — load tape into memory */
+        /* LOADT: CPU about to execute at $1873 - load tape into memory */
         if (a == 0x1873u) {
             kim1_tape_load(s);
             s->cpu.PC = 0x1C4Fu;
             return 0xEAu;
         }
-        /* OUTCH: CPU about to execute at $1EA0 — output char in A to serial terminal */
+        /* OUTCH: CPU about to execute at $1EA0 - output char in A to serial terminal */
         if (s->serial && a == 0x1EA0u) {
             s->serial->write_byte(s->serial->ud, s->cpu.A);
             s->cpu.PC = 0x1ED4u;   /* skip to OUTCH's RTS */
             return 0xEAu;
         }
-        /* GETCH: CPU about to execute at $1E5A — read char from serial terminal (blocking) */
+        /* GETCH: CPU about to execute at $1E5A - read char from serial terminal (blocking) */
         if (s->serial && a == 0x1E5Au) {
             while (!s->serial->key_available(s->serial->ud)) {
                 s->serial->poll(s->serial->ud);
@@ -1417,7 +1417,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         };
         int n_regions = 4;
         if (s->ext_ram) {
-            /* Cap the hex editor's view of expansion RAM to 4 KB — plenty
+            /* Cap the hex editor's view of expansion RAM to 4 KB - plenty
              * for hand-scrolling, and keeps startup allocation bounded. */
             size_t hex_sz = s->ext_ram_top - 0x0400u;
             if (hex_sz > 4096u) hex_sz = 4096u;

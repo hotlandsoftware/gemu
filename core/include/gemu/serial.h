@@ -4,7 +4,7 @@
 #include <stdbool.h>
 
 /*
- * GemuSerial — generic serial-terminal interface.
+ * GemuSerial - generic serial-terminal interface.
  *
  * Any machine that does character I/O stores a pointer to one of these.
  * Any terminal device (VT100, etc.) fills one in via its _as_serial() helper.

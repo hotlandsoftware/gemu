@@ -173,7 +173,7 @@ void cdp1802_step(Cdp1802 *c) {
 
         switch (op) {
 
-        /* 0x00 IDLE — handled above */
+        /* 0x00 IDLE - handled above */
 
         /* 0x01-0x0F  LDN Rn */
         case 0x01: case 0x02: case 0x03: case 0x04:
@@ -333,7 +333,7 @@ void cdp1802_step(Cdp1802 *c) {
         case 0xBC: case 0xBD: case 0xBE: case 0xBF:
             c->R[c->N] = (c->R[c->N] & 0x00FFu) | ((uint16_t)c->D << 8); break;
 
-        /* Long branches / skips — all 0xC0..0xCF, exec_left cycles from 2→1 */
+        /* Long branches / skips - all 0xC0..0xCF, exec_left cycles from 2→1 */
         case 0xC0: lbranch(c, true);        break;   /* LBR  */
         case 0xC1: lbranch(c, c->Q);        break;   /* LBQ  */
         case 0xC2: lbranch(c, !c->D);       break;   /* LBZ  */

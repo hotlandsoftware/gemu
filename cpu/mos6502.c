@@ -12,7 +12,7 @@ static inline void wr(Mos6502 *c, uint16_t a, uint8_t v) {
     c->cycle_count++;
     c->mem_write(a, v, c->mem_ud);
 }
-/* Zero-page 16-bit read (wraps within page — critical for JMP ind bug etc.) */
+/* Zero-page 16-bit read (wraps within page - critical for JMP ind bug etc.) */
 static inline uint16_t rd16zp(Mos6502 *c, uint8_t a) {
     uint8_t lo = rd(c, (uint16_t)a);
     uint8_t hi = rd(c, (uint16_t)((uint8_t)(a + 1)));
@@ -183,7 +183,7 @@ static void do_branch(Mos6502 *c, bool cond) {
 
 static void service_irq(Mos6502 *c, uint16_t vector, bool brk) {
     rd(c, c->PC);                           /* dummy fetch 1 */
-    rd(c, (uint16_t)(c->PC + 1));           /* dummy fetch 2 — real 6502 reads PC+1 */
+    rd(c, (uint16_t)(c->PC + 1));           /* dummy fetch 2 - real 6502 reads PC+1 */
     push(c, (uint8_t)(c->PC >> 8));
     push(c, (uint8_t)(c->PC & 0xFFu));
     push(c, (c->P & ~MOS6502_P_B) | (brk ? MOS6502_P_B : 0u) | MOS6502_P_U);
@@ -428,7 +428,7 @@ void mos6502_step(Mos6502 *c) {
     case 0xA8: rd(c, c->PC); c->Y = c->A;  set_nz(c, c->Y); break; /* TAY */
     case 0xBA: rd(c, c->PC); c->X = c->SP; set_nz(c, c->X); break; /* TSX */
     case 0x8A: rd(c, c->PC); c->A = c->X;  set_nz(c, c->A); break; /* TXA */
-    case 0x9A: rd(c, c->PC); c->SP = c->X;                  break; /* TXS — no flag change */
+    case 0x9A: rd(c, c->PC); c->SP = c->X;                  break; /* TXS - no flag change */
     case 0x98: rd(c, c->PC); c->A = c->Y;  set_nz(c, c->A); break; /* TYA */
 
     /* ── Stack ────────────────────────────────────────────────────────── */
@@ -439,15 +439,15 @@ void mos6502_step(Mos6502 *c) {
                c->P = (pop(c) & ~MOS6502_P_B) | MOS6502_P_U; break;
 
     /* ── Jumps / Calls / Returns ─────────────────────────────────────── */
-    case 0x4C: c->PC = am_abs(c); break; /* JMP abs — 3 cycles */
-    case 0x6C: {  /* JMP ind — 5 cycles; implements NMOS page-wrap bug */
+    case 0x4C: c->PC = am_abs(c); break; /* JMP abs - 3 cycles */
+    case 0x6C: {  /* JMP ind - 5 cycles; implements NMOS page-wrap bug */
         uint16_t ptr = am_abs(c);
         uint8_t lo = rd(c, ptr);
         uint8_t hi = rd(c, (uint16_t)((ptr & 0xFF00u) | ((ptr + 1) & 0x00FFu)));
         c->PC = (uint16_t)(lo | ((uint16_t)hi << 8));
         break;
     }
-    case 0x20: {  /* JSR abs — 6 cycles */
+    case 0x20: {  /* JSR abs - 6 cycles */
         uint8_t lo = fetch(c);
         rd(c, 0x0100u | c->SP);          /* dummy stack read */
         push(c, (uint8_t)(c->PC >> 8));
@@ -456,7 +456,7 @@ void mos6502_step(Mos6502 *c) {
         c->PC = (uint16_t)(lo | ((uint16_t)hi << 8));
         break;
     }
-    case 0x60: {  /* RTS — 6 cycles */
+    case 0x60: {  /* RTS - 6 cycles */
         rd(c, c->PC);                    /* dummy */
         rd(c, 0x0100u | c->SP);          /* dummy SP read */
         uint8_t lo = pop(c);
@@ -465,7 +465,7 @@ void mos6502_step(Mos6502 *c) {
         rd(c, c->PC++);                  /* increment past JSR's saved PC */
         break;
     }
-    case 0x40: {  /* RTI — 6 cycles */
+    case 0x40: {  /* RTI - 6 cycles */
         rd(c, c->PC);
         rd(c, 0x0100u | c->SP);
         c->P  = (pop(c) & ~MOS6502_P_B) | MOS6502_P_U;
@@ -495,11 +495,11 @@ void mos6502_step(Mos6502 *c) {
     case 0xF8: rd(c, c->PC); c->P |=  MOS6502_P_D; break; /* SED */
 
     /* ── NOP ──────────────────────────────────────────────────────────── */
-    case 0xEA: rd(c, c->PC); break; /* NOP — 2 cycles */
+    case 0xEA: rd(c, c->PC); break; /* NOP - 2 cycles */
 
     /* ── Illegal / undocumented opcodes ──────────────────────────────── */
 
-    /* NOP variants — extra implied, immediate, zero-page, absolute */
+    /* NOP variants - extra implied, immediate, zero-page, absolute */
     case 0x1A: case 0x3A: case 0x5A: case 0x7A: case 0xDA: case 0xFA:
         rd(c, c->PC); break;
     case 0x80: case 0x82: case 0x89: case 0xC2: case 0xE2:
@@ -513,7 +513,7 @@ void mos6502_step(Mos6502 *c) {
     case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC:
         { int x; uint16_t ea = am_abx(c, &x); if (x) c->cycle_count++; rd(c, ea); break; }
 
-    /* SLO: ASL mem, then ORA A — C from ASL, N/Z from ORA result */
+    /* SLO: ASL mem, then ORA A - C from ASL, N/Z from ORA result */
     case 0x07: { uint16_t ea=am_zp(c);  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_asl(c,v); wr(c,ea,v); c->A|=v; set_nz(c,c->A); break; }
     case 0x17: { uint16_t ea=am_zpx(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_asl(c,v); wr(c,ea,v); c->A|=v; set_nz(c,c->A); break; }
     case 0x03: { uint16_t ea=am_izx(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_asl(c,v); wr(c,ea,v); c->A|=v; set_nz(c,c->A); break; }
@@ -631,7 +631,7 @@ void mos6502_step(Mos6502 *c) {
         break;
     }
 
-    /* Illegal SBC imm — identical to official $E9 */
+    /* Illegal SBC imm - identical to official $E9 */
     case 0xEB: do_sbc(c, fetch(c)); break;
 
     /* XAA: A = X & #imm (unstable on hardware; common approximation) */
@@ -659,10 +659,10 @@ void mos6502_step(Mos6502 *c) {
     case 0x9B: { int x; uint16_t ea=am_aby(c,&x); c->cycle_count++;
                  c->SP = c->A & c->X; wr(c, ea, c->SP & (uint8_t)((ea >> 8) + 1u)); break; }
 
-    /* KIL: CPU halt — jams real hardware; treat as no-op so emulator stays alive */
+    /* KIL: CPU halt - jams real hardware; treat as no-op so emulator stays alive */
     case 0x02: case 0x12: case 0x22: case 0x32: case 0x42: case 0x52:
     case 0x62: case 0x72: case 0x92: case 0xB2: case 0xD2: case 0xF2:
-        fprintf(stderr, "mos6502: KIL at 0x%04X — CPU would halt on hardware\n",
+        fprintf(stderr, "mos6502: KIL at 0x%04X - CPU would halt on hardware\n",
                 (unsigned)(c->PC - 1));
         rd(c, c->PC);
         break;

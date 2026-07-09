@@ -15,7 +15,7 @@
 #  include <sys/stat.h>
 #endif
 
-/* ── Input action tables (per game — different games, different controls) ── */
+/* ── Input action tables (per game - different games, different controls) ── */
 
 static const GemuActionDef magicfly_actions_mf[] = {
     { "coin",     GEMU_ACTION(MAGICFLY_ACT_COIN),      "6" },
@@ -129,7 +129,7 @@ static uint8_t mux_port_r(MagicflyState *s) {
 static void mux_port_w(MagicflyState *s, uint8_t val) {
     s->input_selector = val & 0x0F;
     s->dac_bit = (val & 0x80) != 0;
-    /* Bits 4-6 (Coin2/Payout/Coin1) drive physical counters — nothing to
+    /* Bits 4-6 (Coin2/Payout/Coin1) drive physical counters - nothing to
      * drive in GEMU, so just ignored, matching 5clown's convention. */
 }
 
@@ -204,7 +204,7 @@ static void magicfly_render(MagicflyState *s) {
                          * ONE color group (granularity 8). MAME's tilemap_t::pen_data()
                          * computes colorbase() + granularity()*(color % colors()), and
                          * colors()==1 here, so the "color" attribute bits are always
-                         * folded to group 0 — verified against emu/tilemap.h. The tile
+                         * folded to group 0 - verified against emu/tilemap.h. The tile
                          * bank therefore always renders through pens 16-23 regardless
                          * of the attribute's color nibble (those pens are never assigned
                          * by magicfly_palette()/_7mezzo_palette(), so this layer is
@@ -350,7 +350,7 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
         else if (!strcmp(region, "gfx0"))    gfx0_path = cfg->roms[i].path;
     }
     if (!prg_path || !gfx2_path || !gfx1_path || !gfx0_path) {
-        fprintf(stderr, "%s: missing ROM(s) — need maincpu, gfx0, gfx1, gfx2; "
+        fprintf(stderr, "%s: missing ROM(s) - need maincpu, gfx0, gfx1, gfx2; "
                         "use -rom roms/%s\n", name, name);
         free(s);
         return NULL;
@@ -369,7 +369,7 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
 
     /* Combined gfx blob is gfx[0x0000:0x2000]=gfx2, [0x2000:0x4000]=gfx1,
      * [0x4000:0x6000]=gfx0 (per ROM_LOAD order in the driver). Only specific
-     * 2KB slices of each file actually feed the tile/char decoders — this
+     * 2KB slices of each file actually feed the tile/char decoders - this
      * is a verified real-hardware quirk (see hardware/magicfly.h), not a
      * bug, and is identical between Magic Fly and 7 e Mezzo:
      *   gfxbnk0 (chars, 1bpp)   = gfx[0x1800:0x2000] = gfx2[0x1800:0x2000]
@@ -391,7 +391,7 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
     memcpy(s->gfxbnk1 + 0x1000, gfx0 + 0x1800, 0x800);
     free(gfx2); free(gfx1); free(gfx0);
 
-    /* Palette — hand-coded in the driver, no PROM on this board (only 16 of
+    /* Palette - hand-coded in the driver, no PROM on this board (only 16 of
      * 32 pens are ever set; the rest default to black, matching upstream).
      * Magic Fly and 7 e Mezzo use the exact same table except pens 3 and 7
      * are swapped (verified against magicfly_palette()/_7mezzo_palette()). */

@@ -1,13 +1,13 @@
 #pragma once
 #include <stdint.h>
 
-/* Motorola/Synertek 6821 PIA (Peripheral Interface Adapter) — minimal
+/* Motorola/Synertek 6821 PIA (Peripheral Interface Adapter) - minimal
  * register-level model.
  *
  * Covers the ORA/DDRA/CRA + ORB/DDRB/CRB register decode (the "which
  * register does offset 0-3 mean" logic every 6821 has) and the standard
  * DDR-masked read-back behavior. Does NOT model CA1/CA2/CB1/CB2 handshake
- * lines or IRQ flag bits in the control registers — no known GEMU machine
+ * lines or IRQ flag bits in the control registers - no known GEMU machine
  * needs that yet; add it if one shows up.
  */
 

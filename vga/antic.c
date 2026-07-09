@@ -82,7 +82,7 @@ void antic_reg_write(Antic *a, uint8_t reg, uint8_t v) {
     case 0x05: a->vscrol = v; break;
     case 0x07: a->pmbase = v; break;
     case 0x09: a->chbase = v; break;
-    case 0x0A: /* WSYNC — CPU stall, handled by the machine */ break;
+    case 0x0A: /* WSYNC - CPU stall, handled by the machine */ break;
     case 0x0E: a->nmien  = v; break;
     case 0x0F: a->nmist  = 0; break;                        /* NMIRES */
     default: break;
@@ -91,7 +91,7 @@ void antic_reg_write(Antic *a, uint8_t reg, uint8_t v) {
 
 uint8_t gtia_reg_read(Antic *a, uint8_t reg, uint8_t consol_in, uint8_t trig[4]) {
     reg &= 0x1F;
-    if (reg <= 0x0F) return 0;                    /* collision regs — none */
+    if (reg <= 0x0F) return 0;                    /* collision regs - none */
     switch (reg) {
     case 0x10: case 0x11: case 0x12: case 0x13:   /* TRIG0-3, 1 = released */
         return trig ? trig[reg - 0x10] : 1;
@@ -302,7 +302,7 @@ void antic_render_frame(Antic *a) {
         if (mode == 1) {
             uint8_t lo = a->mem(dl, a->mem_ud); dl = dl_next(dl);
             uint8_t hi = a->mem(dl, a->mem_ud);
-            if (op & 0x40) break;                 /* JVB — frame done */
+            if (op & 0x40) break;                 /* JVB - frame done */
             dl = (uint16_t)(lo | ((uint16_t)hi << 8));
             continue;
         }

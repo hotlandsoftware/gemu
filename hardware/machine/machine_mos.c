@@ -182,7 +182,7 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
         return NULL;
     }
 
-    mos6502_init(&s->cpu);   /* zeroes the struct — must come before assigning callbacks */
+    mos6502_init(&s->cpu);   /* zeroes the struct - must come before assigning callbacks */
 
     s->cpu.mem_read        = generic_mem_read;
     s->cpu.mem_write       = generic_mem_write;

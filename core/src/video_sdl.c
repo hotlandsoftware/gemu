@@ -108,7 +108,7 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
 #ifdef HAVE_SDL_IMAGE
     /* Best-effort: gemu.png lives at the repo root, same as every other
      * relative path this project uses (ROMs, gemu.ini via $HOME aside).
-     * Missing/unreadable icon is not fatal — just falls back to the
+     * Missing/unreadable icon is not fatal - just falls back to the
      * platform default window icon. */
     SDL_Surface *icon = IMG_Load("gemu.png");
     if (icon) {
@@ -140,7 +140,7 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
     }
 
     SDL_RenderSetLogicalSize(v->renderer, v->width, v->height);
-    /* For resizable windows, render at the largest integer scale that fits —
+    /* For resizable windows, render at the largest integer scale that fits -
      * avoids fighting the WM with SDL_SetWindowSize during a resize drag. */
     if (v->resizable)
         SDL_RenderSetIntegerScale(v->renderer, SDL_TRUE);
@@ -178,7 +178,7 @@ void gemu_video_sdl_present_argb(GemuVideoSdl *v, const uint32_t *pixels,
         SDL_GetRendererOutputSize(v->renderer, &ow, &oh);
         int scale = (v->width > 0) ? (ow / v->width) : 1;
         if (scale < 1) scale = 1;
-        /* Cap independent of the emulated framebuffer's pixel scale — low-res
+        /* Cap independent of the emulated framebuffer's pixel scale - low-res
          * cores (e.g. CHIP-8 at scale 10) would otherwise blow the menu font
          * up to the point of being unreadable/comically oversized. */
         if (scale > 4) scale = 4;

@@ -1,6 +1,6 @@
 #ifndef _WIN32
 /*
- * ANSI terminal display backend — pixterm-style graphics without libcaca.
+ * ANSI terminal display backend - pixterm-style graphics without libcaca.
  *
  * Each character cell shows two vertically stacked framebuffer samples via
  * U+2580 UPPER HALF BLOCK: foreground color = top pixel, background color =
@@ -14,7 +14,7 @@
  *
  * Input: raw non-canonical stdin.  On terminals that support the kitty
  * keyboard protocol (kitty, foot, WezTerm, Ghostty, Alacritty, ...) we get
- * real key press/release events — input quality matches SDL.  Elsewhere,
+ * real key press/release events - input quality matches SDL.  Elsewhere,
  * terminals only report key *presses* plus autorepeat, so a bound action
  * stays "held" for GEMU_TERM_KEY_MS milliseconds (default 250) after its
  * last repeat.  Lower values make taps release promptly; higher values can
@@ -45,7 +45,7 @@ enum {
     TK_RETURN, TK_TAB, TK_BACKSPACE, TK_DELETE, TK_ESCAPE,
     TK_F1, TK_F2, TK_F3, TK_F4, TK_F5, TK_F6,
     TK_F7, TK_F8, TK_F9, TK_F10, TK_F11, TK_F12,
-    /* Modifier keys — only observable with the kitty protocol */
+    /* Modifier keys - only observable with the kitty protocol */
     TK_LSHIFT, TK_LCTRL, TK_LALT, TK_LSUPER, TK_LHYPER, TK_LMETA,
     TK_RSHIFT, TK_RCTRL, TK_RALT, TK_RSUPER, TK_RHYPER, TK_RMETA,
 };
@@ -169,7 +169,7 @@ static void emit_colors(TermBackend *b, uint32_t top, uint32_t bot,
 /* ── Rendering ───────────────────────────────────────────────────────────── */
 
 /* Box-average the fb rect covering sample row `sy` of `total_sy` rows and
- * sample column `sx` of `total_sx` — integer arithmetic, no libm. */
+ * sample column `sx` of `total_sx` - integer arithmetic, no libm. */
 static uint32_t sample_box(const uint32_t *argb, int fw, int fh,
                            int sx, int total_sx, int sy, int total_sy) {
     int x0 = sx * fw / total_sx, x1 = (sx + 1) * fw / total_sx;
@@ -446,7 +446,7 @@ static int term_csi(GemuDisplay *d, const unsigned char *buf, int n) {
         return i;
     }
     default:
-        return i;      /* unknown CSI — swallow */
+        return i;      /* unknown CSI - swallow */
     }
 }
 
@@ -469,7 +469,7 @@ static int term_decode(GemuDisplay *d, const unsigned char *buf, int n) {
     }
     if (buf[1] == '[')
         return term_csi(d, buf, n);
-    return 2;                                 /* ESC + other — swallow */
+    return 2;                                 /* ESC + other - swallow */
 }
 
 static uint32_t term_do_poll(GemuDisplay *d) {
@@ -519,7 +519,7 @@ static uint32_t term_do_poll(GemuDisplay *d) {
 
 static void term_do_set_title(GemuDisplay *d, const char *title) {
     (void)d;
-    /* OSC 2 — window title; harmless on terminals that ignore it */
+    /* OSC 2 - window title; harmless on terminals that ignore it */
     fprintf(stdout, "\033]2;%s\033\\", title ? title : "GEMU");
     fflush(stdout);
 }

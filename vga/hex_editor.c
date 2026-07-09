@@ -721,7 +721,7 @@ static void hex_editor_add_tab(HexEditor *he, const char *label,
         .base_addr = base_addr,
     };
     hex_create_tab_view(he, tab);
-    /* Don't populate the buffer here — hex_editor_show() rebuilds all tabs
+    /* Don't populate the buffer here - hex_editor_show() rebuilds all tabs
      * on first display; building large regions now would queue thousands of
      * GTK repaint events that starve the GL renderer before it's ready. */
     gtk_notebook_append_page(GTK_NOTEBOOK(he->notebook), tab->scrolled,
@@ -740,7 +740,7 @@ HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
 
     /* ── Window ── */
     he->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(he->window), "GEMU — Hex Editor");
+    gtk_window_set_title(GTK_WINDOW(he->window), "GEMU - Hex Editor");
     gtk_window_set_default_size(GTK_WINDOW(he->window), 660, 520);
     g_signal_connect(he->window, "delete-event",
                      G_CALLBACK(on_window_delete), he);
@@ -877,7 +877,7 @@ void hex_editor_refresh(HexEditor *he) {
     }
 
     /* Rebuild all non-read-only tabs with fresh data via in-place line
-     * updates — scroll position is naturally preserved because only
+     * updates - scroll position is naturally preserved because only
      * changed lines are replaced. */
     for (int i = 0; i < he->n_tabs; i++) {
         HexEditorTab *tab = &he->tabs[i];

@@ -1,4 +1,4 @@
-# Compatibility shim — the real build system is Ninja.
+# Compatibility shim - the real build system is Ninja.
 # Run ./configure first, then use ninja directly for full control.
 
 .PHONY: all clean distclean

@@ -10,7 +10,7 @@
  * Generic 6502 machine: flat address space (default 64 KB, override with -m).
  *   RAM: 0x0000–0xDEFF  (up to mem_size bytes, writable by default)
  *   I/O: 0xDF00–0xDFFF  (memory-mapped peripherals, always present)
- *   ROM: overlaid at load time — those ranges become read-only
+ *   ROM: overlaid at load time - those ranges become read-only
  *
  * I/O map:
  *   $DF00  Timer reload low byte   (W) / current count low  (R)
@@ -19,7 +19,7 @@
  *            bit 0  enable (1=counting)
  *            bit 1  IRQ enable
  *            bit 2  auto-reload on expiry (0=disable on expiry)
- *            bit 7  IRQ pending — write 1 to clear, read to test
+ *            bit 7  IRQ pending - write 1 to clear, read to test
  *   $DF10  Serial data             (W=TX→stdout, R=RX from stdin)
  *   $DF11  Serial status           (R)
  *            bit 0  RX byte available

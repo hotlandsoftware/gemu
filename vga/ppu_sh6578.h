@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 /*
- * UM6578/SH6578/NT6578 PPU — an enhanced NES-clone video chip used in cheap
+ * UM6578/SH6578/NT6578 PPU - an enhanced NES-clone video chip used in cheap
  * "plug & play TV game" cartridges/consoles. Reference: MAME's
  * src/devices/video/ppu2c0x_sh6578.{h,cpp} (subclasses the standard NES
  * ppu2c0x_device, reusing its register/scanline/vblank timing wholesale, but
@@ -12,7 +12,7 @@
  * Differences from a plain NES RP2C02 (vga/rp2c02.c), all verified against
  * the MAME source:
  *   - No separate CHR ROM/mapper: the PPU owns a flat, CPU-writable 64 KB
- *     VRAM (populated via PPUDATA writes or the machine's DMA controller —
+ *     VRAM (populated via PPUDATA writes or the machine's DMA controller -
  *     there is no bank-switched pattern table like standard NES mappers).
  *   - No separate attribute table: each nametable entry is 2 bytes
  *     (tile-number-low, tile-number-high-nibble | color-nibble) instead of
@@ -44,7 +44,7 @@
 #define SH6578_PALETTE_SIZE 0x40
 
 /* $2000 PPUCTRL / $2001 PPUMASK / $2002 PPUSTATUS bit layouts are numerically
- * identical to standard NES — see vga/rp2c02.h's PPUCTRL_, PPUMASK_ and
+ * identical to standard NES - see vga/rp2c02.h's PPUCTRL_, PPUMASK_ and
  * PPUSTAT_ bit-value macros, which ppu_sh6578.c reuses directly (along with
  * the 64-colour NTSC palette table, since this chip's palette RAM holds
  * plain indices into that very same master palette). */
@@ -63,7 +63,7 @@ typedef struct Sh6578Ppu {
     uint16_t t;   /* scroll/rendering latch, "loopy t" (m_refresh_latch) */
     uint8_t  x;   /* fine X scroll */
     bool     w;   /* write toggle (first/second write latch) */
-    /* CPU-visible PPUDATA ($2007) address — a field *separate* from v/t
+    /* CPU-visible PPUDATA ($2007) address - a field *separate* from v/t
      * (matches MAME's m_videomem_addr): reading/writing tile or palette
      * data via $2007 does not disturb the active scroll position. Synced
      * from the latch only at the moment of a fresh PPUADDR second write. */
@@ -86,7 +86,7 @@ typedef struct Sh6578Ppu {
     bool     dirty;          /* set for one tick when a frame completes */
     bool     nmi_pending;    /* edge-triggered: fires once, caller clears */
     bool     scanline_tick;  /* set for one tick on every scanline advance (not
-                               * just frame-complete) — drives the $4034 timer's
+                               * just frame-complete) - drives the $4034 timer's
                                * "Source=Scanline" mode; caller clears it. */
 
     uint8_t  pixels[SH6578_WIDTH * SH6578_HEIGHT];

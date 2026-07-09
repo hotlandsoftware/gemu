@@ -26,7 +26,7 @@ void cdp1861_sync(Cdp1861 *vdc, Cdp1802 *cpu);
  * Enable/disable the display.
  *
  * On the COSMAC VIP: IN 1 enables, OUT 1 disables (SC lines of the 1802 drive
- * the CDP1861 enable pin directly). Q output is NOT the display enable —
+ * the CDP1861 enable pin directly). Q output is NOT the display enable -
  * Q drives the audio tone generator.
  */
 static inline void cdp1861_set_display(Cdp1861 *vdc, bool on) {

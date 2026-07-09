@@ -3,7 +3,7 @@
 #include <string.h>
 
 /* ── Screen sampling (matches the reference Mesen Lua script) ────────────────
- * 4×4 sparse grid — the same x/y coordinates the Lua script uses.
+ * 4×4 sparse grid - the same x/y coordinates the Lua script uses.
  * Rec.709 luma; threshold 80 (same as Lua "is_bright").
  * ─────────────────────────────────────────────────────────────────────────── */
 static const int XVALS[4] = {53, 103, 153, 203};
@@ -41,8 +41,8 @@ static bool bits_follow_pattern(uint16_t bits) {
     /* Test-mode special cases (alternating full patterns) */
     if (bits == 0x1555 || bits == 0x0aaa) return true;
 
-    /* bits_mask  = 0b1111110101010 — positions to check                    */
-    /* correct_pattern = 0b0001010101010 — expected values (clock=1, lead=0) */
+    /* bits_mask  = 0b1111110101010 - positions to check                    */
+    /* correct_pattern = 0b0001010101010 - expected values (clock=1, lead=0) */
     return (bits & 0x1faa) == 0x02aa;
 }
 
@@ -58,7 +58,7 @@ static int extract_command(uint16_t bits) {
 /* ROB command table (Gyromite protocol, 0-indexed) */
 static void apply_command(RobMotorState *target, int cmd) {
     switch (cmd) {
-    case 1: /* Reset — arm rises to full height, rotation to 0, hands open */
+    case 1: /* Reset - arm rises to full height, rotation to 0, hands open */
         target->arm_step   = 0;
         target->arm_height = ROB_HEIGHT_MAX;
         target->hands_open = true;
@@ -66,7 +66,7 @@ static void apply_command(RobMotorState *target, int cmd) {
     case 2: /* Down one */
         if (target->arm_height > 0) target->arm_height--;
         break;
-    case 4: /* Left — rotate arm assembly one step counterclockwise */
+    case 4: /* Left - rotate arm assembly one step counterclockwise */
         target->arm_step = (target->arm_step + 1) % ROB_ARM_STEPS;
         break;
     case 5: /* Up two */
@@ -76,7 +76,7 @@ static void apply_command(RobMotorState *target, int cmd) {
     case 6: /* Close arms */
         target->hands_open = false;
         break;
-    case 8: /* Right — rotate arm assembly one step clockwise */
+    case 8: /* Right - rotate arm assembly one step clockwise */
         target->arm_step = (target->arm_step - 1 + ROB_ARM_STEPS) % ROB_ARM_STEPS;
         break;
     case 10: /* Open arms */

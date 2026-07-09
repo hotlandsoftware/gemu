@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-gemu configure — probes dependencies and writes build.ninja.
+gemu configure - probes dependencies and writes build.ninja.
 
 Usage:
   ./configure [options]
@@ -168,7 +168,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     machines.sort(key=lambda m: m['name'])
 
     # Resolve alias inheritance: aliases inherit cpu/vga/soundhw/chargen from their canonical
-    # (but not tv — that is machine-specific) and fill in canonical name.
+    # (but not tv - that is machine-specific) and fill in canonical name.
     name_to_m = {m['name']: m for m in machines}
     for m in machines:
         if m['alias']:
@@ -181,8 +181,8 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         else:
             m['canonical'] = m['name']
 
-    # machines.inc — filtered to active families, no #ifdef needed
-    lines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
+    # machines.inc - filtered to active families, no #ifdef needed
+    lines = ['// Auto-generated from data/machine/*.xml - do not edit\n']
     for m in machines:
         if m['family'] not in active:
             continue
@@ -191,10 +191,10 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     with open(os.path.join(gen_dir, 'machines.inc'), 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
-    # machines_<family>.inc — GemuDevDesc {name, desc} rows for each family's
+    # machines_<family>.inc - GemuDevDesc {name, desc} rows for each family's
     # -M validation/listing table (keeps setup .c files free of hand-copied
     # machine descriptions).
-    fam_lines = {fam: ['// Auto-generated from data/machine/*.xml — do not edit\n']
+    fam_lines = {fam: ['// Auto-generated from data/machine/*.xml - do not edit\n']
                  for fam in active}
     for m in machines:
         if m['family'] not in active:
@@ -205,9 +205,9 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         with open(os.path.join(gen_dir, f'machines_{fam}.inc'), 'w', encoding='utf-8') as f:
             f.writelines(flines)
 
-    # machine_defaults.inc — per-machine defaults table used by *_setup.c
+    # machine_defaults.inc - per-machine defaults table used by *_setup.c
     def cstr(s): return f'"{s}"' if s else 'NULL'
-    dlines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
+    dlines = ['// Auto-generated from data/machine/*.xml - do not edit\n']
     for m in machines:
         if m['family'] not in active:
             continue
@@ -221,8 +221,8 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     with open(os.path.join(gen_dir, 'machine_defaults.inc'), 'w', encoding='utf-8') as f:
         f.writelines(dlines)
 
-    # romdb.inc — all families combined; romdb.c is family-agnostic
-    romdb_lines = ['// Auto-generated from data/machine/*.xml — do not edit\n']
+    # romdb.inc - all families combined; romdb.c is family-agnostic
+    romdb_lines = ['// Auto-generated from data/machine/*.xml - do not edit\n']
     for m in machines:
         for r in m['roms']:
             if not r['sha256']:
@@ -250,7 +250,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         devices.append({'name': name, 'desc': desc, 'machines': mlist})
     devices.sort(key=lambda d: d['name'])
 
-    lines = ['// Auto-generated from data/device/*.xml — do not edit\n']
+    lines = ['// Auto-generated from data/device/*.xml - do not edit\n']
     for d in devices:
         desc = d['desc'].replace('"', '\\"')
         mstr = ', '.join(d['machines'])
@@ -276,7 +276,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         soundhw.append({'name': name, 'desc': desc, 'machines': mstr})
     soundhw.sort(key=lambda s: s['name'])
 
-    lines = ['// Auto-generated from data/soundhw/*.xml — do not edit\n']
+    lines = ['// Auto-generated from data/soundhw/*.xml - do not edit\n']
     for s in soundhw:
         desc = s['desc'].replace('"', '\\"')
         lines.append(f'    {{ "{s["name"]}", "{desc}", "{s["machines"]}" }},\n')
@@ -284,7 +284,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         f.writelines(lines)
 
     # ── Parse character generator XMLs ───────────────────────────────────────
-    cg_lines = {fam: ['// Auto-generated from data/chargen/*.xml — do not edit\n']
+    cg_lines = {fam: ['// Auto-generated from data/chargen/*.xml - do not edit\n']
                 for fam in active}
     for path in _xml_files('data/chargen/*.xml'):
         root = ET.parse(path).getroot()
@@ -303,7 +303,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
 
     # ── Parse VGA XMLs ────────────────────────────────────────────────────────
     # Generates one include per family: vgas_mos.inc, vgas_rca.inc, etc.
-    vga_lines = {fam: ['// Auto-generated from data/vga/*.xml — do not edit\n']
+    vga_lines = {fam: ['// Auto-generated from data/vga/*.xml - do not edit\n']
                  for fam in active}
     for path in _xml_files('data/vga/*.xml'):
         root = ET.parse(path).getroot()
@@ -372,7 +372,7 @@ def main():
         cf = pkg('sdl2', '--cflags', *pkg_flags)
         lf = pkg('sdl2', '--libs',   *pkg_flags)
         if not check('SDL2', cf):
-            die('SDL2 not found — install libsdl2-dev')
+            die('SDL2 not found - install libsdl2-dev')
         sdl2_cflags = cf
         sdl2_libs   = lf
 
@@ -386,7 +386,7 @@ def main():
         libzip_cflags = cf or []
         libzip_libs   = lf or ['-lzip']
     else:
-        print('  (libzip not found — -rom cannot point directly at a .zip)')
+        print('  (libzip not found - -rom cannot point directly at a .zip)')
 
     have_sdl_image  = False
     sdl_image_cflags = []
@@ -399,7 +399,7 @@ def main():
             sdl_image_cflags = cf or []
             sdl_image_libs   = lf
         else:
-            print('  (SDL2_image not found — window icon disabled)')
+            print('  (SDL2_image not found - window icon disabled)')
 
     gtk_cflags = gtk_libs = []
     epoxy_cflags = epoxy_libs = []
@@ -408,7 +408,7 @@ def main():
         cf = pkg('gtk+-3.0', '--cflags', *pkg_flags)
         lf = pkg('gtk+-3.0', '--libs',   *pkg_flags)
         if not check('GTK 3', cf):
-            print('  (GTK not found — building without GTK)')
+            print('  (GTK not found - building without GTK)')
             want_gtk = False
         else:
             gtk_cflags = cf
@@ -419,7 +419,7 @@ def main():
                 epoxy_cflags = ecf or []
                 epoxy_libs   = elf
             else:
-                print('  (epoxy not found — building without GTK)')
+                print('  (epoxy not found - building without GTK)')
                 want_gtk = False
 
     have_ttf  = False
@@ -433,7 +433,7 @@ def main():
             ttf_cflags = cf or []
             ttf_libs   = lf
         else:
-            print('  (SDL2_ttf not found — VT100 terminal will use host stdin/stdout)')
+            print('  (SDL2_ttf not found - VT100 terminal will use host stdin/stdout)')
 
     have_alsa  = False
     alsa_cflags = []
@@ -504,7 +504,7 @@ def main():
             crypto_libs = lf or ['-lcrypto']
             have_crypto = True
         else:
-            die('OpenSSL libcrypto not found — install libssl-dev '
+            die('OpenSSL libcrypto not found - install libssl-dev '
                 'or pass --disable-crypto')
 
     print()
@@ -524,7 +524,7 @@ def main():
     # Generate .inc files from data/ XML files before writing build.ninja
     data_xml_files = generate_data(build_dir, targets, have_alsa, have_winmidi)
 
-    # All sources share a single unified include path — no per-family separation.
+    # All sources share a single unified include path - no per-family separation.
     inc_dirs = ['core/include', 'cpu', 'vga', 'audio',
                 'hardware', 'hardware/machine', 'hardware/device',
                 'src', build_dir]
@@ -577,7 +577,7 @@ def main():
         if 'mos' in targets and not want_gtk:
             # Native Win32 hex editor (vga/hex_editor_win32.c): tab control
             # + SetWindowSubclass need comctl32, and the GDI text/bitmap
-            # calls need gdi32 — neither is in MinGW's default link set
+            # calls need gdi32 - neither is in MinGW's default link set
             # (user32, pulled in by the existing SDL File-menu code, is).
             ld_parts += ['-lcomctl32', '-lgdi32']
     ldflags = ' '.join(ld_parts)
@@ -626,7 +626,7 @@ def main():
 
     lines = [
         f'# Auto-generated by ./configure {orig_args}',
-        f'# Do not edit — re-run ./configure to update.',
+        f'# Do not edit - re-run ./configure to update.',
         f'',
         f'ninja_required_version = 1.3',
         f'',

@@ -581,7 +581,7 @@ void rob_window_render(RobWindow *w, const RobState *rob) {
              * Actual tip vertex: x=0.149, z=±0.020. To bring z→0:
              * θ = atan(0.020/0.149) ≈ 0.133 rad ≈ 7.6°.
              * The old 0.436 rad used the bounding-box extent (z=±0.075) which
-             * is the arm BASE, not the tip — that triple-overshot and crossed. */
+             * is the arm BASE, not the tip - that triple-overshot and crossed. */
             float close_ang = -0.070f + (1.0f - rob->hands_open_pos) * 0.203f;
             /* arm_idx 0 is at −Z: closing needs a negative Y rotation (moves −z toward 0).
              * arm_idx 1 is at +Z: closing needs a positive Y rotation (moves +z toward 0). */
@@ -681,7 +681,7 @@ void rob_window_render(RobWindow *w, const RobState *rob) {
     SDL_GL_MakeCurrent(NULL, NULL);
 }
 
-/* SDL event watch — fires for every event as it enters the queue, even when
+/* SDL event watch - fires for every event as it enters the queue, even when
  * gemu_display_poll() is draining the queue on the same SDL_PollEvent call. */
 static int SDLCALL rob_event_watch(void *ud, SDL_Event *e) {
     RobWindow *w = ud;

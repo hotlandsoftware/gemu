@@ -3,7 +3,7 @@
 #include <stdbool.h>
 
 /*
- * ANTIC + GTIA — Atari 400/800 display pair, modelled as one unit.
+ * ANTIC + GTIA - Atari 400/800 display pair, modelled as one unit.
  *
  * ANTIC is a display-list processor: a program in guest RAM (the display
  * list) tells it, row by row, which of 14 character/map modes to fetch and

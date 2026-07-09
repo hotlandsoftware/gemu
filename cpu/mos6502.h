@@ -8,7 +8,7 @@
 #define MOS6502_P_I  0x04u  /* Interrupt disable */
 #define MOS6502_P_D  0x08u  /* Decimal */
 #define MOS6502_P_B  0x10u  /* Break (set on push; not stored in live P) */
-#define MOS6502_P_U  0x20u  /* Unused — always reads 1 */
+#define MOS6502_P_U  0x20u  /* Unused - always reads 1 */
 #define MOS6502_P_V  0x40u  /* Overflow */
 #define MOS6502_P_N  0x80u  /* Negative */
 

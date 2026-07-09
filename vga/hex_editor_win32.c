@@ -1,9 +1,9 @@
 /*
- * Native Win32 hex editor — GTK-free equivalent of hex_editor.c.
+ * Native Win32 hex editor - GTK-free equivalent of hex_editor.c.
  *
  * One tab-per-region window (SysTabControl32) whose page is a single
  * owner-drawn child (class "GemuHexView") that paints directly from the
- * live data pointer every WM_PAINT — there is no intermediate text buffer
+ * live data pointer every WM_PAINT - there is no intermediate text buffer
  * to keep in sync, so the diffing machinery the GTK version needs (it
  * mutates a GtkTextBuffer in place to avoid starving the GTK main loop)
  * has no equivalent here: repainting ~25 visible lines from memory is

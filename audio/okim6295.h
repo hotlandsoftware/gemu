@@ -4,7 +4,7 @@
 #include <SDL2/SDL.h>
 
 /*
- * OKI MSM6295 — 4-channel ADPCM voice synthesis LSI.
+ * OKI MSM6295 - 4-channel ADPCM voice synthesis LSI.
  * Reference: OKI Semiconductor MSM6295 datasheet.
  *
  * Command protocol (2 bytes to start a phrase, 1 byte to stop):

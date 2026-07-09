@@ -36,7 +36,7 @@ void hex_editor_hide(HexEditor *he);
 bool hex_editor_is_visible(const HexEditor *he);
 
 /* Refresh the hex display with current data.  Safe to call from the run
- * loop every frame — it will only redraw when the window is visible. */
+ * loop every frame - it will only redraw when the window is visible. */
 void hex_editor_refresh(HexEditor *he);
 
 #endif /* GEMU_GTK || _WIN32 */

@@ -57,7 +57,7 @@ void gemu_gtk_add_action_menu(GtkWidget *vbox, GemuMonitor *mon,
 
         g_signal_connect(hex_item, "activate",
                          G_CALLBACK(on_menu_hex_editor), ctx);
-        /* ctx is leaked — small, lives as long as the menu does */
+        /* ctx is leaked - small, lives as long as the menu does */
     }
 
     gtk_box_pack_start(GTK_BOX(vbox), menubar, FALSE, FALSE, 0);

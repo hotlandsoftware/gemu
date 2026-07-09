@@ -177,7 +177,7 @@ static uint8_t pia0_read_pa(void *ud) {
 static uint8_t pia0_read_pb(void *ud) { (void)ud; return 0x00; }
 
 static void pia0_write_pb(void *ud, uint8_t val) {
-    (void)ud; (void)val; /* coin counters — nothing physical to drive */
+    (void)ud; (void)val; /* coin counters - nothing physical to drive */
 }
 
 /* ── PIA1: SW4 + audio-CPU NMI trigger + mux select ─────────────────────── */
@@ -340,7 +340,7 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
         else if (!strcmp(region, "proms"))     proms_path    = cfg->roms[i].path;
     }
     if (!prg_path || !audiocpu_path || !gfxbanks_path || !proms_path) {
-        fprintf(stderr, "5clown: missing ROM(s) — need prg, audiocpu, gfxbanks, proms "
+        fprintf(stderr, "5clown: missing ROM(s) - need prg, audiocpu, gfxbanks, proms "
                         "(oki6295 optional); use -rom roms/5clown\n");
         free(s);
         return NULL;
@@ -358,7 +358,7 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
     }
 
     /* Decrypt main program (whole-byte XOR) then split into the CPU's two
-     * visible ROM windows — see hardware/5clown.h for the layout. */
+     * visible ROM windows - see hardware/5clown.h for the layout. */
     for (int i = 0; i < 0x8000; i++) prg_raw[i] = (uint8_t)(prg_raw[i] ^ 0x20);
     s->prg = malloc(0x8000);
     memcpy(s->prg,          prg_raw,          0x6000); /* -> $2000-$7FFF */
@@ -367,7 +367,7 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
 
     s->audio_prg = audiocpu_raw; /* unencrypted */
 
-    /* Decrypt gfxbanks in place — 0x5000-0x5FFF is deliberately left alone
+    /* Decrypt gfxbanks in place - 0x5000-0x5FFF is deliberately left alone
      * (verified against the driver's init_fclown; not a bug). */
     for (int i = 0x4000; i < 0x5000; i++) gfxbanks_raw[i] = (uint8_t)(gfxbanks_raw[i] ^ 0x22);
     for (int i = 0x6000; i < 0x7000; i++) gfxbanks_raw[i] = (uint8_t)(gfxbanks_raw[i] ^ 0x3F);
@@ -399,10 +399,10 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
     free(proms_raw);
 
     /* DIP switch defaults, computed bit-by-bit from the driver's
-     * PORT_DIPNAME default arguments (deliberately not just "0xFF" —
+     * PORT_DIPNAME default arguments (deliberately not just "0xFF" -
      * several bits default "on"). SW2 bit 0x10 is "System Boot": the
      * driver comment says it must be On (=0 for that bit) to boot, which
-     * is already reflected in 0xCF below — do not change this default
+     * is already reflected in 0xCF below - do not change this default
      * without re-checking that comment. */
     s->dip1 = 0xFF;
     s->dip2 = 0xCF;

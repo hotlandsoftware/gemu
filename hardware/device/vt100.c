@@ -1,5 +1,5 @@
 /*
- * vt100.c — DEC VT100 terminal emulator (SDL2 window)
+ * vt100.c - DEC VT100 terminal emulator (SDL2 window)
  *
  * Translated from uconsole.pas (Hans Otten / Eduardo Casino, MIT).
  *
@@ -1139,7 +1139,7 @@ Vt100State *vt100_create(GemuDisplayType dtype, const char *title) {
     /* Create renderer.
      * In GTK mode use software rendering: the accelerated renderer uses OpenGL,
      * and every SDL_RenderPresent triggers glXSwapBuffers which causes the
-     * compositor to re-composite all windows — making the GTK menu bar flicker. */
+     * compositor to re-composite all windows - making the GTK menu bar flicker. */
     Uint32 rflags = (dtype == GEMU_DISPLAY_GTK)
                     ? SDL_RENDERER_SOFTWARE
                     : (SDL_RENDERER_ACCELERATED | (use_vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
@@ -1185,7 +1185,7 @@ Vt100State *vt100_create(GemuDisplayType dtype, const char *title) {
     return t;
 }
 
-#else /* !HAVE_TTF — spawn xterm (or fall back to stdin/stdout) */
+#else /* !HAVE_TTF - spawn xterm (or fall back to stdin/stdout) */
 
 #ifndef _WIN32
 #  if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
@@ -1293,7 +1293,7 @@ Vt100State *vt100_create(GemuDisplayType dtype, const char *title)
         if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0)
             t->raw = true;
     }
-    fprintf(stderr, "vt100: xterm not found — using host terminal (stdin/stdout)\n");
+    fprintf(stderr, "vt100: xterm not found - using host terminal (stdin/stdout)\n");
 #endif
     return t;
 }
