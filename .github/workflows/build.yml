@@ -82,8 +82,52 @@ jobs:
           path: gemu-windows-x86_64.zip
           retention-days: 7
 
+  build-windows-i686:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          install: >-
+            make
+            mingw-w64-i686-toolchain
+            mingw-w64-i686-SDL2
+            mingw-w64-i686-ninja
+            mingw-w64-i686-python
+
+      - name: Configure
+        run: python3 configure --target-list="chip8,mos,rca"
+
+      - name: Build
+        run: ninja
+
+      - name: Gather runtime DLLs
+        run: |
+          for exe in bin/*.exe; do
+            { ldd "$exe" 2>/dev/null || true; } | awk '/mingw32/{print $3}' | while IFS= read -r dll; do
+              cp -n "$dll" bin/ 2>/dev/null || true
+            done
+          done
+
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path bin\* -DestinationPath gemu-windows-i686.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemu-windows-i686
+          path: gemu-windows-i686.zip
+          retention-days: 7
+
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-windows-i686]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
@@ -98,6 +142,11 @@ jobs:
           name: gemu-windows-x86_64
           path: .
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: gemu-windows-i686
+          path: .
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly
@@ -107,3 +156,4 @@ jobs:
           files: |
             gemu-linux-x86_64.tar.gz
             gemu-windows-x86_64.zip
+            gemu-windows-i686.zip
