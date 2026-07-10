@@ -20,14 +20,11 @@
  *
  *   comb_filter = true: a 3-line comb filter (see the .c file for why 3
  *   lines and not the classic broadcast-TV 2-line design) — pools raw
- *   samples from the scanline above, the scanline itself, and the one
- *   below into one joint demodulation, using each sample's own exact
- *   subcarrier phase. This is what a real comb-filter TV did: exploit
- *   inter-line correlation to separate luma/chroma more cleanly than any
- *   single line's frequency content alone allows. It measurably reduces
- *   dot crawl and cross-color fringing, at comb filtering's own known,
- *   authentic cost: some vertical luma softening, since luma is now
- *   blended across 3 lines instead of read from just one.
+ *   chroma samples from the scanline above, the scanline itself, and the
+ *   one below into one joint demodulation, using each sample's own exact
+ *   subcarrier phase. Luma is still decoded from the current scanline so
+ *   high-contrast text and sprite edges keep a sharper core while chroma
+ *   dot crawl and cross-color fringing are reduced.
  *
  * Any chip that can produce a colorburst-referenced composite signal (see
  * crt/nes_ntsc_encode.h for the NES's encoder) can target this decoder —

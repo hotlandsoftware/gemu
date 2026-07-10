@@ -2,19 +2,19 @@
 #include "fast_trig.h"
 #include <math.h>
 
-/* Accumulate one scanline's window of samples into the running Y/I/Q sums.
+/* Accumulate one scanline's window of samples into the running decode sums.
  * line_base is that scanline's absolute sample-index origin (line_index *
  * samples_per_line — i.e. its position in the flat signal buffer), which
  * is also what phase continuity is computed from, so a window "belonging"
  * to a different line than the one being decoded still gets an exactly
  * correct phase reference for its own samples, not an approximated one.
  *
- * Uniform (boxcar) weighting over exactly one subcarrier period is load
- * bearing, not just simple: a Hamming-style taper was tried here to cut
- * edge ringing, but a non-uniform window has nonzero DFT content at the
- * subcarrier's own fundamental frequency over this window length, which
- * lets the pedestal (luma) leak into the I/Q channels -- an effect a
- * uniform window cancels for free via discrete orthogonality (N equally
+ * Uniform (boxcar) chroma weighting over exactly one subcarrier period is
+ * load bearing, not just simple: a Hamming-style taper was tried here to
+ * cut edge ringing, but a non-uniform window has nonzero DFT content at
+ * the subcarrier's own fundamental frequency over this window length,
+ * which lets the pedestal (luma) leak into the I/Q channels -- an effect
+ * a uniform window cancels for free via discrete orthogonality (N equally
  * spaced samples over exactly one period sum a single-frequency term to
  * exactly zero). That leak's phase depends on absolute signal position,
  * so it doesn't average out -- it showed up as the whole picture cycling
@@ -22,9 +22,22 @@
  * the ringing it was meant to fix. Properly windowing this decode
  * without that leak needs a real multi-null FIR design, not a drop-in
  * taper; deferred rather than attempted half-fixed. */
-static void accumulate_window(const float *signal, int spl, long line_base,
-                              int center, int taps, double cyc,
-                              double *y_acc, double *i_acc, double *q_acc, int *n) {
+static void accumulate_luma_window(const float *signal, int spl, long line_base,
+                                   int center, int taps, double *y_acc, int *n) {
+    const float *row = signal + line_base;
+    int k0 = -taps / 2;
+    for (int k = k0; k < taps / 2; k++) {
+        int s = center + k;
+        if (s >= 0 && s < spl) {
+            *y_acc += row[s];
+            (*n)++;
+        }
+    }
+}
+
+static void accumulate_chroma_window(const float *signal, int spl, long line_base,
+                                     int center, int taps, double cyc,
+                                     double *i_acc, double *q_acc, int *n) {
     const float *row = signal + line_base;
     int k0 = -taps / 2;
     /* Phase advances by a fixed `cyc` per sample, so one fmod() at the
@@ -37,7 +50,6 @@ static void accumulate_window(const float *signal, int spl, long line_base,
         int s = center + k;
         if (s >= 0 && s < spl) {
             double sample = row[s];
-            *y_acc += sample;
             *i_acc += sample * ntsc_cos_frac(frac);
             *q_acc += sample * ntsc_sin_frac(frac);
             (*n)++;
@@ -80,22 +92,29 @@ void ntsc_decode(const NtscDecodeSpec *spec, const float *signal, uint32_t *out)
             int center = (int)((long)ox * spl / ow);
 
             double y_acc = 0.0, i_acc = 0.0, q_acc = 0.0;
-            int n = 0;
-            accumulate_window(signal, spl, (long)line * spl, center, taps, cyc,
-                              &y_acc, &i_acc, &q_acc, &n);
+            int y_n = 0, chroma_n = 0;
+            /* A comb-filter set should clean up chroma without turning
+             * high-contrast luma edges into a vertical blur.  Decode Y from
+             * the current scanline only; pool neighboring lines only for
+             * synchronous I/Q chroma demodulation. */
+            accumulate_luma_window(signal, spl, (long)line * spl, center, taps,
+                                   &y_acc, &y_n);
+            accumulate_chroma_window(signal, spl, (long)line * spl, center, taps, cyc,
+                                     &i_acc, &q_acc, &chroma_n);
             if (spec->comb_filter) {
-                accumulate_window(signal, spl, (long)line_lo * spl, center, taps, cyc,
-                                  &y_acc, &i_acc, &q_acc, &n);
-                accumulate_window(signal, spl, (long)line_hi * spl, center, taps, cyc,
-                                  &y_acc, &i_acc, &q_acc, &n);
+                accumulate_chroma_window(signal, spl, (long)line_lo * spl, center, taps, cyc,
+                                         &i_acc, &q_acc, &chroma_n);
+                accumulate_chroma_window(signal, spl, (long)line_hi * spl, center, taps, cyc,
+                                         &i_acc, &q_acc, &chroma_n);
             }
 
-            if (n == 0) n = 1;
-            double Y = y_acc / n;
+            if (y_n == 0) y_n = 1;
+            if (chroma_n == 0) chroma_n = 1;
+            double Y = y_acc / y_n;
             /* x2: synchronous demodulation of a cosine-modulated signal
              * recovers half the true amplitude; restore it here. */
-            double I = (i_acc / n) * 2.0;
-            double Q = (q_acc / n) * 2.0;
+            double I = (i_acc / chroma_n) * 2.0;
+            double Q = (q_acc / chroma_n) * 2.0;
 
             double r = Y + 0.956 * I + 0.621 * Q;
             double g = Y - 0.272 * I - 0.647 * Q;
