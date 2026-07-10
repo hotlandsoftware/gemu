@@ -4,11 +4,12 @@
 
 static const CrtTubeProfile generic_crt = {
     .name = "generic-crt",
-    .scanline_strength = 0.24f,
-    .mask_strength = 0.10f,
-    .bloom_strength = 0.08f,
+    .scanline_strength = 0.18f,
+    .mask_strength = 0.07f,
+    .bloom_strength = 0.10f,
     .bloom_threshold = 0.70f,
-    .gamma = 1.12f,
+    .gain = 1.18f,
+    .gamma = 1.18f,
 };
 
 const CrtTubeProfile *crt_tube_profile_generic(void) {
@@ -91,6 +92,10 @@ void crt_tube_apply(const CrtTubeProfile *profile, const uint32_t *src,
             case 1: r *= mask_dark; b *= mask_dark; break;
             case 2: r *= mask_dark; g *= mask_dark; break;
             }
+
+            r *= profile->gain;
+            g *= profile->gain;
+            b *= profile->gain;
 
             uint8_t R = light_to_srgb(r, profile->gamma);
             uint8_t G = light_to_srgb(g, profile->gamma);

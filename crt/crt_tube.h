@@ -17,6 +17,7 @@ typedef struct {
     float mask_strength;      /* 0..1 phosphor/shadow-mask tint amount */
     float bloom_strength;     /* small neighbor light bleed */
     float bloom_threshold;    /* source luma where bloom starts */
+    float gain;               /* overall drive compensation */
     float gamma;              /* output light response, 1.0 = linear */
 } CrtTubeProfile;
 
