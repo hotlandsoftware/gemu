@@ -1,10 +1,10 @@
 <?xml version="1.0"?>
-<!-- Generic name: always the best available decode quality. Currently a
-     3-line comb filter (MOS_CRT_COMB, see hardware/mos6502cfg.h and
-     crt/ntsc_decode.c); less dot crawl/fringing than -device cheap-crt
-     (see cheap-crt.xml), which stays pinned to the plain single-line
-     decode on purpose rather than upgrading alongside this name. -->
-<device name="crt" description="NTSC composite signal decode with a 3-line comb filter (less dot crawl/fringing than a cheap set)" status="preliminary">
+<!-- Generic name: always the best available CRT pipeline. Currently this is
+     NES composite encode -> 3-line chroma comb decode -> generic tube pass.
+     Less dot crawl/fringing than -device cheap-crt (see cheap-crt.xml),
+     which stays pinned to the plain single-line decode path on purpose
+     rather than upgrading alongside this name. -->
+<device name="crt" description="Generic CRT monitor" status="preliminary">
     <machine name="nes"/>
     <machine name="famicom"/>
     <machine name="vssmb"/>

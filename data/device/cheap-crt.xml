@@ -5,7 +5,7 @@
      budget-TV look (visible dot crawl/chroma fringing from a single-line
      decode with no comb filter) rather than whatever the best available
      quality happens to be. -->
-<device name="cheap-crt" description="Generic, cheap CRT monitor (single-line NTSC decode, no comb filter dot crawl/chroma bleed" status="preliminary">
+<device name="cheap-crt" description="Generic, cheap CRT monitor (single-line NTSC decode, no comb filter dot crawl/chroma bleed)" status="preliminary">
     <machine name="nes"/>
     <machine name="famicom"/>
     <machine name="vssmb"/>

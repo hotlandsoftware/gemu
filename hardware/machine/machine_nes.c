@@ -9,6 +9,7 @@
 #include "apu2a03.h"
 #include "nes_ntsc_encode.h"
 #include "ntsc_decode.h"
+#include "crt_tube.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
 #include "gemu/gemu_display.h"
@@ -2336,12 +2337,15 @@ NesState *nes_create(const MosConfig *cfg) {
     if (cfg->crt_type != MOS_CRT_NONE) {
         s->crt_signal = calloc((size_t)RP2C02_WIDTH * NES_NTSC_OVERSAMPLE *
                                RP2C02_HEIGHT, sizeof(float));
+        s->crt_decoded_argb = calloc((size_t)NES_CRT_WIDTH * NES_CRT_HEIGHT,
+                                     sizeof(uint32_t));
         s->crt_argb = calloc((size_t)NES_CRT_WIDTH * NES_CRT_HEIGHT,
                              sizeof(uint32_t));
-        if (!s->crt_signal || !s->crt_argb) {
+        if (!s->crt_signal || !s->crt_decoded_argb || !s->crt_argb) {
             fprintf(stderr, "nes: -device crt: out of memory, disabling\n");
-            free(s->crt_signal); s->crt_signal = NULL;
-            free(s->crt_argb);   s->crt_argb   = NULL;
+            free(s->crt_signal);       s->crt_signal = NULL;
+            free(s->crt_decoded_argb); s->crt_decoded_argb = NULL;
+            free(s->crt_argb);         s->crt_argb   = NULL;
         }
     }
 
@@ -2431,6 +2435,7 @@ void nes_destroy(NesState *s) {
     gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
     free(s->crt_signal);
+    free(s->crt_decoded_argb);
     free(s->crt_argb);
     free(s->prg);
     free(s->chr);
@@ -2629,7 +2634,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
              * straight into pixels_argb (e.g. the Lua gui.* API above)
              * won't appear in CRT mode — correctly so, since it was never
              * part of the real signal. */
-            if (cfg->crt_type != MOS_CRT_NONE && s->crt_argb) {
+            if (cfg->crt_type != MOS_CRT_NONE && s->crt_argb && s->crt_decoded_argb) {
                 NesNtscEncodeSpec enc_spec = {
                     .oversample = NES_NTSC_OVERSAMPLE,
                     .emphasis   = (uint8_t)(s->ppu.ppumask & 0xE0u),
@@ -2646,7 +2651,9 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                     .out_width        = NES_CRT_WIDTH,
                     .comb_filter      = cfg->crt_type == MOS_CRT_COMB,
                 };
-                ntsc_decode(&dec_spec, s->crt_signal, s->crt_argb);
+                ntsc_decode(&dec_spec, s->crt_signal, s->crt_decoded_argb);
+                crt_tube_apply(crt_tube_profile_generic(), s->crt_decoded_argb,
+                               s->crt_argb, NES_CRT_WIDTH, NES_CRT_HEIGHT);
             }
 
             /* Render completed frame (PPU already builds pixels_argb). */
