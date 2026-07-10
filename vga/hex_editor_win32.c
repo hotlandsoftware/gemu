@@ -252,6 +252,20 @@ static bool byte_at_pos(HexEditorTab *tab, int line, int col,
     return false;
 }
 
+/* Plain TextOutA sizes its OPAQUE background fill from the font's real
+ * glyph-advance metrics, not from he->char_w. Since every fragment below is
+ * positioned by hand at "4 + col * he->char_w", any mismatch between the
+ * two (ClearType/kerning rounding — even on a "monospace" font) makes
+ * adjacent opaque fragments gap or overlap by a pixel, clipping whatever
+ * glyph sits at that seam. Force exact per-character pixel width via
+ * ExtTextOutA's dx array so hand-computed columns are always right. */
+static void hex_text_out(HDC hdc, int x, int y, const char *s, int n, int char_w) {
+    static int dx[128];
+    if (n > 128) n = 128;
+    for (int i = 0; i < n; i++) dx[i] = char_w;
+    ExtTextOutA(hdc, x, y, ETO_OPAQUE, NULL, s, (UINT)n, dx);
+}
+
 static void view_paint(HexEditor *he, HDC hdc, RECT client) {
     HexEditorTab *tab = cur_tab(he);
     HFONT old_font = (HFONT)SelectObject(hdc, he->font);
@@ -260,7 +274,7 @@ static void view_paint(HexEditor *he, HDC hdc, RECT client) {
     if (!tab || !tab->data || tab->size == 0) {
         SetTextColor(hdc, RGB(0, 0, 0));
         SetBkColor(hdc, RGB(255, 255, 255));
-        TextOutA(hdc, 4, 2, "(no data)", 9);
+        hex_text_out(hdc, 4, 2, "(no data)", 9, he->char_w);
         SelectObject(hdc, old_font);
         return;
     }
@@ -284,7 +298,7 @@ static void view_paint(HexEditor *he, HDC hdc, RECT client) {
         if (!sel_row) {
             SetTextColor(hdc, RGB(0, 0, 0));
             SetBkColor(hdc, RGB(255, 255, 255));
-            TextOutA(hdc, 4, y, line, len);
+            hex_text_out(hdc, 4, y, line, len, he->char_w);
         } else {
             /* Draw in three pieces so the selected hex digits / ASCII char
              * can be highlighted without a second pass. */
@@ -293,20 +307,20 @@ static void view_paint(HexEditor *he, HDC hdc, RECT client) {
 
             SetTextColor(hdc, RGB(0, 0, 0));
             SetBkColor(hdc, RGB(255, 255, 255));
-            TextOutA(hdc, 4, y, line, hex_col);
-            TextOutA(hdc, 4 + (ascii_col + 2) * he->char_w, y,
-                    line + ascii_col + 2, len - ascii_col - 2);
+            hex_text_out(hdc, 4, y, line, hex_col, he->char_w);
+            hex_text_out(hdc, 4 + (hex_col + 2) * he->char_w, y,
+                        line + hex_col + 2, len - hex_col - 2, he->char_w);
 
             SetTextColor(hdc, RGB(0, 0, 0));
             SetBkColor(hdc, RGB(255, 255, 0));
-            TextOutA(hdc, 4 + hex_col * he->char_w, y, line + hex_col, 2);
-            TextOutA(hdc, 4 + ascii_col * he->char_w, y, line + ascii_col, 1);
+            hex_text_out(hdc, 4 + hex_col * he->char_w, y, line + hex_col, 2, he->char_w);
+            hex_text_out(hdc, 4 + ascii_col * he->char_w, y, line + ascii_col, 1, he->char_w);
 
             if (GetFocus() == he->view) {
                 int nib_col = hex_col + he->edit_nibble;
                 SetTextColor(hdc, RGB(255, 255, 255));
                 SetBkColor(hdc, RGB(0, 0, 0));
-                TextOutA(hdc, 4 + nib_col * he->char_w, y, line + nib_col, 1);
+                hex_text_out(hdc, 4 + nib_col * he->char_w, y, line + nib_col, 1, he->char_w);
             }
         }
     }
