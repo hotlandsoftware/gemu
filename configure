@@ -128,8 +128,23 @@ FAMILY_DEFINE = {'mos': 'HAVE_MOS',  'rca': 'HAVE_RCA',  'chip8': 'HAVE_CHIP8'}
 def _xml_files(*patterns):
     paths = []
     for pat in patterns:
-        paths.extend(sorted(glob.glob(pat)))
+        paths.extend(sorted(glob.glob(pat, recursive=True)))
     return paths
+
+# Ranks mirror MAME driver status flags; see MACHINES_MOS.md's "Implemented"
+# table for the vocabulary this predates and should eventually replace.
+# Shared by machine/device/soundhw/chargen/vga XMLs.
+STATUSES = {'working', 'imperfect', 'preliminary', 'skeleton'}
+
+def _status(path, root):
+    status = root.get('status', '')
+    if status and status not in STATUSES:
+        die(f"{path}: invalid status '{status}' "
+            f"(expected one of: {', '.join(sorted(STATUSES))})")
+    return status
+
+def _with_status(desc, status):
+    return f'{desc} [{status}]' if status else desc
 
 def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     gen_dir = os.path.join(build_dir, 'generated')
@@ -140,7 +155,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     # ── Parse machine XMLs ────────────────────────────────────────────────────
     machines = []
     machine_family = {}
-    for path in _xml_files('data/machine/*.xml'):
+    for path in _xml_files('data/machine/**/*.xml'):
         root = ET.parse(path).getroot()
         name   = root.get('name')
         family = root.get('family')
@@ -150,6 +165,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
                    'sha256': r.get('sha256', '')}
                   for r in root.findall('rom')]
         devices = [d.get('name') for d in root.findall('device') if d.get('name')]
+        status = _status(path, root)
         machines.append({
             'name':   name,
             'family': family,
@@ -163,6 +179,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             'tv':     root.get('tv',     ''),
             'ram':    root.get('ram',    ''),
             'devices': ','.join(devices),
+            'status': status,
         })
         machine_family[name] = family
     machines.sort(key=lambda m: m['name'])
@@ -187,7 +204,8 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         if m['family'] not in active:
             continue
         setup = FAMILY_SETUP.get(m['family'], m['family'] + '_setup')
-        lines.append(f'    {{ "{m["name"]}", {setup}, "{m["desc"]}" }},\n')
+        desc = _with_status(m['desc'], m['status'])
+        lines.append(f'    {{ "{m["name"]}", {setup}, "{desc}" }},\n')
     with open(os.path.join(gen_dir, 'machines.inc'), 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
@@ -199,7 +217,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     for m in machines:
         if m['family'] not in active:
             continue
-        desc = m['desc'].replace('"', '\\"')
+        desc = _with_status(m['desc'], m['status']).replace('"', '\\"')
         fam_lines[m['family']].append(f'    {{ "{m["name"]}", "{desc}" }},\n')
     for fam, flines in fam_lines.items():
         with open(os.path.join(gen_dir, f'machines_{fam}.inc'), 'w', encoding='utf-8') as f:
@@ -240,6 +258,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         root = ET.parse(path).getroot()
         name  = root.get('name')
         desc  = root.get('description', '')
+        status = _status(path, root)
         if root.get('scope') == 'all':
             mlist = sorted(mn for mn, fam in machine_family.items() if fam in active)
         else:
@@ -247,12 +266,12 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             mlist = [mn for mn in mlist if machine_family.get(mn, '') in active]
         if not mlist:
             continue
-        devices.append({'name': name, 'desc': desc, 'machines': mlist})
+        devices.append({'name': name, 'desc': desc, 'machines': mlist, 'status': status})
     devices.sort(key=lambda d: d['name'])
 
     lines = ['// Auto-generated from data/device/*.xml - do not edit\n']
     for d in devices:
-        desc = d['desc'].replace('"', '\\"')
+        desc = _with_status(d['desc'], d['status']).replace('"', '\\"')
         mstr = ', '.join(d['machines'])
         lines.append(f'    {{ "{d["name"]}", "{desc}", "{mstr}" }},\n')
     with open(os.path.join(gen_dir, 'devices.inc'), 'w', encoding='utf-8') as f:
@@ -266,6 +285,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         desc   = root.get('description', '')
         req    = root.get('requires', '')
         req_ft = root.get('requires-feature', '')
+        status = _status(path, root)
         mlist  = [m.get('name') for m in root.findall('machine')]
         if req and req not in active:
             continue
@@ -273,12 +293,12 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         if req_ft == 'midi'  and not (have_alsa or have_winmidi): continue
         mlist = [mn for mn in mlist if machine_family.get(mn, '') in active]
         mstr  = ', '.join(mlist) if mlist else 'all'
-        soundhw.append({'name': name, 'desc': desc, 'machines': mstr})
+        soundhw.append({'name': name, 'desc': desc, 'machines': mstr, 'status': status})
     soundhw.sort(key=lambda s: s['name'])
 
     lines = ['// Auto-generated from data/soundhw/*.xml - do not edit\n']
     for s in soundhw:
-        desc = s['desc'].replace('"', '\\"')
+        desc = _with_status(s['desc'], s['status']).replace('"', '\\"')
         lines.append(f'    {{ "{s["name"]}", "{desc}", "{s["machines"]}" }},\n')
     with open(os.path.join(gen_dir, 'soundhw.inc'), 'w', encoding='utf-8') as f:
         f.writelines(lines)
@@ -289,7 +309,8 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     for path in _xml_files('data/chargen/*.xml'):
         root = ET.parse(path).getroot()
         name = root.get('name')
-        desc = root.get('description', '').replace('"', '\\"')
+        status = _status(path, root)
+        desc = _with_status(root.get('description', ''), status).replace('"', '\\"')
         req  = root.get('requires', '')
         if req and req not in active:
             continue
@@ -308,7 +329,8 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     for path in _xml_files('data/vga/*.xml'):
         root = ET.parse(path).getroot()
         name  = root.get('name')
-        desc  = root.get('description', '').replace('"', '\\"')
+        status = _status(path, root)
+        desc  = _with_status(root.get('description', ''), status).replace('"', '\\"')
         req   = root.get('requires', '')
         if req not in active:
             continue
@@ -317,7 +339,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         with open(os.path.join(gen_dir, f'vgas_{fam}.inc'), 'w', encoding='utf-8') as f:
             f.writelines(flines)
 
-    return _xml_files('data/machine/*.xml', 'data/device/*.xml',
+    return _xml_files('data/machine/**/*.xml', 'data/device/*.xml',
                       'data/soundhw/*.xml', 'data/chargen/*.xml',
                       'data/vga/*.xml')
 

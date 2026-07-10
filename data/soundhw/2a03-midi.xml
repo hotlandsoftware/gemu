@@ -1,5 +1,6 @@
 <?xml version="1.0"?>
-<soundhw name="2a03,output=midi" description="Ricoh 2A03 APU → MIDI output" requires="mos" requires-feature="midi">
+<soundhw name="2a03,output=midi" description="Ricoh 2A03 APU → MIDI output" requires="mos" 
+    requires-feature="midi" status="imperfect">
     <machine name="nes"/>
     <machine name="famicom"/>
 </soundhw>

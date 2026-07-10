@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<machine name="iopener" family="x86" description="Netpliance i-Opener (1999)"
+        cpu="winchip-c6" ram="32M" status="skeleton">
+    <rom name="bios_image_256k.bin"  addr="0x0000" sha256="d82b99ee8d0a7a01971eae1e72966e03d503358fe7b46e95e7a91d3e1d405df9"/>
+</machine>

@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
 <machine name="mos" family="mos" description="Generic MOS 6502 machine (flat 64 KB)"
-         cpu="6502" ram="64K">
+         cpu="6502" ram="64K" status="preliminary">
     <rom name="6502_functional_test.bin" addr="0x0000" sha256="9f00c8a4055f441894683462ac8ecbf007d15df29cef77e03555977f9a03a2f0"/>
 </machine>

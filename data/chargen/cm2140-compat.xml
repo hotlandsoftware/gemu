@@ -1,4 +1,5 @@
 <?xml version="1.0"?>
-<chargen name="cm2140-compat" description="Signetics 2513 CM2140 character generator (compatibility, no ROM)" requires="mos">
+<chargen name="cm2140-compat" description="Signetics 2513 CM2140 character generator (compatibility, no ROM)" 
+    requires="mos" status="working">
     <machine name="apple1"/>
 </chargen>

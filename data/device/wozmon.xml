@@ -1,4 +1,4 @@
 <?xml version="1.0"?>
-<device name="wozmon" description="Wozniak 'Woz' Monitor">
+<device name="wozmon" description="Wozniak 'Woz' Monitor" status="imperfect">
     <machine name="kim1"/>
 </device>

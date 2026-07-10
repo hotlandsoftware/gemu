@@ -1,2 +1,3 @@
 <?xml version="1.0"?>
-<vga name="cdp1869" description="RCA CDP1869/1870 VIS (tile-based colour display, PAL/NTSC)" requires="rca"/>
+<vga name="cdp1869" description="RCA CDP1869/1870 VIS (tile-based colour display, PAL/NTSC)" 
+    requires="rca" status="working"/>

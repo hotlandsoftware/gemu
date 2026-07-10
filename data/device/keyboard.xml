@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<device name="keyboard" description="Generic QWERTY keyboard">
+<device name="keyboard" description="Generic QWERTY keyboard" status="working">
     <machine name="atari400"/>
     <machine name="atari400a"/>
     <machine name="vip"/>

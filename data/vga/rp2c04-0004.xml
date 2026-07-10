@@ -1,2 +1,3 @@
 <?xml version="1.0"?>
-<vga name="rp2c04-0004" description="Ricoh RP2C04-0004 (VS. System RGB PPU, no odd-frame dot skip)" requires="mos"/>
+<vga name="rp2c04-0004" description="Ricoh RP2C04-0004 (VS. System RGB PPU, no odd-frame dot skip)" 
+    requires="mos" status="working"/>

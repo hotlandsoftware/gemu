@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<device name="rob" description="R.O.B. (Robotic Operating Buddy) (second window)">
+<device name="rob" description="R.O.B. (Robotic Operating Buddy) (second window)" status="working">
     <machine name="nes"/>
     <machine name="famicom"/>
 </device>

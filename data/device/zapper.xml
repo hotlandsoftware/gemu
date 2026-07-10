@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<device name="zapper" description="NES Zapper (light gun)">
+<device name="zapper" description="NES Zapper (light gun)" status="working">
     <machine name="nes"/>
     <machine name="famicom"/>
 </device>

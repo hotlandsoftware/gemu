@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
 <machine name="asobou" family="mos" description="Go! Go! Connie-chan! Asobou Mouse (um6578)"
-         cpu="6502" vga="sh6578" soundhw="2a03" alias="um6578">
+         cpu="6502" vga="sh6578" soundhw="2a03" alias="um6578" status="imperfect">
     <rom name="gogoconniechan.bin" region="maincpu" addr="0x0000" sha256="66c254482eeae9cc36a9c32bc8da3fd010922e1a25087433eaf2c9f521abfbca"/>
 </machine>

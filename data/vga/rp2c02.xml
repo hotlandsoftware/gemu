@@ -1,2 +1,3 @@
 <?xml version="1.0"?>
-<vga name="rp2c02" description="Ricoh RP2C02 (NES/Famicom PPU, 256×240 px, 64-colour palette)" requires="mos"/>
+<vga name="rp2c02" description="Ricoh RP2C02 (NES/Famicom PPU, 256×240 px, 64-colour palette)" 
+    requires="mos" status="working"/>

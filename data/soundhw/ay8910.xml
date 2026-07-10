@@ -1,4 +1,5 @@
 <?xml version="1.0"?>
-<soundhw name="ay8910" description="General Instrument AY-3-8910 PSG (stub, no synthesis yet)" requires="mos">
+<soundhw name="ay8910" description="General Instrument AY-3-8910 PSG (stub, no synthesis yet)" 
+    requires="mos" status="skeleton">
     <machine name="5clown"/>
 </soundhw>

@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<soundhw name="pcspk" description="Primitive 1-bit speaker">
+<soundhw name="pcspk" description="Primitive 1-bit speaker" status="working">
     <machine name="vip"/>
     <machine name="studio2"/>
     <machine name="pecom32"/>

@@ -1,2 +1,3 @@
 <?xml version="1.0"?>
-<chargen name="auto" description="Use ROM character generator when present, otherwise fallback" requires="mos"/>
+<chargen name="auto" description="Use ROM character generator when present, otherwise fallback" 
+    requires="mos" status="working"/>

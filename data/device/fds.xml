@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<device name="fds" description="Famicom Disk System">
+<device name="fds" description="Famicom Disk System" status="working">
     <machine name="nes"/>
     <machine name="famicom"/>
 </device>

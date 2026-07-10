@@ -1,4 +1,4 @@
 <?xml version="1.0"?>
-<device name="subor-mouse" description="Subor Mouse">
+<device name="subor-mouse" description="Subor Mouse" status="preliminary">
     <machine name="um6578"/>
 </device>

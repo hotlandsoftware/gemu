@@ -1,2 +1,2 @@
 <?xml version="1.0"?>
-<vga name="none" description="No video output" requires="rca"/>
+<vga name="none" description="No video output" status="working"/>

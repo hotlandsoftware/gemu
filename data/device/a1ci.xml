@@ -1,4 +1,4 @@
 <?xml version="1.0"?>
-<device name="a1ci" description="Apple I Cassette Interface">
+<device name="a1ci" description="Apple I Cassette Interface" status="working">
     <machine name="apple1"/>
 </device>

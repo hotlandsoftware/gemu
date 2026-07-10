@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <machine name="7mezzo" family="mos" description="7 e Mezzo (alias for magicfly)"
-         alias="magicfly" cpu="6502" soundhw="pcspk">
+         alias="magicfly" cpu="6502" soundhw="pcspk" status="working">
     <rom name="ns3_1.bin"           region="maincpu" addr="0x0000" sha256="b27638b7c1e94638b78ef344d0cc6d55269fdcacfef18fd883428ef2c3d6aee3"/>
     <rom name="ns2.bin"             region="gfx2"    addr="0x0000" sha256="23cd076c1fb99811e2f048eabc0708b09c3e384d21bd543d70ddd79fcffbeefa"/>
     <rom name="ns1.bin"             region="gfx1"    addr="0x0000" sha256="ed09619e45bb61580addadaadc0532fe92d9852df8b014b391460e0e629a19dd"/>

@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<device name="nes-controller" description="NES/Famicom Standard Controller">
+<device name="nes-controller" description="NES/Famicom Standard Controller" status="working">
     <machine name="nes"/>
     <machine name="famicom"/>
     <machine name="um6578"/>
