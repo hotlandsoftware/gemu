@@ -1,4 +1,5 @@
 #include "nes_ntsc_encode.h"
+#include "fast_trig.h"
 #include <math.h>
 
 #ifndef M_PI
@@ -99,6 +100,7 @@ void nes_ntsc_encode(const NesNtscEncodeSpec *spec, const uint8_t *pixels,
                      float *signal_out) {
     build_color_tables();
     build_emphasis_centers();
+    ntsc_trig_lut_init();
 
     int oversample = spec->oversample;
     double cyc_per_sample = nes_ntsc_subcarrier_cycles_per_sample(oversample);
@@ -113,14 +115,20 @@ void nes_ntsc_encode(const NesNtscEncodeSpec *spec, const uint8_t *pixels,
             double pedestal  = color_pedestal[color];
             double amp       = color_amp[color];
             double phase0    = color_phase_rad[color];
+            double phase0_frac = phase0 / (2.0 * M_PI);
             double emph = amp > 0.0 ? emphasis_factor(spec->emphasis, phase0) : 1.0;
 
             uint64_t dot_idx = line_dot_base + (uint64_t)x;
+            uint64_t abs_sample0 = dot_idx * (uint64_t)oversample;
+            /* Phase advances by a fixed cyc_per_sample each raw sample, so
+             * one fmod() here plus a running add+wrap below replaces
+             * oversample-1 redundant fmod()s per pixel. */
+            double frac = fmod((double)abs_sample0 * cyc_per_sample, 1.0);
             for (int s = 0; s < oversample; s++) {
-                uint64_t abs_sample = dot_idx * (uint64_t)oversample + (uint64_t)s;
-                double phase = 2.0 * M_PI * fmod((double)abs_sample * cyc_per_sample, 1.0);
-                double chroma = amp * cos(phase - phase0);
+                double chroma = amp * ntsc_cos_frac(ntsc_wrap01(frac - phase0_frac));
                 out_row[x * oversample + s] = (float)((pedestal + chroma) * emph);
+                frac += cyc_per_sample;
+                if (frac >= 1.0) frac -= 1.0;
             }
         }
     }

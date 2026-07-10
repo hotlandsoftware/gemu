@@ -2644,6 +2644,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                     .subcarrier_cycles_per_sample =
                         nes_ntsc_subcarrier_cycles_per_sample(NES_NTSC_OVERSAMPLE),
                     .out_width        = NES_CRT_WIDTH,
+                    .comb_filter      = cfg->crt_type == MOS_CRT_COMB,
                 };
                 ntsc_decode(&dec_spec, s->crt_signal, s->crt_argb);
             }

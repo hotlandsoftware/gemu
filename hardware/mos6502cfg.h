@@ -17,15 +17,22 @@ typedef enum {
 
 /* -device crt / -device cheap-crt (NES only, see crt/ntsc_decode.h). A
  * single selector rather than independent booleans, since exactly one
- * decode quality applies at a time. MOS_CRT_CHEAP is today's only real
- * decoder (single-line, no comb filter -- authentically "cheap TV"
- * dot crawl); "crt" and "cheap-crt" both select it for now. When a comb
- * filter mode exists, "crt" upgrades to a new MOS_CRT_* value while
- * "cheap-crt" stays pinned here by design, so it keeps producing the
- * cheap-TV artifacts on purpose rather than getting quietly upgraded. */
+ * decode quality applies at a time.
+ *
+ *   MOS_CRT_CHEAP: single-line decode, no comb filter -- authentically
+ *   "cheap TV" dot crawl. "cheap-crt" always selects this, permanently,
+ *   by design -- it will not be upgraded if a nicer mode is added later.
+ *
+ *   MOS_CRT_COMB: 3-line comb filter (see crt/ntsc_decode.c for why 3
+ *   lines, not the broadcast-TV-standard 2) -- measurably less dot
+ *   crawl/fringing, at comb filtering's own authentic cost of some
+ *   vertical luma softening. "crt" selects this: it always names
+ *   whatever the best available decode quality is, so it upgrades to
+ *   future MOS_CRT_* values the same way it upgraded from CHEAP to this. */
 typedef enum {
     MOS_CRT_NONE,
     MOS_CRT_CHEAP,
+    MOS_CRT_COMB,
 } MosCrtType;
 
 typedef enum {

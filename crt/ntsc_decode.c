@@ -1,11 +1,54 @@
 #include "ntsc_decode.h"
+#include "fast_trig.h"
 #include <math.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+/* Accumulate one scanline's window of samples into the running Y/I/Q sums.
+ * line_base is that scanline's absolute sample-index origin (line_index *
+ * samples_per_line — i.e. its position in the flat signal buffer), which
+ * is also what phase continuity is computed from, so a window "belonging"
+ * to a different line than the one being decoded still gets an exactly
+ * correct phase reference for its own samples, not an approximated one.
+ *
+ * Uniform (boxcar) weighting over exactly one subcarrier period is load
+ * bearing, not just simple: a Hamming-style taper was tried here to cut
+ * edge ringing, but a non-uniform window has nonzero DFT content at the
+ * subcarrier's own fundamental frequency over this window length, which
+ * lets the pedestal (luma) leak into the I/Q channels -- an effect a
+ * uniform window cancels for free via discrete orthogonality (N equally
+ * spaced samples over exactly one period sum a single-frequency term to
+ * exactly zero). That leak's phase depends on absolute signal position,
+ * so it doesn't average out -- it showed up as the whole picture cycling
+ * through rainbow colors even in perfectly flat regions, far worse than
+ * the ringing it was meant to fix. Properly windowing this decode
+ * without that leak needs a real multi-null FIR design, not a drop-in
+ * taper; deferred rather than attempted half-fixed. */
+static void accumulate_window(const float *signal, int spl, long line_base,
+                              int center, int taps, double cyc,
+                              double *y_acc, double *i_acc, double *q_acc, int *n) {
+    const float *row = signal + line_base;
+    int k0 = -taps / 2;
+    /* Phase advances by a fixed `cyc` per sample, so one fmod() at the
+     * window's first tap plus a running add+wrap for the rest replaces
+     * taps-1 redundant fmod()s (this loop runs 3x per output pixel for
+     * the comb filter, so it's the hottest part of the whole pipeline). */
+    double frac = fmod((double)(line_base + center + k0) * cyc, 1.0);
+    if (frac < 0.0) frac += 1.0;
+    for (int k = k0; k < taps / 2; k++) {
+        int s = center + k;
+        if (s >= 0 && s < spl) {
+            double sample = row[s];
+            *y_acc += sample;
+            *i_acc += sample * ntsc_cos_frac(frac);
+            *q_acc += sample * ntsc_sin_frac(frac);
+            (*n)++;
+        }
+        frac += cyc;
+        if (frac >= 1.0) frac -= 1.0;
+    }
+}
 
 void ntsc_decode(const NtscDecodeSpec *spec, const float *signal, uint32_t *out) {
+    ntsc_trig_lut_init();
     int spl = spec->samples_per_line;
     int lines = spec->lines;
     int ow = spec->out_width;
@@ -19,26 +62,34 @@ void ntsc_decode(const NtscDecodeSpec *spec, const float *signal, uint32_t *out)
     if (taps < 4) taps = 4;
 
     for (int line = 0; line < lines; line++) {
-        const float *row = signal + (size_t)line * spl;
         uint32_t *out_row = out + (size_t)line * ow;
-        long line_base = (long)line * spl;   /* absolute sample index, for continuous phase */
+
+        /* Comb filter: NTSC's classic 2-line, 180-degrees-per-line comb
+         * design doesn't apply here — this signal (like real NES hardware,
+         * whose dot clock isn't a broadcast-standard multiple of
+         * colorburst either) advances a non-180-degree amount per line and
+         * only realigns every 3 lines (see crt/ntsc_decode.h and the
+         * feature's design notes for the exact numbers). Pooling 3 lines'
+         * samples into one joint demodulation — rather than the 2-line
+         * add/subtract a broadcast comb does — is the structure that
+         * actually matches this signal's real periodicity. */
+        int line_lo = spec->comb_filter && line > 0        ? line - 1 : line;
+        int line_hi = spec->comb_filter && line < lines - 1 ? line + 1 : line;
 
         for (int ox = 0; ox < ow; ox++) {
             int center = (int)((long)ox * spl / ow);
 
             double y_acc = 0.0, i_acc = 0.0, q_acc = 0.0;
             int n = 0;
-            for (int k = -taps / 2; k < taps / 2; k++) {
-                int s = center + k;
-                if (s < 0 || s >= spl) continue;
-                double sample = row[s];
-                long abs_idx = line_base + s;
-                double phase = 2.0 * M_PI * fmod((double)abs_idx * cyc, 1.0);
-                y_acc += sample;
-                i_acc += sample * cos(phase);
-                q_acc += sample * sin(phase);
-                n++;
+            accumulate_window(signal, spl, (long)line * spl, center, taps, cyc,
+                              &y_acc, &i_acc, &q_acc, &n);
+            if (spec->comb_filter) {
+                accumulate_window(signal, spl, (long)line_lo * spl, center, taps, cyc,
+                                  &y_acc, &i_acc, &q_acc, &n);
+                accumulate_window(signal, spl, (long)line_hi * spl, center, taps, cyc,
+                                  &y_acc, &i_acc, &q_acc, &n);
             }
+
             if (n == 0) n = 1;
             double Y = y_acc / n;
             /* x2: synchronous demodulation of a cosine-modulated signal

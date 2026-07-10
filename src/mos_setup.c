@@ -256,10 +256,10 @@ static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
             return false;
         }
         cfg->devices_none = false;
-        /* Both names select MOS_CRT_CHEAP today -- see MosCrtType in
-         * mos6502cfg.h for why that's not a bug, just the only mode that
-         * exists yet. */
-        cfg->crt_type = MOS_CRT_CHEAP;
+        /* "crt" always names the best available quality; "cheap-crt" is
+         * permanently pinned to the cheap decode -- see MosCrtType in
+         * mos6502cfg.h. */
+        cfg->crt_type = strcmp(name, "cheap-crt") == 0 ? MOS_CRT_CHEAP : MOS_CRT_COMB;
         return true;
     }
 
