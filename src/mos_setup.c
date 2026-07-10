@@ -244,6 +244,24 @@ static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
         cfg->kim_keyboard = true;
         return true;
     }
+    if (strcmp(name, "crt") == 0 || strcmp(name, "cheap-crt") == 0) {
+        if (cfg->machine != MOS_MACHINE_NES) {
+            if (!quiet) fprintf(stderr, "gemu: -device %s is not supported on this machine\n", name);
+            return false;
+        }
+        if (cfg->is_pal) {
+            // TODO: PAL support
+            if (!quiet) fprintf(stderr,
+                "gemu: -device %s is not supported on this machine\n", name);
+            return false;
+        }
+        cfg->devices_none = false;
+        /* Both names select MOS_CRT_CHEAP today -- see MosCrtType in
+         * mos6502cfg.h for why that's not a bug, just the only mode that
+         * exists yet. */
+        cfg->crt_type = MOS_CRT_CHEAP;
+        return true;
+    }
 
     static const struct { const char *name; NesDeviceType type; } nes_devs[] = {
         {"nes-controller",   NES_DEVICE_CONTROLLER},

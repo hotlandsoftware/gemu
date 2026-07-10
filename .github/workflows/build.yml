@@ -170,7 +170,7 @@ jobs:
           tag_name: nightly
           name: gemu
           prerelease: true
-          body: "This is an unstable build of gemu that is not suitable for production yet."
+          body: "NIGHTLY BUILD OF GEMU, THIS IS UNSTABLE!"
           files: |
             gemu-linux-x86_64.tar.gz
             gemu-windows-x86_64.zip

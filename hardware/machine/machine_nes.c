@@ -7,6 +7,8 @@
 #include "romdb.h"
 #include "fds_hle.h"
 #include "apu2a03.h"
+#include "nes_ntsc_encode.h"
+#include "ntsc_decode.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
 #include "gemu/gemu_display.h"
@@ -33,6 +35,19 @@
         fprintf(stderr, "vs: " __VA_ARGS__); \
     } \
 } while (0)
+
+/* -device crt: decoded output resolution. Matches the NES's native
+ * 256x240 exactly -- SDL_RenderSetLogicalSize (core/src/video_sdl.c)
+ * always preserves *this* aspect ratio via letterboxing regardless of
+ * window shape, so any width other than RP2C02_WIDTH here distorts the
+ * displayed picture into that ratio (an earlier attempt at 4x width for
+ * "more decode detail" did exactly that -- stretched the whole image
+ * widescreen). The extra horizontal detail from oversampled decoding
+ * (see NES_NTSC_OVERSAMPLE in crt/nes_ntsc_encode.h) still improves the
+ * signal recovery quality even when resampled back down to native width
+ * here; it just isn't shown as literal extra pixels. */
+#define NES_CRT_WIDTH  RP2C02_WIDTH
+#define NES_CRT_HEIGHT RP2C02_HEIGHT
 
 static bool nes_vs_debug_enabled(void) {
     static int enabled = -1;
@@ -1863,6 +1878,8 @@ static void nes_handle_keys(NesState *s, uint32_t held) {
 
 static bool nes_screendump(void *ud, const char *path) {
     NesState *s = ud;
+    if (s->cfg->crt_type != MOS_CRT_NONE && s->crt_argb)
+        return gemu_screendump_argb(path, s->crt_argb, NES_CRT_WIDTH, NES_CRT_HEIGHT);
     int w = RP2C02_WIDTH, h = RP2C02_HEIGHT;
     uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
     if (!rgb) return false;
@@ -2290,8 +2307,8 @@ NesState *nes_create(const MosConfig *cfg) {
         s->display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
                 .title       = "GEMU",
-                .fb_width    = RP2C02_WIDTH,
-                .fb_height   = RP2C02_HEIGHT,
+                .fb_width    = NES_CRT_WIDTH,
+                .fb_height   = NES_CRT_HEIGHT,
                 .scale       = cfg->display_scale,
                 .renderer    = cfg->display_renderer,
                 .actions     = acts,
@@ -2311,6 +2328,21 @@ NesState *nes_create(const MosConfig *cfg) {
             gemu_monitor_set_input_reset_cb(s->monitor,
                                             gemu_display_reset_input_bindings_ud,
                                             s->display);
+    }
+
+    /* -device crt: independent of display_type -- also drives screendump
+     * and (later) VNC output for headless "-display none" runs, so it must
+     * not be gated on an interactive display window existing. */
+    if (cfg->crt_type != MOS_CRT_NONE) {
+        s->crt_signal = calloc((size_t)RP2C02_WIDTH * NES_NTSC_OVERSAMPLE *
+                               RP2C02_HEIGHT, sizeof(float));
+        s->crt_argb = calloc((size_t)NES_CRT_WIDTH * NES_CRT_HEIGHT,
+                             sizeof(uint32_t));
+        if (!s->crt_signal || !s->crt_argb) {
+            fprintf(stderr, "nes: -device crt: out of memory, disabling\n");
+            free(s->crt_signal); s->crt_signal = NULL;
+            free(s->crt_argb);   s->crt_argb   = NULL;
+        }
     }
 
     if (!s->fds_enabled)
@@ -2398,6 +2430,8 @@ void nes_destroy(NesState *s) {
 #endif
     gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
+    free(s->crt_signal);
+    free(s->crt_argb);
     free(s->prg);
     free(s->chr);
     free(s);
@@ -2586,10 +2620,42 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             nes_lua_run_frame(s->lua, s->ppu.pixels_argb, RP2C02_WIDTH, RP2C02_HEIGHT);
 #endif
 
-            /* Render completed frame (PPU already builds pixels_argb) */
-            if (s->display)
+            /* -device crt: re-derive the frame from the PPU's raw hue+luma
+             * values (ppu.pixels[], not the already-quantized pixels_argb)
+             * through a genuine NTSC composite encode+decode into
+             * crt_argb. Independent of s->display so screendump/VNC still
+             * get a decoded frame on headless "-display none" runs. Note
+             * this means anything drawn as an emulator-only overlay
+             * straight into pixels_argb (e.g. the Lua gui.* API above)
+             * won't appear in CRT mode — correctly so, since it was never
+             * part of the real signal. */
+            if (cfg->crt_type != MOS_CRT_NONE && s->crt_argb) {
+                NesNtscEncodeSpec enc_spec = {
+                    .oversample = NES_NTSC_OVERSAMPLE,
+                    .emphasis   = (uint8_t)(s->ppu.ppumask & 0xE0u),
+                };
+                nes_ntsc_encode(&enc_spec, s->ppu.pixels, RP2C02_WIDTH, RP2C02_HEIGHT,
+                                s->crt_dot_counter, s->crt_signal);
+                s->crt_dot_counter += (uint64_t)RP2C02_WIDTH * RP2C02_HEIGHT;
+
+                NtscDecodeSpec dec_spec = {
+                    .samples_per_line = RP2C02_WIDTH * NES_NTSC_OVERSAMPLE,
+                    .lines            = RP2C02_HEIGHT,
+                    .subcarrier_cycles_per_sample =
+                        nes_ntsc_subcarrier_cycles_per_sample(NES_NTSC_OVERSAMPLE),
+                    .out_width        = NES_CRT_WIDTH,
+                };
+                ntsc_decode(&dec_spec, s->crt_signal, s->crt_argb);
+            }
+
+            /* Render completed frame (PPU already builds pixels_argb). */
+            if (s->display && cfg->crt_type != MOS_CRT_NONE && s->crt_argb) {
+                gemu_display_render(s->display, s->crt_argb,
+                                    NES_CRT_WIDTH, NES_CRT_HEIGHT);
+            } else if (s->display) {
                 gemu_display_render(s->display, s->ppu.pixels_argb,
                                     RP2C02_WIDTH, RP2C02_HEIGHT);
+            }
             if (s->vnc)
                 gemu_vnc_update(s->vnc, s->ppu.pixels,
                                 RP2C02_WIDTH, RP2C02_HEIGHT);

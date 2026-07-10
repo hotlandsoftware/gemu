@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!-- Generic name: today this is identical to -device cheap-crt (see
+     cheap-crt.xml) since  that's the only decode quality implemented yet.
+     When a nicer comb-filter mode exists, this name upgrades to it;
+     cheap-crt stays pinned to the cheap-TV behavior on purpose. See
+     MosCrtType in hardware/mos6502cfg.h. -->
+<device name="crt" description="Generic CRT monitor" status="preliminary">
+    <machine name="nes"/>
+    <machine name="famicom"/>
+    <machine name="vssmb"/>
+    <machine name="vsskatekids"/>
+</device>

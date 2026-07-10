@@ -15,6 +15,19 @@ typedef enum {
     MOS_MACHINE_ATARI400, /* Atari 400 (6502 + ANTIC/GTIA/POKEY) */
 } MosMachineType;
 
+/* -device crt / -device cheap-crt (NES only, see crt/ntsc_decode.h). A
+ * single selector rather than independent booleans, since exactly one
+ * decode quality applies at a time. MOS_CRT_CHEAP is today's only real
+ * decoder (single-line, no comb filter -- authentically "cheap TV"
+ * dot crawl); "crt" and "cheap-crt" both select it for now. When a comb
+ * filter mode exists, "crt" upgrades to a new MOS_CRT_* value while
+ * "cheap-crt" stays pinned here by design, so it keeps producing the
+ * cheap-TV artifacts on purpose rather than getting quietly upgraded. */
+typedef enum {
+    MOS_CRT_NONE,
+    MOS_CRT_CHEAP,
+} MosCrtType;
+
 typedef enum {
     MOS_CPU_6502,
     MOS_CPU_2A03,   /* Ricoh 2A03: 6502 without decimal mode, built into NES */
@@ -88,6 +101,7 @@ typedef struct MosConfig {
     const char     *cart_path;   /* iNES .nes cartridge file (NES machine) */
     bool            fds_enabled; /* Famicom Disk System addon active        */
     const char     *fda_path;    /* FDS disk image path (NULL = no disk)    */
+    MosCrtType      crt_type;    /* -device crt / cheap-crt: see MosCrtType above */
     MosSoundType    sound;
     bool            sound_explicit; /* user passed -soundhw; skip auto-default */
     uint32_t        sound_hw_mask; /* MOS_SOUNDHW_* bits (5clown: AY8910/OKI6295) */

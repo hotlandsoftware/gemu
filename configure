@@ -60,6 +60,7 @@ FAMILY_SRC = {
         'hardware/machine/machine_um6578.c',
         'hardware/machine/machine_atari400.c',
         'vga/antic.c', 'audio/pokey.c',
+        'crt/ntsc_decode.c', 'crt/nes_ntsc_encode.c',
         'hardware/device/fds.c', 'hardware/device/fds_hle.c',
         'hardware/device/vt100.c', 'hardware/romdb.c',
         # Native Win32 hex editor: the whole file is wrapped in
@@ -547,7 +548,7 @@ def main():
     data_xml_files = generate_data(build_dir, targets, have_alsa, have_winmidi)
 
     # All sources share a single unified include path - no per-family separation.
-    inc_dirs = ['core/include', 'cpu', 'vga', 'audio',
+    inc_dirs = ['core/include', 'cpu', 'vga', 'audio', 'crt',
                 'hardware', 'hardware/machine', 'hardware/device',
                 'src', build_dir]
     inc_flags = ' '.join(f'-I{d}' for d in inc_dirs)

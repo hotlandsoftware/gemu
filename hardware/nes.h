@@ -200,6 +200,17 @@ typedef struct NesState {
     HexEditor *hex_editor;
 #endif
 
+    /* -device crt: NTSC composite encode+decode (see crt/nes_ntsc_encode.h,
+     * crt/ntsc_decode.h). crt_signal is the oversampled composite scratch
+     * buffer; crt_argb is the decoded output, presented instead of
+     * ppu.pixels_argb when active; crt_dot_counter is the running count of
+     * visible dots encoded so far, carried across frames so chroma phase
+     * (and the dot crawl it produces) stays continuous. All three are
+     * lazily allocated in nes_create() only when the device is attached. */
+    float    *crt_signal;
+    uint32_t *crt_argb;
+    uint64_t  crt_dot_counter;
+
 #ifdef HAVE_ROB
     RobState    rob;
     RobWindow  *rob_window;
