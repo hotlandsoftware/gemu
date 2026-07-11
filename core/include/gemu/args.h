@@ -57,6 +57,7 @@ typedef struct {
 typedef struct {
     const char     *rom_path;
     const char     *machine;       /* NULL until -M given */
+    const char     *machine_opts;  /* comma tail from -M machine,opt,... */
     const char     *cpu;           /* NULL until -cpu given */
     const char     *vga;           /* NULL until -vga given */
     GemuDisplayType display_type;

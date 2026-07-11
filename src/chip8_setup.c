@@ -69,6 +69,10 @@ int chip8_setup(int argc, char *argv[]) {
     char *rem[32]; int nrem = 0;
     if (!gemu_args_parse(argc, argv, &def, &args, &nrem, rem))
         return 1;
+    if (args.machine_opts) {
+        fprintf(stderr, "gemu: -M machine feature options are not supported for CHIP-8 machines\n");
+        return 1;
+    }
     gemu_monitor_set_default(args.monitor_spec);
 
     cfg.rom_path     = args.rom_path;

@@ -81,6 +81,11 @@ typedef struct Apu2a03 {
     /* Expansion audio: written before each tick by the host machine */
     float    fds_in;
 
+    /* Compatibility switches */
+    bool     sweep_enabled;
+    bool     dmc_enabled;
+    bool     frame_irq_enabled;
+
     /* DMC memory reader (set by NES machine) */
     uint8_t (*mem_read)(uint16_t addr, void *ud);
     void    *mem_ud;

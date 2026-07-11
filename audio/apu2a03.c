@@ -75,10 +75,11 @@ static bool sweep_mute(uint16_t period, uint8_t shift, bool neg, int ch) {
 
 /* ── Channel output ──────────────────────────────────────────────────────── */
 
-static float pulse_out(const ApuPulse *p, int ch, bool en) {
+static float pulse_out(const ApuPulse *p, int ch, bool en, bool sweep_enabled) {
     if (!en || p->len == 0) return 0.0f;
     if (p->timer_period < 8) return 0.0f;
-    if (sweep_mute(p->timer_period, p->sweep_shift, p->sweep_neg, ch)) return 0.0f;
+    if (sweep_enabled &&
+        sweep_mute(p->timer_period, p->sweep_shift, p->sweep_neg, ch)) return 0.0f;
     if (!duty_seq[p->duty][p->seq]) return 0.0f;
     return (float)env_volume(p->const_vol, p->vol, p->env_dec);
 }
@@ -142,7 +143,7 @@ static void clock_lengths_sweep(Apu2a03 *a) {
     /* Sweep units */
     for (int i = 0; i < 2; i++) {
         ApuPulse *p = &a->pulse[i];
-        if (p->sweep_div == 0 && p->sweep_en && p->sweep_shift > 0
+        if (a->sweep_enabled && p->sweep_div == 0 && p->sweep_en && p->sweep_shift > 0
             && !sweep_mute(p->timer_period, p->sweep_shift, p->sweep_neg, i)) {
             p->timer_period = sweep_target(p->timer_period, p->sweep_shift,
                                            p->sweep_neg, i);
@@ -202,7 +203,7 @@ void apu2a03_tick(Apu2a03 *a) {
     }
 
     /* DMC: clocked every CPU cycle (rate table values are in CPU cycles) */
-    if (a->ch_en[4]) {
+    if (a->dmc_enabled && a->ch_en[4]) {
         if (a->dmc.timer > 0) {
             a->dmc.timer--;
         } else {
@@ -256,7 +257,7 @@ void apu2a03_tick(Apu2a03 *a) {
                 if (a->fc_mode && i == 3) break;
                 bool half = (i == 1) || (i == 3) || (a->fc_mode && i == 4);
                 clock_frame(a, half);
-                if (!a->fc_mode && i == 3 && !a->fc_irq_inhibit)
+                if (a->frame_irq_enabled && !a->fc_mode && i == 3 && !a->fc_irq_inhibit)
                     a->fc_irq = true;
                 break;
             }
@@ -269,11 +270,11 @@ void apu2a03_tick(Apu2a03 *a) {
         a->sample_acc -= a->clock_pps;
         if (a->frame_n < 1024) {
             float s = mix(
-                pulse_out(&a->pulse[0], 0, a->ch_en[0]),
-                pulse_out(&a->pulse[1], 1, a->ch_en[1]),
+                pulse_out(&a->pulse[0], 0, a->ch_en[0], a->sweep_enabled),
+                pulse_out(&a->pulse[1], 1, a->ch_en[1], a->sweep_enabled),
                 tri_out(&a->tri,           a->ch_en[2]),
                 noise_out(&a->noise,       a->ch_en[3]),
-                dmc_out(&a->dmc,           a->ch_en[4])
+                dmc_out(&a->dmc,           a->dmc_enabled && a->ch_en[4])
             ) + a->fds_in;
             a->frame_buf[a->frame_n++] = s;
         }
@@ -292,6 +293,7 @@ void apu2a03_write(Apu2a03 *a, uint16_t addr, uint8_t v) {
         a->pulse[0].vol       = v & 0xF;
         break;
     case 0x4001:
+        if (!a->sweep_enabled) break;
         a->pulse[0].sweep_en     = (v >> 7) & 1;
         a->pulse[0].sweep_period = (v >> 4) & 7;
         a->pulse[0].sweep_neg    = (v >> 3) & 1;
@@ -315,6 +317,7 @@ void apu2a03_write(Apu2a03 *a, uint16_t addr, uint8_t v) {
         a->pulse[1].vol       = v & 0xF;
         break;
     case 0x4005:
+        if (!a->sweep_enabled) break;
         a->pulse[1].sweep_en     = (v >> 7) & 1;
         a->pulse[1].sweep_period = (v >> 4) & 7;
         a->pulse[1].sweep_neg    = (v >> 3) & 1;
@@ -359,6 +362,7 @@ void apu2a03_write(Apu2a03 *a, uint16_t addr, uint8_t v) {
         break;
     /* ── DMC ─────────── */
     case 0x4010:
+        if (!a->dmc_enabled) { a->dmc.irq_flag = false; break; }
         a->dmc.irq_en   = (v >> 7) & 1;
         a->dmc.loop     = (v >> 6) & 1;
         a->dmc.rate_idx = v & 0xF;
@@ -366,18 +370,22 @@ void apu2a03_write(Apu2a03 *a, uint16_t addr, uint8_t v) {
         if (!a->dmc.irq_en) a->dmc.irq_flag = false;
         break;
     case 0x4011:
+        if (!a->dmc_enabled) break;
         a->dmc.level = v & 0x7F;
         break;
     case 0x4012:
+        if (!a->dmc_enabled) break;
         a->dmc.start_addr = (uint16_t)(0xC000 + ((uint16_t)v << 6));
         break;
     case 0x4013:
+        if (!a->dmc_enabled) break;
         a->dmc.start_len = (uint16_t)((v << 4) + 1);
         break;
     /* ── Status ──────── */
     case 0x4015:
         for (int i = 0; i < 5; i++) {
             a->ch_en[i] = (v >> i) & 1;
+            if (i == 4 && !a->dmc_enabled) a->ch_en[i] = false;
             if (!a->ch_en[i]) {
                 if (i < 2) a->pulse[i].len = 0;
                 else if (i == 2) a->tri.len = 0;
@@ -393,7 +401,7 @@ void apu2a03_write(Apu2a03 *a, uint16_t addr, uint8_t v) {
     /* ── Frame counter ─ */
     case 0x4017:
         a->fc_mode        = (v >> 7) & 1;
-        a->fc_irq_inhibit = (v >> 6) & 1;
+        a->fc_irq_inhibit = ((v >> 6) & 1) || !a->frame_irq_enabled;
         a->fc_div         = 0;
         a->fc_step        = 0;
         if (a->fc_irq_inhibit) a->fc_irq = false;
@@ -411,9 +419,9 @@ uint8_t apu2a03_read(Apu2a03 *a, uint16_t addr) {
     if (a->pulse[1].len > 0) s |= 0x02;
     if (a->tri.len      > 0) s |= 0x04;
     if (a->noise.len    > 0) s |= 0x08;
-    if (a->dmc.bytes_rem> 0) s |= 0x10;
-    if (a->fc_irq)           s |= 0x40;
-    if (a->dmc.irq_flag)     s |= 0x80;
+    if (a->dmc_enabled && a->dmc.bytes_rem > 0) s |= 0x10;
+    if (a->frame_irq_enabled && a->fc_irq)      s |= 0x40;
+    if (a->dmc_enabled && a->dmc.irq_flag)      s |= 0x80;
     a->fc_irq       = false;
     a->dmc.irq_flag = false;
     return s;
@@ -441,6 +449,9 @@ void apu2a03_reset(Apu2a03 *a) {
     void *mu = a->mem_ud;
     void (*tap)(uint16_t, uint8_t, void*) = a->write_tap;
     void *tu = a->write_tap_ud;
+    bool sweep_enabled = a->sweep_enabled;
+    bool dmc_enabled = a->dmc_enabled;
+    bool frame_irq_enabled = a->frame_irq_enabled;
     memset(a, 0, sizeof(*a));
     a->audio_dev    = dev;
     a->clock_pps    = pps;
@@ -448,6 +459,9 @@ void apu2a03_reset(Apu2a03 *a) {
     a->mem_ud       = mu;
     a->write_tap    = tap;
     a->write_tap_ud = tu;
+    a->sweep_enabled = sweep_enabled;
+    a->dmc_enabled = dmc_enabled;
+    a->frame_irq_enabled = frame_irq_enabled;
     a->noise.lfsr = 1;
     for (int i = 0; i < 8; i++) a->dmc.bits_rem = 8;
     a->dmc.bits_rem = 8;
@@ -461,6 +475,9 @@ bool apu2a03_init(Apu2a03 *a, uint32_t cpu_clock_hz) {
     a->dmc.bits_rem  = 8;
     a->dmc.buf_empty = true;
     a->dmc.silence   = true;
+    a->sweep_enabled = true;
+    a->dmc_enabled = true;
+    a->frame_irq_enabled = true;
     a->clock_pps     = (double)cpu_clock_hz / (double)APU2A03_SAMPLE_RATE;
 
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {

@@ -65,6 +65,14 @@ typedef enum {
 #define MOS_SOUNDHW_AY8910  0x01u
 #define MOS_SOUNDHW_OKI6295 0x02u
 
+/* Machine feature toggles used by -M machine,[-+]feature.  These are
+ * intentionally low-level compatibility switches for emulator-behavior
+ * profiles, not user-facing hardware devices. */
+#define MOS_FEATURE_SWEEP_REGISTERS 0x00000001u
+#define MOS_FEATURE_DMC_CHANNEL     0x00000002u
+#define MOS_FEATURE_FRAME_IRQ       0x00000004u
+#define MOS_FEATURE_ODD_FRAME_SKIP  0x00000008u
+
 typedef enum {
     NES_DEVICE_NONE = 0,
     NES_DEVICE_CONTROLLER,  /* NES Standard Controller */
@@ -123,6 +131,7 @@ typedef struct MosConfig {
     bool            is_7mezzo;  /* MOS_MACHINE_MAGICFLY game variant: "7 e Mezzo" vs Magic Fly */
     bool            devices_none;    /* -device none: suppress default input devices */
     bool            generic_keyboard; /* -device keyboard: host ASCII/QWERTY keyboard */
+    uint32_t        disabled_features; /* MOS_FEATURE_* bits disabled by -M opts */
     bool            kim_keyboard; /* KIM-1: -device kim-keypad → visual keypad overlay */
     bool            want_wozmon;  /* -device wozmon → patch wozmon into KIM-1 ROM at $1AA0 */
     bool            a1ci;         /* Apple I Cassette Interface attached */

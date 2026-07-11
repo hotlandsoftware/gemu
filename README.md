@@ -3,9 +3,15 @@
 > [!WARNING]
 > GEMU is currently unstable and should not be used in production environments.
 
-GEMU is a generic multi-machine emulator designed to be backwards compatible with QEMU while emulating as many different machines and architectures (along with their hardware and peripherals) as possible. The UI (planned) is to be based on the simplistic UI of Virtual PC 2007 while still containing an advanced featureset.
+<img align="left" src="gemu.png" alt="GEMU Icon" /> GEMU is a multi-machine emulator which seeks to emulate every device and machine in existence (yes, really) while having an extremely wide variety of features and the versatile command set of QEMU. 
 
-GEMU is currently in an alpha state. It will likely never be "complete" as there will always be more machines and hardware for it to emulate. Currently the absolute latest (for my end) is set to 1985 (exceptions made for clone consoles), and will be increased as more machines are completed/added.
+The emulator seeks to offer:
+- full, accurate, low-level emulation of a wide variety of computers, machines and devices
+- a simple, easy to use UI to easily set up any machine
+- full, backwards compatibility with QEMU, including console commands, command line options, even featuring full QMP support.
+- a wide variety of helpful debug features
+
+GEMU currently emulates around 32 machines, and is currently in an **alpha** state.
 
 # Build command
 ```
@@ -17,4 +23,4 @@ python configure --enable-gtk && ninja -j$(nproc) # for GTK support
 See https://gemu.miraheze.org/
 
 # Transparency
-This entire program is vibe coded - though I have some experience with programming which helps make it not completely horrible. I mainly started this as a way to see how far AI agents have come, and now I'm curious how many machines I can make AI emulate with little reference (manuals if necessary are allowed.)
+This entire program is vibe coded, though I have some experience with programming which helps make it not completely horrible. I mainly started this as a way to see how far AI agents have come - and now I'm curious to see how many different machines and devices I can make AI emulate with little reference (simply feeding it datasheets, manuals, expected behavior etc)

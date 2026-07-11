@@ -25,6 +25,8 @@ static void print_usage(const GemuArgsDef *def) {
            "Options:\n", def->prog);
     if (def->n_machines > 0)
         printf("  %-14s Machine type      (use -M ? to list)\n", "-M TYPE");
+    if (def->n_machines > 0)
+        printf("  %-14s Machine feature toggles, e.g. nes,-feature\n", "-M M,OPTS");
     if (def->n_cpus > 0)
         printf("  %-14s CPU model         (use -cpu ? to list)\n", "-cpu TYPE");
     if (def->n_vgas > 0)
@@ -88,6 +90,18 @@ static void print_vnc_help(void) {
            "  host:N        listen on host, port 5900+N\n"
            "  unix:/path    listen on a Unix domain socket (POSIX only)\n"
            "Examples:  :0   127.0.0.1:0   0.0.0.0:1\n");
+}
+
+static void split_machine_spec(const char *spec, char *machine, size_t machine_sz,
+                               const char **opts) {
+    const char *comma = strchr(spec, ',');
+    size_t len = comma ? (size_t)(comma - spec) : strlen(spec);
+    if (machine_sz > 0) {
+        if (len >= machine_sz) len = machine_sz - 1;
+        memcpy(machine, spec, len);
+        machine[len] = '\0';
+    }
+    if (opts) *opts = comma ? comma + 1 : NULL;
 }
 
 static void print_monitor_help(void) {
@@ -173,9 +187,17 @@ bool gemu_args_parse(int argc, char **argv,
                 list_devices("machines", def->machines, def->n_machines);
                 exit(0);
             }
-            if (!dev_validate(def->prog, "-M", def->machines, def->n_machines, v))
+            static char machine_name[128];
+            const char *machine_opts = NULL;
+            split_machine_spec(v, machine_name, sizeof(machine_name), &machine_opts);
+            if (!machine_name[0]) {
+                fprintf(stderr, "%s: -M requires a machine name before options\n", def->prog);
                 return false;
-            out->machine = v;
+            }
+            if (!dev_validate(def->prog, "-M", def->machines, def->n_machines, machine_name))
+                return false;
+            out->machine = machine_name;
+            out->machine_opts = machine_opts;
             continue;
         }
 

@@ -2206,6 +2206,8 @@ NesState *nes_create(const MosConfig *cfg) {
     if (cfg->is_dendy) s->ppu.vblank_line = 291;  /* Dendy: 50 extra post-render lines */
     if (cfg->vga == MOS_VGA_RP2C04_0004)
         s->ppu.no_odd_skip = true;
+    if (cfg->disabled_features & MOS_FEATURE_ODD_FRAME_SKIP)
+        s->ppu.no_odd_skip = true;
     if (cfg->is_arcade && s->vs_palette_rgb[0])    /* 2C04 palette present */
         s->ppu.alt_palette_rgb = s->vs_palette_rgb;
     s->ppu.chr_read  = nes_chr_read;
@@ -2219,6 +2221,10 @@ NesState *nes_create(const MosConfig *cfg) {
     s->cpu.mem_ud          = s;
     s->cpu.decimal_disable = (cfg->cpu == MOS_CPU_2A03 ||
                               cfg->cpu == MOS_CPU_2A07);
+
+    s->apu.sweep_enabled = true;
+    s->apu.dmc_enabled = true;
+    s->apu.frame_irq_enabled = true;
 
     /* APU - only initialise when sound is enabled */
     if (cfg->sound == MOS_SOUND_2A03) {
@@ -2236,6 +2242,9 @@ NesState *nes_create(const MosConfig *cfg) {
         s->apu.write_tap_ud = &s->apu_midi;
 #endif
     }
+    s->apu.sweep_enabled = (cfg->disabled_features & MOS_FEATURE_SWEEP_REGISTERS) == 0;
+    s->apu.dmc_enabled = (cfg->disabled_features & MOS_FEATURE_DMC_CHANNEL) == 0;
+    s->apu.frame_irq_enabled = (cfg->disabled_features & MOS_FEATURE_FRAME_IRQ) == 0;
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, nes_screendump, s);

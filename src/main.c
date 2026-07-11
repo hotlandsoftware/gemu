@@ -99,6 +99,15 @@ static void print_usage(const char *prog) {
                "Use '-M <machine> -h' for machine-specific options and examples.\n");
 }
 
+static void machine_spec_name(const char *spec, char *out, size_t out_sz) {
+    const char *comma = strchr(spec, ',');
+    size_t len = comma ? (size_t)(comma - spec) : strlen(spec);
+    if (out_sz == 0) return;
+    if (len >= out_sz) len = out_sz - 1;
+    memcpy(out, spec, len);
+    out[len] = '\0';
+}
+
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
@@ -133,11 +142,13 @@ int main(int argc, char *argv[]) {
 
     /* Dispatch via -M */
     if (machine_name) {
+        char base_machine[128];
+        machine_spec_name(machine_name, base_machine, sizeof(base_machine));
         for (int i = 0; i < N_MACHINES; i++) {
-            if (strcmp(machine_name, MACHINES[i].name) == 0)
+            if (strcmp(base_machine, MACHINES[i].name) == 0)
                 return MACHINES[i].fn(argc, argv);
         }
-        fprintf(stderr, "gemu: unknown machine '%s' (use -M ? to list)\n", machine_name);
+        fprintf(stderr, "gemu: unknown machine '%s' (use -M ? to list)\n", base_machine);
         return 1;
     }
 
