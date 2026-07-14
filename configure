@@ -8,7 +8,7 @@ Usage:
 
 Options:
   --target-list=LIST   comma-separated families to include (default: all)
-                       valid families: chip8, mos, rca
+                       valid families: chip8, mitsu, mos, rca
   --enable-gtk         build GTK3 UI (default: no)
   --disable-sdl        do not link SDL2 (rarely useful)
   --disable-ttf        skip SDL2_ttf
@@ -48,6 +48,10 @@ FAMILY_SRC = {
         'hardware/machine/machine_chip8.c',
         'vga/input_menu.c',
         'src/chip8_setup.c',
+    ],
+    'mitsu': [
+        'hardware/machine/machine_tvgame6.c',
+        'src/mitsu_setup.c',
     ],
     'mos': [
         'cpu/mos6502.c',
@@ -123,8 +127,8 @@ def die(msg):
 
 # ── Data-file generation ───────────────────────────────────────────────────────
 
-FAMILY_SETUP  = {'mos': 'mos_setup', 'rca': 'rca_setup', 'chip8': 'chip8_setup'}
-FAMILY_DEFINE = {'mos': 'HAVE_MOS',  'rca': 'HAVE_RCA',  'chip8': 'HAVE_CHIP8'}
+FAMILY_SETUP  = {'mos': 'mos_setup', 'rca': 'rca_setup', 'chip8': 'chip8_setup', 'mitsu': 'mitsu_setup'}
+FAMILY_DEFINE = {'mos': 'HAVE_MOS',  'rca': 'HAVE_RCA',  'chip8': 'HAVE_CHIP8', 'mitsu': 'HAVE_MITSU'}
 
 def _xml_files(*patterns):
     paths = []
