@@ -6,16 +6,11 @@
 #include "gemu/gemu_display.h"
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
-#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-#ifndef M_PI
-#  define M_PI 3.14159265358979323846
-#endif
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -30,10 +25,25 @@ static void tvgame6_sleep_frame(void) {
 #endif
 
 /*
- * Field geometry below is a direct 0.25x/0.2506x scale-down of the
- * reference implementation (Color TV-Game 6.py, 1280x960 window), so that
- * this behavioral model reproduces the same paddle/ball/net proportions
- * and physics rather than an independently-tuned approximation.
+ * No M58815P datasheet or die-shot is publicly known to exist, so this is
+ * not a gate-level reconstruction of that specific chip. Instead it follows
+ * the documented architecture of the wider "Pong-on-a-chip" family it
+ * belongs to (e.g. General Instrument AY-3-8500, reverse-engineered from
+ * die shots - see nerdstuffbycole.blogspot.com/2018/01/reverse-engineering-ay-3-8500-part-1.html):
+ * ball/paddle position held in small binary counters, ball motion driven by
+ * a fixed per-frame horizontal step plus a *clock-divided* vertical step
+ * (the divider/step/direction chosen from a handful of paddle-zone table
+ * entries - not trigonometry; real Pong chips had no multiplier or angle
+ * math, only a few discrete bounce rates), and collision sensed via simple
+ * rect-overlap comparators. Where the real chip's specific bit widths, zone
+ * counts or divider ratios aren't documented, values here are a best effort
+ * recreation rather than lifted from a real datasheet - this is a
+ * behavioral/structural model, blending known hardware architecture with
+ * simulated specifics, not a verified transistor-exact emulation.
+ *
+ * Field geometry is a direct 0.25x/0.2506x scale-down of the Python
+ * reference's 1280x960 window, so this reproduces the same paddle/ball/net
+ * proportions.
  */
 #define FB_W 320
 #define FB_H 240
@@ -47,8 +57,9 @@ static void tvgame6_sleep_frame(void) {
 #define FIELD_B 214
 #define PADDLE_W 8
 #define PADDLE_H 33
-#define PADDLE_HALF (PADDLE_H * 0.5f)
-#define PADDLE_OFFSET 71.0f /* doubles: front/back spacing along x */
+#define PADDLE_H_SMALL 17 /* resize toggle: ~half height */
+#define PADDLE_OFFSET 71  /* doubles: front/back spacing along x */
+#define PADDLE_STEP 3     /* paddle position counter step, per frame held */
 #define BALL_W 7
 #define BALL_H 5
 #define MARKER_W 8
@@ -61,9 +72,8 @@ static void tvgame6_sleep_frame(void) {
 #define MARKER_GREEN_Y0 24
 #define MARKER_RED_Y0 40
 
-#define BALL_SPEED_NORMAL 2.875f
-#define BALL_SPEED_TURBO  5.75f
-#define PADDLE_SPEED      2.75f
+#define BALL_H_STEP_NORMAL 3 /* horizontal position-counter step per frame */
+#define BALL_H_STEP_TURBO  6
 
 /* tennis mode: decorative center net, no collision */
 #define NET_X 121
@@ -107,12 +117,20 @@ struct MitsuTvGame6State {
     bool double_paddles;
     bool waiting_serve;
     bool turbo;
-    float left_y, right_y;
-    float left_h, right_h;
-    float ball_x, ball_y;
-    float ball_vx, ball_vy;
+
+    int left_y, right_y;   /* paddle center-y position counters */
+    int left_h, right_h;   /* paddle height (resize toggle) */
+
+    int ball_x, ball_y;    /* ball position counters */
+    int h_dir;             /* +1/-1: horizontal direction latch */
+    int h_step;            /* horizontal position-counter step/frame */
+    int v_dir;             /* -1/0/+1: vertical direction latch */
+    int v_div;             /* vertical step fires every v_div frames (0 = never) */
+    int v_step;            /* vertical position-counter step, when it fires */
+    int v_acc;             /* frames accumulated toward the next vertical step */
+
     int marker_cooldown;
-    int bounce_count;
+    int bounce_count;      /* consecutive net-tile bounces (volleyball anti-stall) */
     int left_score;
     int right_score;
     uint32_t prev_actions;
@@ -143,11 +161,14 @@ static const GemuActionDef tvgame6_actions[] = {
 };
 
 static void tvgame6_reset_ball(MitsuTvGame6State *s, int dir) {
-    s->ball_x = COURT_X + COURT_W * 0.5f;
-    s->ball_y = COURT_Y + COURT_H * 0.5f;
-    float mag = s->turbo ? BALL_SPEED_TURBO : BALL_SPEED_NORMAL;
-    s->ball_vx = dir >= 0 ? mag : -mag;
-    s->ball_vy = mag * 0.5f;
+    s->ball_x = COURT_X + COURT_W / 2;
+    s->ball_y = COURT_Y + COURT_H / 2;
+    s->h_dir = dir >= 0 ? 1 : -1;
+    s->h_step = s->turbo ? BALL_H_STEP_TURBO : BALL_H_STEP_NORMAL;
+    s->v_dir = 0;
+    s->v_div = 0;
+    s->v_step = 0;
+    s->v_acc = 0;
     s->marker_cooldown = 0;
     s->bounce_count = 0;
     s->waiting_serve = true;
@@ -160,8 +181,8 @@ static void tvgame6_reset(MitsuTvGame6State *s) {
     s->turbo = false;
     s->left_h = PADDLE_H;
     s->right_h = PADDLE_H;
-    s->left_y = COURT_Y + COURT_H * 0.5f;
-    s->right_y = COURT_Y + COURT_H * 0.5f;
+    s->left_y = COURT_Y + COURT_H / 2;
+    s->right_y = COURT_Y + COURT_H / 2;
     s->left_score = 0;
     s->right_score = 0;
     s->prev_actions = 0;
@@ -173,11 +194,13 @@ static void tvgame6_cpu_state(void *ud, char *buf, size_t buf_len) {
     snprintf(buf, buf_len,
              "Nintendo Color TV-Game 6 (behavioral M58815P model)\n"
              "  mode=%s paddles=%s speed=%s score=%d-%d serve=%s\n"
-             "  left_y=%.1f right_y=%.1f ball=(%.1f,%.1f) vel=(%.2f,%.2f)\n",
+             "  left_y=%d right_y=%d ball=(%d,%d)\n"
+             "  h_dir=%+d h_step=%d v_dir=%+d v_div=%d v_step=%d v_acc=%d bounce_count=%d\n",
              mode_name(s->mode), s->double_paddles ? "double" : "single",
              s->turbo ? "turbo" : "normal",
              s->left_score, s->right_score, s->waiting_serve ? "yes" : "no",
-             s->left_y, s->right_y, s->ball_x, s->ball_y, s->ball_vx, s->ball_vy);
+             s->left_y, s->right_y, s->ball_x, s->ball_y,
+             s->h_dir, s->h_step, s->v_dir, s->v_div, s->v_step, s->v_acc, s->bounce_count);
 }
 
 static bool tvgame6_screendump(void *ud, const char *path) {
@@ -236,18 +259,16 @@ static void fill_rect(MitsuTvGame6State *s, int x, int y, int w, int h, uint32_t
             put_px(s, xx, yy, c);
 }
 
-static void draw_paddle(MitsuTvGame6State *s, int x, float cy, float h, uint32_t c) {
-    fill_rect(s, x, (int)(cy - h * 0.5f), PADDLE_W, (int)h, c);
+static void draw_paddle(MitsuTvGame6State *s, int x, int cy, int h, uint32_t c) {
+    fill_rect(s, x, cy - h / 2, PADDLE_W, h, c);
 }
 
-/* Doubles: the second paddle sits at the same y, offset in x toward the
- * net (front/back formation), matching Python's left_paddle2/right_paddle2. */
-static void draw_side_paddles(MitsuTvGame6State *s, bool is_left, int x, float cy, float h, uint32_t c) {
+static void draw_side_paddles(MitsuTvGame6State *s, bool is_left, int x, int cy, int h, uint32_t c) {
     draw_paddle(s, x, cy, h, c);
     if (!s->double_paddles)
         return;
-    float x2 = x + (is_left ? PADDLE_OFFSET : -PADDLE_OFFSET);
-    draw_paddle(s, (int)x2, cy, h, c);
+    int x2 = x + (is_left ? PADDLE_OFFSET : -PADDLE_OFFSET);
+    draw_paddle(s, x2, cy, h, c);
 }
 
 static void draw_center_markers(MitsuTvGame6State *s) {
@@ -273,7 +294,9 @@ static void draw_hockey_walls(MitsuTvGame6State *s) {
     fill_rect(s, HOCKEY_WALL_R_X, HOCKEY_GOAL_Y1, 2, (COURT_B - 2) - HOCKEY_GOAL_Y1, 0xffffffff);
 }
 
-static bool in_rect(float x, float y, int rx, int ry, int rw, int rh) {
+/* ── Comparators (collision/position sensing) ───────────────────────────── */
+
+static bool in_rect(int x, int y, int rx, int ry, int rw, int rh) {
     return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
 }
 
@@ -285,69 +308,71 @@ static bool ball_in_rect(const MitsuTvGame6State *s, int rx, int ry, int rw, int
 
 static bool hit_side_paddles(const MitsuTvGame6State *s, bool left) {
     int x = left ? 48 : 265;
-    float cy = left ? s->left_y : s->right_y;
-    float h = left ? s->left_h : s->right_h;
-    if (in_rect(s->ball_x, s->ball_y, x - 2, (int)(cy - h * 0.5f) - 2, PADDLE_W + 4, (int)h + 4))
+    int cy = left ? s->left_y : s->right_y;
+    int h = left ? s->left_h : s->right_h;
+    if (in_rect(s->ball_x, s->ball_y, x - 2, cy - h / 2 - 2, PADDLE_W + 4, h + 4))
         return true;
     if (!s->double_paddles)
         return false;
-    float x2 = x + (left ? PADDLE_OFFSET : -PADDLE_OFFSET);
-    return in_rect(s->ball_x, s->ball_y, (int)x2 - 2, (int)(cy - h * 0.5f) - 2, PADDLE_W + 4, (int)h + 4);
+    int x2 = x + (left ? PADDLE_OFFSET : -PADDLE_OFFSET);
+    return in_rect(s->ball_x, s->ball_y, x2 - 2, cy - h / 2 - 2, PADDLE_W + 4, h + 4);
 }
 
 static bool hit_marker_rect(const MitsuTvGame6State *s, int x, int y) {
     return ball_in_rect(s, x, y, MARKER_W, MARKER_H);
 }
 
-/* Scans both the red (color=0) and green (color=1) net columns - only
- * called in volleyball mode. Matches Python's net[0]/net[1] tile grid. */
-static bool hit_barrier(const MitsuTvGame6State *s, int *hit_x, int *hit_y, int *color) {
+static bool hit_barrier(const MitsuTvGame6State *s, int *color, int *zone) {
     for (int row = 0; row < 6; row++) {
         int gy = MARKER_GREEN_Y0 + row * MARKER_STEP;
         int ry = MARKER_RED_Y0 + row * MARKER_STEP;
-        if (hit_marker_rect(s, MARKER_RED_X0, ry)) {
-            *hit_x = MARKER_RED_X0; *hit_y = ry; *color = 0;
-            return true;
-        }
-        if (hit_marker_rect(s, MARKER_RED_X1, ry)) {
-            *hit_x = MARKER_RED_X1; *hit_y = ry; *color = 0;
-            return true;
-        }
-        if (hit_marker_rect(s, MARKER_GREEN_X0, gy)) {
-            *hit_x = MARKER_GREEN_X0; *hit_y = gy; *color = 1;
-            return true;
-        }
-        if (hit_marker_rect(s, MARKER_GREEN_X1, gy)) {
-            *hit_x = MARKER_GREEN_X1; *hit_y = gy; *color = 1;
-            return true;
-        }
+        int ty = 0, c = -1;
+        if (hit_marker_rect(s, MARKER_RED_X0, ry))        { ty = ry; c = 0; }
+        else if (hit_marker_rect(s, MARKER_RED_X1, ry))   { ty = ry; c = 0; }
+        else if (hit_marker_rect(s, MARKER_GREEN_X0, gy)) { ty = gy; c = 1; }
+        else if (hit_marker_rect(s, MARKER_GREEN_X1, gy)) { ty = gy; c = 1; }
+        if (c < 0)
+            continue;
+        int off = s->ball_y - ty;
+        if (off < 0) off = 0;
+        if (off >= MARKER_H) off = MARKER_H - 1;
+        *color = c;
+        *zone = off * 3 / MARKER_H;
+        return true;
     }
     return false;
 }
 
-/*
- * Reproduces Python's paddle_collision() angle formula exactly: the bounce
- * angle is +/-50 degrees at the paddle tips, computed via
- * tan(direction) regardless of which side is hit, and always normalized
- * against the nominal (non-resized) paddle half-height - Python divides by
- * the global paddle_height even when bouncing off a net tile, so we do too.
+/* ── Bounce-rate tables ──────────────────────────────────────────────────
+ *
+ * Real Pong-on-a-chip hardware had no multiplier or angle math: the paddle
+ * (or net tile) is divided into a handful of zones, and each zone just picks
+ * a vertical clock-divider/step/direction for the ball's position counter -
+ * a coarse lookup, not a computed angle. 5 zones for the (taller) paddles,
+ * 3 for the (much shorter) net tiles.
  */
-static void compute_bounce(float vx_in, bool left_style, float c_point, float *vx_out, float *vy_out) {
-    if (c_point < -1.0f) c_point = -1.0f;
-    if (c_point > 1.0f) c_point = 1.0f;
-    float angle = c_point * 50.0f;
-    float direction;
-    if (left_style)
-        direction = angle < 0.0f ? 360.0f + angle : angle;
-    else
-        direction = angle == 0.0f ? 180.0f : 180.0f - angle;
-    if (direction >= 181.0f && direction <= 185.0f)
-        direction = 180.0f;
-    else if (direction >= 355.0f && direction <= 359.0f)
-        direction = 0.0f;
-    float nvx = -vx_in;
-    *vx_out = nvx;
-    *vy_out = tanf(direction * (float)(M_PI / 180.0)) * nvx;
+static const int paddle_zone_div[5]  = { 1, 2, 0, 2, 1 };
+static const int paddle_zone_step[5] = { 2, 1, 0, 1, 2 };
+static const int paddle_zone_dir[5]  = { -1, -1, 0, 1, 1 };
+
+static const int net_zone_div[3]  = { 1, 0, 1 };
+static const int net_zone_step[3] = { 2, 0, 2 };
+static const int net_zone_dir[3]  = { -1, 0, 1 };
+
+static int paddle_zone_of(int ball_y, int paddle_cy, int paddle_h) {
+    int off = ball_y - (paddle_cy - paddle_h / 2);
+    if (off < 0) off = 0;
+    if (off >= paddle_h) off = paddle_h - 1;
+    int zone = off * 5 / paddle_h;
+    return zone > 4 ? 4 : zone;
+}
+
+static void apply_bounce(MitsuTvGame6State *s, int div, int step, int dir) {
+    s->h_dir = -s->h_dir;
+    s->v_div = div;
+    s->v_step = step;
+    s->v_dir = dir;
+    s->v_acc = 0;
 }
 
 static void set_mode(MitsuTvGame6State *s, TvGame6Mode mode) {
@@ -359,6 +384,17 @@ static void set_mode(MitsuTvGame6State *s, TvGame6Mode mode) {
     tvgame6_reset_ball(s, 1);
 }
 
+static void step_ball(MitsuTvGame6State *s) {
+    s->ball_x += s->h_dir * s->h_step;
+    if (s->v_div > 0) {
+        s->v_acc++;
+        if (s->v_acc >= s->v_div) {
+            s->v_acc = 0;
+            s->ball_y += s->v_dir * s->v_step;
+        }
+    }
+}
+
 static void update_game(MitsuTvGame6State *s, uint32_t actions) {
     uint32_t pressed = actions & ~s->prev_actions;
     if (pressed & ACT_TENNIS) set_mode(s, TVG_TENNIS);
@@ -368,83 +404,75 @@ static void update_game(MitsuTvGame6State *s, uint32_t actions) {
     if (pressed & ACT_SERVE) s->waiting_serve = false;
     if (pressed & ACT_SPEED_TOGGLE) {
         s->turbo = !s->turbo;
-        float mag = s->turbo ? BALL_SPEED_TURBO : BALL_SPEED_NORMAL;
-        s->ball_vx = s->ball_vx < 0 ? -mag : mag;
+        s->h_step = s->turbo ? BALL_H_STEP_TURBO : BALL_H_STEP_NORMAL;
     }
     if (pressed & ACT_RESIZE_L)
-        s->left_h = (s->left_h > PADDLE_H * 0.75f) ? PADDLE_H * 0.5f : PADDLE_H;
+        s->left_h = (s->left_h > (PADDLE_H + PADDLE_H_SMALL) / 2) ? PADDLE_H_SMALL : PADDLE_H;
     if (pressed & ACT_RESIZE_R)
-        s->right_h = (s->right_h > PADDLE_H * 0.75f) ? PADDLE_H * 0.5f : PADDLE_H;
+        s->right_h = (s->right_h > (PADDLE_H + PADDLE_H_SMALL) / 2) ? PADDLE_H_SMALL : PADDLE_H;
 
-    if (actions & ACT_L_UP) s->left_y -= PADDLE_SPEED;
-    if (actions & ACT_L_DOWN) s->left_y += PADDLE_SPEED;
-    if (actions & ACT_R_UP) s->right_y -= PADDLE_SPEED;
-    if (actions & ACT_R_DOWN) s->right_y += PADDLE_SPEED;
-    float lh2 = s->left_h * 0.5f, rh2 = s->right_h * 0.5f;
+    if (actions & ACT_L_UP) s->left_y -= PADDLE_STEP;
+    if (actions & ACT_L_DOWN) s->left_y += PADDLE_STEP;
+    if (actions & ACT_R_UP) s->right_y -= PADDLE_STEP;
+    if (actions & ACT_R_DOWN) s->right_y += PADDLE_STEP;
+    int lh2 = s->left_h / 2, rh2 = s->right_h / 2;
     if (s->left_y - lh2 < FIELD_Y) s->left_y = FIELD_Y + lh2;
     if (s->left_y + lh2 > FIELD_B) s->left_y = FIELD_B - lh2;
     if (s->right_y - rh2 < FIELD_Y) s->right_y = FIELD_Y + rh2;
     if (s->right_y + rh2 > FIELD_B) s->right_y = FIELD_B - rh2;
 
     if (!s->waiting_serve) {
-        s->ball_x += s->ball_vx;
-        s->ball_y += s->ball_vy;
+        step_ball(s);
         if (s->marker_cooldown > 0)
             s->marker_cooldown--;
-        if (s->ball_y < FIELD_Y || s->ball_y > FIELD_B)
-            s->ball_vy = -s->ball_vy;
 
-        if ((s->ball_vx < 0 && hit_side_paddles(s, true)) ||
-            (s->ball_vx > 0 && hit_side_paddles(s, false))) {
-            bool left_style = s->ball_vx < 0;
-            float cy = left_style ? s->left_y : s->right_y;
-            float c_point = (s->ball_y - cy) / PADDLE_HALF;
-            compute_bounce(s->ball_vx, left_style, c_point, &s->ball_vx, &s->ball_vy);
+        if (s->ball_y <= FIELD_Y || s->ball_y >= FIELD_B)
+            s->v_dir = -s->v_dir;
+
+        if ((s->h_dir < 0 && hit_side_paddles(s, true)) ||
+            (s->h_dir > 0 && hit_side_paddles(s, false))) {
+            bool left_style = s->h_dir < 0;
+            int cy = left_style ? s->left_y : s->right_y;
+            int h = left_style ? s->left_h : s->right_h;
+            int zone = paddle_zone_of(s->ball_y, cy, h);
+            apply_bounce(s, paddle_zone_div[zone], paddle_zone_step[zone], paddle_zone_dir[zone]);
             s->bounce_count = 0;
         }
 
         if (s->mode == TVG_VOLLEY) {
-            int mx = 0, my = 0, color = 0;
-            if (s->marker_cooldown == 0 && hit_barrier(s, &mx, &my, &color)) {
+            int color = 0, zone = 0;
+            if (s->marker_cooldown == 0 && hit_barrier(s, &color, &zone)) {
                 bool left_style = (color == 0);
-                bool correct_dir = left_style ? (s->ball_vx < 0) : (s->ball_vx > 0);
-                float c_point;
-                if (correct_dir && s->bounce_count < 10) {
-                    float ref_cy = my + MARKER_H * 0.5f;
-                    c_point = (s->ball_y - ref_cy) / PADDLE_HALF;
-                } else {
+                bool correct_dir = left_style ? (s->h_dir < 0) : (s->h_dir > 0);
+                if (!(correct_dir && s->bounce_count < 10)) {
                     /* Anti-stall: after too many consecutive net bounces (or a
-                     * bounce from the "wrong" side), Python randomizes the
-                     * escape angle among {-45, 0, +45} instead of deflecting
-                     * deterministically. The 0 (flat) option is what actually
-                     * lets the ball slip through a gap between tile rows - a
-                     * continuously-random angle almost never lands exactly
-                     * flat, so the ball would otherwise get re-deflected
-                     * forever instead of ever coasting through. */
-                    static const float escape_c[3] = { -0.9f, 0.0f, 0.9f };
-                    c_point = escape_c[rand() % 3];
+                     * bounce from the "wrong" side), pick a random zone
+                     * instead of the one the ball geometrically hit - the
+                     * flat (zone 1) entry is what actually lets the ball
+                     * slip through the gap between tile rows next frame. */
+                    zone = rand() % 3;
                 }
-                compute_bounce(s->ball_vx, left_style, c_point, &s->ball_vx, &s->ball_vy);
+                apply_bounce(s, net_zone_div[zone], net_zone_step[zone], net_zone_dir[zone]);
                 s->bounce_count++;
                 s->marker_cooldown = 8;
             }
         } else if (s->mode == TVG_HOCKEY) {
             bool in_gap = s->ball_y > HOCKEY_GOAL_Y0 && s->ball_y < HOCKEY_GOAL_Y1;
             if (!in_gap) {
-                if (s->ball_vx < 0 && s->ball_x <= HOCKEY_WALL_L_X + BALL_W * 0.5f) {
-                    s->ball_x = HOCKEY_WALL_L_X + BALL_W * 0.5f;
-                    s->ball_vx = -s->ball_vx;
-                } else if (s->ball_vx > 0 && s->ball_x >= HOCKEY_WALL_R_X - BALL_W * 0.5f) {
-                    s->ball_x = HOCKEY_WALL_R_X - BALL_W * 0.5f;
-                    s->ball_vx = -s->ball_vx;
+                if (s->h_dir < 0 && s->ball_x <= HOCKEY_WALL_L_X + BALL_W / 2) {
+                    s->ball_x = HOCKEY_WALL_L_X + BALL_W / 2;
+                    s->h_dir = -s->h_dir;
+                } else if (s->h_dir > 0 && s->ball_x >= HOCKEY_WALL_R_X - BALL_W / 2) {
+                    s->ball_x = HOCKEY_WALL_R_X - BALL_W / 2;
+                    s->h_dir = -s->h_dir;
                 }
             }
         }
 
-        if (s->ball_x < COURT_X - 8.0f) {
+        if (s->ball_x < COURT_X - 8) {
             s->right_score = (s->right_score + 1) % 10;
             tvgame6_reset_ball(s, -1);
-        } else if (s->ball_x > COURT_R + 8.0f) {
+        } else if (s->ball_x > COURT_R + 8) {
             s->left_score = (s->left_score + 1) % 10;
             tvgame6_reset_ball(s, 1);
         }
@@ -471,7 +499,7 @@ static void render_game(MitsuTvGame6State *s) {
 
     draw_side_paddles(s, true, 48, s->left_y, s->left_h, 0xffa6e6ff);
     draw_side_paddles(s, false, 265, s->right_y, s->right_h, 0xffa6e6ff);
-    fill_rect(s, (int)s->ball_x - BALL_W / 2, (int)s->ball_y - BALL_H / 2,
+    fill_rect(s, s->ball_x - BALL_W / 2, s->ball_y - BALL_H / 2,
               BALL_W, BALL_H, 0xffc7dbfd);
 }
 
