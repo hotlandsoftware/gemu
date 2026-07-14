@@ -40,10 +40,6 @@ static void tvgame6_sleep_frame(void) {
  * recreation rather than lifted from a real datasheet - this is a
  * behavioral/structural model, blending known hardware architecture with
  * simulated specifics, not a verified transistor-exact emulation.
- *
- * Field geometry is a direct 0.25x/0.2506x scale-down of the Python
- * reference's 1280x960 window, so this reproduces the same paddle/ball/net
- * proportions.
  */
 #define FB_W 320
 #define FB_H 240
@@ -108,6 +104,28 @@ typedef enum {
     TVG_VOLLEY,
     TVG_HOCKEY,
 } TvGame6Mode;
+
+/*
+ * Python's color_list[game-1]: each mode has its own court/background/net
+ * (& ball)/paddle/goal/wall palette, not a single shared color scheme.
+ * Index by TvGame6Mode - note GEMU's mode *names* don't line up with
+ * Python's game numbers (GEMU "tennis" plays like Python's game=2, "volley"
+ * like game=1, "hockey" like game=3 - see the mode-behavior comment above
+ * update_game()), so the palette below follows that same by-behavior
+ * mapping rather than the raw game index.
+ */
+typedef struct {
+    uint32_t court, bg, net_ball, paddle, goal_l, goal_r, wall_base;
+} ModePalette;
+
+static const ModePalette mode_palette[3] = {
+    [TVG_TENNIS] = { 0xffc07645, 0xff0e7aab, 0xfffae7b4, 0xffd0ecb2,
+                      0xff4cbd7c, 0xffa36878, 0xffdad2b0 },
+    [TVG_VOLLEY] = { 0xff6d70f9, 0xff19b537, 0xffc7dbfd, 0xffa6e6ff,
+                      0xff84686a, 0xff408caf, 0xffcddcfb },
+    [TVG_HOCKEY] = { 0xff2cc94c, 0xff505068, 0xff98ff8d, 0xffff9fff,
+                      0xff3a687f, 0xff51bc29, 0xff98ff8d },
+};
 
 struct MitsuTvGame6State {
     GemuDisplay *display;
@@ -271,27 +289,76 @@ static void draw_side_paddles(MitsuTvGame6State *s, bool is_left, int x, int cy,
     draw_paddle(s, x2, cy, h, c);
 }
 
+/* Net tile colors are hardcoded in Python's draw_volleyball_net() rather than
+ * taken from color_list - they're the same red/green in every mode. */
 static void draw_center_markers(MitsuTvGame6State *s) {
     for (int row = 0; row < 6; row++) {
         int gy = MARKER_GREEN_Y0 + row * MARKER_STEP;
         int ry = MARKER_RED_Y0 + row * MARKER_STEP;
         fill_rect(s, MARKER_GREEN_X0, gy, MARKER_W, MARKER_H, 0xff30ae18);
         fill_rect(s, MARKER_GREEN_X1, gy, MARKER_W, MARKER_H, 0xff30ae18);
-        fill_rect(s, MARKER_RED_X0, ry, MARKER_W, MARKER_H, 0xffcc4b51);
-        fill_rect(s, MARKER_RED_X1, ry, MARKER_W, MARKER_H, 0xffcc4b51);
+        fill_rect(s, MARKER_RED_X0, ry, MARKER_W, MARKER_H, 0xffcc4b49);
+        fill_rect(s, MARKER_RED_X1, ry, MARKER_W, MARKER_H, 0xffcc4b49);
     }
 }
 
-static void draw_tennis_net(MitsuTvGame6State *s) {
+static void draw_tennis_net(MitsuTvGame6State *s, uint32_t c) {
     for (int i = 0; i < 6; i++)
-        fill_rect(s, NET_X, NET_Y0 + i * NET_STEP, NET_W, NET_H, 0xffc7dbfd);
+        fill_rect(s, NET_X, NET_Y0 + i * NET_STEP, NET_W, NET_H, c);
 }
 
-static void draw_hockey_walls(MitsuTvGame6State *s) {
-    fill_rect(s, HOCKEY_WALL_L_X, COURT_Y + 2, 2, HOCKEY_GOAL_Y0 - (COURT_Y + 2), 0xffffffff);
-    fill_rect(s, HOCKEY_WALL_L_X, HOCKEY_GOAL_Y1, 2, (COURT_B - 2) - HOCKEY_GOAL_Y1, 0xffffffff);
-    fill_rect(s, HOCKEY_WALL_R_X, COURT_Y + 2, 2, HOCKEY_GOAL_Y0 - (COURT_Y + 2), 0xffffffff);
-    fill_rect(s, HOCKEY_WALL_R_X, HOCKEY_GOAL_Y1, 2, (COURT_B - 2) - HOCKEY_GOAL_Y1, 0xffffffff);
+/* Python never renders a visible line for the hockey side walls (only a
+ * collision boundary) - we draw one for player legibility, in the mode's
+ * net/ball accent color rather than an arbitrary stark white. */
+static void draw_hockey_walls(MitsuTvGame6State *s, uint32_t c) {
+    fill_rect(s, HOCKEY_WALL_L_X, COURT_Y + 2, 2, HOCKEY_GOAL_Y0 - (COURT_Y + 2), c);
+    fill_rect(s, HOCKEY_WALL_L_X, HOCKEY_GOAL_Y1, 2, (COURT_B - 2) - HOCKEY_GOAL_Y1, c);
+    fill_rect(s, HOCKEY_WALL_R_X, COURT_Y + 2, 2, HOCKEY_GOAL_Y0 - (COURT_Y + 2), c);
+    fill_rect(s, HOCKEY_WALL_R_X, HOCKEY_GOAL_Y1, 2, (COURT_B - 2) - HOCKEY_GOAL_Y1, c);
+}
+
+/* Goal strips at the very edge of the court - Python's draw_goals(), one
+ * color per side, spanning the same y-range as the top/bottom wall bounce
+ * boundary (FIELD_Y..FIELD_B). Missing entirely from earlier revisions. */
+static void draw_goals(MitsuTvGame6State *s, uint32_t left_c, uint32_t right_c) {
+    fill_rect(s, COURT_X, FIELD_Y, 2, FIELD_B - FIELD_Y, left_c);
+    fill_rect(s, COURT_R - 2, FIELD_Y, 2, FIELD_B - FIELD_Y, right_c);
+}
+
+/*
+ * Python's color_walls(): the top/bottom wall band ramps r/g/b across only
+ * its first ~10% of width (the rest stays flat at wherever the ramp ended),
+ * with per-mode increment rules. GRAD_W is COURT_W's ~10% (matches the
+ * original's 100-of-1000-pixel ramp).
+ */
+#define GRAD_W 25
+
+static void wall_gradient(TvGame6Mode mode, uint32_t base, uint32_t out[GRAD_W]) {
+    int r = (int)((base >> 16) & 0xff);
+    int g = (int)((base >> 8) & 0xff);
+    int b = (int)(base & 0xff);
+    for (int i = 0; i < GRAD_W; i++) {
+        switch (mode) {
+        case TVG_VOLLEY: /* Python game=1 */
+            if (i % 4 == 0 && r < 255) r++;
+            if (g % 3 == 0 && g < 255) g++;
+            break;
+        case TVG_TENNIS: /* Python game=2 */
+            if (i % 3 == 0 && g < 255) g++;
+            if (i % 5 == 0 && b < 255) b++;
+            break;
+        case TVG_HOCKEY: /* Python game=3 */
+            if (i % 4 == 0 && r < 255) r++;
+            if (i % 2 == 0 && b < 255) b++;
+            break;
+        }
+        out[i] = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    }
+}
+
+static void draw_wall_band(MitsuTvGame6State *s, int y, int h, const uint32_t grad[GRAD_W]) {
+    for (int i = 0; i < COURT_W; i++)
+        fill_rect(s, COURT_X + i, y, 1, h, grad[i < GRAD_W ? i : GRAD_W - 1]);
 }
 
 /* ── Comparators (collision/position sensing) ───────────────────────────── */
@@ -481,26 +548,33 @@ static void update_game(MitsuTvGame6State *s, uint32_t actions) {
 }
 
 static void render_game(MitsuTvGame6State *s) {
-    for (int i = 0; i < FB_W * FB_H; i++)
-        s->fb[i] = 0xff19b537;
+    const ModePalette *pal = &mode_palette[s->mode];
 
-    fill_rect(s, COURT_X, COURT_Y, COURT_W, COURT_H, 0xff6d70f9);
+    for (int i = 0; i < FB_W * FB_H; i++)
+        s->fb[i] = pal->bg;
+
+    fill_rect(s, COURT_X, COURT_Y, COURT_W, COURT_H, pal->court);
     fill_rect(s, COURT_X, COURT_Y, COURT_W, 1, 0xff000000);
-    fill_rect(s, COURT_X, COURT_Y + 1, COURT_W, 5, 0xffcddcfb);
-    fill_rect(s, COURT_X, COURT_B - 5, COURT_W, 5, 0xffcddcfb);
     fill_rect(s, COURT_X, COURT_B - 1, COURT_W, 1, 0xff000000);
+
+    uint32_t grad[GRAD_W];
+    wall_gradient(s->mode, pal->wall_base, grad);
+    draw_wall_band(s, COURT_Y + 1, 5, grad);
+    draw_wall_band(s, COURT_B - 6, 5, grad);
+
+    draw_goals(s, pal->goal_l, pal->goal_r);
 
     if (s->mode == TVG_VOLLEY)
         draw_center_markers(s);
     else if (s->mode == TVG_TENNIS)
-        draw_tennis_net(s);
+        draw_tennis_net(s, pal->net_ball);
     else if (s->mode == TVG_HOCKEY)
-        draw_hockey_walls(s);
+        draw_hockey_walls(s, pal->net_ball);
 
-    draw_side_paddles(s, true, 48, s->left_y, s->left_h, 0xffa6e6ff);
-    draw_side_paddles(s, false, 265, s->right_y, s->right_h, 0xffa6e6ff);
+    draw_side_paddles(s, true, 48, s->left_y, s->left_h, pal->paddle);
+    draw_side_paddles(s, false, 265, s->right_y, s->right_h, pal->paddle);
     fill_rect(s, s->ball_x - BALL_W / 2, s->ball_y - BALL_H / 2,
-              BALL_W, BALL_H, 0xffc7dbfd);
+              BALL_W, BALL_H, pal->net_ball);
 }
 
 void mitsu_tvgame6_run(MitsuTvGame6State *s, const MitsuConfig *cfg) {
