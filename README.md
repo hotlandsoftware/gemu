@@ -6,7 +6,7 @@
 <img align="left" src="gemu.png" alt="GEMU Icon" /> GEMU is a multi-machine emulator which seeks to emulate every device and machine in existence (yes, really) while having an extremely wide variety of features and the versatile command set of QEMU. 
 
 The emulator seeks to offer:
-- full, accurate, low-level emulation of a wide variety of computers, machines and devices
+- full, accurate, and fast low-level emulation of a wide variety of computers, machines and devices
 - a simple, easy to use UI to easily set up any machine
 - full, backwards compatibility with QEMU, including console commands, command line options, even featuring full QMP support.
 - a wide variety of helpful debug features
