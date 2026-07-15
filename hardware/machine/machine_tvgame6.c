@@ -71,10 +71,17 @@ static void tvgame6_sleep_frame(void) {
 #define BALL_H_STEP_NORMAL 3 /* horizontal position-counter step per frame */
 #define BALL_H_STEP_TURBO  6
 
-/* tennis mode: decorative center net, no collision */
-#define NET_X 121
+/*
+ * Tennis mode: decorative center net, no collision. The reference's net
+ * draw call draws onto the pre-blit "screen" surface (screen-space x=485),
+ * unlike the ball/paddles/volleyball-net which are drawn directly in
+ * display-space - so its court-relative position is
+ * COURT_X + 485*(COURT_W/1000), landing it at true court-center, not offset
+ * by the 140px blit margin.
+ */
+#define NET_X 156
 #define NET_W MARKER_W
-#define NET_Y0 8
+#define NET_Y0 25
 #define NET_STEP 33
 #define NET_H 16
 
@@ -106,25 +113,25 @@ typedef enum {
 } TvGame6Mode;
 
 /*
- * Python's color_list[game-1]: each mode has its own court/background/net
- * (& ball)/paddle/goal/wall palette, not a single shared color scheme.
- * Index by TvGame6Mode - note GEMU's mode *names* don't line up with
- * Python's game numbers (GEMU "tennis" plays like Python's game=2, "volley"
- * like game=1, "hockey" like game=3 - see the mode-behavior comment above
- * update_game()), so the palette below follows that same by-behavior
- * mapping rather than the raw game index.
+ * The reference's color_list[game-1]: each mode has its own
+ * court/background/net (& ball)/paddle/goal/wall palette, not a single
+ * shared color scheme. Index by TvGame6Mode - note GEMU's mode *names*
+ * don't line up with the reference's game numbers (GEMU "tennis" plays like
+ * its game=2, "volley" like game=1, "hockey" like game=3 - see the
+ * mode-behavior comment above update_game()), so the palette below follows
+ * that same by-behavior mapping rather than the raw game index.
  */
 typedef struct {
-    uint32_t court, bg, net_ball, paddle, goal_l, goal_r, wall_base;
+    uint32_t court, bg, net_ball, paddle, goal_l, goal_r, wall_base, score;
 } ModePalette;
 
 static const ModePalette mode_palette[3] = {
     [TVG_TENNIS] = { 0xffc07645, 0xff0e7aab, 0xfffae7b4, 0xffd0ecb2,
-                      0xff4cbd7c, 0xffa36878, 0xffdad2b0 },
+                      0xff4cbd7c, 0xffa36878, 0xffdad2b0, 0xffcdf0ff },
     [TVG_VOLLEY] = { 0xff6d70f9, 0xff19b537, 0xffc7dbfd, 0xffa6e6ff,
-                      0xff84686a, 0xff408caf, 0xffcddcfb },
+                      0xff84686a, 0xff408caf, 0xffcddcfb, 0xffedfd84 },
     [TVG_HOCKEY] = { 0xff2cc94c, 0xff505068, 0xff98ff8d, 0xffff9fff,
-                      0xff3a687f, 0xff51bc29, 0xff98ff8d },
+                      0xff3a687f, 0xff51bc29, 0xff98ff8d, 0xffaefbff },
 };
 
 struct MitsuTvGame6State {
@@ -289,8 +296,9 @@ static void draw_side_paddles(MitsuTvGame6State *s, bool is_left, int x, int cy,
     draw_paddle(s, x2, cy, h, c);
 }
 
-/* Net tile colors are hardcoded in Python's draw_volleyball_net() rather than
- * taken from color_list - they're the same red/green in every mode. */
+/* Net tile colors are hardcoded in the reference's net-drawing routine
+ * rather than taken from color_list - they're the same red/green in every
+ * mode. */
 static void draw_center_markers(MitsuTvGame6State *s) {
     for (int row = 0; row < 6; row++) {
         int gy = MARKER_GREEN_Y0 + row * MARKER_STEP;
@@ -307,9 +315,9 @@ static void draw_tennis_net(MitsuTvGame6State *s, uint32_t c) {
         fill_rect(s, NET_X, NET_Y0 + i * NET_STEP, NET_W, NET_H, c);
 }
 
-/* Python never renders a visible line for the hockey side walls (only a
- * collision boundary) - we draw one for player legibility, in the mode's
- * net/ball accent color rather than an arbitrary stark white. */
+/* The reference never renders a visible line for the hockey side walls
+ * (only a collision boundary) - we draw one for player legibility, in the
+ * mode's net/ball accent color rather than an arbitrary stark white. */
 static void draw_hockey_walls(MitsuTvGame6State *s, uint32_t c) {
     fill_rect(s, HOCKEY_WALL_L_X, COURT_Y + 2, 2, HOCKEY_GOAL_Y0 - (COURT_Y + 2), c);
     fill_rect(s, HOCKEY_WALL_L_X, HOCKEY_GOAL_Y1, 2, (COURT_B - 2) - HOCKEY_GOAL_Y1, c);
@@ -317,19 +325,19 @@ static void draw_hockey_walls(MitsuTvGame6State *s, uint32_t c) {
     fill_rect(s, HOCKEY_WALL_R_X, HOCKEY_GOAL_Y1, 2, (COURT_B - 2) - HOCKEY_GOAL_Y1, c);
 }
 
-/* Goal strips at the very edge of the court - Python's draw_goals(), one
- * color per side, spanning the same y-range as the top/bottom wall bounce
- * boundary (FIELD_Y..FIELD_B). Missing entirely from earlier revisions. */
+/* Goal strips at the very edge of the court - one color per side, spanning
+ * the same y-range as the top/bottom wall bounce boundary
+ * (FIELD_Y..FIELD_B). Missing entirely from earlier revisions. */
 static void draw_goals(MitsuTvGame6State *s, uint32_t left_c, uint32_t right_c) {
     fill_rect(s, COURT_X, FIELD_Y, 2, FIELD_B - FIELD_Y, left_c);
     fill_rect(s, COURT_R - 2, FIELD_Y, 2, FIELD_B - FIELD_Y, right_c);
 }
 
 /*
- * Python's color_walls(): the top/bottom wall band ramps r/g/b across only
- * its first ~10% of width (the rest stays flat at wherever the ramp ended),
- * with per-mode increment rules. GRAD_W is COURT_W's ~10% (matches the
- * original's 100-of-1000-pixel ramp).
+ * The reference's wall-coloring routine: the top/bottom wall band ramps
+ * r/g/b across only its first ~10% of width (the rest stays flat at
+ * wherever the ramp ended), with per-mode increment rules. GRAD_W is
+ * COURT_W's ~10% (matches the original's 100-of-1000-pixel ramp).
  */
 #define GRAD_W 25
 
@@ -339,15 +347,15 @@ static void wall_gradient(TvGame6Mode mode, uint32_t base, uint32_t out[GRAD_W])
     int b = (int)(base & 0xff);
     for (int i = 0; i < GRAD_W; i++) {
         switch (mode) {
-        case TVG_VOLLEY: /* Python game=1 */
+        case TVG_VOLLEY: /* reference game=1 */
             if (i % 4 == 0 && r < 255) r++;
             if (g % 3 == 0 && g < 255) g++;
             break;
-        case TVG_TENNIS: /* Python game=2 */
+        case TVG_TENNIS: /* reference game=2 */
             if (i % 3 == 0 && g < 255) g++;
             if (i % 5 == 0 && b < 255) b++;
             break;
-        case TVG_HOCKEY: /* Python game=3 */
+        case TVG_HOCKEY: /* reference game=3 */
             if (i % 4 == 0 && r < 255) r++;
             if (i % 2 == 0 && b < 255) b++;
             break;
@@ -359,6 +367,47 @@ static void wall_gradient(TvGame6Mode mode, uint32_t base, uint32_t out[GRAD_W])
 static void draw_wall_band(MitsuTvGame6State *s, int y, int h, const uint32_t grad[GRAD_W]) {
     for (int i = 0; i < COURT_W; i++)
         fill_rect(s, COURT_X + i, y, 1, h, grad[i < GRAD_W ? i : GRAD_W - 1]);
+}
+
+/*
+ * Score digits - the reference renders these with a custom TTF
+ * (nintendo.ttf) that isn't a runtime asset here. Its glyphs turned out to
+ * be a plain rectilinear 7-segment design (confirmed by dumping the outline
+ * contours: every digit is built from axis-aligned rectangles at the same
+ * handful of x/y boundaries, no curves at all), so this bitmap was
+ * generated once by rasterizing that font's actual vector outlines down to
+ * a 7x10 grid (nonzero-winding fill, solid contours minus hole contours)
+ * and hand-copied in - a pixel-accurate reproduction of the real glyphs,
+ * not a from-scratch approximation, without needing the .ttf file at
+ * runtime.
+ */
+#define DIGIT_SCALE 2
+#define DIGIT_COLS 7
+#define DIGIT_ROWS 10
+#define DIGIT_W (DIGIT_COLS * DIGIT_SCALE)
+#define DIGIT_H (DIGIT_ROWS * DIGIT_SCALE)
+
+static const uint8_t digit_font[10][DIGIT_ROWS] = {
+    { 0x7F, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x7F }, /* 0 */
+    { 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03 }, /* 1 */
+    { 0x7F, 0x7F, 0x03, 0x03, 0x7F, 0x60, 0x60, 0x60, 0x7F, 0x7F }, /* 2 */
+    { 0x7F, 0x7F, 0x03, 0x03, 0x7F, 0x03, 0x03, 0x03, 0x7F, 0x7F }, /* 3 */
+    { 0x63, 0x63, 0x63, 0x63, 0x7F, 0x03, 0x03, 0x03, 0x03, 0x03 }, /* 4 */
+    { 0x7F, 0x7F, 0x60, 0x60, 0x7F, 0x03, 0x03, 0x03, 0x7F, 0x7F }, /* 5 */
+    { 0x7F, 0x7F, 0x60, 0x60, 0x7F, 0x63, 0x63, 0x63, 0x63, 0x7F }, /* 6 */
+    { 0x7F, 0x7F, 0x63, 0x63, 0x63, 0x03, 0x03, 0x03, 0x03, 0x03 }, /* 7 */
+    { 0x7F, 0x63, 0x63, 0x63, 0x7F, 0x63, 0x63, 0x63, 0x63, 0x7F }, /* 8 */
+    { 0x7F, 0x63, 0x63, 0x63, 0x7F, 0x03, 0x03, 0x03, 0x7F, 0x7F }, /* 9 */
+};
+
+static void draw_digit(MitsuTvGame6State *s, int x, int y, int digit, uint32_t c) {
+    if (digit < 0 || digit > 9)
+        return;
+    for (int row = 0; row < DIGIT_ROWS; row++)
+        for (int col = 0; col < DIGIT_COLS; col++)
+            if (digit_font[digit][row] & (1 << (DIGIT_COLS - 1 - col)))
+                fill_rect(s, x + col * DIGIT_SCALE, y + row * DIGIT_SCALE,
+                          DIGIT_SCALE, DIGIT_SCALE, c);
 }
 
 /* ── Comparators (collision/position sensing) ───────────────────────────── */
@@ -482,19 +531,39 @@ static void update_game(MitsuTvGame6State *s, uint32_t actions) {
     if (actions & ACT_L_DOWN) s->left_y += PADDLE_STEP;
     if (actions & ACT_R_UP) s->right_y -= PADDLE_STEP;
     if (actions & ACT_R_DOWN) s->right_y += PADDLE_STEP;
-    int lh2 = s->left_h / 2, rh2 = s->right_h / 2;
-    if (s->left_y - lh2 < FIELD_Y) s->left_y = FIELD_Y + lh2;
-    if (s->left_y + lh2 > FIELD_B) s->left_y = FIELD_B - lh2;
-    if (s->right_y - rh2 < FIELD_Y) s->right_y = FIELD_Y + rh2;
-    if (s->right_y + rh2 > FIELD_B) s->right_y = FIELD_B - rh2;
+    /* draw_paddle()'s rect is [cy - h/2, cy - h/2 + h), so for odd heights
+     * the bottom edge sits h/2 (rounded up) below center, one pixel more
+     * than the top's h/2 (rounded down) above it - clamping both edges by
+     * the same h/2 let the paddle clip a pixel through the bottom wall. */
+    int lh_top = s->left_h / 2, lh_bot = s->left_h - lh_top;
+    int rh_top = s->right_h / 2, rh_bot = s->right_h - rh_top;
+    /* The reference lets the paddle travel almost the whole window - well
+     * past the wall bands and into the background margin (paddle.top can
+     * reach -65, paddle.bottom 1005, against a 960-tall window) - not just
+     * to the ball's wall-bounce line. Clamp to the framebuffer edges instead
+     * of FIELD_Y/FIELD_B so it isn't stopped early. */
+    if (s->left_y - lh_top < 0) s->left_y = lh_top;
+    if (s->left_y + lh_bot > FB_H) s->left_y = FB_H - lh_bot;
+    if (s->right_y - rh_top < 0) s->right_y = rh_top;
+    if (s->right_y + rh_bot > FB_H) s->right_y = FB_H - rh_bot;
 
     if (!s->waiting_serve) {
         step_ball(s);
         if (s->marker_cooldown > 0)
             s->marker_cooldown--;
 
-        if (s->ball_y <= FIELD_Y || s->ball_y >= FIELD_B)
-            s->v_dir = -s->v_dir;
+        /* Clamp back in bounds and only flip if still heading further out -
+         * previously this just flipped v_dir unconditionally every frame the
+         * ball sat at/past the line, which (since vertical motion only steps
+         * once every v_div frames) could flip it back and forth on
+         * successive frames while the ball stayed parked outside the court. */
+        if (s->ball_y <= FIELD_Y) {
+            s->ball_y = FIELD_Y;
+            if (s->v_dir < 0) s->v_dir = -s->v_dir;
+        } else if (s->ball_y >= FIELD_B) {
+            s->ball_y = FIELD_B;
+            if (s->v_dir > 0) s->v_dir = -s->v_dir;
+        }
 
         if ((s->h_dir < 0 && hit_side_paddles(s, true)) ||
             (s->h_dir > 0 && hit_side_paddles(s, false))) {
@@ -570,6 +639,15 @@ static void render_game(MitsuTvGame6State *s) {
         draw_tennis_net(s, pal->net_ball);
     else if (s->mode == TVG_HOCKEY)
         draw_hockey_walls(s, pal->net_ball);
+
+    /* The reference shows the score continuously while the ball is
+     * stationary waiting to be served - not a timed flash, but it reads as
+     * "briefly comes up" since play resumes as soon as the point is
+     * served. */
+    if (s->waiting_serve) {
+        draw_digit(s, COURT_X + 30, COURT_Y + 20, s->left_score, pal->score);
+        draw_digit(s, COURT_R - 30 - DIGIT_W, COURT_Y + 20, s->right_score, pal->score);
+    }
 
     draw_side_paddles(s, true, 48, s->left_y, s->left_h, pal->paddle);
     draw_side_paddles(s, false, 265, s->right_y, s->right_h, pal->paddle);
