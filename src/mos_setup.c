@@ -132,7 +132,7 @@ static const GemuArgsDef def = {
 #endif
         "  -start ADDR        Override reset vector and start execution at ADDR\n"
         "  -cartridge FILE    Insert a cartridge\n"
-        "  -fda FILE          Insert a floppy disk image\n"
+        "  -floppy FILE       Insert a floppy disk image (-fda is an alias)\n"
         "  -tape [ADDR:]FILE  Insert a cassette tape\n"
 #ifdef HAVE_LUA
         "  -lua FILE          Run an FCEUX-Lua-subset script (NES only)\n"
@@ -547,8 +547,8 @@ int mos_setup(int argc, char *argv[]) {
             fprintf(stderr, "gemu: -lua: this build was compiled without Lua 5.1 support\n");
             return 1;
 #endif
-        } else if (strcmp(rem[i], "-fda") == 0) {
-            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -fda requires an argument\n"); return 1; }
+        } else if (strcmp(rem[i], "-fda") == 0 || strcmp(rem[i], "-floppy") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: %s requires an argument\n", rem[i]); return 1; }
             cfg.fda_path = rem[++i];
         } else if (strcmp(rem[i], "-tape") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -tape requires an argument\n"); return 1; }
@@ -700,7 +700,7 @@ int mos_setup(int argc, char *argv[]) {
                 return 1;
             }
         }
-        if (cfg.fda_path && !cfg.fds_enabled) {
+        if (cfg.fda_path && !cfg.fds_enabled && cfg.machine != MOS_MACHINE_ATARI400) {
             fprintf(stderr, "gemu: -fda requires -device fds\n");
             return 1;
         }

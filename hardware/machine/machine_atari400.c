@@ -368,6 +368,113 @@ static bool a400_load_cart(Atari400State *s, const char *path) {
     return true;
 }
 
+/* ATR is a sector dump with a 16-byte header.  In enhanced-density images
+ * sectors 1-3 remain 128 bytes; later sectors use the size in the header. */
+static bool a400_load_atr(Atari400State *s, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "atari400: cannot open floppy '%s'\n", path);
+        return false;
+    }
+    uint8_t h[16];
+    if (fread(h, 1, sizeof(h), f) != sizeof(h) || h[0] != 0x96 || h[1] != 0x02) {
+        fprintf(stderr, "atari400: '%s' is not an ATR floppy image\n", path);
+        fclose(f);
+        return false;
+    }
+    uint32_t paragraphs = (uint32_t)h[2] | ((uint32_t)h[3] << 8) |
+                          ((uint32_t)h[6] << 16) | ((uint32_t)h[7] << 24);
+    size_t declared_bytes = (size_t)paragraphs * 16u;
+    uint16_t sector_size = (uint16_t)(h[4] | ((uint16_t)h[5] << 8));
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long file_size = ftell(f);
+    if (file_size < 16 || fseek(f, 16, SEEK_SET) != 0) { fclose(f); return false; }
+    size_t bytes = (size_t)file_size - 16u;
+    if ((sector_size != 128 && sector_size != 256) || bytes < 3u * 128u ||
+        (sector_size == 128 && bytes % 128u != 0) ||
+        (sector_size == 256 && (bytes - 3u * 128u) % 256u != 0)) {
+        fprintf(stderr, "atari400: unsupported ATR geometry in '%s'\n", path);
+        fclose(f);
+        return false;
+    }
+    if (bytes != declared_bytes)
+        fprintf(stderr, "atari400: warning: ATR header declares %zu bytes, "
+                        "using %zu-byte file payload\n", declared_bytes, bytes);
+    uint8_t *data = malloc(bytes);
+    if (!data || fread(data, 1, bytes, f) != bytes) {
+        fprintf(stderr, "atari400: truncated ATR image '%s'\n", path);
+        free(data);
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    s->disk_data = data;
+    s->disk_size = bytes;
+    s->disk_sector_size = sector_size;
+    s->disk_sectors = sector_size == 128 ? (uint32_t)(bytes / 128u) :
+                      3u + (uint32_t)((bytes - 3u * 128u) / sector_size);
+    printf("atari400: floppy '%s' (%u sectors, %u-byte density)\n",
+           path, s->disk_sectors, sector_size);
+    return true;
+}
+
+static void a400_sio_return(Atari400State *s, uint8_t status) {
+    s->ram[0x0303] = status;               /* DSTATS */
+    s->cpu.Y = status;
+    s->cpu.P = (uint8_t)((s->cpu.P & ~(MOS6502_P_N | MOS6502_P_Z)) |
+                         (status & MOS6502_P_N) |
+                         (status == 0 ? MOS6502_P_Z : 0));
+    s->cpu.SP++;
+    uint8_t lo = a400_read((uint16_t)(0x0100u | s->cpu.SP), s);
+    s->cpu.SP++;
+    uint8_t hi = a400_read((uint16_t)(0x0100u | s->cpu.SP), s);
+    s->cpu.PC = (uint16_t)(((uint16_t)hi << 8) | lo);
+    s->cpu.PC++;
+    s->cpu.cycle_count += 200;             /* keep the trap from being free */
+    s->cpu.insn_count++;
+}
+
+/* High-level emulation of drive 1 at the Atari OS SIO vector ($E459).
+ * This avoids pretending that a bare Atari 400 contains the electronics of
+ * an Atari 810 while retaining the normal OS/device-control-block contract. */
+static bool a400_sio_trap(Atari400State *s) {
+    if (!s->disk_data || s->cpu.PC != 0xE459u) return false;
+
+    uint8_t device = s->ram[0x0300], unit = s->ram[0x0301];
+    uint8_t command = s->ram[0x0302];
+    uint16_t buffer = (uint16_t)(s->ram[0x0304] | ((uint16_t)s->ram[0x0305] << 8));
+    uint16_t count = (uint16_t)(s->ram[0x0308] | ((uint16_t)s->ram[0x0309] << 8));
+    uint16_t aux = (uint16_t)(s->ram[0x030A] | ((uint16_t)s->ram[0x030B] << 8));
+    uint8_t status = 0x01;                 /* complete without error */
+
+    if (device != 0x31 || unit != 1) {
+        status = 0x8A;                     /* device timeout */
+    } else if (command == 0x52) {          /* 'R' - read sector */
+        size_t len = aux <= 3 ? 128u : s->disk_sector_size;
+        size_t off = aux <= 3 ? (size_t)(aux - 1u) * 128u :
+                     3u * 128u + (size_t)(aux - 4u) * s->disk_sector_size;
+        if (aux == 0 || aux > s->disk_sectors || count < len ||
+            off + len > s->disk_size || (uint32_t)buffer + len > s->ram_size) {
+            status = 0x90;                 /* invalid sector / buffer */
+        } else {
+            memcpy(s->ram + buffer, s->disk_data + off, len);
+        }
+    } else if (command == 0x53) {          /* 'S' - drive status */
+        if (count < 4 || (uint32_t)buffer + 4u > s->ram_size) {
+            status = 0x90;
+        } else {
+            s->ram[buffer + 0] = 0x10;     /* motor/drive ready */
+            s->ram[buffer + 1] = 0xFF;
+            s->ram[buffer + 2] = s->disk_sector_size == 128 ? 0xE0 : 0xA0;
+            s->ram[buffer + 3] = 0x00;
+        }
+    } else {
+        status = 0x8B;                     /* command not implemented */
+    }
+    a400_sio_return(s, status);
+    return true;
+}
+
 /* ── Create / destroy ───────────────────────────────────────────────────── */
 
 Atari400State *atari400_create(const MosConfig *cfg) {
@@ -396,6 +503,10 @@ Atari400State *atari400_create(const MosConfig *cfg) {
         free(s);
         return NULL;
     }
+    if (cfg->fda_path && !a400_load_atr(s, cfg->fda_path)) {
+        free(s);
+        return NULL;
+    }
 
     antic_init(&s->antic, a400_read, s, cfg->is_pal);
     pokey_init(&s->pokey);
@@ -407,7 +518,7 @@ Atari400State *atari400_create(const MosConfig *cfg) {
     s->cpu.mem_ud    = s;
 
     s->monitor = gemu_monitor_create();
-    if (!s->monitor) { free(s); return NULL; }
+    if (!s->monitor) { free(s->disk_data); free(s); return NULL; }
     gemu_monitor_set_cpu_state_cb(s->monitor, a400_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, a400_screendump, s);
 
@@ -443,6 +554,7 @@ void atari400_destroy(Atari400State *s) {
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
+    free(s->disk_data);
     free(s);
 }
 
@@ -512,6 +624,7 @@ void atari400_run(Atari400State *s, const MosConfig *cfg) {
                     (uint64_t)(line + 1) * ANTIC_CYCLES_PER_LINE;
                 while (s->cpu.cycle_count < target) {
                     if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) { stop = true; break; }
+                    if (a400_sio_trap(s)) continue;
                     s->cpu.irq = pokey_irq_asserted(&s->pokey);
                     mos6502_step(&s->cpu);
                     if (s->wsync) {

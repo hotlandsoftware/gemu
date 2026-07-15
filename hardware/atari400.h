@@ -16,7 +16,7 @@
  * Atari 400/800 OS listings (rev A/B), De Re Atari.
  *
  * Memory map ($0000-$FFFF, CPU-visible):
- *   $0000-ram_top  RAM (8-48 KB, -m; default 16 KB)
+ *   $0000-ram_top  RAM (8-48 KB, -m; default 48 KB compatibility profile)
  *   $8000-$BFFF    cartridge ROM when inserted (-cartridge, 8 or 16 KB;
  *                  8 KB carts sit at $A000)
  *   $D000-$D0FF    GTIA registers
@@ -71,6 +71,11 @@ typedef struct Atari400State {
     uint8_t  cart[ATARI400_CART_MAX];
     uint32_t cart_size;
     uint16_t cart_base;     /* $A000 (8K) or $8000 (16K); 0 = no cart */
+
+    uint8_t  *disk_data;    /* ATR payload (the 16-byte header is stripped) */
+    size_t    disk_size;
+    uint16_t  disk_sector_size;
+    uint32_t  disk_sectors;
 
     bool     wsync;         /* WSYNC written; stall to end of scanline */
 

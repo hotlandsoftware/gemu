@@ -79,7 +79,7 @@ static void print_usage(const char *prog) {
     OPT("-rom [ADDR:]FILE",   "Load ROM image at ADDR (auto-detected if omitted)");
     OPT("-rom DIR",           "Scan directory and load known ROMs by SHA-256");
     OPT("-cartridge FILE",    "Insert cartridge (NES .nes, Studio II)");
-    OPT("-fda FILE",          "Insert floppy/disk image (Famicom Disk System)");
+    OPT("-floppy FILE",       "Insert floppy/disk image");
     OPT("-tape [ADDR:]FILE",  "Insert cassette tape (KIM-1, COSMAC VIP)");
     OPT("-start ADDR",        "Override reset vector / force start address");
     fprintf(f, "\n");
