@@ -124,15 +124,39 @@ static uint8_t a400_consol(const Atari400State *s) {
 
 /* ── Memory map ─────────────────────────────────────────────────────────── */
 
+static bool a400_maxflash_control(Atari400State *s, uint16_t addr) {
+    if (addr < 0xD500u || addr > 0xD5FFu) return false;
+    if (s->cart_type == 41u) {
+        /* The 1Mbit cartridge decodes only D500-D51F.  The rest of CCTL
+         * must not alias it: SDX probes other cartridge implementations. */
+        if (addr > 0xD51Fu) return false;
+        s->cart_bank = (uint8_t)(addr & 0x0Fu);
+        s->cart_enabled = (addr & 0x10u) == 0;
+        return true;
+    }
+    if (s->cart_type == 42u) {
+        s->cart_bank = (uint8_t)(addr & 0x7Fu);
+        s->cart_enabled = (addr & 0x80u) == 0;
+        return true;
+    }
+    return false;
+}
+
 static uint8_t a400_read(uint16_t addr, void *ud) {
     Atari400State *s = ud;
+    if (a400_maxflash_control(s, addr)) return 0xFF;
+    if (s->cart_enabled && s->cart_base && addr >= s->cart_base &&
+        addr < (s->cart_type ? 0xC000u : s->cart_base + s->cart_size)) {
+        if (s->cart_type == 41u || s->cart_type == 42u)
+            return s->cart[(size_t)s->cart_bank * 0x2000u +
+                           (addr - 0xA000u)];
+        if (addr < s->cart_base + s->cart_size)
+            return s->cart[addr - s->cart_base];
+    }
     if (s->axlon_ram && s->axlon_bank && addr >= 0x4000u && addr < 0x8000u)
         return s->axlon_ram[(size_t)(s->axlon_bank - 1u) * A400_AXLON_BANK_SIZE +
                             (addr - 0x4000u)];
     if (addr < s->ram_size) return s->ram[addr];
-    if (s->cart_base && addr >= s->cart_base &&
-        addr < s->cart_base + s->cart_size)
-        return s->cart[addr - s->cart_base];
     if (addr >= 0xD800u) return s->os_rom[addr - 0xD800u];
     switch (addr & 0xFF00u) {
     case 0xD000u: {
@@ -149,6 +173,10 @@ static uint8_t a400_read(uint16_t addr, void *ud) {
 
 static void a400_write(uint16_t addr, uint8_t val, void *ud) {
     Atari400State *s = ud;
+    if (a400_maxflash_control(s, addr)) return;
+    if (s->cart_enabled && s->cart_base && addr >= s->cart_base &&
+        addr < (s->cart_type ? 0xC000u : s->cart_base + s->cart_size))
+        return;                            /* cartridge ROM overlays RAM */
     bool axlon_select = s->axlon_ram &&
         ((addr >= 0x0FC0u && addr <= 0x0FFFu) ||
          (addr >= 0xCFC0u && addr <= 0xCFFFu));
@@ -187,6 +215,8 @@ static void a400_reset(Atari400State *s) {
     s->pia.ud      = s;
     s->wsync = false;
     s->axlon_bank = 0;
+    s->cart_bank = 0;
+    s->cart_enabled = s->cart != NULL;
     s->keyq_head = s->keyq_tail = 0;
     s->key_hold_frames = s->key_gap_frames = 0;
     mos6502_reset(&s->cpu);
@@ -371,27 +401,50 @@ static bool a400_load_cart(Atari400State *s, const char *path) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     rewind(f);
-    if (sz != 0x1000 && sz != 0x2000 && sz != 0x4000) {
-        fprintf(stderr, "atari400: unsupported cartridge size %ld "
-                        "(need 4, 8 or 16 KB raw image)\n", sz);
+    uint8_t header[16];
+    uint32_t type = 0;
+    long payload_size = sz;
+    if (sz >= 16 && fread(header, 1, sizeof(header), f) == sizeof(header) &&
+        memcmp(header, "CART", 4) == 0) {
+        type = ((uint32_t)header[4] << 24) | ((uint32_t)header[5] << 16) |
+               ((uint32_t)header[6] << 8) | header[7];
+        payload_size -= 16;
+    } else {
+        rewind(f);
+    }
+    bool raw = type == 0 &&
+               (payload_size == 0x1000 || payload_size == 0x2000 ||
+                payload_size == 0x4000);
+    bool maxflash = (type == 41u && payload_size == 0x20000) ||
+                    (type == 42u && payload_size == 0x100000);
+    if (!raw && !maxflash) {
+        fprintf(stderr, "atari400: unsupported cartridge format/type %u "
+                        "(%ld-byte payload; supported: raw 4/8/16K, "
+                        "CAR type 41/42)\n", type, payload_size);
         fclose(f);
         return false;
     }
-    uint8_t image[ATARI400_CART_MAX];
-    if (fread(image, 1, (size_t)sz, f) != (size_t)sz) {
+    uint8_t *image = malloc((size_t)payload_size);
+    if (!image || fread(image, 1, (size_t)payload_size, f) !=
+                  (size_t)payload_size) {
         fprintf(stderr, "atari400: read error on '%s'\n", path);
+        free(image);
         fclose(f);
         return false;
     }
     fclose(f);
-    memcpy(s->cart, image, (size_t)sz);
-    s->cart_size = (uint32_t)sz;
-    s->cart_base = (uint16_t)(0xC000u - sz);   /* 4K→$B000, 8K→$A000, 16K→$8000 */
-    /* Cartridge shadows RAM: cap RAM below the cart window. */
+    free(s->cart);
+    s->cart = image;
+    s->cart_size = (uint32_t)payload_size;
+    s->cart_type = type;
+    s->cart_bank = 0;
+    s->cart_enabled = true;
+    s->cart_base = maxflash ? 0xA000u :
+                   (uint16_t)(0xC000u - payload_size);
+    /* Cartridge overlays RAM; disabling a bank-switched cart reveals it. */
     s->ram_size = a400_installed_ram_size(s);
-    if (s->ram_size > s->cart_base) s->ram_size = s->cart_base;
-    printf("atari400: cartridge '%s' (%ldK at $%04X)\n",
-           path, sz / 1024, s->cart_base);
+    printf("atari400: cartridge '%s' (%ldK%s at $%04X)\n", path,
+           payload_size / 1024, maxflash ? " Maxflash" : "", s->cart_base);
     return true;
 }
 
@@ -499,8 +552,12 @@ static GemuMediaResult a400_cart_change(void *ud, const char *arg,
 static GemuMediaResult a400_cart_eject(void *ud, char *err, size_t err_len) {
     (void)err; (void)err_len;
     Atari400State *s = ud;
+    free(s->cart);
+    s->cart = NULL;
     s->cart_base = 0;
     s->cart_size = 0;
+    s->cart_type = 0;
+    s->cart_enabled = false;
     s->ram_size = a400_installed_ram_size(s);
     return GEMU_MEDIA_OK_RESET;
 }
@@ -510,8 +567,10 @@ static void a400_cart_status(void *ud, char *buf, size_t buf_len) {
     if (!s->cart_base)
         snprintf(buf, buf_len, "no cartridge");
     else
-        snprintf(buf, buf_len, "%uK cartridge at $%04X",
-                 (unsigned)(s->cart_size / 1024u), s->cart_base);
+        snprintf(buf, buf_len, "%uK%s cartridge at $%04X%s",
+                 (unsigned)(s->cart_size / 1024u),
+                 s->cart_type == 41u || s->cart_type == 42u ? " Maxflash" : "",
+                 s->cart_base, s->cart_enabled ? "" : " (disabled)");
 }
 
 static void a400_sio_return(Atari400State *s, uint8_t status) {
@@ -591,22 +650,22 @@ Atari400State *atari400_create(const MosConfig *cfg) {
     for (int i = 0; i < cfg->n_roms; i++) {
         uint32_t addr = cfg->roms[i].addr;
         if (!a400_load_file_at(s, cfg->roms[i].path, addr)) {
-            free(s->axlon_ram); free(s);
+            free(s->cart); free(s->axlon_ram); free(s);
             return NULL;
         }
         if (addr >= 0xD800u) have_os = true;
     }
     if (!have_os) {
         fprintf(stderr, "atari400: missing OS ROMs - use -rom roms/a400.zip\n");
-        free(s->axlon_ram); free(s);
+        free(s->cart); free(s->axlon_ram); free(s);
         return NULL;
     }
     if (cfg->cart_path && !a400_load_cart(s, cfg->cart_path)) {
-        free(s->axlon_ram); free(s);
+        free(s->cart); free(s->axlon_ram); free(s);
         return NULL;
     }
     if (cfg->fda_path && !a400_load_atr(s, cfg->fda_path)) {
-        free(s->disk_data); free(s->axlon_ram); free(s);
+        free(s->disk_data); free(s->cart); free(s->axlon_ram); free(s);
         return NULL;
     }
 
@@ -621,7 +680,7 @@ Atari400State *atari400_create(const MosConfig *cfg) {
 
     s->monitor = gemu_monitor_create();
     if (!s->monitor) {
-        free(s->disk_data); free(s->axlon_ram); free(s); return NULL;
+        free(s->disk_data); free(s->cart); free(s->axlon_ram); free(s); return NULL;
     }
     gemu_monitor_set_cpu_state_cb(s->monitor, a400_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, a400_screendump, s);
@@ -679,6 +738,7 @@ void atari400_destroy(Atari400State *s) {
     gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
     free(s->disk_data);
+    free(s->cart);
     free(s->axlon_ram);
     free(s);
 }

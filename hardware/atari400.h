@@ -17,8 +17,8 @@
  *
  * Memory map ($0000-$FFFF, CPU-visible):
  *   $0000-ram_top  RAM (8-48 KB, -m; default 48 KB compatibility profile)
- *   $8000-$BFFF    cartridge ROM when inserted (-cartridge, 8 or 16 KB;
- *                  8 KB carts sit at $A000)
+ *   $8000-$BFFF    cartridge ROM when inserted (-cartridge); raw 4/8/16 KB
+ *                  images and CAR type 41/42 Maxflash images are supported
  *   $D000-$D0FF    GTIA registers
  *   $D200-$D2FF    POKEY registers
  *   $D300-$D3FF    PIA (joystick ports, active-low directions)
@@ -45,7 +45,6 @@
 #define ATARI400_CPU_HZ_PAL  1773447.0
 
 #define ATARI400_OS_SIZE   0x2800u   /* $D800-$FFFF */
-#define ATARI400_CART_MAX  0x4000u   /* 16 KB at $8000 */
 #define ATARI400_RAM_MAX   0xC000u   /* 48 KB */
 #define A400_AXLON_BANK_SIZE 0x4000u /* bank window at $4000-$7FFF */
 #define A400_AXLON_EXT_BANKS 63u     /* 63 extra banks = 1008 KB */
@@ -75,9 +74,12 @@ typedef struct Atari400State {
     uint8_t  ram[ATARI400_RAM_MAX];
     uint32_t ram_size;
     uint8_t  os_rom[ATARI400_OS_SIZE];
-    uint8_t  cart[ATARI400_CART_MAX];
+    uint8_t *cart;
     uint32_t cart_size;
     uint16_t cart_base;     /* $A000 (8K) or $8000 (16K); 0 = no cart */
+    uint32_t cart_type;     /* CAR header type; 0 for a raw image */
+    uint8_t  cart_bank;     /* active 8K bank for bank-switched carts */
+    bool     cart_enabled;
 
     uint8_t *axlon_ram;     /* banks 1-63; bank 0 is ram[$4000-$7FFF] */
     uint8_t  axlon_bank;
