@@ -110,7 +110,9 @@ static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
     if (r < 16) { m->gr_static[r] = v; m->nat_static[r] = nat; return; }
     if (r < 32) {
         if (m->psr & PSR_BN) { m->gr_static[r] = v; m->nat_static[r] = nat; }
-        else { m->gr_bank0[r - 16] = v; m->nat_bank0[r - 16] = nat; }
+        else {
+            m->gr_bank0[r - 16] = v; m->nat_bank0[r - 16] = nat;
+        }
         return;
     }
     unsigned p = stacked_phys(m, r);
@@ -199,17 +201,48 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     m->nfaults++;
+    if ((vec == VEC_ITLB || vec == VEC_DTLB ||
+         vec == VEC_ALT_ITLB || vec == VEC_ALT_DTLB) && m->nfaults <= 16) {
+        fprintf(stderr, "merced: TLB fault #%-2" PRIu64
+                " vec=%04X ip=%016" PRIX64 " ifa=%016" PRIX64
+                " ic=%u it=%u dt=%u pta=%016" PRIX64 "\n",
+                m->nfaults, vec, m->ip, ifa,
+                !!(m->psr & PSR_IC), !!(m->psr & PSR_IT),
+                !!(m->psr & PSR_DT), m->cr[CR_PTA]);
+        fprintf(stderr, "  iva=%016" PRIX64 "\n", m->cr[CR_IVA]);
+        fprintf(stderr, "  rr:");
+        for (unsigned i = 0; i < MERCED_N_RR; i++)
+            fprintf(stderr, " %u=%016" PRIX64, i, m->rr[i]);
+        fprintf(stderr, "\n  bank0:");
+        for (unsigned i = 0; i < 16; i++)
+            fprintf(stderr, " r%u=%016" PRIX64, i + 16, m->gr_bank0[i]);
+        fprintf(stderr, "\n");
+        for (unsigned i = 0; i < MERCED_N_TR; i++)
+            if (m->dtr[i].valid)
+                fprintf(stderr, "  dtr[%u] rid=%06X va=%016" PRIX64
+                        "-%016" PRIX64 " pa=%016" PRIX64 " ps=%u\n",
+                        i, m->dtr[i].rid, m->dtr[i].va_start,
+                        m->dtr[i].va_end, m->dtr[i].pfn_base, m->dtr[i].ps);
+        for (unsigned i = 0; i < MERCED_N_TC; i++)
+            if (m->dtc[i].valid)
+                fprintf(stderr, "  dtc[%u] rid=%06X va=%016" PRIX64
+                        "-%016" PRIX64 " pa=%016" PRIX64 " ps=%u\n",
+                        i, m->dtc[i].rid, m->dtc[i].va_start,
+                        m->dtc[i].va_end, m->dtc[i].pfn_base, m->dtc[i].ps);
+    }
     if (!(m->psr & PSR_IC)) {
         /* Translation faults encountered while interruption collection is
          * disabled have dedicated vectors and must not overwrite the saved
          * interruption state.  The handlers use these paths to establish a
          * mapping needed by the original miss handler. */
-        if (vec == VEC_ITLB || vec == VEC_DTLB) {
+        if (vec == VEC_ITLB || vec == VEC_ALT_ITLB ||
+            vec == VEC_DTLB || vec == VEC_ALT_DTLB) {
+            bool instr = (vec == VEC_ITLB || vec == VEC_ALT_ITLB);
             m->cr[CR_ISR] = isr | (1ull << 39); /* ni: nested interruption */
             if (set_ifa)
                 m->cr[CR_IFA] = ifa;
             m->ip = (m->cr[CR_IVA] & ~0x7FFFull) +
-                    (vec == VEC_ITLB ? VEC_ALT_ITLB : VEC_NESTED_DTLB);
+                    (instr ? VEC_ALT_ITLB : VEC_NESTED_DTLB);
             m->taken = 1;
             return MERCED_OK;
         }
@@ -263,9 +296,31 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
         tlb_search(ifetch ? m->itr : m->dtr, MERCED_N_TR, rid, lookup_va);
     if (!e)
         e = tlb_search(ifetch ? m->itc : m->dtc, MERCED_N_TC, rid, lookup_va);
+    if (!e && !ifetch) {
+        /* Merced-style unified behavior: the i2000 firmware maps its 4 MiB
+         * shadow with itr.i only, yet reads/writes data in that region with
+         * translation on (e.g. the alt-DTLB handler's own descriptor at
+         * [r12+112]). Data lookups therefore fall back to the I-side
+         * entries; a strictly split model dead-ends in the nested-miss
+         * reporter. */
+        e = tlb_search(m->itr, MERCED_N_TR, rid, lookup_va);
+        if (!e)
+            e = tlb_search(m->itc, MERCED_N_TC, rid, lookup_va);
+    }
     if (!e) {
         if (spec) return false;   /* ld.s: caller sets NaT, no fault */
-        *st = deliver_fault(m, ifetch ? VEC_ITLB : VEC_DTLB, 0, va, true);
+        /* Vector choice depends on whether the VHPT walker would have run
+         * for this reference: pta.ve=0 or rr.ve=0 disables it, and misses
+         * then raise the Alternate ITLB/DTLB vectors. (We model no walker,
+         * so with it enabled we deliver the plain ITLB/DTLB miss vectors -
+         * the handlers there do the VHPT search in software anyway.) */
+        bool walker = (m->cr[CR_PTA] & 1) && (m->rr[vrn] & 1);
+        uint32_t fvec;
+        if (ifetch)
+            fvec = walker ? VEC_ITLB : VEC_ALT_ITLB;
+        else
+            fvec = walker ? VEC_DTLB : VEC_ALT_DTLB;
+        *st = deliver_fault(m, fvec, 0, va, true);
         return false;
     }
     *pa = (e->pfn_base + (lookup_va - e->va_start)) & MERCED_PHYS_MASK;
@@ -816,6 +871,24 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
 
 /* ── M-unit system ops ───────────────────────────────────────────────────── */
 
+static unsigned tlb_debug_events;
+#define TLB_DEBUG_MAX 48
+
+/* debug: log transitions of PSR.it / PSR.dt with their source */
+static void psr_trans_log(Merced *m, uint64_t newpsr, const char *src) {
+    static unsigned n;
+    uint64_t chg = (m->psr ^ newpsr) & (PSR_IT | PSR_DT | PSR_RT);
+    if (chg && n < 32) {
+        n++;
+        fprintf(stderr, "merced: PSR it=%u->%u dt=%u->%u rt=%u->%u via %s"
+                " at ip=%016" PRIX64 "\n",
+                !!(m->psr & PSR_IT), !!(newpsr & PSR_IT),
+                !!(m->psr & PSR_DT), !!(newpsr & PSR_DT),
+                !!(m->psr & PSR_RT), !!(newpsr & PSR_RT),
+                src, m->ip);
+    }
+}
+
 static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
                        bool instruction) {
     uint64_t ifa = m->cr[CR_IFA];
@@ -826,20 +899,35 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
     e->valid = (uint8_t)(pte & 1);
     e->rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
     e->va_start = ifa & page;
-    (void)instruction;
     e->va_end = e->va_start + (ps >= 64 ? ~0ull : (1ull << ps) - 1);
     e->pfn_base = (pte & 0x0003FFFFFFFFF000ull) & page;
     e->ps = (uint8_t)ps;
     e->itir = itir;
     e->pte = pte;
+    if (tlb_debug_events < TLB_DEBUG_MAX) {
+        tlb_debug_events++;
+        fprintf(stderr, "merced: insert %c ip=%016" PRIX64
+                " va=%016" PRIX64 " pa=%016" PRIX64 " ps=%u rid=%06X"
+                " pte=%016" PRIX64 " valid=%u\n",
+                instruction ? 'I' : 'D', m->ip, e->va_start, e->pfn_base,
+                ps, e->rid, pte, e->valid);
+    }
 }
 
 static void tlb_purge(MercedTlbEntry *t, int n, uint32_t rid,
                       uint64_t va, uint64_t len) {
     for (int i = 0; i < n; i++) {
         if (t[i].valid && t[i].rid == rid &&
-            t[i].va_start < va + len && va <= t[i].va_end)
+            t[i].va_start < va + len && va <= t[i].va_end) {
             t[i].valid = 0;
+            if (tlb_debug_events < TLB_DEBUG_MAX) {
+                tlb_debug_events++;
+                fprintf(stderr, "merced: purge va=%016" PRIX64
+                        " len=%016" PRIX64 " rid=%06X hit va=%016" PRIX64
+                        "-%016" PRIX64 "\n",
+                        va, len, rid, t[i].va_start, t[i].va_end);
+            }
+        }
     }
 }
 
@@ -862,8 +950,10 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                 switch (x4) {
                 case 4: m->psr |= (imm & 0x3F); break;          /* sum */
                 case 5: m->psr &= ~(imm & 0x3F); break;         /* rum */
-                case 6: m->psr |= imm; break;                   /* ssm */
-                default: m->psr &= ~imm; break;                 /* rsm */
+                case 6: psr_trans_log(m, m->psr | imm, "ssm");
+                        m->psr |= imm; break;                   /* ssm */
+                default: psr_trans_log(m, m->psr & ~imm, "rsm");
+                         m->psr &= ~imm; break;                 /* rsm */
                 }
                 return MERCED_OK;
             }
@@ -1060,11 +1150,22 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x2C: case 0x3C: {                         /* mov cr3=r2 */
         unsigned cr3 = (unsigned)bits(raw, 20, 7);
         m->cr[cr3] = gr_read(m, r2, &n2);
+        if (cr3 == CR_IVA) {
+            static unsigned n;
+            if (n < 16) {
+                n++;
+                fprintf(stderr, "merced: cr.iva <- %016" PRIX64
+                        " at ip=%016" PRIX64 "\n", m->cr[cr3], m->ip);
+            }
+        }
         return MERCED_OK;
     }
-    case 0x2D:                                      /* mov psr.l=r2 */
-        m->psr = (m->psr & ~0xFFFFFFFFull) | (uint32_t)gr_read(m, r2, &n2);
+    case 0x2D: {                                    /* mov psr.l=r2 */
+        uint64_t np = (m->psr & ~0xFFFFFFFFull) | (uint32_t)gr_read(m, r2, &n2);
+        psr_trans_log(m, np, "mov psr.l");
+        m->psr = np;
         return MERCED_OK;
+    }
     case 0x2E:                                      /* itc.d */
         tlb_insert(m, &m->dtc[m->dtc_next++ % MERCED_N_TC],
                    gr_read(m, r2, &n2), false);
@@ -1380,6 +1481,7 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
         case 0x08: {                                /* rfi */
             uint64_t ipsr = m->cr[CR_IPSR];
             uint64_t iip = m->cr[CR_IIP];
+            psr_trans_log(m, ipsr, "rfi");
             m->psr = ipsr & ~(3ull << PSR_RI_SHIFT);
             m->ip = (iip & ~0xFull) | ((ipsr >> PSR_RI_SHIFT) & 3);
             if (m->cr[CR_IFS] >> 63) {

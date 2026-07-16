@@ -317,8 +317,15 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     }
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
         uint64_t v = 0, off = addr - I2000_FLASH_BASE;
-        if (off + size <= I2000_FLASH_SIZE)
-            memcpy(&v, s->flash + off, size);
+        if (off + size <= I2000_FLASH_SIZE) {
+            /* Once shadowed, the top-of-4GiB window is served from the RAM
+             * copy so the firmware's stores through this alias are seen. */
+            if (s->fw_shadow_enabled &&
+                I2000_FW_SHADOW_BASE + I2000_FLASH_SIZE <= s->ram_size)
+                memcpy(&v, s->ram + I2000_FW_SHADOW_BASE + off, size);
+            else
+                memcpy(&v, s->flash + off, size);
+        }
         return v;
     }
     if (addr - I2000_IO_BASE < I2000_IO_SIZE) {
@@ -335,14 +342,8 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
 }
 
 static uint64_t bus_fetch(void *ud, uint64_t addr, unsigned size) {
-    Ia64I2000State *s = ud;
-    if (s->fw_shadow_enabled &&
-        addr - I2000_FW_SHADOW_BASE < I2000_FLASH_SIZE) {
-        uint64_t v = 0, off = addr - I2000_FW_SHADOW_BASE;
-        if (off + size <= I2000_FLASH_SIZE)
-            memcpy(&v, s->flash + off, size);
-        return v;
-    }
+    /* With the shadow RAM-backed (copied on enable), fetches take the
+     * ordinary read path everywhere. */
     return bus_read(ud, addr, size);
 }
 
@@ -352,8 +353,15 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
         memcpy(s->ram + addr, &val, size);
         return;
     }
-    if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE)
-        return;                                     /* flash writes ignored */
+    if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
+        uint64_t off = addr - I2000_FLASH_BASE;
+        /* Shadowed: writes through the alias land in the RAM copy.
+         * Unshadowed: flash programming cycles are ignored for now. */
+        if (s->fw_shadow_enabled && off + size <= I2000_FLASH_SIZE &&
+            I2000_FW_SHADOW_BASE + I2000_FLASH_SIZE <= s->ram_size)
+            memcpy(s->ram + I2000_FW_SHADOW_BASE + off, &val, size);
+        return;
+    }
     if (addr - I2000_IO_BASE < I2000_IO_SIZE) {
         uint64_t port;
         if (sparse_io_port(addr - I2000_IO_BASE, &port)) {
@@ -656,8 +664,16 @@ static void i2000_run_slice(Ia64I2000State *s) {
             fprintf(stderr, "i2000: firmware requested a platform reset\n");
             /* CF9 resets the processor while the 460GX retains the sticky
              * configuration state SAL just programmed.  In particular,
-             * SAC CBNR bit 0 selects the second bootstrap phase. */
+             * SAC CBNR bit 0 selects the second bootstrap phase, with the
+             * firmware range shadowed in RAM: the flash image is copied to
+             * 0x03C00000 and the top-of-4GiB window becomes RAM-backed for
+             * reads AND writes (the firmware's data segment lives up there
+             * - its physical-mode stores via the 0xFFFDxxxx alias must
+             * stick, or the SAL descriptors stay empty). */
             s->fw_shadow_enabled = true;
+            if (I2000_FW_SHADOW_BASE + I2000_FLASH_SIZE <= s->ram_size)
+                memcpy(s->ram + I2000_FW_SHADOW_BASE, s->flash,
+                       I2000_FLASH_SIZE);
             merced_reset(s->cpu);
             s->halted = false;
             s->reset_requested = false;
