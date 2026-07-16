@@ -25,6 +25,8 @@
 #define POST_PORT       0x80
 #define PCI_CFG_ADDR     0xCF8
 #define PCI_CFG_DATA     0xCFC
+#define RESET_CTRL_PORT  0xCF9
+#define I2000_FW_SHADOW_BASE 0x03C00000ull
 
 /* Early 460GX SAC scratch/control registers used by the SAL bootstrap. */
 #define I2000_SAC_CBNR  0x0000FEB00CB0ull
@@ -41,6 +43,8 @@
 
 #define INSTR_PER_FRAME 500000
 #define MMIO_LOG_N 8
+#define HALT_TRACE_LINES 32
+#define HALT_CALL_LINES  32
 
 typedef struct {
     uint64_t addr;
@@ -63,6 +67,8 @@ struct Ia64I2000State {
     bool      flash_loaded;
 
     bool      halted;
+    bool      reset_requested;
+    bool      fw_shadow_enabled;
     MercedStatus halt_status;
 
     /* front panel */
@@ -88,6 +94,7 @@ struct Ia64I2000State {
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
                      unsigned size, bool is_write);
+static void i2000_reset(Ia64I2000State *s);
 
 static uint64_t size_mask(unsigned size) {
     return size >= 8 ? ~0ull : (1ull << (size * 8)) - 1;
@@ -239,6 +246,14 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
+    if (port == RESET_CTRL_PORT && size == 1) {
+        /* Intel reset-control convention: bit 1 selects a hard reset and
+         * bit 2 triggers it.  SAL writes 02h followed by 06h, then waits in
+         * a dead loop for the platform reset to arrive. */
+        if (val & 0x04)
+            s->reset_requested = true;
+        return;
+    }
     if (port == PCI_CFG_ADDR && size == 4) {
         s->pci_cfg_addr = (uint32_t)val;
         return;
@@ -317,6 +332,18 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         return s->sac_ccsr;
     mmio_log(s, addr, 0, size, false);
     return ~0ull;
+}
+
+static uint64_t bus_fetch(void *ud, uint64_t addr, unsigned size) {
+    Ia64I2000State *s = ud;
+    if (s->fw_shadow_enabled &&
+        addr - I2000_FW_SHADOW_BASE < I2000_FLASH_SIZE) {
+        uint64_t v = 0, off = addr - I2000_FW_SHADOW_BASE;
+        if (off + size <= I2000_FLASH_SIZE)
+            memcpy(&v, s->flash + off, size);
+        return v;
+    }
+    return bus_read(ud, addr, size);
 }
 
 static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
@@ -513,6 +540,19 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
         c[2] = (uint8_t)ids[i].did; c[3] = (uint8_t)(ids[i].did >> 8);
         c[0x0B] = 0x06;
     }
+
+    /* The SDV firmware enumerates processors through the 460GX system-bus
+     * configuration mechanism.  Its address format is PCI-like: processor
+     * zero is CBN:05.2, and byte 02h contains the presence/type code 4.
+     * Bytes 03h-05h form the family/model/revision signature used to group
+     * compatible processors.  Advertise the one Merced CPU implemented by
+     * this machine; leaving this function all zero makes SAL conclude that
+     * no processor exists and deliberately enter its timer-calibrated park
+     * loop at FFFE2020. */
+    s->memcard_cfg[0][2][0x02] = 4;  /* processor present */
+    s->memcard_cfg[0][2][0x03] = 7;  /* Itanium family */
+    s->memcard_cfg[0][2][0x04] = 0;  /* Merced model */
+    s->memcard_cfg[0][2][0x05] = 6;  /* C2 stepping */
 }
 
 Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
@@ -532,7 +572,9 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     memset(s->flash, 0xFF, I2000_FLASH_SIZE);
     chipset_cfg_reset(s);
 
-    MercedBus bus = { .ud = s, .read = bus_read, .write = bus_write };
+    MercedBus bus = {
+        .ud = s, .read = bus_read, .fetch = bus_fetch, .write = bus_write
+    };
     s->cpu = merced_create(&bus);
     if (!s->cpu) {
         ia64_i2000_destroy(s);
@@ -585,7 +627,22 @@ static void i2000_report_halt(Ia64I2000State *s) {
         fprintf(stderr, " %02X", (unsigned)bus_read(s, bpa + (uint64_t)i, 1));
     fprintf(stderr, "\n");
     fprintf(stderr, "i2000: recent instruction slots:\n");
-    merced_dump_trace(m, 32, stderr);
+    merced_dump_trace(m, HALT_TRACE_LINES, stderr);
+    fprintf(stderr, "i2000: recent calls/returns:\n");
+    merced_dump_calls(m, HALT_CALL_LINES, stderr);
+    fprintf(stderr, "i2000: translation registers:\n");
+    for (unsigned i = 0; i < MERCED_N_TR; i++) {
+        const MercedTlbEntry *it = &m->itr[i];
+        const MercedTlbEntry *dt = &m->dtr[i];
+        if (it->valid)
+            fprintf(stderr, "  itr[%u] rid=%06X va=%016" PRIX64
+                            "-%016" PRIX64 " pa=%016" PRIX64 " ps=%u\n",
+                    i, it->rid, it->va_start, it->va_end, it->pfn_base, it->ps);
+        if (dt->valid)
+            fprintf(stderr, "  dtr[%u] rid=%06X va=%016" PRIX64
+                            "-%016" PRIX64 " pa=%016" PRIX64 " ps=%u\n",
+                    i, dt->rid, dt->va_start, dt->va_end, dt->pfn_base, dt->ps);
+    }
     merced_dump_state(m, buf, sizeof(buf));
     fputs(buf, stderr);
 }
@@ -595,6 +652,21 @@ static void i2000_run_slice(Ia64I2000State *s) {
         return;
     for (int i = 0; i < INSTR_PER_FRAME; i++) {
         MercedStatus st = merced_step(s->cpu);
+        if (s->reset_requested) {
+            fprintf(stderr, "i2000: firmware requested a platform reset\n");
+            /* CF9 resets the processor while the 460GX retains the sticky
+             * configuration state SAL just programmed.  In particular,
+             * SAC CBNR bit 0 selects the second bootstrap phase. */
+            s->fw_shadow_enabled = true;
+            merced_reset(s->cpu);
+            s->halted = false;
+            s->reset_requested = false;
+            s->mmio_log_n = 0;
+            memset(s->mmio_log, 0, sizeof(s->mmio_log));
+            printf("i2000: processor reset, IP=0x%016" PRIX64 "\n",
+                   s->cpu->ip);
+            return;
+        }
         if (st != MERCED_OK) {
             s->halted = true;
             s->halt_status = st;
@@ -607,6 +679,8 @@ static void i2000_run_slice(Ia64I2000State *s) {
 static void i2000_reset(Ia64I2000State *s) {
     merced_reset(s->cpu);
     s->halted = false;
+    s->reset_requested = false;
+    s->fw_shadow_enabled = false;
     s->post_code = 0;
     s->sac_cbnr = s->sac_ccsr = 0;
     s->port61 = s->pit2_polls = 0;

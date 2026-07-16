@@ -33,7 +33,8 @@
 #define MERCED_N_RR       8
 #define MERCED_N_TR       16   /* per side (code/data) */
 #define MERCED_N_TC       64   /* per side, round-robin */
-#define MERCED_TRACE_HISTORY 128
+#define MERCED_TRACE_HISTORY 512
+#define MERCED_CALL_HISTORY 128
 
 #define MERCED_PHYS_MASK  0x000FFFFFFFFFFFFFull  /* strip UC bit + unimpl */
 
@@ -42,6 +43,9 @@ typedef struct {
     /* size in {1,2,4,8}; addr is a physical address (attribute bit already
      * stripped). Unmapped reads should return all-ones and log. */
     uint64_t (*read)(void *ud, uint64_t addr, unsigned size);
+    /* Optional instruction-fetch path for machines whose chipset gives code
+     * fetches a different physical decode from ordinary data accesses. */
+    uint64_t (*fetch)(void *ud, uint64_t addr, unsigned size);
     void     (*write)(void *ud, uint64_t addr, uint64_t val, unsigned size);
 } MercedBus;
 
@@ -51,6 +55,7 @@ typedef enum {
     MERCED_HALT_BREAK,    /* break instruction executed */
     MERCED_HALT_FAULT,    /* fault that could not be delivered */
     MERCED_HALT_BAD_IP,   /* branch to obviously bad address */
+    MERCED_HALT_DEADLOOP, /* firmware entered an empty unconditional loop */
 } MercedStatus;
 
 /* 82-bit FP register: significand, 17-bit exponent, sign. */
@@ -119,6 +124,11 @@ typedef struct Merced {
         uint8_t unit, qp;
     } trace_history[MERCED_TRACE_HISTORY];
     uint32_t trace_history_next;
+    struct {
+        uint64_t from, to;
+        uint8_t is_return;
+    } call_history[MERCED_CALL_HISTORY];
+    uint32_t call_history_next;
     uint64_t ninsts;
     uint64_t nfaults;
     char     halt_msg[256];
@@ -139,6 +149,7 @@ MercedStatus merced_step(Merced *m);
 /* Full register dump for the monitor. */
 void merced_dump_state(const Merced *m, char *buf, size_t len);
 void merced_dump_trace(const Merced *m, unsigned count, FILE *out);
+void merced_dump_calls(const Merced *m, unsigned count, FILE *out);
 
 /* Read a general register by architectural number (for debugging). */
 uint64_t merced_gr(const Merced *m, unsigned r);

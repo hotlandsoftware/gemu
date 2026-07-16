@@ -200,6 +200,19 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     m->nfaults++;
     if (!(m->psr & PSR_IC)) {
+        /* Translation faults encountered while interruption collection is
+         * disabled have dedicated vectors and must not overwrite the saved
+         * interruption state.  The handlers use these paths to establish a
+         * mapping needed by the original miss handler. */
+        if (vec == VEC_ITLB || vec == VEC_DTLB) {
+            m->cr[CR_ISR] = isr | (1ull << 39); /* ni: nested interruption */
+            if (set_ifa)
+                m->cr[CR_IFA] = ifa;
+            m->ip = (m->cr[CR_IVA] & ~0x7FFFull) +
+                    (vec == VEC_ITLB ? VEC_ALT_ITLB : VEC_NESTED_DTLB);
+            m->taken = 1;
+            return MERCED_OK;
+        }
         return mhalt(m, "fault vec=0x%X with PSR.ic=0 (ifa=0x%016" PRIX64 ")",
                      vec, ifa);
     }
@@ -239,21 +252,34 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
     }
     unsigned vrn = (unsigned)(va >> 61);
     uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
+    uint64_t lookup_va = va;
+    /* The SDV's 4 MiB bootstrap mapping is described by its low physical
+     * shadow address, while the reset code continues executing through the
+     * chipset's top-of-4-GiB alias.  Keep the TR itself intact so it also
+     * covers the low interruption vector table. */
+    if (ifetch && va >= 0xFFC00000ull && va <= 0xFFFFFFFFull)
+        lookup_va = va - 0xFC000000ull;
     const MercedTlbEntry *e =
-        tlb_search(ifetch ? m->itr : m->dtr, MERCED_N_TR, rid, va);
+        tlb_search(ifetch ? m->itr : m->dtr, MERCED_N_TR, rid, lookup_va);
     if (!e)
-        e = tlb_search(ifetch ? m->itc : m->dtc, MERCED_N_TC, rid, va);
+        e = tlb_search(ifetch ? m->itc : m->dtc, MERCED_N_TC, rid, lookup_va);
     if (!e) {
         if (spec) return false;   /* ld.s: caller sets NaT, no fault */
         *st = deliver_fault(m, ifetch ? VEC_ITLB : VEC_DTLB, 0, va, true);
         return false;
     }
-    *pa = (e->pfn_base + (va - e->va_start)) & MERCED_PHYS_MASK;
+    *pa = (e->pfn_base + (lookup_va - e->va_start)) & MERCED_PHYS_MASK;
     return true;
 }
 
 static uint64_t phys_read(Merced *m, uint64_t pa, unsigned size) {
     return m->bus.read(m->bus.ud, pa & MERCED_PHYS_MASK, size);
+}
+
+static uint64_t phys_fetch(Merced *m, uint64_t pa, unsigned size) {
+    pa &= MERCED_PHYS_MASK;
+    return m->bus.fetch ? m->bus.fetch(m->bus.ud, pa, size)
+                        : m->bus.read(m->bus.ud, pa, size);
 }
 static void phys_write(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
     m->bus.write(m->bus.ud, pa & MERCED_PHYS_MASK, v, size);
@@ -312,6 +338,10 @@ uint64_t merced_gr(const Merced *m, unsigned r) {
 /* ── Branch helpers ──────────────────────────────────────────────────────── */
 
 static void do_call(Merced *m, unsigned b1, uint64_t target) {
+    unsigned h = m->call_history_next++ % MERCED_CALL_HISTORY;
+    m->call_history[h].from = m->ip;
+    m->call_history[h].to = target;
+    m->call_history[h].is_return = 0;
     unsigned sol = CFM_SOL(m->cfm);
     m->ar[AR_PFS] = (m->cfm & CFM_MASK) |
                     ((m->ar[AR_EC] & 0x3F) << 52) |
@@ -325,6 +355,10 @@ static void do_call(Merced *m, unsigned b1, uint64_t target) {
 }
 
 static void do_ret(Merced *m, uint64_t target) {
+    unsigned h = m->call_history_next++ % MERCED_CALL_HISTORY;
+    m->call_history[h].from = m->ip;
+    m->call_history[h].to = target;
+    m->call_history[h].is_return = 1;
     uint64_t pfs = m->ar[AR_PFS];
     uint64_t new_cfm = pfs & CFM_MASK;
     unsigned sol = CFM_SOL(new_cfm);
@@ -782,7 +816,8 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
 
 /* ── M-unit system ops ───────────────────────────────────────────────────── */
 
-static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte) {
+static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
+                       bool instruction) {
     uint64_t ifa = m->cr[CR_IFA];
     uint64_t itir = m->cr[CR_ITIR];
     unsigned ps = (unsigned)((itir >> 2) & 0x3F);
@@ -791,6 +826,7 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte) {
     e->valid = (uint8_t)(pte & 1);
     e->rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
     e->va_start = ifa & page;
+    (void)instruction;
     e->va_end = e->va_start + (ps >= 64 ? ~0ull : (1ull << ps) - 1);
     e->pfn_base = (pte & 0x0003FFFFFFFFF000ull) & page;
     e->ps = (uint8_t)ps;
@@ -934,11 +970,11 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     }
     case 0x0E:                                      /* itr.d dtr[r3]=r2 */
         tlb_insert(m, &m->dtr[gr_read(m, r3, &n3) & (MERCED_N_TR - 1)],
-                   gr_read(m, r2, &n2));
+                   gr_read(m, r2, &n2), false);
         return MERCED_OK;
     case 0x0F:                                      /* itr.i itr[r3]=r2 */
         tlb_insert(m, &m->itr[gr_read(m, r3, &n3) & (MERCED_N_TR - 1)],
-                   gr_read(m, r2, &n2));
+                   gr_read(m, r2, &n2), true);
         return MERCED_OK;
     case 0x10: gr_write(m, r1, m->rr[gr_read(m, r3, &n3) >> 61 & 7], 0); return MERCED_OK;
     case 0x11: gr_write(m, r1, m->dbr[gr_read(m, r3, &n3) & 15], 0); return MERCED_OK;
@@ -1030,10 +1066,12 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         m->psr = (m->psr & ~0xFFFFFFFFull) | (uint32_t)gr_read(m, r2, &n2);
         return MERCED_OK;
     case 0x2E:                                      /* itc.d */
-        tlb_insert(m, &m->dtc[m->dtc_next++ % MERCED_N_TC], gr_read(m, r2, &n2));
+        tlb_insert(m, &m->dtc[m->dtc_next++ % MERCED_N_TC],
+                   gr_read(m, r2, &n2), false);
         return MERCED_OK;
     case 0x2F:                                      /* itc.i */
-        tlb_insert(m, &m->itc[m->itc_next++ % MERCED_N_TC], gr_read(m, r2, &n2));
+        tlb_insert(m, &m->itc[m->itc_next++ % MERCED_N_TC],
+                   gr_read(m, r2, &n2), true);
         return MERCED_OK;
     case 0x30: return MERCED_OK;                    /* fc / fc.i */
     case 0x31: case 0x32: case 0x33: return MERCED_OK;   /* probe.fault */
@@ -1644,8 +1682,8 @@ MercedStatus merced_step(Merced *m) {
     if (!va_translate(m, bundle_va, true, false, &pa, &st))
         return st;   /* ITLB miss delivered (or halt) */
 
-    uint64_t lo = phys_read(m, pa, 8);
-    uint64_t hi = phys_read(m, pa + 8, 8);
+    uint64_t lo = phys_fetch(m, pa, 8);
+    uint64_t hi = phys_fetch(m, pa + 8, 8);
     unsigned tmpl = (unsigned)(lo & 0x1F);
     const char *units = bundle_units[tmpl];
     if (units[0] == '?')
@@ -1655,6 +1693,47 @@ MercedStatus merced_step(Merced *m) {
     slots[0] = (lo >> 5) & 0x1FFFFFFFFFFull;
     slots[1] = ((lo >> 46) | (hi << 18)) & 0x1FFFFFFFFFFull;
     slots[2] = (hi >> 23) & 0x1FFFFFFFFFFull;
+
+    /* Firmware delay/calibration loops commonly consist solely of
+     *
+     *     nop.m; nop.i; br.cloop <same bundle>
+     *
+     * Executing hundreds of millions of architecturally empty iterations
+     * only burns host time.  Complete the loop in one step while advancing
+     * the architected instruction and interval-time counters by exactly the
+     * number of slots that sequential execution would have consumed. */
+    if (slot == 0 && units[0] == 'M' && units[1] == 'I' && units[2] == 'B' &&
+        slots[0] == 0x00008000000ull && slots[1] == 0x00008000000ull &&
+        bits(slots[2], 37, 4) == 4 && bits(slots[2], 6, 3) == 5 &&
+        bits(slots[2], 0, 6) == 0) {
+        int64_t disp = sext((bits(slots[2], 36, 1) << 20) |
+                            bits(slots[2], 13, 20), 21) << 4;
+        if (disp == 0) {
+            uint64_t iterations = m->ar[AR_LC] + 1;
+            uint64_t executed = iterations * 3;
+            m->ar[AR_LC] = 0;
+            m->ninsts += executed;
+            m->ar[AR_ITC] += executed;
+            m->ip = bundle_va + 16;
+            return MERCED_OK;
+        }
+    }
+
+    /* Preserve the path into the conventional firmware dead loop instead of
+     * executing it forever and overwriting the useful trace history. */
+    if (slot == 0 && units[0] == 'M' && units[1] == 'I' && units[2] == 'B' &&
+        slots[0] == 0x00008000000ull && slots[1] == 0x00008000000ull &&
+        bits(slots[2], 37, 4) == 4 && bits(slots[2], 6, 3) == 0 &&
+        bits(slots[2], 0, 6) == 0) {
+        int64_t disp = sext((bits(slots[2], 36, 1) << 20) |
+                            bits(slots[2], 13, 20), 21) << 4;
+        if (disp == 0) {
+            snprintf(m->halt_msg, sizeof(m->halt_msg),
+                     "firmware dead loop at 0x%016" PRIX64, bundle_va);
+            m->halt_ip = m->ip;
+            return MERCED_HALT_DEADLOOP;
+        }
+    }
 
     char unit = units[slot];
     if (unit == 'L') {
@@ -1748,6 +1827,21 @@ void merced_dump_trace(const Merced *m, unsigned count, FILE *out) {
                 m->trace_history[h].raw, m->trace_history[h].src2,
                 m->trace_history[h].src3, m->trace_history[h].r25,
                 m->trace_history[h].b0);
+    }
+}
+
+void merced_dump_calls(const Merced *m, unsigned count, FILE *out) {
+    unsigned available = m->call_history_next < MERCED_CALL_HISTORY
+                       ? m->call_history_next : MERCED_CALL_HISTORY;
+    if (count > available) count = available;
+    unsigned first = m->call_history_next - count;
+    for (unsigned i = first; i < m->call_history_next; i++) {
+        unsigned h = i % MERCED_CALL_HISTORY;
+        fprintf(out, "C %s %016" PRIX64 ".%u -> %016" PRIX64 "\n",
+                m->call_history[h].is_return ? "ret " : "call",
+                (uint64_t)(m->call_history[h].from & ~(uint64_t)0xF),
+                (unsigned)(m->call_history[h].from & 0xF),
+                m->call_history[h].to);
     }
 }
 
