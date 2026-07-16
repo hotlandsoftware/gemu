@@ -23,6 +23,8 @@
 #define I2000_IO_SIZE   0x0000000004000000ull   /* 64 MiB window */
 #define COM1_PORT       0x3F8
 #define POST_PORT       0x80
+#define PCI_CFG_ADDR     0xCF8
+#define PCI_CFG_DATA     0xCFC
 
 /* Early 460GX SAC scratch/control registers used by the SAL bootstrap. */
 #define I2000_SAC_CBNR  0x0000FEB00CB0ull
@@ -72,11 +74,98 @@ struct Ia64I2000State {
     /* devices */
     uint8_t   post_code;
     uint32_t  sac_cbnr, sac_ccsr;
+    uint8_t   port61;
+    uint8_t   pit2_polls;
+    uint32_t  pci_cfg_addr;
+    uint8_t   chipset_bus;
+    uint8_t   chipset_cfg[32][256];
+    uint8_t   memcard_cfg[2][8][256];
     uint8_t   uart_ier, uart_lcr, uart_mcr, uart_scr, uart_dll, uart_dlm;
 
     MmioLogEnt mmio_log[MMIO_LOG_N];
     int        mmio_log_n;
 };
+
+static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
+                     unsigned size, bool is_write);
+
+static uint64_t size_mask(unsigned size) {
+    return size >= 8 ? ~0ull : (1ull << (size * 8)) - 1;
+}
+
+static bool chipset_device_present(unsigned dev) {
+    return dev == 0 || dev == 1 || dev == 4 || dev == 5 || dev == 6;
+}
+
+static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
+    uint32_t a = s->pci_cfg_addr;
+    if (!(a & 0x80000000u) || lane + size > 4)
+        return size_mask(size);
+    unsigned bus = (a >> 16) & 0xFF;
+    unsigned dev = (a >> 11) & 0x1F;
+    unsigned fun = (a >> 8) & 7;
+    unsigned reg = (a & 0xFC) + lane;
+
+    /* On bus zero, device 10h is the SAC's special CBN programming
+     * endpoint.  Firmware uses byte register 40h to select the bus on
+     * which the rest of the 460GX components appear. */
+    if (bus == 0 && dev == 0x10 && fun == 0 && reg == 0x40 && size == 1)
+        return s->chipset_bus;
+    if (bus == s->chipset_bus && fun == 0 && chipset_device_present(dev) &&
+        reg + size <= 256) {
+        uint64_t v = 0;
+        memcpy(&v, &s->chipset_cfg[dev][reg], size);
+        return v;
+    }
+    if (bus == s->chipset_bus && (dev == 5 || dev == 6) &&
+        reg + size <= 256) {
+        uint64_t v = 0;
+        memcpy(&v, &s->memcard_cfg[dev - 5][fun][reg], size);
+        return v;
+    }
+
+    uint64_t key = 0xC000000000000000ull |
+                   ((uint64_t)bus << 24) | ((uint64_t)dev << 19) |
+                   ((uint64_t)fun << 16) | reg;
+    mmio_log(s, key, 0, size, false);
+    return size_mask(size);
+}
+
+static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
+                          uint64_t val, unsigned size) {
+    uint32_t a = s->pci_cfg_addr;
+    if (!(a & 0x80000000u) || lane + size > 4)
+        return;
+    unsigned bus = (a >> 16) & 0xFF;
+    unsigned dev = (a >> 11) & 0x1F;
+    unsigned fun = (a >> 8) & 7;
+    unsigned reg = (a & 0xFC) + lane;
+    if (bus == 0 && dev == 0x10 && fun == 0 && reg == 0x40 && size == 1) {
+        s->chipset_bus = (uint8_t)val;
+        return;
+    }
+    if (bus == s->chipset_bus && fun == 0 && chipset_device_present(dev) &&
+        reg + size <= 256) {
+        /* Device/vendor ID and class/revision are read-only.  The remaining
+         * chipset-specific registers are retained as ordinary latches until
+         * their individual side effects are needed. */
+        for (unsigned i = 0; i < size; i++) {
+            unsigned off = reg + i;
+            if (off >= 4 && !(off >= 8 && off < 12))
+                s->chipset_cfg[dev][off] = (uint8_t)(val >> (i * 8));
+        }
+        return;
+    }
+    if (bus == s->chipset_bus && (dev == 5 || dev == 6) &&
+        reg + size <= 256) {
+        memcpy(&s->memcard_cfg[dev - 5][fun][reg], &val, size);
+        return;
+    }
+    uint64_t key = 0xC000000000000000ull |
+                   ((uint64_t)bus << 24) | ((uint64_t)dev << 19) |
+                   ((uint64_t)fun << 16) | reg;
+    mmio_log(s, key, val & size_mask(size), size, true);
+}
 
 /* ── Serial console ──────────────────────────────────────────────────────── */
 
@@ -124,6 +213,9 @@ static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
 }
 
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
+    if (port == PCI_CFG_ADDR && size == 4) return s->pci_cfg_addr;
+    if (port >= PCI_CFG_DATA && port < PCI_CFG_DATA + 4)
+        return pci_cfg_read(s, (unsigned)(port - PCI_CFG_DATA), size);
     if (port >= COM1_PORT && port < COM1_PORT + 8) {
         switch (port - COM1_PORT) {
         case 0: return (s->uart_lcr & 0x80) ? s->uart_dll : 0x00;  /* RBR/DLL */
@@ -137,15 +229,35 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         }
     }
     if (port == 0x21 || port == 0xA1) return 0xFF;  /* PIC masks */
-    if (port == 0x61) return 0x00;                  /* port B */
+    if (port == 0x61) {                            /* PIT channel-2 gate/output */
+        if (s->pit2_polls < 2) s->pit2_polls++;
+        return s->port61 | (s->pit2_polls >= 2 ? 0x20 : 0);
+    }
     mmio_log(s, I2000_IO_BASE + port, 0, size, false);
     return ~0ull;
 }
 
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
+    if (port == PCI_CFG_ADDR && size == 4) {
+        s->pci_cfg_addr = (uint32_t)val;
+        return;
+    }
+    if (port >= PCI_CFG_DATA && port < PCI_CFG_DATA + 4) {
+        pci_cfg_write(s, (unsigned)(port - PCI_CFG_DATA), val, size);
+        return;
+    }
     if (port == POST_PORT) {
         s->post_code = (uint8_t)val;
+        return;
+    }
+    if (port == 0x42) {                            /* PIT channel-2 count */
+        s->pit2_polls = 0;
+        return;
+    }
+    if (port == 0x43) return;                       /* PIT mode control */
+    if (port == 0x61) {
+        s->port61 = (uint8_t)val & 0x0F;
         return;
     }
     if (port >= COM1_PORT && port < COM1_PORT + 8) {
@@ -169,6 +281,18 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
     mmio_log(s, I2000_IO_BASE + port, val, size, true);
 }
 
+/* Merced uses the architected sparse legacy-I/O encoding:
+ *   offset = port + ((port & ~3) << 10)
+ * The low two address bits select the byte lane. */
+static bool sparse_io_port(uint64_t offset, uint64_t *port) {
+    uint64_t lane = offset & 3;
+    uint64_t p = (offset + (lane << 10)) / 1025;
+    if (p > 0xFFFF || p + ((p & ~3ull) << 10) != offset)
+        return false;
+    *port = p;
+    return true;
+}
+
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64I2000State *s = ud;
     if (addr + size <= s->ram_size) {
@@ -182,8 +306,11 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
             memcpy(&v, s->flash + off, size);
         return v;
     }
-    if (addr - I2000_IO_BASE < I2000_IO_SIZE)
-        return io_port_read(s, addr - I2000_IO_BASE, size);
+    if (addr - I2000_IO_BASE < I2000_IO_SIZE) {
+        uint64_t port;
+        if (sparse_io_port(addr - I2000_IO_BASE, &port))
+            return io_port_read(s, port, size);
+    }
     if (addr == I2000_SAC_CBNR && size == 4)
         return s->sac_cbnr;
     if (addr == I2000_SAC_CCSR && size == 4)
@@ -201,8 +328,11 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE)
         return;                                     /* flash writes ignored */
     if (addr - I2000_IO_BASE < I2000_IO_SIZE) {
-        io_port_write(s, addr - I2000_IO_BASE, val, size);
-        return;
+        uint64_t port;
+        if (sparse_io_port(addr - I2000_IO_BASE, &port)) {
+            io_port_write(s, port, val, size);
+            return;
+        }
     }
     if (addr == I2000_SAC_CBNR && size == 4) {
         s->sac_cbnr = (uint32_t)val;
@@ -367,6 +497,24 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
 
+static void chipset_cfg_reset(Ia64I2000State *s) {
+    s->pci_cfg_addr = 0;
+    s->chipset_bus = 0;
+    memset(s->chipset_cfg, 0, sizeof(s->chipset_cfg));
+    memset(s->memcard_cfg, 0, sizeof(s->memcard_cfg));
+    static const struct { uint8_t dev; uint16_t did; } ids[] = {
+        { 0, 0x84E0 }, { 1, 0x84E0 },
+        { 4, 0x84E1 },
+        { 5, 0x84E3 }, { 6, 0x84E3 },
+    };
+    for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+        uint8_t *c = s->chipset_cfg[ids[i].dev];
+        c[0] = 0x86; c[1] = 0x80;
+        c[2] = (uint8_t)ids[i].did; c[3] = (uint8_t)(ids[i].did >> 8);
+        c[0x0B] = 0x06;
+    }
+}
+
 Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     Ia64I2000State *s = calloc(1, sizeof(*s));
     if (!s)
@@ -382,6 +530,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
         return NULL;
     }
     memset(s->flash, 0xFF, I2000_FLASH_SIZE);
+    chipset_cfg_reset(s);
 
     MercedBus bus = { .ud = s, .read = bus_read, .write = bus_write };
     s->cpu = merced_create(&bus);
@@ -460,6 +609,8 @@ static void i2000_reset(Ia64I2000State *s) {
     s->halted = false;
     s->post_code = 0;
     s->sac_cbnr = s->sac_ccsr = 0;
+    s->port61 = s->pit2_polls = 0;
+    chipset_cfg_reset(s);
     s->mmio_log_n = 0;
     memset(s->mmio_log, 0, sizeof(s->mmio_log));
     memset(s->console, 0, sizeof(s->console));
