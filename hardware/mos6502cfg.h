@@ -115,7 +115,8 @@ typedef struct MosConfig {
     uint16_t        start_addr;
     const char     *cart_path;   /* iNES .nes cartridge file (NES machine) */
     bool            fds_enabled; /* Famicom Disk System addon active        */
-    const char     *fda_path;    /* FDS disk image path (NULL = no disk)    */
+    bool            atari810;    /* Atari 810 SIO floppy drive attached      */
+    const char     *fda_path;    /* floppy image path (NULL = no disk)      */
     MosCrtType      crt_type;    /* -device crt / cheap-crt: see MosCrtType above */
     MosSoundType    sound;
     bool            sound_explicit; /* user passed -soundhw; skip auto-default */

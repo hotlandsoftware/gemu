@@ -29,6 +29,8 @@
  *
  * Timing: 262 scanlines x 114 CPU cycles (NTSC); VBI NMI at scanline 248;
  * WSYNC stalls the CPU to the end of the current scanline.
+ * An Atari 810 SIO floppy drive is attached by default and may be removed
+ * with `-device none` or explicitly attached with `-device atari810`.
  *
  * Keyboard: host characters (SDL raw-key queue / VNC keysyms / monitor
  * `sendkey`) are translated to POKEY scan codes and paced a few frames

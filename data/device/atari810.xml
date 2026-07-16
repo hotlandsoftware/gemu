@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<device name="atari810" description="Atari 810 floppy disk drive" status="working">
+    <machine name="atari400"/>
+    <machine name="atari400a"/>
+</device>

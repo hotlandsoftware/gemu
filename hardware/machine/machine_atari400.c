@@ -353,15 +353,19 @@ static bool a400_load_cart(Atari400State *s, const char *path) {
         fclose(f);
         return false;
     }
-    if (fread(s->cart, 1, (size_t)sz, f) != (size_t)sz) {
+    uint8_t image[ATARI400_CART_MAX];
+    if (fread(image, 1, (size_t)sz, f) != (size_t)sz) {
         fprintf(stderr, "atari400: read error on '%s'\n", path);
         fclose(f);
         return false;
     }
     fclose(f);
+    memcpy(s->cart, image, (size_t)sz);
     s->cart_size = (uint32_t)sz;
     s->cart_base = (uint16_t)(0xC000u - sz);   /* 4K→$B000, 8K→$A000, 16K→$8000 */
     /* Cartridge shadows RAM: cap RAM below the cart window. */
+    s->ram_size = s->cfg->mem_size ? s->cfg->mem_size : 0x4000u;
+    if (s->ram_size > ATARI400_RAM_MAX) s->ram_size = ATARI400_RAM_MAX;
     if (s->ram_size > s->cart_base) s->ram_size = s->cart_base;
     printf("atari400: cartridge '%s' (%ldK at $%04X)\n",
            path, sz / 1024, s->cart_base);
@@ -408,6 +412,7 @@ static bool a400_load_atr(Atari400State *s, const char *path) {
         return false;
     }
     fclose(f);
+    free(s->disk_data);
     s->disk_data = data;
     s->disk_size = bytes;
     s->disk_sector_size = sector_size;
@@ -416,6 +421,75 @@ static bool a400_load_atr(Atari400State *s, const char *path) {
     printf("atari400: floppy '%s' (%u sectors, %u-byte density)\n",
            path, s->disk_sectors, sector_size);
     return true;
+}
+
+/* ── Removable media slots ──────────────────────────────────────────────── */
+
+static GemuMediaResult a400_floppy_change(void *ud, const char *arg,
+                                          char *err, size_t err_len) {
+    Atari400State *s = ud;
+    if (!arg || !arg[0]) {
+        snprintf(err, err_len, "missing floppy path");
+        return GEMU_MEDIA_ERR;
+    }
+    if (!a400_load_atr(s, arg)) {
+        snprintf(err, err_len, "failed to load '%s'", arg);
+        return GEMU_MEDIA_ERR;
+    }
+    return GEMU_MEDIA_OK;
+}
+
+static GemuMediaResult a400_floppy_eject(void *ud, char *err, size_t err_len) {
+    (void)err; (void)err_len;
+    Atari400State *s = ud;
+    free(s->disk_data);
+    s->disk_data = NULL;
+    s->disk_size = 0;
+    s->disk_sector_size = 0;
+    s->disk_sectors = 0;
+    return GEMU_MEDIA_OK;
+}
+
+static void a400_floppy_status(void *ud, char *buf, size_t buf_len) {
+    const Atari400State *s = ud;
+    if (!s->disk_data)
+        snprintf(buf, buf_len, "no disk");
+    else
+        snprintf(buf, buf_len, "%u sectors, %u bytes/sector",
+                 s->disk_sectors, s->disk_sector_size);
+}
+
+static GemuMediaResult a400_cart_change(void *ud, const char *arg,
+                                        char *err, size_t err_len) {
+    Atari400State *s = ud;
+    if (!arg || !arg[0]) {
+        snprintf(err, err_len, "missing cartridge path");
+        return GEMU_MEDIA_ERR;
+    }
+    if (!a400_load_cart(s, arg)) {
+        snprintf(err, err_len, "failed to load '%s'", arg);
+        return GEMU_MEDIA_ERR;
+    }
+    return GEMU_MEDIA_OK_RESET;
+}
+
+static GemuMediaResult a400_cart_eject(void *ud, char *err, size_t err_len) {
+    (void)err; (void)err_len;
+    Atari400State *s = ud;
+    s->cart_base = 0;
+    s->cart_size = 0;
+    s->ram_size = s->cfg->mem_size ? s->cfg->mem_size : 0x4000u;
+    if (s->ram_size > ATARI400_RAM_MAX) s->ram_size = ATARI400_RAM_MAX;
+    return GEMU_MEDIA_OK_RESET;
+}
+
+static void a400_cart_status(void *ud, char *buf, size_t buf_len) {
+    const Atari400State *s = ud;
+    if (!s->cart_base)
+        snprintf(buf, buf_len, "no cartridge");
+    else
+        snprintf(buf, buf_len, "%uK cartridge at $%04X",
+                 (unsigned)(s->cart_size / 1024u), s->cart_base);
 }
 
 static void a400_sio_return(Atari400State *s, uint8_t status) {
@@ -521,6 +595,26 @@ Atari400State *atari400_create(const MosConfig *cfg) {
     if (!s->monitor) { free(s->disk_data); free(s); return NULL; }
     gemu_monitor_set_cpu_state_cb(s->monitor, a400_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, a400_screendump, s);
+
+    if (cfg->atari810) {
+        GemuMediaDevice floppy_dev = {
+            .name = "floppy", .kind = "atari810", .ud = s,
+            .change = a400_floppy_change, .eject = a400_floppy_eject,
+            .status = a400_floppy_status,
+        };
+        if (cfg->fda_path)
+            snprintf(floppy_dev.file, sizeof(floppy_dev.file), "%s", cfg->fda_path);
+        gemu_monitor_register_media(s->monitor, &floppy_dev);
+    }
+
+    GemuMediaDevice cart_dev = {
+        .name = "cartridge", .kind = "cartridge", .ud = s,
+        .change = a400_cart_change, .eject = a400_cart_eject,
+        .status = a400_cart_status,
+    };
+    if (cfg->cart_path)
+        snprintf(cart_dev.file, sizeof(cart_dev.file), "%s", cfg->cart_path);
+    gemu_monitor_register_media(s->monitor, &cart_dev);
 
     if (cfg->vnc_addr) {
         s->vnc = gemu_vnc_create(cfg->vnc_addr, ANTIC_FB_W, ANTIC_FB_H);

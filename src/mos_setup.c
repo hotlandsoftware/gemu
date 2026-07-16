@@ -258,6 +258,7 @@ static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
         cfg->generic_keyboard = false;
         cfg->kim_keyboard = false;
         cfg->fds_enabled = false;
+        cfg->atari810 = false;
         *want_vt100 = false;
         cfg->want_wozmon = false;
         cfg->a1ci = false;
@@ -267,6 +268,15 @@ static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
     if (strcmp(name, "fds") == 0) {
         cfg->devices_none = false;
         cfg->fds_enabled = true;
+        return true;
+    }
+    if (strcmp(name, "atari810") == 0) {
+        if (cfg->machine != MOS_MACHINE_ATARI400) {
+            if (!quiet) fprintf(stderr, "gemu: -device atari810 is supported by atari400 only\n");
+            return false;
+        }
+        cfg->devices_none = false;
+        cfg->atari810 = true;
         return true;
     }
     if (strcmp(name, "vt100") == 0) {
@@ -704,6 +714,10 @@ int mos_setup(int argc, char *argv[]) {
             fprintf(stderr, "gemu: -fda requires -device fds\n");
             return 1;
         }
+    } else if (cfg.machine == MOS_MACHINE_ATARI400 &&
+               cfg.fda_path && !cfg.atari810) {
+        fprintf(stderr, "gemu: -floppy requires -device atari810\n");
+        return 1;
     } else if (cfg.machine != MOS_MACHINE_APPLE1) {
         if (cfg.n_roms == 0) {
             fprintf(stderr, "gemu: no ROM specified\n"

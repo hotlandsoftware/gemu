@@ -3,7 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdint.h>
+#ifndef _WIN32
+#include <termios.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#endif
 
 /* ── Display backend table (fixed set, same for all binaries) ────────────── */
 
@@ -44,27 +50,191 @@ static void print_usage(const GemuArgsDef *def) {
         printf("%s", def->extra_help);
 }
 
+enum { TABLE_PAGER_MIN_ROWS = 15 };
+
+static bool text_contains_ci(const char *text, const char *needle) {
+    if (!needle[0]) return true;
+    for (; *text; text++) {
+        const char *a = text, *b = needle;
+        while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) {
+            a++; b++;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
+
+static void table_row(char *buf, size_t len, const GemuDevDesc *devs,
+                      const GemuDevDesc3 *devs3, int i, int maxw) {
+    if (devs3)
+        snprintf(buf, len, "  %-*s  %s [%s]", maxw, devs3[i].name,
+                 devs3[i].desc, devs3[i].machines);
+    else
+        snprintf(buf, len, "  %-*s  %s", maxw, devs[i].name, devs[i].desc);
+}
+
+#ifndef _WIN32
+static struct termios pager_saved_termios;
+static bool pager_termios_active;
+
+static void pager_restore_terminal(void) {
+    if (pager_termios_active) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &pager_saved_termios);
+        pager_termios_active = false;
+    }
+}
+
+static bool pager_begin(void) {
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return false;
+    if (tcgetattr(STDIN_FILENO, &pager_saved_termios) != 0) return false;
+    struct termios raw = pager_saved_termios;
+    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO | ISIG);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return false;
+    pager_termios_active = true;
+    static bool registered;
+    if (!registered) { atexit(pager_restore_terminal); registered = true; }
+    return true;
+}
+
+static void pager_size(int *columns, int *rows) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        *columns = ws.ws_col ? ws.ws_col : 80;
+        *rows = ws.ws_row ? ws.ws_row : 24;
+    } else {
+        *columns = 80;
+        *rows = 24;
+    }
+}
+
+static int pager_read_key(void) {
+    unsigned char c;
+    if (read(STDIN_FILENO, &c, 1) != 1) return 'q';
+    if (c != 0x1b) return c;
+    unsigned char seq[2];
+    if (read(STDIN_FILENO, &seq[0], 1) != 1 || seq[0] != '[') return 0x1b;
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) return 0x1b;
+    if (seq[1] == 'C' || seq[1] == 'B') return 'n';
+    if (seq[1] == 'D' || seq[1] == 'A') return 'p';
+    return 0x1b;
+}
+
+static void pager_search(char *query, size_t query_len) {
+    size_t used = 0;
+    query[0] = '\0';
+    printf("\033[2K\r/Search: ");
+    fflush(stdout);
+    for (;;) {
+        unsigned char c;
+        if (read(STDIN_FILENO, &c, 1) != 1) break;
+        if (c == '\r' || c == '\n') break;
+        if (c == 0x1b) { query[0] = '\0'; break; }
+        if (c == 0x7f || c == '\b') {
+            if (used) { used--; query[used] = '\0'; printf("\b \b"); fflush(stdout); }
+        } else if (c >= 0x20 && c < 0x7f && used + 1 < query_len) {
+            query[used++] = (char)c;
+            query[used] = '\0';
+            putchar(c);
+            fflush(stdout);
+        }
+    }
+}
+
+static bool table_pager(const char *heading, const GemuDevDesc *devs,
+                        const GemuDevDesc3 *devs3, int n, int maxw) {
+    if (n < TABLE_PAGER_MIN_ROWS || !pager_begin()) return false;
+
+    int *matches = malloc((size_t)n * sizeof(*matches));
+    if (!matches) { pager_restore_terminal(); return false; }
+    char query[128] = "";
+    int page = 0;
+
+    for (;;) {
+        int cols, terminal_rows;
+        pager_size(&cols, &terminal_rows);
+        /* One row for the heading and one for the status bar.  Rows are
+         * truncated to the terminal width below, so every item consumes
+         * exactly one terminal line. */
+        int page_rows = terminal_rows - 2;
+        if (page_rows < 1) page_rows = 1;
+
+        int count = 0;
+        for (int i = 0; i < n; i++) {
+            char row[1024];
+            table_row(row, sizeof(row), devs, devs3, i, maxw);
+            if (text_contains_ci(row, query)) matches[count++] = i;
+        }
+        int pages = count ? (count + page_rows - 1) / page_rows : 1;
+        if (page >= pages) page = pages - 1;
+
+        printf("\033[H\033[2J%s%s:\n", heading,
+               query[0] ? " (filtered)" : "");
+        int first = page * page_rows;
+        int last = first + page_rows;
+        if (last > count) last = count;
+        for (int i = first; i < last; i++) {
+            char row[1024];
+            table_row(row, sizeof(row), devs, devs3, matches[i], maxw);
+            printf("%.*s\n", cols, row);
+        }
+        if (!count) printf("  No matches for \"%s\".\n", query);
+
+        char status[256];
+        snprintf(status, sizeof(status), " Page %d / %d   <-/-> page   / search   q quit%s%s ",
+                 page + 1, pages, query[0] ? "   filter: " : "", query);
+        printf("\033[30;42m%-*.*s\033[0m", cols, cols, status);
+        fflush(stdout);
+
+        int key = pager_read_key();
+        if (key == 'q' || key == 'Q' || key == 0x1b || key == 0x03 || key == 0x04) break;
+        if (key == '/' ) { pager_search(query, sizeof(query)); page = 0; }
+        else if (key == 'n' || key == ' ' || key == '\r' || key == '\n') {
+            if (page + 1 < pages) page++;
+        } else if (key == 'p' || key == 'b') {
+            if (page > 0) page--;
+        }
+    }
+    putchar('\n');
+    free(matches);
+    pager_restore_terminal();
+    return true;
+}
+#endif
+
 void gemu_print_table(const char *heading, const GemuDevDesc *devs, int n) {
-    printf("%s:\n", heading);
     int maxw = 0;
     for (int i = 0; i < n; i++) {
         int w = (int)strlen(devs[i].name);
         if (w > maxw) maxw = w;
     }
-    for (int i = 0; i < n; i++)
-        printf("  %-*s  %s\n", maxw, devs[i].name, devs[i].desc);
+#ifndef _WIN32
+    if (table_pager(heading, devs, NULL, n, maxw)) return;
+#endif
+    printf("%s:\n", heading);
+    for (int i = 0; i < n; i++) {
+        char row[1024];
+        table_row(row, sizeof(row), devs, NULL, i, maxw);
+        printf("%s\n", row);
+    }
 }
 
 void gemu_print_table3(const char *heading, const GemuDevDesc3 *devs, int n) {
-    printf("%s:\n", heading);
     int maxw = 0;
     for (int i = 0; i < n; i++) {
         int w = (int)strlen(devs[i].name);
         if (w > maxw) maxw = w;
     }
-    for (int i = 0; i < n; i++)
-        printf("  %-*s  %s [%s]\n", maxw, devs[i].name, devs[i].desc,
-               devs[i].machines);
+#ifndef _WIN32
+    if (table_pager(heading, NULL, devs, n, maxw)) return;
+#endif
+    printf("%s:\n", heading);
+    for (int i = 0; i < n; i++) {
+        char row[1024];
+        table_row(row, sizeof(row), NULL, devs, i, maxw);
+        printf("%s\n", row);
+    }
 }
 
 static void list_devices(const char *kind, const GemuDevDesc *devs, int n) {
