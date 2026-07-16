@@ -342,8 +342,22 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
 }
 
 static uint64_t bus_fetch(void *ud, uint64_t addr, unsigned size) {
-    /* With the shadow RAM-backed (copied on enable), fetches take the
-     * ordinary read path everywhere. */
+    Ia64I2000State *s = ud;
+    /* Code fetches in the shadow window come from the flash ROM: on real
+     * hardware the firmware executes through the top-of-4GiB ROM alias
+     * while its data lives in the RAM shadow at the same offsets. Serving
+     * fetches from the (mutable) RAM copy lets the SAL data-area clear
+     * wipe the very code performing it. */
+    /* Top-of-4GiB fetches execute the ROM itself even once the window is
+     * RAM-shadowed for data; low shadow fetches read RAM (the firmware
+     * patches handler code there at runtime). */
+    uint64_t off = addr - I2000_FLASH_BASE;
+    if (off < I2000_FLASH_SIZE) {
+        uint64_t v = 0;
+        if (off + size <= I2000_FLASH_SIZE)
+            memcpy(&v, s->flash + off, size);
+        return v;
+    }
     return bus_read(ud, addr, size);
 }
 

@@ -286,12 +286,26 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
     unsigned vrn = (unsigned)(va >> 61);
     uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
     uint64_t lookup_va = va;
-    /* The SDV's 4 MiB bootstrap mapping is described by its low physical
-     * shadow address, while the reset code continues executing through the
-     * chipset's top-of-4-GiB alias.  Keep the TR itself intact so it also
-     * covers the low interruption vector table. */
-    if (ifetch && va >= 0xFFC00000ull && va <= 0xFFFFFFFFull)
-        lookup_va = va - 0xFC000000ull;
+    /* PAL leaves a bootstrap identity mapping over the firmware ROM: code
+     * keeps executing through the top-of-4-GiB alias after SAL enables
+     * translation, with only its RAM-shadow ranges in the visible TRs.
+     * Model that as a fixed ifetch window straight to the ROM PA. */
+    if (ifetch && va >= 0xFFC00000ull && va <= 0xFFFFFFFFull) {
+        *pa = va & MERCED_PHYS_MASK;
+        return true;
+    }
+    /* ... and matching pinned data translations for the firmware range and
+     * the I/O port block (SAL hand-off state: firmware code/data and I/O
+     * port space stay accessible in virtual mode). The I/O window also
+     * matches the region-4 alias the firmware uses for UC accesses. */
+    if (!ifetch) {
+        uint64_t v61 = va & 0x1FFFFFFFFFFFFFFFull;
+        if ((va >= 0xFFC00000ull && va <= 0xFFFFFFFFull) ||
+            v61 - 0xFFFFC000000ull < 0x4000000ull) {
+            *pa = v61 & MERCED_PHYS_MASK;
+            return true;
+        }
+    }
     const MercedTlbEntry *e =
         tlb_search(ifetch ? m->itr : m->dtr, MERCED_N_TR, rid, lookup_va);
     if (!e)
