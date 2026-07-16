@@ -1,7 +1,8 @@
 # GEMU - Generic EMUlator
 
-Single unified binary (`bin/gemu`) dispatching on `-M <machine>`. Three CPU
-families: CHIP-8, MOS 6502 (NES/KIM-1), RCA CDP1802 (COSMAC VIP / Studio II).
+Single unified binary (`bin/gemu`) dispatching on `-M <machine>`. CPU
+families: CHIP-8, MOS 6502 (NES/KIM-1/Atari 400), RCA CDP1802 (COSMAC VIP /
+Studio II), Mitsubishi M58815P (Color TV-Game 6), IA-64 (HP i2000, skeleton).
 Modeled after QEMU in CLI style.
 
 ---
@@ -25,6 +26,7 @@ Run `./bin/gemu -M ?` for the full sorted list. Key entries:
 | Machine    | Description                                  |
 |------------|----------------------------------------------|
 | `chip8`    | Generic CHIP-8 / SUPER-CHIP interpreter      |
+| `i2000`    | HP i2000 Itanium workstation (skeleton)      |
 | `nes`      | Nintendo Entertainment System (NTSC)         |
 | `nespal`   | Nintendo Entertainment System (PAL)          |
 | `famicom`  | Nintendo Family Computer (alias for nes)     |
@@ -71,6 +73,7 @@ hardware/   Machine glue, devices, ROM databases
 src/        Entry points
   main.c          - global -M dispatch, -device ?/-soundhw ? listing
   chip8_setup.c   - CHIP-8 family setup
+  ia64_setup.c    - IA-64 (HP i2000) family setup
   mos_setup.c     - MOS 6502 family setup
   rca_setup.c     - RCA CDP1802 family setup
 core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
@@ -80,7 +83,7 @@ core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
 
 ## Compile-time guards
 
-`HAVE_CHIP8`, `HAVE_MOS`, `HAVE_RCA` - set by configure based on
+`HAVE_CHIP8`, `HAVE_IA64`, `HAVE_MITSU`, `HAVE_MOS`, `HAVE_RCA` - set by configure based on
 `--target-list`. Used in `src/main.c` and anywhere code is family-specific.
 
 ---

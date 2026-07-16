@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gemu/display.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -32,8 +33,10 @@
 #define IA64_RESET_VECTOR  0xFFFFFFB0ull
 
 typedef struct {
-    uint64_t ram_size;
-    bool     no_shutdown;
+    uint64_t        ram_size;
+    GemuDisplayType display_type;
+    int             display_scale;
+    bool            no_shutdown;
 } Ia64Config;
 
 typedef struct Ia64I2000State Ia64I2000State;

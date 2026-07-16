@@ -391,7 +391,8 @@ static void info_cpu(const GemuMonitor *mon) {
         mon_printf(mon, "CPU state is not available for this machine.\n");
         return;
     }
-    char buf[512];
+    /* 4 KiB: enough for large register files (e.g. IA-64's 128 GRs) */
+    char buf[4096];
     mon->cpu_state_cb(mon->cpu_state_ud, buf, sizeof(buf));
     buf[sizeof(buf) - 1] = '\0';
     mon_printf(mon, "%s\n", buf);

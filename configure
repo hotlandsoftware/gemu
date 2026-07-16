@@ -50,8 +50,10 @@ FAMILY_SRC = {
         'src/chip8_setup.c',
     ],
     'ia64': [
+        'cpu/merced.c',
         'hardware/machine/machine_i2000.c',
         'hardware/romdb.c',
+        'vga/input_menu.c',
         'src/ia64_setup.c',
     ],
     'mitsu': [

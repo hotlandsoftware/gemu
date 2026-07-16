@@ -2,6 +2,7 @@
 #include "romdb.h"
 #include "gemu/args.h"
 #include "gemu/monitor.h"
+#include <SDL2/SDL.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,16 +40,23 @@ static const GemuArgsDef def = {
     .n_machines   = (int)(sizeof machines / sizeof *machines),
     .cpus         = cpus,
     .n_cpus       = (int)(sizeof cpus / sizeof *cpus),
-    .display_mask = GEMU_DISP_F(GEMU_DISPLAY_NONE),
+    .display_mask = GEMU_DISP_F(GEMU_DISPLAY_SDL) | GEMU_DISP_F(GEMU_DISPLAY_NONE)
+#ifdef GEMU_GTK
+                  | GEMU_DISP_F(GEMU_DISPLAY_GTK)
+#endif
+    ,
     .vnc_support  = false,
     .extra_help =
         "\nHP i2000 (IA-64) options:\n"
         "  -rom FILE       Load firmware flash image (top-aligned, max 4 MiB)\n"
         "  -rom DIR|ZIP    Scan for known firmware by SHA-256\n"
         "  -m SIZE         RAM size, K/M/G suffix (default 512M, i2000 max 2G)\n"
+        "\nThe SDL display is a front panel: CPU state, POST code, unhandled\n"
+        "MMIO log, and the COM1 serial console (also echoed to stdout).\n"
+        "Monitor: 'info cpu', 'step [N]', 'x ADDR [COUNT]' (phys hexdump).\n"
         "\nExample commands:\n"
         "  ./bin/gemu -M i2000 -rom roms/bios130.BIN\n"
-        "  ./bin/gemu -M i2000 -rom roms/ -m 1G\n",
+        "  ./bin/gemu -M i2000 -rom roms/ -m 1G -display sdl\n",
 };
 
 /* ── Memory size parsing ─────────────────────────────────────────────────── */
@@ -85,9 +93,12 @@ static bool romdb_add_ia64(const char *path, const char *region, uint32_t addr, 
 int ia64_setup(int argc, char *argv[]) {
     Ia64Config cfg = {
         .ram_size = 512ull << 20,
+        .display_type = GEMU_DISPLAY_SDL,
+        .display_scale = 1,
     };
     GemuArgs args = {
-        .display_type = GEMU_DISPLAY_NONE,
+        .display_type = cfg.display_type,
+        .display_scale = cfg.display_scale,
     };
 
     char *rem[32];
@@ -142,7 +153,15 @@ int ia64_setup(int argc, char *argv[]) {
         }
     }
 
+    cfg.display_type = args.display_type;
+    cfg.display_scale = args.display_scale;
     cfg.no_shutdown = args.no_shutdown;
+
+    bool sdl_up = (cfg.display_type == GEMU_DISPLAY_SDL);
+    if (sdl_up && SDL_Init(0) < 0) {
+        fprintf(stderr, "gemu: SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
+    }
 
     Ia64I2000State *s = ia64_i2000_create(&cfg);
     if (!s)
@@ -178,5 +197,7 @@ int ia64_setup(int argc, char *argv[]) {
 
     ia64_i2000_run(s, &cfg);
     ia64_i2000_destroy(s);
+    if (sdl_up)
+        SDL_Quit();
     return 0;
 }
