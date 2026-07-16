@@ -6,6 +6,9 @@
 #ifdef HAVE_CHIP8
 int chip8_setup(int argc, char *argv[]);
 #endif
+#ifdef HAVE_IA64
+int ia64_setup(int argc, char *argv[]);
+#endif
 #ifdef HAVE_MITSU
 int mitsu_setup(int argc, char *argv[]);
 #endif
@@ -160,6 +163,9 @@ int main(int argc, char *argv[]) {
     base = base ? base + 1 : prog;
 #ifdef HAVE_CHIP8
     if (strcmp(base, "gemu-chip8") == 0) return chip8_setup(argc, argv);
+#endif
+#ifdef HAVE_IA64
+    if (strcmp(base, "gemu-ia64") == 0)  return ia64_setup(argc, argv);
 #endif
 #ifdef HAVE_MITSU
     if (strcmp(base, "gemu-mitsu") == 0) return mitsu_setup(argc, argv);
