@@ -126,6 +126,9 @@ static uint8_t a400_consol(const Atari400State *s) {
 
 static uint8_t a400_read(uint16_t addr, void *ud) {
     Atari400State *s = ud;
+    if (s->axlon_ram && s->axlon_bank && addr >= 0x4000u && addr < 0x8000u)
+        return s->axlon_ram[(size_t)(s->axlon_bank - 1u) * A400_AXLON_BANK_SIZE +
+                            (addr - 0x4000u)];
     if (addr < s->ram_size) return s->ram[addr];
     if (s->cart_base && addr >= s->cart_base &&
         addr < s->cart_base + s->cart_size)
@@ -146,6 +149,20 @@ static uint8_t a400_read(uint16_t addr, void *ud) {
 
 static void a400_write(uint16_t addr, uint8_t val, void *ud) {
     Atari400State *s = ud;
+    bool axlon_select = s->axlon_ram &&
+        ((addr >= 0x0FC0u && addr <= 0x0FFFu) ||
+         (addr >= 0xCFC0u && addr <= 0xCFFFu));
+    if (axlon_select) {
+        s->axlon_bank = val & 0x3Fu;
+        /* The low mirror is also ordinary base RAM; the high selector range
+         * is otherwise open bus on a 48K 400. */
+        if (addr >= 0xCFC0u) return;
+    }
+    if (s->axlon_ram && s->axlon_bank && addr >= 0x4000u && addr < 0x8000u) {
+        s->axlon_ram[(size_t)(s->axlon_bank - 1u) * A400_AXLON_BANK_SIZE +
+                     (addr - 0x4000u)] = val;
+        return;
+    }
     if (addr < s->ram_size) { s->ram[addr] = val; return; }
     switch (addr & 0xFF00u) {
     case 0xD000u: gtia_reg_write(&s->antic, (uint8_t)addr, val); break;
@@ -169,6 +186,7 @@ static void a400_reset(Atari400State *s) {
     s->pia.read_pb = a400_pia_read_pb;
     s->pia.ud      = s;
     s->wsync = false;
+    s->axlon_bank = 0;
     s->keyq_head = s->keyq_tail = 0;
     s->key_hold_frames = s->key_gap_frames = 0;
     mos6502_reset(&s->cpu);
@@ -338,6 +356,12 @@ static bool a400_load_file_at(Atari400State *s, const char *path, uint32_t addr)
     return ok;
 }
 
+static uint32_t a400_installed_ram_size(const Atari400State *s) {
+    if (s->cfg->axlon1056) return ATARI400_RAM_MAX;
+    uint32_t size = s->cfg->mem_size ? s->cfg->mem_size : 0x4000u;
+    return size > ATARI400_RAM_MAX ? ATARI400_RAM_MAX : size;
+}
+
 static bool a400_load_cart(Atari400State *s, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -364,8 +388,7 @@ static bool a400_load_cart(Atari400State *s, const char *path) {
     s->cart_size = (uint32_t)sz;
     s->cart_base = (uint16_t)(0xC000u - sz);   /* 4K→$B000, 8K→$A000, 16K→$8000 */
     /* Cartridge shadows RAM: cap RAM below the cart window. */
-    s->ram_size = s->cfg->mem_size ? s->cfg->mem_size : 0x4000u;
-    if (s->ram_size > ATARI400_RAM_MAX) s->ram_size = ATARI400_RAM_MAX;
+    s->ram_size = a400_installed_ram_size(s);
     if (s->ram_size > s->cart_base) s->ram_size = s->cart_base;
     printf("atari400: cartridge '%s' (%ldK at $%04X)\n",
            path, sz / 1024, s->cart_base);
@@ -478,8 +501,7 @@ static GemuMediaResult a400_cart_eject(void *ud, char *err, size_t err_len) {
     Atari400State *s = ud;
     s->cart_base = 0;
     s->cart_size = 0;
-    s->ram_size = s->cfg->mem_size ? s->cfg->mem_size : 0x4000u;
-    if (s->ram_size > ATARI400_RAM_MAX) s->ram_size = ATARI400_RAM_MAX;
+    s->ram_size = a400_installed_ram_size(s);
     return GEMU_MEDIA_OK_RESET;
 }
 
@@ -531,16 +553,18 @@ static bool a400_sio_trap(Atari400State *s) {
             off + len > s->disk_size || (uint32_t)buffer + len > s->ram_size) {
             status = 0x90;                 /* invalid sector / buffer */
         } else {
-            memcpy(s->ram + buffer, s->disk_data + off, len);
+            for (size_t i = 0; i < len; i++)
+                a400_write((uint16_t)(buffer + i), s->disk_data[off + i], s);
         }
     } else if (command == 0x53) {          /* 'S' - drive status */
         if (count < 4 || (uint32_t)buffer + 4u > s->ram_size) {
             status = 0x90;
         } else {
-            s->ram[buffer + 0] = 0x10;     /* motor/drive ready */
-            s->ram[buffer + 1] = 0xFF;
-            s->ram[buffer + 2] = s->disk_sector_size == 128 ? 0xE0 : 0xA0;
-            s->ram[buffer + 3] = 0x00;
+            a400_write(buffer + 0u, 0x10, s); /* motor/drive ready */
+            a400_write(buffer + 1u, 0xFF, s);
+            a400_write(buffer + 2u,
+                       s->disk_sector_size == 128 ? 0xE0 : 0xA0, s);
+            a400_write(buffer + 3u, 0x00, s);
         }
     } else {
         status = 0x8B;                     /* command not implemented */
@@ -556,29 +580,33 @@ Atari400State *atari400_create(const MosConfig *cfg) {
     if (!s) return NULL;
     s->cfg = cfg;
 
-    s->ram_size = cfg->mem_size ? cfg->mem_size : 0x4000u;
-    if (s->ram_size > ATARI400_RAM_MAX) s->ram_size = ATARI400_RAM_MAX;
+    s->ram_size = a400_installed_ram_size(s);
+    if (cfg->axlon1056) {
+        s->axlon_ram = calloc(A400_AXLON_EXT_BANKS, A400_AXLON_BANK_SIZE);
+        if (!s->axlon_ram) { free(s); return NULL; }
+        printf("atari400: Axlon 1056K expansion (48K base + 63 x 16K banks)\n");
+    }
 
     bool have_os = false;
     for (int i = 0; i < cfg->n_roms; i++) {
         uint32_t addr = cfg->roms[i].addr;
         if (!a400_load_file_at(s, cfg->roms[i].path, addr)) {
-            free(s);
+            free(s->axlon_ram); free(s);
             return NULL;
         }
         if (addr >= 0xD800u) have_os = true;
     }
     if (!have_os) {
         fprintf(stderr, "atari400: missing OS ROMs - use -rom roms/a400.zip\n");
-        free(s);
+        free(s->axlon_ram); free(s);
         return NULL;
     }
     if (cfg->cart_path && !a400_load_cart(s, cfg->cart_path)) {
-        free(s);
+        free(s->axlon_ram); free(s);
         return NULL;
     }
     if (cfg->fda_path && !a400_load_atr(s, cfg->fda_path)) {
-        free(s);
+        free(s->disk_data); free(s->axlon_ram); free(s);
         return NULL;
     }
 
@@ -592,7 +620,9 @@ Atari400State *atari400_create(const MosConfig *cfg) {
     s->cpu.mem_ud    = s;
 
     s->monitor = gemu_monitor_create();
-    if (!s->monitor) { free(s->disk_data); free(s); return NULL; }
+    if (!s->monitor) {
+        free(s->disk_data); free(s->axlon_ram); free(s); return NULL;
+    }
     gemu_monitor_set_cpu_state_cb(s->monitor, a400_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, a400_screendump, s);
 
@@ -649,6 +679,7 @@ void atari400_destroy(Atari400State *s) {
     gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
     free(s->disk_data);
+    free(s->axlon_ram);
     free(s);
 }
 

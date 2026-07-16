@@ -259,6 +259,7 @@ static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
         cfg->kim_keyboard = false;
         cfg->fds_enabled = false;
         cfg->atari810 = false;
+        cfg->axlon1056 = false;
         *want_vt100 = false;
         cfg->want_wozmon = false;
         cfg->a1ci = false;
@@ -277,6 +278,15 @@ static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
         }
         cfg->devices_none = false;
         cfg->atari810 = true;
+        return true;
+    }
+    if (strcmp(name, "axlon1056") == 0) {
+        if (cfg->machine != MOS_MACHINE_ATARI400) {
+            if (!quiet) fprintf(stderr, "gemu: -device axlon1056 is supported by atari400 only\n");
+            return false;
+        }
+        cfg->devices_none = false;
+        cfg->axlon1056 = true;
         return true;
     }
     if (strcmp(name, "vt100") == 0) {

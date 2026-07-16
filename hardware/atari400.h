@@ -31,6 +31,9 @@
  * WSYNC stalls the CPU to the end of the current scanline.
  * An Atari 810 SIO floppy drive is attached by default and may be removed
  * with `-device none` or explicitly attached with `-device atari810`.
+ * `-device axlon1056` adds 1008 KB of Axlon-compatible RAM banked into
+ * $4000-$7FFF; writes to $CFC0-$CFFF (conventionally $CFFF), or its
+ * $0FC0-$0FFF mirror, select bank 0-63 (bank 0 is base RAM).
  *
  * Keyboard: host characters (SDL raw-key queue / VNC keysyms / monitor
  * `sendkey`) are translated to POKEY scan codes and paced a few frames
@@ -44,6 +47,8 @@
 #define ATARI400_OS_SIZE   0x2800u   /* $D800-$FFFF */
 #define ATARI400_CART_MAX  0x4000u   /* 16 KB at $8000 */
 #define ATARI400_RAM_MAX   0xC000u   /* 48 KB */
+#define A400_AXLON_BANK_SIZE 0x4000u /* bank window at $4000-$7FFF */
+#define A400_AXLON_EXT_BANKS 63u     /* 63 extra banks = 1008 KB */
 
 enum {
     A400_ACT_UP = 0,
@@ -73,6 +78,9 @@ typedef struct Atari400State {
     uint8_t  cart[ATARI400_CART_MAX];
     uint32_t cart_size;
     uint16_t cart_base;     /* $A000 (8K) or $8000 (16K); 0 = no cart */
+
+    uint8_t *axlon_ram;     /* banks 1-63; bank 0 is ram[$4000-$7FFF] */
+    uint8_t  axlon_bank;
 
     uint8_t  *disk_data;    /* ATR payload (the 16-byte header is stripped) */
     size_t    disk_size;
