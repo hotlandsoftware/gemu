@@ -316,16 +316,13 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         return v;
     }
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
+        /* Reads through the top-of-4GiB window always see the ROM (the
+         * recovery-image scan depends on it); only writes divert into the
+         * RAM shadow, where the firmware reads them back through the low
+         * alias. */
         uint64_t v = 0, off = addr - I2000_FLASH_BASE;
-        if (off + size <= I2000_FLASH_SIZE) {
-            /* Once shadowed, the top-of-4GiB window is served from the RAM
-             * copy so the firmware's stores through this alias are seen. */
-            if (s->fw_shadow_enabled &&
-                I2000_FW_SHADOW_BASE + I2000_FLASH_SIZE <= s->ram_size)
-                memcpy(&v, s->ram + I2000_FW_SHADOW_BASE + off, size);
-            else
-                memcpy(&v, s->flash + off, size);
-        }
+        if (off + size <= I2000_FLASH_SIZE)
+            memcpy(&v, s->flash + off, size);
         return v;
     }
     if (addr - I2000_IO_BASE < I2000_IO_SIZE) {

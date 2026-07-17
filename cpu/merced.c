@@ -672,8 +672,11 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
     MercedStatus st = MERCED_OK;
 
     if (major == 4 && xbit && !mbit) {
-        /* semaphores: cmpxchg (00-07), xchg (08-0B), fetchadd (12/13/16/17) */
+        /* semaphores: cmpxchg (00-07), xchg (08-0B), fetchadd (12/13/16/17);
+         * getf (1C-1F) shares this x=1 encoding space */
         if (!qp) return MERCED_OK;
+        if (x6 >= 0x1C && x6 <= 0x1F)
+            goto getf;
         warn_once(m, WARN_SEMAPHORE, "semaphore ops executed non-atomically");
         uint64_t va = gr_read(m, r3, &n3), pa;
         unsigned size = 1u << (x6 & 3);
@@ -707,7 +710,8 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         return mhalt(m, "unimpl M semaphore x6=0x%02X", x6);
     }
 
-    if (major == 4 && xbit && mbit) {           /* M19 getf */
+    if (major == 4 && xbit && mbit) {           /* (reserved) */
+    getf:
         if (!qp) return MERCED_OK;
         MercedFpReg f = fr_read(m, (unsigned)bits(raw, 13, 7));
         uint64_t v;
@@ -1649,6 +1653,21 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
                 if (x6 == 0x10) r.sign = a.sign;
                 else if (x6 == 0x11) r.sign = !a.sign;
                 else { r.sign = a.sign; r.exp = a.exp; }
+                fr_write(m, f1, r);
+                return MERCED_OK;
+            }
+            case 0x18: case 0x19: case 0x1A: case 0x1B: {
+                /* fcvt.fx / fcvt.fxu / fcvt.fx.trunc / fcvt.fxu.trunc */
+                if (!qp) return MERCED_OK;
+                MercedFpReg a = fr_read(m, f2);
+                MercedFpReg r = {0, 0x1003E, 0, a.nat};
+                double d = fp2d(a);
+                /* only truncating rounding modeled; sf rounding control is
+                 * a refinement for later */
+                if (x6 & 1)
+                    r.sig = (d <= 0) ? 0 : (uint64_t)d;
+                else
+                    r.sig = (uint64_t)(int64_t)d;
                 fr_write(m, f1, r);
                 return MERCED_OK;
             }
