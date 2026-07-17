@@ -27,6 +27,8 @@
 #define PCI_CFG_DATA     0xCFC
 #define RESET_CTRL_PORT  0xCF9
 #define I2000_FW_SHADOW_BASE 0x03C00000ull
+#define CMD649_PCI_DEV   3
+#define CMD649_PCI_FUN   1
 
 /* Early 460GX SAC scratch/control registers used by the SAL bootstrap. */
 #define I2000_SAC_CBNR  0x0000FEB00CB0ull
@@ -83,6 +85,7 @@ struct Ia64I2000State {
     uint8_t   port61;
     uint8_t   pit2_polls;
     uint32_t  pci_cfg_addr;
+    uint8_t   cmd649_cfg[256];
     uint8_t   chipset_bus;
     uint8_t   chipset_cfg[32][256];
     uint8_t   memcard_cfg[2][8][256];
@@ -112,6 +115,12 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
+    if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
+        reg + size <= sizeof(s->cmd649_cfg)) {
+        uint64_t v = 0;
+        memcpy(&v, &s->cmd649_cfg[reg], size);
+        return v;
+    }
 
     /* On bus zero, device 10h is the SAC's special CBN programming
      * endpoint.  Firmware uses byte register 40h to select the bus on
@@ -147,6 +156,18 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
+    if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
+        reg + size <= sizeof(s->cmd649_cfg)) {
+        /* Identity, revision/class and header type are read-only.  Command,
+         * BAR and CMD timing registers are ordinary retained latches for the
+         * empty-controller model. */
+        for (unsigned i = 0; i < size; i++) {
+            unsigned off = reg + i;
+            if (off >= 4 && !(off >= 8 && off < 16))
+                s->cmd649_cfg[off] = (uint8_t)(val >> (i * 8));
+        }
+        return;
+    }
     if (bus == 0 && dev == 0x10 && fun == 0 && reg == 0x40 && size == 1) {
         s->chipset_bus = (uint8_t)val;
         return;
@@ -192,6 +213,7 @@ static void con_putc(Ia64I2000State *s, char c) {
     if (c < 32 || c > 126) c = '.';
     if (s->con_col >= COLS) con_newline(s);
     s->console[s->con_row][s->con_col++] = c;
+    s->console[s->con_row][s->con_col] = 0;
 }
 
 /* ── Physical bus ────────────────────────────────────────────────────────── */
@@ -240,6 +262,15 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         if (s->pit2_polls < 2) s->pit2_polls++;
         return s->port61 | (s->pit2_polls >= 2 ? 0x20 : 0);
     }
+    /* CMD-649 primary/secondary channels, with no ATA devices attached.
+     * A floating ATA bus reports status zero; returning the generic unmapped
+     * value 0xFF makes firmware believe BSY is asserted forever. */
+    if (size == 1 && (port == 0x1F7 || port == 0x177 ||
+                      port == 0x3F6 || port == 0x376))
+        return 0x00;
+    if (size == 1 && ((port >= 0x1F0 && port <= 0x1F6) ||
+                      (port >= 0x170 && port <= 0x176)))
+        return 0x00;
     mmio_log(s, I2000_IO_BASE + port, 0, size, false);
     return ~0ull;
 }
@@ -293,6 +324,9 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         default: return;                            /* FCR etc. */
         }
     }
+    if (size == 1 && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6 ||
+                      (port >= 0x170 && port <= 0x177) || port == 0x376))
+        return;                                     /* empty CMD-649 channels */
     mmio_log(s, I2000_IO_BASE + port, val, size, true);
 }
 
@@ -548,6 +582,18 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->chipset_bus = 0;
     memset(s->chipset_cfg, 0, sizeof(s->chipset_cfg));
     memset(s->memcard_cfg, 0, sizeof(s->memcard_cfg));
+    memset(s->cmd649_cfg, 0, sizeof(s->cmd649_cfg));
+
+    /* Integrated CMD Technology PCI-649 Ultra ATA/100 controller at the
+     * i2000 IFB's fixed 00:03.1 function. */
+    s->cmd649_cfg[0x00] = 0x95; s->cmd649_cfg[0x01] = 0x10; /* 1095 */
+    s->cmd649_cfg[0x02] = 0x49; s->cmd649_cfg[0x03] = 0x06; /* 0649 */
+    s->cmd649_cfg[0x08] = 0x02;                    /* revision */
+    s->cmd649_cfg[0x09] = 0x8A;                    /* native/legacy IDE */
+    s->cmd649_cfg[0x0A] = 0x01;                    /* IDE subclass */
+    s->cmd649_cfg[0x0B] = 0x01;                    /* mass storage */
+    s->cmd649_cfg[0x0E] = 0x00;                    /* normal header */
+    s->cmd649_cfg[0x3D] = 0x01;                    /* INTA */
     static const struct { uint8_t dev; uint16_t did; } ids[] = {
         { 0, 0x84E0 }, { 1, 0x84E0 },
         { 4, 0x84E1 },
