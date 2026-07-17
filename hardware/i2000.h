@@ -34,6 +34,7 @@
 
 typedef struct {
     uint64_t        ram_size;
+    const char     *cdrom_path;
     GemuDisplayType display_type;
     int             display_scale;
     bool            no_shutdown;

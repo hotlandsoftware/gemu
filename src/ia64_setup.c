@@ -51,11 +51,13 @@ static const GemuArgsDef def = {
         "  -rom FILE       Load firmware flash image (top-aligned, max 4 MiB)\n"
         "  -rom DIR|ZIP    Scan for known firmware by SHA-256\n"
         "  -m SIZE         RAM size, K/M/G suffix (default 512M, i2000 max 2G)\n"
+        "  -cdrom FILE     Attach a read-only ISO image as an ATAPI CD-ROM\n"
         "\nThe SDL display is a front panel: CPU state, POST code, unhandled\n"
         "MMIO log, and the COM1 serial console (also echoed to stdout).\n"
         "Monitor: 'info cpu', 'step [N]', 'x ADDR [COUNT]' (phys hexdump).\n"
         "\nExample commands:\n"
         "  ./bin/gemu -M i2000 -rom roms/bios130.BIN\n"
+        "  ./bin/gemu -M i2000 -rom roms/bios130.BIN -cdrom disc.iso\n"
         "  ./bin/gemu -M i2000 -rom roms/ -m 1G -display sdl\n",
 };
 
@@ -147,6 +149,9 @@ int ia64_setup(int argc, char *argv[]) {
             uint64_t sz = parse_size(rem[++i]);
             if (!sz) return 1;
             cfg.ram_size = sz;
+        } else if (strcmp(rem[i], "-cdrom") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cdrom requires an argument\n"); return 1; }
+            cfg.cdrom_path = rem[++i];
         } else {
             fprintf(stderr, "gemu: unknown option '%s' (try -h)\n", rem[i]);
             return 1;

@@ -88,6 +88,15 @@ struct Ia64I2000State {
     uint8_t   cmos[128];
     uint32_t  pci_cfg_addr;
     uint8_t   cmd649_cfg[256];
+    FILE     *cdrom;
+    char      cdrom_file[512];
+    uint64_t  cdrom_size;
+    uint8_t   atapi_error, atapi_features, atapi_count;
+    uint8_t   atapi_lba_low, atapi_lba_mid, atapi_lba_high, atapi_device;
+    uint8_t   atapi_status, atapi_packet[12];
+    unsigned  atapi_packet_pos;
+    uint8_t  *atapi_data;
+    size_t    atapi_data_len, atapi_data_pos;
     uint8_t   chipset_bus;
     uint8_t   chipset_cfg[32][256];
     uint8_t   memcard_cfg[2][8][256];
@@ -103,6 +112,94 @@ static void i2000_reset(Ia64I2000State *s);
 
 static uint64_t size_mask(unsigned size) {
     return size >= 8 ? ~0ull : (1ull << (size * 8)) - 1;
+}
+
+static void atapi_set_data(Ia64I2000State *s, const void *data, size_t len) {
+    free(s->atapi_data);
+    s->atapi_data = NULL;
+    s->atapi_data_len = s->atapi_data_pos = 0;
+    if (len) {
+        s->atapi_data = malloc(len);
+        if (!s->atapi_data) {
+            s->atapi_error = 0x04;
+            s->atapi_status = 0x41;
+            return;
+        }
+        memcpy(s->atapi_data, data, len);
+        s->atapi_data_len = len;
+    }
+    s->atapi_count = 0x02; /* command/data phase, I/O to host */
+    s->atapi_lba_mid = (uint8_t)len;
+    s->atapi_lba_high = (uint8_t)(len >> 8);
+    s->atapi_status = len ? 0x48 : 0x40; /* DRDY|DRQ / DRDY */
+}
+
+static void atapi_reply(Ia64I2000State *s) {
+    const uint8_t *p = s->atapi_packet;
+    uint8_t reply[64] = {0};
+    uint32_t blocks = (uint32_t)(s->cdrom_size / 2048);
+    switch (p[0]) {
+    case 0x00: /* TEST UNIT READY */
+    case 0x1B: /* START STOP UNIT */
+    case 0x1E: /* PREVENT/ALLOW MEDIUM REMOVAL */
+        atapi_set_data(s, NULL, 0);
+        break;
+    case 0x03: /* REQUEST SENSE */
+        reply[0] = 0x70; reply[7] = 10;
+        atapi_set_data(s, reply, p[4] < 18 ? p[4] : 18);
+        break;
+    case 0x12: { /* INQUIRY */
+        reply[0] = 0x05; reply[1] = 0x80; reply[2] = 0x00;
+        reply[3] = 0x21; reply[4] = 31;
+        memcpy(reply + 8, "GEMU    ", 8);
+        memcpy(reply + 16, "ATAPI CD-ROM    ", 16);
+        memcpy(reply + 32, "1.0 ", 4);
+        size_t n = p[4] < 36 ? p[4] : 36;
+        atapi_set_data(s, reply, n);
+        break;
+    }
+    case 0x25: /* READ CAPACITY */
+        if (blocks) blocks--;
+        reply[0] = blocks >> 24; reply[1] = blocks >> 16;
+        reply[2] = blocks >> 8;  reply[3] = blocks;
+        reply[6] = 0x08;
+        atapi_set_data(s, reply, 8);
+        break;
+    case 0x43: { /* READ TOC: one data track, lead-out */
+        reply[1] = 0x12; reply[2] = 1; reply[3] = 1;
+        reply[5] = 0x14; reply[6] = 1;
+        reply[13] = 0x14; reply[14] = 0xAA;
+        reply[16] = blocks >> 24; reply[17] = blocks >> 16;
+        reply[18] = blocks >> 8; reply[19] = blocks;
+        size_t alloc = ((size_t)p[7] << 8) | p[8];
+        atapi_set_data(s, reply, alloc < 20 ? alloc : 20);
+        break;
+    }
+    case 0x28: /* READ(10) */
+    case 0xA8: { /* READ(12) */
+        uint32_t lba = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16) |
+                       ((uint32_t)p[4] << 8) | p[5];
+        uint32_t count = p[0] == 0x28 ? ((uint32_t)p[7] << 8) | p[8] :
+                         ((uint32_t)p[6] << 24) | ((uint32_t)p[7] << 16) |
+                         ((uint32_t)p[8] << 8) | p[9];
+        size_t len = (size_t)count * 2048;
+        uint8_t *buf = len ? malloc(len) : NULL;
+        if ((len && !buf) || lba >= blocks || count > blocks - lba ||
+            fseek(s->cdrom, (long)((uint64_t)lba * 2048), SEEK_SET) != 0 ||
+            (len && fread(buf, 1, len, s->cdrom) != len)) {
+            free(buf); s->atapi_error = 0x50; s->atapi_status = 0x41;
+        } else {
+            atapi_set_data(s, buf, len);
+            free(buf);
+        }
+        break;
+    }
+    default:
+        fprintf(stderr, "i2000: ATAPI unsupported packet command %02X\n", p[0]);
+        s->atapi_error = 0x50;
+        s->atapi_status = 0x41;
+        break;
+    }
 }
 
 static bool chipset_device_present(unsigned dev) {
@@ -266,6 +363,30 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         if (s->pit2_polls < 2) s->pit2_polls++;
         return s->port61 | (s->pit2_polls >= 2 ? 0x20 : 0);
     }
+    if (s->cdrom && ((port >= 0x170 && port <= 0x177) || port == 0x376)) {
+        unsigned reg = port == 0x376 ? 7 : (unsigned)(port - 0x170);
+        if (reg == 0) {
+            uint64_t v = 0;
+            for (unsigned i = 0; i < size; i++) {
+                if (s->atapi_data_pos < s->atapi_data_len)
+                    v |= (uint64_t)s->atapi_data[s->atapi_data_pos++] << (i * 8);
+            }
+            if (s->atapi_data_pos >= s->atapi_data_len && s->atapi_status & 0x08) {
+                s->atapi_status = 0x40;
+                s->atapi_count = 0x03; /* command complete */
+            }
+            return v;
+        }
+        switch (reg) {
+        case 1: return s->atapi_error;
+        case 2: return s->atapi_count;
+        case 3: return s->atapi_lba_low;
+        case 4: return s->atapi_lba_mid;
+        case 5: return s->atapi_lba_high;
+        case 6: return s->atapi_device;
+        case 7: return s->atapi_status;
+        }
+    }
     /* CMD-649 primary/secondary channels, with no ATA devices attached.
      * A floating ATA bus reports status zero; returning the generic unmapped
      * value 0xFF makes firmware believe BSY is asserted forever. */
@@ -318,6 +439,54 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
     if (port == 0x61) {
         s->port61 = (uint8_t)val & 0x0F;
         return;
+    }
+    if (s->cdrom && ((port >= 0x170 && port <= 0x177) || port == 0x376)) {
+        unsigned reg = port == 0x376 ? 8 : (unsigned)(port - 0x170);
+        if (reg == 0) {
+            for (unsigned i = 0; i < size && s->atapi_packet_pos < 12; i++)
+                s->atapi_packet[s->atapi_packet_pos++] = (uint8_t)(val >> (i * 8));
+            if (s->atapi_packet_pos == 12)
+                atapi_reply(s);
+            return;
+        }
+        switch (reg) {
+        case 1: s->atapi_features = (uint8_t)val; return;
+        case 2: s->atapi_count = (uint8_t)val; return;
+        case 3: s->atapi_lba_low = (uint8_t)val; return;
+        case 4: s->atapi_lba_mid = (uint8_t)val; return;
+        case 5: s->atapi_lba_high = (uint8_t)val; return;
+        case 6: s->atapi_device = (uint8_t)val; return;
+        case 7:
+            s->atapi_error = 0;
+            if ((uint8_t)val == 0xA0) { /* PACKET */
+                s->atapi_packet_pos = 0;
+                memset(s->atapi_packet, 0, sizeof(s->atapi_packet));
+                s->atapi_count = 0x01;
+                s->atapi_status = 0x48;
+            } else if ((uint8_t)val == 0xA1) { /* IDENTIFY PACKET DEVICE */
+                uint8_t id[512] = {0};
+                id[0] = 0xC0; id[1] = 0x85;       /* removable ATAPI CD-ROM */
+                id[98] = 0x00; id[99] = 0x02;     /* LBA supported */
+                char model[40];
+                memset(model, ' ', sizeof(model));
+                memcpy(model, "GEMU ATAPI CD-ROM", 17);
+                for (unsigned i = 0; i < 40; i += 2) {
+                    id[54 + i] = model[i + 1]; id[55 + i] = model[i];
+                }
+                atapi_set_data(s, id, sizeof(id));
+            } else if ((uint8_t)val == 0x08) { /* DEVICE RESET */
+                s->atapi_status = 0x40;
+                s->atapi_count = 1; s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB;
+            } else {
+                s->atapi_error = 0x04; s->atapi_status = 0x41;
+            }
+            return;
+        case 8: /* device control / software reset */
+            if (val & 4) s->atapi_status = 0x80;
+            else { s->atapi_status = 0x40; s->atapi_count = 1;
+                   s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB; }
+            return;
+        }
     }
     if (port >= COM1_PORT && port < COM1_PORT + 8) {
         switch (port - COM1_PORT) {
@@ -601,6 +770,17 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->cmos[0x0A] = 0x26;                         /* divider, 32.768 kHz */
     s->cmos[0x0B] = 0x02;                         /* 24-hour BCD mode */
     s->cmos[0x0D] = 0x80;                         /* CMOS power valid */
+    s->atapi_error = s->atapi_features = 0;
+    s->atapi_count = 1;
+    s->atapi_lba_low = 1;
+    s->atapi_lba_mid = 0x14;
+    s->atapi_lba_high = 0xEB;
+    s->atapi_device = 0xA0;
+    s->atapi_status = s->cdrom ? 0x40 : 0;
+    s->atapi_packet_pos = 0;
+    free(s->atapi_data);
+    s->atapi_data = NULL;
+    s->atapi_data_len = s->atapi_data_pos = 0;
 
     /* Integrated CMD Technology PCI-649 Ultra ATA/100 controller at the
      * i2000 IFB's fixed 00:03.1 function. */
@@ -653,6 +833,23 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
         return NULL;
     }
     memset(s->flash, 0xFF, I2000_FLASH_SIZE);
+    if (cfg->cdrom_path) {
+        s->cdrom = fopen(cfg->cdrom_path, "rb");
+        if (!s->cdrom || fseek(s->cdrom, 0, SEEK_END) != 0) {
+            fprintf(stderr, "gemu: cannot open CD-ROM image '%s'\n", cfg->cdrom_path);
+            ia64_i2000_destroy(s);
+            return NULL;
+        }
+        long end = ftell(s->cdrom);
+        if (end <= 0 || (end % 2048) != 0 || fseek(s->cdrom, 0, SEEK_SET) != 0) {
+            fprintf(stderr, "gemu: CD-ROM image '%s' is not a sector-aligned ISO\n",
+                    cfg->cdrom_path);
+            ia64_i2000_destroy(s);
+            return NULL;
+        }
+        s->cdrom_size = (uint64_t)end;
+        snprintf(s->cdrom_file, sizeof(s->cdrom_file), "%s", cfg->cdrom_path);
+    }
     chipset_cfg_reset(s);
 
     MercedBus bus = {
@@ -691,6 +888,8 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
     gemu_display_destroy(s->display);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     merced_destroy(s->cpu);
+    free(s->atapi_data);
+    if (s->cdrom) fclose(s->cdrom);
     free(s->flash);
     free(s->ram);
     free(s);
@@ -791,6 +990,9 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
            s->ram_size >> 20,
            s->flash_loaded ? s->flash_file : "(none)",
            (uint64_t)I2000_FLASH_BASE, (uint64_t)IA64_RESET_VECTOR);
+    if (s->cdrom)
+        printf("  CD-ROM: %s (%" PRIu64 " MiB)\n", s->cdrom_file,
+               s->cdrom_size >> 20);
 
     gemu_monitor_start(s->monitor);
 
