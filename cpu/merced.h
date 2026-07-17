@@ -47,6 +47,9 @@ typedef struct {
      * fetches a different physical decode from ordinary data accesses. */
     uint64_t (*fetch)(void *ud, uint64_t addr, unsigned size);
     void     (*write)(void *ud, uint64_t addr, uint64_t val, unsigned size);
+    /* Optional acceleration for architecturally ordinary repeated byte
+     * stores. Return false if the range is not directly fillable. */
+    bool     (*fill)(void *ud, uint64_t addr, uint8_t val, uint64_t len);
 } MercedBus;
 
 typedef enum {

@@ -98,7 +98,13 @@ struct Ia64I2000State {
     uint8_t  *atapi_data;
     size_t    atapi_data_len, atapi_data_pos;
     uint8_t   chipset_bus;
-    uint8_t   chipset_cfg[32][256];
+    /* Real 460GX device map (SSDM 248704-001 Table 2-1, bus CBN):
+     *   00h/01h SAC, 04h SDC, 05h/06h Memory Card A/B, 10h-17h Expander
+     *   0-3 buses a/b (WXB/PXB/GXB - not yet modeled). Devices are
+     *   multi-function; fn dimension added since SAC dev 1 fn 1 is
+     *   accessed during boot (extended/diagnostic function, purpose
+     *   still being traced). */
+    uint8_t   chipset_cfg[32][8][256];
     uint8_t   memcard_cfg[2][8][256];
     uint8_t   uart_ier, uart_lcr, uart_mcr, uart_scr, uart_dll, uart_dlm;
 
@@ -202,8 +208,22 @@ static void atapi_reply(Ia64I2000State *s) {
     }
 }
 
+/* Chipset-internal devices per Table 2-1: SAC (00h/01h), SDC (04h), and
+ * Expander 0-3 buses a/b (10h-17h, where WXB/PXB/GXB actually live).
+ * Memory Card A/B (05h/06h) are deliberately excluded - they're handled
+ * by the separate memcard_cfg array below, and must be checked first by
+ * callers or the (also dev-present) memcard reads/writes never fire.
+ * Function 0 is always present for SAC/SDC/Expanders; other functions are
+ * probed live (SAC dev 1 responds on fn 1 too) and default to an all-zero
+ * backing store until we learn what firmware expects there. Making the
+ * Expanders present (routed to a zeroed chipset_cfg entry instead of the
+ * unhandled-access all-1s default) matters: firmware's memory-size setup
+ * probes reg 0x98 on each of them and folds the result into a top-of-memory
+ * computation, and an all-1s "no device" response there was read as a huge
+ * bogus size, turning a bounded memclr loop into a multi-billion-iteration
+ * one. */
 static bool chipset_device_present(unsigned dev) {
-    return dev == 0 || dev == 1 || dev == 4 || dev == 5 || dev == 6;
+    return dev == 0 || dev == 1 || dev == 4 || (dev >= 0x10 && dev <= 0x17);
 }
 
 static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
@@ -226,10 +246,10 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
      * which the rest of the 460GX components appear. */
     if (bus == 0 && dev == 0x10 && fun == 0 && reg == 0x40 && size == 1)
         return s->chipset_bus;
-    if (bus == s->chipset_bus && fun == 0 && chipset_device_present(dev) &&
+    if (bus == s->chipset_bus && chipset_device_present(dev) &&
         reg + size <= 256) {
         uint64_t v = 0;
-        memcpy(&v, &s->chipset_cfg[dev][reg], size);
+        memcpy(&v, &s->chipset_cfg[dev][fun][reg], size);
         return v;
     }
     if (bus == s->chipset_bus && (dev == 5 || dev == 6) &&
@@ -271,15 +291,15 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
         s->chipset_bus = (uint8_t)val;
         return;
     }
-    if (bus == s->chipset_bus && fun == 0 && chipset_device_present(dev) &&
+    if (bus == s->chipset_bus && chipset_device_present(dev) &&
         reg + size <= 256) {
-        /* Device/vendor ID and class/revision are read-only.  The remaining
-         * chipset-specific registers are retained as ordinary latches until
-         * their individual side effects are needed. */
+        /* Device/vendor ID and class/revision are read-only on function 0
+         * (real identity); other functions have no such fixed header yet,
+         * so leave them fully writable until we know their layout. */
         for (unsigned i = 0; i < size; i++) {
             unsigned off = reg + i;
-            if (off >= 4 && !(off >= 8 && off < 12))
-                s->chipset_cfg[dev][off] = (uint8_t)(val >> (i * 8));
+            if (fun != 0 || (off >= 4 && !(off >= 8 && off < 12)))
+                s->chipset_cfg[dev][fun][off] = (uint8_t)(val >> (i * 8));
         }
         return;
     }
@@ -619,6 +639,14 @@ void ia64_i2000_phys_write8(Ia64I2000State *s, uint64_t addr, uint8_t val) {
     bus_write(s, addr & MERCED_PHYS_MASK, val, 1);
 }
 
+static bool i2000_bus_fill(void *ud, uint64_t addr, uint8_t val, uint64_t len) {
+    Ia64I2000State *s = ud;
+    if (addr > s->ram_size || len > s->ram_size - addr)
+        return false;
+    memset(s->ram + addr, val, (size_t)len);
+    return true;
+}
+
 /* ── Firmware ────────────────────────────────────────────────────────────── */
 
 bool ia64_i2000_load_firmware(Ia64I2000State *s, const char *path) {
@@ -738,7 +766,8 @@ static bool i2000_screendump(void *ud, const char *path) {
 }
 
 /* monitor "x 0xADDR [count]": physical memory hexdump
- * monitor "trace N": stderr-trace the next N executed slots */
+ * monitor "trace N": stderr-trace the next N executed slots
+ * monitor "history [N]": dump the most recently executed slots */
 static void i2000_custom_cmd(Ia64I2000State *s) {
     const char *txt = gemu_monitor_command_text(s->monitor);
     uint64_t addr;
@@ -747,6 +776,13 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
     if (txt && sscanf(txt, "trace %" SCNu64, &n) == 1) {
         s->cpu->trace_n = n;
         printf("tracing next %" PRIu64 " slots to stderr\n", n);
+        return;
+    }
+    if (txt && strncmp(txt, "history", 7) == 0) {
+        unsigned count = 128;
+        (void)sscanf(txt + 7, "%u", &count);
+        if (count > MERCED_TRACE_HISTORY) count = MERCED_TRACE_HISTORY;
+        merced_dump_trace(s->cpu, count, stderr);
         return;
     }
     if (txt && strncmp(txt, "calls", 5) == 0) {
@@ -822,15 +858,38 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->cmd649_cfg[0x0B] = 0x01;                    /* mass storage */
     s->cmd649_cfg[0x0E] = 0x00;                    /* normal header */
     s->cmd649_cfg[0x3D] = 0x01;                    /* INTA */
+    /* Device numbers and roles per SSDM 248704-001 Table 2-1 (Device
+     * Mapping on Bus CBN): 00h/01h = SAC (82461GX), 04h = SDC (82462GX,
+     * not GXB as an earlier version of this table assumed - GXB has no
+     * fixed device number, it lives on an Expander bus per WXB/PXB/GXB
+     * board population), 05h/06h = Memory Card A/B (handled via
+     * memcard_cfg). Real vendor/device IDs aren't published in the
+     * datasheet or SSDM; these placeholders just need to be internally
+     * consistent and non-zero (0xFFFF reads as "no device"). */
     static const struct { uint8_t dev; uint16_t did; } ids[] = {
-        { 0, 0x84E0 }, { 1, 0x84E0 },
-        { 4, 0x84E1 },
-        { 5, 0x84E3 }, { 6, 0x84E3 },
+        { 0, 0x84E0 }, { 1, 0x84E0 },   /* SAC */
+        { 4, 0x84E2 },                  /* SDC */
+        { 0x10, 0x84E4 }, { 0x11, 0x84E4 }, { 0x12, 0x84E4 }, { 0x13, 0x84E4 },
+        { 0x14, 0x84E4 }, { 0x15, 0x84E4 }, { 0x16, 0x84E4 }, { 0x17, 0x84E4 },
+                                         /* Expander 0-3 buses a/b */
     };
     for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
-        uint8_t *c = s->chipset_cfg[ids[i].dev];
+        uint8_t *c = s->chipset_cfg[ids[i].dev][0];
         c[0] = 0x86; c[1] = 0x80;
         c[2] = (uint8_t)ids[i].did; c[3] = (uint8_t)(ids[i].did >> 8);
+        c[0x0B] = 0x06;
+    }
+    /* Memory Card A/B (dev 5/6) live in memcard_cfg, not chipset_cfg - give
+     * their function 0 a real PCI identity too, or firmware sees an all-zero
+     * vendor ID at CBN:05.0/06.0 and concludes the card is absent before it
+     * ever reads the processor descriptor at CBN:05.2 below. */
+    static const struct { uint8_t card; uint16_t did; } mcids[] = {
+        { 0, 0x84E3 }, { 1, 0x84E3 },   /* Memory Card A/B */
+    };
+    for (unsigned i = 0; i < sizeof(mcids) / sizeof(mcids[0]); i++) {
+        uint8_t *c = s->memcard_cfg[mcids[i].card][0];
+        c[0] = 0x86; c[1] = 0x80;
+        c[2] = (uint8_t)mcids[i].did; c[3] = (uint8_t)(mcids[i].did >> 8);
         c[0x0B] = 0x06;
     }
 
@@ -841,11 +900,16 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
      * compatible processors.  Advertise the one Merced CPU implemented by
      * this machine; leaving this function all zero makes SAL conclude that
      * no processor exists and deliberately enter its timer-calibrated park
-     * loop at FFFE2020. */
+     * loop at FFFE2020.
+     *
+     * This must stay consistent with cpuid[3]'s family/model/revision in
+     * merced_reset() (cpu/merced.c) - firmware cross-checks the two, and a
+     * mismatch also lands in the FFFE2020 park loop as if no (recognized)
+     * processor were present. */
     s->memcard_cfg[0][2][0x02] = 4;  /* processor present */
     s->memcard_cfg[0][2][0x03] = 7;  /* Itanium family */
     s->memcard_cfg[0][2][0x04] = 0;  /* Merced model */
-    s->memcard_cfg[0][2][0x05] = 6;  /* C2 stepping */
+    s->memcard_cfg[0][2][0x05] = 0;  /* revision - must match cpuid[3] */
 }
 
 Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
@@ -883,7 +947,8 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     chipset_cfg_reset(s);
 
     MercedBus bus = {
-        .ud = s, .read = bus_read, .fetch = bus_fetch, .write = bus_write
+        .ud = s, .read = bus_read, .fetch = bus_fetch, .write = bus_write,
+        .fill = i2000_bus_fill
     };
     s->cpu = merced_create(&bus);
     if (!s->cpu) {
@@ -963,6 +1028,8 @@ static void i2000_run_slice(Ia64I2000State *s) {
     if (s->halted)
         return;
     for (int i = 0; i < INSTR_PER_FRAME; i++) {
+        if (gemu_monitor_check_exec(s->monitor, (uint32_t)s->cpu->ip))
+            return;
         MercedStatus st = merced_step(s->cpu);
         if (s->reset_requested) {
             fprintf(stderr, "i2000: firmware requested a platform reset\n");
@@ -1055,6 +1122,9 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                 if (n == 0) n = 1;
                 s->halted = false;
                 for (uint32_t k = 0; k < n && !s->halted; k++) {
+                    if (gemu_monitor_check_exec(s->monitor,
+                                                (uint32_t)s->cpu->ip))
+                        break;
                     MercedStatus st = merced_step(s->cpu);
                     if (st != MERCED_OK) {
                         s->halted = true;

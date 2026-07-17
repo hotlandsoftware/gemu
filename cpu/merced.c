@@ -400,8 +400,14 @@ void merced_reset(Merced *m) {
     m->cfm = 96;                     /* whole stacked file addressable */
     /* CPUID: "GenuineIntel". cpuid[3] is the version register:
      * {number 7:0, revision 15:8, model 23:16, family 31:24, archrev 39:32}
-     * = archrev 0, family 7 (Itanium), model 0 (Merced), rev 6 (C2),
-     * number 4 (cpuid[0..4] implemented). */
+     * = archrev 0, family 7 (Itanium), model 0 (Merced), rev 0, number 4
+     * (cpuid[0..4] implemented). Revision must match the firmware's own
+     * cross-check of it in machine_i2000.c's memcard_cfg[0][2][0x05]
+     * (CBN:05.2 processor descriptor) - a mismatch reads as "no
+     * recognized processor" and parks SAL at FFFE2020. Revision 6 (C2
+     * stepping) diverges into a firmware code path that isn't understood
+     * yet (see SALE_ENTRY reason-dispatch panic in commit 69fab2c); 0
+     * is what's confirmed working. */
     memcpy(&m->cpuid[0], "GenuineI", 8);
     memcpy(&m->cpuid[1], "ntel\0\0\0\0", 8);
     m->cpuid[2] = 0;
@@ -1124,6 +1130,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         m->msr[idx] = gr_read(m, r2, &n2);
         m->msr_written[idx] = 1;
         m->msr_polls[idx] = 0;
+        m->msr_toggle[idx] = 0;
         return MERCED_OK;
     }
     case 0x09: case 0x0A: case 0x0B: {              /* ptc.l/g/ga */
@@ -1174,8 +1181,10 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
              * of either polarity terminates. */
             if (m->msr_polls[idx] < 0xFFFF)
                 m->msr_polls[idx]++;
-            if (m->msr_polls[idx] > 64 && (m->msr_polls[idx] & 1))
-                v = ~v;
+            if (m->msr_polls[idx] > 64) {
+                m->msr_toggle[idx] ^= 1;
+                if (m->msr_toggle[idx]) v = ~v;
+            }
         } else {
             /* Unwritten status MSR: quiet (0) for one-shot reads - the
              * SALE-entry wake-reason probes must see no pending events -
@@ -1183,8 +1192,9 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
              * wait-for-set handshakes still terminate. */
             if (m->msr_polls[idx] < 0xFFFF)
                 m->msr_polls[idx]++;
-            v = (m->msr_polls[idx] > 16 && (m->msr_polls[idx] & 1))
-                ? ~0ull : 0;
+            if (m->msr_polls[idx] > 16)
+                m->msr_toggle[idx] ^= 1;
+            v = m->msr_toggle[idx] ? ~0ull : 0;
         }
         gr_write(m, r1, v, 0);
         return MERCED_OK;
@@ -2038,6 +2048,42 @@ MercedStatus merced_step(Merced *m) {
     slots[0] = (lo >> 5) & 0x1FFFFFFFFFFull;
     slots[1] = ((lo >> 46) | (hi << 18)) & 0x1FFFFFFFFFFull;
     slots[2] = (hi >> 23) & 0x1FFFFFFFFFFull;
+
+    /* SAL clears discovered RAM with two post-increment stores and a
+     * br.cloop.  A 2 GiB clear otherwise costs over 400 million interpreted
+     * slots, so preserve its architectural effects while filling direct
+     * machine memory in one operation. */
+    if (slot == 0 && m->bus.fill && units[0] == 'M' && units[1] == 'M' &&
+        units[2] == 'B' &&
+        bits(slots[0], 37, 4) == 5 && bits(slots[1], 37, 4) == 5 &&
+        bits(slots[0], 30, 6) == 0x33 && bits(slots[1], 30, 6) == 0x33 &&
+        bits(slots[0], 0, 6) == 0 && bits(slots[1], 0, 6) == 0 &&
+        bits(slots[0], 13, 7) == 0 && bits(slots[1], 13, 7) == 0 &&
+        bits(slots[0], 6, 7) == 16 && bits(slots[1], 6, 7) == 16 &&
+        bits(slots[2], 37, 4) == 4 && bits(slots[2], 6, 3) == 5 &&
+        bits(slots[2], 0, 6) == 0) {
+        unsigned ra = (unsigned)bits(slots[0], 20, 7);
+        unsigned rb = (unsigned)bits(slots[1], 20, 7);
+        uint8_t na, nb;
+        uint64_t va = gr_read(m, ra, &na), vb = gr_read(m, rb, &nb);
+        int64_t disp = sext((bits(slots[2], 36, 1) << 20) |
+                            bits(slots[2], 13, 20), 21) << 4;
+        uint64_t iterations = m->ar[AR_LC] + 1;
+        uint64_t len = iterations * 16;
+        uint64_t fill_pa;
+        if (!na && !nb && vb == va + 8 && disp == 0 &&
+            iterations <= UINT64_MAX / 16 &&
+            va_translate(m, va, false, false, &fill_pa, &st) &&
+            m->bus.fill(m->bus.ud, fill_pa, 0, len)) {
+            gr_write(m, ra, va + len, 0);
+            gr_write(m, rb, vb + len, 0);
+            m->ar[AR_LC] = 0;
+            m->ninsts += iterations * 3;
+            m->ar[AR_ITC] += iterations * 3;
+            m->ip = bundle_va + 16;
+            return MERCED_OK;
+        }
+    }
 
     /* Firmware delay/calibration loops commonly consist solely of
      *
