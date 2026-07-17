@@ -405,7 +405,7 @@ void merced_reset(Merced *m) {
     memcpy(&m->cpuid[0], "GenuineI", 8);
     memcpy(&m->cpuid[1], "ntel\0\0\0\0", 8);
     m->cpuid[2] = 0;
-    m->cpuid[3] = (7ull << 24) | (0ull << 16) | (6ull << 8) | 4;
+    m->cpuid[3] = (7ull << 24) | (0ull << 16) | (0ull << 8) | 4;
     m->cpuid[4] = 0;
     m->cr[CR_LID] = 0;               /* cpu 0 */
     strcpy(m->halt_msg, "never ran");
@@ -1952,6 +1952,14 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
                 uint64_t sum = lo + c;
                 hi += (sum < lo);
                 r.sig = hi;
+            }
+            if (merced_dbg()) {
+                static uint64_t n;
+                n++;
+                fprintf(stderr, "XMA #%" PRIu64 " x2=%u f1=%u a=%016" PRIX64
+                        " b=%016" PRIX64 " c=%016" PRIX64
+                        " -> %016" PRIX64 " ip=%016" PRIX64 "\n",
+                        n, x2, f1, a, b, c, r.sig, m->ip);
             }
             fr_write(m, f1, r);
             return MERCED_OK;
