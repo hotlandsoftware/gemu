@@ -67,6 +67,9 @@ struct Ia64I2000State {
     char      flash_file[512];
     uint32_t  flash_image_size;
     bool      flash_loaded;
+    bool      flash_read_status;
+    bool      flash_read_id;
+    uint8_t   flash_status;
 
     bool      halted;
     bool      reset_requested;
@@ -557,6 +560,22 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         return v;
     }
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
+        if (s->flash_read_status) {
+            uint64_t v = 0;
+            for (unsigned i = 0; i < size; i++)
+                v |= (uint64_t)s->flash_status << (i * 8);
+            return v;
+        }
+        if (s->flash_read_id) {
+            uint64_t v = 0;
+            uint64_t off = addr - I2000_FLASH_BASE;
+            for (unsigned i = 0; i < size; i++) {
+                /* Intel manufacturer, firmware-recognized 1 MiB device. */
+                uint8_t id = ((off + i) & 1) ? 0xAC : 0x89;
+                v |= (uint64_t)id << (i * 8);
+            }
+            return v;
+        }
         /* Reads through the top-of-4GiB window always see the ROM (the
          * recovery-image scan depends on it); only writes divert into the
          * RAM shadow, where the firmware reads them back through the low
@@ -607,6 +626,29 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     }
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
         uint64_t off = addr - I2000_FLASH_BASE;
+        /* BIOS 1.30 probes the Intel flash device with the standard
+         * clear-status/read-status/read-array command sequence.  Without
+         * command-state handling the status read returns an array byte and
+         * platform initialization reports EFI_OUT_OF_RESOURCES. */
+        if (size == 1) {
+            switch ((uint8_t)val) {
+            case 0x50:                         /* clear status register */
+                s->flash_status = 0x80;        /* ready, no errors */
+                return;
+            case 0x70:                         /* read status register */
+                s->flash_read_status = true;
+                s->flash_read_id = false;
+                return;
+            case 0x90:                         /* read identifier codes */
+                s->flash_read_status = false;
+                s->flash_read_id = true;
+                return;
+            case 0xFF:                         /* read array */
+                s->flash_read_status = false;
+                s->flash_read_id = false;
+                return;
+            }
+        }
         /* Shadowed: writes through the alias land in the RAM copy.
          * Unshadowed: flash programming cycles are ignored for now. */
         if (s->fw_shadow_enabled && off + size <= I2000_FLASH_SIZE &&
@@ -822,6 +864,9 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
 
 static void chipset_cfg_reset(Ia64I2000State *s) {
+    s->flash_read_status = false;
+    s->flash_read_id = false;
+    s->flash_status = 0x80;
     s->pci_cfg_addr = 0;
     s->chipset_bus = 0xFF;   /* 460GX power-on CBN default: top bus number */
     memset(s->chipset_cfg, 0, sizeof(s->chipset_cfg));
