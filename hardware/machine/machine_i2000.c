@@ -44,7 +44,7 @@
 #define CON_ROWS 30              /* serial console area at the bottom */
 
 #define INSTR_PER_FRAME 500000
-#define MMIO_LOG_N 8
+#define MMIO_LOG_N 24
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES  32
 
@@ -359,6 +359,11 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         }
     }
     if (port == 0x21 || port == 0xA1) return 0xFF;  /* PIC masks */
+    if (port == 0x404)
+        /* System status/GPIO word. The bootstrap reads this once: bits 24
+         * and 19 both set means the BIOS recovery jumper is installed and
+         * sends the whole boot into PspRecover. 0 = Normal position. */
+        return 0;
     if (port == 0x61) {                            /* PIT channel-2 gate/output */
         if (s->pit2_polls < 2) s->pit2_polls++;
         return s->port61 | (s->pit2_polls >= 2 ? 0x20 : 0);
@@ -744,6 +749,27 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
         printf("tracing next %" PRIu64 " slots to stderr\n", n);
         return;
     }
+    if (txt && strncmp(txt, "calls", 5) == 0) {
+        merced_dump_calls(s->cpu, MERCED_CALL_HISTORY, stderr);
+        return;
+    }
+    {
+        uint64_t daddr, dlen;
+        char path[256];
+        if (txt && sscanf(txt, "dump %" SCNx64 " %" SCNx64 " %255s",
+                          &daddr, &dlen, path) == 3) {
+            FILE *f = fopen(path, "wb");
+            if (!f) { printf("cannot open %s\n", path); return; }
+            for (uint64_t i = 0; i < dlen; i++) {
+                uint8_t b = (uint8_t)bus_read(s, daddr + i, 1);
+                fwrite(&b, 1, 1, f);
+            }
+            fclose(f);
+            printf("dumped 0x%" PRIX64 " bytes from 0x%" PRIX64 " to %s\n",
+                   dlen, daddr, path);
+            return;
+        }
+    }
     if (txt && sscanf(txt, "x %" SCNx64 " %d", &addr, &count) >= 1) {
         if (count > 1024) count = 1024;
         for (int i = 0; i < count; i += 16) {
@@ -761,7 +787,7 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
 
 static void chipset_cfg_reset(Ia64I2000State *s) {
     s->pci_cfg_addr = 0;
-    s->chipset_bus = 0;
+    s->chipset_bus = 0xFF;   /* 460GX power-on CBN default: top bus number */
     memset(s->chipset_cfg, 0, sizeof(s->chipset_cfg));
     memset(s->memcard_cfg, 0, sizeof(s->memcard_cfg));
     memset(s->cmd649_cfg, 0, sizeof(s->cmd649_cfg));
@@ -770,6 +796,10 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->cmos[0x0A] = 0x26;                         /* divider, 32.768 kHz */
     s->cmos[0x0B] = 0x02;                         /* 24-hour BCD mode */
     s->cmos[0x0D] = 0x80;                         /* CMOS power valid */
+    /* Extended byte 3 bit 3: "previous boot completed" flag. The bootstrap
+     * takes the PspRecover path (and wants wpgbios.bin from recovery
+     * media) whenever it is clear, i.e. on CMOS loss. */
+    s->cmos[0x03] = 0x08;
     s->atapi_error = s->atapi_features = 0;
     s->atapi_count = 1;
     s->atapi_lba_low = 1;

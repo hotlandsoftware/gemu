@@ -22,6 +22,14 @@ static inline int64_t sext(uint64_t v, unsigned w) {
     return (int64_t)((v ^ m) - m);
 }
 
+/* Verbose boot tracing (TLB fills, PSR transitions, fault vectors) is gated
+ * on the MERCED_DEBUG env var so ordinary runs stay quiet. */
+static int merced_dbg(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("MERCED_DEBUG") != NULL;
+    return cached;
+}
+
 /* ── PSR / CFM / AR / CR layout ──────────────────────────────────────────── */
 
 #define PSR_BE   (1ull << 1)
@@ -201,7 +209,8 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     m->nfaults++;
-    if ((vec == VEC_ITLB || vec == VEC_DTLB ||
+    if (merced_dbg() &&
+        (vec == VEC_ITLB || vec == VEC_DTLB ||
          vec == VEC_ALT_ITLB || vec == VEC_ALT_DTLB) && m->nfaults <= 16) {
         fprintf(stderr, "merced: TLB fault #%-2" PRIu64
                 " vec=%04X ip=%016" PRIX64 " ifa=%016" PRIX64
@@ -389,12 +398,14 @@ void merced_reset(Merced *m) {
     m->psr = 0;                      /* physical mode, bank 0 */
     m->pr  = 1;                      /* pr0 = 1 */
     m->cfm = 96;                     /* whole stacked file addressable */
-    /* CPUID: "GenuineIntel"; number = archrev 0, family 7 (Itanium),
-     * model 0 (Merced), revision 6 (C2 stepping) */
+    /* CPUID: "GenuineIntel". cpuid[3] is the version register:
+     * {number 7:0, revision 15:8, model 23:16, family 31:24, archrev 39:32}
+     * = archrev 0, family 7 (Itanium), model 0 (Merced), rev 6 (C2),
+     * number 4 (cpuid[0..4] implemented). */
     memcpy(&m->cpuid[0], "GenuineI", 8);
     memcpy(&m->cpuid[1], "ntel\0\0\0\0", 8);
     m->cpuid[2] = 0;
-    m->cpuid[3] = (7ull << 16) | (0ull << 8) | 6;
+    m->cpuid[3] = (7ull << 24) | (0ull << 16) | (6ull << 8) | 4;
     m->cpuid[4] = 0;
     m->cr[CR_LID] = 0;               /* cpu 0 */
     strcpy(m->halt_msg, "never ran");
@@ -448,23 +459,52 @@ static void rotate_regs(Merced *m) {
              ((uint64_t)g << 18) | ((uint64_t)f << 25) | ((uint64_t)p << 32);
 }
 
-/* br.ctop/br.cexit engine; returns taken flag */
+/* br.wtop/br.wexit engine: like ctop/cexit but the loop-continue condition
+ * is the qualifying predicate qp rather than LC. Returns taken flag. */
+static int do_wtop(Merced *m, int qp, int is_top) {
+    int cont;
+    if (qp) {
+        pr_write(m, 63, 1);
+        rotate_regs(m);
+        cont = 1;
+    } else if ((m->ar[AR_EC] & 0x3F) > 1) {
+        m->ar[AR_EC]--;
+        pr_write(m, 63, 0);
+        rotate_regs(m);
+        cont = 1;
+    } else {
+        if (m->ar[AR_EC] & 0x3F) m->ar[AR_EC]--;
+        pr_write(m, 63, 0);
+        rotate_regs(m);
+        cont = 0;
+    }
+    return is_top ? cont : !cont;
+}
+
+/* br.ctop/br.cexit engine; returns taken flag.
+ *
+ * Per the SDM the staging predicate PR[63] is written *before* the register
+ * rename base rotates, so the write targets the physical register that the
+ * rotation then exposes as PR[16] on the next iteration. Writing after the
+ * rotate (as an earlier version did) lands the fresh staging predicate one
+ * physical slot off, desynchronising p16/p17 for a rotation and corrupting
+ * software-pipelined loops. */
 static int do_ctop(Merced *m, int is_top) {
     int taken;
     if (m->ar[AR_LC] != 0) {
         m->ar[AR_LC]--;
-        rotate_regs(m);
         pr_write(m, 63, 1);
+        rotate_regs(m);
         taken = 1;
     } else if ((m->ar[AR_EC] & 0x3F) > 1) {
         m->ar[AR_EC]--;
-        rotate_regs(m);
         pr_write(m, 63, 0);
+        rotate_regs(m);
         taken = 1;
     } else {
         if (m->ar[AR_EC] & 0x3F) m->ar[AR_EC]--;
-        rotate_regs(m);
         pr_write(m, 63, 0);
+        rotate_regs(m);
         taken = 0;
     }
     return is_top ? taken : !taken;
@@ -521,21 +561,59 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
             gr_write(m, r1, res, n3);
             return 1;
         }
-        if (x2a == 1) {                       /* A9 parallel integer add */
+        if (x2a == 1) {                       /* A9 parallel arithmetic */
             unsigned za = (unsigned)bits(raw, 36, 1);
             unsigned zb = (unsigned)bits(raw, 33, 1);
-            if (x4 == 0 && x2b == 0) {        /* padd1/padd2/padd4 */
-                unsigned width = za ? 32 : zb ? 16 : 8;
-                uint64_t a = gr_read(m, r2, &n2), res = 0;
-                uint64_t mask = (1ull << width) - 1;
-                for (unsigned shift = 0; shift < 64; shift += width)
-                    res |= (((a >> shift) + (b >> shift)) & mask) << shift;
-                gr_write(m, r1, res, n2 | n3);
-                return 1;
+            unsigned width = za ? 32 : zb ? 16 : 8;
+            uint64_t a = gr_read(m, r2, &n2), res = 0;
+            uint8_t nat = n2 | n3;
+            uint64_t mask = (width >= 64) ? ~0ull : ((1ull << width) - 1);
+            uint64_t smin = 1ull << (width - 1);   /* sign bit of a lane */
+            for (unsigned sh = 0; sh < 64; sh += width) {
+                int64_t la = (int64_t)sext((a >> sh) & mask, width);
+                int64_t lb = (int64_t)sext((b >> sh) & mask, width);
+                uint64_t ua = (a >> sh) & mask, ub = (b >> sh) & mask;
+                uint64_t r;
+                switch (x4) {
+                case 0:                        /* padd */
+                    if (x2b == 0) r = (ua + ub) & mask;
+                    else if (x2b == 1) {       /* sss: signed saturate */
+                        int64_t s = la + lb;
+                        int64_t hi = (int64_t)(smin - 1), lo = -(int64_t)smin;
+                        r = (uint64_t)(s > hi ? hi : s < lo ? lo : s) & mask;
+                    } else {                   /* uuu / uus: unsigned saturate */
+                        uint64_t s = ua + ub;
+                        r = s > mask ? mask : s;
+                    }
+                    break;
+                case 1:                        /* psub */
+                    if (x2b == 0) r = (ua - ub) & mask;
+                    else if (x2b == 1) {       /* sss */
+                        int64_t s = la - lb;
+                        int64_t hi = (int64_t)(smin - 1), lo = -(int64_t)smin;
+                        r = (uint64_t)(s > hi ? hi : s < lo ? lo : s) & mask;
+                    } else {                   /* uuu / uus */
+                        r = ua < ub ? 0 : (ua - ub);
+                    }
+                    break;
+                case 2:                        /* pavg (+raz rounds up) */
+                    r = ((ua + ub + (x2b == 3 ? 1 : 0)) >> 1) & mask;
+                    break;
+                case 3:                        /* pavgsub */
+                    { int64_t s = (la - lb); r = (uint64_t)(s >> 1) & mask; }
+                    break;
+                case 9:                        /* pcmp: all-ones if true */
+                    if (x2b == 0) r = (ua == ub) ? mask : 0;      /* eq */
+                    else r = (la > lb) ? mask : 0;                /* gt */
+                    break;
+                default:
+                    *st = mhalt(m, "unimpl A9 parallel x4=%X x2b=%u", x4, x2b);
+                    return 0;
+                }
+                res |= (r & mask) << sh;
             }
-            *st = mhalt(m, "unimpl A-unit parallel op (major 8 x2a=1 x4=%X x2b=%u)",
-                        x4, x2b);
-            return 0;
+            gr_write(m, r1, res, nat);
+            return 1;
         }
         if (ve != 0) { *st = mhalt(m, "A-unit ve=1 reserved"); return 0; }
         uint64_t a = gr_read(m, r2, &n2);
@@ -896,7 +974,7 @@ static unsigned tlb_debug_events;
 static void psr_trans_log(Merced *m, uint64_t newpsr, const char *src) {
     static unsigned n;
     uint64_t chg = (m->psr ^ newpsr) & (PSR_IT | PSR_DT | PSR_RT);
-    if (chg && n < 32) {
+    if (merced_dbg() && chg && n < 32) {
         n++;
         fprintf(stderr, "merced: PSR it=%u->%u dt=%u->%u rt=%u->%u via %s"
                 " at ip=%016" PRIX64 "\n",
@@ -922,7 +1000,7 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
     e->ps = (uint8_t)ps;
     e->itir = itir;
     e->pte = pte;
-    if (tlb_debug_events < TLB_DEBUG_MAX) {
+    if (merced_dbg() && tlb_debug_events < TLB_DEBUG_MAX) {
         tlb_debug_events++;
         fprintf(stderr, "merced: insert %c ip=%016" PRIX64
                 " va=%016" PRIX64 " pa=%016" PRIX64 " ps=%u rid=%06X"
@@ -938,7 +1016,7 @@ static void tlb_purge(MercedTlbEntry *t, int n, uint32_t rid,
         if (t[i].valid && t[i].rid == rid &&
             t[i].va_start < va + len && va <= t[i].va_end) {
             t[i].valid = 0;
-            if (tlb_debug_events < TLB_DEBUG_MAX) {
+            if (merced_dbg() && tlb_debug_events < TLB_DEBUG_MAX) {
                 tlb_debug_events++;
                 fprintf(stderr, "merced: purge va=%016" PRIX64
                         " len=%016" PRIX64 " rid=%06X hit va=%016" PRIX64
@@ -1104,8 +1182,14 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
             if (m->msr_polls[idx] > 64 && (m->msr_polls[idx] & 1))
                 v = ~v;
         } else {
-            m->msr_toggle[idx] ^= 1;
-            v = m->msr_toggle[idx] ? 0 : ~0ull;
+            /* Unwritten status MSR: quiet (0) for one-shot reads - the
+             * SALE-entry wake-reason probes must see no pending events -
+             * but alternate once something polls it repeatedly so
+             * wait-for-set handshakes still terminate. */
+            if (m->msr_polls[idx] < 0xFFFF)
+                m->msr_polls[idx]++;
+            v = (m->msr_polls[idx] > 16 && (m->msr_polls[idx] & 1))
+                ? ~0ull : 0;
         }
         gr_write(m, r1, v, 0);
         return MERCED_OK;
@@ -1170,7 +1254,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         m->cr[cr3] = gr_read(m, r2, &n2);
         if (cr3 == CR_IVA) {
             static unsigned n;
-            if (n < 16) {
+            if (merced_dbg() && n < 16) {
                 n++;
                 fprintf(stderr, "merced: cr.iva <- %016" PRIX64
                         " at ip=%016" PRIX64 "\n", m->cr[cr3], m->ip);
@@ -1449,6 +1533,104 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             gr_write(m, r1, c, n3);
             return MERCED_OK;
         }
+        if (x2a == 2) {                             /* I2 parallel (mix/unpack/pack/pmin/pmax/psad) */
+            if (!qp) return MERCED_OK;
+            uint64_t s1 = gr_read(m, r2, &n2), s2 = gr_read(m, r3, &n3), res = 0;
+            uint8_t nat = n2 | n3;
+            unsigned esz = za ? 4 : zb ? 2 : 1;     /* element bytes */
+            unsigned n = 8 / esz;                    /* elements per reg */
+            uint64_t emask = (esz >= 8) ? ~0ull : ((1ull << (esz * 8)) - 1);
+            #define ELEM(v, i) (((v) >> ((i) * esz * 8)) & emask)
+            #define PUT(i, val) (res |= ((uint64_t)(val) & emask) << ((i) * esz * 8))
+            if (x2c == 2 && x2b != 3) {              /* mix.r (x2b=0) / mix.l (x2b=2) */
+                unsigned off = (x2b == 0) ? 1 : 0;   /* r takes odd elems, l even */
+                for (unsigned k = 0; k < n / 2; k++) {
+                    PUT(2 * k,     ELEM(s1, 2 * k + off));
+                    PUT(2 * k + 1, ELEM(s2, 2 * k + off));
+                }
+            } else if (x2c == 1 && (x2b == 0 || x2b == 2)) {  /* unpack.h/.l */
+                unsigned base = (x2b == 0) ? 0 : n / 2;
+                for (unsigned k = 0; k < n / 2; k++) {
+                    PUT(2 * k,     ELEM(s1, base + k));
+                    PUT(2 * k + 1, ELEM(s2, base + k));
+                }
+            } else if (x2c == 0 && (x2b == 0 || x2b == 2)) {  /* pack (sat, 2*esz->esz) */
+                /* pack2: hw->byte; pack4: word->hw. za=1 => pack4, else pack2.
+                 * x2b=0 unsigned-sat (pack2.uss), x2b=2 signed-sat. */
+                unsigned dbytes = esz;               /* dest element size */
+                unsigned sbytes = esz * 2;           /* src element size */
+                unsigned sn = 8 / sbytes;            /* src elems per reg */
+                uint64_t smask = (1ull << (sbytes * 8)) - 1;
+                for (unsigned k = 0; k < sn; k++) {
+                    for (int src = 0; src < 2; src++) {
+                        uint64_t sv = src ? s1 : s2;
+                        int64_t e = (int64_t)((sv >> (k * sbytes * 8)) & smask);
+                        e = sext((uint64_t)e, sbytes * 8);
+                        int64_t lim_hi = (1ll << (dbytes * 8 - 1)) - 1;
+                        int64_t lim_lo, out;
+                        if (x2b == 0) { lim_lo = 0; lim_hi = (1ll << (dbytes * 8)) - 1; }
+                        else lim_lo = -(1ll << (dbytes * 8 - 1));
+                        out = e < lim_lo ? lim_lo : e > lim_hi ? lim_hi : e;
+                        unsigned di = k + (src ? sn : 0);
+                        PUT(di, (uint64_t)out);
+                    }
+                }
+            } else if (x2b == 1 && (x2c == 0 || x2c == 1)) {  /* pmin.u/pmax.u (1) or signed (2) */
+                for (unsigned k = 0; k < n; k++) {
+                    uint64_t a = ELEM(s1, k), b = ELEM(s2, k);
+                    uint64_t r = (x2c == 0) ? (a < b ? a : b) : (a > b ? a : b);
+                    PUT(k, r);
+                }
+            } else if (x2b == 3 && (x2c == 0 || x2c == 1)) {  /* pmin2/pmax2 signed */
+                for (unsigned k = 0; k < n; k++) {
+                    int64_t a = sext(ELEM(s1, k), esz * 8);
+                    int64_t b = sext(ELEM(s2, k), esz * 8);
+                    int64_t r = (x2c == 0) ? (a < b ? a : b) : (a > b ? a : b);
+                    PUT(k, (uint64_t)r);
+                }
+            } else if (x2b == 3 && x2c == 2) {       /* psad1: sum of abs byte diffs */
+                uint64_t acc = 0;
+                for (unsigned k = 0; k < n; k++) {
+                    int a = (int)ELEM(s1, k), b = (int)ELEM(s2, k);
+                    acc += (uint64_t)(a > b ? a - b : b - a);
+                }
+                res = acc;
+            } else {
+                return mhalt(m, "unimpl I2 x2b=%u x2c=%u esz=%u", x2b, x2c, esz);
+            }
+            #undef ELEM
+            #undef PUT
+            gr_write(m, r1, res, nat);
+            return MERCED_OK;
+        }
+        if (x2a == 3 && x2b == 2 && x2c == 2 && za == 0) {  /* I3 mux1 / I4 mux2 */
+            if (!qp) return MERCED_OK;
+            uint64_t a = gr_read(m, r2, &n2), res = 0;
+            uint8_t sb[8];
+            for (int i = 0; i < 8; i++) sb[i] = (uint8_t)(a >> (i * 8));
+            if (zb == 0) {                              /* mux1: byte permute */
+                unsigned mbt = (unsigned)bits(raw, 20, 4);
+                static const int perm[16][8] = {
+                    [0x0] = {7,7,7,7,7,7,7,7},          /* @brcst (byte 7) */
+                    [0x8] = {0,4,2,6,1,5,3,7},          /* @mix */
+                    [0x9] = {0,4,1,5,2,6,3,7},          /* @shuf */
+                    [0xA] = {0,2,4,6,1,3,5,7},          /* @alt */
+                    [0xB] = {7,6,5,4,3,2,1,0},          /* @rev */
+                };
+                if (mbt != 0 && mbt != 8 && mbt != 9 && mbt != 0xA && mbt != 0xB)
+                    return mhalt(m, "mux1 reserved mbtype %u", mbt);
+                for (int i = 0; i < 8; i++)
+                    res |= (uint64_t)sb[perm[mbt][i]] << (i * 8);
+            } else {                                    /* mux2: 16-bit permute */
+                unsigned mht = (unsigned)bits(raw, 20, 8);
+                uint16_t hw[4];
+                for (int i = 0; i < 4; i++) hw[i] = (uint16_t)(a >> (i * 16));
+                for (int i = 0; i < 4; i++)
+                    res |= (uint64_t)hw[(mht >> (i * 2)) & 3] << (i * 16);
+            }
+            gr_write(m, r1, res, n2);
+            return MERCED_OK;
+        }
         return mhalt(m, "unimpl I-unit major 7 za=%u zb=%u x2a=%u x2b=%u x2c=%u",
                      za, zb, x2a, x2b, x2c);
     }
@@ -1555,6 +1737,12 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
             return MERCED_OK;
         case 7:                                     /* br.ctop */
             if (do_ctop(m, 1)) { m->ip = target; m->taken = 1; }
+            return MERCED_OK;
+        case 2:                                     /* br.wexit */
+            if (do_wtop(m, qp, 0)) { m->ip = target; m->taken = 1; }
+            return MERCED_OK;
+        case 3:                                     /* br.wtop */
+            if (do_wtop(m, qp, 1)) { m->ip = target; m->taken = 1; }
             return MERCED_OK;
         }
         return mhalt(m, "unimpl B-unit major 4 btype=%u", btype);
@@ -1676,6 +1864,25 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
                 MercedFpReg a = fr_read(m, f2), r;
                 r = d2fp((double)(int64_t)a.sig);
                 r.nat = a.nat;
+                fr_write(m, f1, r);
+                return MERCED_OK;
+            }
+            case 0x3A: case 0x3B: case 0x3C: case 0x3D: {
+                /* fmix.r/.l, fsxt.r/.l - treat FP regs as 64-bit integer
+                 * data (two 32-bit words) and shuffle the halves. */
+                if (!qp) return MERCED_OK;
+                MercedFpReg a = fr_read(m, f2), b = fr_read(m, f3);
+                MercedFpReg r = {0, 0x1003E, 0, (uint8_t)(a.nat | b.nat)};
+                uint32_t a_lo = (uint32_t)a.sig, a_hi = (uint32_t)(a.sig >> 32);
+                uint32_t b_lo = (uint32_t)b.sig, b_hi = (uint32_t)(b.sig >> 32);
+                uint32_t lo, hi;
+                switch (x6) {
+                case 0x3A: lo = a_hi; hi = b_hi; break;               /* fmix.r */
+                case 0x3B: lo = a_lo; hi = b_lo; break;               /* fmix.l */
+                case 0x3C: lo = (a_hi & 1) ? ~0u : 0u; hi = b_hi; break; /* fsxt.r */
+                default:   lo = (uint32_t)((int32_t)a_lo >> 31); hi = b_lo; break; /* fsxt.l */
+                }
+                r.sig = (uint64_t)lo | ((uint64_t)hi << 32);
                 fr_write(m, f1, r);
                 return MERCED_OK;
             }
