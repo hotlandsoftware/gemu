@@ -84,6 +84,8 @@ struct Ia64I2000State {
     uint32_t  sac_cbnr, sac_ccsr;
     uint8_t   port61;
     uint8_t   pit2_polls;
+    uint8_t   cmos_index;
+    uint8_t   cmos[128];
     uint32_t  pci_cfg_addr;
     uint8_t   cmd649_cfg[256];
     uint8_t   chipset_bus;
@@ -242,6 +244,8 @@ static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
 }
 
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
+    if (port == 0x73 && size == 1)
+        return s->cmos[s->cmos_index & 0x7F];
     if (port == PCI_CFG_ADDR && size == 4) return s->pci_cfg_addr;
     if (port >= PCI_CFG_DATA && port < PCI_CFG_DATA + 4)
         return pci_cfg_read(s, (unsigned)(port - PCI_CFG_DATA), size);
@@ -277,6 +281,15 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
+    if (port == 0x72 && size == 1) {
+        /* The i2000 IFB exposes its RTC/configuration RAM at 72h/73h. */
+        s->cmos_index = (uint8_t)val & 0x7F;
+        return;
+    }
+    if (port == 0x73 && size == 1) {
+        s->cmos[s->cmos_index & 0x7F] = (uint8_t)val;
+        return;
+    }
     if (port == RESET_CTRL_PORT && size == 1) {
         /* Intel reset-control convention: bit 1 selects a hard reset and
          * bit 2 triggers it.  SAL writes 02h followed by 06h, then waits in
@@ -583,6 +596,11 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     memset(s->chipset_cfg, 0, sizeof(s->chipset_cfg));
     memset(s->memcard_cfg, 0, sizeof(s->memcard_cfg));
     memset(s->cmd649_cfg, 0, sizeof(s->cmd649_cfg));
+    memset(s->cmos, 0, sizeof(s->cmos));
+    s->cmos_index = 0;
+    s->cmos[0x0A] = 0x26;                         /* divider, 32.768 kHz */
+    s->cmos[0x0B] = 0x02;                         /* 24-hour BCD mode */
+    s->cmos[0x0D] = 0x80;                         /* CMOS power valid */
 
     /* Integrated CMD Technology PCI-649 Ultra ATA/100 controller at the
      * i2000 IFB's fixed 00:03.1 function. */
