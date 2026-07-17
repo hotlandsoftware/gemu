@@ -462,21 +462,17 @@ static void rotate_regs(Merced *m) {
 /* br.wtop/br.wexit engine: like ctop/cexit but the loop-continue condition
  * is the qualifying predicate qp rather than LC. Returns taken flag. */
 static int do_wtop(Merced *m, int qp, int is_top) {
-    int cont;
+    int cont = qp || (m->ar[AR_EC] & 0x3F) > 1;
+
+    /* Unlike br.ctop, the while-loop forms always stage a false predicate.
+     * They rotate only while the qualifying predicate is true or epilog
+     * stages remain. */
+    pr_write(m, 63, 0);
     if (qp) {
-        pr_write(m, 63, 1);
         rotate_regs(m);
-        cont = 1;
-    } else if ((m->ar[AR_EC] & 0x3F) > 1) {
+    } else if (m->ar[AR_EC] & 0x3F) {
         m->ar[AR_EC]--;
-        pr_write(m, 63, 0);
         rotate_regs(m);
-        cont = 1;
-    } else {
-        if (m->ar[AR_EC] & 0x3F) m->ar[AR_EC]--;
-        pr_write(m, 63, 0);
-        rotate_regs(m);
-        cont = 0;
     }
     return is_top ? cont : !cont;
 }
@@ -490,22 +486,17 @@ static int do_wtop(Merced *m, int qp, int is_top) {
  * physical slot off, desynchronising p16/p17 for a rotation and corrupting
  * software-pipelined loops. */
 static int do_ctop(Merced *m, int is_top) {
-    int taken;
+    int taken = m->ar[AR_LC] != 0 || (m->ar[AR_EC] & 0x3F) > 1;
     if (m->ar[AR_LC] != 0) {
         m->ar[AR_LC]--;
         pr_write(m, 63, 1);
         rotate_regs(m);
-        taken = 1;
-    } else if ((m->ar[AR_EC] & 0x3F) > 1) {
+    } else if (m->ar[AR_EC] & 0x3F) {
         m->ar[AR_EC]--;
         pr_write(m, 63, 0);
         rotate_regs(m);
-        taken = 1;
     } else {
-        if (m->ar[AR_EC] & 0x3F) m->ar[AR_EC]--;
         pr_write(m, 63, 0);
-        rotate_regs(m);
-        taken = 0;
     }
     return is_top ? taken : !taken;
 }
@@ -1107,7 +1098,11 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         if (sof > MERCED_N_STACKED)
             return mhalt(m, "alloc sof=%u too large", sof);
         gr_write(m, r1, m->ar[AR_PFS], 0);
-        m->cfm = sof | ((uint64_t)sol << 7) | ((uint64_t)sor << 14);
+        /* alloc replaces sof/sol/sor but preserves the three rotation
+         * bases.  Firmware routinely enters leaf arithmetic helpers with
+         * a non-zero rrb.pr and relies on alloc leaving it intact. */
+        m->cfm = (m->cfm & ~0x3FFFFull) |
+                 sof | ((uint64_t)sol << 7) | ((uint64_t)sor << 14);
         return MERCED_OK;
     }
     if (x3 != 0)
