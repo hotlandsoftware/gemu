@@ -1415,7 +1415,13 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
 
     case 4: {                                       /* I15 dep r1=r2,r3,pos6,len4 */
         if (!qp) return MERCED_OK;
-        unsigned pos = 63 - (unsigned)bits(raw, 31, 6);
+        /* I15's complemented position is split around the opcode fields;
+         * it is not raw bits 36:31. */
+        unsigned cpos = (unsigned)bits(raw, 31, 2) |
+                        ((unsigned)bits(raw, 33, 1) << 2) |
+                        ((unsigned)bits(raw, 34, 2) << 3) |
+                        ((unsigned)bits(raw, 36, 1) << 5);
+        unsigned pos = 63 - cpos;
         unsigned len = (unsigned)bits(raw, 27, 4) + 1;
         uint64_t a = gr_read(m, r2, &n2), b = gr_read(m, r3, &n3);
         uint64_t mask = (len >= 64) ? ~0ull : ((1ull << len) - 1);
@@ -1900,10 +1906,14 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
             if (!qp) return MERCED_OK;
             warn_once(m, WARN_FP_APPROX, "FP ops use double-precision approximation");
             unsigned p2 = (unsigned)bits(raw, 27, 6);
+            MercedFpReg a = fr_read(m, f2);
             MercedFpReg b = fr_read(m, f3);
             double d = fp2d(b);
             if (d != 0.0) {
-                fr_write(m, f1, d2fp(1.0 / d));
+                /* frcpa approximates a / b.  The following refinement
+                 * sequence relies on the numerator being included; using
+                 * 1 / b breaks the compiler's integer-division helpers. */
+                fr_write(m, f1, d2fp(fp2d(a) / d));
                 pr_write(m, p2, 1);
             } else {
                 pr_write(m, p2, 0);
