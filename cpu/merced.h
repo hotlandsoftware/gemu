@@ -119,6 +119,13 @@ typedef struct Merced {
     MercedTlbEntry itc[MERCED_N_TC], dtc[MERCED_N_TC];
     uint32_t itc_next, dtc_next;
 
+    /* Interval-timer external interrupt: edge-latched when ar.itc crosses
+     * cr.itm, delivered at the next instruction boundary if psr.i is set,
+     * acknowledged (cleared) by a cr.ivr read. Real firmware relies on this
+     * for cooperative timeouts during driver/protocol enumeration; without
+     * it, any code that waits on a timer tick spins forever. */
+    uint8_t  timer_pending;
+
     /* --- bookkeeping --- */
     uint8_t  taken;       /* set when the executed slot redirected IP */
     uint64_t trace_n;     /* stderr-trace this many slots (debug) */

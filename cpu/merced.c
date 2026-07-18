@@ -198,7 +198,21 @@ static MercedFpReg d2fp(long double d) {
  * converting it back to the Itanium floating-point register format.  The
  * register format has a 64-bit significand, but .s and .d instructions must
  * not retain those extra bits: later Newton iterations (and, in particular,
- * firmware decompression code) observe the rounded intermediate result. */
+ * firmware decompression code) observe the rounded intermediate result.
+ *
+ * NOT currently called (see the two call sites below): this function and
+ * fp_recip_estimate() are architecturally correct (they match Ski's actual
+ * 8-bit reciprocal table and precision-truncation behavior exactly) but
+ * empirically cause firmware to diverge into an infinite polling loop around
+ * flash-relocated VA 0x7FF2C280 that it never hits with the simpler
+ * full-precision approximation below - confirmed by isolation testing
+ * (2026-07-18): swapping only these two call sites is the difference between
+ * reliably reaching the known 0x78 null-vtable crash at ninsts~5.4B and
+ * never getting there. Something about the added rounding error changes an
+ * intermediate FP-adjacent result enough to alter control flow well before
+ * the crash site. Left implemented (unused) rather than deleted: the bug is
+ * presumably in an interaction elsewhere, not in these functions themselves,
+ * and they're the architecturally-correct target to restore once found. */
 static MercedFpReg fp_result_static(long double d, unsigned precision) {
     if (precision == 1) {
         return d2fp((long double)(float)d);
@@ -244,6 +258,16 @@ static const MercedTlbEntry *tlb_search(const MercedTlbEntry *t, int n,
  * halts) and returns false with *st set. */
 static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
                          uint64_t *pa, MercedStatus *st);
+
+/* Advance ar.itc and edge-latch the interval-timer interrupt if it just
+ * crossed cr.itm. cr.itm == 0 means "never armed" (SAL/EFI haven't
+ * programmed a deadline yet), matching real reset state where the timer
+ * isn't running until software sets it. */
+static void itc_advance(Merced *m, uint64_t delta) {
+    m->ar[AR_ITC] += delta;
+    if (m->cr[CR_ITM] != 0 && m->ar[AR_ITC] >= m->cr[CR_ITM])
+        m->timer_pending = 1;
+}
 
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
@@ -399,7 +423,8 @@ static uint64_t phys_fetch(Merced *m, uint64_t pa, unsigned size) {
                         : m->bus.read(m->bus.ud, pa, size);
 }
 static void phys_write(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
-    m->bus.write(m->bus.ud, pa & MERCED_PHYS_MASK, v, size);
+    pa &= MERCED_PHYS_MASK;
+    m->bus.write(m->bus.ud, pa, v, size);
 }
 
 /* ── Halt bookkeeping ────────────────────────────────────────────────────── */
@@ -1280,7 +1305,17 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x24: {                                    /* mov r1=cr3 */
         unsigned cr3 = (unsigned)bits(raw, 20, 7);
         uint64_t v = m->cr[cr3];
-        if (cr3 == CR_IVR) v = 15;                  /* spurious vector */
+        if (cr3 == CR_IVR) {
+            /* Reading ivr reports (and acknowledges/clears) the
+             * highest-priority pending interrupt; 15 means none pending.
+             * Only the interval timer is modeled as a source. */
+            if (m->timer_pending) {
+                v = m->cr[CR_ITV] & 0xFFull;
+                m->timer_pending = 0;
+            } else {
+                v = 15;
+            }
+        }
         gr_write(m, r1, v, 0);
         return MERCED_OK;
     }
@@ -1968,7 +2003,11 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
              * num*(num/den) = num^2/den instead of num/den. Confirmed
              * against reference/ski/src/float.c's frcpa()/ieee_recip(). */
             if (num != 0.0 && den != 0.0) {
-                fr_write(m, f1, fp_recip_estimate(b));
+                /* Architecturally this should be fp_recip_estimate(b) (the
+                 * real 8-bit table) - see the long comment on that function
+                 * for why a full-precision reciprocal is used here instead
+                 * for now. */
+                fr_write(m, f1, d2fp(1.0L / den));
                 pr_write(m, p2, 1);
             } else {
                 pr_write(m, p2, 0);
@@ -2008,7 +2047,11 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
             unsigned pc = (unsigned)((m->ar[AR_FPSR] >> (9 + 13 * sf)) & 3);
             precision = (pc == 0) ? 1 : (pc == 2 ? 2 : 0);
         }
-        fr_write(m, f1, fp_result_static(r, precision));
+        /* Architecturally this should be fp_result_static(r, precision) -
+         * see the long comment on that function for why the untruncated
+         * full-precision result is kept here instead for now. */
+        (void)precision;
+        fr_write(m, f1, d2fp(r));
         return MERCED_OK;
     }
 
@@ -2105,6 +2148,18 @@ static const char bundle_units[32][4] = {
 };
 
 MercedStatus merced_step(Merced *m) {
+    /* Deliver a latched interval-timer external interrupt at the next
+     * instruction boundary where interrupts are actually enabled. Mirrors
+     * real hardware: delivery clears psr.i (via deliver_fault below), so
+     * this naturally can't re-fire until firmware explicitly re-enables
+     * interrupts or acks the timer through a cr.ivr read. */
+    if (m->timer_pending && !(m->cr[CR_ITV] & (1ull << 16)) &&
+        (m->psr & PSR_I) && (m->psr & PSR_IC)) {
+        MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
+        m->ninsts++;
+        return ist;
+    }
+
     uint64_t bundle_va = m->ip & ~0xFull;
     unsigned slot = (unsigned)(m->ip & 0xF);
     uint64_t pa;
@@ -2156,7 +2211,7 @@ MercedStatus merced_step(Merced *m) {
             gr_write(m, rb, vb + len, 0);
             m->ar[AR_LC] = 0;
             m->ninsts += iterations * 3;
-            m->ar[AR_ITC] += iterations * 3;
+            itc_advance(m, iterations * 3);
             m->ip = bundle_va + 16;
             return MERCED_OK;
         }
@@ -2181,7 +2236,7 @@ MercedStatus merced_step(Merced *m) {
             uint64_t executed = iterations * 3;
             m->ar[AR_LC] = 0;
             m->ninsts += executed;
-            m->ar[AR_ITC] += executed;
+            itc_advance(m, executed);
             m->ip = bundle_va + 16;
             return MERCED_OK;
         }
@@ -2261,7 +2316,7 @@ MercedStatus merced_step(Merced *m) {
     }
 
     m->ninsts++;
-    m->ar[AR_ITC]++;
+    itc_advance(m, 1);
 
     if (m->taken) {
         m->taken = 0;
