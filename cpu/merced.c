@@ -8,6 +8,7 @@
 
 #include "merced.h"
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -158,33 +159,71 @@ static void fr_write(Merced *m, unsigned r, MercedFpReg v) {
 
 /* FP <-> double conversion (approximate: fine for firmware arithmetic,
  * not IEEE-corner exact). */
-static double fp2d(MercedFpReg f) {
+static long double fp2d(MercedFpReg f) {
     if (f.exp == 0 && f.sig == 0) return f.sign ? -0.0 : 0.0;
     if (f.exp == 0x1003E) {   /* integer form */
-        double d = (double)f.sig;
+        long double d = (long double)f.sig;
         return f.sign ? -d : d;
     }
     int e = (int)f.exp - 0xFFFF;
-    double d = (double)f.sig * 0x1p-63 * 0.5;   /* sig has explicit int bit */
+    long double d = (long double)f.sig * 0x1p-63L * 0.5L; /* explicit int bit */
     d = d * 2.0;
     /* build 2^e */
-    double p = 1.0;
+    long double p = 1.0L;
     int n = e < 0 ? -e : e;
-    double b = 2.0;
+    long double b = 2.0L;
     while (n) { if (n & 1) p *= b; b *= b; n >>= 1; }
     d = e < 0 ? d / p : d * p;
     return f.sign ? -d : d;
 }
-static MercedFpReg d2fp(double d) {
+static MercedFpReg d2fp(long double d) {
     MercedFpReg f = {0, 0, 0, 0};
     if (d == 0.0) return f;
     if (d < 0) { f.sign = 1; d = -d; }
     int e = 0;
-    while (d >= 2.0) { d *= 0.5; e++; }
-    while (d < 1.0) { d *= 2.0; e--; }
+    while (d >= 2.0L) { d *= 0.5L; e++; }
+    while (d < 1.0L) { d *= 2.0L; e--; }
+    long double scaled = d * 0x1p63L;
+    if (scaled >= 0x1p64L - 0.5L) {
+        f.sig = 0x8000000000000000ull;
+        e++;
+    } else {
+        f.sig = (uint64_t)(scaled + 0.5L);
+    }
     f.exp = (uint32_t)(e + 0xFFFF);
-    f.sig = (uint64_t)(d * 0x1p63);
     return f;
+}
+
+/* Round an FMA-family result to the instruction's static precision before
+ * converting it back to the Itanium floating-point register format.  The
+ * register format has a 64-bit significand, but .s and .d instructions must
+ * not retain those extra bits: later Newton iterations (and, in particular,
+ * firmware decompression code) observe the rounded intermediate result. */
+static MercedFpReg fp_result_static(long double d, unsigned precision) {
+    if (precision == 1) {
+        return d2fp((long double)(float)d);
+    }
+    if (precision == 2) {
+        return d2fp((long double)(double)d);
+    }
+    return d2fp(d);
+}
+
+/* Merced frcpa's architected 8-bit reciprocal estimate.  Ski expresses this
+ * as a 256-entry table indexed by significand bits 62:55.  The table is
+ * exactly round(2^20 / (513 + 2*index)), so keep the equivalent integer form
+ * here instead of embedding 256 constants. */
+static MercedFpReg fp_recip_estimate(MercedFpReg den) {
+    unsigned index = (unsigned)((den.sig >> 55) & 0xff);
+    unsigned divisor = 513 + 2 * index;
+    uint64_t estimate = (1048576u + divisor / 2) / divisor;
+    MercedFpReg r = {
+        .sig = estimate << 53,
+        .exp = 0x1fffdU - den.exp,
+        .sign = den.sign,
+        .nat = den.nat,
+    };
+    return r;
 }
 
 /* ── Memory / translation ────────────────────────────────────────────────── */
@@ -1331,12 +1370,21 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
                                             bits(raw, 13, 7), 8);
                 return MERCED_OK;
             }
-            case 0x10: if (qp) gr_write(m, r1, (uint8_t)gr_read(m, r3, &n3), n3); return MERCED_OK;
-            case 0x11: if (qp) gr_write(m, r1, (uint16_t)gr_read(m, r3, &n3), n3); return MERCED_OK;
-            case 0x12: if (qp) gr_write(m, r1, (uint32_t)gr_read(m, r3, &n3), n3); return MERCED_OK;
-            case 0x14: if (qp) gr_write(m, r1, (uint64_t)(int8_t)gr_read(m, r3, &n3), n3); return MERCED_OK;
-            case 0x15: if (qp) gr_write(m, r1, (uint64_t)(int16_t)gr_read(m, r3, &n3), n3); return MERCED_OK;
-            case 0x16: if (qp) gr_write(m, r1, (uint64_t)(int32_t)gr_read(m, r3, &n3), n3); return MERCED_OK;
+            case 0x10: case 0x11: case 0x12:
+            case 0x14: case 0x15: case 0x16: {       /* zxt/sext */
+                if (!qp) return MERCED_OK;
+                uint64_t v = gr_read(m, r3, &n3);
+                switch (x6) {
+                case 0x10: v = (uint8_t)v; break;
+                case 0x11: v = (uint16_t)v; break;
+                case 0x12: v = (uint32_t)v; break;
+                case 0x14: v = (uint64_t)(int64_t)(int8_t)v; break;
+                case 0x15: v = (uint64_t)(int64_t)(int16_t)v; break;
+                default:   v = (uint64_t)(int64_t)(int32_t)v; break;
+                }
+                gr_write(m, r1, v, n3);
+                return MERCED_OK;
+            }
             case 0x18: case 0x19: case 0x1C: case 0x1D: {   /* czx */
                 if (!qp) return MERCED_OK;
                 uint64_t v = gr_read(m, r3, &n3);
@@ -1860,7 +1908,7 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
                 if (!qp) return MERCED_OK;
                 MercedFpReg a = fr_read(m, f2);
                 MercedFpReg r = {0, 0x1003E, 0, a.nat};
-                double d = fp2d(a);
+                long double d = fp2d(a);
                 /* only truncating rounding modeled; sf rounding control is
                  * a refinement for later */
                 if (x6 & 1)
@@ -1908,12 +1956,19 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
             unsigned p2 = (unsigned)bits(raw, 27, 6);
             MercedFpReg a = fr_read(m, f2);
             MercedFpReg b = fr_read(m, f3);
-            double d = fp2d(b);
-            if (d != 0.0) {
-                /* frcpa approximates a / b.  The following refinement
-                 * sequence relies on the numerator being included; using
-                 * 1 / b breaks the compiler's integer-division helpers. */
-                fr_write(m, f1, d2fp(fp2d(a) / d));
+            long double num = fp2d(a), den = fp2d(b);
+            /* frcpa approximates 1/den only - num (f2) is a source purely for
+             * the architected NaN/zero/inf special-case checks below, never
+             * multiplied in. Compiler-generated Newton-Raphson division
+             * sequences rely on this: they multiply the reciprocal by the
+             * numerator themselves in a later fma. Returning num/den here
+             * (as an earlier version of this code did) silently corrupts
+             * every runtime integer/float division that goes through such a
+             * sequence, since the caller's next step becomes
+             * num*(num/den) = num^2/den instead of num/den. Confirmed
+             * against reference/ski/src/float.c's frcpa()/ieee_recip(). */
+            if (num != 0.0 && den != 0.0) {
+                fr_write(m, f1, fp_recip_estimate(b));
                 pr_write(m, p2, 1);
             } else {
                 pr_write(m, p2, 0);
@@ -1926,22 +1981,34 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
     if (major >= 8 && major <= 0xD) {               /* F1 fma family */
         if (!qp) return MERCED_OK;
         unsigned xbit = (unsigned)bits(raw, 36, 1);
-        if (major == 0xE || (major >= 0xE)) {}      /* unreachable */
-        if (xbit && (major == 8 || major == 9)) {
+        if (xbit && (major & 1)) {
             /* fpma (parallel) - unimplemented */
             return mhalt(m, "unimpl F-unit fpma/parallel major %u", major);
         }
         warn_once(m, WARN_FP_APPROX, "FP ops use double-precision approximation");
-        double a = fp2d(fr_read(m, f3));
-        double bmul = fp2d(fr_read(m, f4));
-        double c = fp2d(fr_read(m, f2));
-        double r;
+        long double a = fp2d(fr_read(m, f3));
+        long double bmul = fp2d(fr_read(m, f4));
+        long double c = fp2d(fr_read(m, f2));
+        long double r;
         switch (major) {
-        case 8: case 9:  r = a * bmul + c; break;   /* fma */
-        case 0xA: case 0xB: r = a * bmul - c; break;/* fms */
-        default: r = -(a * bmul) + c; break;        /* fnma */
+        case 8: case 9:  r = fmal(a, bmul, c); break;    /* fma */
+        case 0xA: case 0xB: r = fmal(a, bmul, -c); break;/* fms */
+        default: r = fmal(-a, bmul, c); break;           /* fnma */
         }
-        fr_write(m, f1, d2fp(r));
+        /* Even major, x=0 is dynamic precision selected by the instruction's
+         * FPSR status field; even major, x=1 is explicitly single precision.
+         * Odd major, x=0 is double precision (odd/x=1 is parallel). */
+        unsigned precision;
+        if (major & 1) {
+            precision = 2;
+        } else if (xbit) {
+            precision = 1;
+        } else {
+            unsigned sf = (unsigned)bits(raw, 34, 2);
+            unsigned pc = (unsigned)((m->ar[AR_FPSR] >> (9 + 13 * sf)) & 3);
+            precision = (pc == 0) ? 1 : (pc == 2 ? 2 : 0);
+        }
+        fr_write(m, f1, fp_result_static(r, precision));
         return MERCED_OK;
     }
 
@@ -1996,7 +2063,7 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
         unsigned ta = (unsigned)bits(raw, 12, 1);
         unsigned p1 = (unsigned)bits(raw, 6, 6);
         unsigned p2 = (unsigned)bits(raw, 27, 6);
-        double a = fp2d(fr_read(m, f2)), b = fp2d(fr_read(m, f3));
+        long double a = fp2d(fr_read(m, f2)), b = fp2d(fr_read(m, f3));
         int res;
         switch ((ra << 1) | rb) {
         case 0: res = a == b; break;
