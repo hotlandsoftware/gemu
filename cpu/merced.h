@@ -125,6 +125,8 @@ typedef struct Merced {
      * for cooperative timeouts during driver/protocol enumeration; without
      * it, any code that waits on a timer tick spins forever. */
     uint8_t  timer_pending;
+    uint8_t  external_pending;
+    uint8_t  external_vector;
 
     /* --- bookkeeping --- */
     uint8_t  taken;       /* set when the executed slot redirected IP */
@@ -155,6 +157,9 @@ void    merced_reset(Merced *m);
 /* Execute one instruction slot. On anything but MERCED_OK, halt_msg
  * describes why and the CPU is stopped at the offending IP. */
 MercedStatus merced_step(Merced *m);
+
+/* Latch a platform interrupt for delivery through cr.ivr. */
+void merced_raise_external(Merced *m, uint8_t vector);
 
 /* Full register dump for the monitor. */
 void merced_dump_state(const Merced *m, char *buf, size_t len);

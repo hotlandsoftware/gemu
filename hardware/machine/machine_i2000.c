@@ -84,9 +84,16 @@ struct Ia64I2000State {
 
     /* devices */
     uint8_t   post_code;
+    bool      legacy_irq_routed;
     uint32_t  sac_cbnr, sac_ccsr;
     uint8_t   port61;
     uint8_t   pit2_polls;
+    uint8_t   pic_master_mask, pic_slave_mask;
+    uint8_t   pic_master_base, pic_slave_base;
+    uint8_t   pic_master_icw, pic_slave_icw;
+    uint16_t  pit0_reload, pit0_latch;
+    uint8_t   pit0_write_phase;
+    uint64_t  pit0_next_irq;
     uint8_t   kbc_command_byte;
     uint8_t   kbc_pending_write; /* 0=keyboard data, 1=command byte, 2=output port, 3=aux */
     uint8_t   kbc_out[8];
@@ -398,7 +405,8 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         case 7: return s->uart_scr;
         }
     }
-    if (port == 0x21 || port == 0xA1) return 0xFF;  /* PIC masks */
+    if (port == 0x21) return s->pic_master_mask;
+    if (port == 0xA1) return s->pic_slave_mask;
     if (port == 0x404)
         /* System status/GPIO word. The bootstrap reads this once: bits 24
          * and 19 both set means the BIOS recovery jumper is installed and
@@ -447,6 +455,52 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
+    if (port == 0x21 && size == 1) {
+        if (s->pic_master_icw) {
+            if (s->pic_master_icw == 1)
+                s->pic_master_base = (uint8_t)val & 0xF8;
+            if (++s->pic_master_icw > 3)
+                s->pic_master_icw = 0;
+            return;
+        }
+        s->pic_master_mask = (uint8_t)val;
+        if (!(s->pic_master_mask & 1) && s->pit0_reload &&
+            !s->pit0_next_irq)
+            s->pit0_next_irq = s->cpu->ninsts + 100000;
+        return;
+    }
+    if (port == 0xA1 && size == 1) {
+        if (s->pic_slave_icw) {
+            if (s->pic_slave_icw == 1)
+                s->pic_slave_base = (uint8_t)val & 0xF8;
+            if (++s->pic_slave_icw > 3)
+                s->pic_slave_icw = 0;
+            return;
+        }
+        s->pic_slave_mask = (uint8_t)val;
+        return;
+    }
+    if (port == 0x20 || port == 0xA0) {
+        if ((val & 0x10) != 0) {
+            if (port == 0x20)
+                s->pic_master_icw = 1;
+            else
+                s->pic_slave_icw = 1;
+        }
+        /* Other commands are OCWs (including EOI). */
+        return;
+    }
+    if (port == 0x40 && size == 1) {
+        if (!s->pit0_write_phase) {
+            s->pit0_latch = (uint8_t)val;
+            s->pit0_write_phase = 1;
+        } else {
+            s->pit0_reload = s->pit0_latch | ((uint16_t)(uint8_t)val << 8);
+            s->pit0_write_phase = 0;
+            s->pit0_next_irq = s->cpu->ninsts + 100000;
+        }
+        return;
+    }
     if (port == 0x64 && size == 1) {               /* 8042 command */
         uint8_t cmd = (uint8_t)val;
         s->kbc_out_pos = s->kbc_out_len = 0;
@@ -533,7 +587,11 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         s->pit2_polls = 0;
         return;
     }
-    if (port == 0x43) return;                       /* PIT mode control */
+    if (port == 0x43) {
+        if (((uint8_t)val >> 6) == 0)
+            s->pit0_write_phase = 0;
+        return;
+    }
     if (port == 0x61) {
         s->port61 = (uint8_t)val & 0x0F;
         return;
@@ -1032,6 +1090,9 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     if (!s)
         return NULL;
 
+    s->pic_master_mask = 0xFF;
+    s->pic_slave_mask = 0xFF;
+
     s->ram_size = cfg->ram_size;
     s->ram = calloc(1, (size_t)s->ram_size);
     s->flash = malloc(I2000_FLASH_SIZE);
@@ -1107,6 +1168,14 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
 
 /* ── Execution ───────────────────────────────────────────────────────────── */
 
+static void i2000_poll_interrupts(Ia64I2000State *s) {
+    if (s->legacy_irq_routed && !(s->pic_master_mask & 1) && s->pit0_next_irq &&
+        s->cpu->ninsts >= s->pit0_next_irq) {
+        merced_raise_external(s->cpu, s->pic_master_base);
+        s->pit0_next_irq = s->cpu->ninsts + 100000;
+    }
+}
+
 static void i2000_report_halt(Ia64I2000State *s) {
     Merced *m = s->cpu;
     char buf[4096];
@@ -1145,6 +1214,7 @@ static void i2000_run_slice(Ia64I2000State *s) {
     for (int i = 0; i < INSTR_PER_FRAME; i++) {
         if (gemu_monitor_check_exec(s->monitor, (uint32_t)s->cpu->ip))
             return;
+        i2000_poll_interrupts(s);
         MercedStatus st = merced_step(s->cpu);
         if (s->reset_requested) {
             fprintf(stderr, "i2000: firmware requested a platform reset\n");
@@ -1184,8 +1254,16 @@ static void i2000_reset(Ia64I2000State *s) {
     s->reset_requested = false;
     s->fw_shadow_enabled = false;
     s->post_code = 0;
+    s->legacy_irq_routed = false;
     s->sac_cbnr = s->sac_ccsr = 0;
     s->port61 = s->pit2_polls = 0;
+    s->pic_master_mask = s->pic_slave_mask = 0xFF;
+    s->pic_master_base = 0x08;
+    s->pic_slave_base = 0x70;
+    s->pic_master_icw = s->pic_slave_icw = 0;
+    s->pit0_reload = s->pit0_latch = 0;
+    s->pit0_write_phase = 0;
+    s->pit0_next_irq = 0;
     chipset_cfg_reset(s);
     s->mmio_log_n = 0;
     memset(s->mmio_log, 0, sizeof(s->mmio_log));
@@ -1240,6 +1318,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                     if (gemu_monitor_check_exec(s->monitor,
                                                 (uint32_t)s->cpu->ip))
                         break;
+                    i2000_poll_interrupts(s);
                     MercedStatus st = merced_step(s->cpu);
                     if (st != MERCED_OK) {
                         s->halted = true;

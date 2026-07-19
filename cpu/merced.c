@@ -184,12 +184,16 @@ static MercedFpReg d2fp(long double d) {
     while (d >= 2.0L) { d *= 0.5L; e++; }
     while (d < 1.0L) { d *= 2.0L; e--; }
     long double scaled = d * 0x1p63L;
-    if (scaled >= 0x1p64L - 0.5L) {
-        f.sig = 0x8000000000000000ull;
-        e++;
-    } else {
-        f.sig = (uint64_t)(scaled + 0.5L);
+    uint64_t sig = (uint64_t)scaled;
+    long double fraction = scaled - (long double)sig;
+    if (fraction > 0.5L || (fraction == 0.5L && (sig & 1))) {
+        sig++;
+        if (sig == 0) {
+            sig = UINT64_C(0x8000000000000000);
+            e++;
+        }
     }
+    f.sig = sig;
     f.exp = (uint32_t)(e + 0xFFFF);
     return f;
 }
@@ -200,19 +204,11 @@ static MercedFpReg d2fp(long double d) {
  * not retain those extra bits: later Newton iterations (and, in particular,
  * firmware decompression code) observe the rounded intermediate result.
  *
- * NOT currently called (see the two call sites below): this function and
- * fp_recip_estimate() are architecturally correct (they match Ski's actual
- * 8-bit reciprocal table and precision-truncation behavior exactly) but
- * empirically cause firmware to diverge into an infinite polling loop around
- * flash-relocated VA 0x7FF2C280 that it never hits with the simpler
- * full-precision approximation below - confirmed by isolation testing
- * (2026-07-18): swapping only these two call sites is the difference between
- * reliably reaching the known 0x78 null-vtable crash at ninsts~5.4B and
- * never getting there. Something about the added rounding error changes an
- * intermediate FP-adjacent result enough to alter control flow well before
- * the crash site. Left implemented (unused) rather than deleted: the bug is
- * presumably in an interaction elsewhere, not in these functions themselves,
- * and they're the architecturally-correct target to restore once found. */
+ * fp_result_static() is used for FMA-family results. fp_recip_estimate()
+ * remains available for the eventual table-accurate frcpa implementation;
+ * frcpa currently uses a full-precision reciprocal so its surrounding
+ * Newton-Raphson sequence remains stable while the rest of FP exception and
+ * rounding behavior is still incomplete. */
 static MercedFpReg fp_result_static(long double d, unsigned precision) {
     if (precision == 1) {
         return d2fp((long double)(float)d);
@@ -267,6 +263,13 @@ static void itc_advance(Merced *m, uint64_t delta) {
     m->ar[AR_ITC] += delta;
     if (m->cr[CR_ITM] != 0 && m->ar[AR_ITC] >= m->cr[CR_ITM])
         m->timer_pending = 1;
+}
+
+void merced_raise_external(Merced *m, uint8_t vector) {
+    if (!m->external_pending) {
+        m->external_vector = vector;
+        m->external_pending = 1;
+    }
 }
 
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
@@ -1306,10 +1309,11 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         unsigned cr3 = (unsigned)bits(raw, 20, 7);
         uint64_t v = m->cr[cr3];
         if (cr3 == CR_IVR) {
-            /* Reading ivr reports (and acknowledges/clears) the
-             * highest-priority pending interrupt; 15 means none pending.
-             * Only the interval timer is modeled as a source. */
-            if (m->timer_pending) {
+            /* Reading ivr reports and acknowledges the pending vector. */
+            if (m->external_pending) {
+                v = m->external_vector;
+                m->external_pending = 0;
+            } else if (m->timer_pending) {
                 v = m->cr[CR_ITV] & 0xFFull;
                 m->timer_pending = 0;
             } else {
@@ -2044,14 +2048,12 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
             precision = 1;
         } else {
             unsigned sf = (unsigned)bits(raw, 34, 2);
-            unsigned pc = (unsigned)((m->ar[AR_FPSR] >> (9 + 13 * sf)) & 3);
+            /* FPSR.sfN.pc occupies bits 8:9 of sf0, with each subsequent
+             * status field starting 13 bits higher. */
+            unsigned pc = (unsigned)((m->ar[AR_FPSR] >> (8 + 13 * sf)) & 3);
             precision = (pc == 0) ? 1 : (pc == 2 ? 2 : 0);
         }
-        /* Architecturally this should be fp_result_static(r, precision) -
-         * see the long comment on that function for why the untruncated
-         * full-precision result is kept here instead for now. */
-        (void)precision;
-        fr_write(m, f1, d2fp(r));
+        fr_write(m, f1, fp_result_static(r, precision));
         return MERCED_OK;
     }
 
@@ -2148,6 +2150,12 @@ static const char bundle_units[32][4] = {
 };
 
 MercedStatus merced_step(Merced *m) {
+    if (m->external_pending && (m->psr & PSR_I) && (m->psr & PSR_IC)) {
+        MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
+        m->ninsts++;
+        return ist;
+    }
+
     /* Deliver a latched interval-timer external interrupt at the next
      * instruction boundary where interrupts are actually enabled. Mirrors
      * real hardware: delivery clears psr.i (via deliver_fault below), so
@@ -2177,13 +2185,41 @@ MercedStatus merced_step(Merced *m) {
      * investigation round" and later, 2026-07-18). */
     if (bundle_va == 0) {
         static unsigned hits;
+        uint64_t return_ip = m->br[0] & ~0xFull;
+        /* A null service descriptor is an unavailable PIM service.  Never
+         * return a stale success/status value: callers use r8 to decide
+         * whether dependent modules may be initialized. */
+        gr_write(m, 8, ~0ull, 0);
         if (hits < 50) {
             hits++;
             fprintf(stderr, "merced: WORKAROUND null-descriptor call at "
                     "ip=%016" PRIX64 ", synthesizing br.ret b0=%016" PRIX64
                     " (hit #%u)\n", m->ip, m->br[0], hits);
         }
-        do_ret(m, m->br[0] & ~0xFull);
+        /* The CDB query returning to 0x7FE86D90 has an explicit non-zero
+         * error path.  A missing callback cannot mean success: leaving the
+         * old r8 value at zero makes its caller consume untouched output
+         * parameters (one is initialized to -1) and fault later. */
+        if (return_ip == 0x7FE867B0ull) {
+            /* CDB slot 0 initializes an opaque query handle through arg0. */
+            uint64_t out = gr_read(m, 32, NULL), out_pa;
+            if (va_translate(m, out, false, false, &out_pa, &st))
+                phys_write(m, out_pa, 0, 8);
+        } else if (return_ip == 0x7FE867E0ull) {
+            /* CDB slot 1 returns an iterable result through arg3.  Supply a
+             * valid empty result using the caller's adjacent count-output
+             * storage (arg4), so its normal zero-count path is exercised. */
+            uint64_t out = gr_read(m, 35, NULL);
+            uint64_t empty = gr_read(m, 36, NULL);
+            uint64_t out_pa, empty_pa;
+            if (va_translate(m, empty, false, false, &empty_pa, &st) &&
+                va_translate(m, out, false, false, &out_pa, &st)) {
+                phys_write(m, empty_pa, 0, 8);
+                phys_write(m, out_pa, empty, 8);
+                gr_write(m, 8, 0, 0);
+            }
+        }
+        do_ret(m, return_ip);
         m->ninsts++;
         return MERCED_OK;
     }
