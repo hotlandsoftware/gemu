@@ -101,7 +101,11 @@ struct Ia64I2000State {
     uint8_t   cmos_index;
     uint8_t   cmos[128];
     uint32_t  pci_cfg_addr;
+    uint8_t   ifb_cfg[256];
+    uint8_t   ifb_usb_cfg[256];
+    uint8_t   ifb_smbus_cfg[256];
     uint8_t   cmd649_cfg[256];
+    uint8_t   acpi_io[64];
     FILE     *cdrom;
     char      cdrom_file[512];
     uint64_t  cdrom_size;
@@ -248,6 +252,18 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
+    if (bus == 0 && dev == CMD649_PCI_DEV && fun == 0 &&
+        reg + size <= sizeof(s->ifb_cfg)) {
+        uint64_t v = 0;
+        memcpy(&v, &s->ifb_cfg[reg], size);
+        return v;
+    }
+    if (bus == 0 && dev == CMD649_PCI_DEV && (fun == 2 || fun == 3)) {
+        uint8_t *cfg = fun == 2 ? s->ifb_usb_cfg : s->ifb_smbus_cfg;
+        uint64_t v = 0;
+        memcpy(&v, &cfg[reg], size);
+        return v;
+    }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
         reg + size <= sizeof(s->cmd649_cfg)) {
         uint64_t v = 0;
@@ -289,6 +305,28 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
+    if (bus == 0 && dev == CMD649_PCI_DEV && fun == 0 &&
+        reg + size <= sizeof(s->ifb_cfg)) {
+        /* Identity, class code and header type are read-only.  The rest of
+         * the IFB LPC/FWH configuration space is mostly retained control
+         * latches; firmware programs ACPI/GPIO bases and decode enables
+         * here before entering EFI. */
+        for (unsigned i = 0; i < size; i++) {
+            unsigned off = reg + i;
+            if (off >= 4 && !(off >= 8 && off < 16))
+                s->ifb_cfg[off] = (uint8_t)(val >> (i * 8));
+        }
+        return;
+    }
+    if (bus == 0 && dev == CMD649_PCI_DEV && (fun == 2 || fun == 3)) {
+        uint8_t *cfg = fun == 2 ? s->ifb_usb_cfg : s->ifb_smbus_cfg;
+        for (unsigned i = 0; i < size; i++) {
+            unsigned off = reg + i;
+            if (off >= 4 && !(off >= 8 && off < 16))
+                cfg[off] = (uint8_t)(val >> (i * 8));
+        }
+        return;
+    }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
         reg + size <= sizeof(s->cmd649_cfg)) {
         /* Identity, revision/class and header type are read-only.  Command,
@@ -412,6 +450,11 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
          * and 19 both set means the BIOS recovery jumper is installed and
          * sends the whole boot into PspRecover. 0 = Normal position. */
         return 0;
+    if (port >= 0x400 && port + size <= 0x440) {
+        uint64_t v = 0;
+        memcpy(&v, &s->acpi_io[port - 0x400], size);
+        return v;
+    }
     if (port == 0x61) {                            /* PIT channel-2 gate/output */
         if (s->pit2_polls < 2) s->pit2_polls++;
         return s->port61 | (s->pit2_polls >= 2 ? 0x20 : 0);
@@ -455,6 +498,10 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
+    if (port >= 0x400 && port + size <= 0x440) {
+        memcpy(&s->acpi_io[port - 0x400], &val, size);
+        return;
+    }
     if (port == 0x21 && size == 1) {
         if (s->pic_master_icw) {
             if (s->pic_master_icw == 1)
@@ -999,7 +1046,11 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->chipset_bus = 0xFF;   /* 460GX power-on CBN default: top bus number */
     memset(s->chipset_cfg, 0, sizeof(s->chipset_cfg));
     memset(s->memcard_cfg, 0, sizeof(s->memcard_cfg));
+    memset(s->ifb_cfg, 0, sizeof(s->ifb_cfg));
+    memset(s->ifb_usb_cfg, 0, sizeof(s->ifb_usb_cfg));
+    memset(s->ifb_smbus_cfg, 0, sizeof(s->ifb_smbus_cfg));
     memset(s->cmd649_cfg, 0, sizeof(s->cmd649_cfg));
+    memset(s->acpi_io, 0, sizeof(s->acpi_io));
     memset(s->cmos, 0, sizeof(s->cmos));
     s->cmos_index = 0;
     s->cmos[0x0A] = 0x26;                         /* divider, 32.768 kHz */
@@ -1020,6 +1071,41 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     free(s->atapi_data);
     s->atapi_data = NULL;
     s->atapi_data_len = s->atapi_data_pos = 0;
+
+    /* Intel 460GX IFB PCI-to-LPC/FWH bridge at 00:03.0.  BIOS 1.30 writes
+     * its device-specific configuration registers very early; treating
+     * the function as absent made every read return all ones.  Reset values
+     * are from SSDM 248704-001, chapter 11. */
+    s->ifb_cfg[0x00] = 0x86; s->ifb_cfg[0x01] = 0x80; /* Intel */
+    s->ifb_cfg[0x02] = 0x00; s->ifb_cfg[0x03] = 0x76; /* IFB 7600 */
+    s->ifb_cfg[0x04] = 0x07; s->ifb_cfg[0x05] = 0x00;
+    s->ifb_cfg[0x06] = 0x80; s->ifb_cfg[0x07] = 0x02;
+    s->ifb_cfg[0x09] = 0x00; s->ifb_cfg[0x0A] = 0x01;
+    s->ifb_cfg[0x0B] = 0x06; s->ifb_cfg[0x0E] = 0x80;
+    s->ifb_cfg[0x4E] = 0xC1; s->ifb_cfg[0x4F] = 0x07;
+    s->ifb_cfg[0x60] = s->ifb_cfg[0x61] = 0x80;
+    s->ifb_cfg[0x62] = s->ifb_cfg[0x63] = 0x80;
+    s->ifb_cfg[0x64] = 0x10;
+    s->ifb_cfg[0x69] = 0x02;
+    s->ifb_cfg[0x84] = 0x00; s->ifb_cfg[0x85] = 0x05;
+
+    /* The remaining documented IFB functions are present even though the
+     * UHCI and SMBus engines themselves are currently empty.  Advertising
+     * their real identities lets EFI enumerate and then cleanly disable
+     * them instead of treating configuration reads as master aborts. */
+    s->ifb_usb_cfg[0x00] = 0x86; s->ifb_usb_cfg[0x01] = 0x80;
+    s->ifb_usb_cfg[0x02] = 0x02; s->ifb_usb_cfg[0x03] = 0x76;
+    s->ifb_usb_cfg[0x06] = 0x80; s->ifb_usb_cfg[0x07] = 0x02;
+    s->ifb_usb_cfg[0x09] = 0x00; s->ifb_usb_cfg[0x0A] = 0x03;
+    s->ifb_usb_cfg[0x0B] = 0x0C; s->ifb_usb_cfg[0x0E] = 0x00;
+    s->ifb_usb_cfg[0x3D] = 0x04; s->ifb_usb_cfg[0x60] = 0x10;
+
+    s->ifb_smbus_cfg[0x00] = 0x86; s->ifb_smbus_cfg[0x01] = 0x80;
+    s->ifb_smbus_cfg[0x02] = 0x03; s->ifb_smbus_cfg[0x03] = 0x76;
+    s->ifb_smbus_cfg[0x06] = 0x80; s->ifb_smbus_cfg[0x07] = 0x02;
+    s->ifb_smbus_cfg[0x09] = 0x00; s->ifb_smbus_cfg[0x0A] = 0x05;
+    s->ifb_smbus_cfg[0x0B] = 0x0C; s->ifb_smbus_cfg[0x0E] = 0x00;
+    s->ifb_smbus_cfg[0x3D] = 0x02;
 
     /* Integrated CMD Technology PCI-649 Ultra ATA/100 controller at the
      * i2000 IFB's fixed 00:03.1 function. */
