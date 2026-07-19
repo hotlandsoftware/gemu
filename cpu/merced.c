@@ -2165,6 +2165,29 @@ MercedStatus merced_step(Merced *m) {
     uint64_t pa;
     MercedStatus st;
 
+    /* EXPERIMENTAL, not a real fix: VA 0 is never legitimately executable.
+     * Reaching it is the signature of an indirect call through a null IA-64
+     * function descriptor (entry point and gp both read back as 0 from
+     * zero-filled RAM). Real firmware is presumably supposed to null-check
+     * before such a call; something upstream isn't, or the check we haven't
+     * found yet is being bypassed. Rather than crash, treat it as if the
+     * call immediately returned (br.ret b0), to see how much further boot
+     * gets past this specific landmine. This is a diagnostic bisection aid,
+     * not a fix for the real bug (see i2000 project memory, "third
+     * investigation round" and later, 2026-07-18). */
+    if (bundle_va == 0) {
+        static unsigned hits;
+        if (hits < 50) {
+            hits++;
+            fprintf(stderr, "merced: WORKAROUND null-descriptor call at "
+                    "ip=%016" PRIX64 ", synthesizing br.ret b0=%016" PRIX64
+                    " (hit #%u)\n", m->ip, m->br[0], hits);
+        }
+        do_ret(m, m->br[0] & ~0xFull);
+        m->ninsts++;
+        return MERCED_OK;
+    }
+
     if (slot > 2) return mhalt(m, "bad IP slot %u", slot);
     if (!va_translate(m, bundle_va, true, false, &pa, &st))
         return st;   /* ITLB miss delivered (or halt) */

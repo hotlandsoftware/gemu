@@ -87,6 +87,10 @@ struct Ia64I2000State {
     uint32_t  sac_cbnr, sac_ccsr;
     uint8_t   port61;
     uint8_t   pit2_polls;
+    uint8_t   kbc_command_byte;
+    uint8_t   kbc_pending_write; /* 0=keyboard data, 1=command byte, 2=output port, 3=aux */
+    uint8_t   kbc_out[8];
+    uint8_t   kbc_out_pos, kbc_out_len;
     uint8_t   cmos_index;
     uint8_t   cmos[128];
     uint32_t  pci_cfg_addr;
@@ -364,6 +368,19 @@ static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
 }
 
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
+    if (port == 0x60 && size == 1) {               /* 8042 data */
+        if (s->kbc_out_pos >= s->kbc_out_len)
+            return 0;
+        uint8_t v = s->kbc_out[s->kbc_out_pos++];
+        if (s->kbc_out_pos == s->kbc_out_len)
+            s->kbc_out_pos = s->kbc_out_len = 0;
+        return v;
+    }
+    if (port == 0x64 && size == 1) {               /* 8042 status */
+        /* Commands are consumed synchronously, so IBF (bit 1) is clear.
+         * OBF reflects queued controller/keyboard response bytes. */
+        return (s->kbc_out_len ? 0x01 : 0) | 0x04; /* system flag */
+    }
     if (port == 0x73 && size == 1)
         return s->cmos[s->cmos_index & 0x7F];
     if (port == PCI_CFG_ADDR && size == 4) return s->pci_cfg_addr;
@@ -430,6 +447,59 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
+    if (port == 0x64 && size == 1) {               /* 8042 command */
+        uint8_t cmd = (uint8_t)val;
+        s->kbc_out_pos = s->kbc_out_len = 0;
+        switch (cmd) {
+        case 0x20: /* read command byte */
+            s->kbc_out[0] = s->kbc_command_byte;
+            s->kbc_out_len = 1;
+            break;
+        case 0x60: s->kbc_pending_write = 1; break;
+        case 0xAA: /* controller self-test */
+            s->kbc_out[0] = 0x55; s->kbc_out_len = 1;
+            break;
+        case 0xAB: /* keyboard interface test */
+            s->kbc_out[0] = 0x00; s->kbc_out_len = 1;
+            break;
+        case 0xA9: /* auxiliary interface test: no PS/2 mouse attached */
+            s->kbc_out[0] = 0x01; s->kbc_out_len = 1;
+            break;
+        case 0xAD: s->kbc_command_byte |= 0x10; break;
+        case 0xAE: s->kbc_command_byte &= (uint8_t)~0x10; break;
+        case 0xA7: s->kbc_command_byte |= 0x20; break;
+        case 0xA8: s->kbc_command_byte &= (uint8_t)~0x20; break;
+        case 0xD0: /* read output port: reset deasserted, A20 enabled */
+            s->kbc_out[0] = 0x03; s->kbc_out_len = 1;
+            break;
+        case 0xD1: s->kbc_pending_write = 2; break;
+        case 0xD4: s->kbc_pending_write = 3; break;
+        default: break;
+        }
+        return;
+    }
+    if (port == 0x60 && size == 1) {               /* 8042/keyboard data */
+        uint8_t data = (uint8_t)val;
+        s->kbc_out_pos = s->kbc_out_len = 0;
+        if (s->kbc_pending_write == 1) {
+            s->kbc_command_byte = data;
+        } else if (s->kbc_pending_write == 3) {
+            /* No auxiliary PS/2 device is attached.  Consume the routed
+             * byte but leave OBF clear so the firmware's mouse probe times
+             * out and does not instantiate a phantom mouse driver. */
+        } else if (s->kbc_pending_write == 0) {
+            /* An empty PS/2 keyboard still acknowledges commands.  Reset
+             * additionally reports a successful BAT result. */
+            s->kbc_out[0] = 0xFA;
+            s->kbc_out_len = 1;
+            if (data == 0xFF) {
+                s->kbc_out[1] = 0xAA;
+                s->kbc_out_len = 2;
+            }
+        }
+        s->kbc_pending_write = 0;
+        return;
+    }
     if (port == 0x72 && size == 1) {
         /* The i2000 IFB exposes its RTC/configuration RAM at 72h/73h. */
         s->cmos_index = (uint8_t)val & 0x7F;
