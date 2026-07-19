@@ -18,8 +18,16 @@
  *  - Instructions execute sequentially; instruction-group parallelism is
  *    not modeled (a RAW hazard inside one group reads the NEW value here,
  *    old value on silicon - compilers never emit that, handcode rarely).
- *  - The RSE never spills/fills to backing store on its own; the stacked
- *    file is a 96-register circular buffer (flushrs/loadrs are no-ops).
+ *  - The stacked file is a 96-register circular buffer; there's no
+ *    automatic background spill on physical-register-file overflow (real
+ *    hardware would spill once >96 registers are outstanding across the
+ *    active call chain - firmware that goes that deep between explicit
+ *    flushes will read back corrupted frames, same as a real overflow the
+ *    RSE never got a chance to service). flushrs/loadrs themselves DO
+ *    perform real backing-store I/O (see rse_flush()/rse_load() in
+ *    merced.c), but assume the ar.bspstore anchor established by firmware's
+ *    last `mov ar.bspstore=r` sits at a fresh NaT-collection-group boundary,
+ *    and don't model ar.rnat or per-slot NaT collection words at all.
  *  - Memory attributes (UC/WB) are ignored beyond stripping bit 63 in
  *    physical addressing mode.
  */
@@ -95,6 +103,19 @@ typedef struct Merced {
     uint64_t gr_stack[MERCED_N_STACKED];
     uint8_t  nat_stack[MERCED_N_STACKED];
     uint32_t bof;                       /* bottom-of-frame index into gr_stack */
+
+    /* RSE backing-store bookkeeping. bof_total mirrors bof (updated at the
+     * same four sites: call, return, cover, rfi-restore) but never wraps, so
+     * it's a stable register-units axis for translating to/from real
+     * addresses. rse_anchor_{addr,regs} record the (address, bof_total+sof)
+     * pair captured the last time firmware executed `mov ar.bspstore=r`
+     * (architecturally the only way an address<->register-count
+     * correspondence gets established); rse_flushed_regs is that same axis's
+     * mirror of ar.bspstore, advanced by flushrs and rewound by loadrs. */
+    uint64_t bof_total;
+    uint64_t rse_anchor_addr;
+    int64_t  rse_anchor_regs;
+    int64_t  rse_flushed_regs;
 
     MercedFpReg fr[MERCED_N_FR];
     uint64_t br[MERCED_N_BR];

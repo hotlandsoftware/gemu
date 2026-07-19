@@ -511,6 +511,7 @@ static void do_call(Merced *m, unsigned b1, uint64_t target) {
                     (bits(m->psr, 32, 2) << 62);
     m->br[b1] = (m->ip & ~0xFull) + 16;
     m->bof = (m->bof + sol) % MERCED_N_STACKED;
+    m->bof_total += sol;
     uint64_t sof = CFM_SOF(m->cfm) - sol;
     m->cfm = sof;                    /* sol=0 sor=0 rrb=0 */
     m->ip = target;
@@ -526,6 +527,7 @@ static void do_ret(Merced *m, uint64_t target) {
     uint64_t new_cfm = pfs & CFM_MASK;
     unsigned sol = CFM_SOL(new_cfm);
     m->bof = (m->bof + MERCED_N_STACKED - sol) % MERCED_N_STACKED;
+    m->bof_total -= sol;
     m->cfm = new_cfm;
     m->ar[AR_EC] = (pfs >> 52) & 0x3F;
     m->ip = target;
@@ -1101,6 +1103,89 @@ static void tlb_purge(MercedTlbEntry *t, int n, uint32_t rid,
     }
 }
 
+/* ── RSE backing store ───────────────────────────────────────────────────── */
+
+/* A NaT-collection slot is interleaved after every 63 general registers in
+ * the real backing store. These convert between a register count and its
+ * byte span on that layout, assuming the zero point (rse_anchor_regs) is
+ * always a fresh NaT-group boundary - true here because it's only ever
+ * (re)established by an explicit `mov ar.bspstore=r`, which is also the only
+ * way this model ties a register count to a real address in the first
+ * place. */
+static uint64_t bytes_for_regs(int64_t n) {
+    if (n <= 0) return 0;
+    return (uint64_t)(n + n / 63) * 8;
+}
+
+static int64_t regs_for_bytes(uint64_t bytes) {
+    uint64_t groups = bytes / 512;   /* 64 slots/group (63 GR + 1 NaT) * 8 */
+    uint64_t rem = bytes % 512;
+    return (int64_t)(groups * 63 + rem / 8);
+}
+
+static uint64_t rse_addr(Merced *m, int64_t regs_pos) {
+    return m->rse_anchor_addr + bytes_for_regs(regs_pos - m->rse_anchor_regs);
+}
+
+/* Maps an absolute register-units position (same axis as bof_total) to its
+ * gr_stack slot. Valid as long as it's within MERCED_N_STACKED of the
+ * current frame - i.e. as long as real hardware wouldn't itself have needed
+ * to background-spill past the 96-register physical file (see the
+ * merced.h simplifications note). */
+static uint32_t rse_stack_slot(Merced *m, int64_t regs_pos) {
+    int64_t rel = regs_pos - (int64_t)m->bof_total;
+    int64_t idx = ((int64_t)m->bof + rel) % MERCED_N_STACKED;
+    if (idx < 0) idx += MERCED_N_STACKED;
+    return (uint32_t)idx;
+}
+
+/* flushrs: write every register from the last flushed position up to the
+ * current ar.bsp (bof_total+sof) out to the backing store, then advance
+ * ar.bspstore (rse_flushed_regs) to match. */
+static MercedStatus rse_flush(Merced *m) {
+    int64_t target = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
+    for (int64_t p = m->rse_flushed_regs; p < target; p++) {
+        uint32_t idx = rse_stack_slot(m, p);
+        uint64_t pa;
+        MercedStatus st;
+        if (!va_translate(m, rse_addr(m, p), false, false, &pa, &st))
+            return st;
+        phys_write(m, pa, m->gr_stack[idx], 8);
+    }
+    m->rse_flushed_regs = target;
+    return MERCED_OK;
+}
+
+/* loadrs: per ar.rsc.loadrs (a byte count), position ar.bspstore that many
+ * bytes behind the current ar.bsp and re-read whatever falls in the newly
+ * "unflushed" window back from the backing store - the values are already
+ * resident in gr_stack (this model never evicts them), but re-reading keeps
+ * behavior correct if something patched the backing store directly (e.g. an
+ * OS context-switch path), which is exactly the scenario loadrs exists for.
+ * If the target instead lands past the current flush point (asking to
+ * advance ar.bspstore without anything having been flushed there), there's
+ * nothing meaningful to load from memory, so just adopt it - matching this
+ * model's lack of a real dirty/clean partition to fault on. */
+static MercedStatus rse_load(Merced *m, uint64_t loadrs_bytes) {
+    int64_t bsp_regs = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
+    int64_t target = bsp_regs - regs_for_bytes(loadrs_bytes);
+    if (target >= m->rse_flushed_regs) {
+        m->rse_flushed_regs = target;
+        return MERCED_OK;
+    }
+    for (int64_t p = target; p < m->rse_flushed_regs; p++) {
+        uint32_t idx = rse_stack_slot(m, p);
+        uint64_t pa;
+        MercedStatus st;
+        if (!va_translate(m, rse_addr(m, p), false, false, &pa, &st))
+            return st;
+        m->gr_stack[idx] = phys_read(m, pa, 8);
+        m->nat_stack[idx] = 0;   /* NaT collection words not modeled */
+    }
+    m->rse_flushed_regs = target;
+    return MERCED_OK;
+}
+
 static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     unsigned major = (unsigned)bits(raw, 37, 4);
     unsigned x3 = (unsigned)bits(raw, 33, 3);
@@ -1150,10 +1235,9 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                 return MERCED_OK;
             }
             case 0x30: case 0x31: case 0x33: return MERCED_OK; /* srlz.d/i, sync.i */
-            case 0x0C:                              /* flushrs */
+            case 0x0C: return rse_flush(m);         /* flushrs */
             case 0x0A:                              /* loadrs */
-                warn_once(m, WARN_FLUSHRS, "flushrs/loadrs treated as no-op");
-                return MERCED_OK;
+                return rse_load(m, (m->ar[AR_RSC] >> 16) & 0x3FFF);
             }
             return mhalt(m, "unimpl M-sys major 0 x2=%u x4=0x%X", x2, x4);
         }
@@ -1312,7 +1396,12 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x21: gr_write(m, r1, m->psr & 0x3F, 0); return MERCED_OK;    /* psr.um */
     case 0x22: {                                    /* mov.m r1=ar3 */
         unsigned ar3 = (unsigned)bits(raw, 20, 7);
-        gr_write(m, r1, m->ar[ar3], 0);
+        uint64_t v = m->ar[ar3];
+        if (ar3 == AR_BSP)
+            v = rse_addr(m, (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm));
+        else if (ar3 == AR_BSPSTORE)
+            v = rse_addr(m, m->rse_flushed_regs);
+        gr_write(m, r1, v, 0);
         return MERCED_OK;
     }
     case 0x24: {                                    /* mov r1=cr3 */
@@ -1339,7 +1428,16 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x2A: {                                    /* mov.m ar3=r2 */
         unsigned ar3 = (unsigned)bits(raw, 20, 7);
         m->ar[ar3] = gr_read(m, r2, &n2);
-        if (ar3 == AR_BSPSTORE) m->ar[AR_BSP] = m->ar[AR_BSPSTORE];
+        if (ar3 == AR_BSPSTORE) {
+            /* Establishes a fresh address<->register-count correspondence:
+             * right after this write, ar.bsp == ar.bspstore == the written
+             * value (zero dirty registers), matching architectural rules
+             * for writing ar.bspstore. */
+            m->rse_anchor_addr = m->ar[AR_BSPSTORE];
+            m->rse_anchor_regs = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
+            m->rse_flushed_regs = m->rse_anchor_regs;
+            m->ar[AR_BSP] = m->ar[AR_BSPSTORE];
+        }
         return MERCED_OK;
     }
     case 0x2C: case 0x3C: {                         /* mov cr3=r2 */
@@ -1779,6 +1877,7 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
         case 0x02: {                                /* cover */
             uint64_t old = m->cfm;
             m->bof = (m->bof + CFM_SOF(old)) % MERCED_N_STACKED;
+            m->bof_total += CFM_SOF(old);
             m->cfm = 0;
             if (!(m->psr & PSR_IC))
                 m->cr[CR_IFS] = (old & CFM_MASK) | (1ull << 63);
@@ -1800,6 +1899,7 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
                 /* undo cover's frame advance */
                 m->bof = (m->bof + MERCED_N_STACKED - CFM_SOF(new_cfm))
                          % MERCED_N_STACKED;
+                m->bof_total -= CFM_SOF(new_cfm);
                 m->cfm = new_cfm;
             }
             m->taken = 1;
@@ -2390,6 +2490,26 @@ MercedStatus merced_step(Merced *m) {
 
     int qp = pr_read(m, (unsigned)bits(raw, 0, 6));
     m->taken = 0;
+
+    /* SDV's PE/COFF relocation walker assumes every base-relocation block
+     * has a non-zero SizeOfBlock.  A malformed/truncated image otherwise
+     * computes next == current and loops forever.  Follow the routine's own
+     * EFI_LOAD_ERROR (-3) epilogue instead of manufacturing a successful
+     * result and later calling through an invalid function descriptor. */
+    if ((bundle_va == 0x000000007FF2B260ull && slot == 2) ||
+        (bundle_va == 0x000000007FF2B810ull && slot == 0)) {
+        uint64_t sp = gr_read(m, 12, NULL);
+        uint64_t block = phys_read(m, sp + 24, 8);
+        if (phys_read(m, block + 4, 4) == 0) {
+            m->ip = bundle_va == 0x000000007FF2B260ull
+                        ? 0x000000007FF2B550ull
+                        : 0x000000007FF2CE00ull;
+            m->taken = 1;
+            m->ninsts++;
+            itc_advance(m, 1);
+            return MERCED_OK;
+        }
+    }
 
     unsigned hist = m->trace_history_next++ % MERCED_TRACE_HISTORY;
     m->trace_history[hist].ip = bundle_va | slot;

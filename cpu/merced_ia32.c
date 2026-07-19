@@ -327,6 +327,23 @@ MercedStatus merced_ia32_step(Merced *m) {
         else if(op==0x89) { if(!rmwrite(&x,rm,size,xr(&x,reg,size)))goto fault; }
         else if(op==0x8c) { if(reg>5||!rmwrite(&x,rm,2,sel(&x,reg)))goto fault; }
         else { if(reg>5||!rmread(&x,rm,2,&q))goto fault; setseg_real(&x,reg,q); }
+    } else if (op == 0x2f) {                        /* das */
+        uint32_t f = eflags(&x);
+        uint32_t al = xr(&x, 0, 1);
+        uint32_t old_al = al;
+        bool old_cf = f & FL_CF, af = f & FL_AF, cf;
+        if ((al & 0xf) > 9 || af) { al = (al - 6) & 0xff; af = true; }
+        else af = false;
+        if (old_al > 0x99 || old_cf) { al = (al - 0x60) & 0xff; cf = true; }
+        else cf = false;
+        f &= ~(FL_CF|FL_AF|FL_ZF|FL_SF|FL_PF);
+        if (cf) f |= FL_CF;
+        if (af) f |= FL_AF;
+        if (!al) f |= FL_ZF;
+        if (al & 0x80) f |= FL_SF;
+        if (!__builtin_parity(al)) f |= FL_PF;
+        setflags(&x, f);
+        setxr(&x, 0, 1, al);
     } else if (op == 0x3c) {
         if (!fetch(&x,1,&q)) goto fault;
         uint32_t a=xr(&x,0,1), v=a-(uint8_t)q;
@@ -355,6 +372,22 @@ MercedStatus merced_ia32_step(Merced *m) {
             unsigned sg=x.seg_override>=0?(unsigned)x.seg_override:X_DS;
             if(!rb(&x,sbase(&x,sg)+si,n,false,&v)||!wb(&x,sbase(&x,X_ES)+di,n,v))goto fault;
             setxr(&x,6,x.addr32?4:2,si+step);setxr(&x,7,x.addr32?4:2,di+step);}
+        if(x.rep)setxr(&x,1,x.addr32?4:2,0);
+    } else if (op == 0xac || op == 0xad) {
+        unsigned n=op==0xac?1:size; uint32_t count=x.rep?xr(&x,1,x.addr32?4:2):1;
+        int step=(eflags(&x)&FL_DF)?-(int)n:(int)n;
+        unsigned sg=x.seg_override>=0?(unsigned)x.seg_override:X_DS;
+        while(count--){uint32_t v,si=xr(&x,6,x.addr32?4:2);
+            if(!rb(&x,sbase(&x,sg)+si,n,false,&v))goto fault;
+            setxr(&x,0,n,v);setxr(&x,6,x.addr32?4:2,si+step);}
+        if(x.rep)setxr(&x,1,x.addr32?4:2,0);
+    } else if (op == 0xaa || op == 0xab) {
+        unsigned n=op==0xaa?1:size; uint32_t count=x.rep?xr(&x,1,x.addr32?4:2):1;
+        int step=(eflags(&x)&FL_DF)?-(int)n:(int)n;
+        uint32_t val=xr(&x,0,n);
+        while(count--){uint32_t di=xr(&x,7,x.addr32?4:2);
+            if(!wb(&x,sbase(&x,X_ES)+di,n,val))goto fault;
+            setxr(&x,7,x.addr32?4:2,di+step);}
         if(x.rep)setxr(&x,1,x.addr32?4:2,0);
     } else if (op == 0xff) {
         if(!fetch(&x,1,&q))goto fault;
