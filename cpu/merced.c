@@ -38,9 +38,15 @@ static int merced_dbg(void) {
 #define PSR_IC   (1ull << 13)
 #define PSR_I    (1ull << 14)
 #define PSR_DT   (1ull << 17)
+#define PSR_DI   (1ull << 22)
 #define PSR_RT   (1ull << 27)
+#define PSR_IS   (1ull << 34)
+#define PSR_DA   (1ull << 38)
+#define PSR_DD   (1ull << 39)
 #define PSR_IT   (1ull << 36)
+#define PSR_ED   (1ull << 43)
 #define PSR_BN   (1ull << 44)
+#define PSR_IA   (1ull << 45)
 #define PSR_RI_SHIFT 41
 
 #define CFM_SOF(c)    ((unsigned)((c) & 0x7F))
@@ -324,10 +330,12 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
         return mhalt(m, "fault vec=0x%X with PSR.ic=0 (ifa=0x%016" PRIX64 ")",
                      vec, ifa);
     }
-    m->cr[CR_IPSR] = m->psr | ((m->ip & 3) << PSR_RI_SHIFT);
-    m->cr[CR_IIP]  = m->ip & ~0xFull;
-    m->cr[CR_ISR]  = isr | ((m->ip & 3) << 41);
-    m->cr[CR_IIPA] = m->ip & ~0xFull;
+    bool ia32 = (m->psr & PSR_IS) != 0;
+    unsigned slot = ia32 ? 0 : (unsigned)(m->ip & 3);
+    m->cr[CR_IPSR] = m->psr | ((uint64_t)slot << PSR_RI_SHIFT);
+    m->cr[CR_IIP]  = ia32 ? (uint32_t)m->ip : (m->ip & ~0xFull);
+    m->cr[CR_ISR]  = isr | ((uint64_t)slot << 41);
+    m->cr[CR_IIPA] = ia32 ? (uint32_t)m->ip : (m->ip & ~0xFull);
     m->cr[CR_IFS] &= ~(1ull << 63);
     if (set_ifa) {
         m->cr[CR_IFA] = ifa;
@@ -343,7 +351,9 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
         m->cr[CR_IHA] = ((uint64_t)vrn << 61) |
                         ((pta & ~0x7FFull & ~mask) | (off & mask & ~0x7ull));
     }
-    m->psr &= ~(PSR_IC | PSR_I | PSR_BN);
+    /* Every interruption enters the IA-64 instruction set.  IPSR above
+     * retains the interrupted PSR.is value so rfi can return to IA-32. */
+    m->psr &= ~(PSR_IC | PSR_I | PSR_BN | PSR_IS);
     m->psr &= ~(3ull << PSR_RI_SHIFT);
     m->ip = (m->cr[CR_IVA] & ~0x7FFFull) + vec;
     m->taken = 1;
@@ -1781,7 +1791,10 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
             uint64_t iip = m->cr[CR_IIP];
             psr_trans_log(m, ipsr, "rfi");
             m->psr = ipsr & ~(3ull << PSR_RI_SHIFT);
-            m->ip = (iip & ~0xFull) | ((ipsr >> PSR_RI_SHIFT) & 3);
+            if (ipsr & PSR_IS)
+                m->ip = (uint32_t)iip;
+            else
+                m->ip = (iip & ~0xFull) | ((ipsr >> PSR_RI_SHIFT) & 3);
             if (m->cr[CR_IFS] >> 63) {
                 uint64_t new_cfm = m->cr[CR_IFS] & CFM_MASK;
                 /* undo cover's frame advance */
@@ -1797,8 +1810,23 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
         case 0x10: return MERCED_OK;                                /* epc */
         case 0x20: {                                /* br.cond/br.ia b2 */
             if (!qp) return MERCED_OK;
-            if (btype == 1)
-                return mhalt(m, "br.ia (IA-32 mode) not supported");
+            if (btype == 1) {
+                unsigned b = (unsigned)bits(raw, 13, 3);
+                if (m->psr & PSR_DI)
+                    return mhalt(m, "br.ia with disabled ISA transitions");
+                /* Itanium SDM vol. 2, 9.1.2: the target has byte rather
+                 * than bundle granularity and is restricted to BR{31:0}.
+                 * IA-32 maps CSD/SSD into GR25/GR26 while executing. */
+                m->ip = (uint32_t)m->br[b];
+                m->psr |= PSR_IS;
+                m->psr &= ~(PSR_DA | PSR_DD | PSR_IA | PSR_ED |
+                            (3ull << PSR_RI_SHIFT));
+                m->cfm = 0;
+                gr_write(m, 25, m->ar[25], 0);       /* ar.csd -> CSD */
+                gr_write(m, 26, m->ar[26], 0);       /* ar.ssd -> SSD */
+                m->taken = 1;
+                return MERCED_OK;
+            }
             m->ip = m->br[bits(raw, 13, 3)] & ~0xFull;
             m->taken = 1;
             return MERCED_OK;
@@ -2149,7 +2177,37 @@ static const char bundle_units[32][4] = {
     /* 18 */ "MMB", "MMB", "??", "??", "MFB", "MFB", "??", "??",
 };
 
+bool merced_ia32_read(Merced *m, uint64_t va, unsigned size,
+                      bool ifetch, uint64_t *value) {
+    uint64_t pa;
+    MercedStatus st;
+    if (!va_translate(m, va, ifetch, false, &pa, &st))
+        return false;
+    *value = ifetch ? phys_fetch(m, pa, size) : phys_read(m, pa, size);
+    return true;
+}
+
+bool merced_ia32_write(Merced *m, uint64_t va, unsigned size,
+                       uint64_t value) {
+    uint64_t pa;
+    MercedStatus st;
+    if (!va_translate(m, va, false, false, &pa, &st))
+        return false;
+    phys_write(m, pa, value, size);
+    return true;
+}
+
+uint64_t merced_ia32_gr_read(Merced *m, unsigned reg) {
+    return gr_read(m, reg, NULL);
+}
+
+void merced_ia32_gr_write(Merced *m, unsigned reg, uint64_t value) {
+    gr_write(m, reg, value, 0);
+}
+
 MercedStatus merced_step(Merced *m) {
+    if (m->psr & PSR_IS)
+        return merced_ia32_step(m);
     if (m->external_pending && (m->psr & PSR_I) && (m->psr & PSR_IC)) {
         MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
         m->ninsts++;

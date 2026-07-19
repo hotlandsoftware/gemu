@@ -158,6 +158,17 @@ void    merced_reset(Merced *m);
  * describes why and the CPU is stopped at the offending IP. */
 MercedStatus merced_step(Merced *m);
 
+/* IA-32 compatibility engine.  These hooks deliberately use the IA-64
+ * translation machinery: IA-32 code and data references share the Merced
+ * TR/TC/RR resources architecturally. */
+MercedStatus merced_ia32_step(Merced *m);
+bool merced_ia32_read(Merced *m, uint64_t va, unsigned size,
+                      bool ifetch, uint64_t *value);
+bool merced_ia32_write(Merced *m, uint64_t va, unsigned size,
+                       uint64_t value);
+uint64_t merced_ia32_gr_read(Merced *m, unsigned reg);
+void merced_ia32_gr_write(Merced *m, unsigned reg, uint64_t value);
+
 /* Latch a platform interrupt for delivery through cr.ivr. */
 void merced_raise_external(Merced *m, uint8_t vector);
 
