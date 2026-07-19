@@ -70,6 +70,8 @@ struct Ia64I2000State {
     bool      flash_read_status;
     bool      flash_read_id;
     uint8_t   flash_status;
+    uint8_t   flash_cmd;
+    uint64_t  flash_cmd_addr;
 
     bool      halted;
     bool      reset_requested;
@@ -125,6 +127,7 @@ struct Ia64I2000State {
     uint8_t   chipset_cfg[32][8][256];
     uint8_t   memcard_cfg[2][8][256];
     uint8_t   uart_ier, uart_lcr, uart_mcr, uart_scr, uart_dll, uart_dlm;
+    uint8_t   uart_rx[256], uart_rx_head, uart_rx_tail;
 
     MmioLogEnt mmio_log[MMIO_LOG_N];
     int        mmio_log_n;
@@ -413,6 +416,7 @@ static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
 }
 
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
+    static unsigned debug_reads;
     if (port == 0x60 && size == 1) {               /* 8042 data */
         if (s->kbc_out_pos >= s->kbc_out_len)
             return 0;
@@ -427,18 +431,34 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         return (s->kbc_out_len ? 0x01 : 0) | 0x04; /* system flag */
     }
     if (port == 0x73 && size == 1)
-        return s->cmos[s->cmos_index & 0x7F];
+    {
+        uint8_t v = s->cmos[s->cmos_index & 0x7F];
+        if (getenv("MERCED_DEBUG") && debug_reads++ < 128)
+            fprintf(stderr, "i2000: CMOS[%02X] -> %02X\n",
+                    s->cmos_index & 0x7F, v);
+        return v;
+    }
     if (port == PCI_CFG_ADDR && size == 4) return s->pci_cfg_addr;
     if (port >= PCI_CFG_DATA && port < PCI_CFG_DATA + 4)
         return pci_cfg_read(s, (unsigned)(port - PCI_CFG_DATA), size);
     if (port >= COM1_PORT && port < COM1_PORT + 8) {
+        if (getenv("MERCED_DEBUG") && debug_reads++ < 128)
+            fprintf(stderr, "i2000: COM1 read reg %u\n",
+                    (unsigned)(port - COM1_PORT));
         switch (port - COM1_PORT) {
-        case 0: return (s->uart_lcr & 0x80) ? s->uart_dll : 0x00;  /* RBR/DLL */
+        case 0:
+            if (s->uart_lcr & 0x80) return s->uart_dll;
+            if (s->uart_rx_head != s->uart_rx_tail) {
+                uint8_t v = s->uart_rx[s->uart_rx_head++];
+                return v;
+            }
+            return 0;
         case 1: return (s->uart_lcr & 0x80) ? s->uart_dlm : s->uart_ier;
-        case 2: return 0x01;                        /* IIR: no int pending */
+        case 2: return ((s->uart_ier & 1) && s->uart_rx_head != s->uart_rx_tail)
+                     ? 0x04 : 0x01;                /* RX data / no interrupt */
         case 3: return s->uart_lcr;
         case 4: return s->uart_mcr;
-        case 5: return 0x60;                        /* LSR: THR empty+idle */
+        case 5: return 0x60 | (s->uart_rx_head != s->uart_rx_tail ? 1 : 0);
         case 6: return 0xB0;                        /* MSR: CTS|DSR|DCD */
         case 7: return s->uart_scr;
         }
@@ -498,6 +518,7 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
+    static unsigned debug_writes;
     if (port >= 0x400 && port + size <= 0x440) {
         memcpy(&s->acpi_io[port - 0x400], &val, size);
         return;
@@ -607,6 +628,9 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         return;
     }
     if (port == 0x73 && size == 1) {
+        if (getenv("MERCED_DEBUG") && debug_writes++ < 128)
+            fprintf(stderr, "i2000: CMOS[%02X] <- %02X\n",
+                    s->cmos_index & 0x7F, (unsigned)(uint8_t)val);
         s->cmos[s->cmos_index & 0x7F] = (uint8_t)val;
         return;
     }
@@ -692,6 +716,9 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         }
     }
     if (port >= COM1_PORT && port < COM1_PORT + 8) {
+        if (getenv("MERCED_DEBUG") && debug_writes++ < 128)
+            fprintf(stderr, "i2000: COM1 write reg %u <- %02X\n",
+                    (unsigned)(port - COM1_PORT), (unsigned)(uint8_t)val);
         switch (port - COM1_PORT) {
         case 0:
             if (s->uart_lcr & 0x80) { s->uart_dll = (uint8_t)val; return; }
@@ -803,9 +830,33 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
         uint64_t off = addr - I2000_FLASH_BASE;
         /* BIOS 1.30 probes the Intel flash device with the standard
          * clear-status/read-status/read-array command sequence.  Without
-         * command-state handling the status read returns an array byte and
-         * platform initialization reports EFI_OUT_OF_RESOURCES. */
+        * command-state handling the status read returns an array byte and
+        * platform initialization reports EFI_OUT_OF_RESOURCES. */
         if (size == 1) {
+            if (s->flash_cmd == 0x40 || s->flash_cmd == 0x10) {
+                /* Intel byte-program operation.  Keep NVRAM updates in the
+                 * in-memory image; the user's ROM file remains untouched. */
+                s->flash[off] &= (uint8_t)val;
+                s->flash_status = 0x80;
+                s->flash_read_status = true;
+                s->flash_read_id = false;
+                s->flash_cmd = 0;
+                return;
+            }
+            if (s->flash_cmd == 0x20) {
+                if ((uint8_t)val == 0xD0) {
+                    uint64_t block = s->flash_cmd_addr & ~0xFFFFull;
+                    if (block < I2000_FLASH_SIZE)
+                        memset(s->flash + block, 0xFF, 0x10000);
+                    s->flash_status = 0x80;
+                } else {
+                    s->flash_status = 0xB0; /* ready + erase error */
+                }
+                s->flash_read_status = true;
+                s->flash_read_id = false;
+                s->flash_cmd = 0;
+                return;
+            }
             switch ((uint8_t)val) {
             case 0x50:                         /* clear status register */
                 s->flash_status = 0x80;        /* ready, no errors */
@@ -818,9 +869,18 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                 s->flash_read_status = false;
                 s->flash_read_id = true;
                 return;
+            case 0x10: case 0x40:              /* byte program setup */
+                s->flash_cmd = (uint8_t)val;
+                s->flash_cmd_addr = off;
+                return;
+            case 0x20:                         /* block erase setup */
+                s->flash_cmd = 0x20;
+                s->flash_cmd_addr = off;
+                return;
             case 0xFF:                         /* read array */
                 s->flash_read_status = false;
                 s->flash_read_id = false;
+                s->flash_cmd = 0;
                 return;
             }
         }
@@ -1042,6 +1102,8 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->flash_read_status = false;
     s->flash_read_id = false;
     s->flash_status = 0x80;
+    s->flash_cmd = 0;
+    s->flash_cmd_addr = 0;
     s->pci_cfg_addr = 0;
     s->chipset_bus = 0xFF;   /* 460GX power-on CBN default: top bus number */
     memset(s->chipset_cfg, 0, sizeof(s->chipset_cfg));
@@ -1051,6 +1113,7 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     memset(s->ifb_smbus_cfg, 0, sizeof(s->ifb_smbus_cfg));
     memset(s->cmd649_cfg, 0, sizeof(s->cmd649_cfg));
     memset(s->acpi_io, 0, sizeof(s->acpi_io));
+    s->uart_rx_head = s->uart_rx_tail = 0;
     memset(s->cmos, 0, sizeof(s->cmos));
     s->cmos_index = 0;
     s->cmos[0x0A] = 0x26;                         /* divider, 32.768 kHz */
@@ -1376,6 +1439,14 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
     while (running) {
         if (s->display) {
             gemu_display_poll(s->display);
+            uint32_t cp;
+            while ((cp = gemu_display_pop_raw_key(s->display)) != 0) {
+                uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+                if (next != s->uart_rx_head && cp <= 0x7F) {
+                    s->uart_rx[s->uart_rx_tail] = (uint8_t)cp;
+                    s->uart_rx_tail = next;
+                }
+            }
             if (gemu_display_should_quit(s->display)) {
                 if (cfg->no_shutdown) gemu_display_clear_flags(s->display);
                 else running = false;
