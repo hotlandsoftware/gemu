@@ -53,6 +53,7 @@ FAMILY_SRC = {
         'cpu/merced.c',
         'cpu/merced_ia32.c',
         'hardware/machine/machine_i2000.c',
+        'hardware/machine/machine_generic.c',
         'hardware/romdb.c',
         'vga/input_menu.c',
         'vga/vga_ibm.c',

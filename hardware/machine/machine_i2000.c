@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 
 /*
  * HP i2000 system model. See i2000.h for the memory map.
@@ -143,6 +145,14 @@ struct Ia64I2000State {
 
     MmioLogEnt mmio_log[MMIO_LOG_N];
     int        mmio_log_n;
+
+    /* Wall-clock (not instruction-count) periodic autosave, so a long,
+     * mostly-idle-waiting debug session always has a recent rollback point
+     * without needing a human to remember to snapshot. Two rotating slots
+     * rather than one: if the process is killed mid-write of the current
+     * slot, the other one is still intact. */
+    time_t     last_autosave;
+    unsigned   autosave_slot;
 };
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -447,6 +457,34 @@ static bool vga_port(uint64_t port) {
            port == 0x3D4 || port == 0x3D5 || port == 0x3DA;
 }
 
+static uint8_t cmos_bcd(unsigned v) {
+    return (uint8_t)(((v / 10) << 4) | (v % 10));
+}
+
+/* The static cmos[] array (fixed at reset, never touched again) satisfies
+ * anything that just wants a valid-looking byte back, but firmware
+ * commonly calibrates or synchronizes against the RTC by reading a time
+ * register, then re-reading it later and waiting for the VALUE to change -
+ * a permanently frozen clock makes that an infinite wait no matter what
+ * byte comes back. Refresh the standard time/date registers (0-9) from
+ * real host time on every access so any such wait resolves within a real
+ * second or so. Status register A's UIP (bit 7, update-in-progress) is
+ * left at 0 always rather than pulsed, which is a fine approximation:
+ * real hardware only asserts it for ~244us out of every second, so a
+ * poll for "not updating" would see it clear almost immediately anyway. */
+static void cmos_sync_live_clock(Ia64I2000State *s) {
+    time_t t = time(NULL);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    s->cmos[0x00] = cmos_bcd((unsigned)tmv.tm_sec);
+    s->cmos[0x02] = cmos_bcd((unsigned)tmv.tm_min);
+    s->cmos[0x04] = cmos_bcd((unsigned)tmv.tm_hour);
+    s->cmos[0x06] = (uint8_t)(tmv.tm_wday + 1);
+    s->cmos[0x07] = cmos_bcd((unsigned)tmv.tm_mday);
+    s->cmos[0x08] = cmos_bcd((unsigned)(tmv.tm_mon + 1));
+    s->cmos[0x09] = cmos_bcd((unsigned)(tmv.tm_year % 100));
+}
+
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     static unsigned debug_reads;
     if (size == 1 && vga_port(port))
@@ -476,9 +514,27 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
          * OBF reflects queued controller/keyboard response bytes. */
         return (s->kbc_out_len ? 0x01 : 0) | 0x04; /* system flag */
     }
-    if (port == 0x73 && size == 1)
+    if ((port == 0x71 || port == 0x73) && size == 1)
     {
+        /* 72h/73h is the i2000 IFB's own RTC/CFGRAM alias; 70h/71h is the
+         * universal, standard AT-compatible CMOS index/data pair that
+         * every x86-compatible BIOS (including the real-mode setup code
+         * this firmware runs before entering native SAL/EFI) expects to
+         * work regardless of platform, so both need to reach the same
+         * underlying state. */
+        if ((s->cmos_index & 0x7F) < 0x0A)
+            cmos_sync_live_clock(s);
         uint8_t v = s->cmos[s->cmos_index & 0x7F];
+        if ((s->cmos_index & 0x7F) == 0x0A)
+            /* Status Register A bit 7 is UIP (update in progress). We don't
+             * emulate the real ~244us-per-second update window, and nothing
+             * else ever clears whatever got stored here (firmware itself
+             * can write this register, and did - a stale 1 bit is exactly
+             * what left an earlier boot spinning forever waiting for "not
+             * busy"). Force it clear on every read rather than trust
+             * whatever's retained; the other status-A bits (divider/rate
+             * select) are harmless to read back as stored. */
+            v &= ~0x80u;
         if (getenv("MERCED_DEBUG") && debug_reads++ < 128)
             fprintf(stderr, "i2000: CMOS[%02X] -> %02X\n",
                     s->cmos_index & 0x7F, v);
@@ -674,12 +730,16 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         s->kbc_pending_write = 0;
         return;
     }
-    if (port == 0x72 && size == 1) {
-        /* The i2000 IFB exposes its RTC/configuration RAM at 72h/73h. */
+    if ((port == 0x70 || port == 0x72) && size == 1) {
+        /* The i2000 IFB exposes its RTC/configuration RAM at 72h/73h, but
+         * 70h/71h (standard AT CMOS index/data) must alias the same state -
+         * see the read-side comment. Bit 7 of 70h is conventionally the
+         * NMI-mask bit on real hardware; we don't model NMI, so it's
+         * harmlessly folded into the index like the rest of the byte. */
         s->cmos_index = (uint8_t)val & 0x7F;
         return;
     }
-    if (port == 0x73 && size == 1) {
+    if ((port == 0x71 || port == 0x73) && size == 1) {
         if (getenv("MERCED_DEBUG") && debug_writes++ < 128)
             fprintf(stderr, "i2000: CMOS[%02X] <- %02X\n",
                     s->cmos_index & 0x7F, (unsigned)(uint8_t)val);
@@ -1155,17 +1215,182 @@ static bool i2000_screendump(void *ud, const char *path) {
     return gemu_screendump_argb(path, s->fb, FB_W, FB_H);
 }
 
+/* Snapshot format: full-machine save/restore so a slow, deterministic boot
+ * only ever has to run once. Everything in Ia64I2000State and Merced is
+ * plain data (fixed-size arrays and scalars) except a handful of pointers
+ * that are only meaningful within one process's lifetime - live handles
+ * (monitor/display), the CPU's back-reference and bus hookup, and buffers
+ * whose CONTENTS need saving but whose addresses obviously can't be
+ * (ram, flash, atapi_data). The save/restore strategy is: snapshot those
+ * buffers' contents separately, then bulk-copy the rest of each struct in
+ * one shot with the pointer fields blanked out (save) or preserved from the
+ * live, already-correctly-allocated instance (load) - far less fragile
+ * than hand-listing every scalar field, and it stays correct automatically
+ * as fields get added. */
+#define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
+#define I2000_SNAPSHOT_VERSION 1u
+
+static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = true;
+    uint64_t magic = I2000_SNAPSHOT_MAGIC;
+    uint32_t version = I2000_SNAPSHOT_VERSION;
+    ok &= fwrite(&magic, sizeof(magic), 1, f) == 1;
+    ok &= fwrite(&version, sizeof(version), 1, f) == 1;
+    ok &= fwrite(&s->ram_size, sizeof(s->ram_size), 1, f) == 1;
+    ok &= fwrite(s->ram, 1, s->ram_size, f) == s->ram_size;
+    ok &= fwrite(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
+    uint64_t atapi_len = (uint64_t)s->atapi_data_len;
+    ok &= fwrite(&atapi_len, sizeof(atapi_len), 1, f) == 1;
+    if (atapi_len)
+        ok &= fwrite(s->atapi_data, 1, atapi_len, f) == atapi_len;
+
+    Ia64I2000State snap = *s;
+    snap.monitor = NULL;
+    snap.display = NULL;
+    snap.cpu = NULL;
+    snap.ram = NULL;
+    snap.flash = NULL;
+    snap.cdrom = NULL;
+    snap.atapi_data = NULL;
+    ok &= fwrite(&snap, sizeof(snap), 1, f) == 1;
+
+    Merced cpu_snap = *s->cpu;
+    memset(&cpu_snap.bus, 0, sizeof(cpu_snap.bus));
+    ok &= fwrite(&cpu_snap, sizeof(cpu_snap), 1, f) == 1;
+
+    fclose(f);
+    return ok;
+}
+
+static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    bool ok = true;
+    uint64_t magic = 0;
+    uint32_t version = 0;
+    uint64_t ram_size = 0;
+    ok &= fread(&magic, sizeof(magic), 1, f) == 1;
+    ok &= fread(&version, sizeof(version), 1, f) == 1;
+    ok &= fread(&ram_size, sizeof(ram_size), 1, f) == 1;
+    if (!ok || magic != I2000_SNAPSHOT_MAGIC ||
+        version != I2000_SNAPSHOT_VERSION || ram_size != s->ram_size) {
+        fclose(f);
+        return false;
+    }
+    ok &= fread(s->ram, 1, s->ram_size, f) == s->ram_size;
+    ok &= fread(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
+
+    uint64_t atapi_len = 0;
+    ok &= fread(&atapi_len, sizeof(atapi_len), 1, f) == 1;
+    free(s->atapi_data);
+    s->atapi_data = atapi_len ? malloc((size_t)atapi_len) : NULL;
+    if (atapi_len) {
+        if (!s->atapi_data) { fclose(f); return false; }
+        ok &= fread(s->atapi_data, 1, atapi_len, f) == atapi_len;
+    }
+
+    GemuMonitor *monitor = s->monitor;
+    GemuDisplay *display = s->display;
+    Merced *cpu = s->cpu;
+    uint8_t *ram = s->ram;
+    uint8_t *flash = s->flash;
+    uint8_t *atapi_data = s->atapi_data;
+    if (s->cdrom) fclose(s->cdrom);
+    Ia64I2000State loaded;
+    ok &= fread(&loaded, sizeof(loaded), 1, f) == 1;
+    if (ok) {
+        *s = loaded;
+        s->monitor = monitor;
+        s->display = display;
+        s->cpu = cpu;
+        s->ram = ram;
+        s->flash = flash;
+        s->atapi_data = atapi_data;
+        s->cdrom = s->cdrom_file[0] ? fopen(s->cdrom_file, "rb") : NULL;
+        /* Restart the autosave clock from now, not from whatever wall time
+         * the snapshot itself was taken at. */
+        s->last_autosave = time(NULL);
+        /* A snapshot taken right at (or after) a halt is exactly the point
+         * of loading it back in - to keep going, typically to retest a
+         * fix for whatever caused that halt. Don't leave it stuck. */
+        s->halted = false;
+    }
+
+    MercedBus bus = s->cpu->bus;
+    Merced loaded_cpu;
+    ok &= fread(&loaded_cpu, sizeof(loaded_cpu), 1, f) == 1;
+    if (ok) {
+        *s->cpu = loaded_cpu;
+        s->cpu->bus = bus;
+    }
+
+    fclose(f);
+    return ok;
+}
+
+#define I2000_AUTOSAVE_DIR "/home/admin/jemu/snapshots"
+#define I2000_AUTOSAVE_PERIOD_SEC 300
+
+/* Called once per run_slice from the main loop. Wall-clock gated (not
+ * instruction-count gated) since the whole point is a rollback point every
+ * few minutes of real debugging time, regardless of how fast or slow any
+ * particular stretch of firmware executes. Silent no-op until the first
+ * period has elapsed, so a quick one-off run doesn't pay for a snapshot it
+ * will never use. */
+static void i2000_autosave_tick(Ia64I2000State *s) {
+    time_t now = time(NULL);
+    if (s->last_autosave == 0) {
+        s->last_autosave = now;
+        return;
+    }
+    if (now - s->last_autosave < I2000_AUTOSAVE_PERIOD_SEC)
+        return;
+    s->last_autosave = now;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/autosave_%u.vmstate",
+             I2000_AUTOSAVE_DIR, s->autosave_slot);
+    s->autosave_slot ^= 1u;
+    if (i2000_save_snapshot(s, path))
+        printf("i2000: autosaved to %s (ninsts=%" PRIu64 ")\n",
+               path, s->cpu->ninsts);
+    else
+        fprintf(stderr, "i2000: autosave to %s FAILED\n", path);
+}
+
 /* monitor "x 0xADDR [count]": physical memory hexdump
  * monitor "trace N": stderr-trace the next N executed slots
  * monitor "history [N]": dump the most recently executed slots
  * monitor "panel FILE": dump the CPU/MMIO debug front panel (the live
- * display and default screendump now show real VGA output instead) */
+ * display and default screendump now show real VGA output instead)
+ * monitor "savevm FILE": snapshot the full machine state to FILE
+ * monitor "loadvm FILE": restore full machine state from FILE (run this
+ * right after startup to skip re-running a slow, already-verified boot
+ * prefix) */
 static void i2000_custom_cmd(Ia64I2000State *s) {
     const char *txt = gemu_monitor_command_text(s->monitor);
     uint64_t addr;
     int count = 64;
     uint64_t n;
     char panel_path[256];
+    char vm_path[256];
+    if (txt && sscanf(txt, "savevm %255s", vm_path) == 1) {
+        if (i2000_save_snapshot(s, vm_path))
+            printf("saved snapshot to %s (ninsts=%" PRIu64 ")\n",
+                   vm_path, s->cpu->ninsts);
+        else
+            printf("failed to save snapshot to %s\n", vm_path);
+        return;
+    }
+    if (txt && sscanf(txt, "loadvm %255s", vm_path) == 1) {
+        if (i2000_load_snapshot(s, vm_path))
+            printf("loaded snapshot from %s (ninsts=%" PRIu64 ")\n",
+                   vm_path, s->cpu->ninsts);
+        else
+            printf("failed to load snapshot from %s\n", vm_path);
+        return;
+    }
     if (txt && sscanf(txt, "panel %255s", panel_path) == 1) {
         panel_render(s);
         if (gemu_screendump_argb(panel_path, s->fb, FB_W, FB_H))
@@ -1373,6 +1598,8 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     Ia64I2000State *s = calloc(1, sizeof(*s));
     if (!s)
         return NULL;
+
+    mkdir(I2000_AUTOSAVE_DIR, 0755); /* ignore EEXIST/already-there */
 
     s->pic_master_mask = 0xFF;
     s->pic_slave_mask = 0xFF;
@@ -1645,8 +1872,11 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
         if (!running)
             break;
 
-        if (!gemu_monitor_is_paused(s->monitor))
+        if (!gemu_monitor_is_paused(s->monitor)) {
             i2000_run_slice(s);
+            if (!s->halted)
+                i2000_autosave_tick(s);
+        }
 
         if (s->display) {
             gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));

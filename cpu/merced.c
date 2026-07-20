@@ -1217,10 +1217,11 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                 uint64_t imm = (bits(raw, 36, 1) << 20) | bits(raw, 6, 20);
                 if (!qp) return MERCED_OK;
                 m->cr[CR_IIM] = imm;
-                snprintf(m->halt_msg, sizeof(m->halt_msg),
-                         "break.m 0x%" PRIX64, imm);
-                m->halt_ip = m->ip;
-                return MERCED_HALT_BREAK;
+                /* Architecturally a Break Instruction fault, delivered to
+                 * firmware's own handler (which decides what a given
+                 * immediate means - PAL call, OS call, debug trap, etc.),
+                 * not an emulator halt. Real hardware never stops here. */
+                return deliver_fault(m, VEC_BREAK, 0, 0, false);
             }
             case 0x01: return MERCED_OK;            /* nop.m / hint.m */
             case 0x10: return MERCED_OK;            /* invala */
@@ -1504,10 +1505,7 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
                 uint64_t imm = (bits(raw, 36, 1) << 20) | bits(raw, 6, 20);
                 if (!qp) return MERCED_OK;
                 m->cr[CR_IIM] = imm;
-                snprintf(m->halt_msg, sizeof(m->halt_msg),
-                         "break.i 0x%" PRIX64, imm);
-                m->halt_ip = m->ip;
-                return MERCED_HALT_BREAK;
+                return deliver_fault(m, VEC_BREAK, 0, 0, false);
             }
             case 0x01: return MERCED_OK;            /* nop.i / hint.i */
             case 0x0A: {                            /* mov.i ar3=imm8 */
@@ -1870,9 +1868,7 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
             uint64_t imm = (bits(raw, 36, 1) << 20) | bits(raw, 6, 20);
             if (!qp) return MERCED_OK;
             m->cr[CR_IIM] = imm;
-            snprintf(m->halt_msg, sizeof(m->halt_msg), "break.b 0x%" PRIX64, imm);
-            m->halt_ip = m->ip;
-            return MERCED_HALT_BREAK;
+            return deliver_fault(m, VEC_BREAK, 0, 0, false);
         }
         case 0x02: {                                /* cover */
             uint64_t old = m->cfm;
@@ -2020,9 +2016,7 @@ static MercedStatus exec_x(Merced *m, uint64_t raw, uint64_t lraw, int qp) {
             uint64_t imm = (bits(raw, 36, 1) << 20) | bits(raw, 6, 20);
             if (!qp) return MERCED_OK;
             m->cr[CR_IIM] = imm;
-            snprintf(m->halt_msg, sizeof(m->halt_msg), "break.x 0x%" PRIX64, imm);
-            m->halt_ip = m->ip;
-            return MERCED_HALT_BREAK;
+            return deliver_fault(m, VEC_BREAK, 0, 0, false);
         }
     }
     return mhalt(m, "unimpl X-unit major 0x%X", major);
@@ -2043,10 +2037,10 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
         if (!x) {
             switch (x6) {
             case 0x00: {                            /* break.f */
+                uint64_t imm = (bits(raw, 36, 1) << 20) | bits(raw, 6, 20);
                 if (!qp) return MERCED_OK;
-                snprintf(m->halt_msg, sizeof(m->halt_msg), "break.f");
-                m->halt_ip = m->ip;
-                return MERCED_HALT_BREAK;
+                m->cr[CR_IIM] = imm;
+                return deliver_fault(m, VEC_BREAK, 0, 0, false);
             }
             case 0x01: return MERCED_OK;            /* nop.f / hint.f */
             case 0x04: {                            /* fsetc */

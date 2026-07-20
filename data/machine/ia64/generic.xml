@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<machine name="generic" family="ia64" description="Generic Itanium-compatible PC"
+        cpu="merced" ram="512M" status="preliminary">
+    <rom name="GEMU_EFI.bin" addr="0x0000" sha256="2e6e13f599d13eaf4b30a4bfd2327dcc26b3b73df6c90f0ce2a38a98e6e3dda7"/>
+</machine>

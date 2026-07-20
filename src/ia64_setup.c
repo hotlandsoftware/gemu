@@ -1,4 +1,5 @@
 #include "i2000.h"
+#include "generic.h"
 #include "romdb.h"
 #include "gemu/args.h"
 #include "gemu/monitor.h"
@@ -166,6 +167,28 @@ int ia64_setup(int argc, char *argv[]) {
     if (sdl_up && SDL_Init(0) < 0) {
         fprintf(stderr, "gemu: SDL_Init failed: %s\n", SDL_GetError());
         return 1;
+    }
+
+    if (strcmp(alias, "generic") == 0) {
+        GenericConfig gcfg = {
+            .ram_size = cfg.ram_size,
+            .display_type = cfg.display_type,
+            .display_scale = cfg.display_scale,
+            .no_shutdown = cfg.no_shutdown,
+        };
+        Ia64GenericState *g = ia64_generic_create(&gcfg);
+        if (!g)
+            return 1;
+        if (!rom_arg || !ia64_generic_load_firmware(g, rom_arg)) {
+            fprintf(stderr, "gemu: generic needs a firmware image (-rom FILE)\n");
+            ia64_generic_destroy(g);
+            return 1;
+        }
+        ia64_generic_run(g, &gcfg);
+        ia64_generic_destroy(g);
+        if (sdl_up)
+            SDL_Quit();
+        return 0;
     }
 
     Ia64I2000State *s = ia64_i2000_create(&cfg);

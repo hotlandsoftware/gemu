@@ -218,7 +218,7 @@ void vga_ibm_render(const VgaIbm *v, uint32_t *argb, int fb_w, int fb_h,
 
         for (int row = 0; row < rows; row++) {
             for (int col = 0; col < cols; col++) {
-                uint32_t off = (uint32_t)((row * cols + col) * 2);
+                uint32_t off = (uint32_t)(row * cols + col);
                 uint8_t ch_code = off < 0x10000 ? v->vram[0][off] : 0;
                 uint8_t attr = off < 0x10000 ? v->vram[1][off] : 0x07;
                 uint32_t fg = palette_argb(v, attr & 0xF);

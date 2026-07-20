@@ -5,3 +5,4 @@ roms/
 .ninja_log
 build.ninja*.log
 reference/
+snapshots/
