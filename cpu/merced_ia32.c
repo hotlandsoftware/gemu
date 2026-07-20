@@ -86,6 +86,19 @@ static bool rb(X86 *x, uint32_t a, unsigned size, bool fetch, uint32_t *v) {
 static bool wb(X86 *x, uint32_t a, unsigned size, uint32_t v) {
     return merced_ia32_write(x->m, a, size, v);
 }
+static uint64_t ioaddr(X86 *x, uint16_t port) {
+    return x->m->ar[0] | ((uint64_t)(port & 0xfffc) << 10) |
+           (port & 0x0fff);
+}
+static bool ioread(X86 *x, uint16_t port, unsigned size, uint32_t *v) {
+    uint64_t q;
+    if (!merced_ia32_read(x->m, ioaddr(x, port), size, false, &q)) return false;
+    *v = (uint32_t)q;
+    return true;
+}
+static bool iowrite(X86 *x, uint16_t port, unsigned size, uint32_t v) {
+    return merced_ia32_write(x->m, ioaddr(x, port), size, v);
+}
 static bool fetch(X86 *x, unsigned size, uint32_t *v) {
     if (!rb(x, x->pc, size, true, v)) return false;
     x->pc += size;
@@ -117,7 +130,7 @@ static bool decode_rm(X86 *x, uint8_t modrm, RM *rm) {
     unsigned seg = x->seg_override >= 0 ? (unsigned)x->seg_override : X_DS;
     int32_t disp = 0;
     if (!x->addr32) {
-        static const int8_t base[8] = {3,3,5,5,6,7,-1,3};
+        static const int8_t base[8] = {3,3,5,5,6,7,5,3};
         static const int8_t index[8] = {6,7,6,7,-1,-1,-1,-1};
         if ((r >= 2 && r <= 3) || (r == 6 && mod != 0)) seg = X_SS;
         uint32_t off = base[r] < 0 ? 0 : xr(x, base[r], 2);
@@ -192,6 +205,13 @@ static void add_flags(X86 *x, uint32_t a, uint32_t b, uint32_t v,
     setflags(x, f);
 }
 
+static void incdec_flags(X86 *x, uint32_t a, uint32_t b, uint32_t v,
+                         unsigned size, bool sub) {
+    uint32_t cf = eflags(x) & FL_CF;
+    if (sub) sub_flags(x,a,b,v,size); else add_flags(x,a,b,v,size);
+    setflags(x,(eflags(x) & ~FL_CF) | cf);
+}
+
 static bool condition(X86 *x, unsigned c) {
     uint32_t f = eflags(x);
     bool cf=f&FL_CF, pf=f&FL_PF, zf=f&FL_ZF, sf=f&FL_SF, of=f&FL_OF;
@@ -205,6 +225,18 @@ static bool condition(X86 *x, unsigned c) {
     case 12:return sf!=of;   case 13:return sf==of;
     case 14:return zf||sf!=of; default:return !zf&&sf==of;
     }
+}
+
+/* Near control transfers update EIP, not the already-segmented linear IP.
+ * In a 16-bit code segment the result wraps at 16 bits before CSD.base is
+ * added.  Treating x.pc as a flat address made backward calls crossing the
+ * segment base jump below CS (for example F000:F50FE -> physical EF019
+ * instead of the intended F000:0019). */
+static uint32_t near_target(X86 *x, int32_t rel) {
+    uint32_t off = x->pc - sbase(x, X_CS);
+    off += (uint32_t)rel;
+    if (!x->op32) off &= UINT16_MAX;
+    return sbase(x, X_CS) + off;
 }
 
 MercedStatus merced_ia32_step(Merced *m) {
@@ -248,6 +280,22 @@ MercedStatus merced_ia32_step(Merced *m) {
     m->trace_history[hi].qp = 0;
 
     if (op == 0x90) { /* nop */ }
+    else if (op >= 0x91 && op <= 0x97) {
+        unsigned r=op&7; uint32_t a=xr(&x,0,size), b=xr(&x,r,size);
+        setxr(&x,0,size,b); setxr(&x,r,size,a);
+    }
+    else if ((op & 6) == 4 && (op <= 0x0d ||
+             (op >= 0x20 && op <= 0x3d))) {
+        unsigned n=(op&1)?size:1; uint32_t imm,a=xr(&x,0,n),v;
+        if(!fetch(&x,n,&imm))goto fault;
+        unsigned family=op&0x38;
+        if(family==0x00){v=a+imm;add_flags(&x,a,imm,v,n);}
+        else if(family==0x08){v=a|imm;logic_flags(&x,v,n);}
+        else if(family==0x20){v=a&imm;logic_flags(&x,v,n);}
+        else if(family==0x28||family==0x38){v=a-imm;sub_flags(&x,a,imm,v,n);}
+        else {v=a^imm;logic_flags(&x,v,n);}
+        if(family!=0x38)setxr(&x,0,n,v);
+    }
     else if ((op <= 0x03) || (op >= 0x08 && op <= 0x0b) ||
              (op >= 0x20 && op <= 0x23) || (op >= 0x28 && op <= 0x2b) ||
              (op >= 0x30 && op <= 0x33) || (op >= 0x38 && op <= 0x3b)) {
@@ -269,14 +317,25 @@ MercedStatus merced_ia32_step(Merced *m) {
             else if (!rmwrite(&x,rm,n,v)) goto fault;
         }
     }
-    else if (op >= 0xb8 && op <= 0xbf) {
+    else if (op >= 0xb0 && op <= 0xb7) {
+        if (!fetch(&x, 1, &q)) goto fault;
+        setxr(&x, op - 0xb0, 1, q);
+    } else if (op >= 0xb8 && op <= 0xbf) {
         if (!fetch(&x, size, &q)) goto fault;
         setxr(&x, op - 0xb8, size, q);
     } else if (op >= 0x50 && op <= 0x57) {
         if (!push(&x, size, xr(&x, op - 0x50, size))) goto fault;
+    } else if (op == 0x68 || op == 0x6a) {
+        if (!fetch(&x,op==0x68?size:1,&q)) goto fault;
+        if (op==0x6a) q=(uint32_t)(int32_t)(int8_t)q;
+        if (!push(&x,size,q)) goto fault;
     } else if (op >= 0x58 && op <= 0x5f) {
         if (!pop(&x, size, &q)) goto fault;
         setxr(&x, op - 0x58, size, q);
+    } else if (op >= 0x40 && op <= 0x4f) {
+        unsigned r=op&7; uint32_t a=xr(&x,r,size);
+        bool sub=op>=0x48; uint32_t v=sub?a-1:a+1;
+        setxr(&x,r,size,v); incdec_flags(&x,a,1,v,size,sub);
     } else if (op == 0x06 || op == 0x0e || op == 0x16 || op == 0x1e) {
         unsigned s = op == 0x06 ? X_ES : op == 0x0e ? X_CS : op == 0x16 ? X_SS : X_DS;
         if (!push(&x, 2, sel(&x, s))) goto fault;
@@ -302,14 +361,26 @@ MercedStatus merced_ia32_step(Merced *m) {
     else if (op == 0xfd) setflags(&x, eflags(&x) | FL_DF);
     else if (op >= 0x70 && op <= 0x7f) {
         if (!fetch(&x,1,&q)) goto fault;
-        if (condition(&x,op&15)) { x.pc += (int8_t)q; branch=true; }
+        if (condition(&x,op&15)) { x.pc=near_target(&x,(int8_t)q); branch=true; }
+    } else if (op >= 0xe0 && op <= 0xe3) {
+        if (!fetch(&x,1,&q)) goto fault;
+        unsigned n=x.addr32?4:2; uint32_t count=xr(&x,1,n);
+        bool take;
+        if(op==0xe3) take=count==0;
+        else {
+            count--; setxr(&x,1,n,count);
+            take=count!=0 && (op==0xe2 || (op==0xe1)==!!(eflags(&x)&FL_ZF));
+        }
+        if (take) {
+            x.pc=near_target(&x,(int8_t)q); branch=true;
+        }
     } else if (op == 0xeb || op == 0xe9) {
         if (!fetch(&x, op==0xeb?1:size, &q)) goto fault;
         int32_t rel = op==0xeb ? (int8_t)q : size==2 ? (int16_t)q : (int32_t)q;
-        x.pc += rel; branch=true;
+        x.pc=near_target(&x,rel); branch=true;
     } else if (op == 0xe8) {
         if (!fetch(&x,size,&q) || !push(&x,size,x.pc-sbase(&x,X_CS))) goto fault;
-        x.pc += size==2?(int16_t)q:(int32_t)q; branch=true;
+        x.pc=near_target(&x,size==2?(int16_t)q:(int32_t)q); branch=true;
     } else if (op == 0xea) {
         uint32_t off, cs;
         if (!fetch(&x,size,&off) || !fetch(&x,2,&cs)) goto fault;
@@ -319,14 +390,94 @@ MercedStatus merced_ia32_step(Merced *m) {
         if (!pop(&x,size,&off)) goto fault;
         if (op==0xcb) { if (!pop(&x,2,&cs)) goto fault; setseg_real(&x,X_CS,cs); }
         x.pc=sbase(&x,X_CS)+(off&(size==2?0xffff:UINT32_MAX)); branch=true;
-    } else if (op == 0x8b || op == 0x89 || op == 0x8c || op == 0x8e) {
+    } else if (op == 0xc4 || op == 0xc5) {          /* les / lds */
+        if (!fetch(&x,1,&q)) goto fault;
+        uint8_t mr=q; RM rm; if(!decode_rm(&x,mr,&rm)||rm.is_reg)goto fault;
+        uint32_t off,seg;
+        if(!rb(&x,rm.addr,size,false,&off)||!rb(&x,rm.addr+size,2,false,&seg))goto fault;
+        setxr(&x,(mr>>3)&7,size,off);
+        setseg_real(&x,op==0xc4?X_ES:X_DS,(uint16_t)seg);
+    } else if (op == 0xcd || op == 0xcc) {           /* int imm8 / int3 */
+        uint32_t vec = 3;
+        if (op == 0xcd && !fetch(&x,1,&vec)) goto fault;
+        uint32_t ip_lo, cs_lo;
+        if (!push(&x,2,(uint16_t)eflags(&x)) ||
+            !push(&x,2,sel(&x,X_CS)) ||
+            !push(&x,2,(uint16_t)(x.pc-sbase(&x,X_CS))) ||
+            !rb(&x,vec*4,2,false,&ip_lo) || !rb(&x,vec*4+2,2,false,&cs_lo))
+            goto fault;
+        setseg_real(&x,X_CS,(uint16_t)cs_lo);
+        x.pc = sbase(&x,X_CS) + ip_lo;
+        setflags(&x, eflags(&x) & ~(FL_IF));
+        branch = true;
+    } else if (op == 0xcf) {                        /* iret */
+        uint32_t ip_r, cs_r, fl_r;
+        if (!pop(&x,2,&ip_r) || !pop(&x,2,&cs_r) || !pop(&x,2,&fl_r)) goto fault;
+        setseg_real(&x,X_CS,(uint16_t)cs_r);
+        x.pc = sbase(&x,X_CS) + ip_r;
+        setflags(&x, fl_r);
+        branch = true;
+    } else if (op == 0xfa) setflags(&x, eflags(&x) & ~FL_IF);   /* cli */
+    else if (op == 0xfb) setflags(&x, eflags(&x) | FL_IF);      /* sti */
+    else if (op == 0xe4 || op == 0xe5 || op == 0xe6 || op == 0xe7 ||
+             op == 0xec || op == 0xed || op == 0xee || op == 0xef) {
+        bool out = op == 0xe6 || op == 0xe7 || op == 0xee || op == 0xef;
+        unsigned n = (op & 1) ? size : 1;
+        uint16_t port;
+        if (op >= 0xec) port = (uint16_t)xr(&x,2,2);
+        else { if (!fetch(&x,1,&q)) goto fault; port = (uint8_t)q; }
+        if (out) {
+            if (!iowrite(&x,port,n,xr(&x,0,n))) goto fault;
+        } else {
+            if (!ioread(&x,port,n,&q)) goto fault;
+            setxr(&x,0,n,q);
+        }
+    } else if (op == 0x86 || op == 0x87) {
+        if (!fetch(&x,1,&q)) goto fault;
+        uint8_t mr=q; RM rm; if (!decode_rm(&x,mr,&rm)) goto fault;
+        unsigned n=op==0x86?1:size, reg=(mr>>3)&7; uint32_t a,b;
+        if(!rmread(&x,rm,n,&a))goto fault;
+        b=xr(&x,reg,n);
+        if(!rmwrite(&x,rm,n,b))goto fault;
+        setxr(&x,reg,n,a);
+    } else if (op == 0x8f) {
+        if (!fetch(&x,1,&q)) goto fault;
+        uint8_t mr=q; RM rm;
+        if (((mr>>3)&7)!=0 || !decode_rm(&x,mr,&rm)) goto fault;
+        if (!pop(&x,size,&q) || !rmwrite(&x,rm,size,q)) goto fault;
+    } else if (op == 0x88 || op == 0x8a || op == 0x8b || op == 0x89 ||
+               op == 0x8c || op == 0x8e) {
         if (!fetch(&x,1,&q)) goto fault;
         uint8_t mr=q; RM rm; if (!decode_rm(&x,mr,&rm)) goto fault;
         unsigned reg=(mr>>3)&7;
-        if (op==0x8b) { if(!rmread(&x,rm,size,&q))goto fault; setxr(&x,reg,size,q); }
-        else if(op==0x89) { if(!rmwrite(&x,rm,size,xr(&x,reg,size)))goto fault; }
+        if (op==0x8a || op==0x8b) { unsigned n=op==0x8a?1:size; if(!rmread(&x,rm,n,&q))goto fault; setxr(&x,reg,n,q); }
+        else if(op==0x88 || op==0x89) { unsigned n=op==0x88?1:size; if(!rmwrite(&x,rm,n,xr(&x,reg,n)))goto fault; }
         else if(op==0x8c) { if(reg>5||!rmwrite(&x,rm,2,sel(&x,reg)))goto fault; }
         else { if(reg>5||!rmread(&x,rm,2,&q))goto fault; setseg_real(&x,reg,q); }
+    } else if (op == 0x69 || op == 0x6b) {           /* imul r, r/m, imm */
+        if (!fetch(&x,1,&q)) goto fault;
+        uint8_t mr=q; RM rm; if(!decode_rm(&x,mr,&rm)) goto fault;
+        unsigned reg=(mr>>3)&7;
+        uint32_t a, imm;
+        if(!rmread(&x,rm,size,&a)) goto fault;
+        if (op==0x69) { if(!fetch(&x,size,&imm)) goto fault; }
+        else { if(!fetch(&x,1,&imm)) goto fault; imm=(uint32_t)(int32_t)(int8_t)imm; }
+        int64_t sa = size==2 ? (int16_t)a : (int32_t)a;
+        int64_t si = size==2 ? (int16_t)imm : (int32_t)imm;
+        int64_t full = sa*si;
+        uint32_t v = size==2 ? (uint32_t)(uint16_t)full : (uint32_t)full;
+        int64_t sv = size==2 ? (int16_t)v : (int32_t)v;
+        uint32_t f = eflags(&x) & ~(FL_CF|FL_OF);
+        if (full != sv) f |= FL_CF|FL_OF;
+        setflags(&x, f);
+        setxr(&x, reg, size, v);
+    } else if (op >= 0xa0 && op <= 0xa3) {
+        uint32_t off; if(!fetch(&x,x.addr32?4:2,&off))goto fault;
+        unsigned seg=x.seg_override>=0?(unsigned)x.seg_override:X_DS;
+        uint32_t addr=sbase(&x,seg)+(x.addr32?off:(uint16_t)off);
+        unsigned n=(op&1)?size:1;
+        if(op<0xa2){if(!rb(&x,addr,n,false,&q))goto fault;setxr(&x,0,n,q);}
+        else if(!wb(&x,addr,n,xr(&x,0,n)))goto fault;
     } else if (op == 0x2f) {                        /* das */
         uint32_t f = eflags(&x);
         uint32_t al = xr(&x, 0, 1);
@@ -348,23 +499,65 @@ MercedStatus merced_ia32_step(Merced *m) {
         if (!fetch(&x,1,&q)) goto fault;
         uint32_t a=xr(&x,0,1), v=a-(uint8_t)q;
         sub_flags(&x,a,(uint8_t)q,v,1);
+    } else if (op == 0xc0 || op == 0xc1 ||
+               op == 0xd0 || op == 0xd1 || op == 0xd2 || op == 0xd3) {
+        if (!fetch(&x,1,&q)) goto fault;
+        uint8_t mr=q; RM rm; if(!decode_rm(&x,mr,&rm))goto fault;
+        unsigned sub=(mr>>3)&7, n=(op&1)?size:1, count;
+        uint32_t v, old;
+        if(!rmread(&x,rm,n,&v))goto fault;
+        old=v;
+        if(op==0xc0||op==0xc1){if(!fetch(&x,1,&q))goto fault;count=q&31;}
+        else if(op==0xd0||op==0xd1)count=1;
+        else count=xr(&x,1,1)&31;
+        if(count){
+            uint32_t cf=0, sign=1u<<(n*8-1);
+            if(sub!=4&&sub!=5&&sub!=7)
+                return xhalt(&x,"IA-32 shift /%u unimplemented at %08X",sub,x.start);
+            for(unsigned i=0;i<count;i++){
+                if(sub==4){cf=!!(v&sign);v<<=1;}
+                else {cf=v&1;
+                    if(sub==5)v>>=1;
+                    else if(n==1)v=(uint8_t)((int8_t)v>>1);
+                    else if(n==2)v=(uint16_t)((int16_t)v>>1);
+                    else v=(uint32_t)((int32_t)v>>1);
+                }
+            }
+            if(n<4)v&=(1u<<(n*8))-1;
+            logic_flags(&x,v,n);
+            uint32_t f=eflags(&x)&~(FL_CF|FL_OF);
+            if(cf)f|=FL_CF;
+            if(count==1){
+                if(sub==4&&((!!(v&sign))!=cf))f|=FL_OF;
+                else if(sub==5&&(old&sign))f|=FL_OF;
+            }
+            setflags(&x,f);
+            if(!rmwrite(&x,rm,n,v))goto fault;
+        }
     } else if (op == 0xc6 || op == 0xc7) {
         if (!fetch(&x,1,&q)) goto fault;
         uint8_t mr=q; RM rm;
         if (((mr>>3)&7)!=0 || !decode_rm(&x,mr,&rm)) goto fault;
         unsigned n=op==0xc6?1:size;
         if (!fetch(&x,n,&q) || !rmwrite(&x,rm,n,q)) goto fault;
-    } else if (op == 0x81 || op == 0x83) {
+    } else if (op == 0x80 || op == 0x81 || op == 0x83) {
         if (!fetch(&x,1,&q)) goto fault;
         uint8_t mr=q; RM rm;
         if(!decode_rm(&x,mr,&rm))goto fault;
         unsigned sub=(mr>>3)&7;
-        uint32_t a,imm; if(!rmread(&x,rm,size,&a)||!fetch(&x,op==0x83?1:size,&imm))goto fault;
+        unsigned n=op==0x80?1:size;
+        uint32_t a,imm; if(!rmread(&x,rm,n,&a)||!fetch(&x,op==0x83?1:n,&imm))goto fault;
         if(op==0x83) imm=(uint32_t)(int32_t)(int8_t)imm;
-        uint32_t v; if(sub==0)v=a+imm; else if(sub==5)v=a-imm;
+        uint32_t v; if(sub==0)v=a+imm;
+        else if(sub==1)v=a|imm;
+        else if(sub==4)v=a&imm;
+        else if(sub==6)v=a^imm;
+        else if(sub==5||sub==7)v=a-imm;
         else return xhalt(&x,"IA-32 group1 /%u unimplemented at %08X",sub,x.start);
-        if(!rmwrite(&x,rm,size,v))goto fault;
-        if(sub==5) sub_flags(&x,a,imm,v,size); else add_flags(&x,a,imm,v,size);
+        if(sub!=7&&!rmwrite(&x,rm,n,v))goto fault;
+        if(sub==5||sub==7)sub_flags(&x,a,imm,v,n);
+        else if(sub==0)add_flags(&x,a,imm,v,n);
+        else logic_flags(&x,v,n);
     } else if (op == 0xa4 || op == 0xa5) {
         unsigned n=op==0xa4?1:size; uint32_t count=x.rep?xr(&x,1,x.addr32?4:2):1;
         int step=(eflags(&x)&FL_DF)?-(int)n:(int)n;
@@ -389,23 +582,49 @@ MercedStatus merced_ia32_step(Merced *m) {
             if(!wb(&x,sbase(&x,X_ES)+di,n,val))goto fault;
             setxr(&x,7,x.addr32?4:2,di+step);}
         if(x.rep)setxr(&x,1,x.addr32?4:2,0);
-    } else if (op == 0xff) {
+    } else if (op == 0xf6 || op == 0xf7) {
+        if(!fetch(&x,1,&q))goto fault;
+        uint8_t mr=q;RM rm;if(!decode_rm(&x,mr,&rm))goto fault;
+        unsigned sub=(mr>>3)&7,n=op==0xf6?1:size;uint32_t src;
+        if(!rmread(&x,rm,n,&src))goto fault;
+        if(sub==0){uint32_t imm;if(!fetch(&x,n,&imm))goto fault;
+            logic_flags(&x,src&imm,n);
+        } else if(sub==4){
+            if(n==1){uint16_t v=(uint16_t)xr(&x,0,1)*(uint8_t)src;
+                setxr(&x,0,2,v);setflags(&x,(eflags(&x)&~(FL_CF|FL_OF))|((v>>8)?FL_CF|FL_OF:0));}
+            else {uint64_t v=(uint64_t)xr(&x,0,n)*src;
+                setxr(&x,0,n,(uint32_t)v);setxr(&x,2,n,(uint32_t)(v>>(n*8)));
+                setflags(&x,(eflags(&x)&~(FL_CF|FL_OF))|((v>>(n*8))?FL_CF|FL_OF:0));}
+        } else return xhalt(&x,"IA-32 group3 /%u unimplemented at %08X",sub,x.start);
+    } else if (op == 0xfe || op == 0xff) {
         if(!fetch(&x,1,&q))goto fault;
         uint8_t mr=q;RM rm;
         if(!decode_rm(&x,mr,&rm))goto fault;
         unsigned sub=(mr>>3)&7;
-        if(sub==3 && !rm.is_reg){uint32_t off,cs;if(!rb(&x,rm.addr,size,false,&off)||!rb(&x,rm.addr+size,2,false,&cs))goto fault;
+        unsigned n=op==0xfe?1:size;
+        if(op==0xfe && sub<=1){uint32_t a,v;if(!rmread(&x,rm,1,&a))goto fault;v=sub?a-1:a+1;
+            if(!rmwrite(&x,rm,1,v))goto fault;
+            incdec_flags(&x,a,1,v,1,sub!=0);}
+        else if(op==0xff && sub==4){uint32_t off;if(!rmread(&x,rm,n,&off))goto fault;
+            x.pc=sbase(&x,X_CS)+(off&(n==2?UINT16_MAX:UINT32_MAX));branch=true;}
+        else if(op==0xff && sub==3 && !rm.is_reg){uint32_t off,cs;if(!rb(&x,rm.addr,size,false,&off)||!rb(&x,rm.addr+size,2,false,&cs))goto fault;
             if(!push(&x,2,sel(&x,X_CS))||!push(&x,size,x.pc-sbase(&x,X_CS)))goto fault;
             setseg_real(&x,X_CS,cs);x.pc=sbase(&x,X_CS)+(off&(size==2?0xffff:UINT32_MAX));branch=true;}
         else return xhalt(&x,"IA-32 FF /%u unimplemented at %08X",sub,x.start);
     } else if (op == 0x0f) {
         uint32_t op2;if(!fetch(&x,1,&op2))goto fault;
-        if(op2==0x00){uint32_t mr;if(!fetch(&x,1,&mr))goto fault;
+        if(op2==0xb6 || op2==0xb7 || op2==0xbe || op2==0xbf){
+            uint32_t mr;if(!fetch(&x,1,&mr))goto fault;RM rm;
+            if(!decode_rm(&x,mr,&rm))goto fault;
+            unsigned n=(op2&1)?2:1;uint32_t v;if(!rmread(&x,rm,n,&v))goto fault;
+            if(op2>=0xbe)v=n==1?(uint32_t)(int32_t)(int8_t)v:(uint32_t)(int32_t)(int16_t)v;
+            setxr(&x,(mr>>3)&7,size,v);
+        } else if(op2==0x00){uint32_t mr;if(!fetch(&x,1,&mr))goto fault;
             if(((mr>>3)&7)==6){RM rm;if(!decode_rm(&x,mr,&rm)||!rmread(&x,rm,size,&q))goto fault;
                 /* JMPE: leave IA-32 mode and resume at an aligned IA-64 IP. */
                 m->ip=(sbase(&x,X_CS)+q)&UINT32_C(0xfffffff0);m->psr&=~(UINT64_C(1)<<34);m->psr&=~(UINT64_C(3)<<41);m->taken=1;m->ninsts++;return MERCED_OK;}
-        }
-        return xhalt(&x,"IA-32 0F %02X unimplemented at %08X",op2,x.start);
+            return xhalt(&x,"IA-32 0F %02X unimplemented at %08X",op2,x.start);
+        } else return xhalt(&x,"IA-32 0F %02X unimplemented at %08X",op2,x.start);
     } else return xhalt(&x,"IA-32 opcode %02X unimplemented at %08X",op,x.start);
 
     (void)branch;

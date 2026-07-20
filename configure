@@ -55,6 +55,9 @@ FAMILY_SRC = {
         'hardware/machine/machine_i2000.c',
         'hardware/romdb.c',
         'vga/input_menu.c',
+        'vga/vga_ibm.c',
+        'vga/vgafont16.c',
+        'vga/vgabios_rom.c',
         'src/ia64_setup.c',
     ],
     'mitsu': [

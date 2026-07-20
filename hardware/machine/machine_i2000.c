@@ -1,6 +1,9 @@
 #include "i2000.h"
 #include "merced.h"
 #include "input_menu.h"
+#include "vga_ibm.h"
+#include "vgafont16.h"
+#include "vgabios_rom.h"
 #include "gemu/gemu_display.h"
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
@@ -128,6 +131,14 @@ struct Ia64I2000State {
     uint8_t   memcard_cfg[2][8][256];
     uint8_t   uart_ier, uart_lcr, uart_mcr, uart_scr, uart_dll, uart_dlm;
     uint8_t   uart_rx[256], uart_rx_head, uart_rx_tail;
+
+    VgaIbm    vga;
+    /* The video BIOS option ROM shadow, kept separate from plain system RAM
+     * (like `flash`) so a generic "clear all of RAM" firmware loop - which
+     * legitimately treats the whole reported memory range as ordinary RAM -
+     * can't wipe it out before IA-32 mode ever gets to use it. Real chipsets
+     * exclude this range from the reported memory map for the same reason. */
+    uint8_t   vga_rom_shadow[0x10000];
 
     MmioLogEnt mmio_log[MMIO_LOG_N];
     int        mmio_log_n;
@@ -415,8 +426,16 @@ static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
     }
 }
 
+static bool vga_port(uint64_t port) {
+    return port == 0x3B4 || port == 0x3B5 || port == 0x3BA ||
+           (port >= 0x3C0 && port <= 0x3CF) ||
+           port == 0x3D4 || port == 0x3D5 || port == 0x3DA;
+}
+
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     static unsigned debug_reads;
+    if (size == 1 && vga_port(port))
+        return vga_ibm_io_read(&s->vga, (uint16_t)port);
     if (port == 0x60 && size == 1) {               /* 8042 data */
         if (s->kbc_out_pos >= s->kbc_out_len)
             return 0;
@@ -519,6 +538,10 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
     static unsigned debug_writes;
+    if (size == 1 && vga_port(port)) {
+        vga_ibm_io_write(&s->vga, (uint16_t)port, (uint8_t)val);
+        return;
+    }
     if (port >= 0x400 && port + size <= 0x440) {
         memcpy(&s->acpi_io[port - 0x400], &val, size);
         return;
@@ -754,8 +777,39 @@ static bool sparse_io_port(uint64_t offset, uint64_t *port) {
     return true;
 }
 
+static bool vga_mem_window(Ia64I2000State *s, uint64_t addr, unsigned size,
+                          uint32_t *voff) {
+    uint32_t base, wsize;
+    vga_ibm_aperture(&s->vga, &base, &wsize);
+    if (addr < base || addr + size > (uint64_t)base + wsize)
+        return false;
+    *voff = (uint32_t)(addr - base);
+    return true;
+}
+
+#define VGA_ROM_BASE 0xC0000ull
+
+static bool vga_rom_window(uint64_t addr, unsigned size, uint32_t *voff) {
+    if (addr < VGA_ROM_BASE || addr + size > VGA_ROM_BASE + 0x10000ull)
+        return false;
+    *voff = (uint32_t)(addr - VGA_ROM_BASE);
+    return true;
+}
+
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64I2000State *s = ud;
+    uint32_t voff;
+    if (vga_mem_window(s, addr, size, &voff)) {
+        uint64_t v = 0;
+        for (unsigned i = 0; i < size; i++)
+            v |= (uint64_t)vga_ibm_mem_read(&s->vga, voff + i) << (i * 8);
+        return v;
+    }
+    if (vga_rom_window(addr, size, &voff)) {
+        uint64_t v = 0;
+        memcpy(&v, s->vga_rom_shadow + voff, size);
+        return v;
+    }
     if (addr + size <= s->ram_size) {
         uint64_t v = 0;
         memcpy(&v, s->ram + addr, size);
@@ -822,6 +876,18 @@ static uint64_t bus_fetch(void *ud, uint64_t addr, unsigned size) {
 
 static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     Ia64I2000State *s = ud;
+    uint32_t voff;
+    if (vga_mem_window(s, addr, size, &voff)) {
+        for (unsigned i = 0; i < size; i++)
+            vga_ibm_mem_write(&s->vga, voff + i, (uint8_t)(val >> (i * 8)));
+        return;
+    }
+    /* Read-only, like a real (locked) option ROM shadow: this is what keeps
+     * a generic "clear all of system RAM" firmware loop from wiping the
+     * video BIOS out before it's ever used, since real hardware wouldn't
+     * report this range as regular RAM in the first place. */
+    if (vga_rom_window(addr, size, &voff))
+        return;
     if (addr + size <= s->ram_size) {
         memcpy(s->ram + addr, &val, size);
         return;
@@ -1036,20 +1102,35 @@ static void i2000_cpu_state(void *ud, char *buf, size_t buf_len) {
     merced_dump_state(s->cpu, buf, buf_len);
 }
 
+static void i2000_render_frame(Ia64I2000State *s) {
+    vga_ibm_render(&s->vga, s->fb, FB_W, FB_H, vgafont16);
+}
+
 static bool i2000_screendump(void *ud, const char *path) {
     Ia64I2000State *s = ud;
-    panel_render(s);
+    i2000_render_frame(s);
     return gemu_screendump_argb(path, s->fb, FB_W, FB_H);
 }
 
 /* monitor "x 0xADDR [count]": physical memory hexdump
  * monitor "trace N": stderr-trace the next N executed slots
- * monitor "history [N]": dump the most recently executed slots */
+ * monitor "history [N]": dump the most recently executed slots
+ * monitor "panel FILE": dump the CPU/MMIO debug front panel (the live
+ * display and default screendump now show real VGA output instead) */
 static void i2000_custom_cmd(Ia64I2000State *s) {
     const char *txt = gemu_monitor_command_text(s->monitor);
     uint64_t addr;
     int count = 64;
     uint64_t n;
+    char panel_path[256];
+    if (txt && sscanf(txt, "panel %255s", panel_path) == 1) {
+        panel_render(s);
+        if (gemu_screendump_argb(panel_path, s->fb, FB_W, FB_H))
+            printf("wrote debug panel to %s\n", panel_path);
+        else
+            printf("cannot write %s\n", panel_path);
+        return;
+    }
     if (txt && sscanf(txt, "trace %" SCNu64, &n) == 1) {
         s->cpu->trace_n = n;
         printf("tracing next %" PRIu64 " slots to stderr\n", n);
@@ -1252,6 +1333,9 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
         return NULL;
     }
     memset(s->flash, 0xFF, I2000_FLASH_SIZE);
+    vga_ibm_reset(&s->vga);
+    memset(s->vga_rom_shadow, 0xFF, sizeof(s->vga_rom_shadow));
+    memcpy(s->vga_rom_shadow, vgabios_rom, vgabios_rom_len);
     if (cfg->cdrom_path) {
         s->cdrom = fopen(cfg->cdrom_path, "rb");
         if (!s->cdrom || fseek(s->cdrom, 0, SEEK_END) != 0) {
@@ -1399,6 +1483,12 @@ static void i2000_run_slice(Ia64I2000State *s) {
 
 static void i2000_reset(Ia64I2000State *s) {
     merced_reset(s->cpu);
+    vga_ibm_reset(&s->vga);
+    /* Standard VGA option ROM, shadowed at its conventional address so any
+     * legacy option-ROM scan (0x55 0xAA signature check) finds it, the same
+     * way a real add-in VGA card's ROM would appear at boot. */
+    if (0xC0000ull + vgabios_rom_len <= s->ram_size)
+        memcpy(s->ram + 0xC0000, vgabios_rom, vgabios_rom_len);
     s->halted = false;
     s->reset_requested = false;
     s->fw_shadow_enabled = false;
@@ -1506,7 +1596,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
 
         if (s->display) {
             gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
-            panel_render(s);
+            i2000_render_frame(s);
             gemu_display_render(s->display, s->fb, FB_W, FB_H);
             gemu_sleep_ms(s->halted ? 30 : 1);
         } else {

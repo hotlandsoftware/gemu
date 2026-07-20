@@ -2511,6 +2511,45 @@ MercedStatus merced_step(Merced *m) {
         }
     }
 
+    /* EXPERIMENTAL WORKAROUND: bios130.BIN spins here (0x7FE281D0-0x7FE281EC)
+     * waiting for memory at r37 to become the literal 18 (an A8-type
+     * cmp.eq p6,p7=18,r38 immediate compare, not a register compare - the
+     * "18" in objdump's disassembly is a plain immediate, not r18). cr.itv
+     * was deliberately programmed masked just before this, so it's not a
+     * plain interval-timer wait; it looks like an unmodeled event/status
+     * self-test waiting for a specific completion code. Rather than guess
+     * the exact PAL/SAL semantics, supply the value directly and see what
+     * the next blocker reveals. The whole routine (0x7FE28110) re-zeroes
+     * the target and re-enters this wait on retry, so the iteration count
+     * resets on every fresh entry rather than firing once ever. */
+    {
+        static unsigned rendezvous_n;
+        if (bundle_va == 0x000000007FE28110ull && slot == 0) {
+            rendezvous_n = 0;
+        } else if (bundle_va == 0x000000007FE281D0ull && slot == 0) {
+            if (++rendezvous_n == 200000) {
+                uint64_t addr = gr_read(m, 37, NULL);
+                phys_write(m, addr, 18, 8);
+            }
+        }
+    }
+
+    if ((bundle_va == 0x000000007FF390F0ull && slot == 2) ||
+        (bundle_va == 0x000000007FF39120ull && slot == 1)) {
+        static unsigned n;
+        int this_qp = (int)pr_read(m, (unsigned)bits(raw, 0, 6));
+        if (n < 8 && this_qp) {
+            n++;
+            fprintf(stderr, "merced: dbg vhpt-panic at %016" PRIX64
+                            " r29(fa)=%016" PRIX64 " r26(base)=%016" PRIX64
+                            " r27(end)=%016" PRIX64 " r24(cnt)=%016" PRIX64
+                            " r25(ptr)=%016" PRIX64 "\n",
+                    bundle_va, gr_read(m, 29, NULL), gr_read(m, 26, NULL),
+                    gr_read(m, 27, NULL), gr_read(m, 24, NULL),
+                    gr_read(m, 25, NULL));
+        }
+    }
+
     unsigned hist = m->trace_history_next++ % MERCED_TRACE_HISTORY;
     m->trace_history[hist].ip = bundle_va | slot;
     m->trace_history[hist].raw = raw;
