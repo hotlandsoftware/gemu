@@ -175,6 +175,7 @@ int ia64_setup(int argc, char *argv[]) {
             .display_type = cfg.display_type,
             .display_scale = cfg.display_scale,
             .no_shutdown = cfg.no_shutdown,
+            .cdrom_path = cfg.cdrom_path,
         };
         Ia64GenericState *g = ia64_generic_create(&gcfg);
         if (!g)

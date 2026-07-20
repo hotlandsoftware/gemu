@@ -6,6 +6,7 @@
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
 #include "gemu/util.h"
+#include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,17 @@
 #define INSTR_PER_FRAME 500000
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES 32
+
+#define KBD_ACTION_UP    GEMU_ACTION(0)
+#define KBD_ACTION_DOWN  GEMU_ACTION(1)
+#define KBD_ACTION_ENTER GEMU_ACTION(2)
+#define KBD_FIFO_SIZE 16
+
+static const GemuActionDef generic_kbd_actions[] = {
+    { "Up",    KBD_ACTION_UP,    "Up"     },
+    { "Down",  KBD_ACTION_DOWN,  "Down"   },
+    { "Enter", KBD_ACTION_ENTER, "Return" },
+};
 
 struct Ia64GenericState {
     GemuMonitor *monitor;
@@ -33,7 +45,242 @@ struct Ia64GenericState {
 
     VgaIbm    vga;
     uint32_t  fb[FB_W * FB_H];
+
+    uint8_t  kbd_fifo[KBD_FIFO_SIZE];
+    int      kbd_head, kbd_tail;
+
+    FILE    *cdrom;
+    char     cdrom_file[512];
+    uint64_t cdrom_size;
+    uint32_t cdrom_lba;
+    uint8_t  cdrom_result;
+    uint8_t  cdrom_buf[GENERIC_CDROM_BUF_SIZE];
+    char     cdrom_path_buf[GENERIC_CDROM_PATH_SIZE];
+
+    /* El Torito boot image / embedded FAT12 volume, mounted lazily on the
+     * first file-open command (see cdrom_open_file() below). */
+    bool     fat12_valid;
+    uint32_t fat12_vol_off;           /* byte offset of FAT12 sector 0 */
+    uint32_t fat12_bytes_per_cluster;
+    uint32_t fat12_fat_off;           /* byte offset of first FAT copy */
+    uint32_t fat12_root_dir_off;
+    uint32_t fat12_root_entries;
+    uint32_t fat12_data_area_off;     /* byte offset where cluster 2 begins */
+
+    /* Currently open file (opened by GENERIC_CDROM_CMD_OPEN). */
+    bool     file_open;
+    uint32_t file_size;
+    uint32_t file_remaining;
+    uint32_t file_cur_cluster;
+    uint32_t chunk_size;              /* valid bytes in cdrom_buf after READ_NEXT */
 };
+
+static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t rd32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void kbd_push(Ia64GenericState *s, uint8_t code) {
+    int next = (s->kbd_tail + 1) % KBD_FIFO_SIZE;
+    if (next == s->kbd_head)
+        return;   /* drop if full */
+    s->kbd_fifo[s->kbd_tail] = code;
+    s->kbd_tail = next;
+}
+
+static uint8_t kbd_pop(Ia64GenericState *s) {
+    if (s->kbd_head == s->kbd_tail)
+        return 0;
+    uint8_t code = s->kbd_fifo[s->kbd_head];
+    s->kbd_head = (s->kbd_head + 1) % KBD_FIFO_SIZE;
+    return code;
+}
+
+static void cdrom_do_read(Ia64GenericState *s) {
+    if (!s->cdrom) {
+        s->cdrom_result = 1;
+        return;
+    }
+    uint64_t off = (uint64_t)s->cdrom_lba * GENERIC_CDROM_SECTOR_SIZE;
+    if (off + GENERIC_CDROM_SECTOR_SIZE > s->cdrom_size ||
+        fseek(s->cdrom, (long)off, SEEK_SET) != 0 ||
+        fread(s->cdrom_buf, 1, GENERIC_CDROM_SECTOR_SIZE, s->cdrom) !=
+            GENERIC_CDROM_SECTOR_SIZE) {
+        s->cdrom_result = 1;
+        return;
+    }
+    s->cdrom_result = 0;
+}
+
+/* ── El Torito / FAT12 (embedded EFI boot image) ─────────────────────────
+ *
+ * Microsoft's IA-64 EFI install media of this era package their EFI boot
+ * loader inside an El Torito "no emulation" boot image that is itself a
+ * plain 1.44 MiB FAT12 floppy image - real EFI firmware mounts it as a
+ * filesystem and opens the loader by name, rather than executing it as
+ * x86 boot-sector code (its FAT12 boot sector looks like one, but that's
+ * just the on-disk format's provenance, not how this actually boots).
+ * All of that lives here on the host side, in ordinary tested C - see the
+ * comment on the CD-ROM controller in hardware/generic.h for why. */
+
+static bool cdrom_find_eltorito_boot_lba(Ia64GenericState *s, uint32_t *out_lba) {
+    uint8_t sec[2048];
+    for (uint32_t lba = 16; lba < 16 + 32; lba++) {
+        if (fseek(s->cdrom, (long)lba * 2048, SEEK_SET) != 0)
+            return false;
+        if (fread(sec, 1, 2048, s->cdrom) != 2048)
+            return false;
+        if (sec[0] == 255)   /* volume descriptor set terminator */
+            return false;
+        if (sec[0] == 0 && memcmp(sec + 7, "EL TORITO SPECIFICATION", 23) == 0) {
+            uint32_t catalog_lba = rd32(sec + 71);
+            uint8_t cat[64];
+            if (fseek(s->cdrom, (long)catalog_lba * 2048, SEEK_SET) != 0 ||
+                fread(cat, 1, sizeof(cat), s->cdrom) != sizeof(cat))
+                return false;
+            *out_lba = rd32(cat + 40);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool fat12_mount(Ia64GenericState *s) {
+    if (s->fat12_valid)
+        return true;
+    if (!s->cdrom)
+        return false;
+    uint32_t boot_lba;
+    if (!cdrom_find_eltorito_boot_lba(s, &boot_lba))
+        return false;
+    uint32_t vol_off = boot_lba * 2048u;
+    uint8_t bs[512];
+    if (fseek(s->cdrom, (long)vol_off, SEEK_SET) != 0 ||
+        fread(bs, 1, sizeof(bs), s->cdrom) != sizeof(bs))
+        return false;
+
+    uint32_t bytes_per_sector = rd16(bs + 11);
+    uint32_t sectors_per_cluster = bs[13];
+    uint32_t reserved = rd16(bs + 14);
+    uint32_t num_fats = bs[16];
+    uint32_t root_entries = rd16(bs + 17);
+    uint32_t sectors_per_fat = rd16(bs + 22);
+    if (bytes_per_sector == 0 || sectors_per_cluster == 0 || num_fats == 0)
+        return false;
+
+    s->fat12_vol_off = vol_off;
+    s->fat12_bytes_per_cluster = sectors_per_cluster * bytes_per_sector;
+    s->fat12_fat_off = vol_off + reserved * bytes_per_sector;
+    s->fat12_root_dir_off = s->fat12_fat_off + num_fats * sectors_per_fat * bytes_per_sector;
+    s->fat12_root_entries = root_entries;
+    s->fat12_data_area_off = s->fat12_root_dir_off + root_entries * 32u;
+    s->fat12_valid = true;
+    return true;
+}
+
+/* Converts "SETUPLDR.EFI" style names to space-padded 8.3 directory-entry
+ * form. No support for subdirectory paths - not needed, everything this
+ * loader cares about lives in the floppy image's root directory. */
+static void fat12_to_83(const char *name, uint8_t out[11]) {
+    memset(out, ' ', 11);
+    int i = 0, j = 0;
+    for (; name[i] && name[i] != '.' && j < 8; i++, j++)
+        out[j] = (uint8_t)toupper((unsigned char)name[i]);
+    if (name[i] == '.') {
+        i++;
+        for (int k = 0; name[i] && k < 3; i++, k++)
+            out[8 + k] = (uint8_t)toupper((unsigned char)name[i]);
+    }
+}
+
+static void cdrom_open_file(Ia64GenericState *s, const char *path) {
+    s->file_open = false;
+    if (!fat12_mount(s)) {
+        s->cdrom_result = 1;
+        return;
+    }
+    uint8_t want[11];
+    fat12_to_83(path, want);
+
+    size_t dir_bytes = (size_t)s->fat12_root_entries * 32u;
+    uint8_t *dirbuf = malloc(dir_bytes);
+    if (!dirbuf) {
+        s->cdrom_result = 1;
+        return;
+    }
+    bool found = false;
+    uint32_t start_cluster = 0, file_size = 0;
+    if (fseek(s->cdrom, (long)s->fat12_root_dir_off, SEEK_SET) == 0 &&
+        fread(dirbuf, 1, dir_bytes, s->cdrom) == dir_bytes) {
+        for (uint32_t i = 0; i < s->fat12_root_entries; i++) {
+            uint8_t *e = dirbuf + i * 32;
+            if (e[0] == 0x00)
+                break;
+            if (e[0] == 0xE5 || (e[11] & 0x18))   /* deleted, dir, or volume label */
+                continue;
+            if (memcmp(e, want, 11) == 0) {
+                start_cluster = rd16(e + 26);
+                file_size = rd32(e + 28);
+                found = true;
+                break;
+            }
+        }
+    }
+    free(dirbuf);
+    if (!found) {
+        s->cdrom_result = 1;
+        return;
+    }
+    s->file_open = true;
+    s->file_size = file_size;
+    s->file_remaining = file_size;
+    s->file_cur_cluster = start_cluster;
+    s->cdrom_result = 0;
+}
+
+static uint32_t fat12_next_cluster(Ia64GenericState *s, uint32_t cluster) {
+    uint32_t fat_byte_off = cluster + cluster / 2;   /* == cluster*3/2 */
+    uint8_t buf[2];
+    if (fseek(s->cdrom, (long)(s->fat12_fat_off + fat_byte_off), SEEK_SET) != 0 ||
+        fread(buf, 1, 2, s->cdrom) != 2)
+        return 0xFFF;
+    uint16_t word = rd16(buf);
+    return (cluster & 1) ? (word >> 4) : (word & 0x0FFF);
+}
+
+/* Fills cdrom_buf with up to GENERIC_CDROM_BUF_SIZE more bytes of the
+ * file opened by cdrom_open_file(), walking the FAT12 cluster chain.
+ * Assumes the cluster size evenly divides the buffer size (true for the
+ * standard 1.44 MiB floppy layout these images use: 512-byte clusters
+ * into a 2048-byte buffer) - a cluster is always fully consumed or is
+ * the file's last, never split across two READ_NEXT calls. */
+static void cdrom_read_next_chunk(Ia64GenericState *s) {
+    if (!s->file_open || s->file_remaining == 0) {
+        s->chunk_size = 0;
+        s->cdrom_result = 1;
+        return;
+    }
+    uint32_t cluster_bytes = s->fat12_bytes_per_cluster;
+    uint32_t produced = 0;
+    while (produced < GENERIC_CDROM_BUF_SIZE && s->file_remaining > 0 &&
+           s->file_cur_cluster >= 2 && s->file_cur_cluster < 0xFF8) {
+        uint32_t cluster_off = s->fat12_data_area_off +
+            (s->file_cur_cluster - 2) * cluster_bytes;
+        uint32_t want = cluster_bytes;
+        if (want > s->file_remaining)
+            want = s->file_remaining;
+        if (fseek(s->cdrom, (long)cluster_off, SEEK_SET) != 0 ||
+            fread(s->cdrom_buf + produced, 1, want, s->cdrom) != want)
+            break;
+        produced += want;
+        s->file_remaining -= want;
+        if (want == cluster_bytes)
+            s->file_cur_cluster = fat12_next_cluster(s, s->file_cur_cluster);
+    }
+    s->chunk_size = produced;
+    s->cdrom_result = (produced > 0) ? 0 : 1;
+}
 
 /* ── Physical address space ─────────────────────────────────────────────── */
 
@@ -64,6 +311,31 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
                     (uint16_t)(0x3B0 + (addr - GENERIC_VGA_IO_BASE) + i)) << (i * 8);
         return v;
     }
+    if (addr >= GENERIC_KBD_IO_BASE && addr + size <= GENERIC_KBD_IO_BASE + GENERIC_KBD_IO_SIZE) {
+        uint32_t off = (uint32_t)(addr - GENERIC_KBD_IO_BASE);
+        if (off == 0)
+            return s->kbd_head != s->kbd_tail;
+        if (off == 4)
+            return kbd_pop(s);
+        return 0;
+    }
+    if (addr >= GENERIC_CDROM_IO_BASE && addr + size <= GENERIC_CDROM_IO_BASE + GENERIC_CDROM_IO_SIZE) {
+        uint32_t off = (uint32_t)(addr - GENERIC_CDROM_IO_BASE);
+        if (off == 0)
+            return s->cdrom != NULL;
+        if (off == 0xC)
+            return s->cdrom_result;
+        if (off == 0x10)
+            return s->file_size;
+        if (off == 0x14)
+            return s->chunk_size;
+        return 0;
+    }
+    if (addr >= GENERIC_CDROM_BUF_BASE && addr + size <= GENERIC_CDROM_BUF_BASE + GENERIC_CDROM_BUF_SIZE) {
+        uint64_t v = 0;
+        memcpy(&v, s->cdrom_buf + (addr - GENERIC_CDROM_BUF_BASE), size);
+        return v;
+    }
     if (addr + size <= s->ram_size) {
         uint64_t v = 0;
         memcpy(&v, s->ram + addr, size);
@@ -91,6 +363,29 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
             vga_ibm_io_write(&s->vga,
                     (uint16_t)(0x3B0 + (addr - GENERIC_VGA_IO_BASE) + i),
                     (uint8_t)(val >> (i * 8)));
+        return;
+    }
+    if (addr >= GENERIC_CDROM_IO_BASE && addr + size <= GENERIC_CDROM_IO_BASE + GENERIC_CDROM_IO_SIZE) {
+        uint32_t off = (uint32_t)(addr - GENERIC_CDROM_IO_BASE);
+        if (off == 4) {
+            s->cdrom_lba = (uint32_t)val;
+        } else if (off == 8) {
+            uint8_t cmd = (uint8_t)val;
+            if (cmd == GENERIC_CDROM_CMD_READ)
+                cdrom_do_read(s);
+            else if (cmd == GENERIC_CDROM_CMD_OPEN)
+                cdrom_open_file(s, s->cdrom_path_buf);
+            else if (cmd == GENERIC_CDROM_CMD_READ_NEXT)
+                cdrom_read_next_chunk(s);
+        }
+        return;
+    }
+    if (addr >= GENERIC_CDROM_PATH_BASE && addr + size <= GENERIC_CDROM_PATH_BASE + GENERIC_CDROM_PATH_SIZE) {
+        for (unsigned i = 0; i < size; i++) {
+            uint32_t off = (uint32_t)(addr - GENERIC_CDROM_PATH_BASE) + i;
+            if (off < sizeof(s->cdrom_path_buf))
+                s->cdrom_path_buf[off] = (char)(val >> (i * 8));
+        }
         return;
     }
     if (addr + size <= s->ram_size) {
@@ -183,6 +478,14 @@ static void generic_custom_cmd(Ia64GenericState *s) {
         merced_dump_calls(s->cpu, MERCED_CALL_HISTORY, stderr);
         return;
     }
+    if (txt && strncmp(txt, "key ", 4) == 0) {
+        const char *arg = txt + 4;
+        if (strcmp(arg, "up") == 0) kbd_push(s, GENERIC_KBD_KEY_UP);
+        else if (strcmp(arg, "down") == 0) kbd_push(s, GENERIC_KBD_KEY_DOWN);
+        else if (strcmp(arg, "enter") == 0) kbd_push(s, GENERIC_KBD_KEY_ENTER);
+        else printf("usage: key <up|down|enter>\n");
+        return;
+    }
     gemu_monitor_unknown_command(s->monitor);
 }
 
@@ -232,6 +535,19 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
     gemu_monitor_set_cpu_state_cb(s->monitor, generic_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, generic_screendump, s);
 
+    if (cfg->cdrom_path) {
+        s->cdrom = fopen(cfg->cdrom_path, "rb");
+        if (!s->cdrom) {
+            fprintf(stderr, "gemu: cannot open CD-ROM image '%s'\n", cfg->cdrom_path);
+            ia64_generic_destroy(s);
+            return NULL;
+        }
+        fseek(s->cdrom, 0, SEEK_END);
+        s->cdrom_size = (uint64_t)ftell(s->cdrom);
+        fseek(s->cdrom, 0, SEEK_SET);
+        snprintf(s->cdrom_file, sizeof(s->cdrom_file), "%s", cfg->cdrom_path);
+    }
+
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         GemuDisplayConfig dc = {
             .title = "GEMU",
@@ -239,6 +555,8 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
             .fb_height = FB_H,
             .scale = cfg->display_scale,
             .ini_section = "generic",
+            .actions = generic_kbd_actions,
+            .n_actions = (int)(sizeof generic_kbd_actions / sizeof *generic_kbd_actions),
         };
         s->display = gemu_display_create(cfg->display_type, &dc);
         if (!s->display) {
@@ -255,6 +573,7 @@ void ia64_generic_destroy(Ia64GenericState *s) {
     if (s->display) gemu_display_destroy(s->display);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     if (s->cpu) merced_destroy(s->cpu);
+    if (s->cdrom) fclose(s->cdrom);
     free(s->ram);
     free(s);
 }
@@ -325,6 +644,11 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
         }
 
         if (s->display) {
+            gemu_display_poll(s->display);
+            uint32_t pressed = gemu_display_last_pressed(s->display);
+            if (pressed & KBD_ACTION_UP) kbd_push(s, GENERIC_KBD_KEY_UP);
+            if (pressed & KBD_ACTION_DOWN) kbd_push(s, GENERIC_KBD_KEY_DOWN);
+            if (pressed & KBD_ACTION_ENTER) kbd_push(s, GENERIC_KBD_KEY_ENTER);
             gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
             generic_render_frame(s);
             gemu_display_render(s->display, s->fb, FB_W, FB_H);
