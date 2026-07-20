@@ -386,6 +386,12 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
     if (!ifetch) {
         uint64_t v61 = va & 0x1FFFFFFFFFFFFFFFull;
         if ((va >= 0xFFC00000ull && va <= 0xFFFFFFFFull) ||
+            (va >= 0xA0000ull && va < 0xC0000ull) ||
+            /* The generic EFI ROM keeps its pool bump pointer and console
+             * cursor in this reserved low-RAM scratch area.  EFI callbacks
+             * remain callable after SETUPLDR enables psr.dt, before it has
+             * installed translations for firmware-private data. */
+            (va >= 0x500000ull && va < 0x10000000ull) ||
             v61 - 0xFFFFC000000ull < 0x4000000ull) {
             *pa = v61 & MERCED_PHYS_MASK;
             return true;
@@ -475,6 +481,12 @@ void merced_reset(Merced *m) {
     m->psr = 0;                      /* physical mode, bank 0 */
     m->pr  = 1;                      /* pr0 = 1 */
     m->cfm = 96;                     /* whole stacked file addressable */
+    /* Architected/reset floating-point environment.  In particular, the
+     * precision-control fields for sf0..sf3 are 3 (register/extended
+     * precision).  Leaving FPSR zero made compiler-generated integer
+     * division sequences round every .s1 FMA intermediate to single
+     * precision, corrupting even SETUPLDR's 40/40 memory-map calculation. */
+    m->ar[AR_FPSR] = UINT64_C(0x0009804c0270033f);
     /* CPUID: "GenuineIntel". cpuid[3] is the version register:
      * {number 7:0, revision 15:8, model 23:16, family 31:24, archrev 39:32}
      * = archrev 0, family 7 (Itanium), model 0 (Merced), rev 0, number 4
@@ -702,7 +714,7 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
         case 3:
             switch (x2b) {
             case 0: res = a & b; break;
-            case 1: res = ~a & b; break;      /* andcm */
+            case 1: res = a & ~b; break;      /* andcm */
             case 2: res = a | b; break;
             default: res = a ^ b; break;
             }
@@ -719,7 +731,7 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
             nat = n3;
             switch (x2b) {
             case 0: res = imm & b; break;
-            case 1: res = ~imm & b; break;
+            case 1: res = imm & ~b; break;    /* andcm imm8,r3 */
             case 2: res = imm | b; break;
             default: res = imm ^ b; break;
             }
@@ -1271,6 +1283,22 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
          * a non-zero rrb.pr and relies on alloc leaving it intact. */
         m->cfm = (m->cfm & ~0x3FFFFull) |
                  sof | ((uint64_t)sol << 7) | ((uint64_t)sor << 14);
+        return MERCED_OK;
+    }
+    if (x3 == 1) {
+        /* M20 chk.s.m r2,target25 - this is the actual, correct home for
+         * chk.s.m per the ISA's opcode tables (op=1,x3=1); we have no
+         * ALAT/speculation model to fault against, so - like the M22/M23
+         * chk.a variants above - this only ever needs to take its branch
+         * when the checked register is NaT-like-zero. */
+        if (!qp) return MERCED_OK;
+        gr_read(m, r2, &n2);
+        if (n2) {
+            int64_t disp = sext((bits(raw, 36, 1) << 20) |
+                                (bits(raw, 20, 13) << 7) | bits(raw, 6, 7), 21) << 4;
+            m->ip = (m->ip & ~0xFull) + (uint64_t)disp;
+            m->taken = 1;
+        }
         return MERCED_OK;
     }
     if (x3 != 0)

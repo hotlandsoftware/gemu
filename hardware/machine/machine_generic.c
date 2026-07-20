@@ -73,12 +73,19 @@ struct Ia64GenericState {
     uint32_t file_remaining;
     uint32_t file_cur_cluster;
     uint32_t chunk_size;              /* valid bytes in cdrom_buf after READ_NEXT */
+
+    /* PE32+/IA-64 image loading (GENERIC_CDROM_CMD_LOAD_PE). */
+    uint32_t pe_src, pe_dst;
+    uint32_t pe_entry_rva;             /* valid after a successful CMD 4 */
 };
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t rd32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint64_t rd64(const uint8_t *p) {
+    return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
 }
 
 static void kbd_push(Ia64GenericState *s, uint8_t code) {
@@ -282,6 +289,104 @@ static void cdrom_read_next_chunk(Ia64GenericState *s) {
     s->cdrom_result = (produced > 0) ? 0 : 1;
 }
 
+/* ── PE32+/IA-64 image loading ────────────────────────────────────────────
+ *
+ * Copies each section of an already-loaded raw PE file (at `src`, placed
+ * there earlier via the OPEN/READ_NEXT streaming above) to its virtual
+ * address relative to `dst`, zero-padding out to VirtualSize - the file's
+ * on-disk layout does not match its in-memory layout (alignment gaps,
+ * BSS), so this can't just be a flat copy. Only PE32+ (64-bit) IA-64
+ * images are handled - that's what SETUPLDR.EFI and every other IA-64 EFI
+ * binary of this era actually is.
+ *
+ * `dst` is expected to be the image's own preferred ImageBase (firmware
+ * reads that from the optional header itself before issuing this
+ * command), which sidesteps PE base relocations entirely: relocations
+ * only patch addresses that assumed a different load address, and if
+ * dst == ImageBase the adjustment is always zero. */
+static void cdrom_load_pe_image(Ia64GenericState *s, uint32_t src, uint32_t dst) {
+    s->cdrom_result = 1;
+    s->pe_entry_rva = 0;
+
+    if ((uint64_t)src + 0x40 > s->ram_size || dst >= s->ram_size)
+        return;
+    const uint8_t *raw = s->ram + src;
+    uint64_t src_remaining = s->ram_size - src;
+
+    if (raw[0] != 'M' || raw[1] != 'Z')
+        return;
+    uint32_t e_lfanew = rd32(raw + 0x3C);
+    if ((uint64_t)e_lfanew + 24 > src_remaining)
+        return;
+    const uint8_t *pe = raw + e_lfanew;
+    if (memcmp(pe, "PE\0\0", 4) != 0)
+        return;
+
+    const uint8_t *coff = pe + 4;
+    uint16_t machine = rd16(coff + 0);
+    uint16_t num_sections = rd16(coff + 2);
+    uint16_t size_opt_hdr = rd16(coff + 16);
+    if (machine != 0x200)
+        return;
+
+    const uint8_t *opt = coff + 20;
+    if ((uint64_t)(opt - raw) + size_opt_hdr > src_remaining || size_opt_hdr < 112)
+        return;
+    if (rd16(opt) != 0x20B)   /* PE32+ only */
+        return;
+
+    uint32_t entry_rva = rd32(opt + 16);
+    uint64_t image_base = rd64(opt + 24);
+    uint32_t size_of_image = rd32(opt + 56);
+    if (image_base != dst)
+        return;   /* only the no-relocation-needed case is supported */
+    if ((uint64_t)dst + size_of_image > s->ram_size)
+        return;
+
+    const uint8_t *sec_table = opt + size_opt_hdr;
+    uint64_t sec_table_bytes = (uint64_t)num_sections * 40u;
+    if ((uint64_t)(sec_table - raw) + sec_table_bytes > src_remaining)
+        return;
+
+    uint32_t size_of_headers = rd32(opt + 60);
+
+    memset(s->ram + dst, 0, size_of_image);
+    /* Copy the raw headers (DOS/PE/COFF/Optional header, Data
+     * Directories, section table) to the image base too, not just the
+     * sections - PE images routinely read their own loaded headers at
+     * runtime (e.g. to find the resource directory), and since the
+     * first section is typically well past the header region (.text
+     * often starts at RVA 0x2000), that gap would otherwise stay
+     * zeroed forever. Matches what a real loader does (see
+     * reference/qemu-system-ia64/roms/ia64-firmware/firmware.c's
+     * fw_copy_mem(...,size_of_headers) step). */
+    if (size_of_headers > 0 && size_of_headers <= src_remaining &&
+        size_of_headers <= size_of_image)
+        memcpy(s->ram + dst, raw, size_of_headers);
+
+    for (unsigned i = 0; i < num_sections; i++) {
+        const uint8_t *sh = sec_table + i * 40u;
+        uint32_t vsize = rd32(sh + 8);
+        uint32_t vaddr = rd32(sh + 12);
+        uint32_t rawsize = rd32(sh + 16);
+        uint32_t rawptr = rd32(sh + 20);
+        uint32_t copy_size = (vsize != 0 && vsize < rawsize) ? vsize : rawsize;
+
+        if (copy_size == 0)
+            continue;
+        if ((uint64_t)rawptr + copy_size > src_remaining)
+            return;
+        if ((uint64_t)vaddr + copy_size > size_of_image)
+            return;
+        memcpy(s->ram + dst + vaddr, s->ram + src + rawptr, copy_size);
+    }
+
+    if (entry_rva >= size_of_image)
+        return;
+    s->pe_entry_rva = entry_rva;
+    s->cdrom_result = 0;
+}
+
 /* ── Physical address space ─────────────────────────────────────────────── */
 
 static bool vga_mem_window(Ia64GenericState *s, uint64_t addr, unsigned size,
@@ -329,6 +434,8 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
             return s->file_size;
         if (off == 0x14)
             return s->chunk_size;
+        if (off == 0x20)
+            return s->pe_entry_rva;
         return 0;
     }
     if (addr >= GENERIC_CDROM_BUF_BASE && addr + size <= GENERIC_CDROM_BUF_BASE + GENERIC_CDROM_BUF_SIZE) {
@@ -349,12 +456,32 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     return ~0ull;
 }
 
+/* Every character the guest ever puts on screen - our own boot manager's
+ * text and SETUPLDR.EFI's own ConOut->OutputString calls alike - passes
+ * through here, since both ultimately write to the same VGA text plane.
+ * Mirroring it to host stdout here (rather than in every assembly
+ * routine that prints something) gives a "COM1"-style debug log for
+ * free, with no firmware-side bookkeeping and nothing to remember to
+ * wire up for future text output paths. */
+static void vga_mirror_to_stdout(Ia64GenericState *s, uint32_t voff, uint8_t val) {
+    if (!vga_ibm_is_text_mode(&s->vga) || (voff & 1) != 0)
+        return;   /* only even offsets are the character plane (odd = attribute) */
+    if (val >= 0x20 && val < 0x7F)
+        putchar((int)val);
+    else if (val == '\n' || val == '\r')
+        putchar('\n');
+}
+
 static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     Ia64GenericState *s = ud;
     uint32_t voff;
     if (vga_mem_window(s, addr, size, &voff)) {
-        for (unsigned i = 0; i < size; i++)
-            vga_ibm_mem_write(&s->vga, voff + i, (uint8_t)(val >> (i * 8)));
+        for (unsigned i = 0; i < size; i++) {
+            uint8_t b = (uint8_t)(val >> (i * 8));
+            vga_ibm_mem_write(&s->vga, voff + i, b);
+            vga_mirror_to_stdout(s, voff + i, b);
+        }
+        fflush(stdout);
         return;
     }
     if (addr >= GENERIC_VGA_IO_BASE &&
@@ -377,6 +504,12 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                 cdrom_open_file(s, s->cdrom_path_buf);
             else if (cmd == GENERIC_CDROM_CMD_READ_NEXT)
                 cdrom_read_next_chunk(s);
+            else if (cmd == GENERIC_CDROM_CMD_LOAD_PE)
+                cdrom_load_pe_image(s, s->pe_src, s->pe_dst);
+        } else if (off == 0x18) {
+            s->pe_src = (uint32_t)val;
+        } else if (off == 0x1C) {
+            s->pe_dst = (uint32_t)val;
         }
         return;
     }
@@ -484,6 +617,17 @@ static void generic_custom_cmd(Ia64GenericState *s) {
         else if (strcmp(arg, "down") == 0) kbd_push(s, GENERIC_KBD_KEY_DOWN);
         else if (strcmp(arg, "enter") == 0) kbd_push(s, GENERIC_KBD_KEY_ENTER);
         else printf("usage: key <up|down|enter>\n");
+        return;
+    }
+    if (txt && strncmp(txt, "peek ", 5) == 0) {
+        uint64_t addr = strtoull(txt + 5, NULL, 16);
+        if (addr + 8 <= s->ram_size) {
+            uint64_t v;
+            memcpy(&v, s->ram + addr, 8);
+            printf("peek 0x%" PRIx64 " = 0x%016" PRIx64 "\n", addr, v);
+        } else {
+            printf("peek: address out of range\n");
+        }
         return;
     }
     gemu_monitor_unknown_command(s->monitor);

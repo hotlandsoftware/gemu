@@ -112,13 +112,31 @@
  *   +0x14 CHUNK_SIZE (read-only, 4B) valid byte count in the buffer
  *                                    window after the last CMD 3 (less
  *                                    than 2048 only for the final chunk)
+ *   +0x18 PE_SRC     (write, 4B)   RAM address of an already-loaded raw
+ *                                  PE32+/IA-64 file, for CMD 4
+ *   +0x1C PE_DST     (write, 4B)   RAM address to place the PE image's
+ *                                  sections at (firmware passes the
+ *                                  image's own preferred ImageBase here,
+ *                                  so no relocation is needed - see
+ *                                  cdrom_load_pe_image() for why that's
+ *                                  a safe simplification)
+ *   +0x20 PE_ENTRY_RVA (read-only, 4B) RVA of the entry-point plabel,
+ *                                      valid after a successful CMD 4
+ * CMD 4 = parse the PE headers/section table at PE_SRC (already-loaded
+ * raw file bytes) and copy each section to PE_DST + VirtualAddress,
+ * zero-padding out to VirtualSize. This is "LoadImage()"-ish section
+ * placement, not disk access, but it's the same kind of file-format
+ * mechanics as the FAT12 work above, and far more reliable done once in
+ * tested C than as a hand-unrolled assembly loop (see the whole point of
+ * this device's design in the block comment above hardware/generic.h).
  * The result of the last READ/OPEN/chunk-read is memory-mapped
  * read-only at GENERIC_CDROM_BUF_BASE. */
 #define GENERIC_CDROM_IO_BASE       0x00000000C0002000ull
-#define GENERIC_CDROM_IO_SIZE       0x18u
+#define GENERIC_CDROM_IO_SIZE       0x24u
 #define GENERIC_CDROM_CMD_READ      1u
 #define GENERIC_CDROM_CMD_OPEN      2u
 #define GENERIC_CDROM_CMD_READ_NEXT 3u
+#define GENERIC_CDROM_CMD_LOAD_PE   4u
 #define GENERIC_CDROM_BUF_BASE      0x00000000C0100000ull
 #define GENERIC_CDROM_BUF_SIZE      0x800u                        /* 2048 */
 #define GENERIC_CDROM_SECTOR_SIZE   2048u
