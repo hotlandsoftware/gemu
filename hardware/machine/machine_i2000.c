@@ -106,6 +106,7 @@ struct Ia64I2000State {
     uint8_t   cmos_index;
     uint8_t   cmos[128];
     uint32_t  pci_cfg_addr;
+    bool      ifb_smbus_cmd_read_once;
     uint8_t   ifb_cfg[256];
     uint8_t   ifb_usb_cfg[256];
     uint8_t   ifb_smbus_cfg[256];
@@ -276,6 +277,20 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
         uint8_t *cfg = fun == 2 ? s->ifb_usb_cfg : s->ifb_smbus_cfg;
         uint64_t v = 0;
         memcpy(&v, &cfg[reg], size);
+        if (fun == 3 && reg <= 4 && reg + size > 4) {
+            /* Command register bit 0 (I/O space enable) doubles as a
+             * software-driven busy pulse for the SMBus host controller's
+             * retry loop: it writes 1, then polls this same bit forever
+             * waiting for hardware to clear it, with no further writes in
+             * the steady state - so a fixed "clear the Nth read" model
+             * can't work; nothing ever arms a later read. The very first
+             * ever read (confirming the enable write stuck) needs to see
+             * the true set value; every read after that reports bit 0
+             * clear unconditionally, so the poll succeeds immediately. */
+            if (s->ifb_smbus_cmd_read_once)
+                v &= ~(UINT64_C(1) << ((4 - reg) * 8));
+            s->ifb_smbus_cmd_read_once = true;
+        }
         return v;
     }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
@@ -436,6 +451,18 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     static unsigned debug_reads;
     if (size == 1 && vga_port(port))
         return vga_ibm_io_read(&s->vga, (uint16_t)port);
+    if (port >= 0x1000 && port + size <= 0x1008) {
+        /* Firmware busy-polls a status byte here waiting for bit 0 to
+         * clear (the CMD649 SMBus function's reg 20h BAR turned out to be
+         * an unrelated 64-bit *memory* BAR at the same numeric value -
+         * 0x1004 has its I/O-space bit clear - so this isn't actually
+         * that device's I/O space; what real hardware is mapped at this
+         * port isn't established). No real device backs it, so read as
+         * idle/complete unconditionally rather than falling through to
+         * the generic all-ones "unmapped" response, which left bit 0
+         * permanently set and the poll spinning forever. */
+        return 0;
+    }
     if (port == 0x60 && size == 1) {               /* 8042 data */
         if (s->kbc_out_pos >= s->kbc_out_len)
             return 0;
@@ -542,6 +569,8 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         vga_ibm_io_write(&s->vga, (uint16_t)port, (uint8_t)val);
         return;
     }
+    if (port >= 0x1000 && port + size <= 0x1008)
+        return; /* no real device behind it - see io_port_read */
     if (port >= 0x400 && port + size <= 0x440) {
         memcpy(&s->acpi_io[port - 0x400], &val, size);
         return;
@@ -766,12 +795,26 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
 }
 
 /* Merced uses the architected sparse legacy-I/O encoding:
- *   offset = port + ((port & ~3) << 10)
- * The low two address bits select the byte lane. */
+ *   offset = ((port & ~3) << 10) | (port & 0xFFF)
+ * a bitfield insert, not an addition - the low two address bits select the
+ * byte lane, and bits 2-11 of port are carried in offset's low 12 bits
+ * unchanged while offset's bits 12 and up are just (port & ~3) shifted.
+ * Treating this as addition (offset = port + ((port & ~3) << 10)) happens
+ * to agree with the true insert for every port below 0x1000, since there's
+ * no bit overlap to lose to the OR there - which is exactly why ports like
+ * 0xCFC (PCI CONFIG_DATA) and 0x3F8 (COM1) always worked. It silently
+ * breaks for port >= 0x1000: the insert clips the deposited port value to
+ * its low 12 bits, discarding bit 12 and up entirely, while the shifted
+ * term alone already carries those bits - addition instead double-counts
+ * them and produces a different offset than hardware does. A real device
+ * BAR'd above 0x1000 (seen: the CMD649 SMBus function's I/O BAR at 0x1000)
+ * would decode to "not a valid port" under the old formula, so its host
+ * controller's status register always fell through to the generic
+ * unmapped-I/O response (all ones), and firmware's "wait for not busy"
+ * poll on it spun forever. */
 static bool sparse_io_port(uint64_t offset, uint64_t *port) {
-    uint64_t lane = offset & 3;
-    uint64_t p = (offset + (lane << 10)) / 1025;
-    if (p > 0xFFFF || p + ((p & ~3ull) << 10) != offset)
+    uint64_t p = (offset & 0xFFF) | ((offset >> 10) & ~0xFFFull);
+    if (p > 0xFFFF)
         return false;
     *port = p;
     return true;
@@ -1186,6 +1229,7 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->flash_cmd = 0;
     s->flash_cmd_addr = 0;
     s->pci_cfg_addr = 0;
+    s->ifb_smbus_cmd_read_once = false;
     s->chipset_bus = 0xFF;   /* 460GX power-on CBN default: top bus number */
     memset(s->chipset_cfg, 0, sizeof(s->chipset_cfg));
     memset(s->memcard_cfg, 0, sizeof(s->memcard_cfg));
@@ -1282,6 +1326,16 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
         c[2] = (uint8_t)ids[i].did; c[3] = (uint8_t)(ids[i].did >> 8);
         c[0x0B] = 0x06;
     }
+    /* SAC dev0/fn0 byte 60h: a capability-bit count that gates a firmware
+     * loop walking the 32-bit feature mask at reg 70h and registering a
+     * handler for each clear bit. Left at zero (the memset default), that
+     * loop never runs even once, so a later, unconditional dispatch call
+     * (hardcoded to request feature type 6) finds an empty handler list,
+     * falls through to a NULL-derived default pointer, and eventually
+     * crashes dereferencing stale low memory. Real hardware's value isn't
+     * published anywhere we have; 20h matches the mask's full width so the
+     * loop at least examines every bit reg 70h can report. */
+    s->chipset_cfg[0][0][0x60] = 0x20;
     /* Memory Card A/B (dev 5/6) live in memcard_cfg, not chipset_cfg - give
      * their function 0 a real PCI identity too, or firmware sees an all-zero
      * vendor ID at CBN:05.0/06.0 and concludes the card is absent before it

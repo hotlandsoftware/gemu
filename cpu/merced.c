@@ -2534,22 +2534,6 @@ MercedStatus merced_step(Merced *m) {
         }
     }
 
-    if ((bundle_va == 0x000000007FF390F0ull && slot == 2) ||
-        (bundle_va == 0x000000007FF39120ull && slot == 1)) {
-        static unsigned n;
-        int this_qp = (int)pr_read(m, (unsigned)bits(raw, 0, 6));
-        if (n < 8 && this_qp) {
-            n++;
-            fprintf(stderr, "merced: dbg vhpt-panic at %016" PRIX64
-                            " r29(fa)=%016" PRIX64 " r26(base)=%016" PRIX64
-                            " r27(end)=%016" PRIX64 " r24(cnt)=%016" PRIX64
-                            " r25(ptr)=%016" PRIX64 "\n",
-                    bundle_va, gr_read(m, 29, NULL), gr_read(m, 26, NULL),
-                    gr_read(m, 27, NULL), gr_read(m, 24, NULL),
-                    gr_read(m, 25, NULL));
-        }
-    }
-
     unsigned hist = m->trace_history_next++ % MERCED_TRACE_HISTORY;
     m->trace_history[hist].ip = bundle_va | slot;
     m->trace_history[hist].raw = raw;

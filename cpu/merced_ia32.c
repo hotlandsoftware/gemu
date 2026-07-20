@@ -621,9 +621,34 @@ MercedStatus merced_ia32_step(Merced *m) {
             setxr(&x,(mr>>3)&7,size,v);
         } else if(op2==0x00){uint32_t mr;if(!fetch(&x,1,&mr))goto fault;
             if(((mr>>3)&7)==6){RM rm;if(!decode_rm(&x,mr,&rm)||!rmread(&x,rm,size,&q))goto fault;
-                /* JMPE: leave IA-32 mode and resume at an aligned IA-64 IP. */
+                /* JMPE: leave IA-32 mode and resume at an aligned IA-64 IP.
+                 * Per the Itanium SDM's JMPE operation: "GR[1] = EIP +
+                 * AR[CSD].base" (the next sequential instruction address
+                 * following JMPE), zero-extended - IA-64 code on the other
+                 * side of the mode switch is architecturally entitled to
+                 * rely on r1 holding this. Leaving it unset let whatever
+                 * stale IA-32-mode value sat there leak into IA-64
+                 * execution as a bogus address (seen corrupting a later
+                 * TLB-miss lookup). x.pc here is already the linear address
+                 * right after this instruction's operand, matching the
+                 * formula exactly. */
+                m->gr_static[1] = x.pc;
+                m->nat_static[1] = 0;
                 m->ip=(sbase(&x,X_CS)+q)&UINT32_C(0xfffffff0);m->psr&=~(UINT64_C(1)<<34);m->psr&=~(UINT64_C(3)<<41);m->taken=1;m->ninsts++;return MERCED_OK;}
             return xhalt(&x,"IA-32 0F %02X unimplemented at %08X",op2,x.start);
+        } else if(op2==0xa2){
+            /* CPUID. Only leaf 0 (vendor string + max leaf) and leaf 1
+             * (family/model/stepping + feature flags) are modeled; any
+             * other leaf falls back to the leaf-1 shape rather than
+             * halting. Feature flags advertise FPU only - RDTSC,
+             * CMPXCHG8B and friends aren't implemented in this IA-32
+             * layer, so claiming them would just trade this halt for a
+             * later "unimplemented opcode" one when firmware acts on
+             * them. */
+            uint32_t a,b,c,d;
+            if(xr(&x,0,4)==0){a=1;b=0x756e6547;d=0x49656e69;c=0x6c65746e;}
+            else{a=0x00000601;b=0;c=0;d=0x00000001;}
+            setxr(&x,0,4,a);setxr(&x,3,4,b);setxr(&x,1,4,c);setxr(&x,2,4,d);
         } else return xhalt(&x,"IA-32 0F %02X unimplemented at %08X",op2,x.start);
     } else return xhalt(&x,"IA-32 opcode %02X unimplemented at %08X",op,x.start);
 
