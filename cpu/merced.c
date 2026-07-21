@@ -49,6 +49,10 @@ static int merced_dbg(void) {
 #define PSR_IA   (1ull << 45)
 #define PSR_RI_SHIFT 41
 
+#define ISR_X (1ull << 32)
+#define ISR_W (1ull << 33)
+#define ISR_R (1ull << 34)
+
 #define CFM_SOF(c)    ((unsigned)((c) & 0x7F))
 #define CFM_SOL(c)    ((unsigned)(((c) >> 7) & 0x7F))
 #define CFM_SOR(c)    ((unsigned)(((c) >> 14) & 0xF))
@@ -258,15 +262,31 @@ static const MercedTlbEntry *tlb_search(const MercedTlbEntry *t, int n,
 /* Returns true and sets *pa on success; on failure delivers a fault (or
  * halts) and returns false with *st set. */
 static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
+                         uint64_t isr_access,
                          uint64_t *pa, MercedStatus *st);
+
+/* Hardware-style VHPT walk, tried on a TLB miss before falling back to the
+ * software fault path - see the definition (after tlb_insert) for why this
+ * is safe even if the hash math is subtly wrong. */
+enum { VHPT_MISS = 0, VHPT_HIT = 1, VHPT_NOT_PRESENT = -1 };
+static int vhpt_walk(Merced *m, uint64_t va, bool ifetch);
 
 /* Advance ar.itc and edge-latch the interval-timer interrupt if it just
  * crossed cr.itm. cr.itm == 0 means "never armed" (SAL/EFI haven't
  * programmed a deadline yet), matching real reset state where the timer
  * isn't running until software sets it. */
 static void itc_advance(Merced *m, uint64_t delta) {
+    uint64_t old = m->ar[AR_ITC];
     m->ar[AR_ITC] += delta;
-    if (m->cr[CR_ITM] != 0 && m->ar[AR_ITC] >= m->cr[CR_ITM])
+    uint64_t deadline = m->cr[CR_ITM];
+    /* cr.itm is a one-shot match, not a level-triggered "ITC is beyond
+     * ITM" condition.  Once cr.ivr acknowledges the interrupt it must stay
+     * quiet until software programs and crosses a new deadline.  The old
+     * level comparison reasserted the timer after every instruction and
+     * trapped NT in its external-interrupt handler. */
+    if (deadline != 0 &&
+        (int64_t)(old - deadline) < 0 &&
+        (int64_t)(m->ar[AR_ITC] - deadline) >= 0)
         m->timer_pending = 1;
 }
 
@@ -360,6 +380,7 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
 }
 
 static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
+                         uint64_t isr_access,
                          uint64_t *pa, MercedStatus *st) {
     *st = MERCED_OK;
     bool on = ifetch ? (m->psr & PSR_IT) != 0 : (m->psr & PSR_DT) != 0;
@@ -419,19 +440,36 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
             e = tlb_search(m->itc, MERCED_N_TC, rid, lookup_va);
     }
     if (!e) {
+        int walk = vhpt_walk(m, va, ifetch);
+        if (walk == VHPT_HIT) {
+            /* Walk succeeded and installed a TC entry exactly as software's
+             * itc.d/itc.i would have - re-search to pick it up. */
+            e = tlb_search(ifetch ? m->itc : m->dtc, MERCED_N_TC,
+                           rid, lookup_va);
+        } else if (walk == VHPT_NOT_PRESENT) {
+            if (spec) return false;
+            *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT, isr_access,
+                                va, true);
+            return false;
+        }
+    }
+    if (!e) {
         if (spec) return false;   /* ld.s: caller sets NaT, no fault */
         /* Vector choice depends on whether the VHPT walker would have run
          * for this reference: pta.ve=0 or rr.ve=0 disables it, and misses
-         * then raise the Alternate ITLB/DTLB vectors. (We model no walker,
-         * so with it enabled we deliver the plain ITLB/DTLB miss vectors -
-         * the handlers there do the VHPT search in software anyway.) */
+         * then raise the Alternate ITLB/DTLB vectors. A walker that's
+         * enabled but found nothing (vhpt_walk() above returned false)
+         * still reaches the plain miss vectors here - exactly matching
+         * real hardware, whose walker also falls through to the
+         * software-visible miss fault when the VHPT itself doesn't
+         * resolve the reference. */
         bool walker = (m->cr[CR_PTA] & 1) && (m->rr[vrn] & 1);
         uint32_t fvec;
         if (ifetch)
             fvec = walker ? VEC_ITLB : VEC_ALT_ITLB;
         else
             fvec = walker ? VEC_DTLB : VEC_ALT_DTLB;
-        *st = deliver_fault(m, fvec, 0, va, true);
+        *st = deliver_fault(m, fvec, isr_access, va, true);
         return false;
     }
     *pa = (e->pfn_base + (lookup_va - e->va_start)) & MERCED_PHYS_MASK;
@@ -871,7 +909,7 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         warn_once(m, WARN_SEMAPHORE, "semaphore ops executed non-atomically");
         uint64_t va = gr_read(m, r3, &n3), pa;
         unsigned size = 1u << (x6 & 3);
-        if (!va_translate(m, va, false, false, &pa, &st)) return st;
+        if (!va_translate(m, va, false, false, ISR_R | ISR_W, &pa, &st)) return st;
         if (x6 <= 0x07) {                       /* cmpxchg.acq/.rel */
             uint64_t old = phys_read(m, pa, size);
             uint64_t ccv = m->ar[AR_CCV];
@@ -939,7 +977,7 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
             uint64_t va = gr_read(m, r3, &n3), pa;
             int spec = (type == 1 || type == 3);   /* .s / .sa */
             if (x6 == 0x1B) size = 8;              /* ld8.fill */
-            if (!va_translate(m, va, false, spec, &pa, &st)) {
+            if (!va_translate(m, va, false, spec, ISR_R, &pa, &st)) {
                 if (st != MERCED_OK) return st;
                 gr_write(m, r1, 0, 1);             /* NaT on deferred spec load */
             } else {
@@ -965,7 +1003,7 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
             if (!qp) return MERCED_OK;
             uint64_t va = gr_read(m, r3, &n3), pa;
             if (x6 == 0x3B) size = 8;              /* st8.spill */
-            if (!va_translate(m, va, false, false, &pa, &st)) return st;
+            if (!va_translate(m, va, false, false, ISR_W, &pa, &st)) return st;
             uint64_t v = gr_read(m, r2, &n2);
             if (x6 == 0x3B) {
                 unsigned bit = (unsigned)((va >> 3) & 0x3F);
@@ -1019,7 +1057,8 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         int is_st = (x6 >= 0x30);
         if (!qp) return MERCED_OK;
         uint64_t va = gr_read(m, r3, &n3), pa;
-        if (!va_translate(m, va, false, false, &pa, &st)) return st;
+        if (!va_translate(m, va, false, false, is_st ? ISR_W : ISR_R,
+                          &pa, &st)) return st;
         unsigned fmt = x6 & 3;   /* 0=e 1=8 2=s 3=d */
         if (!is_st && (x6 <= 0x0F || x6 == 0x1B)) {
             MercedFpReg f = {0, 0, 0, 0};
@@ -1123,6 +1162,157 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
     }
 }
 
+/* Reads a VHPT hash-table slot's home address. VHPT reads are always data
+ * references, translated through the same TR/TC state (or the same
+ * physical/pinned-window carve-outs) va_translate() itself uses for any
+ * other data access. Deliberately does not recurse into vhpt_walk() - real
+ * hardware requires its VHPT backing store to already be resident rather
+ * than chasing it through another level of walking - and never raises a
+ * fault on a miss; the caller treats "can't reach the hash table" the same
+ * as "walk found nothing", falling back to the pre-existing software path. */
+static bool vhpt_entry_pa(Merced *m, uint64_t entry_va, uint64_t *pa) {
+    if (!(m->psr & PSR_DT)) {
+        *pa = entry_va & MERCED_PHYS_MASK;
+        return true;
+    }
+    uint64_t v61 = entry_va & 0x1FFFFFFFFFFFFFFFull;
+    if ((entry_va >= 0xFFC00000ull && entry_va <= 0xFFFFFFFFull) ||
+        (entry_va >= 0xA0000ull && entry_va < 0xC0000ull) ||
+        (entry_va >= 0x400000ull && entry_va < 0x10000000ull) ||
+        v61 - 0xFFFFC000000ull < 0x4000000ull) {
+        *pa = v61 & MERCED_PHYS_MASK;
+        return true;
+    }
+    unsigned vrn = (unsigned)(entry_va >> 61);
+    uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
+    const MercedTlbEntry *e = tlb_search(m->dtr, MERCED_N_TR, rid, entry_va);
+    if (!e) e = tlb_search(m->dtc, MERCED_N_TC, rid, entry_va);
+    if (!e) e = tlb_search(m->itr, MERCED_N_TR, rid, entry_va);
+    if (!e) e = tlb_search(m->itc, MERCED_N_TC, rid, entry_va);
+    if (!e) return false;
+    *pa = (e->pfn_base + (entry_va - e->va_start)) & MERCED_PHYS_MASK;
+    return true;
+}
+
+/* Hardware-style VHPT walk, tried on a TLB miss before the software fault
+ * path: hash the faulting VA into the OS-managed VHPT and, on a genuine
+ * hit, install a TC entry via the same tlb_insert() a software itc.d/itc.i
+ * would have used. Hash addressing and the long-format tag match
+ * reference/qemu-system-ia64/target/ia64/op_helper.c's
+ * ia64_vhpt_{short,long}_hash_address()/ia64_vhpt_long_tag() exactly.
+ *
+ * Safe by construction even if some corner of the math below is subtly
+ * off: every failure mode here (wrong hash address, tag mismatch,
+ * unreadable hash table, PTE not present) just returns false, and the
+ * caller falls through to the software TLB-miss fault path that ran
+ * unconditionally before this walker existed. A bug here can only cost
+ * the speedup - it can't install a translation the OS didn't itself write
+ * into its own VHPT. */
+static uint64_t dbg_vhpt_calls, dbg_vhpt_disabled, dbg_vhpt_hit,
+                dbg_vhpt_unmapped, dbg_vhpt_tagfail, dbg_vhpt_np;
+
+/* Temporary diagnostic accessor (see machine_generic.c's "vhptstats"
+ * monitor command) for measuring how often the hardware VHPT walk above
+ * actually resolves a miss vs. falling back to the software path - remove
+ * both once that question is answered. */
+void merced_vhpt_stats(uint64_t *calls, uint64_t *disabled, uint64_t *hit,
+                       uint64_t *unmapped, uint64_t *tagfail, uint64_t *np) {
+    *calls = dbg_vhpt_calls; *disabled = dbg_vhpt_disabled;
+    *hit = dbg_vhpt_hit; *unmapped = dbg_vhpt_unmapped;
+    *tagfail = dbg_vhpt_tagfail; *np = dbg_vhpt_np;
+}
+
+static int vhpt_walk(Merced *m, uint64_t va, bool ifetch) {
+    dbg_vhpt_calls++;
+    uint64_t pta = m->cr[CR_PTA];
+    if (!(pta & 1)) {
+        dbg_vhpt_disabled++;
+        return VHPT_MISS;                    /* pta.ve=0: walker off */
+    }
+    unsigned vrn = (unsigned)(va >> 61);
+    uint64_t rr = m->rr[vrn];
+    if (!(rr & 1)) {
+        dbg_vhpt_disabled++;
+        return VHPT_MISS;                    /* rr.ve=0: walker off here */
+    }
+
+    unsigned size = (unsigned)((pta >> 2) & 0x3F);
+    bool long_format = (pta & (1ull << 8)) != 0;
+    unsigned rr_ps = (unsigned)((rr >> 2) & 0x3F);
+    unsigned ps = rr_ps < 12 ? 12 : rr_ps;    /* region's preferred page size */
+
+    /* IA64_IMPL_VA_MSB=60 in the reference model: the full 61-bit payload
+     * below the 3-bit region field is implemented, so there are no
+     * unimplemented bits to sign-extend/validate here. */
+    uint64_t payload = va & ((1ull << 61) - 1);
+    uint64_t hpn = payload >> ps;
+    uint32_t rid = (uint32_t)((rr >> 8) & 0xFFFFFF);
+
+    uint64_t entry_va;
+    if (!long_format) {
+        uint64_t region = va & (0x7ull << 61);
+        uint64_t offset = hpn << 3;
+        uint64_t mask = (1ull << size) - 1;
+        uint64_t base = pta & (((1ull << 61) - 1) & ~0x7FFFull);
+        entry_va = region | ((base & ~mask) | (offset & mask));
+    } else {
+        if (size < 5)
+            return VHPT_MISS;                /* table smaller than one entry */
+        uint64_t base = pta & ~0x7FFFull;
+        uint64_t entries = 1ull << (size - 5);
+        uint64_t hash = (hpn ^ (hpn >> 7) ^ rid) & (entries - 1);
+        uint64_t offset = hash << 5;
+        uint64_t mask = (1ull << size) - 1;
+        entry_va = (base & ~mask) | (offset & mask);
+    }
+
+    uint64_t entry_pa;
+    if (!vhpt_entry_pa(m, entry_va, &entry_pa)) {
+        dbg_vhpt_unmapped++;
+        return VHPT_MISS; /* VHPT itself isn't mapped - software will search it */
+    }
+
+    uint64_t pte, itir;
+    if (!long_format) {
+        pte = phys_read(m, entry_pa, 8);
+        itir = (uint64_t)ps << 2;  /* short format: ps is implied, not stored */
+    } else {
+        pte = phys_read(m, entry_pa, 8);
+        itir = phys_read(m, entry_pa + 8, 8);
+        uint64_t tag = phys_read(m, entry_pa + 16, 8);
+        unsigned hpn_bits = ps > 60 ? 0 : 61 - ps;
+        uint64_t expected_tag = hpn_bits
+            ? (((uint64_t)rid << hpn_bits) | (hpn & ((1ull << hpn_bits) - 1)))
+            : rid;
+        if ((tag & (1ull << 63)) || tag != expected_tag) {
+            dbg_vhpt_tagfail++;
+            return VHPT_MISS; /* collision slot / stale memory, not our entry */
+        }
+    }
+    if (!(pte & 1)) {
+        dbg_vhpt_np++;
+        /* An accessible VHPT entry with P=0 is architecturally a Page Not
+         * Present fault, not a DTLB miss.  The latter merely asks software
+         * to refill and causes an infinite retry when no translation exists. */
+        return VHPT_NOT_PRESENT;
+    }
+    dbg_vhpt_hit++;
+
+    /* tlb_insert() reads CR_IFA/CR_ITIR implicitly, matching itc.d/itc.i's
+     * own semantics; stage them, insert, then restore, so a successful
+     * walk leaves the visible fault-context registers untouched exactly
+     * like real hardware's walker does. */
+    uint64_t save_ifa = m->cr[CR_IFA], save_itir = m->cr[CR_ITIR];
+    m->cr[CR_IFA] = va;
+    m->cr[CR_ITIR] = itir;
+    tlb_insert(m, ifetch ? &m->itc[m->itc_next++ % MERCED_N_TC]
+                        : &m->dtc[m->dtc_next++ % MERCED_N_TC],
+              pte, ifetch);
+    m->cr[CR_IFA] = save_ifa;
+    m->cr[CR_ITIR] = save_itir;
+    return VHPT_HIT;
+}
+
 static void tlb_purge(MercedTlbEntry *t, int n, uint32_t rid,
                       uint64_t va, uint64_t len) {
     for (int i = 0; i < n; i++) {
@@ -1185,7 +1375,7 @@ static MercedStatus rse_flush(Merced *m) {
         uint32_t idx = rse_stack_slot(m, p);
         uint64_t pa;
         MercedStatus st;
-        if (!va_translate(m, rse_addr(m, p), false, false, &pa, &st))
+        if (!va_translate(m, rse_addr(m, p), false, false, ISR_W, &pa, &st))
             return st;
         phys_write(m, pa, m->gr_stack[idx], 8);
     }
@@ -1214,7 +1404,7 @@ static MercedStatus rse_load(Merced *m, uint64_t loadrs_bytes) {
         uint32_t idx = rse_stack_slot(m, p);
         uint64_t pa;
         MercedStatus st;
-        if (!va_translate(m, rse_addr(m, p), false, false, &pa, &st))
+        if (!va_translate(m, rse_addr(m, p), false, false, ISR_R, &pa, &st))
             return st;
         m->gr_stack[idx] = phys_read(m, pa, 8);
         m->nat_stack[idx] = 0;   /* NaT collection words not modeled */
@@ -1279,7 +1469,21 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
             }
             return mhalt(m, "unimpl M-sys major 0 x2=%u x4=0x%X", x2, x4);
         }
-        if (x3 >= 4) return MERCED_OK;              /* M22/M23 chk.a: no ALAT → never fail */
+        if (x3 >= 4) {                              /* M22/M23 chk.a */
+            if (!qp) return MERCED_OK;
+            /* We do not model the ALAT.  Architecturally, an implementation
+             * may conservatively fail chk.a even when an entry might have
+             * matched; with no entry tracking, failure is the only safe
+             * result.  Treating every check as success lets lock-free code
+             * consume stale advanced loads and corrupt structures such as
+             * NT's pool free lists. */
+            int64_t disp = sext((bits(raw, 36, 1) << 20) |
+                                (bits(raw, 20, 13) << 7) |
+                                bits(raw, 6, 7), 21) << 4;
+            m->ip = (m->ip & ~0xFull) + (uint64_t)disp;
+            m->taken = 1;
+            return MERCED_OK;
+        }
         if (x3 == 1 || x3 == 2 || x3 == 3) {
             /* M20 chk.s.m r2,target25 (x3=1); 2/3 are fp/spec variants */
             if (!qp) return MERCED_OK;
@@ -1415,10 +1619,27 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         return MERCED_OK;
     }
     case 0x17: gr_write(m, r1, m->cpuid[gr_read(m, r3, &n3) & 7], 0); return MERCED_OK;
-    case 0x18: case 0x19:                           /* probe imm2 */
-        warn_once(m, WARN_PROBE, "probe always succeeds");
-        gr_write(m, r1, 1, 0);
+    case 0x18: case 0x19: case 0x38: case 0x39: {   /* probe.r / probe.w */
+        /* Probe is a non-faulting translation/accessibility query.  Saying
+         * "present" unconditionally makes an OS page-fault handler retry an
+         * unmapped instruction forever: NT uses probe to detect exactly
+         * that race.  Permission/key checks are still TODO, but translation
+         * presence alone is the conservative and useful baseline. */
+        uint64_t va = gr_read(m, r3, &n3);
+        bool present = !(m->psr & PSR_DT);
+        if (!present) {
+            unsigned vrn = (unsigned)(va >> 61);
+            uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
+            const MercedTlbEntry *e = tlb_search(m->dtr, MERCED_N_TR,
+                                                  rid, va);
+            if (!e) e = tlb_search(m->dtc, MERCED_N_TC, rid, va);
+            if (!e && vhpt_walk(m, va, false) == VHPT_HIT)
+                e = tlb_search(m->dtc, MERCED_N_TC, rid, va);
+            present = e != NULL;
+        }
+        gr_write(m, r1, present ? 1 : 0, 0);
         return MERCED_OK;
+    }
     case 0x1A: {                                    /* thash */
         uint64_t va = gr_read(m, r3, &n3);
         unsigned vrn = (unsigned)(va >> 61);
@@ -1442,7 +1663,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x1E: {                                    /* tpa */
         uint64_t va = gr_read(m, r3, &n3), pa;
         MercedStatus st;
-        if (!va_translate(m, va, false, false, &pa, &st)) return st;
+        if (!va_translate(m, va, false, false, ISR_R, &pa, &st)) return st;
         gr_write(m, r1, pa, 0);
         return MERCED_OK;
     }
@@ -1526,10 +1747,6 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x34:                                      /* ptc.e */
         memset(m->itc, 0, sizeof(m->itc));
         memset(m->dtc, 0, sizeof(m->dtc));
-        return MERCED_OK;
-    case 0x38: case 0x39:                           /* probe.r/w reg */
-        warn_once(m, WARN_PROBE, "probe always succeeds");
-        gr_write(m, r1, 1, 0);
         return MERCED_OK;
     }
     return mhalt(m, "unimpl M-sys major 1 x6=0x%02X", x6);
@@ -2100,7 +2317,8 @@ static MercedStatus exec_x(Merced *m, uint64_t raw, uint64_t lraw, int qp) {
             return deliver_fault(m, VEC_BREAK, 0, 0, false);
         }
     }
-    return mhalt(m, "unimpl X-unit major 0x%X", major);
+    return mhalt(m, "unimpl X-unit major 0x%X lraw=0x%011" PRIX64,
+                 major, lraw);
 }
 
 /* ── F-unit (minimal) ────────────────────────────────────────────────────── */
@@ -2369,7 +2587,8 @@ bool merced_ia32_read(Merced *m, uint64_t va, unsigned size,
                       bool ifetch, uint64_t *value) {
     uint64_t pa;
     MercedStatus st;
-    if (!va_translate(m, va, ifetch, false, &pa, &st))
+    if (!va_translate(m, va, ifetch, false, ifetch ? ISR_X : ISR_R,
+                      &pa, &st))
         return false;
     *value = ifetch ? phys_fetch(m, pa, size) : phys_read(m, pa, size);
     return true;
@@ -2379,7 +2598,7 @@ bool merced_ia32_write(Merced *m, uint64_t va, unsigned size,
                        uint64_t value) {
     uint64_t pa;
     MercedStatus st;
-    if (!va_translate(m, va, false, false, &pa, &st))
+    if (!va_translate(m, va, false, false, ISR_W, &pa, &st))
         return false;
     phys_write(m, pa, value, size);
     return true;
@@ -2449,7 +2668,7 @@ MercedStatus merced_step(Merced *m) {
         if (return_ip == 0x7FE867B0ull) {
             /* CDB slot 0 initializes an opaque query handle through arg0. */
             uint64_t out = gr_read(m, 32, NULL), out_pa;
-            if (va_translate(m, out, false, false, &out_pa, &st))
+            if (va_translate(m, out, false, false, ISR_W, &out_pa, &st))
                 phys_write(m, out_pa, 0, 8);
         } else if (return_ip == 0x7FE867E0ull) {
             /* CDB slot 1 returns an iterable result through arg3.  Supply a
@@ -2458,8 +2677,8 @@ MercedStatus merced_step(Merced *m) {
             uint64_t out = gr_read(m, 35, NULL);
             uint64_t empty = gr_read(m, 36, NULL);
             uint64_t out_pa, empty_pa;
-            if (va_translate(m, empty, false, false, &empty_pa, &st) &&
-                va_translate(m, out, false, false, &out_pa, &st)) {
+            if (va_translate(m, empty, false, false, ISR_W, &empty_pa, &st) &&
+                va_translate(m, out, false, false, ISR_W, &out_pa, &st)) {
                 phys_write(m, empty_pa, 0, 8);
                 phys_write(m, out_pa, empty, 8);
                 gr_write(m, 8, 0, 0);
@@ -2471,7 +2690,7 @@ MercedStatus merced_step(Merced *m) {
     }
 
     if (slot > 2) return mhalt(m, "bad IP slot %u", slot);
-    if (!va_translate(m, bundle_va, true, false, &pa, &st))
+    if (!va_translate(m, bundle_va, true, false, ISR_X, &pa, &st))
         return st;   /* ITLB miss delivered (or halt) */
 
     uint64_t lo = phys_fetch(m, pa, 8);
@@ -2510,7 +2729,7 @@ MercedStatus merced_step(Merced *m) {
         uint64_t fill_pa;
         if (!na && !nb && vb == va + 8 && disp == 0 &&
             iterations <= UINT64_MAX / 16 &&
-            va_translate(m, va, false, false, &fill_pa, &st) &&
+            va_translate(m, va, false, false, ISR_W, &fill_pa, &st) &&
             m->bus.fill(m->bus.ud, fill_pa, 0, len)) {
             gr_write(m, ra, va + len, 0);
             gr_write(m, rb, vb + len, 0);
@@ -2754,5 +2973,12 @@ void merced_dump_state(const Merced *m, char *buf, size_t len) {
       m->cr[CR_IVA], m->cr[CR_IIP], m->cr[CR_IPSR], m->cr[CR_ISR]);
     P("ifa %016" PRIX64 "  itir %016" PRIX64 "  halt: %s\n",
       m->cr[CR_IFA], m->cr[CR_ITIR], m->halt_msg);
+    for (unsigned i = 0; i < MERCED_N_TR; i++) {
+        if (m->dtr[i].valid)
+            P("dtr[%u] rid=%06X va=%016" PRIX64 "-%016" PRIX64
+              " pa=%016" PRIX64 " ps=%u\n", i, m->dtr[i].rid,
+              m->dtr[i].va_start, m->dtr[i].va_end,
+              m->dtr[i].pfn_base, m->dtr[i].ps);
+    }
     #undef P
 }

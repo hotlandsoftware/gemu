@@ -41,7 +41,7 @@
 #define MERCED_N_CR       128
 #define MERCED_N_RR       8
 #define MERCED_N_TR       16   /* per side (code/data) */
-#define MERCED_N_TC       64   /* per side, round-robin */
+#define MERCED_N_TC       512  /* per side; amortize software VHPT refills */
 #define MERCED_TRACE_HISTORY 512
 #define MERCED_CALL_HISTORY 128
 
@@ -215,3 +215,9 @@ void merced_dump_calls(const Merced *m, unsigned count, FILE *out);
 
 /* Read a general register by architectural number (for debugging). */
 uint64_t merced_gr(const Merced *m, unsigned r);
+
+/* Temporary VHPT-walker diagnostic counters - see the definition in
+ * merced.c for what each field means. Remove once the walker's hit rate
+ * on real workloads is understood. */
+void merced_vhpt_stats(uint64_t *calls, uint64_t *disabled, uint64_t *hit,
+                       uint64_t *unmapped, uint64_t *tagfail, uint64_t *np);

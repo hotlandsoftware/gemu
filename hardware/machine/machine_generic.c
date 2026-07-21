@@ -653,6 +653,14 @@ static void generic_custom_cmd(Ia64GenericState *s) {
         }
         return;
     }
+    if (txt && strncmp(txt, "vhptstats", 9) == 0) {
+        uint64_t calls, disabled, hit, unmapped, tagfail, np;
+        merced_vhpt_stats(&calls, &disabled, &hit, &unmapped, &tagfail, &np);
+        printf("vhpt: calls=%" PRIu64 " disabled=%" PRIu64 " hit=%" PRIu64
+               " unmapped=%" PRIu64 " tagfail=%" PRIu64 " np=%" PRIu64 "\n",
+               calls, disabled, hit, unmapped, tagfail, np);
+        return;
+    }
     if (txt && strncmp(txt, "vgapeek ", 8) == 0) {
         unsigned plane;
         unsigned off;
