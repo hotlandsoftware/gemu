@@ -77,6 +77,8 @@ struct Ia64GenericState {
     /* PE32+/IA-64 image loading (GENERIC_CDROM_CMD_LOAD_PE). */
     uint32_t pe_src, pe_dst;
     uint32_t pe_entry_rva;             /* valid after a successful CMD 4 */
+    uint32_t cdrom_dma_dst;
+    uint32_t cdrom_dma_size;
 };
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -117,6 +119,21 @@ static void cdrom_do_read(Ia64GenericState *s) {
         s->cdrom_result = 1;
         return;
     }
+    s->cdrom_result = 0;
+}
+
+static void cdrom_do_read_dma(Ia64GenericState *s) {
+    s->cdrom_result = 1;
+    if (!s->cdrom || s->cdrom_dma_size == 0 ||
+        s->cdrom_dma_size % GENERIC_CDROM_SECTOR_SIZE != 0 ||
+        (uint64_t)s->cdrom_dma_dst + s->cdrom_dma_size > s->ram_size)
+        return;
+    uint64_t off = (uint64_t)s->cdrom_lba * GENERIC_CDROM_SECTOR_SIZE;
+    if (off + s->cdrom_dma_size > s->cdrom_size ||
+        fseek(s->cdrom, (long)off, SEEK_SET) != 0 ||
+        fread(s->ram + s->cdrom_dma_dst, 1, s->cdrom_dma_size, s->cdrom) !=
+            s->cdrom_dma_size)
+        return;
     s->cdrom_result = 0;
 }
 
@@ -506,10 +523,16 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                 cdrom_read_next_chunk(s);
             else if (cmd == GENERIC_CDROM_CMD_LOAD_PE)
                 cdrom_load_pe_image(s, s->pe_src, s->pe_dst);
+            else if (cmd == GENERIC_CDROM_CMD_READ_DMA)
+                cdrom_do_read_dma(s);
         } else if (off == 0x18) {
             s->pe_src = (uint32_t)val;
         } else if (off == 0x1C) {
             s->pe_dst = (uint32_t)val;
+        } else if (off == 0x24) {
+            s->cdrom_dma_dst = (uint32_t)val;
+        } else if (off == 0x28) {
+            s->cdrom_dma_size = (uint32_t)val;
         }
         return;
     }
@@ -674,6 +697,11 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
         ia64_generic_destroy(s);
         return NULL;
     }
+    /* Windows for Itanium refuses to proceed past "pre-B3 stepping" -
+     * real historical behavior. This machine doesn't run i2000's
+     * firmware, so its cpuid revision cross-check doesn't apply here
+     * (see the comment on cpuid[3] in cpu/merced.c). */
+    merced_set_cpu_revision(s->cpu, 6);
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_cpu_state_cb(s->monitor, generic_cpu_state, s);

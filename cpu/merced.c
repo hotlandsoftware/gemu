@@ -103,7 +103,7 @@ static unsigned stacked_phys(const Merced *m, unsigned r) {
     unsigned sor8 = CFM_SOR(m->cfm) * 8;
     if (sor8 && idx < sor8)
         idx = (idx + CFM_RRB_GR(m->cfm)) % sor8;
-    return (m->bof + idx) % MERCED_N_STACKED;
+    return (m->bof + idx) % MERCED_RSE_CAPACITY;
 }
 
 static uint64_t gr_read(Merced *m, unsigned r, uint8_t *nat) {
@@ -210,11 +210,10 @@ static MercedFpReg d2fp(long double d) {
  * not retain those extra bits: later Newton iterations (and, in particular,
  * firmware decompression code) observe the rounded intermediate result.
  *
- * fp_result_static() is used for FMA-family results. fp_recip_estimate()
- * remains available for the eventual table-accurate frcpa implementation;
- * frcpa currently uses a full-precision reciprocal so its surrounding
- * Newton-Raphson sequence remains stable while the rest of FP exception and
- * rounding behavior is still incomplete. */
+ * fp_result_static() is used for FMA-family results.  frcpa must return the
+ * architected table estimate, not a full-precision reciprocal: compiler
+ * Newton-Raphson sequences deliberately refine the low-precision estimate
+ * and can produce a non-converging quotient if handed an exact reciprocal. */
 static MercedFpReg fp_result_static(long double d, unsigned precision) {
     if (precision == 1) {
         return d2fp((long double)(float)d);
@@ -391,7 +390,7 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
              * cursor in this reserved low-RAM scratch area.  EFI callbacks
              * remain callable after SETUPLDR enables psr.dt, before it has
              * installed translations for firmware-private data. */
-            (va >= 0x500000ull && va < 0x10000000ull) ||
+            (va >= 0x400000ull && va < 0x10000000ull) ||
             v61 - 0xFFFFC000000ull < 0x4000000ull) {
             *pa = v61 & MERCED_PHYS_MASK;
             return true;
@@ -473,9 +472,11 @@ void merced_destroy(Merced *m) { free(m); }
 void merced_reset(Merced *m) {
     MercedBus bus = m->bus;
     uint64_t ninsts = 0;
+    uint8_t cpu_revision = m->cpu_revision;
     memset(m, 0, sizeof(*m));
     m->bus = bus;
     m->ninsts = ninsts;
+    m->cpu_revision = cpu_revision;
 
     m->ip  = 0xFFFFFFB0ull;          /* PALE_RESET, 4 GiB - 0x50 */
     m->psr = 0;                      /* physical mode, bank 0 */
@@ -489,21 +490,38 @@ void merced_reset(Merced *m) {
     m->ar[AR_FPSR] = UINT64_C(0x0009804c0270033f);
     /* CPUID: "GenuineIntel". cpuid[3] is the version register:
      * {number 7:0, revision 15:8, model 23:16, family 31:24, archrev 39:32}
-     * = archrev 0, family 7 (Itanium), model 0 (Merced), rev 0, number 4
-     * (cpuid[0..4] implemented). Revision must match the firmware's own
-     * cross-check of it in machine_i2000.c's memcard_cfg[0][2][0x05]
-     * (CBN:05.2 processor descriptor) - a mismatch reads as "no
-     * recognized processor" and parks SAL at FFFE2020. Revision 6 (C2
-     * stepping) diverges into a firmware code path that isn't understood
-     * yet (see SALE_ENTRY reason-dispatch panic in commit 69fab2c); 0
-     * is what's confirmed working. */
+     * = archrev 0, family 7 (Itanium), model 0 (Merced), rev cpu_revision,
+     * number 4 (cpuid[0..4] implemented).
+     *
+     * The revision (stepping) value is machine-configurable (see
+     * merced_set_cpu_revision()) because different consumers disagree
+     * about what they want to see here:
+     *   - i2000's own firmware cross-checks it against
+     *     machine_i2000.c's memcard_cfg[0][2][0x05] (CBN:05.2 processor
+     *     descriptor) - a mismatch reads as "no recognized processor"
+     *     and parks SAL at FFFE2020. Revision 6 ("C2" stepping)
+     *     diverges into a firmware code path that isn't understood yet
+     *     (see SALE_ENTRY reason-dispatch panic in commit 69fab2c); 0
+     *     is what's confirmed working there, and remains the default.
+     *   - Windows for Itanium (SETUPLDR.EFI on the generic machine)
+     *     refuses to proceed on anything it reads as "pre-B3 stepping" -
+     *     real historical behavior, not an emulator bug. The generic
+     *     machine sets revision 6 for this reason; it doesn't run
+     *     i2000's firmware, so that machine's SALE_ENTRY concern doesn't
+     *     apply to it. */
     memcpy(&m->cpuid[0], "GenuineI", 8);
     memcpy(&m->cpuid[1], "ntel\0\0\0\0", 8);
     m->cpuid[2] = 0;
-    m->cpuid[3] = (7ull << 24) | (0ull << 16) | (0ull << 8) | 4;
+    m->cpuid[3] = (7ull << 24) | (0ull << 16) |
+                  ((uint64_t)m->cpu_revision << 8) | 4;
     m->cpuid[4] = 0;
     m->cr[CR_LID] = 0;               /* cpu 0 */
     strcpy(m->halt_msg, "never ran");
+}
+
+void merced_set_cpu_revision(Merced *m, uint8_t revision) {
+    m->cpu_revision = revision;
+    m->cpuid[3] = (m->cpuid[3] & ~0xFF00ull) | ((uint64_t)revision << 8);
 }
 
 uint64_t merced_gr(const Merced *m, unsigned r) {
@@ -522,7 +540,7 @@ static void do_call(Merced *m, unsigned b1, uint64_t target) {
                     ((m->ar[AR_EC] & 0x3F) << 52) |
                     (bits(m->psr, 32, 2) << 62);
     m->br[b1] = (m->ip & ~0xFull) + 16;
-    m->bof = (m->bof + sol) % MERCED_N_STACKED;
+    m->bof = (m->bof + sol) % MERCED_RSE_CAPACITY;
     m->bof_total += sol;
     uint64_t sof = CFM_SOF(m->cfm) - sol;
     m->cfm = sof;                    /* sol=0 sor=0 rrb=0 */
@@ -538,7 +556,7 @@ static void do_ret(Merced *m, uint64_t target) {
     uint64_t pfs = m->ar[AR_PFS];
     uint64_t new_cfm = pfs & CFM_MASK;
     unsigned sol = CFM_SOL(new_cfm);
-    m->bof = (m->bof + MERCED_N_STACKED - sol) % MERCED_N_STACKED;
+    m->bof = (m->bof + MERCED_RSE_CAPACITY - sol) % MERCED_RSE_CAPACITY;
     m->bof_total -= sol;
     m->cfm = new_cfm;
     m->ar[AR_EC] = (pfs >> 52) & 0x3F;
@@ -1146,8 +1164,8 @@ static uint64_t rse_addr(Merced *m, int64_t regs_pos) {
  * merced.h simplifications note). */
 static uint32_t rse_stack_slot(Merced *m, int64_t regs_pos) {
     int64_t rel = regs_pos - (int64_t)m->bof_total;
-    int64_t idx = ((int64_t)m->bof + rel) % MERCED_N_STACKED;
-    if (idx < 0) idx += MERCED_N_STACKED;
+    int64_t idx = ((int64_t)m->bof + rel) % MERCED_RSE_CAPACITY;
+    if (idx < 0) idx += MERCED_RSE_CAPACITY;
     return (uint32_t)idx;
 }
 
@@ -1520,8 +1538,13 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
     uint8_t n2, n3;
     MercedStatus st;
 
+    /* Compare .unc is unusual: when its qualifying predicate is false it
+     * still clears both destination predicates.  Let the A-unit decoder see
+     * the instruction first, then discard every other predicated-off I op
+     * before opcode validation. */
     if (exec_alu(m, raw, qp, &st)) return st;
     if (st != MERCED_OK) return st;
+    if (!qp) return MERCED_OK;
 
     switch (major) {
     case 0: {
@@ -1739,6 +1762,29 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
         unsigned x2c = (unsigned)bits(raw, 30, 2);
         unsigned x2b = (unsigned)bits(raw, 28, 2);
         if (ve) return mhalt(m, "I-unit major 7 ve=1");
+        if (za == 0 && zb == 1 && x2a == 0 &&
+            (x2b == 1 || x2b == 3)) {               /* I1 pmpyshr2.u / pmpyshr2 */
+            if (!qp) return MERCED_OK;
+            uint64_t a = gr_read(m, r2, &n2), b = gr_read(m, r3, &n3);
+            uint64_t res = 0;
+            static const unsigned count2[4] = { 0, 7, 15, 16 };
+            unsigned shift_count = count2[x2c];
+            for (unsigned lane = 0; lane < 4; lane++) {
+                unsigned shift = lane * 16;
+                uint16_t av = (uint16_t)(a >> shift);
+                uint16_t bv = (uint16_t)(b >> shift);
+                uint16_t product;
+                if (x2b == 1) {                     /* unsigned */
+                    product = (uint16_t)(((uint32_t)av * bv) >> shift_count);
+                } else {                            /* signed */
+                    int32_t p = (int32_t)(int16_t)av * (int32_t)(int16_t)bv;
+                    product = (uint16_t)(p >> shift_count);
+                }
+                res |= (uint64_t)product << shift;
+            }
+            gr_write(m, r1, res, n2 | n3);
+            return MERCED_OK;
+        }
         if (za == 1 && zb == 1) {
             if (!qp) return MERCED_OK;
             uint64_t a, b, res;
@@ -1900,7 +1946,7 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
         }
         case 0x02: {                                /* cover */
             uint64_t old = m->cfm;
-            m->bof = (m->bof + CFM_SOF(old)) % MERCED_N_STACKED;
+            m->bof = (m->bof + CFM_SOF(old)) % MERCED_RSE_CAPACITY;
             m->bof_total += CFM_SOF(old);
             m->cfm = 0;
             if (!(m->psr & PSR_IC))
@@ -1921,8 +1967,8 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
             if (m->cr[CR_IFS] >> 63) {
                 uint64_t new_cfm = m->cr[CR_IFS] & CFM_MASK;
                 /* undo cover's frame advance */
-                m->bof = (m->bof + MERCED_N_STACKED - CFM_SOF(new_cfm))
-                         % MERCED_N_STACKED;
+                m->bof = (m->bof + MERCED_RSE_CAPACITY - CFM_SOF(new_cfm))
+                         % MERCED_RSE_CAPACITY;
                 m->bof_total -= CFM_SOF(new_cfm);
                 m->cfm = new_cfm;
             }
@@ -2053,6 +2099,10 @@ static MercedStatus exec_x(Merced *m, uint64_t raw, uint64_t lraw, int qp) {
 /* ── F-unit (minimal) ────────────────────────────────────────────────────── */
 
 static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
+    /* A predicated-off instruction has no architectural effect, including
+     * reserved/unimplemented opcode checks.  Compilers routinely fill an
+     * F slot with an opcode that is only meaningful on the true path. */
+    if (!qp) return MERCED_OK;
     unsigned major = (unsigned)bits(raw, 37, 4);
     unsigned f1 = (unsigned)bits(raw, 6, 7);
     unsigned f2 = (unsigned)bits(raw, 13, 7);
@@ -2157,12 +2207,21 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
              * num*(num/den) = num^2/den instead of num/den. Confirmed
              * against reference/ski/src/float.c's frcpa()/ieee_recip(). */
             if (num != 0.0 && den != 0.0) {
-                /* Architecturally this should be fp_recip_estimate(b) (the
-                 * real 8-bit table) - see the long comment on that function
-                 * for why a full-precision reciprocal is used here instead
-                 * for now. */
-                fr_write(m, f1, d2fp(1.0L / den));
+                fr_write(m, f1, fp_recip_estimate(b));
                 pr_write(m, p2, 1);
+            } else if (num == 0.0 && den != 0.0) {
+                /* frcpa completes architecturally trivial cases itself and
+                 * clears the refinement predicate.  In particular, 0/x
+                 * must overwrite f1 with signed zero.  Leaving f1 unchanged
+                 * exposes its stale value to the unpredicated tail of the
+                 * compiler's division sequence; Windows' integer conversion
+                 * helper then turns a zero quotient back into the preceding
+                 * non-zero quotient and loops forever.  See Ski's frcpa():
+                 * ZERO(num) writes a zero result and returns pt=NO. */
+                MercedFpReg zero = {0, 0, (uint8_t)(a.sign ^ b.sign),
+                                    (uint8_t)(a.nat | b.nat)};
+                fr_write(m, f1, zero);
+                pr_write(m, p2, 0);
             } else {
                 pr_write(m, p2, 0);
             }

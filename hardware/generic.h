@@ -132,11 +132,12 @@
  * The result of the last READ/OPEN/chunk-read is memory-mapped
  * read-only at GENERIC_CDROM_BUF_BASE. */
 #define GENERIC_CDROM_IO_BASE       0x00000000C0002000ull
-#define GENERIC_CDROM_IO_SIZE       0x24u
+#define GENERIC_CDROM_IO_SIZE       0x2Cu
 #define GENERIC_CDROM_CMD_READ      1u
 #define GENERIC_CDROM_CMD_OPEN      2u
 #define GENERIC_CDROM_CMD_READ_NEXT 3u
 #define GENERIC_CDROM_CMD_LOAD_PE   4u
+#define GENERIC_CDROM_CMD_READ_DMA  5u
 #define GENERIC_CDROM_BUF_BASE      0x00000000C0100000ull
 #define GENERIC_CDROM_BUF_SIZE      0x800u                        /* 2048 */
 #define GENERIC_CDROM_SECTOR_SIZE   2048u

@@ -34,6 +34,7 @@
 
 #define MERCED_N_GR       128
 #define MERCED_N_STACKED  96
+#define MERCED_RSE_CAPACITY 4096
 #define MERCED_N_FR       128
 #define MERCED_N_BR       8
 #define MERCED_N_AR       128
@@ -100,8 +101,8 @@ typedef struct Merced {
     uint8_t  nat_static[32];
     uint8_t  nat_bank0[16];
 
-    uint64_t gr_stack[MERCED_N_STACKED];
-    uint8_t  nat_stack[MERCED_N_STACKED];
+    uint64_t gr_stack[MERCED_RSE_CAPACITY];
+    uint8_t  nat_stack[MERCED_RSE_CAPACITY];
     uint32_t bof;                       /* bottom-of-frame index into gr_stack */
 
     /* RSE backing-store bookkeeping. bof_total mirrors bof (updated at the
@@ -169,11 +170,25 @@ typedef struct Merced {
 
     /* one-shot warnings for approximated ops */
     uint32_t warned;
+
+    /* cpuid[3] revision field (see merced_reset()) - defaults to 0
+     * (matches i2000's own firmware cross-check); machines that need a
+     * different reported stepping call merced_set_cpu_revision()
+     * instead of poking cpuid[3] directly, so it survives merced_reset()
+     * (e.g. the monitor's "reset" command, or a machine's own reset
+     * handling) rather than reverting to the default every time. */
+    uint8_t  cpu_revision;
 } Merced;
 
 Merced *merced_create(const MercedBus *bus);
 void    merced_destroy(Merced *m);
 void    merced_reset(Merced *m);
+
+/* Overrides the stepping Windows/firmware sees in cpuid[3]'s revision
+ * field (bits 15:8). Takes effect immediately and persists across
+ * merced_reset(). See the comment on cpuid[3] in merced_reset() for
+ * what's known about which values work where. */
+void    merced_set_cpu_revision(Merced *m, uint8_t revision);
 
 /* Execute one instruction slot. On anything but MERCED_OK, halt_msg
  * describes why and the CPU is stopped at the offending IP. */
