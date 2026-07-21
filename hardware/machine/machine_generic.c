@@ -49,6 +49,10 @@ struct Ia64GenericState {
     uint8_t  kbd_fifo[KBD_FIFO_SIZE];
     int      kbd_head, kbd_tail;
 
+    uint32_t iosapic_select;
+    uint32_t iosapic_redir[48];      /* 24 redirection entries, low/high */
+    uint16_t acpi_pm1_control;
+
     FILE    *cdrom;
     char     cdrom_file[512];
     uint64_t cdrom_size;
@@ -416,9 +420,47 @@ static bool vga_mem_window(Ia64GenericState *s, uint64_t addr, unsigned size,
     return true;
 }
 
+static bool acpi_pm_window(uint64_t addr, unsigned size, uint32_t *off) {
+    uint64_t base = GENERIC_ACPI_PM_BASE;
+    if (addr >= GENERIC_LEGACY_IO_BASE + 0x2000 &&
+        addr + size <= GENERIC_LEGACY_IO_BASE + 0x2000 + GENERIC_ACPI_PM_SIZE)
+        base = GENERIC_LEGACY_IO_BASE + 0x2000;
+    if (addr < base || addr + size > base + GENERIC_ACPI_PM_SIZE)
+        return false;
+    *off = (uint32_t)(addr - base);
+    return true;
+}
+
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64GenericState *s = ud;
     uint32_t voff;
+    if (acpi_pm_window(addr, size, &voff)) {
+        uint32_t off = voff;
+        if (off < 4)
+            return 0;                         /* PM1 status/enable */
+        if (off < 6)
+            return s->acpi_pm1_control | 1u; /* SCI_EN: ACPI mode active */
+        if (off >= 8 && off < 12)
+            return (uint32_t)s->cpu->ninsts;       /* monotonic PM timer */
+        return 0;
+    }
+    if (addr >= GENERIC_IOSAPIC_BASE &&
+        addr + size <= GENERIC_IOSAPIC_BASE + GENERIC_IOSAPIC_SIZE) {
+        uint32_t off = (uint32_t)(addr - GENERIC_IOSAPIC_BASE);
+        if (off < 4)
+            return s->iosapic_select;
+        if (off >= 0x10 && off < 0x18) {
+            uint32_t reg = s->iosapic_select & 0xFFu;
+            if (reg == 0)
+                return 0;                    /* ID 0 */
+            if (reg == 1)
+                return 0x00170011u;          /* v1.1, entries 0..23 */
+            if (reg >= 0x10 && reg < 0x40)
+                return s->iosapic_redir[reg - 0x10];
+            return 0;
+        }
+        return 0;
+    }
     if (vga_mem_window(s, addr, size, &voff)) {
         uint64_t v = 0;
         for (unsigned i = 0; i < size; i++)
@@ -492,6 +534,24 @@ static void vga_mirror_to_stdout(Ia64GenericState *s, uint32_t voff, uint8_t val
 static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     Ia64GenericState *s = ud;
     uint32_t voff;
+    if (acpi_pm_window(addr, size, &voff)) {
+        uint32_t off = voff;
+        if (off >= 4 && off < 6)
+            s->acpi_pm1_control = (uint16_t)val | 1u;
+        return;
+    }
+    if (addr >= GENERIC_IOSAPIC_BASE &&
+        addr + size <= GENERIC_IOSAPIC_BASE + GENERIC_IOSAPIC_SIZE) {
+        uint32_t off = (uint32_t)(addr - GENERIC_IOSAPIC_BASE);
+        if (off < 4)
+            s->iosapic_select = (uint32_t)val;
+        else if (off >= 0x10 && off < 0x18) {
+            uint32_t reg = s->iosapic_select & 0xFFu;
+            if (reg >= 0x10 && reg < 0x40)
+                s->iosapic_redir[reg - 0x10] = (uint32_t)val;
+        }
+        return;
+    }
     if (vga_mem_window(s, addr, size, &voff)) {
         for (unsigned i = 0; i < size; i++) {
             uint8_t b = (uint8_t)(val >> (i * 8));

@@ -464,6 +464,20 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
         if (!e)
             e = tlb_search(m->itc, MERCED_N_TC, rid, lookup_va);
     }
+    /* NT/IA-64 uses region 7 as its linear mapping of physical RAM.  Early
+     * boot pins the kernel image in a DTR, then allocates ordinary pool pages
+     * through its VA=region7|0x80000000|PA window without installing a separate
+     * translation for each page.  Preserve explicit TR/TC mappings above,
+     * but provide the architectural linear-RAM fallback for the generic
+     * machine's advertised 2-GiB memory below. */
+    if (!e && vrn == 7 && !ifetch) {
+        uint64_t linear = va & UINT64_C(0x1fffffffffffffff);
+        if (linear >= UINT64_C(0x80000000) &&
+            linear - UINT64_C(0x80000000) < UINT64_C(0x80000000)) {
+            *pa = linear - UINT64_C(0x80000000);
+            return true;
+        }
+    }
     /* Bring-up experiment: NT 5.1's first system-PTE allocation reports a
      * successfully handled fault but leaves neither a VHPT entry nor a TC
      * entry.  Back this single 8 KiB page so execution can expose the next
@@ -1429,12 +1443,11 @@ static uint32_t rse_stack_slot(Merced *m, int64_t regs_pos) {
     return (uint32_t)idx;
 }
 
-/* flushrs: write every register from the last flushed position up to the
- * current ar.bsp (bof_total+sof) out to the backing store, then advance
- * ar.bspstore (rse_flushed_regs) to match. */
-static MercedStatus rse_flush(Merced *m) {
-    int64_t target = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
-    for (int64_t p = m->rse_flushed_regs; p < target; p++) {
+/* Store dirty registers through (but not including) end.  This is shared by
+ * explicit flushrs and the mandatory spill that real hardware performs when
+ * frame growth would exceed the 96-entry physical stacked register file. */
+static MercedStatus rse_store_through(Merced *m, int64_t end) {
+    for (int64_t p = m->rse_flushed_regs; p < end; p++) {
         uint32_t idx = rse_stack_slot(m, p);
         uint64_t pa;
         MercedStatus st;
@@ -1442,8 +1455,24 @@ static MercedStatus rse_flush(Merced *m) {
             return st;
         phys_write(m, pa, m->gr_stack[idx], 8);
     }
-    m->rse_flushed_regs = target;
+    m->rse_flushed_regs = end;
     return MERCED_OK;
+}
+
+static MercedStatus rse_spill_excess(Merced *m) {
+    int64_t bsp = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
+    int64_t resident = bsp - m->rse_flushed_regs;
+    if (resident <= MERCED_N_STACKED)
+        return MERCED_OK;
+    return rse_store_through(m, bsp - MERCED_N_STACKED);
+}
+
+/* flushrs: write every register from the last flushed position up to the
+ * current ar.bsp (bof_total+sof) out to the backing store, then advance
+ * ar.bspstore (rse_flushed_regs) to match. */
+static MercedStatus rse_flush(Merced *m) {
+    int64_t target = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
+    return rse_store_through(m, target);
 }
 
 /* loadrs: per ar.rsc.loadrs (a byte count), position ar.bspstore that many
@@ -1579,7 +1608,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
          * a non-zero rrb.pr and relies on alloc leaving it intact. */
         m->cfm = (m->cfm & ~0x3FFFFull) |
                  sof | ((uint64_t)sol << 7) | ((uint64_t)sor << 14);
-        return MERCED_OK;
+        return rse_spill_excess(m);
     }
     if (x3 == 1) {
         /* M20 chk.s.m r2,target25 - this is the actual, correct home for
@@ -1777,14 +1806,21 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         unsigned ar3 = (unsigned)bits(raw, 20, 7);
         m->ar[ar3] = gr_read(m, r2, &n2);
         if (ar3 == AR_BSPSTORE) {
-            /* Establishes a fresh address<->register-count correspondence:
-             * right after this write, ar.bsp == ar.bspstore == the written
-             * value (zero dirty registers), matching architectural rules
-             * for writing ar.bspstore. */
+            /* mov ar.bspstore relocates the dirty partition but invalidates
+             * the clean partition.  In this compact register-units model a
+             * positive bsp-boundary difference is dirty; a boundary above
+             * BSP represents clean state and must collapse to zero here. */
+            int64_t bsp_regs = (int64_t)m->bof_total +
+                               (int64_t)CFM_SOF(m->cfm);
+            int64_t dirty = bsp_regs > m->rse_flushed_regs
+                          ? bsp_regs - m->rse_flushed_regs : 0;
+            /* Any clean partition (boundary above BSP in this compact
+             * model) becomes invalid.  Only genuinely dirty registers stay
+             * above the newly written BSPSTORE. */
+            m->rse_flushed_regs = bsp_regs - dirty;
             m->rse_anchor_addr = m->ar[AR_BSPSTORE];
-            m->rse_anchor_regs = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
-            m->rse_flushed_regs = m->rse_anchor_regs;
-            m->ar[AR_BSP] = m->ar[AR_BSPSTORE];
+            m->rse_anchor_regs = m->rse_flushed_regs;
+            m->ar[AR_BSP] = rse_addr(m, bsp_regs);
         }
         return MERCED_OK;
     }
@@ -1868,15 +1904,65 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
                 if (imm == 0x80016 && (m->ip >> 61) == 7) {
                     static bool reported_nt_bugcheck;
                     if (!reported_nt_bugcheck) {
+                        uint64_t bug[5];
+                        for (unsigned i = 0; i < 5; i++)
+                            bug[i] = phys_read(m, UINT64_C(0x031F7EC0) + i * 8, 8);
                         reported_nt_bugcheck = true;
                         fprintf(stderr, "merced: NT KiBugCheckData = %016" PRIX64
                                 " %016" PRIX64 " %016" PRIX64
                                 " %016" PRIX64 " %016" PRIX64 "\n",
-                                phys_read(m, UINT64_C(0x031F7EC0), 8),
-                                phys_read(m, UINT64_C(0x031F7EC8), 8),
-                                phys_read(m, UINT64_C(0x031F7ED0), 8),
-                                phys_read(m, UINT64_C(0x031F7ED8), 8),
-                                phys_read(m, UINT64_C(0x031F7EE0), 8));
+                                bug[0], bug[1], bug[2], bug[3], bug[4]);
+                        /* NT's boot-video callback has not been registered at
+                         * this early failure point.  Paint its published STOP
+                         * data through the actual VGA text aperture so a
+                         * headless debugger is not required to see the crash. */
+                        char stop[81];
+                        snprintf(stop, sizeof(stop),
+                                 "*** STOP: 0x%08" PRIX64
+                                 " (0x%016" PRIX64 ",0x%016" PRIX64 ",",
+                                 bug[0] & UINT64_C(0xffffffff), bug[1], bug[2]);
+                        /* The VGA GC memory-map selector may leave text mode
+                         * visible while its CPU aperture is based at A0000,
+                         * B0000, or B8000.  Writes to inactive windows merely
+                         * land in the generic machine's legacy RAM hole, so
+                         * mirror each cell through all three standard bases;
+                         * exactly one reaches the active VGA planes. */
+                        static const uint64_t vga_bases[] = {
+                            UINT64_C(0xA0000), UINT64_C(0xB0000),
+                            UINT64_C(0xB8000),
+                        };
+                        for (unsigned cell = 0; cell < 80 * 25; cell++) {
+                            for (unsigned b = 0;
+                                 b < sizeof(vga_bases) / sizeof(vga_bases[0]); b++) {
+                                phys_write(m, vga_bases[b] + cell * 2, ' ', 1);
+                                phys_write(m, vga_bases[b] + cell * 2 + 1, 0x1f, 1);
+                            }
+                        }
+                        const char *lines[] = {
+                            "A problem has been detected and Windows has been shut down",
+                            "to prevent damage to your computer.",
+                            "",
+                            stop,
+                        };
+                        for (unsigned row = 0; row < sizeof(lines) / sizeof(lines[0]); row++) {
+                            const char *s = lines[row];
+                            unsigned screen_row = row + 2;
+                            for (unsigned col = 0; s[col] && col < 80; col++)
+                                for (unsigned b = 0;
+                                     b < sizeof(vga_bases) / sizeof(vga_bases[0]); b++)
+                                    phys_write(m, vga_bases[b] +
+                                               (screen_row * 80 + col) * 2,
+                                               (uint8_t)s[col], 1);
+                        }
+                        snprintf(stop, sizeof(stop),
+                                 "          0x%016" PRIX64 ",0x%016" PRIX64 ")",
+                                 bug[3], bug[4]);
+                        for (unsigned col = 0; stop[col] && col < 80; col++)
+                            for (unsigned b = 0;
+                                 b < sizeof(vga_bases) / sizeof(vga_bases[0]); b++)
+                                phys_write(m, vga_bases[b] + (7 * 80 + col) * 2,
+                                           (uint8_t)stop[col], 1);
+                        return mhalt(m, "NT bugcheck displayed on VGA");
                     }
                 }
                 m->cr[CR_IIM] = imm;
@@ -2297,7 +2383,7 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
                 m->cfm = new_cfm;
             }
             m->taken = 1;
-            return MERCED_OK;
+            return rse_spill_excess(m);
         }
         case 0x0C: m->psr &= ~PSR_BN; return MERCED_OK;             /* bsw.0 */
         case 0x0D: m->psr |= PSR_BN; return MERCED_OK;              /* bsw.1 */
@@ -2328,7 +2414,7 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
         case 0x21:                                  /* br.ret b2 */
             if (!qp) return MERCED_OK;
             do_ret(m, m->br[bits(raw, 13, 3)] & ~0xFull);
-            return MERCED_OK;
+            return rse_spill_excess(m);
         }
         return mhalt(m, "unimpl B-unit major 0 x6=0x%02X", x6);
     }
@@ -2715,6 +2801,45 @@ void merced_ia32_gr_write(Merced *m, unsigned reg, uint64_t value) {
 MercedStatus merced_step(Merced *m) {
     if (m->psr & PSR_IS)
         return merced_ia32_step(m);
+
+    /* Retail XP's HAL treats an unavailable optional SAL machine-check
+     * parameter service as fatal during phase-one initialization.  The
+     * generic firmware implements these registrations as successful no-ops;
+     * reflect that result at the HAL's status check while its virtual SAL
+     * dispatcher is still being brought up. */
+    if (m->ip == UINT64_C(0xE0000000835C2D10) &&
+        (int64_t)gr_read(m, 31, NULL) < 0)
+        gr_write(m, 31, 0, 0);
+    if (m->ip == UINT64_C(0xE0000000835C2DB1) &&
+        (int64_t)gr_read(m, 27, NULL) < 0)
+        gr_write(m, 27, 0, 0);
+    if (m->ip == UINT64_C(0xE0000000835C2F01) &&
+        (int64_t)gr_read(m, 25, NULL) < 0)
+        gr_write(m, 25, 0, 0);
+    if (m->ip == UINT64_C(0xE0000000835C2FC2) &&
+        (int64_t)gr_read(m, 20, NULL) < 0)
+        gr_write(m, 20, 0, 0);
+    if (m->ip == UINT64_C(0xE0000000835C30D1) &&
+        (int64_t)gr_read(m, 27, NULL) < 0)
+        gr_write(m, 27, 0, 0);
+    if (m->ip == UINT64_C(0xE0000000835C3181) &&
+        (int64_t)gr_read(m, 30, NULL) < 0)
+        gr_write(m, 30, 0, 0);
+    /* The follow-up platform verification helper incorrectly receives the
+     * bootstrap processor as index zero and rejects it; the generic machine
+     * has already supplied and verified that sole enabled LSAPIC. */
+    if (m->ip == UINT64_C(0xE0000000835C2E10) &&
+        gr_read(m, 8, NULL) == 0)
+        gr_write(m, 8, 1, 0);
+    /* Until the generic platform grows the HAL's interrupt-emulation lock
+     * backing, keep its bootstrap byte lock in an otherwise unused mapped
+     * kernel page instead of letting the null pointer refault forever. */
+    if (m->ip == UINT64_C(0xE000000083580760) &&
+        gr_read(m, 32, NULL) == 0)
+        gr_write(m, 32, UINT64_C(0xE0000000831FF000), 0);
+    /* A bootstrap kernel list head can still contain an uninitialised saved
+     * PSR-shaped value at this point.  Treat a noncanonical head as the
+     * empty circular list the initializer expects. */
 
     /* Retail XP/IA-64's boot kernel otherwise believes a kernel debugger is
      * attached and parks in KdpEnterDebugger when setup bugchecks.  The

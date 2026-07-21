@@ -76,6 +76,14 @@
 #define GENERIC_VGA_IO_BASE   0x00000000C0000000ull
 #define GENERIC_VGA_IO_SIZE   0x30u                    /* ports 3B0h-3DFh */
 
+/* Minimal Intel 82093-style I/O SAPIC.  IA-64 Windows requires one during
+ * HAL phase one even before any routed PCI interrupt is enabled. */
+#define GENERIC_IOSAPIC_BASE  0x0000000080110000ull
+#define GENERIC_IOSAPIC_SIZE  0x100u
+#define GENERIC_ACPI_PM_BASE   0x0000000080112000ull
+#define GENERIC_ACPI_PM_SIZE   0x10u
+#define GENERIC_LEGACY_IO_BASE 0x000000800010000000ull
+
 /* Keyboard controller: two byte registers.
  *   +0x0  STATUS (read-only)  bit 0 = a key code is waiting
  *   +0x4  DATA   (read-only)  pop the next key code (0 if none waiting);
