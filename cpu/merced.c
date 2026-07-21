@@ -374,7 +374,14 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
      * keeps executing through the top-of-4-GiB alias after SAL enables
      * translation, with only its RAM-shadow ranges in the visible TRs.
      * Model that as a fixed ifetch window straight to the ROM PA. */
-    if (ifetch && va >= 0xFFC00000ull && va <= 0xFFFFFFFFull) {
+    if (ifetch && ((va >= 0xFFC00000ull && va <= 0xFFFFFFFFull) ||
+                   /* The generic EFI loader executes its final low-RAM
+                    * transition trampoline with psr.it enabled before NT
+                    * owns cr.iva or has installed a software TLB-miss
+                    * handler.  Keep the same bootstrap identity window for
+                    * instruction fetches that generic firmware already
+                    * supplies for data references. */
+                   (va >= 0x400000ull && va < 0x10000000ull))) {
         *pa = va & MERCED_PHYS_MASK;
         return true;
     }

@@ -653,6 +653,21 @@ static void generic_custom_cmd(Ia64GenericState *s) {
         }
         return;
     }
+    if (txt && strncmp(txt, "vgapeek ", 8) == 0) {
+        unsigned plane;
+        unsigned off;
+        unsigned count;
+        if (sscanf(txt + 8, "%u %x %u", &plane, &off, &count) == 3 &&
+            plane < 4 && count <= 256) {
+            printf("vgapeek plane=%u off=0x%x:", plane, off);
+            for (unsigned i = 0; i < count; i++)
+                printf(" %02x", s->vga.vram[plane][off + i]);
+            printf("\n");
+        } else {
+            printf("usage: vgapeek <plane 0-3> <hex offset> <count>\n");
+        }
+        return;
+    }
     gemu_monitor_unknown_command(s->monitor);
 }
 
