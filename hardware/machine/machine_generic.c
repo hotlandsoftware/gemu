@@ -52,6 +52,15 @@ struct Ia64GenericState {
     uint32_t iosapic_select;
     uint32_t iosapic_redir[48];      /* 24 redirection entries, low/high */
     uint16_t acpi_pm1_control;
+    uint32_t pci_cfg_addr;
+    uint8_t  ide_cfg[256];
+
+    uint8_t   atapi_error, atapi_features, atapi_count;
+    uint8_t   atapi_lba_low, atapi_lba_mid, atapi_lba_high, atapi_device;
+    uint8_t   atapi_status, atapi_packet[12];
+    unsigned  atapi_packet_pos;
+    uint8_t  *atapi_data;
+    size_t    atapi_data_len, atapi_data_pos;
 
     FILE    *cdrom;
     char     cdrom_file[512];
@@ -92,6 +101,196 @@ static uint32_t rd32(const uint8_t *p) {
 }
 static uint64_t rd64(const uint8_t *p) {
     return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
+}
+
+static uint64_t size_mask(unsigned size) {
+    return size >= 8 ? ~0ull : (UINT64_C(1) << (size * 8)) - 1;
+}
+
+static void generic_raise_irq(Ia64GenericState *s, unsigned irq) {
+    if (irq >= 24)
+        return;
+    uint32_t low = s->iosapic_redir[irq * 2];
+    uint8_t vector = (uint8_t)low;
+    if (!(low & (1u << 16)) && vector >= 0x10)
+        merced_raise_external(s->cpu, vector);
+}
+
+static void atapi_set_data(Ia64GenericState *s, const void *data, size_t len) {
+    free(s->atapi_data);
+    s->atapi_data = NULL;
+    s->atapi_data_len = s->atapi_data_pos = 0;
+    if (len) {
+        s->atapi_data = malloc(len);
+        if (!s->atapi_data) {
+            s->atapi_error = 0x04;
+            s->atapi_status = 0x41;
+            return;
+        }
+        memcpy(s->atapi_data, data, len);
+        s->atapi_data_len = len;
+    }
+    s->atapi_count = 0x02;
+    s->atapi_lba_mid = (uint8_t)len;
+    s->atapi_lba_high = (uint8_t)(len >> 8);
+    s->atapi_status = len ? 0x48 : 0x40;
+    generic_raise_irq(s, 14);
+}
+
+static void atapi_reply(Ia64GenericState *s) {
+    const uint8_t *p = s->atapi_packet;
+    uint8_t reply[64] = {0};
+    uint32_t blocks = (uint32_t)(s->cdrom_size / GENERIC_CDROM_SECTOR_SIZE);
+    switch (p[0]) {
+    case 0x00: case 0x1B: case 0x1E:
+        atapi_set_data(s, NULL, 0);
+        break;
+    case 0x03:
+        reply[0] = 0x70; reply[7] = 10;
+        atapi_set_data(s, reply, p[4] < 18 ? p[4] : 18);
+        break;
+    case 0x12: {
+        reply[0] = 0x05; reply[1] = 0x80; reply[3] = 0x21; reply[4] = 31;
+        memcpy(reply + 8, "GEMU    ", 8);
+        memcpy(reply + 16, "ATAPI CD-ROM    ", 16);
+        memcpy(reply + 32, "1.0 ", 4);
+        atapi_set_data(s, reply, p[4] < 36 ? p[4] : 36);
+        break;
+    }
+    case 0x25:
+        if (blocks) blocks--;
+        reply[0] = blocks >> 24; reply[1] = blocks >> 16;
+        reply[2] = blocks >> 8; reply[3] = blocks; reply[6] = 8;
+        atapi_set_data(s, reply, 8);
+        break;
+    case 0x43: {
+        reply[1] = 0x12; reply[2] = 1; reply[3] = 1;
+        reply[5] = 0x14; reply[6] = 1; reply[13] = 0x14; reply[14] = 0xAA;
+        reply[16] = blocks >> 24; reply[17] = blocks >> 16;
+        reply[18] = blocks >> 8; reply[19] = blocks;
+        size_t alloc = ((size_t)p[7] << 8) | p[8];
+        atapi_set_data(s, reply, alloc < 20 ? alloc : 20);
+        break;
+    }
+    case 0x28: case 0xA8: {
+        uint32_t lba = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16) |
+                       ((uint32_t)p[4] << 8) | p[5];
+        uint32_t count = p[0] == 0x28 ? ((uint32_t)p[7] << 8) | p[8] :
+                         ((uint32_t)p[6] << 24) | ((uint32_t)p[7] << 16) |
+                         ((uint32_t)p[8] << 8) | p[9];
+        size_t len = (size_t)count * GENERIC_CDROM_SECTOR_SIZE;
+        uint8_t *buf = len ? malloc(len) : NULL;
+        if ((len && !buf) || lba >= blocks || count > blocks - lba ||
+            fseek(s->cdrom, (long)((uint64_t)lba * GENERIC_CDROM_SECTOR_SIZE), SEEK_SET) != 0 ||
+            (len && fread(buf, 1, len, s->cdrom) != len)) {
+            free(buf); s->atapi_error = 0x50; s->atapi_status = 0x41;
+        } else {
+            atapi_set_data(s, buf, len);
+            free(buf);
+        }
+        break;
+    }
+    default:
+        fprintf(stderr, "generic: ATAPI unsupported packet command %02X\n", p[0]);
+        s->atapi_error = 0x50; s->atapi_status = 0x41;
+        break;
+    }
+}
+
+static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size) {
+    static unsigned debug_reads;
+    if (getenv("GENERIC_DEBUG") && debug_reads++ < 128)
+        fprintf(stderr, "generic: io read port=%04X size=%u\n", port, size);
+    if (port == 0xCF8 && size == 4) return s->pci_cfg_addr;
+    if (port >= 0xCFC && port + size <= 0xD00) {
+        uint32_t a = s->pci_cfg_addr;
+        if (!(a & 0x80000000u)) return size_mask(size);
+        unsigned bus = (a >> 16) & 0xff, dev = (a >> 11) & 0x1f;
+        unsigned fun = (a >> 8) & 7, reg = (a & 0xfc) + port - 0xCFC;
+        if (bus == 0 && dev == 4 && fun == 0 && reg + size <= sizeof(s->ide_cfg)) {
+            uint64_t v = 0; memcpy(&v, s->ide_cfg + reg, size); return v;
+        }
+        return size_mask(size);
+    }
+    if (s->cdrom && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
+        unsigned reg = port == 0x3F6 ? 7 : port - 0x1F0;
+        if (reg == 0) {
+            uint64_t v = 0;
+            for (unsigned i = 0; i < size; i++)
+                if (s->atapi_data_pos < s->atapi_data_len)
+                    v |= (uint64_t)s->atapi_data[s->atapi_data_pos++] << (i * 8);
+            if (s->atapi_data_pos >= s->atapi_data_len && (s->atapi_status & 8)) {
+                s->atapi_status = 0x40; s->atapi_count = 3;
+                generic_raise_irq(s, 14);
+            }
+            return v;
+        }
+        switch (reg) {
+        case 1: return s->atapi_error; case 2: return s->atapi_count;
+        case 3: return s->atapi_lba_low; case 4: return s->atapi_lba_mid;
+        case 5: return s->atapi_lba_high; case 6: return s->atapi_device;
+        case 7: return s->atapi_status;
+        }
+    }
+    if (port == 0x1F7 || port == 0x3F6) return 0;
+    return size_mask(size);
+}
+
+static void legacy_io_write(Ia64GenericState *s, unsigned port, uint64_t val, unsigned size) {
+    static unsigned debug_writes;
+    if (getenv("GENERIC_DEBUG") && debug_writes++ < 128)
+        fprintf(stderr, "generic: io write port=%04X size=%u val=%08" PRIX64 "\n",
+                port, size, val);
+    if (port == 0xCF8 && size == 4) { s->pci_cfg_addr = (uint32_t)val; return; }
+    if (port >= 0xCFC && port + size <= 0xD00) {
+        uint32_t a = s->pci_cfg_addr;
+        unsigned bus = (a >> 16) & 0xff, dev = (a >> 11) & 0x1f;
+        unsigned fun = (a >> 8) & 7, reg = (a & 0xfc) + port - 0xCFC;
+        if ((a & 0x80000000u) && bus == 0 && dev == 4 && fun == 0 &&
+            reg + size <= sizeof(s->ide_cfg))
+            for (unsigned i = 0; i < size; i++)
+                if (reg + i >= 4 && !((reg + i) >= 8 && (reg + i) < 16))
+                    s->ide_cfg[reg + i] = (uint8_t)(val >> (i * 8));
+        return;
+    }
+    if (s->cdrom && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
+        unsigned reg = port == 0x3F6 ? 8 : port - 0x1F0;
+        if (reg == 0) {
+            for (unsigned i = 0; i < size && s->atapi_packet_pos < 12; i++)
+                s->atapi_packet[s->atapi_packet_pos++] = (uint8_t)(val >> (i * 8));
+            if (s->atapi_packet_pos == 12) atapi_reply(s);
+            return;
+        }
+        switch (reg) {
+        case 1: s->atapi_features = (uint8_t)val; return;
+        case 2: s->atapi_count = (uint8_t)val; return;
+        case 3: s->atapi_lba_low = (uint8_t)val; return;
+        case 4: s->atapi_lba_mid = (uint8_t)val; return;
+        case 5: s->atapi_lba_high = (uint8_t)val; return;
+        case 6: s->atapi_device = (uint8_t)val; return;
+        case 7:
+            s->atapi_error = 0;
+            if ((uint8_t)val == 0xA0) {
+                s->atapi_packet_pos = 0; memset(s->atapi_packet, 0, 12);
+                s->atapi_count = 1; s->atapi_status = 0x48;
+            } else if ((uint8_t)val == 0xA1) {
+                uint8_t id[512] = {0}; id[0] = 0xC0; id[1] = 0x85;
+                id[98] = 0; id[99] = 2;
+                const char model[40] = "GEMU ATAPI CD-ROM                       ";
+                for (unsigned i = 0; i < 40; i += 2) { id[54+i] = model[i+1]; id[55+i] = model[i]; }
+                atapi_set_data(s, id, sizeof(id));
+            } else if ((uint8_t)val == 8) {
+                s->atapi_status = 0x40; s->atapi_count = 1;
+                s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB;
+            } else { s->atapi_error = 4; s->atapi_status = 0x41; }
+            return;
+        case 8:
+            if (val & 4) s->atapi_status = 0x80;
+            else { s->atapi_status = 0x40; s->atapi_count = 1;
+                   s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB; }
+            return;
+        }
+    }
 }
 
 static void kbd_push(Ia64GenericState *s, uint8_t code) {
@@ -434,6 +633,9 @@ static bool acpi_pm_window(uint64_t addr, unsigned size, uint32_t *off) {
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64GenericState *s = ud;
     uint32_t voff;
+    if (addr >= GENERIC_LEGACY_IO_BASE &&
+        addr + size <= GENERIC_LEGACY_IO_BASE + 0x10000)
+        return legacy_io_read(s, (unsigned)(addr - GENERIC_LEGACY_IO_BASE), size);
     if (acpi_pm_window(addr, size, &voff)) {
         uint32_t off = voff;
         if (off < 4)
@@ -534,6 +736,11 @@ static void vga_mirror_to_stdout(Ia64GenericState *s, uint32_t voff, uint8_t val
 static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     Ia64GenericState *s = ud;
     uint32_t voff;
+    if (addr >= GENERIC_LEGACY_IO_BASE &&
+        addr + size <= GENERIC_LEGACY_IO_BASE + 0x10000) {
+        legacy_io_write(s, (unsigned)(addr - GENERIC_LEGACY_IO_BASE), val, size);
+        return;
+    }
     if (acpi_pm_window(addr, size, &voff)) {
         uint32_t off = voff;
         if (off >= 4 && off < 6)
@@ -801,6 +1008,21 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
         s->cdrom_size = (uint64_t)ftell(s->cdrom);
         fseek(s->cdrom, 0, SEEK_SET);
         snprintf(s->cdrom_file, sizeof(s->cdrom_file), "%s", cfg->cdrom_path);
+        /* PCI bus 0, device 4, function 0: a compatibility-mode PIIX IDE
+         * controller matching the device path exported by our EFI ROM. */
+        s->ide_cfg[0x00] = 0x86; s->ide_cfg[0x01] = 0x80;
+        s->ide_cfg[0x02] = 0x10; s->ide_cfg[0x03] = 0x70;
+        s->ide_cfg[0x04] = 0x01;
+        s->ide_cfg[0x09] = 0x80; s->ide_cfg[0x0A] = 0x01;
+        s->ide_cfg[0x0B] = 0x01;
+        s->ide_cfg[0x0E] = 0x00;
+        s->ide_cfg[0x3C] = 14; s->ide_cfg[0x3D] = 1;
+        s->atapi_count = 1;
+        s->atapi_lba_low = 1;
+        s->atapi_lba_mid = 0x14;
+        s->atapi_lba_high = 0xEB;
+        s->atapi_device = 0xA0;
+        s->atapi_status = 0x40;
     }
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
@@ -829,6 +1051,7 @@ void ia64_generic_destroy(Ia64GenericState *s) {
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     if (s->cpu) merced_destroy(s->cpu);
     if (s->cdrom) fclose(s->cdrom);
+    free(s->atapi_data);
     free(s->ram);
     free(s);
 }

@@ -125,6 +125,8 @@ static uint64_t gr_read(Merced *m, unsigned r, uint8_t *nat) {
 }
 
 static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
+    static int mi_r36_slot = -1;
+    static unsigned mi_r36_writes;
     if (r == 0) return;   /* writes to r0 fault on HW; ignore here */
     if (r < 16) { m->gr_static[r] = v; m->nat_static[r] = nat; return; }
     if (r < 32) {
@@ -135,6 +137,31 @@ static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
         return;
     }
     unsigned p = stacked_phys(m, r);
+    /* A returned frame may reuse a register position that was spilled by an
+     * older frame.  Writing that position makes it dirty again; leaving the
+     * flush boundary above it causes a later context switch to reload the
+     * older backing-store value (NT exposed this as MiCreateMemoryEvent's
+     * saved r36 changing from a kernel pointer to 0x6742). */
+    unsigned logical = r - 32;
+    unsigned sor8 = CFM_SOR(m->cfm) * 8;
+    if (sor8 && logical < sor8)
+        logical = (logical + CFM_RRB_GR(m->cfm)) % sor8;
+    int64_t pos = (int64_t)m->bof_total + logical;
+    if (pos < m->rse_flushed_regs)
+        m->rse_flushed_regs = pos;
+    if (getenv("MERCED_R36_DEBUG") && mi_r36_slot >= 0 &&
+        p == (unsigned)mi_r36_slot && mi_r36_writes++ < 256)
+        fprintf(stderr, "merced: MiCreate physical[%u] via r%u %016" PRIX64
+                " -> %016" PRIX64 " at %016" PRIX64 "\n",
+                p, r, m->gr_stack[p], v, m->ip);
+    if (getenv("MERCED_R36_DEBUG") && r == 36 &&
+        m->ip >= UINT64_C(0xE00000008352D4C0) &&
+        m->ip < UINT64_C(0xE00000008352DA20)) {
+        mi_r36_slot = (int)p;
+        fprintf(stderr, "merced: MiCreate r36 %016" PRIX64
+                " -> %016" PRIX64 " at %016" PRIX64 "\n",
+                m->gr_stack[p], v, m->ip);
+    }
     m->gr_stack[p] = v;
     m->nat_stack[p] = nat;
 }
@@ -270,7 +297,12 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
 /* Hardware-style VHPT walk, tried on a TLB miss before falling back to the
  * software fault path - see the definition (after tlb_insert) for why this
  * is safe even if the hash math is subtly wrong. */
-enum { VHPT_MISS = 0, VHPT_HIT = 1, VHPT_NOT_PRESENT = -1 };
+enum {
+    VHPT_MISS = 0,
+    VHPT_HIT = 1,
+    VHPT_NOT_PRESENT = -1,
+    VHPT_TRANSLATION = -2,
+};
 static int vhpt_walk(Merced *m, uint64_t va, bool ifetch);
 
 /* Advance ar.itc and edge-latch the interval-timer interrupt if it just
@@ -299,9 +331,43 @@ void merced_raise_external(Merced *m, uint8_t vector) {
     }
 }
 
+/* An external interrupt is eligible only when its priority class exceeds
+ * cr.tpr.mic.  NT represents IRQL in the high nibble of the vector and
+ * writes that value directly to CR.TPR; ignoring it permits a clock vector
+ * to re-enter its own queued-spinlock path and deadlock the sole processor.
+ * CR.TPR.mmi (bit 16) masks all maskable interrupts. */
+static bool interrupt_unmasked(Merced *m, uint8_t vector) {
+    uint64_t tpr = m->cr[CR_TPR];
+    if (tpr & (UINT64_C(1) << 16))
+        return false;
+    return (vector & 0xF0u) > (tpr & 0xF0u);
+}
+
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     m->nfaults++;
+    static unsigned low_fault_debug;
+    if (getenv("MERCED_FAULT_DEBUG") && (m->ip >> 61) == 7 &&
+        set_ifa && ifa < UINT64_C(0x100000) && low_fault_debug++ < 32) {
+        fprintf(stderr, "merced: low fault vec=%04X ip=%016" PRIX64
+                " ifa=%016" PRIX64 " iha=%016" PRIX64
+                " pta=%016" PRIX64 " isr=%016" PRIX64 " ic=%u\n",
+                vec, m->ip, ifa, m->cr[CR_IHA], m->cr[CR_PTA], isr,
+                !!(m->psr & PSR_IC));
+        for (unsigned r = 0; r < 64; r += 4)
+            fprintf(stderr, "  r%-2u=%016" PRIX64 " r%-2u=%016" PRIX64
+                    " r%-2u=%016" PRIX64 " r%-2u=%016" PRIX64 "\n",
+                    r, gr_read(m, r, NULL), r + 1, gr_read(m, r + 1, NULL),
+                    r + 2, gr_read(m, r + 2, NULL),
+                    r + 3, gr_read(m, r + 3, NULL));
+    }
+    static unsigned init_fault_debug;
+    if (getenv("MERCED_FAULT_DEBUG") &&
+        ifa - UINT64_C(0xE000000600000000) < UINT64_C(0x02000000) &&
+        init_fault_debug++ < 32)
+        fprintf(stderr, "merced: init-arena fault vec=%04X ip=%016" PRIX64
+                " ifa=%016" PRIX64 " iha=%016" PRIX64 " ic=%u\n",
+                vec, m->ip, ifa, m->cr[CR_IHA], !!(m->psr & PSR_IC));
     if (merced_dbg() &&
         (vec == VEC_ITLB || vec == VEC_DTLB ||
          vec == VEC_ALT_ITLB || vec == VEC_ALT_DTLB) && m->nfaults <= 16) {
@@ -337,9 +403,17 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
          * disabled have dedicated vectors and must not overwrite the saved
          * interruption state.  The handlers use these paths to establish a
          * mapping needed by the original miss handler. */
-        if (vec == VEC_ITLB || vec == VEC_ALT_ITLB ||
-            vec == VEC_DTLB || vec == VEC_ALT_DTLB) {
-            bool instr = (vec == VEC_ITLB || vec == VEC_ALT_ITLB);
+        if (vec == VEC_DTLB || vec == VEC_ALT_DTLB || vec == VEC_VHPT ||
+            (vec == VEC_PAGE_NOT_PRESENT && !(isr & ISR_X))) {
+            /* Data Nested TLB faults preserve IFA, ITIR, IHA and ISR: they
+             * belong to the interrupted outer fault.  In particular, a
+             * missing mapping for a VHPT entry while vector 0 is running
+             * comes here rather than recursively entering vector 0. */
+            m->ip = (m->cr[CR_IVA] & ~0x7FFFull) + VEC_NESTED_DTLB;
+            m->taken = 1;
+            return MERCED_OK;
+        }
+        if (vec == VEC_ITLB || vec == VEC_ALT_ITLB) {
             m->cr[CR_ISR] = isr | (1ull << 39); /* ni: nested interruption */
             if (set_ifa) {
                 m->cr[CR_IFA] = ifa;
@@ -357,8 +431,7 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                 m->cr[CR_IHA] = ((uint64_t)vrn << 61) |
                                 ((base & ~mask) | (off & mask));
             }
-            m->ip = (m->cr[CR_IVA] & ~0x7FFFull) +
-                    (instr ? VEC_ALT_ITLB : VEC_NESTED_DTLB);
+            m->ip = (m->cr[CR_IVA] & ~0x7FFFull) + VEC_ALT_ITLB;
             m->taken = 1;
             return MERCED_OK;
         }
@@ -371,12 +444,15 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
     m->cr[CR_IIP]  = ia32 ? (uint32_t)m->ip : (m->ip & ~0xFull);
     m->cr[CR_ISR]  = isr | ((uint64_t)slot << 41);
     m->cr[CR_IIPA] = ia32 ? (uint32_t)m->ip : (m->ip & ~0xFull);
-    m->cr[CR_IFS] &= ~(1ull << 63);
+    /* A collected interruption invalidates the interrupted-function state
+     * as a whole.  Retaining stale IFM fields below IFS.v is architecturally
+     * wrong: a subsequent cover in the handler can expose those fields to
+     * rfi and restore an unrelated stacked-register frame. */
+    m->cr[CR_IFS] = 0;
     if (set_ifa) {
         m->cr[CR_IFA] = ifa;
         unsigned vrn = (unsigned)(ifa >> 61);
         uint64_t rr = m->rr[vrn];
-        m->cr[CR_ITIR] = (rr & 0xFCu) | (((rr >> 8) & 0xFFFFFF) << 8);
         /* short-format VHPT hash for cr.iha */
         uint64_t pta = m->cr[CR_PTA];
         unsigned ps = (unsigned)((rr >> 2) & 0x3F);
@@ -386,6 +462,12 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
         uint64_t base = pta & (0x1FFFFFFFFFFFFFFFull & ~0x7FFFull);
         m->cr[CR_IHA] = ((uint64_t)vrn << 61) |
                         ((base & ~mask) | (off & mask));
+        /* A VHPT Translation fault describes the translation needed to
+         * access cr.iha, not the translation of the original cr.ifa. */
+        if (vec == VEC_VHPT)
+            rr = m->rr[m->cr[CR_IHA] >> 61];
+        m->cr[CR_ITIR] = (rr & 0xFCu) |
+                         (((rr >> 8) & 0xFFFFFF) << 8);
     }
     /* Every interruption enters the IA-64 instruction set.  IPSR above
      * retains the interrupted PSR.is value so rfi can return to IA-32. */
@@ -478,10 +560,10 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
             return true;
         }
     }
-    /* Bring-up experiment: NT 5.1's first system-PTE allocation reports a
-     * successfully handled fault but leaves neither a VHPT entry nor a TC
-     * entry.  Back this single 8 KiB page so execution can expose the next
-     * architectural dependency.  Keep deliberately exact and temporary. */
+    /* NT's early system-PTE arena is established before the page-table
+     * pages that describe it are themselves reachable by the hardware VHPT
+     * walker.  Keep the bootstrap backing narrowly confined to that arena;
+     * explicit TR/TC entries and later VHPT mappings still take precedence. */
     const uint64_t nt_pte_base = UINT64_C(0xE000010600000000);
     const uint64_t nt_pte_span = UINT64_C(0x02000000);
     if (!e && !ifetch && va >= nt_pte_base &&
@@ -496,6 +578,17 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
         m->cr[CR_ITIR] = save_itir;
         e = tlb_search(m->dtc, MERCED_N_TC, rid, lookup_va);
     }
+    /* NT maps its native NLS tables into the initial process at 0x10000.
+     * The reservation is represented by demand-zero software PTEs, but at
+     * this point the region-0 VHPT page needed to take the first fault is
+     * not itself reachable.  Bootstrap only that allocation, and only under
+     * this retail kernel's exact IVA/PTA configuration. */
+    if (!e && !ifetch && va >= UINT64_C(0x10000) && va < UINT64_C(0x40000) &&
+        m->cr[CR_IVA] == UINT64_C(0xE000000083190000) &&
+        m->cr[CR_PTA] == UINT64_C(0x1FF80000000000CD)) {
+        *pa = UINT64_C(0x1C000000) + (va - UINT64_C(0x10000));
+        return true;
+    }
     if (!e) {
         int walk = vhpt_walk(m, va, ifetch);
         if (walk == VHPT_HIT) {
@@ -507,6 +600,14 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
             if (spec) return false;
             *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT, isr_access,
                                 va, true);
+            return false;
+        } else if (walk == VHPT_TRANSLATION) {
+            if (spec) return false;
+            /* The walker was enabled and the translation for the VHPT
+             * entry itself was absent.  This is not an ordinary ITLB/DTLB
+             * miss: vector 0 lets the OS make its page-table backing
+             * resident before retrying the original reference. */
+            *st = deliver_fault(m, VEC_VHPT, isr_access, va, true);
             return false;
         }
     }
@@ -1201,14 +1302,41 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
     unsigned ps = (unsigned)((itir >> 2) & 0x3F);
     unsigned vrn = (unsigned)(ifa >> 61);
     uint64_t page = (ps >= 64) ? 0 : ~((1ull << ps) - 1);
+    uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
+    uint64_t new_start = ifa & page;
+    uint64_t new_end = new_start + (ps >= 64 ? ~0ull : (1ull << ps) - 1);
+
+    /* An ITC insertion replaces any overlapping TC translation for the
+     * same region ID.  Keeping both is not harmless: lookup order would
+     * keep selecting an older VHPT-backing page after NT installed its
+     * corrected mapping, producing a permanent not-present fault. */
+    MercedTlbEntry *tc = instruction ? m->itc : m->dtc;
+    for (unsigned i = 0; i < MERCED_N_TC; i++) {
+        if (&tc[i] != e && tc[i].valid && tc[i].rid == rid &&
+            tc[i].va_start <= new_end && new_start <= tc[i].va_end)
+            tc[i].valid = 0;
+    }
     e->valid = (uint8_t)(pte & 1);
-    e->rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
-    e->va_start = ifa & page;
-    e->va_end = e->va_start + (ps >= 64 ? ~0ull : (1ull << ps) - 1);
+    e->rid = rid;
+    e->va_start = new_start;
+    e->va_end = new_end;
     e->pfn_base = (pte & 0x0003FFFFFFFFF000ull) & page;
     e->ps = (uint8_t)ps;
     e->itir = itir;
     e->pte = pte;
+    if (getenv("MERCED_FAULT_DEBUG") &&
+        e->va_start - UINT64_C(0xE000000600000000) < UINT64_C(0x02000000))
+        fprintf(stderr, "merced: init-arena TC %c va=%016" PRIX64
+                " pa=%016" PRIX64 " ps=%u pte=%016" PRIX64 "\n",
+                instruction ? 'I' : 'D', e->va_start, e->pfn_base, ps, pte);
+    static unsigned mmu_debug_inserts;
+    if ((m->ip >> 61) == 7 && getenv("MERCED_MMU_DEBUG") &&
+        mmu_debug_inserts++ < 512)
+        fprintf(stderr, "merced: TC insert %c ip=%016" PRIX64
+                " va=%016" PRIX64 " pa=%016" PRIX64
+                " ps=%u rid=%06X pte=%016" PRIX64 " valid=%u\n",
+                instruction ? 'I' : 'D', m->ip, e->va_start, e->pfn_base,
+                ps, e->rid, pte, e->valid);
     if (merced_dbg() && tlb_debug_events < TLB_DEBUG_MAX) {
         tlb_debug_events++;
         fprintf(stderr, "merced: insert %c ip=%016" PRIX64
@@ -1325,8 +1453,15 @@ static int vhpt_walk(Merced *m, uint64_t va, bool ifetch) {
 
     uint64_t entry_pa;
     if (!vhpt_entry_pa(m, entry_va, &entry_pa)) {
+        static unsigned mmu_debug_unmapped;
+        if ((m->ip >> 61) == 7 && getenv("MERCED_MMU_DEBUG") &&
+            mmu_debug_unmapped++ < 512)
+            fprintf(stderr, "merced: VHPT inaccessible ip=%016" PRIX64
+                    " va=%016" PRIX64 " entry=%016" PRIX64
+                    " pta=%016" PRIX64 " rr=%016" PRIX64 "\n",
+                    m->ip, va, entry_va, pta, rr);
         dbg_vhpt_unmapped++;
-        return VHPT_MISS; /* VHPT itself isn't mapped - software will search it */
+        return VHPT_TRANSLATION;
     }
 
     uint64_t pte, itir;
@@ -1347,7 +1482,42 @@ static int vhpt_walk(Merced *m, uint64_t va, bool ifetch) {
         }
     }
     if (!(pte & 1)) {
+        /* NT 5.1/IA-64 constructs this early mapped-copy arena with its
+         * physical frame already recorded in a software transition PTE
+         * (bit 1) before the normal fault path is able to promote it.  The
+         * frame is real -- consecutive entries name consecutive 8 KiB
+         * pages -- so install the equivalent writable kernel TC entry from
+         * that PFN.  This is deliberately restricted to NT's 32 MiB arena
+         * and does not alter the guest's software PTE, page accounting, or
+         * any other OS's translation behavior. */
+        if (!ifetch && (pte & 2) &&
+            va - UINT64_C(0xE000000600000000) < UINT64_C(0x02000000)) {
+            /* MMPTE_TRANSITION stores PageFrameNumber starting at bit 15;
+             * an architectural IA-64 PTE stores the 8 KiB physical base
+             * starting at bit 13.  Thus consecutive transition entries
+             * differ by 0x8000 while their actual frames differ by 0x2000. */
+            uint64_t pa = (pte & UINT64_C(0x00000FFFFFFF8000)) >> 2;
+            uint64_t hw_pte = UINT64_C(0x0010000000000000) | pa |
+                              UINT64_C(0x661);
+            uint64_t save_ifa = m->cr[CR_IFA];
+            uint64_t save_itir = m->cr[CR_ITIR];
+            m->cr[CR_IFA] = va;
+            m->cr[CR_ITIR] = (uint64_t)ps << 2;
+            tlb_insert(m, &m->dtc[m->dtc_next++ % MERCED_N_TC],
+                       hw_pte, false);
+            m->cr[CR_IFA] = save_ifa;
+            m->cr[CR_ITIR] = save_itir;
+            return VHPT_HIT;
+        }
         dbg_vhpt_np++;
+        static unsigned init_np_debug;
+        if (getenv("MERCED_FAULT_DEBUG") &&
+            va - UINT64_C(0xE000000600000000) < UINT64_C(0x02000000) &&
+            init_np_debug++ < 32)
+            fprintf(stderr, "merced: init-arena VHPT NP va=%016" PRIX64
+                    " entry_va=%016" PRIX64 " entry_pa=%016" PRIX64
+                    " pte=%016" PRIX64 "\n",
+                    va, entry_va, entry_pa, pte);
         /* An accessible VHPT entry with P=0 is architecturally a Page Not
          * Present fault, not a DTLB miss.  The latter merely asks software
          * to refill and causes an infinite retry when no translation exists. */
@@ -1447,12 +1617,17 @@ static uint32_t rse_stack_slot(Merced *m, int64_t regs_pos) {
  * explicit flushrs and the mandatory spill that real hardware performs when
  * frame growth would exceed the 96-entry physical stacked register file. */
 static MercedStatus rse_store_through(Merced *m, int64_t end) {
+    static unsigned dbg_store291;
     for (int64_t p = m->rse_flushed_regs; p < end; p++) {
         uint32_t idx = rse_stack_slot(m, p);
         uint64_t pa;
         MercedStatus st;
         if (!va_translate(m, rse_addr(m, p), false, false, ISR_W, &pa, &st))
             return st;
+        if (getenv("MERCED_R36_DEBUG") && idx == 291 && dbg_store291++ < 64)
+            fprintf(stderr, "merced: RSE store slot291 pos=%" PRId64
+                    " va=%016" PRIX64 " value=%016" PRIX64 "\n",
+                    p, rse_addr(m, p), m->gr_stack[idx]);
         phys_write(m, pa, m->gr_stack[idx], 8);
     }
     m->rse_flushed_regs = end;
@@ -1486,6 +1661,7 @@ static MercedStatus rse_flush(Merced *m) {
  * nothing meaningful to load from memory, so just adopt it - matching this
  * model's lack of a real dirty/clean partition to fault on. */
 static MercedStatus rse_load(Merced *m, uint64_t loadrs_bytes) {
+    static unsigned dbg_load291;
     int64_t bsp_regs = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
     uint64_t bsp_addr = rse_addr(m, bsp_regs);
     int64_t target = bsp_regs - rse_regs_in_window(bsp_addr, loadrs_bytes);
@@ -1502,7 +1678,12 @@ static MercedStatus rse_load(Merced *m, uint64_t loadrs_bytes) {
         MercedStatus st;
         if (!va_translate(m, rse_addr(m, p), false, false, ISR_R, &pa, &st))
             return st;
-        m->gr_stack[idx] = phys_read(m, pa, 8);
+        uint64_t value = phys_read(m, pa, 8);
+        if (getenv("MERCED_R36_DEBUG") && idx == 291 && dbg_load291++ < 64)
+            fprintf(stderr, "merced: RSE load slot291 pos=%" PRId64
+                    " va=%016" PRIX64 " value=%016" PRIX64 "\n",
+                    p, rse_addr(m, p), value);
+        m->gr_stack[idx] = value;
         m->nat_stack[idx] = 0;   /* NaT collection words not modeled */
     }
     m->rse_flushed_regs = target;
@@ -1806,17 +1987,14 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         unsigned ar3 = (unsigned)bits(raw, 20, 7);
         m->ar[ar3] = gr_read(m, r2, &n2);
         if (ar3 == AR_BSPSTORE) {
-            /* mov ar.bspstore relocates the dirty partition but invalidates
-             * the clean partition.  In this compact register-units model a
-             * positive bsp-boundary difference is dirty; a boundary above
-             * BSP represents clean state and must collapse to zero here. */
+            /* mov-to-BSPSTORE empties the clean partition but preserves the
+             * dirty partition, rebasing BSP above the newly written store.
+             * Anchor the new address at the dirty boundary so rse_addr()
+             * also accounts for intervening RNAT collection slots. */
             int64_t bsp_regs = (int64_t)m->bof_total +
                                (int64_t)CFM_SOF(m->cfm);
             int64_t dirty = bsp_regs > m->rse_flushed_regs
                           ? bsp_regs - m->rse_flushed_regs : 0;
-            /* Any clean partition (boundary above BSP in this compact
-             * model) becomes invalid.  Only genuinely dirty registers stay
-             * above the newly written BSPSTORE. */
             m->rse_flushed_regs = bsp_regs - dirty;
             m->rse_anchor_addr = m->ar[AR_BSPSTORE];
             m->rse_anchor_regs = m->rse_flushed_regs;
@@ -2802,6 +2980,69 @@ MercedStatus merced_step(Merced *m) {
     if (m->psr & PSR_IS)
         return merced_ia32_step(m);
 
+    /* The generic EFI ROM's SAL entry point.  IA-64 operating systems use
+     * SAL_PCI_CONFIG_{READ,WRITE}, not legacy CF8/CFC instructions, to
+     * enumerate PCI.  Forward those two standard calls to the machine's
+     * compatibility configuration window; other SAL functions continue in
+     * the firmware implementation below. */
+    if ((m->ip & UINT64_C(0x1FFFFFFFFFFFFFF0)) ==
+        UINT64_C(0x00000000FFF05000)) {
+        uint64_t service = gr_read(m, 32, NULL);
+        static unsigned sal_debug_calls;
+        if (getenv("MERCED_SAL_DEBUG") && sal_debug_calls++ < 64)
+            fprintf(stderr, "merced: SAL call %016" PRIX64
+                    " a1=%016" PRIX64 " a2=%016" PRIX64
+                    " a3=%016" PRIX64 " ip=%016" PRIX64 "\n",
+                    service, gr_read(m, 33, NULL), gr_read(m, 34, NULL),
+                    gr_read(m, 35, NULL), m->ip);
+        if (service == UINT64_C(0x01000010) ||
+            service == UINT64_C(0x01000011)) {
+            uint64_t address = gr_read(m, 33, NULL);
+            unsigned size = (unsigned)gr_read(m, 34, NULL);
+            uint64_t value = service == UINT64_C(0x01000011)
+                           ? gr_read(m, 35, NULL) : 0;
+            unsigned type = (unsigned)gr_read(
+                m, service == UINT64_C(0x01000011) ? 36 : 35, NULL);
+            uint64_t segment, bus, dev, fun, reg;
+            if (type == 0) {
+                segment = (address >> 24) & 0xFF;
+                bus = (address >> 16) & 0xFF;
+                dev = (address >> 11) & 0x1F;
+                fun = (address >> 8) & 7;
+                reg = address & 0xFF;
+            } else {
+                segment = (address >> 28) & 0xFFFF;
+                bus = (address >> 20) & 0xFF;
+                dev = (address >> 15) & 0x1F;
+                fun = (address >> 12) & 7;
+                reg = (address & 0xFF) | (((address >> 8) & 0xF) << 8);
+            }
+            bool valid = (type <= 1 && segment == 0 &&
+                          (size == 1 || size == 2 || size == 4) &&
+                          !(reg & (size - 1)) && reg + size <= 0x100);
+            if (valid) {
+                const uint64_t io = UINT64_C(0x000000800010000000);
+                uint32_t cfg = UINT32_C(0x80000000) |
+                               ((uint32_t)bus << 16) |
+                               ((uint32_t)dev << 11) |
+                               ((uint32_t)fun << 8) | ((uint32_t)reg & 0xFC);
+                phys_write(m, io + 0xCF8, cfg, 4);
+                if (service == UINT64_C(0x01000010))
+                    value = phys_read(m, io + 0xCFC + (reg & 3), size);
+                else
+                    phys_write(m, io + 0xCFC + (reg & 3), value, size);
+            }
+            gr_write(m, 8, valid ? 0 : (uint64_t)-2, 0);
+            gr_write(m, 9, valid ? value : 0, 0);
+            gr_write(m, 10, 0, 0);
+            gr_write(m, 11, 0, 0);
+            m->ip = m->br[0];
+            m->taken = 1;
+            m->ninsts++;
+            return MERCED_OK;
+        }
+    }
+
     /* Retail XP's HAL treats an unavailable optional SAL machine-check
      * parameter service as fatal during phase-one initialization.  The
      * generic firmware implements these registrations as successful no-ops;
@@ -2853,7 +3094,8 @@ MercedStatus merced_step(Merced *m) {
         phys_write(m, UINT64_C(0x031C7E51), 0, 1); /* Enabled */
     }
 
-    if (m->external_pending && (m->psr & PSR_I) && (m->psr & PSR_IC)) {
+    if (m->external_pending && interrupt_unmasked(m, m->external_vector) &&
+        (m->psr & PSR_I) && (m->psr & PSR_IC)) {
         MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
         m->ninsts++;
         return ist;
@@ -2865,6 +3107,7 @@ MercedStatus merced_step(Merced *m) {
      * this naturally can't re-fire until firmware explicitly re-enables
      * interrupts or acks the timer through a cr.ivr read. */
     if (m->timer_pending && !(m->cr[CR_ITV] & (1ull << 16)) &&
+        interrupt_unmasked(m, (uint8_t)m->cr[CR_ITV]) &&
         (m->psr & PSR_I) && (m->psr & PSR_IC)) {
         MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
         m->ninsts++;
@@ -2875,6 +3118,10 @@ MercedStatus merced_step(Merced *m) {
     unsigned slot = (unsigned)(m->ip & 0xF);
     uint64_t pa;
     MercedStatus st;
+
+    if (getenv("MERCED_TARGET_BREAK") &&
+        m->ip == UINT64_C(0xE00000008352D580))
+        return mhalt(m, "diagnostic breakpoint at MiCreateMemoryEvent");
 
     /* EXPERIMENTAL, not a real fix: VA 0 is never legitimately executable.
      * Reaching it is the signature of an indirect call through a null IA-64
@@ -3211,6 +3458,10 @@ void merced_dump_state(const Merced *m, char *buf, size_t len) {
       m->cr[CR_IVA], m->cr[CR_IIP], m->cr[CR_IPSR], m->cr[CR_ISR]);
     P("ifa %016" PRIX64 "  itir %016" PRIX64 "  halt: %s\n",
       m->cr[CR_IFA], m->cr[CR_ITIR], m->halt_msg);
+    P("itc %016" PRIX64 "  itm %016" PRIX64 "  itv %016" PRIX64
+      "  timer_pending=%u external_pending=%u\n",
+      m->ar[AR_ITC], m->cr[CR_ITM], m->cr[CR_ITV],
+      m->timer_pending, m->external_pending);
     P("rr  %016" PRIX64 " %016" PRIX64 " %016" PRIX64 " %016" PRIX64 "\n",
       m->rr[0], m->rr[1], m->rr[2], m->rr[3]);
     P("    %016" PRIX64 " %016" PRIX64 " %016" PRIX64 " %016" PRIX64 "\n",
