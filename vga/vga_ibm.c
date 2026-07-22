@@ -236,12 +236,15 @@ void vga_ibm_render(const VgaIbm *v, uint32_t *argb, int fb_w, int fb_h,
         }
         return;
     }
-
     /* Graphics modes: chain-4 (mode 0x13, 320x200x256) is the common case
      * for BIOS-era graphics; planar 16-color modes are approximated via the
      * same latch-free direct plane read used for mem reads. */
     bool chain4 = (v->seq[4] & 8) != 0;
-    int gw = 320, gh = 200;
+    int gw = (v->crtc[0x01] + 1) * 8;
+    int gh = (int)((v->crtc[0x12] | ((v->crtc[0x07] & 0x02) << 7) |
+                    ((v->crtc[0x07] & 0x40) << 3)) + 1);
+    if (gw <= 0 || gw > 2048) gw = 320;
+    if (gh <= 0 || gh > 1536) gh = 200;
     int scale = fb_w / gw;
     if (scale < 1) scale = 1;
     int ox = (fb_w - gw * scale) / 2, oy = (fb_h - gh * scale) / 2;

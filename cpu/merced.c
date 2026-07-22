@@ -325,7 +325,17 @@ static const MercedTlbEntry *tlb_search(const MercedTlbEntry *t, int n,
 }
 
 /* Returns true and sets *pa on success; on failure delivers a fault (or
- * halts) and returns false with *st set. */
+ * halts) and returns false with *st set. If force is true, always performs
+ * the real region/TR/TC/VHPT lookup even when the corresponding psr.it/dt
+ * bit is off - used by tpa, which is an explicit "what would this VA
+ * translate to" query and must answer correctly regardless of whether
+ * translation happens to be enabled for ordinary references right now
+ * (real hardware's tpa doesn't take the physical-mode passthrough that
+ * ld/st do). Ordinary references go through va_translate(), which is just
+ * this with force=false. */
+static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
+                            uint64_t isr_access, bool force,
+                            uint64_t *pa, MercedStatus *st);
 static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
                          uint64_t isr_access,
                          uint64_t *pa, MercedStatus *st);
@@ -412,6 +422,18 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                     m->ip, m->psr, !!(m->psr & PSR_IC), isr,
                     m->cr[CR_IHA], m->cr[CR_IPSR], m->cr[CR_IIP],
                     m->ninsts);
+    }
+    if ((ifa >> 61) == 4) {
+        static unsigned region4_debug;
+        if (region4_debug++ < 12)
+            fprintf(stderr, "merced: REGION4 fault vec=%04X ip=%016" PRIX64
+                    " ifa=%016" PRIX64 " isr=%016" PRIX64
+                    " ic=%u it=%u dt=%u rt=%u pta=%016" PRIX64
+                    " rr4=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                    vec, m->ip, ifa, isr,
+                    !!(m->psr & PSR_IC), !!(m->psr & PSR_IT),
+                    !!(m->psr & PSR_DT), !!(m->psr & PSR_RT),
+                    m->cr[CR_PTA], m->rr[4], m->ninsts);
     }
     if ((vec & 0xFF) == 0 && (vec >> 8) <
         sizeof(fault_vector_counts) / sizeof(fault_vector_counts[0]))
@@ -529,8 +551,15 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
 static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
                          uint64_t isr_access,
                          uint64_t *pa, MercedStatus *st) {
+    return va_translate_ex(m, va, ifetch, spec, isr_access, false, pa, st);
+}
+
+static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
+                            uint64_t isr_access, bool force,
+                            uint64_t *pa, MercedStatus *st) {
     *st = MERCED_OK;
-    bool on = ifetch ? (m->psr & PSR_IT) != 0 : (m->psr & PSR_DT) != 0;
+    bool on = force ||
+              (ifetch ? (m->psr & PSR_IT) != 0 : (m->psr & PSR_DT) != 0);
     if (!on) {
         *pa = va & MERCED_PHYS_MASK;
         return true;
@@ -1056,6 +1085,24 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
     unsigned r3 = (unsigned)bits(raw, 20, 7);
     uint8_t n2, n3;
     MercedStatus st = MERCED_OK;
+
+    /* M21 check loads use x=3 (bits 28:27), which overlaps the low x bit
+     * used by M16 semaphore encodings.  Decode them first.  Treating an
+     * ld.c.clr as cmpxchg was particularly destructive: SETUPLDR uses the
+     * ld.a/ld.c pair in its image/driver byte scanner, so the bogus atomic
+     * operation changed both its cursor state and destination register.
+     * */
+    if (major == 4 && !mbit && bits(raw, 27, 2) == 3 && x6 <= 3) {
+        if (!qp) return MERCED_OK;
+        uint64_t va = gr_read(m, r3, &n3), pa;
+        unsigned size = 1u << x6;
+        bool clear = bits(raw, 29, 1) == 0;
+        if (!va_translate(m, va, false, false, ISR_R, &pa, &st))
+            return st;
+        if (!alat_check(m, r1, pa, size, clear))
+            gr_write(m, r1, phys_read(m, pa, size), 0);
+        return MERCED_OK;
+    }
 
     if (major == 4 && xbit && !mbit) {
         /* semaphores: cmpxchg (00-07), xchg (08-0B), fetchadd (12/13/16/17);
@@ -1948,22 +1995,15 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     }
     case 0x1A: {                                    /* thash */
         uint64_t va = gr_read(m, r3, &n3);
-        unsigned vrn = (unsigned)(va >> 61);
-        uint64_t pta = m->cr[CR_PTA];
-        unsigned ps = (unsigned)((m->rr[vrn] >> 2) & 0x3F);
-        unsigned sz = (unsigned)((pta >> 2) & 0x3F);
-        uint64_t mask = (sz >= 64) ? ~0ull : ((1ull << sz) - 1);
-        uint64_t off = ((va & 0x1FFFFFFFFFFFFFFFull) >> ps) << 3;
-        uint64_t base = pta & (0x1FFFFFFFFFFFFFFFull & ~0x7FFFull);
-        gr_write(m, r1, ((uint64_t)vrn << 61) |
-                        ((base & ~mask) | (off & mask)), 0);
+        gr_write(m, r1, vhpt_hash_address(m, va), 0);
         return MERCED_OK;
     }
     case 0x1B: {                                    /* ttag */
         uint64_t va = gr_read(m, r3, &n3);
         unsigned vrn = (unsigned)(va >> 61);
         uint64_t rid = (m->rr[vrn] >> 8) & 0xFFFFFFull;
-        unsigned ps = (unsigned)((m->rr[vrn] >> 2) & 0x3F);
+        unsigned rr_ps = (unsigned)((m->rr[vrn] >> 2) & 0x3F);
+        unsigned ps = rr_ps < 12 ? 12 : rr_ps;   /* match vhpt_walk's tag check */
         unsigned hpn_bits = ps > 60 ? 0 : 61 - ps;
         uint64_t hpn = (va & 0x1FFFFFFFFFFFFFFFull) >> ps;
         uint64_t tag = hpn_bits
@@ -1975,7 +2015,12 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x1E: {                                    /* tpa */
         uint64_t va = gr_read(m, r3, &n3), pa;
         MercedStatus st;
-        if (!va_translate(m, va, false, false, ISR_R, &pa, &st)) return st;
+        /* tpa is an explicit translation query - it must do a real
+         * lookup even when psr.dt is currently off (see va_translate_ex).
+         * Software uses it precisely in that state: to compute a physical
+         * jump target before/after flipping dt via rfi. */
+        if (!va_translate_ex(m, va, false, false, ISR_R, true, &pa, &st))
+            return st;
         gr_write(m, r1, pa, 0);
         return MERCED_OK;
     }

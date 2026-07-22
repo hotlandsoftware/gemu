@@ -953,6 +953,15 @@ static void generic_custom_cmd(Ia64GenericState *s) {
         printf("\n");
         return;
     }
+    if (txt && strncmp(txt, "vgareg", 6) == 0) {
+        printf("vga: misc_output=%02x text_mode=%d mode_set=%d\n",
+               s->vga.misc_output, vga_ibm_is_text_mode(&s->vga),
+               vga_ibm_mode_set(&s->vga));
+        printf("seq[0-7]:"); for (int i=0;i<8;i++) printf(" %02x", s->vga.seq[i]); printf("\n");
+        printf("gc[0-15]:"); for (int i=0;i<16;i++) printf(" %02x", s->vga.gc[i]); printf("\n");
+        printf("crtc[0-31]:"); for (int i=0;i<32;i++) printf(" %02x", s->vga.crtc[i]); printf("\n");
+        return;
+    }
     if (txt && strncmp(txt, "vgapeek ", 8) == 0) {
         unsigned plane;
         unsigned off;
