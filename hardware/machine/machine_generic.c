@@ -68,6 +68,7 @@ struct Ia64GenericState {
     uint8_t   rom[GENERIC_ROM_SIZE];
     char      rom_file[512];
     bool      rom_loaded;
+    bool      qemu_firmware;            /* flat image linked at 0x00100000 */
 
     bool         halted;
     MercedStatus halt_status;
@@ -83,6 +84,9 @@ struct Ia64GenericState {
     uint16_t acpi_pm1_control;
     uint32_t pci_cfg_addr;
     uint8_t  ide_cfg[256];
+    uint8_t  qemu_ide_cfg[256];
+    uint8_t  qemu_vga_cfg[256];
+    uint8_t  qemu_nvram[GENERIC_QEMU_NVRAM_SIZE];
 
     uint8_t   atapi_error, atapi_features, atapi_count;
     uint8_t   atapi_lba_low, atapi_lba_mid, atapi_lba_high, atapi_device;
@@ -151,6 +155,45 @@ struct Ia64GenericState {
     generic_sock_t serial_listen_fd;
     generic_sock_t serial_client_fd;
 };
+
+#define QEMU_IA64_FW_BASE       UINT64_C(0x00100000)
+#define QEMU_IA64_HANDOFF_BASE  UINT64_C(0x000FF000)
+#define QEMU_IA64_HANDOFF_MAGIC UINT64_C(0x4D41523436414951)
+
+static bool path_ends_with(const char *path, const char *suffix) {
+    size_t n = strlen(path), m = strlen(suffix);
+    return n >= m && strcmp(path + n - m, suffix) == 0;
+}
+
+static void generic_qemu_firmware_reset(Ia64GenericState *s) {
+    Merced *m = s->cpu;
+    merced_reset(m);
+    m->ip = QEMU_IA64_FW_BASE;
+    m->br[0] = QEMU_IA64_FW_BASE;
+    m->cr[2] = UINT64_C(0x10000);       /* cr.iva */
+    m->cr[8] = 0;                       /* cr.pta */
+    m->cr[0] = (UINT64_C(1) << 8) | (UINT64_C(1) << 9); /* DCR.dm|dp */
+    m->rr[0] = UINT64_C(0x30);
+    m->ar[0] = QEMU_IA64_FW_BASE;       /* ar.k0 */
+    m->ar[16] = UINT64_C(0xC);          /* ar.rsc: enforced lazy mode */
+    m->ar[17] = UINT64_C(0x80000);      /* ar.bsp */
+    m->ar[18] = UINT64_C(0x80000);      /* ar.bspstore */
+    m->gr_static[1] = QEMU_IA64_FW_BASE;
+    m->gr_static[12] = UINT64_C(0x07FFFFF0);
+}
+
+static void generic_write_qemu_handoff(Ia64GenericState *s) {
+    uint64_t words[10] = {
+        QEMU_IA64_HANDOFF_MAGIC, 9, s->ram_size,
+        1, /* VGA console */
+        0, /* IDE DMA disabled until the generic BMDMA model is complete */
+        0, 0, /* no separate debug UART */
+        0, /* generic keyboard is not an i8042 */
+        1, /* one processor */
+        0, /* volatile NVRAM */
+    };
+    memcpy(s->ram + QEMU_IA64_HANDOFF_BASE, words, sizeof(words));
+}
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t rd32(const uint8_t *p) {
@@ -281,11 +324,76 @@ static uint64_t sparse_io_decode(uint64_t off) {
     return off;
 }
 
+static uint8_t *qemu_pci_cfg_space(Ia64GenericState *s, unsigned bus,
+                                   unsigned dev, unsigned fun) {
+    if (bus != 0 || fun != 0)
+        return NULL;
+    if (dev == 0 && s->cdrom)
+        return s->qemu_ide_cfg;
+    if (dev == 5)
+        return s->qemu_vga_cfg;
+    return NULL;
+}
+
+static uint64_t qemu_pci_cfg_read(Ia64GenericState *s, uint64_t addr,
+                                  unsigned size) {
+    uint64_t off = addr - GENERIC_QEMU_PCI_ECAM_BASE;
+    unsigned bus = (unsigned)(off >> 20) & 0xff;
+    unsigned dev = (unsigned)(off >> 15) & 0x1f;
+    unsigned fun = (unsigned)(off >> 12) & 7;
+    unsigned reg = (unsigned)off & 0xfff;
+    uint8_t *cfg = qemu_pci_cfg_space(s, bus, dev, fun);
+    if (!cfg || reg + size > 256)
+        return size_mask(size);
+
+    /* PCI BAR sizing probes write all ones and expect the implemented
+     * address mask on the following read. */
+    if (size == 4 && reg >= 0x10 && reg <= 0x24) {
+        uint32_t bar;
+        memcpy(&bar, cfg + reg, 4);
+        if (bar == UINT32_MAX) {
+            static const uint32_t ide_masks[5] = {
+                0xfffffff9u, 0xfffffffdu, 0xfffffff9u,
+                0xfffffffdu, 0xfffffff1u
+            };
+            if (dev == 0 && reg <= 0x20)
+                return ide_masks[(reg - 0x10) / 4];
+            if (dev == 5 && reg == 0x10)
+                return 0xff000008u;       /* 16 MiB prefetchable FB */
+            if (dev == 5 && reg == 0x18)
+                return 0xffff0000u;       /* VGA MMIO register window */
+            return 0;
+        }
+    }
+    uint64_t v = 0;
+    memcpy(&v, cfg + reg, size);
+    return v;
+}
+
+static void qemu_pci_cfg_write(Ia64GenericState *s, uint64_t addr,
+                               uint64_t val, unsigned size) {
+    uint64_t off = addr - GENERIC_QEMU_PCI_ECAM_BASE;
+    unsigned bus = (unsigned)(off >> 20) & 0xff;
+    unsigned dev = (unsigned)(off >> 15) & 0x1f;
+    unsigned fun = (unsigned)(off >> 12) & 7;
+    unsigned reg = (unsigned)off & 0xfff;
+    uint8_t *cfg = qemu_pci_cfg_space(s, bus, dev, fun);
+    if (!cfg || reg + size > 256 || reg < 4)
+        return;
+    memcpy(cfg + reg, &val, size);
+}
+
 static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size) {
     static unsigned debug_reads;
     if (getenv("GENERIC_DEBUG") && debug_reads++ < 128)
         fprintf(stderr, "generic: io read port=%04X size=%u\n", port, size);
     if (port == 0xCF8 && size == 4) return s->pci_cfg_addr;
+    if (port >= 0x3B0 && port + size <= 0x3E0) {
+        uint64_t v = 0;
+        for (unsigned i = 0; i < size; i++)
+            v |= (uint64_t)vga_ibm_io_read(&s->vga, (uint16_t)(port + i)) << (i * 8);
+        return v;
+    }
     if (port >= 0xCFC && port + size <= 0xD00) {
         uint32_t a = s->pci_cfg_addr;
         if (!(a & 0x80000000u)) return size_mask(size);
@@ -329,7 +437,16 @@ static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size
         case 3: return s->uart_lcr;
         case 4: return s->uart_mcr;
         case 5: return 0x60 | (s->uart_rx_head != s->uart_rx_tail ? 1 : 0);
-        case 6: return 0xB0;                        /* MSR: CTS|DSR|DCD */
+        case 6:
+            if (s->uart_mcr & 0x10) {
+                /* Loopback: modem status mirrors the control bits (RTS->CTS,
+                 * DTR->DSR, OUT1->RI, OUT2->DCD) - the standard 16550 wiring
+                 * a UART presence/self-test probe checks */
+                return (uint8_t)(((s->uart_mcr & 0x0C) << 4) |
+                                 ((s->uart_mcr & 0x02) << 3) |
+                                 ((s->uart_mcr & 0x01) << 5));
+            }
+            return 0xB0;                             /* MSR: CTS|DSR|DCD */
         case 7: return s->uart_scr;
         }
     }
@@ -343,6 +460,12 @@ static void legacy_io_write(Ia64GenericState *s, unsigned port, uint64_t val, un
         fprintf(stderr, "generic: io write port=%04X size=%u val=%08" PRIX64 "\n",
                 port, size, val);
     if (port == 0xCF8 && size == 4) { s->pci_cfg_addr = (uint32_t)val; return; }
+    if (port >= 0x3B0 && port + size <= 0x3E0) {
+        for (unsigned i = 0; i < size; i++)
+            vga_ibm_io_write(&s->vga, (uint16_t)(port + i),
+                             (uint8_t)(val >> (i * 8)));
+        return;
+    }
     if (port >= 0xCFC && port + size <= 0xD00) {
         uint32_t a = s->pci_cfg_addr;
         unsigned bus = (a >> 16) & 0xff, dev = (a >> 11) & 0x1f;
@@ -396,6 +519,18 @@ static void legacy_io_write(Ia64GenericState *s, unsigned port, uint64_t val, un
         switch (port - GENERIC_COM1_PORT) {
         case 0:
             if (s->uart_lcr & 0x80) { s->uart_dll = (uint8_t)val; return; }
+            if (s->uart_mcr & 0x10) {
+                /* Loopback: the transmitted byte becomes the next received
+                 * byte instead of going out the real transport - the UART
+                 * presence self-test a serial detection routine runs before
+                 * trusting a port exists. Matches qemu's serial_xmit(): it
+                 * calls serial_receive1() here instead of writing the chr
+                 * backend when MCR_LOOP is set. */
+                uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+                if (next != s->uart_rx_head)
+                    s->uart_rx[s->uart_rx_tail++] = (uint8_t)val;
+                return;
+            }
             generic_serial_tx(s, (uint8_t)val);
             return;
         case 1:
@@ -570,6 +705,11 @@ static void generic_serial_disable(Ia64GenericState *s) {
  * a 256-byte ring without the guest polling has bigger problems). */
 static void generic_serial_poll(Ia64GenericState *s) {
     if (!s->serial_enabled)
+        return;
+    /* While in loopback self-test, RX must reflect only looped-back TX
+     * bytes - draining the real transport here too would corrupt the test
+     * with whatever the debugger/host happens to send during it. */
+    if (s->uart_mcr & 0x10)
         return;
     uint8_t buf[64];
     if (s->serial_backend == GENERIC_SERIAL_STDIO) {
@@ -959,6 +1099,24 @@ static bool acpi_pm_window(uint64_t addr, unsigned size, uint32_t *off) {
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64GenericState *s = ud;
     uint32_t voff;
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_PCI_ECAM_BASE &&
+        addr + size <= GENERIC_QEMU_PCI_ECAM_BASE + GENERIC_QEMU_PCI_ECAM_SIZE)
+        return qemu_pci_cfg_read(s, addr, size);
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_NVRAM_BASE &&
+        addr + size <= GENERIC_QEMU_NVRAM_BASE + GENERIC_QEMU_NVRAM_SIZE) {
+        uint64_t v = 0;
+        memcpy(&v, s->qemu_nvram + (addr - GENERIC_QEMU_NVRAM_BASE), size);
+        return v;
+    }
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_VGA_FB_BASE &&
+        addr + size <= GENERIC_QEMU_VGA_FB_BASE + GENERIC_QEMU_VGA_FB_SIZE) {
+        uint64_t v = 0;
+        memcpy(&v, (uint8_t *)s->fb + (addr - GENERIC_QEMU_VGA_FB_BASE), size);
+        return v;
+    }
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_VGA_MMIO_BASE &&
+        addr + size <= GENERIC_QEMU_VGA_MMIO_BASE + GENERIC_QEMU_VGA_MMIO_SIZE)
+        return 0;
     if (addr >= GENERIC_LEGACY_IO_BASE &&
         addr + size <= GENERIC_LEGACY_IO_BASE + GENERIC_LEGACY_IO_SPARSE_SIZE)
         return legacy_io_read(s, (unsigned)sparse_io_decode(addr - GENERIC_LEGACY_IO_BASE), size);
@@ -1067,6 +1225,26 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                 " pa=%08" PRIX64 " size=%u value=%016" PRIX64 "\n",
                 s->cpu ? s->cpu->ip : 0, addr, size, val);
     uint32_t voff;
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_PCI_ECAM_BASE &&
+        addr + size <= GENERIC_QEMU_PCI_ECAM_BASE + GENERIC_QEMU_PCI_ECAM_SIZE) {
+        qemu_pci_cfg_write(s, addr, val, size);
+        return;
+    }
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_NVRAM_BASE &&
+        addr + size <= GENERIC_QEMU_NVRAM_BASE + GENERIC_QEMU_NVRAM_SIZE) {
+        /* The handoff advertises volatile NVRAM, so the commit sentinel is
+         * intentionally just another in-memory write. */
+        memcpy(s->qemu_nvram + (addr - GENERIC_QEMU_NVRAM_BASE), &val, size);
+        return;
+    }
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_VGA_FB_BASE &&
+        addr + size <= GENERIC_QEMU_VGA_FB_BASE + GENERIC_QEMU_VGA_FB_SIZE) {
+        memcpy((uint8_t *)s->fb + (addr - GENERIC_QEMU_VGA_FB_BASE), &val, size);
+        return;
+    }
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_VGA_MMIO_BASE &&
+        addr + size <= GENERIC_QEMU_VGA_MMIO_BASE + GENERIC_QEMU_VGA_MMIO_SIZE)
+        return;
     if (addr >= GENERIC_LEGACY_IO_BASE &&
         addr + size <= GENERIC_LEGACY_IO_BASE + GENERIC_LEGACY_IO_SPARSE_SIZE) {
         legacy_io_write(s, (unsigned)sparse_io_decode(addr - GENERIC_LEGACY_IO_BASE), val, size);
@@ -1181,6 +1359,50 @@ bool ia64_generic_load_firmware(Ia64GenericState *s, const char *path) {
         fclose(f);
         return false;
     }
+    // TODO: better way of doing this
+    if (path_ends_with(path, "ia64-firmware.bin")) {
+        if (QEMU_IA64_FW_BASE + (uint64_t)len > s->ram_size) {
+            fprintf(stderr, "gemu: rom does not fit in guest RAM\n");
+            fclose(f);
+            return false;
+        }
+        size_t rd = fread(s->ram + QEMU_IA64_FW_BASE, 1, (size_t)len, f);
+        fclose(f);
+        if (rd != (size_t)len) {
+            fprintf(stderr, "gemu: short read on firmware '%s'\n", path);
+            return false;
+        }
+        s->qemu_firmware = true;
+        /* PCI bus 0: CMD646 IDE in slot 0 and standard VGA in slot 5, as
+         * wired by the reference ia64-vpc machine. */
+        memset(s->qemu_ide_cfg, 0, sizeof(s->qemu_ide_cfg));
+        s->qemu_ide_cfg[0x00] = 0x95; s->qemu_ide_cfg[0x01] = 0x10;
+        s->qemu_ide_cfg[0x02] = 0x46; s->qemu_ide_cfg[0x03] = 0x06;
+        s->qemu_ide_cfg[0x04] = 0x01;
+        s->qemu_ide_cfg[0x09] = 0x8f; s->qemu_ide_cfg[0x0a] = 0x01;
+        s->qemu_ide_cfg[0x0b] = 0x01;
+        s->qemu_ide_cfg[0x0e] = 0x00;
+        { uint32_t bars[5] = { 0x1f1, 0x3f5, 0x171, 0x375, 0xc001 };
+          memcpy(s->qemu_ide_cfg + 0x10, bars, sizeof(bars)); }
+        s->qemu_ide_cfg[0x3c] = 14; s->qemu_ide_cfg[0x3d] = 1;
+
+        memset(s->qemu_vga_cfg, 0, sizeof(s->qemu_vga_cfg));
+        s->qemu_vga_cfg[0x00] = 0x34; s->qemu_vga_cfg[0x01] = 0x12;
+        s->qemu_vga_cfg[0x02] = 0x11; s->qemu_vga_cfg[0x03] = 0x11;
+        s->qemu_vga_cfg[0x04] = 0x03;
+        s->qemu_vga_cfg[0x0b] = 0x03;
+        { uint32_t fb = 0xc4000008u, mmio = 0xc8000000u;
+          memcpy(s->qemu_vga_cfg + 0x10, &fb, 4);
+          memcpy(s->qemu_vga_cfg + 0x18, &mmio, 4); }
+        s->qemu_vga_cfg[0x3d] = 1;
+        s->rom_loaded = true;
+        snprintf(s->rom_file, sizeof(s->rom_file), "%s", path);
+        generic_write_qemu_handoff(s);
+        generic_qemu_firmware_reset(s);
+        gemu_monitor_register_rom(s->monitor, (uint32_t)QEMU_IA64_FW_BASE,
+                                  (uint32_t)len, path);
+        return true;
+    }
     uint32_t off = GENERIC_ROM_SIZE - (uint32_t)len;
     memset(s->rom, 0xFF, off);
     size_t rd = fread(s->rom + off, 1, (size_t)len, f);
@@ -1204,7 +1426,8 @@ static void generic_cpu_state(void *ud, char *buf, size_t buf_len) {
 }
 
 static void generic_render_frame(Ia64GenericState *s) {
-    vga_ibm_render(&s->vga, s->fb, FB_W, FB_H, vgafont16);
+    if (!s->qemu_firmware)
+        vga_ibm_render(&s->vga, s->fb, FB_W, FB_H, vgafont16);
 }
 
 static bool generic_screendump(void *ud, const char *path) {
@@ -1439,7 +1662,12 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
                 running = false;
                 break;
             case GEMU_MON_RESET:
-                merced_reset(s->cpu);
+                if (s->qemu_firmware) {
+                    generic_write_qemu_handoff(s);
+                    generic_qemu_firmware_reset(s);
+                } else {
+                    merced_reset(s->cpu);
+                }
                 vga_ibm_reset(&s->vga);
                 s->halted = false;
                 printf("generic: processor reset, IP=0x%016" PRIX64 "\n",

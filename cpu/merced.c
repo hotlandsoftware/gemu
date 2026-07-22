@@ -1789,6 +1789,38 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                 uint64_t imm = (bits(raw, 36, 1) << 20) | bits(raw, 6, 20);
                 if (!qp) return MERCED_OK;
                 m->cr[CR_IIM] = imm;
+                /* QEMU's IA-64 firmware enters the host FPSWA emulator with
+                 * a private break.  Its startup self-test deliberately calls
+                 * the interface with eight null arguments and expects the
+                 * same invalid-argument tuple returned by QEMU's dispatcher:
+                 * status -1, error number 5 in the high byte of err0.  GEMU
+                 * currently executes floating-point instructions itself, so
+                 * satisfy this probe while retaining architectural break
+                 * delivery for every non-private immediate. */
+                if (imm == UINT64_C(0x100001)) {
+                    gr_write(m, 8, UINT64_MAX, 0);
+                    gr_write(m, 9, UINT64_C(5) << 56, 0);
+                    gr_write(m, 10, 0, 0);
+                    gr_write(m, 11, 0, 0);
+                    /* Do not jump to b0 here: the following br.ret must run
+                     * so that its architectural RSE/CFM frame unwind occurs. */
+                    return MERCED_OK;
+                }
+                /* QEMU's project firmware uses a private break in the IVT
+                 * stub to enter its EFI DebugSupport callback bridge.  GEMU
+                 * does not yet expose QEMU's host-side context-record ABI;
+                 * resume the interrupted probe instead, making the optional
+                 * firmware self-test report unsupported without wedging the
+                 * entire EFI implementation in its own IVT. */
+                if (imm == UINT64_C(0x100002) &&
+                    (m->ip & ~UINT64_C(0x7FFF)) == UINT64_C(0x10000) &&
+                    m->cr[CR_IIP] != 0) {
+                    psr_trans_log(m, m->cr[CR_IPSR], "firmware-debug-bypass");
+                    m->psr = m->cr[CR_IPSR] & ~(UINT64_C(3) << PSR_RI_SHIFT);
+                    m->ip = (m->cr[CR_IIP] & ~UINT64_C(0xF)) + 16;
+                    m->taken = 1;
+                    return MERCED_OK;
+                }
                 /* Architecturally a Break Instruction fault, delivered to
                  * firmware's own handler (which decides what a given
                  * immediate means - PAL call, OS call, debug trap, etc.),
@@ -2360,6 +2392,24 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
         unsigned x2c = (unsigned)bits(raw, 30, 2);
         unsigned x2b = (unsigned)bits(raw, 28, 2);
         if (ve) return mhalt(m, "I-unit major 7 ve=1");
+        if (x2a == 3 && x2c == 1 && x2b == 1 &&
+            bits(raw, 25, 2) == 0 &&
+            ((za == 0 && zb == 1) || (za == 1 && zb == 0))) {
+            /* pshl2/pshl4 immediate.  Each lane shifts independently; a
+             * count greater than the lane width produces a zero lane. */
+            if (!qp) return MERCED_OK;
+            unsigned lane_bits = za ? 32 : 16;
+            unsigned count = 31 - (unsigned)bits(raw, 20, 5);
+            uint64_t src = gr_read(m, r2, &n2), res = 0;
+            uint64_t lane_mask = (UINT64_C(1) << lane_bits) - 1;
+            for (unsigned shift = 0; shift < 64; shift += lane_bits) {
+                uint64_t lane = (src >> shift) & lane_mask;
+                if (count < lane_bits)
+                    res |= ((lane << count) & lane_mask) << shift;
+            }
+            gr_write(m, r1, res, n2);
+            return MERCED_OK;
+        }
         if (za == 0 && zb == 1 && x2a == 0 &&
             (x2b == 1 || x2b == 3)) {               /* I1 pmpyshr2.u / pmpyshr2 */
             if (!qp) return MERCED_OK;
@@ -2407,6 +2457,25 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             unsigned c = 0;
             while (v) { c += (unsigned)(v & 1); v >>= 1; }
             gr_write(m, r1, c, n3);
+            return MERCED_OK;
+        }
+        if (bits(raw, 33, 3) == 5 &&
+            (((bits(raw, 27, 6) & ~UINT64_C(1)) == 0x1A) ||
+             ((bits(raw, 27, 6) & ~UINT64_C(1)) == 0x1E))) {
+            /* pmpy2.r/.l: multiply alternating signed 16-bit lanes and
+             * return the selected pair as two full 32-bit products. */
+            if (!qp) return MERCED_OK;
+            uint64_t a = gr_read(m, r2, &n2), b = gr_read(m, r3, &n3);
+            bool right = (bits(raw, 27, 6) & ~UINT64_C(1)) == 0x1A;
+            unsigned first = right ? 0 : 1;
+            uint64_t res = 0;
+            for (unsigned out = 0; out < 2; out++) {
+                unsigned lane = first + out * 2;
+                int32_t product = (int32_t)(int16_t)(a >> (lane * 16)) *
+                                  (int32_t)(int16_t)(b >> (lane * 16));
+                res |= (uint64_t)(uint32_t)product << (out * 32);
+            }
+            gr_write(m, r1, res, n2 | n3);
             return MERCED_OK;
         }
         if (x2a == 2) {                             /* I2 parallel (mix/unpack/pack/pmin/pmax/psad) */

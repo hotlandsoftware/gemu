@@ -76,6 +76,17 @@
 #define GENERIC_VGA_IO_BASE   0x00000000C0000000ull
 #define GENERIC_VGA_IO_SIZE   0x30u                    /* ports 3B0h-3DFh */
 
+/* Fixed linear framebuffer used by qemu-system-ia64's EFI firmware.  Its
+ * GOP mode is 640x400x32, matching the generic display surface exactly. */
+#define GENERIC_QEMU_VGA_FB_BASE 0x00000000C4000000ull
+#define GENERIC_QEMU_VGA_FB_SIZE (640u * 400u * 4u)
+#define GENERIC_QEMU_VGA_MMIO_BASE 0x00000000C8000000ull
+#define GENERIC_QEMU_VGA_MMIO_SIZE 0x10000u
+#define GENERIC_QEMU_PCI_ECAM_BASE 0x0000007FF0000000ull
+#define GENERIC_QEMU_PCI_ECAM_SIZE 0x10000000ull
+#define GENERIC_QEMU_NVRAM_BASE 0x00000000FFF00000ull
+#define GENERIC_QEMU_NVRAM_SIZE 0x10000u
+
 /* Minimal Intel 82093-style I/O SAPIC.  IA-64 Windows requires one during
  * HAL phase one even before any routed PCI interrupt is enabled. */
 #define GENERIC_IOSAPIC_BASE  0x0000000080110000ull
