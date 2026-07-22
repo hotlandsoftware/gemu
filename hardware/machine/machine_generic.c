@@ -1017,6 +1017,8 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
      * firmware, so its cpuid revision cross-check doesn't apply here
      * (see the comment on cpuid[3] in cpu/merced.c). */
     merced_set_cpu_revision(s->cpu, 6);
+    if (cfg->cpu && strcmp(cfg->cpu, "mckinley") == 0)
+        merced_set_cpu_model(s->cpu, 1);
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_cpu_state_cb(s->monitor, generic_cpu_state, s);

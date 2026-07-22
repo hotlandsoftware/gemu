@@ -158,6 +158,7 @@ typedef struct {
     int             display_scale;
     bool            no_shutdown;
     const char     *cdrom_path;
+    const char     *cpu;        /* NULL or "merced" (default), "mckinley" */
 } GenericConfig;
 
 typedef struct Ia64GenericState Ia64GenericState;

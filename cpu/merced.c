@@ -124,8 +124,61 @@ static uint64_t gr_read(Merced *m, unsigned r, uint8_t *nat) {
     return m->gr_stack[p];
 }
 
+static void alat_invalidate_reg(Merced *m, unsigned reg) {
+    for (unsigned i = 0; i < 32; i++)
+        if (m->alat[i].valid && m->alat[i].reg == reg)
+            m->alat[i].valid = 0;
+}
+
+static void alat_invalidate_store(Merced *m, uint64_t pa, unsigned size) {
+    uint64_t end = pa + size;
+    for (unsigned i = 0; i < 32; i++) {
+        uint64_t aend = m->alat[i].phys_addr + m->alat[i].size;
+        if (m->alat[i].valid && m->alat[i].phys_addr < end && pa < aend)
+            m->alat[i].valid = 0;
+    }
+}
+
+static void alat_set(Merced *m, unsigned reg, uint64_t pa, unsigned size) {
+    alat_invalidate_reg(m, reg);
+    for (unsigned i = 0; i < 32; i++) {
+        if (!m->alat[i].valid) {
+            m->alat[i].phys_addr = pa;
+            m->alat[i].size = (uint8_t)size;
+            m->alat[i].reg = (uint8_t)reg;
+            m->alat[i].valid = 1;
+            return;
+        }
+    }
+}
+
+static bool alat_check(Merced *m, unsigned reg, uint64_t pa, unsigned size,
+                       bool clear) {
+    for (unsigned i = 0; i < 32; i++) {
+        if (!m->alat[i].valid || m->alat[i].reg != reg)
+            continue;
+        bool hit = m->alat[i].phys_addr == pa && m->alat[i].size == size;
+        if (clear || !hit)
+            m->alat[i].valid = 0;
+        return hit;
+    }
+    return false;
+}
+
+static bool alat_check_reg(Merced *m, unsigned reg, bool clear) {
+    for (unsigned i = 0; i < 32; i++) {
+        if (!m->alat[i].valid || m->alat[i].reg != reg)
+            continue;
+        if (clear)
+            m->alat[i].valid = 0;
+        return true;
+    }
+    return false;
+}
+
 static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
     if (r == 0) return;   /* writes to r0 fault on HW; ignore here */
+    alat_invalidate_reg(m, r);
     if (r < 16) { m->gr_static[r] = v; m->nat_static[r] = nat; return; }
     if (r < 32) {
         if (m->psr & PSR_BN) { m->gr_static[r] = v; m->nat_static[r] = nat; }
@@ -290,6 +343,15 @@ enum {
 };
 static int vhpt_walk(Merced *m, uint64_t va, bool ifetch);
 
+/* The VHPT hash address for va - shared by vhpt_walk() (to locate the
+ * collision-chain entry) and deliver_fault() (to populate cr.iha on a
+ * miss). Matching reference/qemu-system-ia64's ia64_vhpt_hash_address():
+ * both call sites use the exact same formula, so GEMU's own VHPT walker
+ * and the value the OS's software walker is told to repair can never
+ * diverge. Returns va unchanged if the walker is disabled (pta.ve=0 or
+ * rr.ve=0), matching the reference's "config invalid" fallback. */
+static uint64_t vhpt_hash_address(Merced *m, uint64_t va);
+
 /* Advance ar.itc and edge-latch the interval-timer interrupt if it just
  * crossed cr.itm. cr.itm == 0 means "never armed" (SAL/EFI haven't
  * programmed a deadline yet), matching real reset state where the timer
@@ -421,16 +483,8 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                 unsigned vrn = (unsigned)(ifa >> 61);
                 uint64_t rr = m->rr[vrn];
                 m->cr[CR_ITIR] = (rr & 0xFCu) |
-                                 (((rr >> 8) & 0xFFFFFF) << 8);
-                uint64_t pta = m->cr[CR_PTA];
-                unsigned ps = (unsigned)((rr >> 2) & 0x3F);
-                unsigned sz = (unsigned)((pta >> 2) & 0x3F);
-                uint64_t mask = sz >= 64 ? ~0ull : ((1ull << sz) - 1);
-                uint64_t off = ((ifa & 0x1FFFFFFFFFFFFFFFull) >> ps) << 3;
-                uint64_t base = pta &
-                    (0x1FFFFFFFFFFFFFFFull & ~0x7FFFull);
-                m->cr[CR_IHA] = ((uint64_t)vrn << 61) |
-                                ((base & ~mask) | (off & mask));
+                                 (((rr >> 8) & 0xFFFFFFull) << 8);
+                m->cr[CR_IHA] = vhpt_hash_address(m, ifa);
             }
             m->ip = (m->cr[CR_IVA] & ~0x7FFFull) + VEC_ALT_ITLB;
             m->taken = 1;
@@ -454,21 +508,14 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
         m->cr[CR_IFA] = ifa;
         unsigned vrn = (unsigned)(ifa >> 61);
         uint64_t rr = m->rr[vrn];
-        /* short-format VHPT hash for cr.iha */
-        uint64_t pta = m->cr[CR_PTA];
-        unsigned ps = (unsigned)((rr >> 2) & 0x3F);
-        unsigned sz = (unsigned)((pta >> 2) & 0x3F);
-        uint64_t mask = (sz >= 64) ? ~0ull : ((1ull << sz) - 1);
-        uint64_t off = ((ifa & 0x1FFFFFFFFFFFFFFFull) >> ps) << 3;
-        uint64_t base = pta & (0x1FFFFFFFFFFFFFFFull & ~0x7FFFull);
-        m->cr[CR_IHA] = ((uint64_t)vrn << 61) |
-                        ((base & ~mask) | (off & mask));
+        /* VHPT hash for cr.iha - shared formula, see vhpt_hash_address(). */
+        m->cr[CR_IHA] = vhpt_hash_address(m, ifa);
         /* A VHPT Translation fault describes the translation needed to
          * access cr.iha, not the translation of the original cr.ifa. */
         if (vec == VEC_VHPT)
             rr = m->rr[m->cr[CR_IHA] >> 61];
         m->cr[CR_ITIR] = (rr & 0xFCu) |
-                         (((rr >> 8) & 0xFFFFFF) << 8);
+                         (((rr >> 8) & 0xFFFFFFull) << 8);
     }
     /* Every interruption enters the IA-64 instruction set.  IPSR above
      * retains the interrupted PSR.is value so rfi can return to IA-32. */
@@ -489,7 +536,7 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
         return true;
     }
     unsigned vrn = (unsigned)(va >> 61);
-    uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
+    uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
     uint64_t lookup_va = va;
     const MercedTlbEntry *e =
         tlb_search(ifetch ? m->itr : m->dtr, MERCED_N_TR, rid, lookup_va);
@@ -586,6 +633,9 @@ static uint64_t phys_fetch(Merced *m, uint64_t pa, unsigned size) {
 }
 static void phys_write(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
     pa &= MERCED_PHYS_MASK;
+    /* All CPU-visible stores can collide with an advanced load, including
+     * semaphore, FP, and RSE spill stores. */
+    alat_invalidate_store(m, pa, size);
     m->bus.write(m->bus.ud, pa, v, size);
 }
 
@@ -617,10 +667,12 @@ void merced_reset(Merced *m) {
     MercedBus bus = m->bus;
     uint64_t ninsts = 0;
     uint8_t cpu_revision = m->cpu_revision;
+    uint8_t cpu_model = m->cpu_model;
     memset(m, 0, sizeof(*m));
     m->bus = bus;
     m->ninsts = ninsts;
     m->cpu_revision = cpu_revision;
+    m->cpu_model = cpu_model;
 
     m->ip  = 0xFFFFFFB0ull;          /* PALE_RESET, 4 GiB - 0x50 */
     m->psr = 0;                      /* physical mode, bank 0 */
@@ -634,12 +686,13 @@ void merced_reset(Merced *m) {
     m->ar[AR_FPSR] = UINT64_C(0x0009804c0270033f);
     /* CPUID: "GenuineIntel". cpuid[3] is the version register:
      * {number 7:0, revision 15:8, model 23:16, family 31:24, archrev 39:32}
-     * = archrev 0, family 7 (Itanium), model 0 (Merced), rev cpu_revision,
-     * number 4 (cpuid[0..4] implemented).
+     * = archrev 0, family 7 (Itanium), model cpu_model (0 = Merced,
+     * 1 = McKinley/Itanium 2), rev cpu_revision, number 4 (cpuid[0..4]
+     * implemented).
      *
-     * The revision (stepping) value is machine-configurable (see
-     * merced_set_cpu_revision()) because different consumers disagree
-     * about what they want to see here:
+     * The model and revision (stepping) values are machine-configurable
+     * (see merced_set_cpu_model()/merced_set_cpu_revision()) because
+     * different consumers disagree about what they want to see here:
      *   - i2000's own firmware cross-checks it against
      *     machine_i2000.c's memcard_cfg[0][2][0x05] (CBN:05.2 processor
      *     descriptor) - a mismatch reads as "no recognized processor"
@@ -656,7 +709,7 @@ void merced_reset(Merced *m) {
     memcpy(&m->cpuid[0], "GenuineI", 8);
     memcpy(&m->cpuid[1], "ntel\0\0\0\0", 8);
     m->cpuid[2] = 0;
-    m->cpuid[3] = (7ull << 24) | (0ull << 16) |
+    m->cpuid[3] = (7ull << 24) | ((uint64_t)m->cpu_model << 16) |
                   ((uint64_t)m->cpu_revision << 8) | 4;
     m->cpuid[4] = 0;
     m->cr[CR_LID] = 0;               /* cpu 0 */
@@ -666,6 +719,11 @@ void merced_reset(Merced *m) {
 void merced_set_cpu_revision(Merced *m, uint8_t revision) {
     m->cpu_revision = revision;
     m->cpuid[3] = (m->cpuid[3] & ~0xFF00ull) | ((uint64_t)revision << 8);
+}
+
+void merced_set_cpu_model(Merced *m, uint8_t model) {
+    m->cpu_model = model;
+    m->cpuid[3] = (m->cpuid[3] & ~0xFF0000ull) | ((uint64_t)model << 16);
 }
 
 uint64_t merced_gr(const Merced *m, unsigned r) {
@@ -1080,11 +1138,20 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
                 if (st != MERCED_OK) return st;
                 gr_write(m, r1, 0, 1);             /* NaT on deferred spec load */
             } else {
-                uint64_t v = phys_read(m, pa, size);
-                uint8_t nat = 0;
-                if (x6 == 0x1B)                    /* ld8.fill: NaT from UNAT */
-                    nat = (uint8_t)((m->ar[AR_UNAT] >> ((va >> 3) & 0x3F)) & 1);
-                gr_write(m, r1, v, nat);
+                bool check = x6 >= 0x20 && x6 <= 0x2B;
+                bool clear = x6 >= 0x20 && x6 <= 0x23;
+                if (!check || !alat_check(m, r1, pa, size, clear)) {
+                    uint64_t v = phys_read(m, pa, size);
+                    uint8_t nat = 0;
+                    if (x6 == 0x1B)                /* ld8.fill: NaT from UNAT */
+                        nat = (uint8_t)((m->ar[AR_UNAT] >> ((va >> 3) & 0x3F)) & 1);
+                    gr_write(m, r1, v, nat);
+                    /* ld.a and ld.sa establish the value/address
+                     * association consumed by a later ld.c. */
+                    if ((x6 >= 0x08 && x6 <= 0x0F) ||
+                        (x6 >= 0x28 && x6 <= 0x2B))
+                        alat_set(m, r1, pa, size);
+                }
             }
             /* base update */
             if (major == 5) {
@@ -1243,7 +1310,7 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
     unsigned ps = (unsigned)((itir >> 2) & 0x3F);
     unsigned vrn = (unsigned)(ifa >> 61);
     uint64_t page = (ps >= 64) ? 0 : ~((1ull << ps) - 1);
-    uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
+    uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
     uint64_t new_start = ifa & page;
     uint64_t new_end = new_start + (ps >= 64 ? ~0ull : (1ull << ps) - 1);
 
@@ -1309,7 +1376,7 @@ static bool vhpt_entry_pa(Merced *m, uint64_t entry_va, uint64_t *pa) {
         return true;
     }
     unsigned vrn = (unsigned)(entry_va >> 61);
-    uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
+    uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
     const MercedTlbEntry *e = tlb_search(m->dtr, MERCED_N_TR, rid, entry_va);
     if (!e) e = tlb_search(m->dtc, MERCED_N_TC, rid, entry_va);
     if (!e) e = tlb_search(m->itr, MERCED_N_TR, rid, entry_va);
@@ -1347,6 +1414,44 @@ void merced_vhpt_stats(uint64_t *calls, uint64_t *disabled, uint64_t *hit,
     *tagfail = dbg_vhpt_tagfail; *np = dbg_vhpt_np;
 }
 
+static uint64_t vhpt_hash_address(Merced *m, uint64_t va) {
+    uint64_t pta = m->cr[CR_PTA];
+    unsigned vrn = (unsigned)(va >> 61);
+    uint64_t rr = m->rr[vrn];
+    if (!(pta & 1) || !(rr & 1))
+        return va;                            /* walker disabled: no hash */
+
+    unsigned size = (unsigned)((pta >> 2) & 0x3F);
+    bool long_format = (pta & (1ull << 8)) != 0;
+    unsigned rr_ps = (unsigned)((rr >> 2) & 0x3F);
+    unsigned ps = rr_ps < 12 ? 12 : rr_ps;    /* region's preferred page size */
+
+    /* IA64_IMPL_VA_MSB=60 in the reference model: the full 61-bit payload
+     * below the 3-bit region field is implemented, so there are no
+     * unimplemented bits to sign-extend/validate here. */
+    uint64_t payload = va & ((1ull << 61) - 1);
+    uint64_t hpn = payload >> ps;
+    uint32_t rid = (uint32_t)((rr >> 8) & 0xFFFFFFull);
+
+    if (!long_format) {
+        uint64_t region = va & (0x7ull << 61);
+        uint64_t offset = hpn << 3;
+        uint64_t mask = (1ull << size) - 1;
+        uint64_t base = pta & (((1ull << 61) - 1) & ~0x7FFFull);
+        return region | ((base & ~mask) | (offset & mask));
+    }
+    if (size < 5)
+        return va;                            /* table smaller than one entry */
+    {
+        uint64_t base = pta & ~0x7FFFull;
+        uint64_t entries = 1ull << (size - 5);
+        uint64_t hash = (hpn ^ (hpn >> 7) ^ rid) & (entries - 1);
+        uint64_t offset = hash << 5;
+        uint64_t mask = (1ull << size) - 1;
+        return (base & ~mask) | (offset & mask);
+    }
+}
+
 static int vhpt_walk(Merced *m, uint64_t va, bool ifetch) {
     dbg_vhpt_calls++;
     uint64_t pta = m->cr[CR_PTA];
@@ -1371,25 +1476,11 @@ static int vhpt_walk(Merced *m, uint64_t va, bool ifetch) {
      * unimplemented bits to sign-extend/validate here. */
     uint64_t payload = va & ((1ull << 61) - 1);
     uint64_t hpn = payload >> ps;
-    uint32_t rid = (uint32_t)((rr >> 8) & 0xFFFFFF);
+    uint32_t rid = (uint32_t)((rr >> 8) & 0xFFFFFFull);
 
-    uint64_t entry_va;
-    if (!long_format) {
-        uint64_t region = va & (0x7ull << 61);
-        uint64_t offset = hpn << 3;
-        uint64_t mask = (1ull << size) - 1;
-        uint64_t base = pta & (((1ull << 61) - 1) & ~0x7FFFull);
-        entry_va = region | ((base & ~mask) | (offset & mask));
-    } else {
-        if (size < 5)
-            return VHPT_MISS;                /* table smaller than one entry */
-        uint64_t base = pta & ~0x7FFFull;
-        uint64_t entries = 1ull << (size - 5);
-        uint64_t hash = (hpn ^ (hpn >> 7) ^ rid) & (entries - 1);
-        uint64_t offset = hash << 5;
-        uint64_t mask = (1ull << size) - 1;
-        entry_va = (base & ~mask) | (offset & mask);
-    }
+    if (long_format && size < 5)
+        return VHPT_MISS;                    /* table smaller than one entry */
+    uint64_t entry_va = vhpt_hash_address(m, va);
 
     uint64_t entry_pa;
     if (!vhpt_entry_pa(m, entry_va, &entry_pa)) {
@@ -1658,8 +1749,15 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                 return deliver_fault(m, VEC_BREAK, 0, 0, false);
             }
             case 0x01: return MERCED_OK;            /* nop.m / hint.m */
-            case 0x10: return MERCED_OK;            /* invala */
-            case 0x12: case 0x13: return MERCED_OK; /* invala.e */
+            case 0x10:                              /* invala */
+                if (qp)
+                    memset(m->alat, 0, sizeof(m->alat));
+                return MERCED_OK;
+            case 0x12:                              /* invala.e r */
+                if (qp)
+                    alat_invalidate_reg(m, r1);
+                return MERCED_OK;
+            case 0x13: return MERCED_OK;            /* invala.e f (FP ALAT TBD) */
             case 0x20: return MERCED_OK;            /* fwb */
             case 0x22: case 0x23: return MERCED_OK; /* mf / mf.a */
             case 0x28: {                            /* M30 mov.m ar3=imm8 */
@@ -1678,12 +1776,13 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         }
         if (x3 >= 4) {                              /* M22/M23 chk.a */
             if (!qp) return MERCED_OK;
-            /* We do not model the ALAT.  Architecturally, an implementation
-             * may conservatively fail chk.a even when an entry might have
-             * matched; with no entry tracking, failure is the only safe
-             * result.  Treating every check as success lets lock-free code
-             * consume stale advanced loads and corrupt structures such as
-             * NT's pool free lists. */
+            /* x3 4/5 check an integer GR; 6/7 check an FP register.  Odd x3
+             * forms clear a matching entry.  FP ALAT entries are not yet
+             * modeled, so FP checks conservatively fail. */
+            unsigned reg = (unsigned)bits(raw, 6, 7);
+            bool hit = x3 < 6 && alat_check_reg(m, reg, x3 & 1);
+            if (hit)
+                return MERCED_OK;
             int64_t disp = sext((bits(raw, 36, 1) << 20) |
                                 (bits(raw, 20, 13) << 7) |
                                 bits(raw, 6, 7), 21) << 4;
@@ -1762,7 +1861,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x09: case 0x0A: case 0x0B: {              /* ptc.l/g/ga */
         uint64_t va = gr_read(m, r3, &n3);
         uint64_t ps = (gr_read(m, r2, &n2) >> 2) & 0x3F;
-        uint32_t rid = (uint32_t)((m->rr[va >> 61] >> 8) & 0xFFFFFF);
+        uint32_t rid = (uint32_t)((m->rr[va >> 61] >> 8) & 0xFFFFFFull);
         uint64_t len = ps >= 64 ? ~0ull : 1ull << ps;
         tlb_purge(m, m->itc, MERCED_N_TC, rid, va, len);
         tlb_purge(m, m->dtc, MERCED_N_TC, rid, va, len);
@@ -1771,7 +1870,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x0C: case 0x0D: {                         /* ptr.d / ptr.i */
         uint64_t va = gr_read(m, r3, &n3);
         uint64_t ps = (gr_read(m, r2, &n2) >> 2) & 0x3F;
-        uint32_t rid = (uint32_t)((m->rr[va >> 61] >> 8) & 0xFFFFFF);
+        uint32_t rid = (uint32_t)((m->rr[va >> 61] >> 8) & 0xFFFFFFull);
         uint64_t len = ps >= 64 ? ~0ull : 1ull << ps;
         if (x6 == 0x0C) {
             tlb_purge(m, m->dtr, MERCED_N_TR, rid, va, len);
@@ -1836,7 +1935,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         bool present = !(m->psr & PSR_DT);
         if (!present) {
             unsigned vrn = (unsigned)(va >> 61);
-            uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
+            uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
             const MercedTlbEntry *e = tlb_search(m->dtr, MERCED_N_TR,
                                                   rid, va);
             if (!e) e = tlb_search(m->dtc, MERCED_N_TC, rid, va);
@@ -1863,7 +1962,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x1B: {                                    /* ttag */
         uint64_t va = gr_read(m, r3, &n3);
         unsigned vrn = (unsigned)(va >> 61);
-        uint64_t rid = (m->rr[vrn] >> 8) & 0xFFFFFF;
+        uint64_t rid = (m->rr[vrn] >> 8) & 0xFFFFFFull;
         unsigned ps = (unsigned)((m->rr[vrn] >> 2) & 0x3F);
         unsigned hpn_bits = ps > 60 ? 0 : 61 - ps;
         uint64_t hpn = (va & 0x1FFFFFFFFFFFFFFFull) >> ps;

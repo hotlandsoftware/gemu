@@ -141,6 +141,16 @@ typedef struct Merced {
     MercedTlbEntry itc[MERCED_N_TC], dtc[MERCED_N_TC];
     uint32_t itc_next, dtc_next;
 
+    /* Integer Advanced Load Address Table.  Merced exposes 32 ALAT entries;
+     * an entry associates an advanced-load destination register with the
+     * physical byte range that supplied it. */
+    struct {
+        uint64_t phys_addr;
+        uint8_t  size;
+        uint8_t  reg;
+        uint8_t  valid;
+    } alat[32];
+
     /* Interval-timer external interrupt: edge-latched when ar.itc crosses
      * cr.itm, delivered at the next instruction boundary if psr.i is set,
      * acknowledged (cleared) by a cr.ivr read. Real firmware relies on this
@@ -178,6 +188,11 @@ typedef struct Merced {
      * (e.g. the monitor's "reset" command, or a machine's own reset
      * handling) rather than reverting to the default every time. */
     uint8_t  cpu_revision;
+
+    /* cpuid[3] model field (bits 23:16) - 0 = Merced (Itanium), 1 =
+     * McKinley (Itanium 2). Set via merced_set_cpu_model(); survives
+     * merced_reset() the same way cpu_revision does. */
+    uint8_t  cpu_model;
 } Merced;
 
 Merced *merced_create(const MercedBus *bus);
@@ -189,6 +204,11 @@ void    merced_reset(Merced *m);
  * merced_reset(). See the comment on cpuid[3] in merced_reset() for
  * what's known about which values work where. */
 void    merced_set_cpu_revision(Merced *m, uint8_t revision);
+
+/* Overrides the family model Windows/firmware sees in cpuid[3]'s model
+ * field (bits 23:16): 0 = Merced (Itanium), 1 = McKinley (Itanium 2).
+ * Takes effect immediately and persists across merced_reset(). */
+void    merced_set_cpu_model(Merced *m, uint8_t model);
 
 /* Execute one instruction slot. On anything but MERCED_OK, halt_msg
  * describes why and the CPU is stopped at the offending IP. */

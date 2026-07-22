@@ -32,7 +32,7 @@ static const GemuDevDesc machines[] = {
 };
 
 static const GemuDevDesc cpus[] = {
-    { "merced", "Intel Itanium (Merced) [skeleton]" },
+    { "merced",   "Intel Itanium (Merced) [preliminary]" },
 };
 
 static const GemuArgsDef def = {
@@ -135,7 +135,8 @@ int ia64_setup(int argc, char *argv[]) {
         }
     }
 
-    if (args.cpu && strcmp(args.cpu, "merced") != 0) {
+    if (args.cpu && strcmp(args.cpu, "merced") != 0 &&
+        strcmp(args.cpu, "mckinley") != 0) {
         fprintf(stderr, "gemu: unknown ia64 CPU '%s' (use -cpu ? to list)\n", args.cpu);
         return 1;
     }
@@ -176,6 +177,7 @@ int ia64_setup(int argc, char *argv[]) {
             .display_scale = cfg.display_scale,
             .no_shutdown = cfg.no_shutdown,
             .cdrom_path = cfg.cdrom_path,
+            .cpu = args.cpu,
         };
         Ia64GenericState *g = ia64_generic_create(&gcfg);
         if (!g)
