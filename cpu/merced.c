@@ -125,8 +125,6 @@ static uint64_t gr_read(Merced *m, unsigned r, uint8_t *nat) {
 }
 
 static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
-    static int mi_r36_slot = -1;
-    static unsigned mi_r36_writes;
     if (r == 0) return;   /* writes to r0 fault on HW; ignore here */
     if (r < 16) { m->gr_static[r] = v; m->nat_static[r] = nat; return; }
     if (r < 32) {
@@ -149,19 +147,6 @@ static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
     int64_t pos = (int64_t)m->bof_total + logical;
     if (pos < m->rse_flushed_regs)
         m->rse_flushed_regs = pos;
-    if (getenv("MERCED_R36_DEBUG") && mi_r36_slot >= 0 &&
-        p == (unsigned)mi_r36_slot && mi_r36_writes++ < 256)
-        fprintf(stderr, "merced: MiCreate physical[%u] via r%u %016" PRIX64
-                " -> %016" PRIX64 " at %016" PRIX64 "\n",
-                p, r, m->gr_stack[p], v, m->ip);
-    if (getenv("MERCED_R36_DEBUG") && r == 36 &&
-        m->ip >= UINT64_C(0xE00000008352D4C0) &&
-        m->ip < UINT64_C(0xE00000008352DA20)) {
-        mi_r36_slot = (int)p;
-        fprintf(stderr, "merced: MiCreate r36 %016" PRIX64
-                " -> %016" PRIX64 " at %016" PRIX64 "\n",
-                m->gr_stack[p], v, m->ip);
-    }
     m->gr_stack[p] = v;
     m->nat_stack[p] = nat;
 }
@@ -343,9 +328,20 @@ static bool interrupt_unmasked(Merced *m, uint8_t vector) {
     return (vector & 0xF0u) > (tpr & 0xF0u);
 }
 
+static uint64_t fault_vector_counts[0x5B];
+
+void merced_fault_stats(uint64_t *counts, size_t count) {
+    if (count > sizeof(fault_vector_counts) / sizeof(fault_vector_counts[0]))
+        count = sizeof(fault_vector_counts) / sizeof(fault_vector_counts[0]);
+    memcpy(counts, fault_vector_counts, count * sizeof(*counts));
+}
+
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     m->nfaults++;
+    if ((vec & 0xFF) == 0 && (vec >> 8) <
+        sizeof(fault_vector_counts) / sizeof(fault_vector_counts[0]))
+        fault_vector_counts[vec >> 8]++;
     static unsigned low_fault_debug;
     if (getenv("MERCED_FAULT_DEBUG") && (m->ip >> 61) == 7 &&
         set_ifa && ifa < UINT64_C(0x100000) && low_fault_debug++ < 32) {
@@ -361,13 +357,6 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                     r + 2, gr_read(m, r + 2, NULL),
                     r + 3, gr_read(m, r + 3, NULL));
     }
-    static unsigned init_fault_debug;
-    if (getenv("MERCED_FAULT_DEBUG") &&
-        ifa - UINT64_C(0xE000000600000000) < UINT64_C(0x02000000) &&
-        init_fault_debug++ < 32)
-        fprintf(stderr, "merced: init-arena fault vec=%04X ip=%016" PRIX64
-                " ifa=%016" PRIX64 " iha=%016" PRIX64 " ic=%u\n",
-                vec, m->ip, ifa, m->cr[CR_IHA], !!(m->psr & PSR_IC));
     if (merced_dbg() &&
         (vec == VEC_ITLB || vec == VEC_DTLB ||
          vec == VEC_ALT_ITLB || vec == VEC_ALT_DTLB) && m->nfaults <= 16) {
@@ -487,50 +476,9 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
         *pa = va & MERCED_PHYS_MASK;
         return true;
     }
-    /* IA-64 region 5 is the conventional uncacheable physical aperture
-     * used by NT's HAL and firmware for early MMIO/physical accesses.  It
-     * does not require a VHPT entry; strip the region bits and access the
-     * corresponding physical address. */
-    if ((va >> 61) == 5) {
-        *pa = va & 0x1FFFFFFFFFFFFFFFull;
-        return true;
-    }
     unsigned vrn = (unsigned)(va >> 61);
     uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFF);
     uint64_t lookup_va = va;
-    /* PAL leaves a bootstrap identity mapping over the firmware ROM: code
-     * keeps executing through the top-of-4-GiB alias after SAL enables
-     * translation, with only its RAM-shadow ranges in the visible TRs.
-     * Model that as a fixed ifetch window straight to the ROM PA. */
-    if (ifetch && ((va >= 0xFFC00000ull && va <= 0xFFFFFFFFull) ||
-                   /* The generic EFI loader executes its final low-RAM
-                    * transition trampoline with psr.it enabled before NT
-                    * owns cr.iva or has installed a software TLB-miss
-                    * handler.  Keep the same bootstrap identity window for
-                    * instruction fetches that generic firmware already
-                    * supplies for data references. */
-                   (va >= 0x400000ull && va < 0x10000000ull))) {
-        *pa = va & MERCED_PHYS_MASK;
-        return true;
-    }
-    /* ... and matching pinned data translations for the firmware range and
-     * the I/O port block (SAL hand-off state: firmware code/data and I/O
-     * port space stay accessible in virtual mode). The I/O window also
-     * matches the region-4 alias the firmware uses for UC accesses. */
-    if (!ifetch) {
-        uint64_t v61 = va & 0x1FFFFFFFFFFFFFFFull;
-        if ((va >= 0xFFC00000ull && va <= 0xFFFFFFFFull) ||
-            (va >= 0xA0000ull && va < 0xC0000ull) ||
-            /* The generic EFI ROM keeps its pool bump pointer and console
-             * cursor in this reserved low-RAM scratch area.  EFI callbacks
-             * remain callable after SETUPLDR enables psr.dt, before it has
-             * installed translations for firmware-private data. */
-            (va >= 0x400000ull && va < 0x10000000ull) ||
-            v61 - 0xFFFFC000000ull < 0x4000000ull) {
-            *pa = v61 & MERCED_PHYS_MASK;
-            return true;
-        }
-    }
     const MercedTlbEntry *e =
         tlb_search(ifetch ? m->itr : m->dtr, MERCED_N_TR, rid, lookup_va);
     if (!e)
@@ -546,47 +494,23 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
         if (!e)
             e = tlb_search(m->itc, MERCED_N_TC, rid, lookup_va);
     }
-    /* NT/IA-64 uses region 7 as its linear mapping of physical RAM.  Early
-     * boot pins the kernel image in a DTR, then allocates ordinary pool pages
-     * through its VA=region7|0x80000000|PA window without installing a separate
-     * translation for each page.  Preserve explicit TR/TC mappings above,
-     * but provide the architectural linear-RAM fallback for the generic
-     * machine's advertised 2-GiB memory below. */
-    if (!e && vrn == 7 && !ifetch) {
-        uint64_t linear = va & UINT64_C(0x1fffffffffffffff);
-        if (linear >= UINT64_C(0x80000000) &&
-            linear - UINT64_C(0x80000000) < UINT64_C(0x80000000)) {
-            *pa = linear - UINT64_C(0x80000000);
-            return true;
+    /* Before ExitBootServices, the SAL environment owns the IVT and services
+     * loader translation misses with identity mappings.  This is firmware
+     * handoff behavior, not a permanent region shortcut: it is active only
+     * while the generic firmware IVA is installed and interruption state is
+     * collectible.  Explicit guest TR/TC entries above always win.  This
+     * matches ia64_sal_boot_virtual_pa() in the reference IA-64 QEMU core. */
+    if (!e && m->cr[CR_IVA] == UINT64_C(0x00000000FFF80000) &&
+        (m->psr & PSR_IC) && vrn == 0 &&
+        va < UINT64_C(0x0000010000000000)) {
+        *pa = va;
+        if (getenv("MERCED_MMU_DEBUG")) {
+            static unsigned sal_identity_debug;
+            if (sal_identity_debug++ < 128)
+                fprintf(stderr, "merced: XLATE SAL identity ip=%016" PRIX64
+                        " va=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                        m->ip, va, m->ninsts);
         }
-    }
-    /* NT's early system-PTE arena is established before the page-table
-     * pages that describe it are themselves reachable by the hardware VHPT
-     * walker.  Keep the bootstrap backing narrowly confined to that arena;
-     * explicit TR/TC entries and later VHPT mappings still take precedence. */
-    const uint64_t nt_pte_base = UINT64_C(0xE000010600000000);
-    const uint64_t nt_pte_span = UINT64_C(0x02000000);
-    if (!e && !ifetch && va >= nt_pte_base &&
-        va - nt_pte_base < nt_pte_span) {
-        uint64_t save_ifa = m->cr[CR_IFA], save_itir = m->cr[CR_ITIR];
-        uint64_t backing = UINT64_C(0x1D000000) + (va - nt_pte_base);
-        m->cr[CR_IFA] = va;
-        m->cr[CR_ITIR] = UINT64_C(13) << 2;
-        tlb_insert(m, &m->dtc[m->dtc_next++ % MERCED_N_TC],
-                   (backing & ~UINT64_C(0x1FFF)) | 1, false);
-        m->cr[CR_IFA] = save_ifa;
-        m->cr[CR_ITIR] = save_itir;
-        e = tlb_search(m->dtc, MERCED_N_TC, rid, lookup_va);
-    }
-    /* NT maps its native NLS tables into the initial process at 0x10000.
-     * The reservation is represented by demand-zero software PTEs, but at
-     * this point the region-0 VHPT page needed to take the first fault is
-     * not itself reachable.  Bootstrap only that allocation, and only under
-     * this retail kernel's exact IVA/PTA configuration. */
-    if (!e && !ifetch && va >= UINT64_C(0x10000) && va < UINT64_C(0x40000) &&
-        m->cr[CR_IVA] == UINT64_C(0xE000000083190000) &&
-        m->cr[CR_PTA] == UINT64_C(0x1FF80000000000CD)) {
-        *pa = UINT64_C(0x1C000000) + (va - UINT64_C(0x10000));
         return true;
     }
     if (!e) {
@@ -628,6 +552,11 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
         else
             fvec = walker ? VEC_DTLB : VEC_ALT_DTLB;
         *st = deliver_fault(m, fvec, isr_access, va, true);
+        return false;
+    }
+    if (!(e->pte & 1)) {
+        if (spec) return false;
+        *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT, isr_access, va, true);
         return false;
     }
     *pa = (e->pfn_base + (lookup_va - e->va_start)) & MERCED_PHYS_MASK;
@@ -1316,7 +1245,12 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
             tc[i].va_start <= new_end && new_start <= tc[i].va_end)
             tc[i].valid = 0;
     }
-    e->valid = (uint8_t)(pte & 1);
+    /* TC occupancy and PTE.p are distinct architectural state.  A VHPT
+     * walk may cache a non-present translation; subsequent references hit
+     * that TC entry and raise Page Not Present.  Conflating P=0 with an
+     * unused slot made probes and software refill logic observe a TLB miss
+     * instead of the translation Windows actually published. */
+    e->valid = 1;
     e->rid = rid;
     e->va_start = new_start;
     e->va_end = new_end;
@@ -1324,19 +1258,21 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
     e->ps = (uint8_t)ps;
     e->itir = itir;
     e->pte = pte;
-    if (getenv("MERCED_FAULT_DEBUG") &&
-        e->va_start - UINT64_C(0xE000000600000000) < UINT64_C(0x02000000))
-        fprintf(stderr, "merced: init-arena TC %c va=%016" PRIX64
-                " pa=%016" PRIX64 " ps=%u pte=%016" PRIX64 "\n",
-                instruction ? 'I' : 'D', e->va_start, e->pfn_base, ps, pte);
     static unsigned mmu_debug_inserts;
-    if ((m->ip >> 61) == 7 && getenv("MERCED_MMU_DEBUG") &&
-        mmu_debug_inserts++ < 512)
-        fprintf(stderr, "merced: TC insert %c ip=%016" PRIX64
+    if (getenv("MERCED_MMU_DEBUG") && mmu_debug_inserts++ < 2048) {
+        const char *kind = instruction ? "ITC" : "DTC";
+        unsigned index = 0;
+        for (unsigned i = 0; i < MERCED_N_TR; i++) {
+            if (e == &m->itr[i]) { kind = "ITR"; index = i; break; }
+            if (e == &m->dtr[i]) { kind = "DTR"; index = i; break; }
+        }
+        fprintf(stderr, "merced: XLATE install %s[%u] ip=%016" PRIX64
                 " va=%016" PRIX64 " pa=%016" PRIX64
-                " ps=%u rid=%06X pte=%016" PRIX64 " valid=%u\n",
-                instruction ? 'I' : 'D', m->ip, e->va_start, e->pfn_base,
-                ps, e->rid, pte, e->valid);
+                " ps=%u rid=%06X pte=%016" PRIX64 " valid=%u"
+                " ninsts=%" PRIu64 "\n",
+                kind, index, m->ip, e->va_start, e->pfn_base,
+                ps, e->rid, pte, e->valid, m->ninsts);
+    }
     if (merced_dbg() && tlb_debug_events < TLB_DEBUG_MAX) {
         tlb_debug_events++;
         fprintf(stderr, "merced: insert %c ip=%016" PRIX64
@@ -1358,14 +1294,6 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
 static bool vhpt_entry_pa(Merced *m, uint64_t entry_va, uint64_t *pa) {
     if (!(m->psr & PSR_DT)) {
         *pa = entry_va & MERCED_PHYS_MASK;
-        return true;
-    }
-    uint64_t v61 = entry_va & 0x1FFFFFFFFFFFFFFFull;
-    if ((entry_va >= 0xFFC00000ull && entry_va <= 0xFFFFFFFFull) ||
-        (entry_va >= 0xA0000ull && entry_va < 0xC0000ull) ||
-        (entry_va >= 0x400000ull && entry_va < 0x10000000ull) ||
-        v61 - 0xFFFFC000000ull < 0x4000000ull) {
-        *pa = v61 & MERCED_PHYS_MASK;
         return true;
     }
     unsigned vrn = (unsigned)(entry_va >> 61);
@@ -1482,45 +1410,28 @@ static int vhpt_walk(Merced *m, uint64_t va, bool ifetch) {
         }
     }
     if (!(pte & 1)) {
-        /* NT 5.1/IA-64 constructs this early mapped-copy arena with its
-         * physical frame already recorded in a software transition PTE
-         * (bit 1) before the normal fault path is able to promote it.  The
-         * frame is real -- consecutive entries name consecutive 8 KiB
-         * pages -- so install the equivalent writable kernel TC entry from
-         * that PFN.  This is deliberately restricted to NT's 32 MiB arena
-         * and does not alter the guest's software PTE, page accounting, or
-         * any other OS's translation behavior. */
-        if (!ifetch && (pte & 2) &&
-            va - UINT64_C(0xE000000600000000) < UINT64_C(0x02000000)) {
-            /* MMPTE_TRANSITION stores PageFrameNumber starting at bit 15;
-             * an architectural IA-64 PTE stores the 8 KiB physical base
-             * starting at bit 13.  Thus consecutive transition entries
-             * differ by 0x8000 while their actual frames differ by 0x2000. */
-            uint64_t pa = (pte & UINT64_C(0x00000FFFFFFF8000)) >> 2;
-            uint64_t hw_pte = UINT64_C(0x0010000000000000) | pa |
-                              UINT64_C(0x661);
-            uint64_t save_ifa = m->cr[CR_IFA];
-            uint64_t save_itir = m->cr[CR_ITIR];
-            m->cr[CR_IFA] = va;
-            m->cr[CR_ITIR] = (uint64_t)ps << 2;
-            tlb_insert(m, &m->dtc[m->dtc_next++ % MERCED_N_TC],
-                       hw_pte, false);
-            m->cr[CR_IFA] = save_ifa;
-            m->cr[CR_ITIR] = save_itir;
-            return VHPT_HIT;
-        }
         dbg_vhpt_np++;
-        static unsigned init_np_debug;
-        if (getenv("MERCED_FAULT_DEBUG") &&
-            va - UINT64_C(0xE000000600000000) < UINT64_C(0x02000000) &&
-            init_np_debug++ < 32)
-            fprintf(stderr, "merced: init-arena VHPT NP va=%016" PRIX64
+        static unsigned vhpt_np_debug;
+        bool sample_np = dbg_vhpt_np &&
+                         !(dbg_vhpt_np & (dbg_vhpt_np - 1));
+        if (getenv("MERCED_MMU_DEBUG") &&
+            (vhpt_np_debug++ < 128 || sample_np))
+            fprintf(stderr, "merced: XLATE VHPT not-present ip=%016" PRIX64
+                    " va=%016" PRIX64
                     " entry_va=%016" PRIX64 " entry_pa=%016" PRIX64
-                    " pte=%016" PRIX64 "\n",
-                    va, entry_va, entry_pa, pte);
-        /* An accessible VHPT entry with P=0 is architecturally a Page Not
-         * Present fault, not a DTLB miss.  The latter merely asks software
-         * to refill and causes an infinite retry when no translation exists. */
+                    " pte=%016" PRIX64 " ps=%u rid=%06X"
+                    " ninsts=%" PRIu64 "\n",
+                    m->ip, va, entry_va, entry_pa, pte, ps, rid, m->ninsts);
+        uint64_t save_ifa = m->cr[CR_IFA], save_itir = m->cr[CR_ITIR];
+        m->cr[CR_IFA] = va;
+        m->cr[CR_ITIR] = itir;
+        tlb_insert(m, ifetch ? &m->itc[m->itc_next++ % MERCED_N_TC]
+                            : &m->dtc[m->dtc_next++ % MERCED_N_TC],
+                   pte, ifetch);
+        m->cr[CR_IFA] = save_ifa;
+        m->cr[CR_ITIR] = save_itir;
+        /* An accessible VHPT entry with P=0 is architecturally cached and
+         * raises Page Not Present, matching the reference IA-64 walker. */
         return VHPT_NOT_PRESENT;
     }
     dbg_vhpt_hit++;
@@ -1540,11 +1451,18 @@ static int vhpt_walk(Merced *m, uint64_t va, bool ifetch) {
     return VHPT_HIT;
 }
 
-static void tlb_purge(MercedTlbEntry *t, int n, uint32_t rid,
+static void tlb_purge(Merced *m, MercedTlbEntry *t, int n, uint32_t rid,
                       uint64_t va, uint64_t len) {
     for (int i = 0; i < n; i++) {
         if (t[i].valid && t[i].rid == rid &&
             t[i].va_start < va + len && va <= t[i].va_end) {
+            if (getenv("MERCED_MMU_DEBUG"))
+                fprintf(stderr, "merced: XLATE purge ip=%016" PRIX64
+                        " va=%016" PRIX64 " len=%016" PRIX64
+                        " rid=%06X hit=%016" PRIX64 "-%016" PRIX64
+                        " ninsts=%" PRIu64 "\n",
+                        m->ip, va, len, rid, t[i].va_start, t[i].va_end,
+                        m->ninsts);
             t[i].valid = 0;
             if (merced_dbg() && tlb_debug_events < TLB_DEBUG_MAX) {
                 tlb_debug_events++;
@@ -1834,8 +1752,8 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         uint64_t ps = (gr_read(m, r2, &n2) >> 2) & 0x3F;
         uint32_t rid = (uint32_t)((m->rr[va >> 61] >> 8) & 0xFFFFFF);
         uint64_t len = ps >= 64 ? ~0ull : 1ull << ps;
-        tlb_purge(m->itc, MERCED_N_TC, rid, va, len);
-        tlb_purge(m->dtc, MERCED_N_TC, rid, va, len);
+        tlb_purge(m, m->itc, MERCED_N_TC, rid, va, len);
+        tlb_purge(m, m->dtc, MERCED_N_TC, rid, va, len);
         return MERCED_OK;
     }
     case 0x0C: case 0x0D: {                         /* ptr.d / ptr.i */
@@ -1844,11 +1762,11 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         uint32_t rid = (uint32_t)((m->rr[va >> 61] >> 8) & 0xFFFFFF);
         uint64_t len = ps >= 64 ? ~0ull : 1ull << ps;
         if (x6 == 0x0C) {
-            tlb_purge(m->dtr, MERCED_N_TR, rid, va, len);
-            tlb_purge(m->dtc, MERCED_N_TC, rid, va, len);
+            tlb_purge(m, m->dtr, MERCED_N_TR, rid, va, len);
+            tlb_purge(m, m->dtc, MERCED_N_TC, rid, va, len);
         } else {
-            tlb_purge(m->itr, MERCED_N_TR, rid, va, len);
-            tlb_purge(m->itc, MERCED_N_TC, rid, va, len);
+            tlb_purge(m, m->itr, MERCED_N_TR, rid, va, len);
+            tlb_purge(m, m->itc, MERCED_N_TC, rid, va, len);
         }
         return MERCED_OK;
     }
@@ -2079,70 +1997,6 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             case 0x00: {                            /* break.i */
                 uint64_t imm = (bits(raw, 36, 1) << 20) | bits(raw, 6, 20);
                 if (!qp) return MERCED_OK;
-                if (imm == 0x80016 && (m->ip >> 61) == 7) {
-                    static bool reported_nt_bugcheck;
-                    if (!reported_nt_bugcheck) {
-                        uint64_t bug[5];
-                        for (unsigned i = 0; i < 5; i++)
-                            bug[i] = phys_read(m, UINT64_C(0x031F7EC0) + i * 8, 8);
-                        reported_nt_bugcheck = true;
-                        fprintf(stderr, "merced: NT KiBugCheckData = %016" PRIX64
-                                " %016" PRIX64 " %016" PRIX64
-                                " %016" PRIX64 " %016" PRIX64 "\n",
-                                bug[0], bug[1], bug[2], bug[3], bug[4]);
-                        /* NT's boot-video callback has not been registered at
-                         * this early failure point.  Paint its published STOP
-                         * data through the actual VGA text aperture so a
-                         * headless debugger is not required to see the crash. */
-                        char stop[81];
-                        snprintf(stop, sizeof(stop),
-                                 "*** STOP: 0x%08" PRIX64
-                                 " (0x%016" PRIX64 ",0x%016" PRIX64 ",",
-                                 bug[0] & UINT64_C(0xffffffff), bug[1], bug[2]);
-                        /* The VGA GC memory-map selector may leave text mode
-                         * visible while its CPU aperture is based at A0000,
-                         * B0000, or B8000.  Writes to inactive windows merely
-                         * land in the generic machine's legacy RAM hole, so
-                         * mirror each cell through all three standard bases;
-                         * exactly one reaches the active VGA planes. */
-                        static const uint64_t vga_bases[] = {
-                            UINT64_C(0xA0000), UINT64_C(0xB0000),
-                            UINT64_C(0xB8000),
-                        };
-                        for (unsigned cell = 0; cell < 80 * 25; cell++) {
-                            for (unsigned b = 0;
-                                 b < sizeof(vga_bases) / sizeof(vga_bases[0]); b++) {
-                                phys_write(m, vga_bases[b] + cell * 2, ' ', 1);
-                                phys_write(m, vga_bases[b] + cell * 2 + 1, 0x1f, 1);
-                            }
-                        }
-                        const char *lines[] = {
-                            "A problem has been detected and Windows has been shut down",
-                            "to prevent damage to your computer.",
-                            "",
-                            stop,
-                        };
-                        for (unsigned row = 0; row < sizeof(lines) / sizeof(lines[0]); row++) {
-                            const char *s = lines[row];
-                            unsigned screen_row = row + 2;
-                            for (unsigned col = 0; s[col] && col < 80; col++)
-                                for (unsigned b = 0;
-                                     b < sizeof(vga_bases) / sizeof(vga_bases[0]); b++)
-                                    phys_write(m, vga_bases[b] +
-                                               (screen_row * 80 + col) * 2,
-                                               (uint8_t)s[col], 1);
-                        }
-                        snprintf(stop, sizeof(stop),
-                                 "          0x%016" PRIX64 ",0x%016" PRIX64 ")",
-                                 bug[3], bug[4]);
-                        for (unsigned col = 0; stop[col] && col < 80; col++)
-                            for (unsigned b = 0;
-                                 b < sizeof(vga_bases) / sizeof(vga_bases[0]); b++)
-                                phys_write(m, vga_bases[b] + (7 * 80 + col) * 2,
-                                           (uint8_t)stop[col], 1);
-                        return mhalt(m, "NT bugcheck displayed on VGA");
-                    }
-                }
                 m->cr[CR_IIM] = imm;
                 return deliver_fault(m, VEC_BREAK, 0, 0, false);
             }
@@ -3043,57 +2897,6 @@ MercedStatus merced_step(Merced *m) {
         }
     }
 
-    /* Retail XP's HAL treats an unavailable optional SAL machine-check
-     * parameter service as fatal during phase-one initialization.  The
-     * generic firmware implements these registrations as successful no-ops;
-     * reflect that result at the HAL's status check while its virtual SAL
-     * dispatcher is still being brought up. */
-    if (m->ip == UINT64_C(0xE0000000835C2D10) &&
-        (int64_t)gr_read(m, 31, NULL) < 0)
-        gr_write(m, 31, 0, 0);
-    if (m->ip == UINT64_C(0xE0000000835C2DB1) &&
-        (int64_t)gr_read(m, 27, NULL) < 0)
-        gr_write(m, 27, 0, 0);
-    if (m->ip == UINT64_C(0xE0000000835C2F01) &&
-        (int64_t)gr_read(m, 25, NULL) < 0)
-        gr_write(m, 25, 0, 0);
-    if (m->ip == UINT64_C(0xE0000000835C2FC2) &&
-        (int64_t)gr_read(m, 20, NULL) < 0)
-        gr_write(m, 20, 0, 0);
-    if (m->ip == UINT64_C(0xE0000000835C30D1) &&
-        (int64_t)gr_read(m, 27, NULL) < 0)
-        gr_write(m, 27, 0, 0);
-    if (m->ip == UINT64_C(0xE0000000835C3181) &&
-        (int64_t)gr_read(m, 30, NULL) < 0)
-        gr_write(m, 30, 0, 0);
-    /* The follow-up platform verification helper incorrectly receives the
-     * bootstrap processor as index zero and rejects it; the generic machine
-     * has already supplied and verified that sole enabled LSAPIC. */
-    if (m->ip == UINT64_C(0xE0000000835C2E10) &&
-        gr_read(m, 8, NULL) == 0)
-        gr_write(m, 8, 1, 0);
-    /* Until the generic platform grows the HAL's interrupt-emulation lock
-     * backing, keep its bootstrap byte lock in an otherwise unused mapped
-     * kernel page instead of letting the null pointer refault forever. */
-    if (m->ip == UINT64_C(0xE000000083580760) &&
-        gr_read(m, 32, NULL) == 0)
-        gr_write(m, 32, UINT64_C(0xE0000000831FF000), 0);
-    /* A bootstrap kernel list head can still contain an uninitialised saved
-     * PSR-shaped value at this point.  Treat a noncanonical head as the
-     * empty circular list the initializer expects. */
-
-    /* Retail XP/IA-64's boot kernel otherwise believes a kernel debugger is
-     * attached and parks in KdpEnterDebugger when setup bugchecks.  The
-     * generic machine exposes no KD transport, so keep the kernel's exported
-     * KdDebuggerNotPresent/KdDebuggerEnabled bytes truthful.  Their physical
-     * locations follow directly from the kernel's region-7 DTR mapping and
-     * are deliberately confined to this known retail image. */
-    if ((m->ip & UINT64_C(0x1FFFFFFFFF000000)) ==
-        UINT64_C(0x0000000083000000)) {
-        phys_write(m, UINT64_C(0x031C7E50), 1, 1); /* NotPresent */
-        phys_write(m, UINT64_C(0x031C7E51), 0, 1); /* Enabled */
-    }
-
     if (m->external_pending && interrupt_unmasked(m, m->external_vector) &&
         (m->psr & PSR_I) && (m->psr & PSR_IC)) {
         MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
@@ -3118,61 +2921,6 @@ MercedStatus merced_step(Merced *m) {
     unsigned slot = (unsigned)(m->ip & 0xF);
     uint64_t pa;
     MercedStatus st;
-
-    if (getenv("MERCED_TARGET_BREAK") &&
-        m->ip == UINT64_C(0xE00000008352D580))
-        return mhalt(m, "diagnostic breakpoint at MiCreateMemoryEvent");
-
-    /* EXPERIMENTAL, not a real fix: VA 0 is never legitimately executable.
-     * Reaching it is the signature of an indirect call through a null IA-64
-     * function descriptor (entry point and gp both read back as 0 from
-     * zero-filled RAM). Real firmware is presumably supposed to null-check
-     * before such a call; something upstream isn't, or the check we haven't
-     * found yet is being bypassed. Rather than crash, treat it as if the
-     * call immediately returned (br.ret b0), to see how much further boot
-     * gets past this specific landmine. This is a diagnostic bisection aid,
-     * not a fix for the real bug (see i2000 project memory, "third
-     * investigation round" and later, 2026-07-18). */
-    if (bundle_va == 0) {
-        static unsigned hits;
-        uint64_t return_ip = m->br[0] & ~0xFull;
-        /* A null service descriptor is an unavailable PIM service.  Never
-         * return a stale success/status value: callers use r8 to decide
-         * whether dependent modules may be initialized. */
-        gr_write(m, 8, ~0ull, 0);
-        if (hits < 50) {
-            hits++;
-            fprintf(stderr, "merced: WORKAROUND null-descriptor call at "
-                    "ip=%016" PRIX64 ", synthesizing br.ret b0=%016" PRIX64
-                    " (hit #%u)\n", m->ip, m->br[0], hits);
-        }
-        /* The CDB query returning to 0x7FE86D90 has an explicit non-zero
-         * error path.  A missing callback cannot mean success: leaving the
-         * old r8 value at zero makes its caller consume untouched output
-         * parameters (one is initialized to -1) and fault later. */
-        if (return_ip == 0x7FE867B0ull) {
-            /* CDB slot 0 initializes an opaque query handle through arg0. */
-            uint64_t out = gr_read(m, 32, NULL), out_pa;
-            if (va_translate(m, out, false, false, ISR_W, &out_pa, &st))
-                phys_write(m, out_pa, 0, 8);
-        } else if (return_ip == 0x7FE867E0ull) {
-            /* CDB slot 1 returns an iterable result through arg3.  Supply a
-             * valid empty result using the caller's adjacent count-output
-             * storage (arg4), so its normal zero-count path is exercised. */
-            uint64_t out = gr_read(m, 35, NULL);
-            uint64_t empty = gr_read(m, 36, NULL);
-            uint64_t out_pa, empty_pa;
-            if (va_translate(m, empty, false, false, ISR_W, &empty_pa, &st) &&
-                va_translate(m, out, false, false, ISR_W, &out_pa, &st)) {
-                phys_write(m, empty_pa, 0, 8);
-                phys_write(m, out_pa, empty, 8);
-                gr_write(m, 8, 0, 0);
-            }
-        }
-        do_ret(m, return_ip);
-        m->ninsts++;
-        return MERCED_OK;
-    }
 
     if (slot > 2) return mhalt(m, "bad IP slot %u", slot);
     if (!va_translate(m, bundle_va, true, false, ISR_X, &pa, &st))
@@ -3282,49 +3030,6 @@ MercedStatus merced_step(Merced *m) {
 
     int qp = pr_read(m, (unsigned)bits(raw, 0, 6));
     m->taken = 0;
-
-    /* SDV's PE/COFF relocation walker assumes every base-relocation block
-     * has a non-zero SizeOfBlock.  A malformed/truncated image otherwise
-     * computes next == current and loops forever.  Follow the routine's own
-     * EFI_LOAD_ERROR (-3) epilogue instead of manufacturing a successful
-     * result and later calling through an invalid function descriptor. */
-    if ((bundle_va == 0x000000007FF2B260ull && slot == 2) ||
-        (bundle_va == 0x000000007FF2B810ull && slot == 0)) {
-        uint64_t sp = gr_read(m, 12, NULL);
-        uint64_t block = phys_read(m, sp + 24, 8);
-        if (phys_read(m, block + 4, 4) == 0) {
-            m->ip = bundle_va == 0x000000007FF2B260ull
-                        ? 0x000000007FF2B550ull
-                        : 0x000000007FF2CE00ull;
-            m->taken = 1;
-            m->ninsts++;
-            itc_advance(m, 1);
-            return MERCED_OK;
-        }
-    }
-
-    /* EXPERIMENTAL WORKAROUND: bios130.BIN spins here (0x7FE281D0-0x7FE281EC)
-     * waiting for memory at r37 to become the literal 18 (an A8-type
-     * cmp.eq p6,p7=18,r38 immediate compare, not a register compare - the
-     * "18" in objdump's disassembly is a plain immediate, not r18). cr.itv
-     * was deliberately programmed masked just before this, so it's not a
-     * plain interval-timer wait; it looks like an unmodeled event/status
-     * self-test waiting for a specific completion code. Rather than guess
-     * the exact PAL/SAL semantics, supply the value directly and see what
-     * the next blocker reveals. The whole routine (0x7FE28110) re-zeroes
-     * the target and re-enters this wait on retry, so the iteration count
-     * resets on every fresh entry rather than firing once ever. */
-    {
-        static unsigned rendezvous_n;
-        if (bundle_va == 0x000000007FE28110ull && slot == 0) {
-            rendezvous_n = 0;
-        } else if (bundle_va == 0x000000007FE281D0ull && slot == 0) {
-            if (++rendezvous_n == 200000) {
-                uint64_t addr = gr_read(m, 37, NULL);
-                phys_write(m, addr, 18, 8);
-            }
-        }
-    }
 
     unsigned hist = m->trace_history_next++ % MERCED_TRACE_HISTORY;
     m->trace_history[hist].ip = bundle_va | slot;

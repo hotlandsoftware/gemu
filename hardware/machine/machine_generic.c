@@ -735,6 +735,11 @@ static void vga_mirror_to_stdout(Ia64GenericState *s, uint32_t voff, uint8_t val
 
 static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     Ia64GenericState *s = ud;
+    if (addr <= UINT32_MAX &&
+        gemu_monitor_check_write(s->monitor, (uint32_t)addr))
+        fprintf(stderr, "generic: write watch hit ip=%016" PRIX64
+                " pa=%08" PRIX64 " size=%u value=%016" PRIX64 "\n",
+                s->cpu ? s->cpu->ip : 0, addr, size, val);
     uint32_t voff;
     if (addr >= GENERIC_LEGACY_IO_BASE &&
         addr + size <= GENERIC_LEGACY_IO_BASE + 0x10000) {
@@ -928,6 +933,26 @@ static void generic_custom_cmd(Ia64GenericState *s) {
                calls, disabled, hit, unmapped, tagfail, np);
         return;
     }
+    if (txt && strncmp(txt, "faultstats", 10) == 0) {
+        uint64_t counts[0x5B] = {0};
+        merced_fault_stats(counts, sizeof(counts) / sizeof(counts[0]));
+        static const struct { unsigned slot; const char *name; } vectors[] = {
+            { 0x00, "vhpt" }, { 0x04, "itlb" }, { 0x08, "dtlb" },
+            { 0x0c, "alt-itlb" }, { 0x10, "alt-dtlb" },
+            { 0x14, "nested-dtlb" }, { 0x20, "dirty" },
+            { 0x24, "iaccess" }, { 0x28, "daccess" },
+            { 0x2c, "break" }, { 0x30, "extint" },
+            { 0x50, "page-not-present" }, { 0x54, "general" },
+            { 0x56, "nat" }, { 0x57, "spec" }, { 0x5a, "unaligned" },
+        };
+        printf("faults:");
+        for (unsigned i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++)
+            if (counts[vectors[i].slot])
+                printf(" %s=%" PRIu64, vectors[i].name,
+                       counts[vectors[i].slot]);
+        printf("\n");
+        return;
+    }
     if (txt && strncmp(txt, "vgapeek ", 8) == 0) {
         unsigned plane;
         unsigned off;
@@ -1118,6 +1143,8 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
                     generic_report_halt(s);
                     break;
                 }
+                if (gemu_monitor_is_paused(s->monitor))
+                    break;
             }
         }
 

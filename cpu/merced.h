@@ -221,3 +221,4 @@ uint64_t merced_gr(const Merced *m, unsigned r);
  * on real workloads is understood. */
 void merced_vhpt_stats(uint64_t *calls, uint64_t *disabled, uint64_t *hit,
                        uint64_t *unmapped, uint64_t *tagfail, uint64_t *np);
+void merced_fault_stats(uint64_t *counts, size_t count);
