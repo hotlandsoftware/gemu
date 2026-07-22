@@ -339,6 +339,18 @@ void merced_fault_stats(uint64_t *counts, size_t count) {
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     m->nfaults++;
+    if (vec == VEC_PAGE_NOT_PRESENT &&
+        ifa == UINT64_C(0xE000010600000000)) {
+        static unsigned target_pnp_debug;
+        if (target_pnp_debug++ < 8)
+            fprintf(stderr, "merced: target PNP ip=%016" PRIX64
+                    " psr=%016" PRIX64 " ic=%u isr=%016" PRIX64
+                    " iha=%016" PRIX64 " ipsr=%016" PRIX64
+                    " iip=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                    m->ip, m->psr, !!(m->psr & PSR_IC), isr,
+                    m->cr[CR_IHA], m->cr[CR_IPSR], m->cr[CR_IIP],
+                    m->ninsts);
+    }
     if ((vec & 0xFF) == 0 && (vec >> 8) <
         sizeof(fault_vector_counts) / sizeof(fault_vector_counts[0]))
         fault_vector_counts[vec >> 8]++;
