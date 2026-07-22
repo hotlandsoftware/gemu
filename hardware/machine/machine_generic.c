@@ -257,6 +257,30 @@ static void atapi_reply(Ia64GenericState *s) {
 
 static void generic_serial_tx(Ia64GenericState *s, uint8_t byte);
 
+/* IA-64 HAL never uses IN/OUT; it reaches "legacy" I/O ports by computing a
+ * memory address within a platform-supplied I/O-space window using the
+ * architecturally-standard *sparse* encoding (see the Itanium Software
+ * Conventions / DIG64 legacy I/O space convention, also implemented in
+ * reference/qemu-system-ia64's hw/ia64/ia64_pci.c ia64_pci_sparse_io_port()):
+ *   encoded = ((port >> 2) << 12) | port
+ * Our own firmware (gemu-efi) was written against this same window but
+ * always used a plain dense/linear offset (encoded == port) instead, since
+ * we control both ends - that's fine right up until real Windows HAL code
+ * (e.g. kdcom.dll servicing a KD-over-COM1 request, the first thing that
+ * ever exercises legacy port I/O here) computes a sparse address for the
+ * exact same port and gets back nothing, because nothing ever decoded it.
+ * The two conventions self-disambiguate: a real sparse encoding requires
+ * bits 11:2 of the low 12 bits to equal bits 9:0 of (encoded>>12), which an
+ * ordinary dense port number (small, no bits above 11 set) essentially
+ * never satisfies, so dense offsets pass through unchanged. */
+static uint64_t sparse_io_decode(uint64_t off) {
+    uint64_t group = off >> 12;
+    uint64_t low = off & 0xfff;
+    if ((group & 0x3ff) == (low >> 2))
+        return (group << 2) | (low & 3);
+    return off;
+}
+
 static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size) {
     static unsigned debug_reads;
     if (getenv("GENERIC_DEBUG") && debug_reads++ < 128)
@@ -936,8 +960,8 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64GenericState *s = ud;
     uint32_t voff;
     if (addr >= GENERIC_LEGACY_IO_BASE &&
-        addr + size <= GENERIC_LEGACY_IO_BASE + 0x10000)
-        return legacy_io_read(s, (unsigned)(addr - GENERIC_LEGACY_IO_BASE), size);
+        addr + size <= GENERIC_LEGACY_IO_BASE + GENERIC_LEGACY_IO_SPARSE_SIZE)
+        return legacy_io_read(s, (unsigned)sparse_io_decode(addr - GENERIC_LEGACY_IO_BASE), size);
     if (acpi_pm_window(addr, size, &voff)) {
         uint32_t off = voff;
         if (off < 4)
@@ -1044,8 +1068,8 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                 s->cpu ? s->cpu->ip : 0, addr, size, val);
     uint32_t voff;
     if (addr >= GENERIC_LEGACY_IO_BASE &&
-        addr + size <= GENERIC_LEGACY_IO_BASE + 0x10000) {
-        legacy_io_write(s, (unsigned)(addr - GENERIC_LEGACY_IO_BASE), val, size);
+        addr + size <= GENERIC_LEGACY_IO_BASE + GENERIC_LEGACY_IO_SPARSE_SIZE) {
+        legacy_io_write(s, (unsigned)sparse_io_decode(addr - GENERIC_LEGACY_IO_BASE), val, size);
         return;
     }
     if (acpi_pm_window(addr, size, &voff)) {
@@ -1214,18 +1238,6 @@ static void generic_custom_cmd(Ia64GenericState *s) {
         else if (strcmp(arg, "down") == 0) kbd_push(s, GENERIC_KBD_KEY_DOWN);
         else if (strcmp(arg, "enter") == 0) kbd_push(s, GENERIC_KBD_KEY_ENTER);
         else printf("usage: key <up|down|enter>\n");
-        return;
-    }
-    if (txt && strncmp(txt, "comtest", 7) == 0) {
-        legacy_io_write(s, GENERIC_COM1_PORT, 'X', 1);
-        legacy_io_write(s, GENERIC_COM1_PORT, 'Y', 1);
-        legacy_io_write(s, GENERIC_COM1_PORT, '\n', 1);
-        printf("comtest: rx_avail=%d\n", s->uart_rx_head != s->uart_rx_tail);
-        while (s->uart_rx_head != s->uart_rx_tail) {
-            uint64_t v = legacy_io_read(s, GENERIC_COM1_PORT, 1);
-            printf("comtest: rx byte 0x%02" PRIx64 " ('%c')\n", v,
-                   (v >= 0x20 && v < 0x7F) ? (char)v : '.');
-        }
         return;
     }
     if (txt && strncmp(txt, "peek ", 5) == 0) {

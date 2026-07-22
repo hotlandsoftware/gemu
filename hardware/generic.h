@@ -83,6 +83,13 @@
 #define GENERIC_ACPI_PM_BASE   0x0000000080112000ull
 #define GENERIC_ACPI_PM_SIZE   0x10u
 #define GENERIC_LEGACY_IO_BASE 0x000000800010000000ull
+/* Real IA-64 HAL never addresses this window with a plain linear port
+ * offset - it uses the architectural "sparse I/O space" encoding (see
+ * sparse_io_decode() in machine_generic.c), which needs ~4 bytes of
+ * address space per port bit rather than 1. Sized to comfortably cover
+ * every port we implement (COM1, ATAPI, PCI config) once sparse-encoded,
+ * matching reference/qemu-system-ia64's IA64_PCI_IO_SIZE convention. */
+#define GENERIC_LEGACY_IO_SPARSE_SIZE 0x1000000ull
 
 /* Keyboard controller: two byte registers.
  *   +0x0  STATUS (read-only)  bit 0 = a key code is waiting
