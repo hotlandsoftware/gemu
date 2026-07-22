@@ -239,6 +239,178 @@ static uint32_t near_target(X86 *x, int32_t rel) {
     return sbase(x, X_CS) + off;
 }
 
+/* ---- Minimal INT 10h video-services shim ----
+ *
+ * Real Itanium firmware runs a legacy x86 video BIOS option ROM through
+ * the IA-32 Execution Layer specifically so NT's boot-time text output
+ * (including bugcheck/blue-screen text) can call int 10h - a real,
+ * documented convention on actual Itanium hardware, not an x86-only
+ * quirk. GEMU has no such ROM to run, so int 10h is intercepted directly
+ * here (the same "shim the call, don't emulate the real firmware"
+ * pattern already used for SAL/PAL) instead of dispatching through the
+ * real-mode IVT into handler code that doesn't exist, implementing the
+ * handful of functions boot-time text output actually needs against the
+ * real VGA registers/memory the rest of this file already talks to.
+ *
+ * VGA ports live behind the generic machine's own MMIO window
+ * (GENERIC_VGA_IO_BASE in hardware/generic.h) rather than the standard
+ * IA-64 sparse I/O port space x86 in/out normally routes through - this
+ * shim reads/writes them (and the BDA/text VRAM, both addressed exactly
+ * like the existing int/iret code already addresses the real-mode IVT:
+ * flat, unsegmented) directly for that reason. The field layout used to
+ * compute the active screen size (VGA_CRTC_H_DISP=1, VGA_CRTC_OVERFLOW=7,
+ * VGA_CRTC_MAX_SCAN=9, VGA_CRTC_V_DISP_END=0x12) matches
+ * reference/qemu-system-ia64's hw/display/vga.c vga_get_resolution(),
+ * not a hardcoded 80x25. */
+#define INT10_VGA_IO_BASE 0xC0000000ull  /* GENERIC_VGA_IO_BASE */
+#define INT10_VRAM_BASE   0xB8000ull
+#define INT10_BDA_CURSOR  0x450ull       /* word per page: (row<<8)|col */
+#define INT10_BDA_MODE    0x449ull
+
+static uint32_t int10_crtc_read(X86 *x, uint8_t index) {
+    uint32_t v = 0;
+    wb(x, INT10_VGA_IO_BASE + (0x3D4 - 0x3B0), 1, index);
+    rb(x, INT10_VGA_IO_BASE + (0x3D5 - 0x3B0), 1, false, &v);
+    return v;
+}
+
+static void int10_screen_dims(X86 *x, unsigned *cols, unsigned *rows) {
+    unsigned h_disp = int10_crtc_read(x, 0x01);
+    unsigned max_scan = (int10_crtc_read(x, 0x09) & 0x1F) + 1;
+    unsigned ov = int10_crtc_read(x, 0x07);
+    unsigned vdisp = int10_crtc_read(x, 0x12) |
+                     ((ov & 0x02) << 7) | ((ov & 0x40) << 3);
+    *cols = h_disp + 1;
+    if (!*cols || *cols > 132) *cols = 80;
+    if (!max_scan) max_scan = 16;
+    *rows = (vdisp + 1) / max_scan;
+    if (!*rows || *rows > 60) *rows = 25;
+}
+
+static void int10_get_cursor(X86 *x, unsigned page, unsigned *row, unsigned *col) {
+    uint32_t v = 0;
+    rb(x, INT10_BDA_CURSOR + page * 2, 2, false, &v);
+    *col = v & 0xFF; *row = (v >> 8) & 0xFF;
+}
+static void int10_set_cursor(X86 *x, unsigned page, unsigned row, unsigned col) {
+    wb(x, INT10_BDA_CURSOR + page * 2, 2, ((row & 0xFF) << 8) | (col & 0xFF));
+}
+
+static void int10_scroll(X86 *x, uint32_t base, unsigned cols, unsigned rows,
+                         uint8_t attr) {
+    for (unsigned r = 1; r < rows; r++)
+        for (unsigned c = 0; c < cols; c++) {
+            uint32_t v = 0;
+            rb(x, base + (r * cols + c) * 2, 2, false, &v);
+            wb(x, base + ((r - 1) * cols + c) * 2, 2, v);
+        }
+    for (unsigned c = 0; c < cols; c++)
+        wb(x, base + ((rows - 1) * cols + c) * 2, 2,
+           ((uint32_t)attr << 8) | ' ');
+}
+
+/* Writes one character at the current cursor position (teletype-style:
+ * handles CR/LF/BS/bell and end-of-line/end-of-screen wraparound),
+ * advances the cursor, and scrolls if it ran off the bottom. with_attr
+ * false leaves the existing attribute byte alone (matches real int 10h
+ * AH=0Eh, which never touches attributes). */
+static void int10_putc(X86 *x, unsigned page, uint8_t ch, uint8_t attr,
+                       bool with_attr) {
+    unsigned cols, rows, row, col;
+    int10_screen_dims(x, &cols, &rows);
+    int10_get_cursor(x, page, &row, &col);
+    uint32_t base = INT10_VRAM_BASE + page * 0x1000;
+    if (ch == '\r') {
+        col = 0;
+    } else if (ch == '\n') {
+        row++;
+    } else if (ch == 8) {
+        if (col) col--;
+    } else if (ch == 7) {
+        /* bell: nothing to do without an audio device */
+    } else {
+        uint32_t off = base + (uint32_t)(row * cols + col) * 2;
+        wb(x, off, 1, ch);
+        if (with_attr) wb(x, off + 1, 1, attr);
+        col++;
+        if (col >= cols) { col = 0; row++; }
+    }
+    if (row >= rows) {
+        int10_scroll(x, base, cols, rows, attr);
+        row = rows - 1;
+    }
+    int10_set_cursor(x, page, row, col);
+}
+
+static void int10_handler(X86 *x) {
+    unsigned ah = xr(x, 4, 1), al = xr(x, 0, 1) & 0xFF;
+    static unsigned int10_debug;
+    if (int10_debug++ < 40)
+        fprintf(stderr, "merced: INT10 ah=%02x al=%02x ip=%08x ninsts=%"
+                PRIu64 "\n", ah, al, x->start, x->m->ninsts);
+    switch (ah) {
+    case 0x0E:                                      /* teletype output */
+        int10_putc(x, 0, (uint8_t)al, 0x07, false);
+        break;
+    case 0x13: {                                    /* write string */
+        unsigned mode = al & 3;
+        unsigned page = xr(x, 7, 1) & 7;             /* BH */
+        uint8_t attr = (uint8_t)xr(x, 3, 1);         /* BL */
+        unsigned cnt = xr(x, 1, 2);                  /* CX */
+        unsigned row = xr(x, 6, 1), col = xr(x, 2, 1); /* DH, DL */
+        uint32_t str_addr = sbase(x, X_ES) + xr(x, 5, 2); /* ES:BP */
+        int10_set_cursor(x, page, row, col);
+        for (unsigned i = 0; i < cnt; i++) {
+            uint32_t ch = 0, at = attr;
+            if (!rb(x, str_addr++, 1, false, &ch)) break;
+            if (mode & 2) {
+                uint32_t a = 0;
+                rb(x, str_addr++, 1, false, &a);
+                at = a;
+            }
+            int10_putc(x, page, (uint8_t)ch, (uint8_t)at, true);
+        }
+        break;
+    }
+    case 0x02: {                                    /* set cursor position */
+        unsigned page = xr(x, 7, 1) & 7;             /* BH */
+        int10_set_cursor(x, page, xr(x, 6, 1), xr(x, 2, 1)); /* DH, DL */
+        break;
+    }
+    case 0x03: {                                    /* get cursor position */
+        unsigned page = xr(x, 7, 1) & 7, row, col;   /* BH */
+        int10_get_cursor(x, page, &row, &col);
+        setxr(x, 6, 1, row);                         /* DH */
+        setxr(x, 2, 1, col);                          /* DL */
+        setxr(x, 1, 2, 0x0607);                       /* CX: cursor shape */
+        break;
+    }
+    case 0x0F: {                                    /* get video mode */
+        unsigned cols, rows;
+        int10_screen_dims(x, &cols, &rows);
+        uint32_t mode = 0;
+        rb(x, INT10_BDA_MODE, 1, false, &mode);
+        setxr(x, 0, 1, mode ? mode : 3);              /* AL */
+        setxr(x, 4, 1, cols);                         /* AH = columns */
+        setxr(x, 7, 1, 0);                            /* BH = page 0 */
+        break;
+    }
+    case 0x00:                                       /* set video mode */
+        /* Not implemented: the mode software actually wants is already
+         * established by the time this shim intercepts int 10h (real
+         * mode-set register tables aren't needed for boot-time text
+         * output), so this is a deliberate no-op rather than a guess at
+         * hardware register values. Revisit if a real mode switch turns
+         * out to be load-bearing. */
+        wb(x, INT10_BDA_MODE, 1, al);
+        break;
+    default:
+        /* Unimplemented function: no-op rather than halting, so a rare
+         * call here doesn't take down an otherwise-working boot. */
+        break;
+    }
+}
+
 MercedStatus merced_ia32_step(Merced *m) {
     X86 x = {.m=m, .start=(uint32_t)m->ip, .pc=(uint32_t)m->ip,
              .seg_override=-1};
@@ -400,16 +572,22 @@ MercedStatus merced_ia32_step(Merced *m) {
     } else if (op == 0xcd || op == 0xcc) {           /* int imm8 / int3 */
         uint32_t vec = 3;
         if (op == 0xcd && !fetch(&x,1,&vec)) goto fault;
-        uint32_t ip_lo, cs_lo;
-        if (!push(&x,2,(uint16_t)eflags(&x)) ||
-            !push(&x,2,sel(&x,X_CS)) ||
-            !push(&x,2,(uint16_t)(x.pc-sbase(&x,X_CS))) ||
-            !rb(&x,vec*4,2,false,&ip_lo) || !rb(&x,vec*4+2,2,false,&cs_lo))
-            goto fault;
-        setseg_real(&x,X_CS,(uint16_t)cs_lo);
-        x.pc = sbase(&x,X_CS) + ip_lo;
-        setflags(&x, eflags(&x) & ~(FL_IF));
-        branch = true;
+        if (op == 0xcd && vec == 0x10) {
+            /* No real video BIOS ROM behind the IVT to jump to - service
+             * the call directly instead (see int10_handler()'s comment). */
+            int10_handler(&x);
+        } else {
+            uint32_t ip_lo, cs_lo;
+            if (!push(&x,2,(uint16_t)eflags(&x)) ||
+                !push(&x,2,sel(&x,X_CS)) ||
+                !push(&x,2,(uint16_t)(x.pc-sbase(&x,X_CS))) ||
+                !rb(&x,vec*4,2,false,&ip_lo) || !rb(&x,vec*4+2,2,false,&cs_lo))
+                goto fault;
+            setseg_real(&x,X_CS,(uint16_t)cs_lo);
+            x.pc = sbase(&x,X_CS) + ip_lo;
+            setflags(&x, eflags(&x) & ~(FL_IF));
+            branch = true;
+        }
     } else if (op == 0xcf) {                        /* iret */
         uint32_t ip_r, cs_r, fl_r;
         if (!pop(&x,2,&ip_r) || !pop(&x,2,&cs_r) || !pop(&x,2,&fl_r)) goto fault;

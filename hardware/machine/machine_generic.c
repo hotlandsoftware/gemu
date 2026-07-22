@@ -11,12 +11,41 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+typedef SOCKET generic_sock_t;
+#  define GENERIC_INVALID_SOCK INVALID_SOCKET
+#  define generic_sock_close(s) closesocket(s)
+#else
+#  include <fcntl.h>
+#  include <termios.h>
+#  include <unistd.h>
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <arpa/inet.h>
+typedef int generic_sock_t;
+#  define GENERIC_INVALID_SOCK (-1)
+#  define generic_sock_close(s) close(s)
+#endif
+#ifndef MSG_NOSIGNAL
+#  define MSG_NOSIGNAL 0
+#endif
 
 #define FB_W 640
 #define FB_H 400
 #define INSTR_PER_FRAME 500000
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES 32
+#define GENERIC_COM1_PORT 0x3F8u
+
+typedef enum {
+    GENERIC_SERIAL_NONE = 0,
+    GENERIC_SERIAL_STDIO,
+    GENERIC_SERIAL_TCP,
+} GenericSerialBackend;
 
 #define KBD_ACTION_UP    GEMU_ACTION(0)
 #define KBD_ACTION_DOWN  GEMU_ACTION(1)
@@ -92,6 +121,35 @@ struct Ia64GenericState {
     uint32_t pe_entry_rva;             /* valid after a successful CMD 4 */
     uint32_t cdrom_dma_dst;
     uint32_t cdrom_dma_size;
+
+    /* -serial: a 16550-style UART at COM1 (port 0x3F8, inside the legacy
+     * I/O window). Register semantics ported from i2000's COM1
+     * (hardware/machine/machine_i2000.c) minus its SDL front-panel echo,
+     * which doesn't exist on this machine. The point is letting a real
+     * Windows kernel debugger (WinDbg/KD) attach over a serial transport
+     * instead of us reverse-engineering unsymbolized binaries by hand.
+     *
+     * Two backends:
+     *  - stdio: host's own stdin/stdout, raw byte mode. Simple, but shares
+     *    stdout with vga_mirror_to_stdout()'s guest-text echo, so it's
+     *    only fit for casual human reading, not a real KD wire protocol.
+     *  - tcp: a dedicated listening socket, accepting one client at a
+     *    time (reconnectable) - a clean full-duplex byte stream with
+     *    nothing else ever written to it. This is the one a real WinDbg
+     *    should be pointed at (e.g. via a serial-to-TCP bridge on the
+     *    Windows side, the same convention QEMU's "-serial tcp:...,server"
+     *    backend uses). */
+    bool     serial_enabled;
+    GenericSerialBackend serial_backend;
+    uint8_t  uart_ier, uart_lcr, uart_mcr, uart_scr, uart_dll, uart_dlm;
+    uint8_t  uart_rx[256];
+    uint8_t  uart_rx_head, uart_rx_tail;
+#ifndef _WIN32
+    struct termios uart_saved_term;
+    bool           uart_term_raw;
+#endif
+    generic_sock_t serial_listen_fd;
+    generic_sock_t serial_client_fd;
 };
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -197,6 +255,8 @@ static void atapi_reply(Ia64GenericState *s) {
     }
 }
 
+static void generic_serial_tx(Ia64GenericState *s, uint8_t byte);
+
 static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size) {
     static unsigned debug_reads;
     if (getenv("GENERIC_DEBUG") && debug_reads++ < 128)
@@ -230,6 +290,23 @@ static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size
         case 3: return s->atapi_lba_low; case 4: return s->atapi_lba_mid;
         case 5: return s->atapi_lba_high; case 6: return s->atapi_device;
         case 7: return s->atapi_status;
+        }
+    }
+    if (s->serial_enabled && port >= GENERIC_COM1_PORT && port < GENERIC_COM1_PORT + 8) {
+        switch (port - GENERIC_COM1_PORT) {
+        case 0:
+            if (s->uart_lcr & 0x80) return s->uart_dll;
+            if (s->uart_rx_head != s->uart_rx_tail)
+                return s->uart_rx[s->uart_rx_head++];
+            return 0;
+        case 1: return (s->uart_lcr & 0x80) ? s->uart_dlm : s->uart_ier;
+        case 2: return ((s->uart_ier & 1) && s->uart_rx_head != s->uart_rx_tail)
+                     ? 0x04 : 0x01;                /* RX data / no interrupt */
+        case 3: return s->uart_lcr;
+        case 4: return s->uart_mcr;
+        case 5: return 0x60 | (s->uart_rx_head != s->uart_rx_tail ? 1 : 0);
+        case 6: return 0xB0;                        /* MSR: CTS|DSR|DCD */
+        case 7: return s->uart_scr;
         }
     }
     if (port == 0x1F7 || port == 0x3F6) return 0;
@@ -291,6 +368,22 @@ static void legacy_io_write(Ia64GenericState *s, unsigned port, uint64_t val, un
             return;
         }
     }
+    if (s->serial_enabled && port >= GENERIC_COM1_PORT && port < GENERIC_COM1_PORT + 8) {
+        switch (port - GENERIC_COM1_PORT) {
+        case 0:
+            if (s->uart_lcr & 0x80) { s->uart_dll = (uint8_t)val; return; }
+            generic_serial_tx(s, (uint8_t)val);
+            return;
+        case 1:
+            if (s->uart_lcr & 0x80) s->uart_dlm = (uint8_t)val;
+            else s->uart_ier = (uint8_t)val;
+            return;
+        case 3: s->uart_lcr = (uint8_t)val; return;
+        case 4: s->uart_mcr = (uint8_t)val; return;
+        case 7: s->uart_scr = (uint8_t)val; return;
+        default: return;                            /* FCR etc. */
+        }
+    }
 }
 
 static void kbd_push(Ia64GenericState *s, uint8_t code) {
@@ -307,6 +400,215 @@ static uint8_t kbd_pop(Ia64GenericState *s) {
     uint8_t code = s->kbd_fifo[s->kbd_head];
     s->kbd_head = (s->kbd_head + 1) % KBD_FIFO_SIZE;
     return code;
+}
+
+static void generic_sock_set_nonblocking(generic_sock_t fd) {
+#ifdef _WIN32
+    u_long one = 1;
+    ioctlsocket(fd, FIONBIO, &one);
+#else
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+}
+
+/* -serial stdio: put the host terminal (if any) into raw, byte-at-a-time
+ * mode so a reader riding on COM1 sees a clean pipe with no line
+ * buffering/echo/signal-generation in the way. Piped stdin (the common
+ * case for scripted use) isn't a tty, so this is a no-op there - already
+ * exactly the raw stream we want.
+ *
+ * NOTE: stdout is shared with vga_mirror_to_stdout()'s guest-text echo,
+ * so this backend is for casual human reading only - a real KD session
+ * needs the tcp backend below, which owns a stream nothing else writes
+ * to. */
+static bool generic_serial_open_stdio(Ia64GenericState *s) {
+#ifndef _WIN32
+    if (isatty(STDIN_FILENO)) {
+        struct termios raw;
+        if (tcgetattr(STDIN_FILENO, &s->uart_saved_term) == 0) {
+            raw = s->uart_saved_term;
+            raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | ISIG);
+            raw.c_iflag &= (tcflag_t)~(IXON | ICRNL);
+            raw.c_cc[VMIN] = 0;
+            raw.c_cc[VTIME] = 0;
+            if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0)
+                s->uart_term_raw = true;
+        }
+    }
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+#endif
+    return true;
+}
+
+/* -serial tcp:HOST:PORT: a dedicated listening socket, always in "server"
+ * mode, accepting one client at a time and going back to listening if it
+ * disconnects (a long KD session is worth surviving a WinDbg restart).
+ * Nothing but COM1 TX ever touches this fd - unlike stdio, it's a clean
+ * wire a real debugger protocol can ride on. */
+static bool generic_serial_open_tcp(Ia64GenericState *s, const char *host, int port) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "generic: -serial tcp: WSAStartup failed\n");
+        return false;
+    }
+#endif
+    generic_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == GENERIC_INVALID_SOCK) {
+        fprintf(stderr, "generic: -serial tcp: socket() failed\n");
+        return false;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    if (strcmp(host, "*") == 0 || strcmp(host, "0.0.0.0") == 0) {
+        a.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+        a.sin_addr.s_addr = inet_addr(host);
+        if (a.sin_addr.s_addr == INADDR_NONE) {
+            fprintf(stderr, "generic: -serial tcp: invalid host '%s'\n", host);
+            generic_sock_close(fd);
+            return false;
+        }
+    }
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(fd, 1) < 0) {
+        fprintf(stderr, "generic: -serial tcp: failed to listen on %s:%d\n", host, port);
+        generic_sock_close(fd);
+        return false;
+    }
+    generic_sock_set_nonblocking(fd);
+    s->serial_listen_fd = fd;
+    s->serial_client_fd = GENERIC_INVALID_SOCK;
+    fprintf(stderr, "generic: -serial tcp listening on %s:%d\n", host, port);
+    return true;
+}
+
+/* Parses "stdio" or "tcp:HOST:PORT" and brings the corresponding backend
+ * up. Returns false (with a message already printed) on a bad spec. */
+static bool generic_serial_configure(Ia64GenericState *s, const char *spec) {
+    s->uart_lcr = 0x03;   /* 8N1, matches real BIOS/HAL COM1 defaults */
+    if (strcmp(spec, "stdio") == 0) {
+        s->serial_backend = GENERIC_SERIAL_STDIO;
+        s->serial_enabled = generic_serial_open_stdio(s);
+        return s->serial_enabled;
+    }
+    if (strncmp(spec, "tcp:", 4) == 0) {
+        char target[128];
+        snprintf(target, sizeof(target), "%s", spec + 4);
+        char *colon = strrchr(target, ':');
+        if (!colon || colon == target || colon[1] == '\0') {
+            fprintf(stderr, "generic: -serial: expected tcp:HOST:PORT\n");
+            return false;
+        }
+        *colon++ = '\0';
+        char *end = NULL;
+        long port = strtol(colon, &end, 10);
+        if (port <= 0 || port > 65535 || (end && *end != '\0')) {
+            fprintf(stderr, "generic: -serial: invalid port '%s'\n", colon);
+            return false;
+        }
+        s->serial_backend = GENERIC_SERIAL_TCP;
+        s->serial_enabled = generic_serial_open_tcp(s, target, (int)port);
+        return s->serial_enabled;
+    }
+    fprintf(stderr, "generic: -serial: unknown backend '%s' (use stdio or tcp:HOST:PORT)\n", spec);
+    return false;
+}
+
+static void generic_serial_disable(Ia64GenericState *s) {
+    if (s->serial_backend == GENERIC_SERIAL_STDIO) {
+#ifndef _WIN32
+        if (s->uart_term_raw)
+            tcsetattr(STDIN_FILENO, TCSANOW, &s->uart_saved_term);
+#endif
+    } else if (s->serial_backend == GENERIC_SERIAL_TCP) {
+        if (s->serial_client_fd != GENERIC_INVALID_SOCK)
+            generic_sock_close(s->serial_client_fd);
+        if (s->serial_listen_fd != GENERIC_INVALID_SOCK)
+            generic_sock_close(s->serial_listen_fd);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+    }
+}
+
+/* Pumps whatever the transport has waiting into the COM1 RX ring,
+ * dropping bytes if the guest hasn't drained the buffer (same "drop if
+ * full" policy as the keyboard FIFO - a debugger transport that overruns
+ * a 256-byte ring without the guest polling has bigger problems). */
+static void generic_serial_poll(Ia64GenericState *s) {
+    if (!s->serial_enabled)
+        return;
+    uint8_t buf[64];
+    if (s->serial_backend == GENERIC_SERIAL_STDIO) {
+#ifndef _WIN32
+        ssize_t n;
+        while ((n = read(STDIN_FILENO, buf, sizeof(buf))) > 0) {
+            for (ssize_t i = 0; i < n; i++) {
+                uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+                if (next != s->uart_rx_head)
+                    s->uart_rx[s->uart_rx_tail++] = buf[i];
+            }
+        }
+#endif
+        return;
+    }
+    if (s->serial_backend == GENERIC_SERIAL_TCP) {
+        if (s->serial_client_fd == GENERIC_INVALID_SOCK) {
+            generic_sock_t c = accept(s->serial_listen_fd, NULL, NULL);
+            if (c != GENERIC_INVALID_SOCK) {
+                generic_sock_set_nonblocking(c);
+                int one = 1;
+                setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+                s->serial_client_fd = c;
+                fprintf(stderr, "generic: -serial tcp: client connected\n");
+            }
+        }
+        if (s->serial_client_fd != GENERIC_INVALID_SOCK) {
+            for (;;) {
+                int n = recv(s->serial_client_fd, (char *)buf, sizeof(buf), 0);
+                if (n > 0) {
+                    for (int i = 0; i < n; i++) {
+                        uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+                        if (next != s->uart_rx_head)
+                            s->uart_rx[s->uart_rx_tail++] = buf[i];
+                    }
+                    continue;
+                }
+                if (n == 0) {
+                    fprintf(stderr, "generic: -serial tcp: client disconnected\n");
+                    generic_sock_close(s->serial_client_fd);
+                    s->serial_client_fd = GENERIC_INVALID_SOCK;
+                }
+                break;
+            }
+        }
+    }
+}
+
+/* COM1 TX: the only thing ever allowed to write to the tcp backend's
+ * client socket, and (see generic_serial_open_stdio()'s comment) one of
+ * two things that write to stdout under the stdio backend. */
+static void generic_serial_tx(Ia64GenericState *s, uint8_t byte) {
+    if (s->serial_backend == GENERIC_SERIAL_STDIO) {
+        fputc((int)byte, stdout);
+        fflush(stdout);
+    } else if (s->serial_backend == GENERIC_SERIAL_TCP) {
+        if (s->serial_client_fd == GENERIC_INVALID_SOCK)
+            return;
+        if (send(s->serial_client_fd, (const char *)&byte, 1, MSG_NOSIGNAL) <= 0) {
+            generic_sock_close(s->serial_client_fd);
+            s->serial_client_fd = GENERIC_INVALID_SOCK;
+        }
+    }
 }
 
 static void cdrom_do_read(Ia64GenericState *s) {
@@ -914,6 +1216,18 @@ static void generic_custom_cmd(Ia64GenericState *s) {
         else printf("usage: key <up|down|enter>\n");
         return;
     }
+    if (txt && strncmp(txt, "comtest", 7) == 0) {
+        legacy_io_write(s, GENERIC_COM1_PORT, 'X', 1);
+        legacy_io_write(s, GENERIC_COM1_PORT, 'Y', 1);
+        legacy_io_write(s, GENERIC_COM1_PORT, '\n', 1);
+        printf("comtest: rx_avail=%d\n", s->uart_rx_head != s->uart_rx_tail);
+        while (s->uart_rx_head != s->uart_rx_tail) {
+            uint64_t v = legacy_io_read(s, GENERIC_COM1_PORT, 1);
+            printf("comtest: rx byte 0x%02" PRIx64 " ('%c')\n", v,
+                   (v >= 0x20 && v < 0x7F) ? (char)v : '.');
+        }
+        return;
+    }
     if (txt && strncmp(txt, "peek ", 5) == 0) {
         uint64_t addr = strtoull(txt + 5, NULL, 16);
         if (addr + 8 <= s->ram_size) {
@@ -1061,6 +1375,13 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
         s->atapi_status = 0x40;
     }
 
+    s->serial_listen_fd = GENERIC_INVALID_SOCK;
+    s->serial_client_fd = GENERIC_INVALID_SOCK;
+    if (cfg->serial_spec && !generic_serial_configure(s, cfg->serial_spec)) {
+        ia64_generic_destroy(s);
+        return NULL;
+    }
+
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         GemuDisplayConfig dc = {
             .title = "GEMU",
@@ -1083,6 +1404,7 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
 void ia64_generic_destroy(Ia64GenericState *s) {
     if (!s)
         return;
+    if (s->serial_enabled) generic_serial_disable(s);
     if (s->display) gemu_display_destroy(s->display);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     if (s->cpu) merced_destroy(s->cpu);
@@ -1158,6 +1480,8 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
                     break;
             }
         }
+
+        generic_serial_poll(s);
 
         if (s->display) {
             gemu_display_poll(s->display);

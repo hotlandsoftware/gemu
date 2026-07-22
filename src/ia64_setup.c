@@ -48,11 +48,18 @@ static const GemuArgsDef def = {
     ,
     .vnc_support  = false,
     .extra_help =
-        "\nHP i2000 (IA-64) options:\n"
+        "\nIA64 options:\n"
         "  -rom FILE       Load firmware flash image (top-aligned, max 4 MiB)\n"
         "  -rom DIR|ZIP    Scan for known firmware by SHA-256\n"
         "  -m SIZE         RAM size, K/M/G suffix (default 512M, i2000 max 2G)\n"
         "  -cdrom FILE     Attach a read-only ISO image as an ATAPI CD-ROM\n"
+        "  -serial stdio   generic machine only: attach COM1 to host stdio\n"
+        "                  (casual use only - shares stdout with the VGA\n"
+        "                  text mirror, not a clean debugger transport)\n"
+        "  -serial tcp:HOST:PORT\n"
+        "                  generic machine only: attach COM1 to a listening\n"
+        "                  TCP socket (a clean full-duplex byte stream, for\n"
+        "                  a real Windows kernel debugger to connect to)\n"
         "\nThe SDL display is a front panel: CPU state, POST code, unhandled\n"
         "MMIO log, and the COM1 serial console (also echoed to stdout).\n"
         "Monitor: 'info cpu', 'step [N]', 'x ADDR [COUNT]' (phys hexdump).\n"
@@ -142,6 +149,7 @@ int ia64_setup(int argc, char *argv[]) {
     }
 
     const char *rom_arg = args.rom_path;
+    const char *serial_spec = NULL;
     for (int i = 0; i < nrem; i++) {
         if (strcmp(rem[i], "-rom") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -rom requires an argument\n"); return 1; }
@@ -154,6 +162,14 @@ int ia64_setup(int argc, char *argv[]) {
         } else if (strcmp(rem[i], "-cdrom") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cdrom requires an argument\n"); return 1; }
             cfg.cdrom_path = rem[++i];
+        } else if (strcmp(rem[i], "-serial") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -serial requires an argument\n"); return 1; }
+            const char *spec = rem[++i];
+            if (strcmp(spec, "stdio") != 0 && strncmp(spec, "tcp:", 4) != 0) {
+                fprintf(stderr, "gemu: -serial: use 'stdio' or 'tcp:HOST:PORT'\n");
+                return 1;
+            }
+            serial_spec = spec;
         } else {
             fprintf(stderr, "gemu: unknown option '%s' (try -h)\n", rem[i]);
             return 1;
@@ -163,6 +179,11 @@ int ia64_setup(int argc, char *argv[]) {
     cfg.display_type = args.display_type;
     cfg.display_scale = args.display_scale;
     cfg.no_shutdown = args.no_shutdown;
+
+    if (serial_spec && strcmp(alias, "generic") != 0) {
+        fprintf(stderr, "gemu: -serial is only supported by the generic machine\n");
+        return 1;
+    }
 
     bool sdl_up = (cfg.display_type == GEMU_DISPLAY_SDL);
     if (sdl_up && SDL_Init(0) < 0) {
@@ -178,6 +199,7 @@ int ia64_setup(int argc, char *argv[]) {
             .no_shutdown = cfg.no_shutdown,
             .cdrom_path = cfg.cdrom_path,
             .cpu = args.cpu,
+            .serial_spec = serial_spec,
         };
         Ia64GenericState *g = ia64_generic_create(&gcfg);
         if (!g)

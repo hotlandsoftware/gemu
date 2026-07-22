@@ -159,6 +159,17 @@ typedef struct {
     bool            no_shutdown;
     const char     *cdrom_path;
     const char     *cpu;        /* NULL or "merced" (default), "mckinley" */
+    /* -serial SPEC: attach a 16550-style COM1 UART (port 0x3F8, inside
+     * the legacy I/O window - see GENERIC_LEGACY_IO_BASE) to a host
+     * transport, for a real Windows kernel debugger (WinDbg/KD) to
+     * attach to over a serial transport. NULL = no UART. SPEC is one of:
+     *   "stdio"          host's own stdin/stdout, raw byte mode (shares
+     *                     stdout with the VGA-mirror text echo - casual
+     *                     use only, not a clean KD wire)
+     *   "tcp:HOST:PORT"  a dedicated listening socket, one reconnectable
+     *                     client at a time - the one to point a real
+     *                     debugger at */
+    const char     *serial_spec;
 } GenericConfig;
 
 typedef struct Ia64GenericState Ia64GenericState;
