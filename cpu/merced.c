@@ -1712,6 +1712,17 @@ static uint64_t rse_addr(Merced *m, int64_t regs_pos) {
                          regs_pos - m->rse_anchor_regs);
 }
 
+/* Inverse of rse_addr(): the register-units position that a backing-store
+ * address maps to under the current anchor.  Walks in either direction,
+ * skipping RNAT collection slots, mirroring rse_move_regs(). */
+static int64_t rse_addr_to_regs(Merced *m, uint64_t addr) {
+    uint64_t a = m->rse_anchor_addr;
+    int64_t regs = 0;
+    while (a < addr) { a += 8; if (rse_is_rnat_slot(a)) a += 8; regs++; }
+    while (a > addr) { a -= 8; if (rse_is_rnat_slot(a)) a -= 8; regs--; }
+    return m->rse_anchor_regs + regs;
+}
+
 /* Maps an absolute register-units position (same axis as bof_total) to its
  * gr_stack slot. Valid as long as it's within MERCED_N_STACKED of the
  * current frame - i.e. as long as real hardware wouldn't itself have needed
@@ -2264,18 +2275,45 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         unsigned ar3 = (unsigned)bits(raw, 20, 7);
         m->ar[ar3] = gr_read(m, r2, &n2);
         if (ar3 == AR_BSPSTORE) {
-            /* mov-to-BSPSTORE empties the clean partition but preserves the
-             * dirty partition, rebasing BSP above the newly written store.
-             * Anchor the new address at the dirty boundary so rse_addr()
-             * also accounts for intervening RNAT collection slots. */
             int64_t bsp_regs = (int64_t)m->bof_total +
                                (int64_t)CFM_SOF(m->cfm);
             int64_t dirty = bsp_regs > m->rse_flushed_regs
                           ? bsp_regs - m->rse_flushed_regs : 0;
-            m->rse_flushed_regs = bsp_regs - dirty;
-            m->rse_anchor_addr = m->ar[AR_BSPSTORE];
-            m->rse_anchor_regs = m->rse_flushed_regs;
-            m->ar[AR_BSP] = rse_addr(m, bsp_regs);
+            uint64_t new_store = m->ar[AR_BSPSTORE];
+            uint64_t cur_store = rse_addr(m, m->rse_flushed_regs);
+            int64_t newpos = rse_addr_to_regs(m, new_store);
+            int64_t new_base = newpos - dirty;
+            int64_t back = (int64_t)m->bof_total - new_base;
+            /* A backward rewind into the *current* backing store, landing at
+             * a still-resident frame: this is SetjmpLongjmp (EDK
+             * InternalLongJump does "flushrs; mov ar.bspstore=saved; loadrs;
+             * mov ar.pfs=saved; br.ret" to unwind several frames at once).
+             * The re-anchoring branch below is correct for a context switch
+             * onto a *fresh* stack, but here it would strand bof_total at the
+             * deep intervening frames, so the following br.ret's naive
+             * bof-=sol lands on the wrong physical slots.  Guard on
+             * new_store < cur_store (a rewind, not a fresh higher stack) and
+             * on the target still being within the resident ring, so a real
+             * cross-stack switch still falls through to re-anchoring. */
+            if (new_store < cur_store && back > 0 && back < MERCED_RSE_CAPACITY) {
+                /* Teleport bof/bof_total to the store's true position under
+                 * the existing anchor, keeping position<->slot mapping intact. */
+                int64_t delta = new_base - (int64_t)m->bof_total;
+                m->bof_total = (uint64_t)new_base;
+                m->bof = (unsigned)(((int64_t)m->bof + delta) % MERCED_RSE_CAPACITY
+                                    + MERCED_RSE_CAPACITY) % MERCED_RSE_CAPACITY;
+                m->rse_flushed_regs = newpos;
+                m->ar[AR_BSP] = rse_addr(m, (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm));
+            } else {
+                /* mov-to-BSPSTORE empties the clean partition but preserves
+                 * the dirty partition, rebasing BSP above the newly written
+                 * store.  Anchor the new address at the dirty boundary so
+                 * rse_addr() also accounts for intervening RNAT slots. */
+                m->rse_flushed_regs = bsp_regs - dirty;
+                m->rse_anchor_addr = new_store;
+                m->rse_anchor_regs = m->rse_flushed_regs;
+                m->ar[AR_BSP] = rse_addr(m, bsp_regs);
+            }
         }
         return MERCED_OK;
     }
