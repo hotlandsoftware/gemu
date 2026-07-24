@@ -35,6 +35,8 @@
 typedef struct {
     uint64_t        ram_size;
     const char     *cdrom_path;
+    /* -hda FILE: raw read-write disk image (generic machine only for now). */
+    const char     *hda_path;
     GemuDisplayType display_type;
     int             display_scale;
     bool            no_shutdown;

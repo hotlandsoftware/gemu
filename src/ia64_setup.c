@@ -27,6 +27,9 @@ static const MachineDef machine_defs[] = {
     { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
+/* src/ia64_selftest.c - architectural microprogram conformance harness. */
+int ia64_selftest_main(const char *path);
+
 static const GemuDevDesc machines[] = {
 #include "generated/machines_ia64.inc"
 };
@@ -53,6 +56,12 @@ static const GemuArgsDef def = {
         "  -rom DIR|ZIP    Scan for known firmware by SHA-256\n"
         "  -m SIZE         RAM size, K/M/G suffix (default 512M, i2000 max 2G)\n"
         "  -cdrom FILE     Attach a read-only ISO image as an ATAPI CD-ROM\n"
+        "  -microprogram F Run an architectural microprogram on a bare core\n"
+        "                  and print the resulting state (conformance testing;\n"
+        "                  see tools/ia64_conformance.py)\n"
+        "  -hda FILE       Attach a raw read-write disk image (512-byte\n"
+        "                  sectors), e.g. one made with\n"
+        "                  'qemu-img create -f raw winxp.img 5G'\n"
         "  -serial stdio   generic machine only: attach COM1 to host stdio\n"
         "                  (casual use only - shares stdout with the VGA\n"
         "                  text mirror, not a clean debugger transport)\n"
@@ -159,6 +168,14 @@ int ia64_setup(int argc, char *argv[]) {
             uint64_t sz = parse_size(rem[++i]);
             if (!sz) return 1;
             cfg.ram_size = sz;
+        } else if (strcmp(rem[i], "-microprogram") == 0) {
+            /* Architectural conformance harness - see src/ia64_selftest.c.
+             * Runs bundles on a bare core and exits; no machine is created. */
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -microprogram requires an argument\n"); return 1; }
+            return ia64_selftest_main(rem[++i]);
+        } else if (strcmp(rem[i], "-hda") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -hda requires an argument\n"); return 1; }
+            cfg.hda_path = rem[++i];
         } else if (strcmp(rem[i], "-cdrom") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cdrom requires an argument\n"); return 1; }
             cfg.cdrom_path = rem[++i];
@@ -198,6 +215,7 @@ int ia64_setup(int argc, char *argv[]) {
             .display_scale = cfg.display_scale,
             .no_shutdown = cfg.no_shutdown,
             .cdrom_path = cfg.cdrom_path,
+            .hda_path = cfg.hda_path,
             .cpu = args.cpu,
             .serial_spec = serial_spec,
             .vnc_addr = args.vnc_addr,

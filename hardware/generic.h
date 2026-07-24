@@ -160,6 +160,25 @@
  * this device's design in the block comment above hardware/generic.h).
  * The result of the last READ/OPEN/chunk-read is memory-mapped
  * read-only at GENERIC_CDROM_BUF_BASE. */
+/* Hard disk: a raw, read-write image in 512-byte sectors (create one with
+ * `qemu-img create -f raw disk.img 5G`, or just truncate(1) a file).  Same
+ * "our own firmware is the only client" reasoning as the CD-ROM above - this
+ * is deliberately not an ATA/ATAPI task-file register set, so an OS driver
+ * will NOT find it; it exists so the firmware can read and write a disk.
+ *   +0x0  STATUS  (ro)        bit 0 = an image is attached
+ *   +0x4  LBA     (wo, 4B)    512-byte sector number for the next command
+ *   +0x8  CMD     (wo)        1 = read that sector into the buffer window
+ *                             2 = write the buffer window to that sector
+ *   +0xC  RESULT  (ro)        0 = last command ok, 1 = error
+ *   +0x10 SECTORS (ro, 4B)    image size in 512-byte sectors
+ * The sector buffer is mapped read-write at GENERIC_HDD_BUF_BASE. */
+#define GENERIC_HDD_IO_BASE         0x00000000C0004000ull
+#define GENERIC_HDD_IO_SIZE         0x14u
+#define GENERIC_HDD_CMD_READ        1u
+#define GENERIC_HDD_CMD_WRITE       2u
+#define GENERIC_HDD_BUF_BASE        0x00000000C0005000ull
+#define GENERIC_HDD_SECTOR_SIZE     512u
+
 #define GENERIC_CDROM_IO_BASE       0x00000000C0002000ull
 #define GENERIC_CDROM_IO_SIZE       0x2Cu
 #define GENERIC_CDROM_CMD_READ      1u
@@ -179,6 +198,8 @@ typedef struct {
     int             display_scale;
     bool            no_shutdown;
     const char     *cdrom_path;
+    /* -hda FILE: raw read-write disk image, 512-byte sectors. NULL = none. */
+    const char     *hda_path;
     const char     *cpu;        /* NULL or "merced" (default), "mckinley" */
     /* -serial SPEC: attach a 16550-style COM1 UART (port 0x3F8, inside
      * the legacy I/O window - see GENERIC_LEGACY_IO_BASE) to a host

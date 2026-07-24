@@ -60,6 +60,7 @@ FAMILY_SRC = {
         'vga/vgafont16.c',
         'vga/vgabios_rom.c',
         'src/ia64_setup.c',
+        'src/ia64_selftest.c',
     ],
     'mitsu': [
         'hardware/machine/machine_tvgame6.c',

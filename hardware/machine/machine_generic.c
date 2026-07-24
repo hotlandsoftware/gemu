@@ -67,6 +67,7 @@ struct Ia64GenericState {
 
     uint8_t  *ram;
     uint64_t  ram_size;
+    bool      warned_lost_write;
     uint8_t   rom[GENERIC_ROM_SIZE];
     char      rom_file[512];
     bool      rom_loaded;
@@ -106,6 +107,14 @@ struct Ia64GenericState {
      * data offset the *current* DRQ block ends at. */
     uint32_t  atapi_byte_limit;
     size_t    atapi_block_end;
+
+    /* -hda: raw read-write disk image (see GENERIC_HDD_IO_BASE). */
+    FILE    *hdd;
+    char     hdd_file[512];
+    uint64_t hdd_sectors;
+    uint32_t hdd_lba;
+    uint8_t  hdd_result;
+    uint8_t  hdd_buf[GENERIC_HDD_SECTOR_SIZE];
 
     FILE    *cdrom;
     char     cdrom_file[512];
@@ -207,6 +216,34 @@ static void generic_write_qemu_handoff(Ia64GenericState *s) {
         0, /* volatile NVRAM */
     };
     memcpy(s->ram + QEMU_IA64_HANDOFF_BASE, words, sizeof(words));
+}
+
+/* Read/write one 512-byte sector between the image and the buffer window.
+ * A short read past a sparse image's end yields zeroes rather than an error:
+ * `qemu-img create -f raw` leaves the file sparse, so the tail of a freshly
+ * created disk legitimately has nothing stored yet. */
+static void hdd_do_read(Ia64GenericState *s) {
+    s->hdd_result = 1;
+    memset(s->hdd_buf, 0, sizeof(s->hdd_buf));
+    if (!s->hdd || s->hdd_lba >= s->hdd_sectors) return;
+    if (fseeko(s->hdd, (off_t)s->hdd_lba * GENERIC_HDD_SECTOR_SIZE,
+               SEEK_SET) != 0)
+        return;
+    fread(s->hdd_buf, 1, sizeof(s->hdd_buf), s->hdd);
+    s->hdd_result = 0;
+}
+
+static void hdd_do_write(Ia64GenericState *s) {
+    s->hdd_result = 1;
+    if (!s->hdd || s->hdd_lba >= s->hdd_sectors) return;
+    if (fseeko(s->hdd, (off_t)s->hdd_lba * GENERIC_HDD_SECTOR_SIZE,
+               SEEK_SET) != 0)
+        return;
+    if (fwrite(s->hdd_buf, 1, sizeof(s->hdd_buf), s->hdd) !=
+        sizeof(s->hdd_buf))
+        return;
+    fflush(s->hdd);
+    s->hdd_result = 0;
 }
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -1235,6 +1272,20 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
             return kbd_pop(s);
         return 0;
     }
+    if (addr >= GENERIC_HDD_IO_BASE &&
+        addr + size <= GENERIC_HDD_IO_BASE + GENERIC_HDD_IO_SIZE) {
+        uint32_t off = (uint32_t)(addr - GENERIC_HDD_IO_BASE);
+        if (off == 0x00) return s->hdd != NULL;
+        if (off == 0x0C) return s->hdd_result;
+        if (off == 0x10) return (uint32_t)s->hdd_sectors;
+        return 0;
+    }
+    if (addr >= GENERIC_HDD_BUF_BASE &&
+        addr + size <= GENERIC_HDD_BUF_BASE + GENERIC_HDD_SECTOR_SIZE) {
+        uint64_t v = 0;
+        memcpy(&v, s->hdd_buf + (addr - GENERIC_HDD_BUF_BASE), size);
+        return v;
+    }
     if (addr >= GENERIC_CDROM_IO_BASE && addr + size <= GENERIC_CDROM_IO_BASE + GENERIC_CDROM_IO_SIZE) {
         uint32_t off = (uint32_t)(addr - GENERIC_CDROM_IO_BASE);
         if (off == 0)
@@ -1356,6 +1407,22 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                     (uint8_t)(val >> (i * 8)));
         return;
     }
+    if (addr >= GENERIC_HDD_IO_BASE &&
+        addr + size <= GENERIC_HDD_IO_BASE + GENERIC_HDD_IO_SIZE) {
+        uint32_t off = (uint32_t)(addr - GENERIC_HDD_IO_BASE);
+        if (off == 0x04) {
+            s->hdd_lba = (uint32_t)val;
+        } else if (off == 0x08) {
+            if ((uint8_t)val == GENERIC_HDD_CMD_READ) hdd_do_read(s);
+            else if ((uint8_t)val == GENERIC_HDD_CMD_WRITE) hdd_do_write(s);
+        }
+        return;
+    }
+    if (addr >= GENERIC_HDD_BUF_BASE &&
+        addr + size <= GENERIC_HDD_BUF_BASE + GENERIC_HDD_SECTOR_SIZE) {
+        memcpy(s->hdd_buf + (addr - GENERIC_HDD_BUF_BASE), &val, size);
+        return;
+    }
     if (addr >= GENERIC_CDROM_IO_BASE && addr + size <= GENERIC_CDROM_IO_BASE + GENERIC_CDROM_IO_SIZE) {
         uint32_t off = (uint32_t)(addr - GENERIC_CDROM_IO_BASE);
         if (off == 4) {
@@ -1394,6 +1461,16 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     if (addr + size <= s->ram_size) {
         memcpy(s->ram + addr, &val, size);
         return;
+    }
+    /* A store to an address that is neither RAM, nor a device, nor ROM goes
+     * nowhere and reads back as all-ones.  That is what real open bus does,
+     * but silently losing guest writes turns a firmware bug (a memory map
+     * that over-reports RAM, say) into a mystery, so say it once. */
+    if (addr < GENERIC_ROM_BASE && !s->warned_lost_write) {
+        s->warned_lost_write = true;
+        fprintf(stderr, "gemu: warning: dropped a %u-byte write to %#" PRIx64
+                ", above the top of RAM (%#" PRIx64 "); reads there return "
+                "all-ones\n", size, addr, s->ram_size);
     }
     /* ROM: read-only, like real (unprogrammed) flash - writes are dropped. */
 }
@@ -1485,6 +1562,11 @@ bool ia64_generic_load_firmware(Ia64GenericState *s, const char *path) {
     }
     snprintf(s->rom_file, sizeof(s->rom_file), "%s", path);
     s->rom_loaded = true;
+    /* Every firmware needs to know how much RAM actually exists, not just
+     * ia64-firmware.bin: a ROM-resident EFI has no other way to find out, and
+     * a memory map that over-reports RAM sends the OS to write into addresses
+     * this machine silently drops (see generic_mem_write). */
+    generic_write_qemu_handoff(s);
     gemu_monitor_register_rom(s->monitor, (uint32_t)(GENERIC_ROM_BASE + off),
                               (uint32_t)len, path);
     return true;
@@ -1669,6 +1751,26 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
         gemu_monitor_set_vnc(s->monitor, s->vnc);
     }
 
+    if (cfg->hda_path) {
+        /* Read-write: a hard disk that silently discarded writes would be
+         * worse than no disk at all. */
+        s->hdd = fopen(cfg->hda_path, "r+b");
+        if (!s->hdd) {
+            fprintf(stderr, "gemu: cannot open disk image '%s' read-write\n",
+                    cfg->hda_path);
+        } else {
+            if (fseeko(s->hdd, 0, SEEK_END) == 0) {
+                off_t end = ftello(s->hdd);
+                if (end > 0)
+                    s->hdd_sectors = (uint64_t)end / GENERIC_HDD_SECTOR_SIZE;
+            }
+            rewind(s->hdd);
+            snprintf(s->hdd_file, sizeof(s->hdd_file), "%s", cfg->hda_path);
+            fprintf(stderr, "gemu: disk '%s': %" PRIu64 " sectors (%" PRIu64
+                    " MiB)\n", cfg->hda_path, s->hdd_sectors,
+                    (s->hdd_sectors * GENERIC_HDD_SECTOR_SIZE) >> 20);
+        }
+    }
     if (cfg->cdrom_path) {
         s->cdrom = fopen(cfg->cdrom_path, "rb");
         if (!s->cdrom) {
@@ -1731,6 +1833,7 @@ void ia64_generic_destroy(Ia64GenericState *s) {
     if (s->vnc) gemu_vnc_destroy(s->vnc);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     if (s->cpu) merced_destroy(s->cpu);
+    if (s->hdd) fclose(s->hdd);
     if (s->cdrom) fclose(s->cdrom);
     free(s->atapi_data);
     free(s->ram);
