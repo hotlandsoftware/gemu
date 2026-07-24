@@ -5,6 +5,7 @@
 #include "gemu/gemu_display.h"
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
+#include "gemu/vnc.h"
 #include "gemu/util.h"
 #include <ctype.h>
 #include <inttypes.h>
@@ -59,9 +60,10 @@ static const GemuActionDef generic_kbd_actions[] = {
 };
 
 struct Ia64GenericState {
-    GemuMonitor *monitor;
-    GemuDisplay *display;
-    Merced      *cpu;
+    GemuMonitor   *monitor;
+    GemuDisplay   *display;
+    GemuVncServer *vnc;
+    Merced        *cpu;
 
     uint8_t  *ram;
     uint64_t  ram_size;
@@ -94,6 +96,16 @@ struct Ia64GenericState {
     unsigned  atapi_packet_pos;
     uint8_t  *atapi_data;
     size_t    atapi_data_len, atapi_data_pos;
+    /* ATAPI PIO transfers larger than the driver's declared "byte count
+     * limit" (written to 1F4/1F5 before the PACKET command) must be split
+     * across multiple DRQ blocks, each announced by its own byte count in
+     * 1F4/1F5 and its own BSY->DRQ/interrupt handshake - a real firmware
+     * ISO9660 driver (as opposed to our own, which never requests more
+     * than one block's worth) depends on this. atapi_byte_limit is
+     * captured when the PACKET command is issued; atapi_block_end is the
+     * data offset the *current* DRQ block ends at. */
+    uint32_t  atapi_byte_limit;
+    size_t    atapi_block_end;
 
     FILE    *cdrom;
     char     cdrom_file[512];
@@ -167,6 +179,8 @@ static bool path_ends_with(const char *path, const char *suffix) {
 
 static void generic_qemu_firmware_reset(Ia64GenericState *s) {
     Merced *m = s->cpu;
+    if (!s->serial_enabled)
+        s->serial_enabled = true;
     merced_reset(m);
     m->ip = QEMU_IA64_FW_BASE;
     m->br[0] = QEMU_IA64_FW_BASE;
@@ -231,9 +245,15 @@ static void atapi_set_data(Ia64GenericState *s, const void *data, size_t len) {
         memcpy(s->atapi_data, data, len);
         s->atapi_data_len = len;
     }
+    /* First DRQ block: capped at the driver's declared byte-count limit
+     * (0 = no limit set, i.e. the native-ATA IDENTIFY path). */
+    size_t block_len = len;
+    if (s->atapi_byte_limit != 0 && (size_t)s->atapi_byte_limit < block_len)
+        block_len = s->atapi_byte_limit;
+    s->atapi_block_end = block_len;
     s->atapi_count = 0x02;
-    s->atapi_lba_mid = (uint8_t)len;
-    s->atapi_lba_high = (uint8_t)(len >> 8);
+    s->atapi_lba_mid = (uint8_t)block_len;
+    s->atapi_lba_high = (uint8_t)(block_len >> 8);
     s->atapi_status = len ? 0x48 : 0x40;
     generic_raise_irq(s, 14);
 }
@@ -343,6 +363,12 @@ static uint64_t qemu_pci_cfg_read(Ia64GenericState *s, uint64_t addr,
     unsigned fun = (unsigned)(off >> 12) & 7;
     unsigned reg = (unsigned)off & 0xfff;
     uint8_t *cfg = qemu_pci_cfg_space(s, bus, dev, fun);
+    if (getenv("IDE_DEBUG")) {
+        static unsigned n;
+        if (n++ < 300)
+            fprintf(stderr, "IDE: pci cfg read bus=%u dev=%u fun=%u reg=%#x size=%u cfg=%p\n",
+                    bus, dev, fun, reg, size, (void *)cfg);
+    }
     if (!cfg || reg + size > 256)
         return size_mask(size);
 
@@ -387,6 +413,14 @@ static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size
     static unsigned debug_reads;
     if (getenv("GENERIC_DEBUG") && debug_reads++ < 128)
         fprintf(stderr, "generic: io read port=%04X size=%u\n", port, size);
+    if (getenv("IDE_DEBUG") &&
+        ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6 ||
+         (port >= 0x170 && port <= 0x177) || port == 0x376)) {
+        static unsigned n;
+        if (n++ < 300)
+            fprintf(stderr, "IDE: read port=%04X size=%u ip=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                    port, size, s->cpu->ip, s->cpu->ninsts);
+    }
     if (port == 0xCF8 && size == 4) return s->pci_cfg_addr;
     if (port >= 0x3B0 && port + size <= 0x3E0) {
         uint64_t v = 0;
@@ -409,10 +443,25 @@ static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size
         if (reg == 0) {
             uint64_t v = 0;
             for (unsigned i = 0; i < size; i++)
-                if (s->atapi_data_pos < s->atapi_data_len)
+                if (s->atapi_data_pos < s->atapi_block_end)
                     v |= (uint64_t)s->atapi_data[s->atapi_data_pos++] << (i * 8);
-            if (s->atapi_data_pos >= s->atapi_data_len && (s->atapi_status & 8)) {
-                s->atapi_status = 0x40; s->atapi_count = 3;
+            if (s->atapi_data_pos >= s->atapi_block_end && (s->atapi_status & 8)) {
+                if (s->atapi_data_pos < s->atapi_data_len) {
+                    /* More data than fit in one DRQ block: announce the next
+                     * block's size and re-arm, instead of ending the
+                     * transfer - real ATAPI PIO delivers large responses
+                     * (e.g. a multi-sector CD-ROM READ) as a sequence of
+                     * driver-bounded blocks, each with its own interrupt. */
+                    size_t remaining = s->atapi_data_len - s->atapi_data_pos;
+                    size_t block_len = s->atapi_byte_limit != 0 &&
+                                        (size_t)s->atapi_byte_limit < remaining
+                                            ? s->atapi_byte_limit : remaining;
+                    s->atapi_block_end = s->atapi_data_pos + block_len;
+                    s->atapi_lba_mid = (uint8_t)block_len;
+                    s->atapi_lba_high = (uint8_t)(block_len >> 8);
+                } else {
+                    s->atapi_status = 0x40; s->atapi_count = 3;
+                }
                 generic_raise_irq(s, 14);
             }
             return v;
@@ -459,6 +508,14 @@ static void legacy_io_write(Ia64GenericState *s, unsigned port, uint64_t val, un
     if (getenv("GENERIC_DEBUG") && debug_writes++ < 128)
         fprintf(stderr, "generic: io write port=%04X size=%u val=%08" PRIX64 "\n",
                 port, size, val);
+    if (getenv("IDE_DEBUG") &&
+        ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6 ||
+         (port >= 0x170 && port <= 0x177) || port == 0x376)) {
+        static unsigned n;
+        if (n++ < 300)
+            fprintf(stderr, "IDE: write port=%04X size=%u val=%" PRIX64 " ip=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                    port, size, val, s->cpu->ip, s->cpu->ninsts);
+    }
     if (port == 0xCF8 && size == 4) { s->pci_cfg_addr = (uint32_t)val; return; }
     if (port >= 0x3B0 && port + size <= 0x3E0) {
         for (unsigned i = 0; i < size; i++)
@@ -495,6 +552,11 @@ static void legacy_io_write(Ia64GenericState *s, unsigned port, uint64_t val, un
         case 7:
             s->atapi_error = 0;
             if ((uint8_t)val == 0xA0) {
+                /* 1F4/1F5 hold the driver's declared max DRQ block size for
+                 * this command - capture it now, before atapi_set_data()
+                 * (called once the 12-byte CDB finishes arriving) overwrites
+                 * those same registers with the response's own byte count. */
+                s->atapi_byte_limit = ((uint32_t)s->atapi_lba_high << 8) | s->atapi_lba_mid;
                 s->atapi_packet_pos = 0; memset(s->atapi_packet, 0, 12);
                 s->atapi_count = 1; s->atapi_status = 0x48;
             } else if ((uint8_t)val == 0xA1) {
@@ -502,6 +564,7 @@ static void legacy_io_write(Ia64GenericState *s, unsigned port, uint64_t val, un
                 id[98] = 0; id[99] = 2;
                 const char model[40] = "GEMU ATAPI CD-ROM                       ";
                 for (unsigned i = 0; i < 40; i += 2) { id[54+i] = model[i+1]; id[55+i] = model[i]; }
+                s->atapi_byte_limit = 0;   /* native ATA IDENTIFY: fixed 512B, one block */
                 atapi_set_data(s, id, sizeof(id));
             } else if ((uint8_t)val == 8) {
                 s->atapi_status = 0x40; s->atapi_count = 1;
@@ -1117,6 +1180,9 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     if (s->qemu_firmware && addr >= GENERIC_QEMU_VGA_MMIO_BASE &&
         addr + size <= GENERIC_QEMU_VGA_MMIO_BASE + GENERIC_QEMU_VGA_MMIO_SIZE)
         return 0;
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_UART_BASE &&
+        addr + size <= GENERIC_QEMU_UART_BASE + GENERIC_QEMU_UART_SIZE)
+        return legacy_io_read(s, (unsigned)(GENERIC_COM1_PORT + (addr - GENERIC_QEMU_UART_BASE)), size);
     if (addr >= GENERIC_LEGACY_IO_BASE &&
         addr + size <= GENERIC_LEGACY_IO_BASE + GENERIC_LEGACY_IO_SPARSE_SIZE)
         return legacy_io_read(s, (unsigned)sparse_io_decode(addr - GENERIC_LEGACY_IO_BASE), size);
@@ -1245,6 +1311,11 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     if (s->qemu_firmware && addr >= GENERIC_QEMU_VGA_MMIO_BASE &&
         addr + size <= GENERIC_QEMU_VGA_MMIO_BASE + GENERIC_QEMU_VGA_MMIO_SIZE)
         return;
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_UART_BASE &&
+        addr + size <= GENERIC_QEMU_UART_BASE + GENERIC_QEMU_UART_SIZE) {
+        legacy_io_write(s, (unsigned)(GENERIC_COM1_PORT + (addr - GENERIC_QEMU_UART_BASE)), val, size);
+        return;
+    }
     if (addr >= GENERIC_LEGACY_IO_BASE &&
         addr + size <= GENERIC_LEGACY_IO_BASE + GENERIC_LEGACY_IO_SPARSE_SIZE) {
         legacy_io_write(s, (unsigned)sparse_io_decode(addr - GENERIC_LEGACY_IO_BASE), val, size);
@@ -1379,6 +1450,7 @@ bool ia64_generic_load_firmware(Ia64GenericState *s, const char *path) {
         s->qemu_ide_cfg[0x00] = 0x95; s->qemu_ide_cfg[0x01] = 0x10;
         s->qemu_ide_cfg[0x02] = 0x46; s->qemu_ide_cfg[0x03] = 0x06;
         s->qemu_ide_cfg[0x04] = 0x01;
+        s->qemu_ide_cfg[0x08] = 0x07;   /* Revision ID: matches real CMD646 (qemu-system-ia64 hw/ide/cmd646.c) */
         s->qemu_ide_cfg[0x09] = 0x8f; s->qemu_ide_cfg[0x0a] = 0x01;
         s->qemu_ide_cfg[0x0b] = 0x01;
         s->qemu_ide_cfg[0x0e] = 0x00;
@@ -1582,6 +1654,21 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
     gemu_monitor_set_cpu_state_cb(s->monitor, generic_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, generic_screendump, s);
 
+    if (cfg->vnc_addr) {
+        /* Keyboard-only: this machine's native framebuffer is 32-bit ARGB,
+         * which gemu_vnc_update() doesn't understand (it wants an 8bpp
+         * palette/mono surface) - so no video is exported here, only
+         * arrow/enter/ASCII key events. Use the monitor's `screendump`
+         * command for a look at the screen when driving this headlessly. */
+        s->vnc = gemu_vnc_create(cfg->vnc_addr, FB_W, FB_H);
+        if (!s->vnc) {
+            fprintf(stderr, "gemu: cannot start VNC server on '%s'\n", cfg->vnc_addr);
+            ia64_generic_destroy(s);
+            return NULL;
+        }
+        gemu_monitor_set_vnc(s->monitor, s->vnc);
+    }
+
     if (cfg->cdrom_path) {
         s->cdrom = fopen(cfg->cdrom_path, "rb");
         if (!s->cdrom) {
@@ -1641,6 +1728,7 @@ void ia64_generic_destroy(Ia64GenericState *s) {
         return;
     if (s->serial_enabled) generic_serial_disable(s);
     if (s->display) gemu_display_destroy(s->display);
+    if (s->vnc) gemu_vnc_destroy(s->vnc);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     if (s->cpu) merced_destroy(s->cpu);
     if (s->cdrom) fclose(s->cdrom);
@@ -1729,12 +1817,58 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
             if (pressed & KBD_ACTION_UP) kbd_push(s, GENERIC_KBD_KEY_UP);
             if (pressed & KBD_ACTION_DOWN) kbd_push(s, GENERIC_KBD_KEY_DOWN);
             if (pressed & KBD_ACTION_ENTER) kbd_push(s, GENERIC_KBD_KEY_ENTER);
+            if (s->qemu_firmware) {
+                /* This firmware's ConIn is its own UART (GENERIC_QEMU_UART_BASE),
+                 * not our custom kbd controller - feed the display's raw
+                 * Unicode key queue into the same UART RX ring COM1 uses,
+                 * so real typing (and Delete/Escape for the boot hotkey
+                 * window, both already mapped by the raw queue) reaches it. */
+                uint32_t cp;
+                while ((cp = gemu_display_pop_raw_key(s->display)) != 0) {
+                    if (cp <= 0x7F) {
+                        uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+                        if (next != s->uart_rx_head)
+                            s->uart_rx[s->uart_rx_tail++] = (uint8_t)cp;
+                    }
+                }
+            }
             gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
             generic_render_frame(s);
             gemu_display_render(s->display, s->fb, FB_W, FB_H);
             gemu_sleep_ms(s->halted ? 30 : 1);
         } else {
             gemu_sleep_ms(s->halted ? 30 : 0);
+        }
+
+        if (s->vnc) {
+            /* Same two destinations as the local-display path above (the
+             * custom kbd controller's boot-menu FIFO, and qemu_firmware's
+             * UART ConIn ring), just fed from RFB KeyEvent messages
+             * instead of the display backend's own key queue. Only
+             * key-down edges matter here - this machine has no concept
+             * of held keys. */
+            GemuVncKeyEvent ev;
+            while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
+                if (!ev.down)
+                    continue;
+                if (ev.keysym == 0xFF52)      kbd_push(s, GENERIC_KBD_KEY_UP);
+                else if (ev.keysym == 0xFF54) kbd_push(s, GENERIC_KBD_KEY_DOWN);
+                else if (ev.keysym == 0xFF0D) kbd_push(s, GENERIC_KBD_KEY_ENTER);
+                if (s->qemu_firmware) {
+                    uint32_t cp = 0;
+                    if (ev.keysym <= 0x7F)          cp = ev.keysym;      /* Latin-1/ASCII keysyms */
+                    else if (ev.keysym == 0xFF0D)   cp = '\r';
+                    else if (ev.keysym == 0xFF08)   cp = '\b';
+                    else if (ev.keysym == 0xFF09)   cp = '\t';
+                    else if (ev.keysym == 0xFF1B)   cp = 0x1b;
+                    else if (ev.keysym == 0xFFFF)   cp = 0x7f;
+                    if (cp) {
+                        uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+                        if (next != s->uart_rx_head)
+                            s->uart_rx[s->uart_rx_tail++] = (uint8_t)cp;
+                    }
+                }
+            }
         }
     }
     gemu_monitor_stop(s->monitor);

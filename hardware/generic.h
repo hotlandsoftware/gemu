@@ -87,6 +87,9 @@
 #define GENERIC_QEMU_NVRAM_BASE 0x00000000FFF00000ull
 #define GENERIC_QEMU_NVRAM_SIZE 0x10000u
 
+#define GENERIC_QEMU_UART_BASE 0x00000047F0000000ull
+#define GENERIC_QEMU_UART_SIZE 0x8u
+
 /* Minimal Intel 82093-style I/O SAPIC.  IA-64 Windows requires one during
  * HAL phase one even before any routed PCI interrupt is enabled. */
 #define GENERIC_IOSAPIC_BASE  0x0000000080110000ull
@@ -188,6 +191,14 @@ typedef struct {
      *                     client at a time - the one to point a real
      *                     debugger at */
     const char     *serial_spec;
+    /* -vnc ADDR: accept RFB keyboard input (arrow/enter, for the boot
+     * menu, and raw ASCII for qemu_firmware's UART ConIn path) over a
+     * VNC connection - the framebuffer itself is NOT exported this way
+     * (gemu_vnc_update() only understands 8bpp palette/mono surfaces,
+     * not this machine's native 32-bit ARGB one); use the monitor's
+     * `screendump` command for visual feedback instead. NULL = no VNC
+     * server. Format: "host:display" or ":display" (port = 5900+display). */
+    const char     *vnc_addr;
 } GenericConfig;
 
 typedef struct Ia64GenericState Ia64GenericState;

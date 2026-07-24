@@ -46,7 +46,7 @@ static const GemuArgsDef def = {
                   | GEMU_DISP_F(GEMU_DISPLAY_GTK)
 #endif
     ,
-    .vnc_support  = false,
+    .vnc_support  = true,
     .extra_help =
         "\nIA64 options:\n"
         "  -rom FILE       Load firmware flash image (top-aligned, max 4 MiB)\n"
@@ -200,6 +200,7 @@ int ia64_setup(int argc, char *argv[]) {
             .cdrom_path = cfg.cdrom_path,
             .cpu = args.cpu,
             .serial_spec = serial_spec,
+            .vnc_addr = args.vnc_addr,
         };
         Ia64GenericState *g = ia64_generic_create(&gcfg);
         if (!g)

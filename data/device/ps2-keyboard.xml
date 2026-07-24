@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<device name="ps2-keyboard" description="Generic QWERTY PS/2 keyboard" status="working">
+    <machine name="generic"/>
+</device>

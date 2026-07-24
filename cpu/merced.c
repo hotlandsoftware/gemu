@@ -423,6 +423,40 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                     m->cr[CR_IHA], m->cr[CR_IPSR], m->cr[CR_IIP],
                     m->ninsts);
     }
+    if (vec == VEC_PAGE_NOT_PRESENT && getenv("MERCED_PNP_DEBUG")) {
+        /* Track whether repeated page-not-present faults are hitting a
+         * small, fixed set of addresses (handler's fixup isn't sticking)
+         * or a large, growing set (genuine forward progress). */
+        static uint64_t pnp_addrs[256];
+        static uint32_t pnp_counts[256];
+        static unsigned pnp_nseen;
+        static uint64_t pnp_total, pnp_overflow;
+        pnp_total++;
+        unsigned i;
+        for (i = 0; i < pnp_nseen; i++) {
+            if (pnp_addrs[i] == ifa) {
+                pnp_counts[i]++;
+                break;
+            }
+        }
+        if (i == pnp_nseen) {
+            if (pnp_nseen < 256) {
+                pnp_addrs[pnp_nseen] = ifa;
+                pnp_counts[pnp_nseen] = 1;
+                pnp_nseen++;
+            } else {
+                pnp_overflow++;
+            }
+        }
+        if (pnp_total % 50000 == 0) {
+            fprintf(stderr, "merced: PNP dist total=%" PRIu64
+                    " distinct=%u overflow=%" PRIu64 "\n",
+                    pnp_total, pnp_nseen, pnp_overflow);
+            for (unsigned k = 0; k < pnp_nseen; k++)
+                fprintf(stderr, "  ifa=%016" PRIX64 " count=%u\n",
+                        pnp_addrs[k], pnp_counts[k]);
+        }
+    }
     if ((ifa >> 61) == 4) {
         static unsigned region4_debug;
         if (region4_debug++ < 12)
@@ -662,6 +696,15 @@ static uint64_t phys_fetch(Merced *m, uint64_t pa, unsigned size) {
 }
 static void phys_write(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
     pa &= MERCED_PHYS_MASK;
+    if (getenv("MERCED_WATCH_DEBUG") &&
+        pa >= UINT64_C(0x031FD280) && pa < UINT64_C(0x031FD2C0)) {
+        static unsigned watch_debug;
+        if (watch_debug++ < 64)
+            fprintf(stderr, "merced: WATCH write pa=%016" PRIX64
+                    " v=%016" PRIX64 " size=%u ip=%016" PRIX64
+                    " ninsts=%" PRIu64 "\n",
+                    pa, v, size, m->ip, m->ninsts);
+    }
     /* All CPU-visible stores can collide with an advanced load, including
      * semaphore, FP, and RSE spill stores. */
     alat_invalidate_store(m, pa, size);
@@ -1821,6 +1864,134 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                     m->taken = 1;
                     return MERCED_OK;
                 }
+                /* QEMU's project firmware's pal_proc_entry trampoline
+                 * ("break.m 0x100000; br.many b0") is not a real Itanium
+                 * PAL image - this firmware never installs a Break-vector
+                 * IVT handler for it, because on real qemu-system-ia64 the
+                 * break is intercepted directly by the host emulator
+                 * (target/ia64/arch/pal.c: ia64_pal_dispatch(), dispatching
+                 * on GR28 per the PAL_STATIC/PAL_STACKED calling
+                 * convention) rather than ever reaching architectural fault
+                 * delivery. Delivering a real VEC_BREAK fault here lands on
+                 * IVA+0x2C00, which is unmapped/empty, and double-faults.
+                 * Until individual PAL procedures are implemented, match
+                 * upstream's default case for every index: gracefully
+                 * report PAL_STATUS_NOT_IMPLEMENTED in GR8 (with GR9-11
+                 * cleared) and resume at the trampoline's own br.many b0
+                 * instead of faulting. */
+                if (imm == UINT64_C(0x100000)) {
+                    uint8_t nn;
+                    uint64_t index = gr_read(m, 28, &nn);
+                    uint64_t arg1 = gr_read(m, 29, &nn);
+                    uint64_t arg2 = gr_read(m, 30, &nn);
+                    uint64_t arg3 = gr_read(m, 31, &nn);
+                    uint64_t status = (uint64_t)-1;   /* PAL_STATUS_NOT_IMPLEMENTED */
+                    uint64_t res1 = 0, res2 = 0, res3 = 0;
+                    /* Static, argument-gated procedures, matching
+                     * target/ia64/arch/pal.c's constant returns for a
+                     * generic (non-Montecito) Itanium: real values, not
+                     * placeholders, so the OS configures its own MMU/RSE
+                     * state correctly instead of guessing after a
+                     * NOT_IMPLEMENTED failure. */
+                    switch (index) {
+                    case 0x14:                        /* PAL_VERSION */
+                        if (arg1 == 0 && arg2 == 0 && arg3 == 0) {
+                            status = 0;                /* PAL_STATUS_SUCCESS */
+                            res1 = (UINT64_C(2) << 40) | (UINT64_C(0x23) << 32) |
+                                   (UINT64_C(1) << 24) | (UINT64_C(2) << 8) |
+                                   UINT64_C(0x23);
+                            res2 = res1;
+                        } else {
+                            status = (uint64_t)-2;     /* PAL_STATUS_INVALID_ARGUMENT */
+                        }
+                        break;
+                    case 0x08:                        /* PAL_VM_SUMMARY */
+                        if (arg1 == 0 && arg2 == 0 && arg3 == 0) {
+                            status = 0;
+                            /* phys_addr_size=50, key_bits=24, pkr_count-1=15,
+                             * hash_tag_id=8, vw=4, keys=2 (matches
+                             * target/ia64/cpu.h's IA64_IMPL_{PA,KEY}_BITS /
+                             * IA64_PKR_COUNT defaults). max_itr-1/max_dtr-1
+                             * MUST match MERCED_N_TR-1, our actual TR slot
+                             * count - itr/dtr insertion masks the requested
+                             * slot with (MERCED_N_TR-1), so overstating this
+                             * makes the OS pick slot numbers that silently
+                             * wrap onto already-used entries instead of the
+                             * distinct ones it thinks it's using. */
+                            res1 = UINT64_C(1) | (UINT64_C(50) << 1) |
+                                   (UINT64_C(24) << 8) | (UINT64_C(15) << 16) |
+                                   (UINT64_C(8) << 24) |
+                                   ((uint64_t)(MERCED_N_TR - 1) << 32) |
+                                   ((uint64_t)(MERCED_N_TR - 1) << 40) |
+                                   (UINT64_C(4) << 48) | (UINT64_C(2) << 56);
+                            /* impl_va_msb=60, rid_bits=24 */
+                            res2 = UINT64_C(60) | (UINT64_C(24) << 8);
+                        } else {
+                            status = (uint64_t)-2;
+                        }
+                        break;
+                    case 0x13:                        /* PAL_RSE_INFO */
+                        if (arg1 == 0 && arg2 == 0 && arg3 == 0) {
+                            status = 0;
+                            res1 = 96;                  /* num_phys_stacked */
+                            res2 = 16;                  /* hints: none */
+                        } else {
+                            status = (uint64_t)-2;
+                        }
+                        break;
+                    case 0x0D:                         /* PAL_FREQ_BASE */
+                        if (arg1 == 0 && arg2 == 0 && arg3 == 0) {
+                            status = 0;
+                            res1 = 100000000;           /* 100 MHz base */
+                        } else {
+                            status = (uint64_t)-2;
+                        }
+                        break;
+                    case 0x04:                         /* PAL_CACHE_SUMMARY */
+                        if (arg1 == 0 && arg2 == 0 && arg3 == 0) {
+                            status = 0;
+                            res1 = 3;                   /* cache levels */
+                            res2 = 4;                   /* unique caches */
+                        } else {
+                            status = (uint64_t)-2;
+                        }
+                        break;
+                    case 0x11:                         /* PAL_PROC_GET_FEATURES */
+                        if (arg1 == 0 && arg3 == 0) {
+                            if (arg2 == 0) {
+                                status = 0;
+                            } else if (arg2 < 16) {
+                                status = (uint64_t)-2;  /* INVALID_ARGUMENT */
+                            } else {
+                                status = (uint64_t)-8;  /* BEYOND_MAX (no Montecito set) */
+                            }
+                        } else {
+                            status = (uint64_t)-2;
+                        }
+                        break;
+                    default:
+                        break;
+                    }
+                    if (getenv("MERCED_PAL_DEBUG") &&
+                        m->ninsts > UINT64_C(1000000000)) {
+                        static unsigned pal_debug;
+                        if (pal_debug++ < 2000)
+                            fprintf(stderr, "merced: PAL index=%" PRIu64
+                                    " arg1=%016" PRIX64 " arg2=%016" PRIX64
+                                    " arg3=%016" PRIX64 " status=%" PRId64
+                                    " ninsts=%" PRIu64 "\n",
+                                    index, arg1, arg2, arg3, (int64_t)status,
+                                    m->ninsts);
+                    }
+                    gr_write(m, 8, status, 0);
+                    gr_write(m, 9, res1, 0);
+                    gr_write(m, 10, res2, 0);
+                    gr_write(m, 11, res3, 0);
+                    return MERCED_OK;
+                }
+                if (getenv("BREAK_DEBUG"))
+                    fprintf(stderr, "BREAK: imm=%#" PRIX64 " ip=%016" PRIX64 " gr28=%#" PRIX64 "\n",
+                            imm, m->ip, gr_read(m, 28, &(uint8_t){0}));
                 /* Architecturally a Break Instruction fault, delivered to
                  * firmware's own handler (which decides what a given
                  * immediate means - PAL call, OS call, debug trap, etc.),
@@ -2494,10 +2665,14 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
                     PUT(2 * k + 1, ELEM(s2, 2 * k + off));
                 }
             } else if (x2c == 1 && (x2b == 0 || x2b == 2)) {  /* unpack.h/.l */
-                unsigned base = (x2b == 0) ? 0 : n / 2;
+                /* x2b=0 encodes .h (select the HIGH/most-significant half of
+                 * each source), x2b=2 encodes .l (select the LOW half) - the
+                 * opposite pairing from mix.r/.l above, confirmed against
+                 * ia64-elf-as's actual encoding of unpack4.l/.h. */
+                unsigned base = (x2b == 0) ? n / 2 : 0;
                 for (unsigned k = 0; k < n / 2; k++) {
-                    PUT(2 * k,     ELEM(s1, base + k));
-                    PUT(2 * k + 1, ELEM(s2, base + k));
+                    PUT(2 * k,     ELEM(s2, base + k));
+                    PUT(2 * k + 1, ELEM(s1, base + k));
                 }
             } else if (x2c == 0 && (x2b == 0 || x2b == 2)) {  /* pack (sat, 2*esz->esz) */
                 /* pack2: hw->byte; pack4: word->hw. za=1 => pack4, else pack2.
@@ -3068,12 +3243,14 @@ MercedStatus merced_step(Merced *m) {
         UINT64_C(0x00000000FFF05000)) {
         uint64_t service = gr_read(m, 32, NULL);
         static unsigned sal_debug_calls;
-        if (getenv("MERCED_SAL_DEBUG") && sal_debug_calls++ < 64)
+        if (getenv("MERCED_SAL_DEBUG") &&
+            m->ninsts > UINT64_C(1000000000) && sal_debug_calls++ < 2000)
             fprintf(stderr, "merced: SAL call %016" PRIX64
                     " a1=%016" PRIX64 " a2=%016" PRIX64
-                    " a3=%016" PRIX64 " ip=%016" PRIX64 "\n",
+                    " a3=%016" PRIX64 " ip=%016" PRIX64
+                    " ninsts=%" PRIu64 "\n",
                     service, gr_read(m, 33, NULL), gr_read(m, 34, NULL),
-                    gr_read(m, 35, NULL), m->ip);
+                    gr_read(m, 35, NULL), m->ip, m->ninsts);
         if (service == UINT64_C(0x01000010) ||
             service == UINT64_C(0x01000011)) {
             uint64_t address = gr_read(m, 33, NULL);
@@ -3148,6 +3325,60 @@ MercedStatus merced_step(Merced *m) {
     MercedStatus st;
 
     if (slot > 2) return mhalt(m, "bad IP slot %u", slot);
+    if (getenv("MERCED_R18_DEBUG") &&
+        bundle_va == UINT64_C(0xE0000000831AF8F0) && slot == 0) {
+        static unsigned r18_debug;
+        if (r18_debug++ < 5) {
+            uint8_t nn;
+            uint64_t r18 = gr_read(m, 18, &nn), r33 = gr_read(m, 33, &nn);
+            fprintf(stderr, "merced: r18-tbl r18=%016" PRIX64
+                    " r26=%016" PRIX64 " r27=%016" PRIX64
+                    " r28=%016" PRIX64 " r29=%016" PRIX64
+                    " r30=%016" PRIX64 " r33=%016" PRIX64
+                    " ninsts=%" PRIu64 "\n",
+                    r18, gr_read(m, 26, &nn), gr_read(m, 27, &nn),
+                    gr_read(m, 28, &nn), gr_read(m, 29, &nn),
+                    gr_read(m, 30, &nn), r33, m->ninsts);
+            for (int idx = 0; idx < 8; idx++) {
+                uint64_t va2 = r18 + (uint64_t)idx * 8, dpa;
+                MercedStatus dst;
+                if (va_translate(m, va2, false, false, ISR_R, &dpa, &dst))
+                    fprintf(stderr, "  r18[%d] = va=%016" PRIX64
+                            " -> %016" PRIX64 "\n", idx, va2,
+                            phys_read(m, dpa, 8));
+            }
+        }
+    }
+    if (getenv("MERCED_R48_DEBUG") &&
+        bundle_va == UINT64_C(0xE0000000831B0580) && slot == 0) {
+        static unsigned r48_debug;
+        if (r48_debug++ < 3) {
+            uint8_t nn;
+            uint64_t r49 = gr_read(m, 49, &nn), r50 = gr_read(m, 50, &nn);
+            fprintf(stderr, "merced: r48-loop r26=%016" PRIX64
+                    " r27=%016" PRIX64 " r48=%016" PRIX64
+                    " r49=%016" PRIX64 " r50=%016" PRIX64
+                    " ninsts=%" PRIu64 "\n",
+                    gr_read(m, 26, &nn), gr_read(m, 27, &nn),
+                    gr_read(m, 48, &nn), r49, r50, m->ninsts);
+            for (int off = -32; off < 32; off += 8) {
+                uint64_t va2 = (r49 + off) & ~7ull, dpa;
+                MercedStatus dst;
+                if (va_translate(m, va2, false, false, ISR_R, &dpa, &dst))
+                    fprintf(stderr, "  r49%+d = va=%016" PRIX64
+                            " -> %016" PRIX64 "\n", off, va2,
+                            phys_read(m, dpa, 8));
+            }
+            for (int off = -32; off < 32; off += 8) {
+                uint64_t va2 = (r50 + off) & ~7ull, dpa;
+                MercedStatus dst;
+                if (va_translate(m, va2, false, false, ISR_R, &dpa, &dst))
+                    fprintf(stderr, "  r50%+d = va=%016" PRIX64
+                            " -> %016" PRIX64 "\n", off, va2,
+                            phys_read(m, dpa, 8));
+            }
+        }
+    }
     if (!va_translate(m, bundle_va, true, false, ISR_X, &pa, &st))
         return st;   /* ITLB miss delivered (or halt) */
 
