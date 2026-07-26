@@ -552,7 +552,7 @@ def main():
     # ── Build CFLAGS / LDFLAGS ────────────────────────────────────────────────
 
     opt_flag = '-O0 -g' if args.debug else '-O2'
-    base_cflags = f'-Wall -Wextra {opt_flag} -std=c11 -pthread'
+    base_cflags = f'-Wall -Wextra {opt_flag} -std=gnu11 -pthread'
     if args.extra_cflags:
         base_cflags += ' ' + args.extra_cflags
     base_ldflags = '-pthread'

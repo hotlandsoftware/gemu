@@ -168,7 +168,10 @@ static void mon_vprintf(const GemuMonitor *mon, const char *fmt, va_list ap) {
     if (!mon || mon->backend == MON_BACKEND_NONE) return;
     if (mon->backend == MON_BACKEND_TELNET) {
         if (mon->client_fd == INVALID_SOCK) return;
-        char buf[2048];
+        /* 64 KiB: large enough for a full IA-64 CPU state dump (128 GRs +
+         * dtr/itr/dtc/itc TLB entries), which the old 2 KiB silently cut
+         * off well before reaching the TLB dump. */
+        char buf[65536];
         int n = vsnprintf(buf, sizeof(buf), fmt, ap);
         if (n <= 0) return;
         size_t len = (n < (int)sizeof(buf)) ? (size_t)n : sizeof(buf) - 1;
@@ -391,8 +394,10 @@ static void info_cpu(const GemuMonitor *mon) {
         mon_printf(mon, "CPU state is not available for this machine.\n");
         return;
     }
-    /* 4 KiB: enough for large register files (e.g. IA-64's 128 GRs) */
-    char buf[4096];
+    /* 64 KiB: 128 GRs plus IA-64's full TLB dump (dtr/itr/dtc/itc) can
+     * exceed the old 4 KiB, silently truncating the TLB entries off the
+     * end of every dump. */
+    char buf[65536];
     mon->cpu_state_cb(mon->cpu_state_ud, buf, sizeof(buf));
     buf[sizeof(buf) - 1] = '\0';
     mon_printf(mon, "%s\n", buf);

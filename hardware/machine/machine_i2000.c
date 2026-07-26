@@ -1330,7 +1330,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     return ok;
 }
 
-#define I2000_AUTOSAVE_DIR "/home/admin/jemu/snapshots"
+#define I2000_AUTOSAVE_DIR "snapshots"
 #define I2000_AUTOSAVE_PERIOD_SEC 300
 
 /* Called once per run_slice from the main loop. Wall-clock gated (not
@@ -1637,7 +1637,8 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     chipset_cfg_reset(s);
 
     MercedBus bus = {
-        .ud = s, .read = bus_read, .fetch = bus_fetch, .write = bus_write,
+        .ud = s, .ram_size = s->ram_size,
+        .read = bus_read, .fetch = bus_fetch, .write = bus_write,
         .fill = i2000_bus_fill
     };
     s->cpu = merced_create(&bus);
@@ -1706,13 +1707,17 @@ static void i2000_report_halt(Ia64I2000State *s) {
     fprintf(stderr, "i2000: recent calls/returns:\n");
     merced_dump_calls(m, HALT_CALL_LINES, stderr);
     fprintf(stderr, "i2000: translation registers:\n");
-    for (unsigned i = 0; i < MERCED_N_TR; i++) {
+    /* The two TR files are different sizes (8 instruction, 48 data), so walk
+     * them separately rather than indexing both with one counter. */
+    for (unsigned i = 0; i < MERCED_N_ITR; i++) {
         const MercedTlbEntry *it = &m->itr[i];
-        const MercedTlbEntry *dt = &m->dtr[i];
         if (it->valid)
             fprintf(stderr, "  itr[%u] rid=%06X va=%016" PRIX64
                             "-%016" PRIX64 " pa=%016" PRIX64 " ps=%u\n",
                     i, it->rid, it->va_start, it->va_end, it->pfn_base, it->ps);
+    }
+    for (unsigned i = 0; i < MERCED_N_DTR; i++) {
+        const MercedTlbEntry *dt = &m->dtr[i];
         if (dt->valid)
             fprintf(stderr, "  dtr[%u] rid=%06X va=%016" PRIX64
                             "-%016" PRIX64 " pa=%016" PRIX64 " ps=%u\n",

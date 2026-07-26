@@ -48,9 +48,15 @@ class Recorder:
         self.calls = []
 
     def __getattr__(self, _name):
+        # Some case bodies chain off the handle (qemu.query_status().state).
+        # Returning self rather than None keeps those chains resolvable, so
+        # the case still reaches its run_program() call.
         def _noop(*_a, **_kw):
-            return None
+            return self
         return _noop
+
+    def __bool__(self):
+        return True
 
 
 def render(bundles, entry, terminal, memory, encoding) -> str:
@@ -73,6 +79,29 @@ def render(bundles, entry, terminal, memory, encoding) -> str:
     return "\n".join(lines) + "\n"
 
 
+class RunState:
+    """The `result.state` a few case bodies assert on directly.
+
+    Those cases express their expectation as Python (`if state.gr[17] <=
+    state.gr[16]: raise`) rather than as an `expected` dict, so they need the
+    run to have already happened by the time run_program() returns.
+    """
+
+    def __init__(self, actual):
+        self.gr = [actual.get(f"r{i}", 0) for i in range(128)]
+        self.ar = [actual.get(f"ar{i}", 0) for i in range(128)]
+        self.ip = actual.get("ip", 0)
+        self.psr = actual.get("psr", 0)
+        self.pr = actual.get("pr", 0)
+
+
+class RunResult:
+    def __init__(self, actual, text):
+        self.state = RunState(actual)
+        self.actual = actual
+        self.register_output = text
+
+
 STATE_RE = re.compile(r"^IA64TEST (.*)$")
 
 
@@ -92,6 +121,9 @@ def run_microprogram(text: str):
         if not m:
             continue
         body = m.group(1)
+        if body.startswith("halt "):
+            state["halt"] = body[5:]
+            continue
         if body.startswith("cr "):
             body = body[3:]
         for field in body.split():
@@ -108,6 +140,12 @@ def compare(expected: dict, actual: dict):
     """Return (mismatches, unsupported) for one case."""
     mismatches, unsupported = [], []
     for key, want in expected.items():
+        # A few cases express an expectation as a helper object (masked bit
+        # patterns, ranges).  Comparing those needs the reference's semantics,
+        # so report them as unsupported rather than guessing.
+        if not isinstance(want, int):
+            unsupported.append(key)
+            continue
         if key == "ip":
             got = actual.get("ip", 0) & ~0xF
             if got != (want & ~0xF):
@@ -126,9 +164,30 @@ def compare(expected: dict, actual: dict):
             got = actual.get("iip")
             if got is not None and (got & ~0xF) != (want & ~0xF):
                 mismatches.append((key, want, got))
+        elif key == "exception":
+            # 492 of 494 uses are IA64_EXCP_NONE, i.e. "the run finished in a
+            # normal architectural state".  Our equivalent is that the core
+            # reached its terminal IP rather than bailing out on an
+            # unimplemented instruction or a halt, so assert exactly that.
+            if want == 0 and actual.get("stop") not in ("terminal", "maxinsts"):
+                mismatches.append((key, want, actual.get("stop")))
+            elif want != 0:
+                unsupported.append(key)
+        elif key == "cfm_sof":
+            got = actual.get("cfm")
+            if got is not None and (got & 0x7F) != want:
+                mismatches.append((key, want, got & 0x7F))
+        elif key == "cfm_sol":
+            got = actual.get("cfm")
+            if got is not None and ((got >> 7) & 0x7F) != want:
+                mismatches.append((key, want, (got >> 7) & 0x7F))
+        elif key == "pr_mask":
+            got = actual.get("pr")
+            if got is not None and (got & want) != want:
+                mismatches.append((key, want, got))
         else:
-            # exception / cfm_* / pr_mask / fN / ar_* need extra plumbing;
-            # report rather than silently pass.
+            # fN / ar_* / fault_code need extra plumbing; report rather than
+            # silently pass.
             unsupported.append(key)
     return mismatches, unsupported
 
@@ -149,10 +208,26 @@ def main() -> int:
     def capture(qemu, bundles, entry=0x10, alat="full", terminal_ip=None,
                 expected=None, timeout=2.0, name="ia64-microprogram",
                 memory=None, **kw):
-        captured[name] = dict(bundles=bundles, entry=entry,
-                              terminal=terminal_ip if terminal_ip is not None
-                              else (expected or {}).get("ip"),
-                              expected=dict(expected or {}), memory=memory)
+        exp = expected or {}
+        # ia64_selftest checks "have we reached terminal?" BEFORE executing
+        # the bundle there (src/ia64_selftest.c), so a fault-testing case
+        # whose expected "ip" is the address of the faulting instruction
+        # itself (the common pattern for reserved-field-fault cases, where
+        # the post-fault ip isn't tracked and "ip" is set equal to fault_ip
+        # as a placeholder) would stop before ever running it. Only default
+        # terminal from "ip" when it's not also the expected fault_ip.
+        if terminal_ip is not None:
+            terminal = terminal_ip
+        elif "fault_ip" in exp and exp.get("fault_ip") == exp.get("ip"):
+            terminal = None
+        else:
+            terminal = exp.get("ip")
+        text = render(bundles, entry, terminal, memory, encoding)
+        actual = run_microprogram(text)
+        captured[name] = dict(expected=dict(expected or {}), actual=actual)
+        # Run here rather than in the caller so the handful of cases that
+        # assert on the result in Python get a real one back.
+        return RunResult(actual, text)
     encoding.run_program = capture
 
     if args.group and args.group != "all":
@@ -168,41 +243,62 @@ def main() -> int:
     rec = Recorder()
     ran = passed = failed = errored = 0
     failures = []
+    halts = []
     for name in names:
         fn = cases.get(name)
         if fn is None:
             continue
         captured.clear()
+        body_error = None
         try:
             fn(rec)
         except Exception as exc:                       # noqa: BLE001
-            errored += 1
-            if args.verbose:
-                print(f"ERROR  {name}: {exc}")
-            continue
+            # A case that asserts in Python raises to signal failure, and by
+            # then it has already run its program.  Treat that as a failure of
+            # the case; only a case that never ran anything is a driver error.
+            if not captured:
+                errored += 1
+                if args.verbose:
+                    print(f"ERROR  {name}: {exc}")
+                continue
+            body_error = exc
         for cname, c in captured.items():
             ran += 1
-            text = render(c["bundles"], c["entry"], c["terminal"],
-                          c["memory"], encoding)
-            actual = run_microprogram(text)
+            actual = c["actual"]
             bad, unsup = compare(c["expected"], actual)
+            if body_error is not None and not bad:
+                bad = [("assertion", 0, str(body_error).split("\n")[0])]
             if bad:
                 failed += 1
                 failures.append((cname, bad, unsup, actual.get("stop")))
+                if actual.get("halt"):
+                    halts.append(actual["halt"])
                 if args.verbose:
                     print(f"FAIL   {cname}  stop={actual.get('stop')}")
                     for k, want, got in bad:
-                        print(f"         {k}: expected {want:#x}, got {got:#x}")
+                        gs = got if isinstance(got, str) else f"{got:#x}"
+                        ws = want if isinstance(want, str) else f"{want:#x}"
+                        print(f"         {k}: expected {ws}, got {gs}")
             else:
                 passed += 1
 
     encoding.run_program = real_run_program
     print(f"\nran={ran} passed={passed} failed={failed} errored={errored}")
+    if halts:
+        import collections
+        norm = collections.Counter(
+            re.sub(r"0x[0-9A-Fa-f]+", "0xNN", h.split(" at=")[0])
+            for h in halts)
+        print("\nunimplemented / halted on:")
+        for msg, n in norm.most_common(25):
+            print(f"  {n:4d}  {msg}")
     if failures and not args.verbose:
         print("\nfirst failures:")
         for cname, bad, _unsup, stop in failures[:15]:
-            detail = ", ".join(f"{k}: want {w:#x} got {g:#x}"
-                               for k, w, g in bad[:3])
+            detail = ", ".join(
+                f"{k}: want {w:#x} got " +
+                (g if isinstance(g, str) else f"{g:#x}")
+                for k, w, g in bad[:3])
             print(f"  {cname} (stop={stop}): {detail}")
     return 1 if failed else 0
 

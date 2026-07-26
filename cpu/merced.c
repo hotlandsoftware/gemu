@@ -49,9 +49,37 @@ static int merced_dbg(void) {
 #define PSR_IA   (1ull << 45)
 #define PSR_RI_SHIFT 41
 
+#define PSR_PK   (1ull << 15)
+#define PSR_CPL_SHIFT 32
+
 #define ISR_X (1ull << 32)
 #define ISR_W (1ull << 33)
 #define ISR_R (1ull << 34)
+/* Set when the reference that faulted was control-speculative.  Software
+ * dispatches on this to decide between retrying with PSR.ed and running its
+ * real fault handler, so a delivered ld.s fault must report it. */
+#define ISR_SP (1ull << 36)
+
+/* PTE fields (SDM Vol.2 4.1, "Translation Insertion Format"). */
+#define PTE_PRESENT   (1ull << 0)
+#define PTE_ACCESSED  (1ull << 5)
+#define PTE_DIRTY     (1ull << 6)
+#define PTE_MA_SHIFT  2
+#define PTE_MA_NATPAGE 7
+#define PTE_PL_SHIFT  7
+#define PTE_AR_SHIFT  9
+
+/* Protection key register fields. */
+#define PKR_VALID (1ull << 0)
+#define PKR_WD    (1ull << 1)
+#define PKR_RD    (1ull << 2)
+#define PKR_XD    (1ull << 3)
+#define PKR_KEY_SHIFT 8
+
+/* Access types, matching the ISR bits the callers already pass around. */
+#define PERM_R 1u
+#define PERM_W 2u
+#define PERM_X 4u
 
 #define CFM_SOF(c)    ((unsigned)((c) & 0x7F))
 #define CFM_SOL(c)    ((unsigned)(((c) >> 7) & 0x7F))
@@ -80,9 +108,12 @@ enum {
 enum {
     VEC_VHPT = 0x0000, VEC_ITLB = 0x0400, VEC_DTLB = 0x0800,
     VEC_ALT_ITLB = 0x0C00, VEC_ALT_DTLB = 0x1000, VEC_NESTED_DTLB = 0x1400,
+    VEC_INST_KEY_MISS = 0x1800, VEC_DATA_KEY_MISS = 0x1C00,
     VEC_DIRTY = 0x2000, VEC_IACCESS = 0x2400, VEC_DACCESS = 0x2800,
     VEC_BREAK = 0x2C00, VEC_EXTINT = 0x3000,
-    VEC_PAGE_NOT_PRESENT = 0x5000, VEC_GENERAL = 0x5400,
+    VEC_PAGE_NOT_PRESENT = 0x5000, VEC_KEY_PERMISSION = 0x5100,
+    VEC_INST_ACCESS_RIGHTS = 0x5200, VEC_DATA_ACCESS_RIGHTS = 0x5300,
+    VEC_GENERAL = 0x5400,
     VEC_NAT = 0x5600, VEC_SPEC = 0x5700, VEC_UNALIGNED = 0x5A00,
 };
 
@@ -739,7 +770,7 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
         for (unsigned i = 0; i < 16; i++)
             fprintf(stderr, " r%u=%016" PRIX64, i + 16, m->gr_bank0[i]);
         fprintf(stderr, "\n");
-        for (unsigned i = 0; i < MERCED_N_TR; i++)
+        for (unsigned i = 0; i < MERCED_N_DTR; i++)
             if (m->dtr[i].valid)
                 fprintf(stderr, "  dtr[%u] rid=%06X va=%016" PRIX64
                         "-%016" PRIX64 " pa=%016" PRIX64 " ps=%u\n",
@@ -786,8 +817,16 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
             m->taken = 1;
             return MERCED_OK;
         }
-        return mhalt(m, "fault vec=0x%X with PSR.ic=0 (ifa=0x%016" PRIX64 ")",
-                     vec, ifa);
+        /* Any other fault taken with interruption collection disabled still
+         * vectors normally - it just leaves cr.ifa/iip/ipsr/itir/iha holding
+         * the outer interruption's state, which is exactly why an OS runs its
+         * handlers with PSR.ic=0.  Halting instead turned a recoverable
+         * nested fault into a dead machine.  ISR still reports the new fault
+         * with ni set, matching the reference core. */
+        m->cr[CR_ISR] = isr | (1ull << 39); /* ni: nested interruption */
+        m->ip = (m->cr[CR_IVA] & ~0x7FFFull) + vec;
+        m->taken = 1;
+        return MERCED_OK;
     }
     bool ia32 = (m->psr & PSR_IS) != 0;
     unsigned slot = ia32 ? 0 : (unsigned)(m->ip & 3);
@@ -862,9 +901,163 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
     return ok;
 }
 
+/* Effective R/W/X permission a PTE's ar/pl grants at a given privilege
+ * level (SDM Vol.2 4.4, "Memory Access Rights").  ar 4-6 grant extra rights
+ * to code running strictly more privileged than pl; ar 7 is the promotion
+ * (gate page) encoding, which is executable at every level. */
+static unsigned tlb_effective_perm(unsigned ar, unsigned pl, unsigned cpl) {
+    if (cpl > 3 || pl > 3)
+        return 0;
+    switch (ar & 7) {
+    case 0: return cpl <= pl ? PERM_R : 0;
+    case 1: return cpl <= pl ? (PERM_R | PERM_X) : 0;
+    case 2: return cpl <= pl ? (PERM_R | PERM_W) : 0;
+    case 3: return cpl <= pl ? (PERM_R | PERM_W | PERM_X) : 0;
+    case 4: return cpl > pl ? 0 : (cpl < pl ? (PERM_R | PERM_W) : PERM_R);
+    case 5: return cpl > pl ? 0
+                            : (cpl < pl ? (PERM_R | PERM_W | PERM_X)
+                                        : (PERM_R | PERM_X));
+    case 6: return cpl > pl ? 0
+                            : (cpl < pl ? (PERM_R | PERM_W | PERM_X)
+                                        : (PERM_R | PERM_W));
+    default: return cpl == 0 ? (PERM_R | PERM_X) : PERM_X;
+    }
+}
+
+/* Protection-key check.  A key with no matching valid PKR raises Key Miss;
+ * a match whose rd/wd/xd bit denies the access raises Key Permission. */
+static uint32_t key_fault_vector(Merced *m, uint32_t key, unsigned needed,
+                                 bool ifetch) {
+    uint64_t match = 0;
+    bool matched = false;
+    for (unsigned i = 0; i < 16; i++) {
+        if ((m->pkr[i] & PKR_VALID) &&
+            ((m->pkr[i] >> PKR_KEY_SHIFT) & 0xFFFFFFull) == key) {
+            match = m->pkr[i];
+            matched = true;
+            break;
+        }
+    }
+    if (!matched)
+        return ifetch ? VEC_INST_KEY_MISS : VEC_DATA_KEY_MISS;
+    if (((needed & PERM_R) && (match & PKR_RD)) ||
+        ((needed & PERM_W) && (match & PKR_WD)) ||
+        ((needed & PERM_X) && (match & PKR_XD)))
+        return VEC_KEY_PERMISSION;
+    return 0;
+}
+
+/* Faults a present translation can still raise, in the architected priority
+ * order: NaT Page Consumption, Key Miss, Key Permission, Access Rights,
+ * Dirty Bit, Access Bit.  Returns 0 when the access may proceed.
+ *
+ * The Dirty Bit fault deliberately outranks the Data Access Bit fault, so a
+ * store to a page with both bits clear reports the dirty vector - that is
+ * what lets an OS resolve both bits in one handler rather than taking a
+ * second fault. */
+static uint32_t translation_fault_vector(Merced *m, const MercedTlbEntry *e,
+                                         unsigned needed, bool ifetch,
+                                         bool is_write, bool is_rse) {
+    uint64_t pte = e->pte;
+    unsigned cpl = (unsigned)((m->psr >> PSR_CPL_SHIFT) & 3);
+    unsigned perm;
+    uint32_t kv;
+
+    if (((pte >> PTE_MA_SHIFT) & 7) == PTE_MA_NATPAGE)
+        return VEC_NAT;
+
+    /* Key checks apply only with PSR.pk set and the matching translation
+     * bit on - the RSE uses PSR.rt rather than PSR.dt. */
+    if ((m->psr & PSR_PK) &&
+        (m->psr & (ifetch ? PSR_IT : (is_rse ? PSR_RT : PSR_DT)))) {
+        kv = key_fault_vector(m, (uint32_t)((e->itir >> 8) & 0xFFFFFFull),
+                              needed, ifetch);
+        if (kv)
+            return kv;
+    }
+
+    perm = tlb_effective_perm((unsigned)((pte >> PTE_AR_SHIFT) & 7),
+                              (unsigned)((pte >> PTE_PL_SHIFT) & 3), cpl);
+    if ((perm & needed) != needed)
+        return ifetch ? VEC_INST_ACCESS_RIGHTS : VEC_DATA_ACCESS_RIGHTS;
+
+    if (ifetch) {
+        if (!(pte & PTE_ACCESSED) && !(m->psr & PSR_IA))
+            return VEC_IACCESS;
+    } else {
+        if (is_write && !(pte & PTE_DIRTY) && !(m->psr & PSR_DA))
+            return VEC_DIRTY;
+        if (!(pte & PTE_ACCESSED) && !(m->psr & PSR_DA))
+            return VEC_DACCESS;
+    }
+    return 0;
+}
+
+/* DCR deferral-enable bit for a fault a control-speculative load can defer.
+ * UINT64_MAX means "always defers" (unimplemented data address); 0 means the
+ * fault is not deferrable through the DCR at all. */
+static uint64_t spec_dcr_mask(uint32_t vec) {
+    switch (vec) {
+    case VEC_ALT_DTLB: case VEC_VHPT: case VEC_DTLB: return 1ull << 8;  /* dm */
+    case VEC_PAGE_NOT_PRESENT:                        return 1ull << 9;  /* dp */
+    case VEC_DATA_KEY_MISS:                           return 1ull << 10; /* dk */
+    case VEC_KEY_PERMISSION:                          return 1ull << 11; /* dx */
+    case VEC_DATA_ACCESS_RIGHTS:                      return 1ull << 12; /* dr */
+    case VEC_DACCESS:                                 return 1ull << 13; /* da */
+    default:                                          return 0;
+    }
+}
+
+/* The ED bit of the page holding the currently executing bundle.  It only
+ * has meaning when instruction translation is on. */
+static bool code_page_ed(Merced *m) {
+    unsigned vrn;
+    uint32_t rid;
+    const MercedTlbEntry *e;
+    if (!(m->psr & PSR_IT))
+        return false;
+    vrn = (unsigned)(m->ip >> 61);
+    rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
+    e = tlb_search(m->itr, MERCED_N_ITR, rid, m->ip & ~0xFull);
+    if (!e)
+        e = tlb_search(m->itc, MERCED_N_TC, rid, m->ip & ~0xFull);
+    return e && (e->pte & (1ull << 52));
+}
+
+/* Whether a control-speculative (ld.s) reference defers this fault - taking
+ * a NaT instead of an interruption - or actually raises it.
+ *
+ * We used to defer unconditionally, which is wrong in both directions: it
+ * hides faults software expects to see, and it makes an ld.s look successful
+ * where hardware would have trapped.  Per SDM Vol.2 (control speculation)
+ * there are five INDEPENDENT enables. */
+static bool spec_defers(Merced *m, uint32_t vec) {
+    uint64_t mask;
+    if (!(m->psr & PSR_IC))
+        return true;                          /* no way to report it */
+    if (vec == VEC_NAT)
+        return true;                          /* NaTVal source always defers */
+    mask = spec_dcr_mask(vec);
+    if (mask == UINT64_MAX)
+        return true;                          /* unimplemented data address */
+    if (code_page_ed(m))
+        return true;
+    /* The DCR path is independent of PSR.it, so an ld.s issued from
+     * physical-mode code still defers when the DCR bit is set. */
+    return mask != 0 && (m->cr[CR_DCR] & mask);
+}
+
 static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
                             uint64_t isr_access, bool force,
                             uint64_t *pa, MercedStatus *st) {
+    /* The debug helpers (symbolization, disassembly, pointer following) probe
+     * translations with spec=true and no access type.  Those must never
+     * perturb the guest, so they defer unconditionally; only a real
+     * control-speculative load consults the architected deferral rules. */
+    bool silent_probe = spec && isr_access == 0;
+    /* A speculative reference whose fault is not deferred still reports that
+     * it was speculative. */
+    uint64_t spec_isr = spec ? ISR_SP : 0;
     *st = MERCED_OK;
     bool on = force ||
               (ifetch ? (m->psr & PSR_IT) != 0 : (m->psr & PSR_DT) != 0);
@@ -876,19 +1069,37 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
     uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
     uint64_t lookup_va = va;
     const MercedTlbEntry *e =
-        tlb_search(ifetch ? m->itr : m->dtr, MERCED_N_TR, rid, lookup_va);
+        tlb_search(ifetch ? m->itr : m->dtr,
+                   ifetch ? MERCED_N_ITR : MERCED_N_DTR, rid, lookup_va);
     if (!e)
         e = tlb_search(ifetch ? m->itc : m->dtc, MERCED_N_TC, rid, lookup_va);
-    if (!e && !ifetch) {
+    if (!e && !ifetch && (m->cr[CR_IVA] >> 61) == 0) {
         /* Merced-style unified behavior: the i2000 firmware maps its 4 MiB
          * shadow with itr.i only, yet reads/writes data in that region with
          * translation on (e.g. the alt-DTLB handler's own descriptor at
-         * [r12+112]). Data lookups therefore fall back to the I-side
-         * entries; a strictly split model dead-ends in the nested-miss
-         * reporter. */
-        e = tlb_search(m->itr, MERCED_N_TR, rid, lookup_va);
+         * [r12+112]). Keep that firmware compatibility only while a
+         * region-0 IVT owns interruption handling. ITRs and DTRs are
+         * architecturally independent once an OS installs its region-7 IVT;
+         * XP intentionally has an instruction-only [64,80 MiB] staging TR
+         * whose data references must fall through to the KSEG alias below. */
+        e = tlb_search(m->itr, MERCED_N_ITR, rid, lookup_va);
         if (!e)
             e = tlb_search(m->itc, MERCED_N_TC, rid, lookup_va);
+    }
+    /*
+     * The loader and early NT kernel retain pointers through the region-7
+     * KSEG alias VA payload = 0x80000000 + PA.  It remains valid after the
+     * firmware IVT is replaced; otherwise KdInitSystem faults before the
+     * recursive page-table window is ready and cascades into a PNP loop.
+     * Explicit TR/TC translations above always take precedence.
+     */
+    if (!e && vrn == 7 && m->bus.ram_size) {
+        uint64_t payload = va & UINT64_C(0x1FFFFFFFFFFFFFFF);
+        if (payload >= UINT64_C(0x80000000) &&
+            payload < m->region7_directmap_limit) {
+            *pa = payload - UINT64_C(0x80000000);
+            return true;
+        }
     }
     /* Before ExitBootServices, the SAL environment owns the IVT and services
      * loader translation misses with identity mappings.  This is firmware
@@ -917,22 +1128,21 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
             e = tlb_search(ifetch ? m->itc : m->dtc, MERCED_N_TC,
                            rid, lookup_va);
         } else if (walk == VHPT_NOT_PRESENT) {
-            if (spec) return false;
-            *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT, isr_access,
-                                va, true);
+            if (spec && (silent_probe || spec_defers(m, VEC_PAGE_NOT_PRESENT))) return false;
+            *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT,
+                                isr_access | spec_isr, va, true);
             return false;
         } else if (walk == VHPT_TRANSLATION) {
-            if (spec) return false;
+            if (spec && (silent_probe || spec_defers(m, VEC_VHPT))) return false;
             /* The walker was enabled and the translation for the VHPT
              * entry itself was absent.  This is not an ordinary ITLB/DTLB
              * miss: vector 0 lets the OS make its page-table backing
              * resident before retrying the original reference. */
-            *st = deliver_fault(m, VEC_VHPT, isr_access, va, true);
+            *st = deliver_fault(m, VEC_VHPT, isr_access | spec_isr, va, true);
             return false;
         }
     }
     if (!e) {
-        if (spec) return false;   /* ld.s: caller sets NaT, no fault */
         /* Vector choice depends on whether the VHPT walker would have run
          * for this reference: pta.ve=0 or rr.ve=0 disables it, and misses
          * then raise the Alternate ITLB/DTLB vectors. A walker that's
@@ -947,13 +1157,34 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
             fvec = walker ? VEC_ITLB : VEC_ALT_ITLB;
         else
             fvec = walker ? VEC_DTLB : VEC_ALT_DTLB;
-        *st = deliver_fault(m, fvec, isr_access, va, true);
+        if (spec && (silent_probe || spec_defers(m, fvec)))
+            return false;         /* ld.s: caller sets NaT, no fault */
+        *st = deliver_fault(m, fvec, isr_access | spec_isr, va, true);
         return false;
     }
-    if (!(e->pte & 1)) {
-        if (spec) return false;
-        *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT, isr_access, va, true);
+    if (!(e->pte & PTE_PRESENT)) {
+        if (spec && (silent_probe || spec_defers(m, VEC_PAGE_NOT_PRESENT))) return false;
+        *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT,
+                            isr_access | spec_isr, va, true);
         return false;
+    }
+    {
+        /* isr_access carries what the reference calls "needed": which of
+         * read/write/execute this reference actually requires. */
+        unsigned needed = ifetch ? PERM_X : 0;
+        uint32_t fvec;
+        if (isr_access & ISR_R) needed |= PERM_R;
+        if (isr_access & ISR_W) needed |= PERM_W;
+        if (isr_access & ISR_X) needed |= PERM_X;
+        fvec = translation_fault_vector(m, e, needed, ifetch,
+                                        (isr_access & ISR_W) != 0, false);
+        if (fvec) {
+            /* A control-speculative load defers a deferrable fault rather
+             * than raising it; the caller turns our refusal into a NaT. */
+            if (spec && (silent_probe || spec_defers(m, fvec))) return false;
+            *st = deliver_fault(m, fvec, isr_access | spec_isr, va, true);
+            return false;
+        }
     }
     *pa = (e->pfn_base + (lookup_va - e->va_start)) & MERCED_PHYS_MASK;
     return true;
@@ -1084,6 +1315,7 @@ void merced_reset(Merced *m) {
     m->ninsts = ninsts;
     m->cpu_revision = cpu_revision;
     m->cpu_model = cpu_model;
+    m->region7_directmap_limit = UINT64_C(0x80000000) + bus.ram_size;
 
     m->ip  = 0xFFFFFFB0ull;          /* PALE_RESET, 4 GiB - 0x50 */
     m->psr = 0;                      /* physical mode, bank 0 */
@@ -1276,7 +1508,8 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
             int64_t imm = sext((bits(raw, 36, 1) << 13) |
                                (bits(raw, 27, 6) << 7) | bits(raw, 13, 7), 14);
             uint64_t res = (uint64_t)imm + b;
-            if (x2a == 3) res = (uint32_t)res | ((b >> 61) << 61);  /* addp4 */
+            if (x2a == 3)
+                res = (uint32_t)res | (((b >> 30) & 3) << 61);      /* addp4 */
             gr_write(m, r1, res, n3);
             return 1;
         }
@@ -1341,7 +1574,14 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
         switch (x4) {
         case 0:  res = a + b + (x2b == 1 ? 1 : 0); break;            /* add */
         case 1:  res = a - b - (x2b == 0 ? 1 : 0); break;            /* sub */
-        case 2:  res = (uint32_t)(a + b) | ((b >> 61) << 61); break; /* addp4 */
+        case 2:
+            /* addp4 expands a 32-bit pointer into the region selected by
+             * bits 31:30 of the base operand.  Those two bits become VA
+             * bits 62:61; it does not preserve the base's existing region
+             * field.  NT relies on this when expanding compact pointers in
+             * its loader/page tables. */
+            res = (uint32_t)(a + b) | (((b >> 30) & 3) << 61);
+            break;
         case 3:
             switch (x2b) {
             case 0: res = a & b; break;
@@ -1351,7 +1591,10 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
             }
             break;
         case 4:  res = (a << (x2b + 1)) + b; break;                  /* shladd */
-        case 6:  res = (uint32_t)((a << (x2b + 1)) + b) | ((b >> 61) << 61); break;
+        case 6:
+            res = (uint32_t)((a << (x2b + 1)) + b) |
+                  (((b >> 30) & 3) << 61);                         /* shladdp4 */
+            break;
         case 9:                                                       /* sub imm8 */
             if (x2b != 1) { *st = mhalt(m, "A3 x4=9 x2b=%u", x2b); return 0; }
             res = (uint64_t)sext((bits(raw, 36, 1) << 7) | bits(raw, 13, 7), 8) - b;
@@ -1499,7 +1742,10 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         if (x6 <= 0x07) {                       /* cmpxchg.acq/.rel */
             uint64_t old = phys_read(m, pa, size);
             uint64_t ccv = m->ar[AR_CCV];
-            if (size < 8) ccv &= (1ull << (size * 8)) - 1;
+            /* The loaded 1/2/4-byte value is zero-extended, then compared
+             * against the full 64-bit ar.ccv.  Truncating ar.ccv makes a
+             * compare spuriously succeed when only its low word matches,
+             * which can turn NT's failed lock-free update into a write. */
             if (old == ccv)
                 phys_write(m, pa, gr_read(m, r2, &n2), size);
             gr_write(m, r1, old, 0);
@@ -1561,6 +1807,13 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         if (x6 <= 0x17 || x6 == 0x1B || (x6 >= 0x20 && x6 <= 0x2B)) {  /* loads */
             if (!qp) return MERCED_OK;
             uint64_t va = gr_read(m, r3, &n3), pa;
+            /* Register postincrement operands are read as inputs before the
+             * load writes r1.  In particular r1 may alias r2; re-reading r2
+             * afterward would use the loaded value as the increment. */
+            uint64_t reg_inc = 0;
+            uint8_t reg_inc_nat = 0;
+            if (major == 4 && mbit)
+                reg_inc = gr_read(m, r2, &reg_inc_nat);
             int spec = (type == 1 || type == 3);   /* .s / .sa */
             if (x6 == 0x1B) size = 8;              /* ld8.fill */
             if (!va_translate(m, va, false, spec, ISR_R, &pa, &st)) {
@@ -1588,8 +1841,7 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
                 gr_write(m, r3, base + (uint64_t)imm9, n3);
             } else if (mbit) {
                 uint64_t base = gr_read(m, r3, &n3);
-                uint64_t inc = gr_read(m, r2, &n2);
-                gr_write(m, r3, base + inc, n3 | n2);
+                gr_write(m, r3, base + reg_inc, n3 | reg_inc_nat);
             }
             return MERCED_OK;
         }
@@ -1597,6 +1849,10 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         if ((x6 >= 0x30 && x6 <= 0x37) || x6 == 0x3B) {   /* stores */
             if (!qp) return MERCED_OK;
             uint64_t va = gr_read(m, r3, &n3), pa;
+            uint64_t reg_inc = 0;
+            uint8_t reg_inc_nat = 0;
+            if (major == 4 && mbit)
+                reg_inc = gr_read(m, r1, &reg_inc_nat);
             if (x6 == 0x3B) size = 8;              /* st8.spill */
             if (!va_translate(m, va, false, false, ISR_W, &pa, &st)) return st;
             uint64_t v = gr_read(m, r2, &n2);
@@ -1608,6 +1864,8 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
             phys_write(m, pa, v, size);
             if (major == 5)
                 gr_write(m, r3, va + (uint64_t)imm9, n3);
+            else if (mbit)
+                gr_write(m, r3, va + reg_inc, n3 | reg_inc_nat);
             return MERCED_OK;
         }
         return mhalt(m, "unimpl M ld/st x6=0x%02X (major %u)", x6, major);
@@ -1770,10 +2028,10 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
     if (getenv("MERCED_MMU_DEBUG") && mmu_debug_inserts++ < 2048) {
         const char *kind = instruction ? "ITC" : "DTC";
         unsigned index = 0;
-        for (unsigned i = 0; i < MERCED_N_TR; i++) {
+        for (unsigned i = 0; i < MERCED_N_ITR; i++)
             if (e == &m->itr[i]) { kind = "ITR"; index = i; break; }
+        for (unsigned i = 0; i < MERCED_N_DTR; i++)
             if (e == &m->dtr[i]) { kind = "DTR"; index = i; break; }
-        }
         fprintf(stderr, "merced: XLATE install %s[%u] ip=%016" PRIX64
                 " va=%016" PRIX64 " pa=%016" PRIX64
                 " ps=%u rid=%06X pte=%016" PRIX64 " valid=%u"
@@ -1806,9 +2064,9 @@ static bool vhpt_entry_pa(Merced *m, uint64_t entry_va, uint64_t *pa) {
     }
     unsigned vrn = (unsigned)(entry_va >> 61);
     uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
-    const MercedTlbEntry *e = tlb_search(m->dtr, MERCED_N_TR, rid, entry_va);
+    const MercedTlbEntry *e = tlb_search(m->dtr, MERCED_N_DTR, rid, entry_va);
     if (!e) e = tlb_search(m->dtc, MERCED_N_TC, rid, entry_va);
-    if (!e) e = tlb_search(m->itr, MERCED_N_TR, rid, entry_va);
+    if (!e) e = tlb_search(m->itr, MERCED_N_ITR, rid, entry_va);
     if (!e) e = tlb_search(m->itc, MERCED_N_TC, rid, entry_va);
     if (!e) return false;
     *pa = (e->pfn_base + (entry_va - e->va_start)) & MERCED_PHYS_MASK;
@@ -1847,12 +2105,19 @@ static uint64_t vhpt_hash_address(Merced *m, uint64_t va) {
     uint64_t pta = m->cr[CR_PTA];
     unsigned vrn = (unsigned)(va >> 61);
     uint64_t rr = m->rr[vrn];
-    if (!(pta & 1) || !(rr & 1))
-        return va;                            /* walker disabled: no hash */
-
     unsigned size = (unsigned)((pta >> 2) & 0x3F);
     bool long_format = (pta & (1ull << 8)) != 0;
-    unsigned rr_ps = (unsigned)((rr >> 2) & 0x3F);
+    unsigned rr_ps;
+
+    /* PTA.ve and RR.ve gate only the hardware walker (see vhpt_walk).  The
+     * software-visible thash/ttag instructions and cr.iha keep using the
+     * configured PTA base, size and format even with the walker switched
+     * off - an OS that computes a VHPT pointer while servicing its own
+     * misses must get the real address, not the input va back. */
+    if (size < 15 || size > (long_format ? 61u : 52u))
+        return va;                            /* PTA misconfigured: no hash */
+
+    rr_ps = (unsigned)((rr >> 2) & 0x3F);
     unsigned ps = rr_ps < 12 ? 12 : rr_ps;    /* region's preferred page size */
 
     /* IA64_IMPL_VA_MSB=60 in the reference model: the full 61-bit payload
@@ -1869,8 +2134,6 @@ static uint64_t vhpt_hash_address(Merced *m, uint64_t va) {
         uint64_t base = pta & (((1ull << 61) - 1) & ~0x7FFFull);
         return region | ((base & ~mask) | (offset & mask));
     }
-    if (size < 5)
-        return va;                            /* table smaller than one entry */
     {
         uint64_t base = pta & ~0x7FFFull;
         uint64_t entries = 1ull << (size - 5);
@@ -2162,6 +2425,616 @@ static MercedStatus rse_load(Merced *m, uint64_t loadrs_bytes) {
     return MERCED_OK;
 }
 
+/* ── PAL procedures ──────────────────────────────────────────────────────
+ *
+ * Firmware reaches PAL through a "break.m 0x100000; br.many b0" trampoline
+ * whose break the processor model intercepts directly, exactly as
+ * reference/qemu-system-ia64 does (target/ia64/op_helper.c:
+ * helper_pal_dispatch).  The values below are that model's, for a Merced
+ * (800 MHz / 133 MHz bus) part: real architectural answers, not
+ * placeholders, so an OS configures its MMU, RSE, caches and performance
+ * monitors from facts instead of guessing after a NOT_IMPLEMENTED failure.
+ *
+ * Statuses are the PAL-defined negative codes. */
+#define PAL_OK           UINT64_C(0)
+#define PAL_NOT_IMPL     ((uint64_t)-1)
+#define PAL_INVALID_ARG  ((uint64_t)-2)
+#define PAL_ERROR        ((uint64_t)-3)
+#define PAL_NO_INFO      ((uint64_t)-6)
+#define PAL_BEYOND_MAX   ((uint64_t)-8)
+#define PAL_NEXT_HIGHER  UINT64_C(1)
+
+/* Merced predates PAL_PREFETCH_VIS, PAL_LOGICAL_TO_PHYSICAL,
+ * PAL_CACHE_SHARED_INFO and PAL_BRAND_INFO (SDM 245318-002 §11.8), so those
+ * report NOT_IMPLEMENTED rather than inventing multi-core/brand answers a
+ * single-thread Itanium cannot back up. */
+#define PAL_HAS_POST_MERCED 0
+
+/* Page sizes itr/itc can insert, and the extra 4 GiB size ptr can purge. */
+#define PAL_INSERTABLE_PS_MASK                                            \
+    ((UINT64_C(1) << 12) | (UINT64_C(1) << 13) | (UINT64_C(1) << 14) |    \
+     (UINT64_C(1) << 16) | (UINT64_C(1) << 18) | (UINT64_C(1) << 20) |    \
+     (UINT64_C(1) << 22) | (UINT64_C(1) << 24) | (UINT64_C(1) << 26) |    \
+     (UINT64_C(1) << 28) | (UINT64_C(1) << 30))
+#define PAL_PURGEABLE_PS_MASK (PAL_INSERTABLE_PS_MASK | (UINT64_C(1) << 32))
+
+#define PAL_IMPL_PA_BITS   50
+#define PAL_LOCAL_SAPIC_PA UINT64_C(0x00000000FEE00000)
+#define PAL_IO_BLOCK_PA    UINT64_C(0x000080000C000000)
+
+typedef struct {
+    bool     unified;
+    uint8_t  attribute, associativity, line_shift, stride_shift;
+    uint8_t  store_latency, load_latency, tag_lsb, tag_msb;
+    uint32_t size;
+} PalCacheInfo;
+
+/* The cache hierarchy PAL_CACHE_INFO / PAL_CACHE_PROT_INFO describe.  Merced
+ * has a split L1 (level 0) but unified L2/L3, so a level-1 query is only
+ * meaningful for the data/unified type. */
+static bool pal_cache_model(uint64_t level, uint64_t type, PalCacheInfo *ci) {
+    if (type < 1 || type > 2 || level >= 3)
+        return false;
+    memset(ci, 0, sizeof(*ci));
+    ci->tag_msb = PAL_IMPL_PA_BITS - 1;
+    switch (level) {
+    case 0:
+        ci->associativity = 4;
+        ci->line_shift = ci->stride_shift = 6;
+        ci->store_latency = (type == 1) ? 0xFF : 1;
+        ci->load_latency = 1;
+        ci->tag_lsb = 12;
+        ci->size = 16u << 10;
+        return true;
+    case 1:
+        if (type != 2)
+            return false;
+        ci->unified = true;
+        ci->attribute = 1;
+        ci->associativity = 8;
+        ci->line_shift = ci->stride_shift = 7;
+        ci->store_latency = 1;
+        ci->load_latency = 5;
+        ci->tag_lsb = 15;
+        ci->size = 256u << 10;
+        return true;
+    default:                                   /* level 2 */
+        if (type != 2)
+            return false;
+        ci->unified = true;
+        ci->attribute = 1;
+        ci->associativity = 12;
+        ci->line_shift = ci->stride_shift = 7;
+        ci->store_latency = 1;
+        ci->load_latency = 12;
+        ci->tag_lsb = 18;
+        ci->size = 3u << 20;
+        return true;
+    }
+}
+
+/* PAL buffer arguments are ordinary data references: honour the MMU so a
+ * caller running with PSR.dt set gets the same translation any store would,
+ * rather than scribbling on the physical address. */
+static bool pal_store8(Merced *m, uint64_t va, uint64_t v) {
+    uint64_t pa;
+    MercedStatus st;
+    if (!va_translate(m, va, false, false, ISR_R | ISR_W, &pa, &st))
+        return false;
+    phys_write(m, pa, v, 8);
+    return true;
+}
+
+/* A level_index names exactly one structure: bits 7:0 and 63:48 reserved,
+ * and the 40-bit structure field must be a single set bit. */
+static bool pal_mc_level_index_valid(uint64_t level_index) {
+    uint64_t structure = (level_index >> 8) & ((UINT64_C(1) << 40) - 1);
+    if ((level_index >> 48) != 0 || (level_index & 0xFF) != 0)
+        return false;
+    return structure != 0 && (structure & (structure - 1)) == 0;
+}
+
+/* PAL_PLATFORM_ADDR must not relocate a block over the firmware update
+ * region, whatever else it would otherwise accept. */
+static bool pal_overlaps_fw_update(uint64_t address, uint64_t alignment) {
+    const uint64_t fw_base = UINT64_C(0xFF000000), fw_limit = UINT64_C(0x100000000);
+    if (address >= fw_limit)
+        return false;
+    return address + alignment > fw_base && address < fw_limit;
+}
+
+/* Dispatch one PAL call.  GR28 selects the procedure; the static convention
+ * passes arguments in GR29-31, the stacked convention in GR33-35 (in1..in3).
+ * Results go to GR8 (status) and GR9-11. */
+static MercedStatus pal_dispatch(Merced *m) {
+    uint8_t nn;
+    uint64_t index = gr_read(m, 28, &nn);
+    uint64_t a1 = gr_read(m, 29, &nn);
+    uint64_t a2 = gr_read(m, 30, &nn);
+    uint64_t a3 = gr_read(m, 31, &nn);
+    /* Stacked arguments live in in1..in3, i.e. GR33-35: in0 carries the
+     * index, matching the reference's pal_stacked_arg(). */
+    uint64_t s1 = gr_read(m, 33, &nn);
+    uint64_t s2 = gr_read(m, 34, &nn);
+    uint64_t s3 = gr_read(m, 35, &nn);
+    bool reserved_zero = (a1 == 0 && a2 == 0 && a3 == 0);
+    uint64_t status = PAL_NOT_IMPL;
+    uint64_t r9 = 0, r10 = 0, r11 = 0;
+    PalCacheInfo ci;
+
+    switch (index) {
+    case 0x01:                                  /* PAL_CACHE_FLUSH */
+        /* cache_type 1..4; operation is a 2-bit field.  We have no cache to
+         * flush, so the architectural effect is limited to invalidating any
+         * instruction-cache-derived state, which we do not cache. */
+        if (a1 < 1 || a1 > 4 || (a2 & ~UINT64_C(3)) != 0)
+            status = PAL_INVALID_ARG;
+        else
+            status = PAL_OK;
+        break;
+    case 0x02:                                  /* PAL_CACHE_INFO */
+        if (a3 != 0 || !pal_cache_model(a1, a2, &ci)) {
+            status = PAL_INVALID_ARG;
+        } else {
+            status = PAL_OK;
+            r9 = (ci.unified ? UINT64_C(1) : 0) |
+                 ((uint64_t)ci.attribute << 1) |
+                 ((uint64_t)ci.associativity << 8) |
+                 ((uint64_t)ci.line_shift << 16) |
+                 ((uint64_t)ci.stride_shift << 24) |
+                 ((uint64_t)ci.store_latency << 32) |
+                 ((uint64_t)ci.load_latency << 40);
+            r10 = ci.size | ((uint64_t)ci.line_shift << 32) |
+                  ((uint64_t)ci.tag_lsb << 40) | ((uint64_t)ci.tag_msb << 48);
+        }
+        break;
+    case 0x03:                                  /* PAL_CACHE_INIT */
+        /* level -1 means "every level" and bypasses the range check. */
+        if (a1 != UINT64_MAX && (a1 >= 3 || a2 < 1 || a2 > 3 || a3 > 1))
+            status = PAL_INVALID_ARG;
+        else
+            status = PAL_OK;
+        break;
+    case 0x04:                                  /* PAL_CACHE_SUMMARY */
+        if (reserved_zero) {
+            status = PAL_OK;
+            r9 = 3;                             /* cache levels */
+            r10 = 4;                            /* unique caches */
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x05:                                  /* PAL_MEM_ATTRIB */
+        if (reserved_zero) {
+            status = PAL_OK;
+            r9 = (UINT64_C(1) << 0) | (UINT64_C(1) << 4);  /* WB and UC */
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x06:                                  /* PAL_PTCE_INFO */
+        if (reserved_zero) {
+            status = PAL_OK;
+            /* One ptc.e from address 0 purges the whole TC: count1=count2=1,
+             * both strides 0. */
+            r10 = (UINT64_C(1) << 32) | UINT64_C(1);
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x07:                                  /* PAL_VM_INFO */
+        if (a1 > 1 || a3 != 0 || a2 < 1 || a2 > 2) {
+            status = PAL_INVALID_ARG;
+        } else {
+            status = PAL_OK;
+            if (a1 == 0) {
+                r9 = UINT64_C(1) | (UINT64_C(32) << 8) | (UINT64_C(32) << 16);
+                r10 = UINT64_C(1) << 12;        /* 4 KiB only at level 0 */
+            } else {
+                r9 = UINT64_C(1) | (UINT64_C(128) << 8) | (UINT64_C(128) << 16) |
+                     (UINT64_C(1) << 32) | (UINT64_C(1) << 34);
+                r10 = PAL_INSERTABLE_PS_MASK;
+            }
+        }
+        break;
+    case 0x08:                                  /* PAL_VM_SUMMARY */
+        if (reserved_zero) {
+            status = PAL_OK;
+            /* phys_addr_size=50, key_bits=24, pkr_count-1=15, hash_tag_id=8,
+             * vw=4, keys=2.  max_itr-1/max_dtr-1 MUST match our actual
+             * TR file sizes: an OS installs pinned translations at the slot
+             * numbers it reads back from here, and itr.i/itr.d fault on
+             * anything past the end of the file. */
+            r9 = UINT64_C(1) | ((uint64_t)PAL_IMPL_PA_BITS << 1) |
+                 (UINT64_C(24) << 8) | (UINT64_C(15) << 16) |
+                 (UINT64_C(8) << 24) |
+                 ((uint64_t)(MERCED_N_ITR - 1) << 32) |
+                 ((uint64_t)(MERCED_N_DTR - 1) << 40) |
+                 (UINT64_C(4) << 48) | (UINT64_C(2) << 56);
+            r10 = UINT64_C(60) | (UINT64_C(24) << 8);  /* impl_va_msb, rid_bits */
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x09:                                  /* PAL_BUS_GET_FEATURES */
+        /* No software-configurable processor-bus features.  Bits 0..28 are
+         * reserved by the spec, so report an empty avail/status/control set
+         * rather than a placeholder mask. */
+        status = reserved_zero ? PAL_OK : PAL_INVALID_ARG;
+        break;
+    case 0x0A:                                  /* PAL_BUS_SET_FEATURES */
+        status = (a2 != 0 || a3 != 0) ? PAL_INVALID_ARG : PAL_OK;
+        break;
+    case 0x0B:                                  /* PAL_DEBUG_INFO */
+        if (reserved_zero) {
+            status = PAL_OK;
+            r9 = 4;                             /* instruction debug pairs */
+            r10 = 4;                            /* data debug pairs */
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x0C:                                  /* PAL_FIXED_ADDR */
+        if (reserved_zero) {
+            status = PAL_OK;
+            r9 = 0;                             /* uniprocessor: fixed addr 0 */
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x0D:                                  /* PAL_FREQ_BASE */
+        if (reserved_zero) {
+            status = PAL_OK;
+            r9 = 100000000;                     /* 100 MHz base */
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x0E:                                  /* PAL_FREQ_RATIOS */
+        if (reserved_zero) {
+            status = PAL_OK;
+            /* (numerator << 32) | denominator, relative to FREQ_BASE:
+             * 800 MHz processor, 133.33 MHz bus, 200 MHz ITC. */
+            r9  = (UINT64_C(8) << 32) | UINT64_C(1);
+            r10 = (UINT64_C(4) << 32) | UINT64_C(3);
+            r11 = (UINT64_C(2) << 32) | UINT64_C(1);
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x0F: {                                /* PAL_PERF_MON_INFO */
+        if (a1 == 0 || (a1 & 7) != 0 || a2 != 0 || a3 != 0) {
+            status = PAL_INVALID_ARG;
+            break;
+        }
+        /* Four 48-bit generic counters at PMC/PMD 4..7. */
+        for (int i = 0; i < 16; i++)
+            if (!pal_store8(m, a1 + (uint64_t)i * 8, 0))
+                return MERCED_OK;               /* fault already delivered */
+        if (!pal_store8(m, a1 + 0x00, UINT64_C(0x3FFF)) ||
+            !pal_store8(m, a1 + 0x20, UINT64_C(0x3FFFF)) ||
+            !pal_store8(m, a1 + 0x40, UINT64_C(0xF0)) ||
+            !pal_store8(m, a1 + 0x60, UINT64_C(0xF0)))
+            return MERCED_OK;
+        status = PAL_OK;
+        r9 = UINT64_C(0x08123004);
+        break;
+    }
+    case 0x10: {                                /* PAL_PLATFORM_ADDR */
+        uint64_t address = a2 & ~(UINT64_C(1) << 63);
+        uint64_t alignment, supported;
+        if (a3 != 0 || a1 > 1) {
+            status = PAL_INVALID_ARG;
+            break;
+        }
+        if (a1 == 0) {
+            alignment = UINT64_C(2) << 20;
+            supported = PAL_LOCAL_SAPIC_PA;
+        } else {
+            alignment = UINT64_C(64) << 20;
+            supported = PAL_IO_BLOCK_PA;
+        }
+        if ((address & (alignment - 1)) != 0 ||
+            pal_overlaps_fw_update(address, alignment) ||
+            address != supported) {
+            status = PAL_ERROR;
+        } else {
+            status = PAL_OK;
+            if (a1 == 0)
+                m->pal_interrupt_block_addr = address;
+            else
+                m->pal_io_block_addr = address;
+        }
+        break;
+    }
+    case 0x11:                                  /* PAL_PROC_GET_FEATURES */
+        if (a1 != 0 || a3 != 0)
+            status = PAL_INVALID_ARG;
+        else if (a2 == 0)
+            status = PAL_OK;
+        else if (a2 < 16)
+            status = PAL_INVALID_ARG;
+        else
+            status = PAL_BEYOND_MAX;            /* no Montecito feature sets */
+        break;
+    case 0x12:                                  /* PAL_PROC_SET_FEATURES */
+        status = (a2 != 0 || a3 != 0) ? PAL_INVALID_ARG : PAL_OK;
+        break;
+    case 0x13:                                  /* PAL_RSE_INFO */
+        if (reserved_zero) {
+            status = PAL_OK;
+            r9 = 96;                            /* num_phys_stacked */
+            r10 = 16;                           /* rse hints */
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x14:                                  /* PAL_VERSION */
+        if (reserved_zero) {
+            status = PAL_OK;
+            r9 = (UINT64_C(2) << 40) | (UINT64_C(0x23) << 32) |
+                 (UINT64_C(1) << 24) | (UINT64_C(2) << 8) | UINT64_C(0x23);
+            r10 = r9;
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x15:                                  /* PAL_MC_CLEAR_LOG */
+        status = reserved_zero ? PAL_OK : PAL_INVALID_ARG;
+        break;
+    case 0x16:                                  /* PAL_MC_DRAIN */
+        status = reserved_zero ? PAL_OK : PAL_INVALID_ARG;
+        break;
+    case 0x17:                                  /* PAL_MC_EXPECTED */
+        if (a1 > 1 || a2 != 0 || a3 != 0) {
+            status = PAL_INVALID_ARG;
+        } else {
+            status = PAL_OK;
+            r9 = m->pal_mc_expected ? 1 : 0;    /* previous value */
+            m->pal_mc_expected = (a1 != 0);
+        }
+        break;
+    case 0x18:                                  /* PAL_MC_DYNAMIC_STATE */
+        status = ((a1 & 7) != 0 || a2 != 0 || a3 != 0) ? PAL_INVALID_ARG : PAL_OK;
+        break;
+    case 0x19: {                                /* PAL_MC_ERROR_INFO */
+        bool valid;
+        if (a1 == 0 || a1 == 1)
+            valid = true;
+        else if (a1 == 2)
+            valid = pal_mc_level_index_valid(a2) && (a3 & 7) <= 4;
+        else
+            valid = false;
+        /* Nothing has gone wrong, so a well-formed query has no record to
+         * return - which is NO_INFORMATION, not an error. */
+        status = valid ? PAL_NO_INFO : PAL_INVALID_ARG;
+        break;
+    }
+    case 0x1A:                                  /* PAL_MC_RESUME */
+        if (a1 > 1 || a3 > 1 || (a2 >> 63) != 0 || (a2 & 0x1FF) != 0)
+            status = PAL_INVALID_ARG;
+        else
+            status = PAL_ERROR;                 /* no machine check in progress */
+        break;
+    case 0x1B:                                  /* PAL_MC_REGISTER_MEM */
+        if ((a1 >> 63) != 0 || (a1 & 0x1FF) != 0 || a2 != 0 || a3 != 0) {
+            status = PAL_INVALID_ARG;
+        } else {
+            status = PAL_OK;
+            m->pal_mc_save_addr = a1;
+        }
+        break;
+    case 0x1E:                                  /* PAL_COPY_INFO */
+        if (a1 == 0 && a2 == 0) {
+            status = PAL_OK;
+            r9 = UINT64_C(0x1000);              /* buffer size */
+            r10 = UINT64_C(0x1000);             /* buffer alignment */
+        } else if (a1 == 1) {
+            status = PAL_ERROR;                 /* no IA-32 support to copy */
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x1F:                                  /* PAL_CACHE_LINE_INIT */
+        status = ((a1 >> 63) != 0 || a3 != 0) ? PAL_INVALID_ARG : PAL_OK;
+        break;
+    case 0x20:                                  /* PAL_PMI_ENTRYPOINT */
+        if ((a1 >> 63) != 0 || (a1 & 0xFF) != 0 || a2 != 0 || a3 != 0) {
+            status = PAL_INVALID_ARG;
+        } else {
+            status = PAL_OK;
+            m->pal_pmi_entry = a1;
+        }
+        break;
+    case 0x22:                                  /* PAL_VM_PAGE_SIZE */
+        if (reserved_zero) {
+            status = PAL_OK;
+            r9 = PAL_INSERTABLE_PS_MASK;
+            r10 = PAL_PURGEABLE_PS_MASK;
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x25:                                  /* PAL_MEM_FOR_TEST */
+        if (reserved_zero) {
+            status = PAL_OK;
+            r10 = 1;                            /* alignment */
+        } else {
+            status = PAL_INVALID_ARG;
+        }
+        break;
+    case 0x26:                                  /* PAL_CACHE_PROT_INFO */
+        if (a3 != 0 || !pal_cache_model(a1, a2, &ci)) {
+            status = PAL_INVALID_ARG;
+        } else {
+            /* No protection on data; tag protection covers the tag field. */
+            uint64_t tag_none = (UINT64_C(1) << 30) |
+                                ((uint64_t)ci.tag_lsb << 8) |
+                                ((uint64_t)ci.tag_msb << 14);
+            status = PAL_OK;
+            r9 = UINT64_C(64) | (tag_none << 32);
+        }
+        break;
+    case 0x27:                                  /* PAL_REGISTER_INFO */
+        if (a2 != 0 || a3 != 0 || a1 > 3) {
+            status = PAL_INVALID_ARG;
+        } else {
+            status = PAL_OK;
+            switch (a1) {
+            case 0:                             /* AR implemented */
+                r9 = UINT64_C(0x000011117F2F00FF);
+                r10 = UINT64_C(0x7);
+                break;
+            case 1:                             /* AR read side effects */
+                break;
+            case 2:                             /* CR implemented */
+                r9 = UINT64_C(0x0000000003FB0107);
+                r10 = UINT64_C(0x307FF);
+                break;
+            default:                            /* CR read side effects */
+                r10 = UINT64_C(0x2);
+                break;
+            }
+        }
+        break;
+    case 0x102:                                 /* PAL_TEST_PROC (stacked) */
+        /* attributes must request at least WB and nothing outside 15:0. */
+        if ((s1 >> 63) != 0 || (s3 & ~UINT64_C(0xFFFF)) != 0 ||
+            (s3 & UINT64_C(1)) == 0) {
+            status = PAL_INVALID_ARG;
+        } else {
+            status = PAL_OK;
+            r9 = UINT64_C(1) << 2;              /* self-test state: tested */
+        }
+        break;
+    case 0x101: {                               /* PAL_HALT_INFO (stacked) */
+        uint64_t states[8] = { 0 };
+        if ((s1 & 7) != 0 || s2 != 0 || s3 != 0) {
+            status = PAL_INVALID_ARG;
+            break;
+        }
+        /* Two implemented halt states; only the first is cache-coherent. */
+        states[0] = (UINT64_C(1) << 60) | (UINT64_C(1) << 61) |
+                    (UINT64_C(1000) << 32) | (UINT64_C(1) << 16) | UINT64_C(1);
+        states[1] = (UINT64_C(1) << 60) |
+                    (UINT64_C(1000) << 32) | (UINT64_C(1) << 16) | UINT64_C(1);
+        for (int i = 0; i < 8; i++)
+            if (!pal_store8(m, s1 + (uint64_t)i * 8, states[i]))
+                return MERCED_OK;
+        status = PAL_OK;
+        break;
+    }
+    case 0x100: {                               /* PAL_COPY_PAL (stacked) */
+        /* The relocatable PAL procedure image: a bundle that re-enters this
+         * dispatcher via break 0x100000 and returns through b0, so a copy
+         * placed anywhere in memory stays callable. */
+        static const uint64_t pal_proc_words[4] = {
+            UINT64_C(0x000002000000000A), UINT64_C(0x0004000000000200),
+            UINT64_C(0x0000000100000010), UINT64_C(0x0084000080000200),
+        };
+        uint64_t target_pa = s1 & ~(UINT64_C(1) << 63);  /* strip cache attr */
+        if (s3 > 1 || s2 < UINT64_C(0x1000) ||
+            (target_pa & (UINT64_C(0x1000) - 1)) != 0 ||
+            target_pa > UINT64_MAX - UINT64_C(0x20)) {
+            status = PAL_INVALID_ARG;
+            break;
+        }
+        /* Only the bootstrap processor performs the copy; an AP call just
+         * re-registers the entry points against the already-copied image. */
+        if (s3 == 0)
+            for (int i = 0; i < 4; i++)
+                phys_write(m, target_pa + (uint64_t)i * 8, pal_proc_words[i], 8);
+        m->pal_pmi_entry = target_pa;
+        status = PAL_OK;
+        r9 = 0;                                 /* proc offset within the copy */
+        break;
+    }
+    case 0x105: {                               /* PAL_VM_TR_READ (stacked) */
+        /* tr_type 0 = instruction TR, 1 = data TR.  The buffer receives
+         * pte / itir / ifa / rr, and GR9 reports which of the four are
+         * valid (0xF for a live slot, 0 for an empty one).
+         *
+         * The reference bounds this against itr_count when tr_type is 1,
+         * which contradicts the array it then indexes; the discrepancy is
+         * invisible there because its default model has 64 of each.  On a
+         * Merced the two files differ, so bound each against its own. */
+        bool data_tr = (s2 == 1);
+        uint64_t bound = data_tr ? MERCED_N_DTR : MERCED_N_ITR;
+        uint64_t pte = 0, itir = 0, ifa = 0, rr = 0, tr_valid = 0;
+        const MercedTlbEntry *e;
+        if (s2 > 1 || s1 >= bound || (s3 & 7) != 0) {
+            status = PAL_INVALID_ARG;
+            break;
+        }
+        e = data_tr ? &m->dtr[s1] : &m->itr[s1];
+        if (e->valid) {
+            uint64_t key = (e->itir >> 8) & UINT64_C(0xFFFFFF);
+            pte = e->pte;
+            itir = ((uint64_t)e->ps << 2) | (key << 8);
+            ifa = e->va_start | 1;              /* bit 0 marks the entry valid */
+            rr = ((uint64_t)e->rid << 8) | ((uint64_t)e->ps << 2);
+            tr_valid = 0xF;
+        }
+        if (!pal_store8(m, s3, pte) || !pal_store8(m, s3 + 8, itir) ||
+            !pal_store8(m, s3 + 16, ifa) || !pal_store8(m, s3 + 24, rr))
+            return MERCED_OK;
+        status = PAL_OK;
+        r9 = tr_valid;
+        break;
+    }
+#if PAL_HAS_POST_MERCED
+    /* Placeholder: 0x29/0x2A/0x2B/0x112 would go here on a later part. */
+#endif
+    case 0x29:                                  /* PAL_PREFETCH_VIS */
+    case 0x2A:                                  /* PAL_LOGICAL_TO_PHYSICAL */
+    case 0x2B:                                  /* PAL_CACHE_SHARED_INFO */
+    case 0x112:                                 /* PAL_BRAND_INFO */
+        status = PAL_NOT_IMPL;                  /* post-Merced */
+        break;
+    default:
+        break;
+    }
+
+    if (getenv("MERCED_PAL_DEBUG") && m->ninsts > UINT64_C(1000000000)) {
+        static unsigned pal_debug;
+        if (pal_debug++ < 2000)
+            fprintf(stderr, "merced: PAL index=%" PRIu64
+                    " arg1=%016" PRIX64 " arg2=%016" PRIX64
+                    " arg3=%016" PRIX64 " status=%" PRId64
+                    " ninsts=%" PRIu64 "\n",
+                    index, a1, a2, a3, (int64_t)status, m->ninsts);
+    }
+    gr_write(m, 8, status, 0);
+    gr_write(m, 9, r9, 0);
+    gr_write(m, 10, r10, 0);
+    gr_write(m, 11, r11, 0);
+    return MERCED_OK;
+}
+
+/* SDM Vol.2 4.1.2 "Reserved Register/Field Faults": itc/itr must reject a
+ * page size outside the architected insertable set (4K/8K/16K/64K/256K/1M/
+ * 4M/16M/64M/256M/1G - note 4G is purgeable but NOT insertable, unlike
+ * ptc/ptr which also accept it), any set bit in ITIR{1:0} or ITIR{63:32},
+ * and - only when the PTE's Present bit is set - PTE{1} or PTE{51:50}, or
+ * an ma encoding other than 0 (wb) or 4-7 (the reserved encodings 1-3).
+ * A not-present PTE only checks ITIR{1:0}: the rest of the PTE is free-form
+ * software bookkeeping once P=0. */
+static bool translation_insert_fields_valid(uint64_t pte, uint64_t itir) {
+    static const uint64_t insertable_ps_mask =
+        (1ull << 12) | (1ull << 13) | (1ull << 14) | (1ull << 16) |
+        (1ull << 18) | (1ull << 20) | (1ull << 22) | (1ull << 24) |
+        (1ull << 26) | (1ull << 28) | (1ull << 30);
+    unsigned ps = (unsigned)((itir >> 2) & 0x3F);
+    uint64_t itir_reserved = 3ull | (0xFFFFFFFFull << 32);
+    if (ps >= 64 || !((insertable_ps_mask >> ps) & 1))
+        return false;
+    if (!(pte & 1))
+        return !(itir & (itir_reserved & 3));
+    unsigned ma = (unsigned)((pte >> 2) & 7);
+    return !(pte & ((1ull << 1) | (3ull << 50))) && !(itir & itir_reserved) &&
+           (ma == 0 || ma >= 4);
+}
+
 static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     unsigned major = (unsigned)bits(raw, 37, 4);
     unsigned x3 = (unsigned)bits(raw, 33, 3);
@@ -2235,121 +3108,10 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                  * convention) rather than ever reaching architectural fault
                  * delivery. Delivering a real VEC_BREAK fault here lands on
                  * IVA+0x2C00, which is unmapped/empty, and double-faults.
-                 * Until individual PAL procedures are implemented, match
-                 * upstream's default case for every index: gracefully
-                 * report PAL_STATUS_NOT_IMPLEMENTED in GR8 (with GR9-11
-                 * cleared) and resume at the trampoline's own br.many b0
-                 * instead of faulting. */
-                if (imm == UINT64_C(0x100000)) {
-                    uint8_t nn;
-                    uint64_t index = gr_read(m, 28, &nn);
-                    uint64_t arg1 = gr_read(m, 29, &nn);
-                    uint64_t arg2 = gr_read(m, 30, &nn);
-                    uint64_t arg3 = gr_read(m, 31, &nn);
-                    uint64_t status = (uint64_t)-1;   /* PAL_STATUS_NOT_IMPLEMENTED */
-                    uint64_t res1 = 0, res2 = 0, res3 = 0;
-                    /* Static, argument-gated procedures, matching
-                     * target/ia64/arch/pal.c's constant returns for a
-                     * generic (non-Montecito) Itanium: real values, not
-                     * placeholders, so the OS configures its own MMU/RSE
-                     * state correctly instead of guessing after a
-                     * NOT_IMPLEMENTED failure. */
-                    switch (index) {
-                    case 0x14:                        /* PAL_VERSION */
-                        if (arg1 == 0 && arg2 == 0 && arg3 == 0) {
-                            status = 0;                /* PAL_STATUS_SUCCESS */
-                            res1 = (UINT64_C(2) << 40) | (UINT64_C(0x23) << 32) |
-                                   (UINT64_C(1) << 24) | (UINT64_C(2) << 8) |
-                                   UINT64_C(0x23);
-                            res2 = res1;
-                        } else {
-                            status = (uint64_t)-2;     /* PAL_STATUS_INVALID_ARGUMENT */
-                        }
-                        break;
-                    case 0x08:                        /* PAL_VM_SUMMARY */
-                        if (arg1 == 0 && arg2 == 0 && arg3 == 0) {
-                            status = 0;
-                            /* phys_addr_size=50, key_bits=24, pkr_count-1=15,
-                             * hash_tag_id=8, vw=4, keys=2 (matches
-                             * target/ia64/cpu.h's IA64_IMPL_{PA,KEY}_BITS /
-                             * IA64_PKR_COUNT defaults). max_itr-1/max_dtr-1
-                             * MUST match MERCED_N_TR-1, our actual TR slot
-                             * count - itr/dtr insertion masks the requested
-                             * slot with (MERCED_N_TR-1), so overstating this
-                             * makes the OS pick slot numbers that silently
-                             * wrap onto already-used entries instead of the
-                             * distinct ones it thinks it's using. */
-                            res1 = UINT64_C(1) | (UINT64_C(50) << 1) |
-                                   (UINT64_C(24) << 8) | (UINT64_C(15) << 16) |
-                                   (UINT64_C(8) << 24) |
-                                   ((uint64_t)(MERCED_N_TR - 1) << 32) |
-                                   ((uint64_t)(MERCED_N_TR - 1) << 40) |
-                                   (UINT64_C(4) << 48) | (UINT64_C(2) << 56);
-                            /* impl_va_msb=60, rid_bits=24 */
-                            res2 = UINT64_C(60) | (UINT64_C(24) << 8);
-                        } else {
-                            status = (uint64_t)-2;
-                        }
-                        break;
-                    case 0x13:                        /* PAL_RSE_INFO */
-                        if (arg1 == 0 && arg2 == 0 && arg3 == 0) {
-                            status = 0;
-                            res1 = 96;                  /* num_phys_stacked */
-                            res2 = 16;                  /* hints: none */
-                        } else {
-                            status = (uint64_t)-2;
-                        }
-                        break;
-                    case 0x0D:                         /* PAL_FREQ_BASE */
-                        if (arg1 == 0 && arg2 == 0 && arg3 == 0) {
-                            status = 0;
-                            res1 = 100000000;           /* 100 MHz base */
-                        } else {
-                            status = (uint64_t)-2;
-                        }
-                        break;
-                    case 0x04:                         /* PAL_CACHE_SUMMARY */
-                        if (arg1 == 0 && arg2 == 0 && arg3 == 0) {
-                            status = 0;
-                            res1 = 3;                   /* cache levels */
-                            res2 = 4;                   /* unique caches */
-                        } else {
-                            status = (uint64_t)-2;
-                        }
-                        break;
-                    case 0x11:                         /* PAL_PROC_GET_FEATURES */
-                        if (arg1 == 0 && arg3 == 0) {
-                            if (arg2 == 0) {
-                                status = 0;
-                            } else if (arg2 < 16) {
-                                status = (uint64_t)-2;  /* INVALID_ARGUMENT */
-                            } else {
-                                status = (uint64_t)-8;  /* BEYOND_MAX (no Montecito set) */
-                            }
-                        } else {
-                            status = (uint64_t)-2;
-                        }
-                        break;
-                    default:
-                        break;
-                    }
-                    if (getenv("MERCED_PAL_DEBUG") &&
-                        m->ninsts > UINT64_C(1000000000)) {
-                        static unsigned pal_debug;
-                        if (pal_debug++ < 2000)
-                            fprintf(stderr, "merced: PAL index=%" PRIu64
-                                    " arg1=%016" PRIX64 " arg2=%016" PRIX64
-                                    " arg3=%016" PRIX64 " status=%" PRId64
-                                    " ninsts=%" PRIu64 "\n",
-                                    index, arg1, arg2, arg3, (int64_t)status,
-                                    m->ninsts);
-                    }
-                    gr_write(m, 8, status, 0);
-                    gr_write(m, 9, res1, 0);
-                    gr_write(m, 10, res2, 0);
-                    gr_write(m, 11, res3, 0);
-                    return MERCED_OK;
-                }
+                 * So answer the call here (see pal_dispatch) and resume at
+                 * the trampoline's own br.many b0 instead of faulting. */
+                if (imm == UINT64_C(0x100000))
+                    return pal_dispatch(m);
                 if (getenv("BREAK_DEBUG"))
                     fprintf(stderr, "BREAK: imm=%#" PRIX64 " ip=%016" PRIX64 " gr28=%#" PRIX64 "\n",
                             imm, m->ip, gr_read(m, 28, &(uint8_t){0}));
@@ -2484,22 +3246,29 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         uint32_t rid = (uint32_t)((m->rr[va >> 61] >> 8) & 0xFFFFFFull);
         uint64_t len = ps >= 64 ? ~0ull : 1ull << ps;
         if (x6 == 0x0C) {
-            tlb_purge(m, m->dtr, MERCED_N_TR, rid, va, len);
+            tlb_purge(m, m->dtr, MERCED_N_DTR, rid, va, len);
             tlb_purge(m, m->dtc, MERCED_N_TC, rid, va, len);
         } else {
-            tlb_purge(m, m->itr, MERCED_N_TR, rid, va, len);
+            tlb_purge(m, m->itr, MERCED_N_ITR, rid, va, len);
             tlb_purge(m, m->itc, MERCED_N_TC, rid, va, len);
         }
         return MERCED_OK;
     }
-    case 0x0E:                                      /* itr.d dtr[r3]=r2 */
-        tlb_insert(m, &m->dtr[gr_read(m, r3, &n3) & (MERCED_N_TR - 1)],
-                   gr_read(m, r2, &n2), false);
+    case 0x0E: case 0x0F: {                         /* itr.d / itr.i */
+        /* A slot past the end of the file is a Reserved Register/Field
+         * fault, not a wrapped write: silently aliasing it onto a live slot
+         * would corrupt a pinned translation the guest still believes in. */
+        bool data = (x6 == 0x0E);
+        /* The slot is bits 7:0 of r3; the rest of the register is ignored. */
+        uint64_t slot = gr_read(m, r3, &n3) & 0xFF;
+        if (slot >= (data ? MERCED_N_DTR : MERCED_N_ITR))
+            return deliver_fault(m, VEC_GENERAL, 0x30, 0, false);
+        uint64_t pte = gr_read(m, r2, &n2);
+        if (!translation_insert_fields_valid(pte, m->cr[CR_ITIR]))
+            return deliver_fault(m, VEC_GENERAL, 0x30, 0, false);
+        tlb_insert(m, data ? &m->dtr[slot] : &m->itr[slot], pte, !data);
         return MERCED_OK;
-    case 0x0F:                                      /* itr.i itr[r3]=r2 */
-        tlb_insert(m, &m->itr[gr_read(m, r3, &n3) & (MERCED_N_TR - 1)],
-                   gr_read(m, r2, &n2), true);
-        return MERCED_OK;
+    }
     case 0x10: gr_write(m, r1, m->rr[gr_read(m, r3, &n3) >> 61 & 7], 0); return MERCED_OK;
     case 0x11: gr_write(m, r1, m->dbr[gr_read(m, r3, &n3) & 15], 0); return MERCED_OK;
     case 0x12: gr_write(m, r1, m->ibr[gr_read(m, r3, &n3) & 15], 0); return MERCED_OK;
@@ -2547,7 +3316,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         if (!present) {
             unsigned vrn = (unsigned)(va >> 61);
             uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
-            const MercedTlbEntry *e = tlb_search(m->dtr, MERCED_N_TR,
+            const MercedTlbEntry *e = tlb_search(m->dtr, MERCED_N_DTR,
                                                   rid, va);
             if (!e) e = tlb_search(m->dtc, MERCED_N_TC, rid, va);
             if (!e && vhpt_walk(m, va, false) == VHPT_HIT)
@@ -2594,7 +3363,11 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         unsigned ar3 = (unsigned)bits(raw, 20, 7);
         uint64_t v = m->ar[ar3];
         if (ar3 == AR_BSP)
-            v = rse_addr(m, (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm));
+            /* AR.BSP names the base of the current frame.  The end of the
+             * dirty partition is BOF+SOF, but exposing that as BSP makes
+             * every alloc appear to advance BSP and corrupts OS RSE context
+             * records.  Calls/returns move bof_total as frames change. */
+            v = rse_addr(m, (int64_t)m->bof_total);
         else if (ar3 == AR_BSPSTORE)
             v = rse_addr(m, m->rse_flushed_regs);
         gr_write(m, r1, v, 0);
@@ -2670,7 +3443,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                 m->bof = (unsigned)(((int64_t)m->bof + delta) % MERCED_RSE_CAPACITY
                                     + MERCED_RSE_CAPACITY) % MERCED_RSE_CAPACITY;
                 m->rse_flushed_regs = newpos;
-                m->ar[AR_BSP] = rse_addr(m, (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm));
+                m->ar[AR_BSP] = rse_addr(m, (int64_t)m->bof_total);
             } else {
                 /* mov-to-BSPSTORE empties the clean partition but preserves
                  * the dirty partition, rebasing BSP above the newly written
@@ -2679,7 +3452,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                 m->rse_flushed_regs = bsp_regs - dirty;
                 m->rse_anchor_addr = new_store;
                 m->rse_anchor_regs = m->rse_flushed_regs;
-                m->ar[AR_BSP] = rse_addr(m, bsp_regs);
+                m->ar[AR_BSP] = rse_addr(m, (int64_t)m->bof_total);
             }
         }
         return MERCED_OK;
@@ -2703,7 +3476,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         m->psr = np;
         return MERCED_OK;
     }
-    case 0x2E:                                      /* itc.d */
+    case 0x2E: {                                    /* itc.d */
         if (m->cr[CR_IFA] >= watch_va_base && m->cr[CR_IFA] < watch_va_end) {
             static unsigned itc_dbg;
             if (itc_dbg++ < 8)
@@ -2713,13 +3486,19 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                         m->cr[CR_ITIR], gr_read(m, r2, NULL), m->ip,
                         m->ninsts), fflush(stderr);
         }
-        tlb_insert(m, &m->dtc[m->dtc_next++ % MERCED_N_TC],
-                   gr_read(m, r2, &n2), false);
+        uint64_t pte = gr_read(m, r2, &n2);
+        if (!translation_insert_fields_valid(pte, m->cr[CR_ITIR]))
+            return deliver_fault(m, VEC_GENERAL, 0x30, 0, false);
+        tlb_insert(m, &m->dtc[m->dtc_next++ % MERCED_N_TC], pte, false);
         return MERCED_OK;
-    case 0x2F:                                      /* itc.i */
-        tlb_insert(m, &m->itc[m->itc_next++ % MERCED_N_TC],
-                   gr_read(m, r2, &n2), true);
+    }
+    case 0x2F: {                                    /* itc.i */
+        uint64_t pte = gr_read(m, r2, &n2);
+        if (!translation_insert_fields_valid(pte, m->cr[CR_ITIR]))
+            return deliver_fault(m, VEC_GENERAL, 0x30, 0, false);
+        tlb_insert(m, &m->itc[m->itc_next++ % MERCED_N_TC], pte, true);
         return MERCED_OK;
+    }
     case 0x30: return MERCED_OK;                    /* fc / fc.i */
     case 0x31: case 0x32: case 0x33: {             /* probe.*.fault */
         /* Unlike result-producing probe, these forms are faulting hints:
@@ -3174,12 +3953,76 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
 
 /* ── M-unit dispatcher ───────────────────────────────────────────────────── */
 
+/* M18: compact always-acquire xchg/cmpxchg, major=2.  Distinct from the
+ * M16 semaphore form exec_mem() handles (major=4): size and cmpxchg-vs-xchg
+ * are selected by the xm/xhint fields rather than x6, and there is no
+ * .rel variant - this encoding is unconditionally .acq. */
+static MercedStatus exec_m_xchg_compact(Merced *m, uint64_t raw, int qp) {
+    unsigned xhint = (unsigned)bits(raw, 27, 2);
+    unsigned xm = (unsigned)bits(raw, 29, 2);
+    if (xhint > 1)
+        return mhalt(m, "unimpl M18 xhint=%u", xhint);
+    if (!qp) return MERCED_OK;
+    unsigned r1 = (unsigned)bits(raw, 6, 7);
+    unsigned r2 = (unsigned)bits(raw, 13, 7);
+    unsigned r3 = (unsigned)bits(raw, 20, 7);
+    uint8_t n2, n3;
+    bool is_cmpxchg = xm >= 2;
+    unsigned size = (xm & 1) ? (xhint ? 8 : 4) : (xhint ? 2 : 1);
+    MercedStatus st;
+    warn_once(m, WARN_SEMAPHORE, "semaphore ops executed non-atomically");
+    uint64_t va = gr_read(m, r3, &n3), pa;
+    if (!va_translate(m, va, false, false, ISR_R | ISR_W, &pa, &st)) return st;
+    uint64_t old = phys_read(m, pa, size);
+    if (is_cmpxchg) {
+        uint64_t ccv = m->ar[AR_CCV];
+        if (size < 8) ccv &= (1ull << (size * 8)) - 1;
+        if (old == ccv)
+            phys_write(m, pa, gr_read(m, r2, &n2), size);
+    } else {
+        phys_write(m, pa, gr_read(m, r2, &n2), size);
+    }
+    gr_write(m, r1, old, 0);
+    return MERCED_OK;
+}
+
+/* M17: compact always-acquire fetchadd, major=3.  Same immediate encoding
+ * as the M16 fetchadd4/8.acq/.rel forms in exec_mem(), just reached via a
+ * different major/field layout with no .rel variant. */
+static MercedStatus exec_m_fetchadd_compact(Merced *m, uint64_t raw, int qp) {
+    unsigned x2 = (unsigned)bits(raw, 27, 1);
+    unsigned xm = (unsigned)bits(raw, 29, 2);
+    if (x2 != 0 || xm > 1)
+        return mhalt(m, "unimpl M17 x2=%u xm=%u", x2, xm);
+    if (!qp) return MERCED_OK;
+    unsigned r1 = (unsigned)bits(raw, 6, 7);
+    unsigned r3 = (unsigned)bits(raw, 20, 7);
+    uint8_t n3;
+    unsigned size = xm ? 8 : 4;
+    unsigned i2b = (unsigned)bits(raw, 13, 2);
+    int s = (int)bits(raw, 15, 1);
+    int64_t inc = (i2b == 3) ? 1 : (1 << (4 - i2b));
+    if (s) inc = -inc;
+    MercedStatus st;
+    warn_once(m, WARN_SEMAPHORE, "semaphore ops executed non-atomically");
+    uint64_t va = gr_read(m, r3, &n3), pa;
+    if (!va_translate(m, va, false, false, ISR_R | ISR_W, &pa, &st)) return st;
+    uint64_t old = phys_read(m, pa, size);
+    phys_write(m, pa, old + (uint64_t)inc, size);
+    gr_write(m, r1, old, 0);
+    return MERCED_OK;
+}
+
 static MercedStatus exec_m(Merced *m, uint64_t raw, int qp) {
     unsigned major = (unsigned)bits(raw, 37, 4);
     MercedStatus st;
     if (exec_alu(m, raw, qp, &st)) return st;
     if (st != MERCED_OK) return st;
     if (major <= 1) return exec_m_sys(m, raw, qp);
+    if (major == 2 && !bits(raw, 36, 1) && !bits(raw, 12, 1))
+        return exec_m_xchg_compact(m, raw, qp);
+    if (major == 3 && !bits(raw, 36, 1))
+        return exec_m_fetchadd_compact(m, raw, qp);
     if (major >= 4 && major <= 7) return exec_mem(m, raw, qp);
     return mhalt(m, "unimpl M-unit major 0x%X", major);
 }
@@ -3843,8 +4686,17 @@ MercedStatus merced_step(Merced *m) {
     uint64_t hi = phys_fetch(m, pa + 8, 8);
     unsigned tmpl = (unsigned)(lo & 0x1F);
     const char *units = bundle_units[tmpl];
-    if (units[0] == '?')
-        return mhalt(m, "reserved bundle template 0x%02X", tmpl);
+    if (units[0] == '?') {
+        /* A reserved bundle template is an Illegal Operation, which the
+         * architecture reports through the General Exception vector with
+         * ISR.code 0 - not a machine stop.  Software relies on this: an OS
+         * that branches into data, or a speculative path that reaches
+         * unwritten memory (which reads as all-ones, template 0x1F), expects
+         * to take the fault and recover.  Halting here turned every such
+         * case into a dead emulator.  Reference: IA64_EXCP_RESERVED_TEMPLATE
+         * and IA64_EXCP_ILLEGAL both vector to 0x5400. */
+        return deliver_fault(m, VEC_GENERAL, 0, 0, false);
+    }
 
     uint64_t slots[3];
     slots[0] = (lo >> 5) & 0x1FFFFFFFFFFull;
@@ -4084,7 +4936,7 @@ void merced_dump_state(const Merced *m, char *buf, size_t len) {
       m->rr[0], m->rr[1], m->rr[2], m->rr[3]);
     P("    %016" PRIX64 " %016" PRIX64 " %016" PRIX64 " %016" PRIX64 "\n",
       m->rr[4], m->rr[5], m->rr[6], m->rr[7]);
-    for (unsigned i = 0; i < MERCED_N_TR; i++) {
+    for (unsigned i = 0; i < MERCED_N_DTR; i++) {
         if (m->dtr[i].valid)
             P("dtr[%u] rid=%06X va=%016" PRIX64 "-%016" PRIX64
               " pa=%016" PRIX64 " ps=%u\n", i, m->dtr[i].rid,

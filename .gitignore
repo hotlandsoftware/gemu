@@ -6,3 +6,5 @@ roms/
 build.ninja*.log
 reference/
 snapshots/
+.claude/
+tools/*.pyc

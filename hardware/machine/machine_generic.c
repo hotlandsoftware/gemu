@@ -1628,6 +1628,24 @@ static void generic_custom_cmd(Ia64GenericState *s) {
         }
         return;
     }
+    {
+        uint64_t daddr, dlen;
+        char path[256];
+        if (txt && sscanf(txt, "dump %" SCNx64 " %" SCNx64 " %255s",
+                          &daddr, &dlen, path) == 3) {
+            if (daddr + dlen > s->ram_size) {
+                printf("dump: range out of bounds\n");
+                return;
+            }
+            FILE *f = fopen(path, "wb");
+            if (!f) { printf("cannot open %s\n", path); return; }
+            fwrite(s->ram + daddr, 1, dlen, f);
+            fclose(f);
+            printf("dumped 0x%" PRIX64 " bytes from 0x%" PRIX64 " to %s\n",
+                   dlen, daddr, path);
+            return;
+        }
+    }
     if (txt && strncmp(txt, "vhptstats", 9) == 0) {
         uint64_t calls, disabled, hit, unmapped, tagfail, np;
         merced_vhpt_stats(&calls, &disabled, &hit, &unmapped, &tagfail, &np);
@@ -1716,7 +1734,8 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
     vga_ibm_reset(&s->vga);
 
     MercedBus bus = {
-        .ud = s, .read = bus_read, .fetch = bus_fetch, .write = bus_write,
+        .ud = s, .ram_size = s->ram_size,
+        .read = bus_read, .fetch = bus_fetch, .write = bus_write,
         .fill = bus_fill
     };
     s->cpu = merced_create(&bus);

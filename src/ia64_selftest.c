@@ -138,7 +138,8 @@ int ia64_selftest_main(const char *path) {
     }
     fclose(f);
 
-    MercedBus bus = { .ud = &bus_state, .read = selftest_read,
+    MercedBus bus = { .ud = &bus_state, .ram_size = UINT64_C(0x40000000),
+                      .read = selftest_read,
                       .write = selftest_write };
     Merced *m = merced_create(&bus);
     if (!m)
@@ -162,6 +163,11 @@ int ia64_selftest_main(const char *path) {
     if (have_terminal && (m->ip & ~0xFull) == (terminal & ~0xFull))
         reason = "terminal";
 
+    /* On a bail-out the halt message names the instruction we could not
+     * execute - that is the single most actionable line of output here. */
+    if (m->halt_msg[0] && (!strcmp(reason, "unimpl") || !strcmp(reason, "halt")))
+        printf("IA64TEST halt msg=%s at=%" PRIX64 "\n", m->halt_msg,
+               m->halt_ip);
     emit_state(m, reason);
     merced_destroy(m);
     for (size_t i = 0; i < SELFTEST_PAGE_SLOTS; i++)

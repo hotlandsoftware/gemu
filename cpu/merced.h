@@ -40,7 +40,14 @@
 #define MERCED_N_AR       128
 #define MERCED_N_CR       128
 #define MERCED_N_RR       8
-#define MERCED_N_TR       16   /* per side (code/data) */
+/* Merced's translation-register files are asymmetric: 8 instruction TRs and
+ * 48 data TRs (SDM 245318; the reference model's merced entry uses the same
+ * counts).  PAL_VM_SUMMARY reports these, and an OS installs pinned
+ * translations at the slot numbers it reads back from there - so a symmetric
+ * guess here makes a guest's DTR 20 land on some other slot entirely. */
+#define MERCED_N_ITR      8
+#define MERCED_N_DTR      48
+#define MERCED_N_TR       MERCED_N_DTR   /* legacy alias: the larger file */
 #define MERCED_N_TC       512  /* per side; amortize software VHPT refills */
 #define MERCED_TRACE_HISTORY 512
 #define MERCED_CALL_HISTORY 128
@@ -49,6 +56,9 @@
 
 typedef struct {
     void *ud;
+    /* Backed low RAM, used to bound the firmware/early-kernel region-7
+     * physical alias. Zero disables that platform fallback. */
+    uint64_t ram_size;
     /* size in {1,2,4,8}; addr is a physical address (attribute bit already
      * stripped). Unmapped reads should return all-ones and log. */
     uint64_t (*read)(void *ud, uint64_t addr, unsigned size);
@@ -137,7 +147,7 @@ typedef struct Merced {
     uint8_t  msr_toggle[4096];
     uint16_t msr_polls[4096];   /* reads since last write (poll detector) */
 
-    MercedTlbEntry itr[MERCED_N_TR], dtr[MERCED_N_TR];
+    MercedTlbEntry itr[MERCED_N_ITR], dtr[MERCED_N_DTR];
     MercedTlbEntry itc[MERCED_N_TC], dtc[MERCED_N_TC];
     uint32_t itc_next, dtc_next;
 
@@ -193,6 +203,18 @@ typedef struct Merced {
      * McKinley (Itanium 2). Set via merced_set_cpu_model(); survives
      * merced_reset() the same way cpu_revision does. */
     uint8_t  cpu_model;
+
+    /* Firmware-visible PAL state.  These outlive a single PAL call because
+     * the procedures that set them are "register this with the processor"
+     * calls whose effect a later call (or a machine check) reads back. */
+    uint64_t pal_mc_save_addr;         /* PAL_MC_REGISTER_MEM */
+    uint64_t pal_pmi_entry;            /* PAL_PMI_ENTRYPOINT */
+    uint64_t pal_interrupt_block_addr; /* PAL_PLATFORM_ADDR type 0 */
+    uint64_t pal_io_block_addr;        /* PAL_PLATFORM_ADDR type 1 */
+    bool     pal_mc_expected;          /* PAL_MC_EXPECTED latch */
+
+    /* Upper bound of the persistent region-7 KSEG physical alias. */
+    uint64_t region7_directmap_limit;
 } Merced;
 
 Merced *merced_create(const MercedBus *bus);
