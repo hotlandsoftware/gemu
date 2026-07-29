@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <winsock2.h>
@@ -38,6 +39,27 @@ typedef int generic_sock_t;
 #define FB_W 640
 #define FB_H 400
 #define INSTR_PER_FRAME 500000
+#define GENERIC_IA64_ITC_TICK_NS 5
+#define GENERIC_ACPI_PM_HZ UINT64_C(3579545)
+#define GENERIC_QEMU_RTC_BASE UINT64_C(0x00000000ffef0000)
+#define GENERIC_QEMU_RTC_SIZE UINT64_C(0x0000000000002000)
+
+static uint64_t generic_monotonic_ns(void) {
+#ifdef _WIN32
+    LARGE_INTEGER counter, frequency;
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    uint64_t count = (uint64_t)counter.QuadPart;
+    uint64_t freq = (uint64_t)frequency.QuadPart;
+    return count / freq * UINT64_C(1000000000) +
+           count % freq * UINT64_C(1000000000) / freq;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)ts.tv_nsec;
+#endif
+}
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES 32
 #define GENERIC_COM1_PORT 0x3F8u
@@ -184,6 +206,13 @@ struct Ia64GenericState {
 static bool path_ends_with(const char *path, const char *suffix) {
     size_t n = strlen(path), m = strlen(suffix);
     return n >= m && strcmp(path + n - m, suffix) == 0;
+}
+
+static uint32_t generic_acpi_pm_ticks(void) {
+    uint64_t ns = generic_monotonic_ns();
+    return (uint32_t)((ns / UINT64_C(1000000000)) * GENERIC_ACPI_PM_HZ +
+                      (ns % UINT64_C(1000000000)) * GENERIC_ACPI_PM_HZ /
+                          UINT64_C(1000000000));
 }
 
 static void generic_qemu_firmware_reset(Ia64GenericState *s) {
@@ -514,15 +543,39 @@ static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size
         switch (port - GENERIC_COM1_PORT) {
         case 0:
             if (s->uart_lcr & 0x80) return s->uart_dll;
-            if (s->uart_rx_head != s->uart_rx_tail)
-                return s->uart_rx[s->uart_rx_head++];
+            if (s->uart_rx_head != s->uart_rx_tail) {
+                uint8_t byte = s->uart_rx[s->uart_rx_head++];
+                if (getenv("GENERIC_DEBUG_UARTRX")) {
+                    fprintf(stderr,
+                            "generic: uart RBR consume byte=0x%02x ip=%016"
+                            PRIx64 " ninsts=%" PRIu64 "\n",
+                            byte, s->cpu->ip, s->cpu->ninsts);
+                    merced_dump_trace(s->cpu, 64, stderr);
+                }
+                return byte;
+            }
             return 0;
         case 1: return (s->uart_lcr & 0x80) ? s->uart_dlm : s->uart_ier;
         case 2: return ((s->uart_ier & 1) && s->uart_rx_head != s->uart_rx_tail)
                      ? 0x04 : 0x01;                /* RX data / no interrupt */
         case 3: return s->uart_lcr;
         case 4: return s->uart_mcr;
-        case 5: return 0x60 | (s->uart_rx_head != s->uart_rx_tail ? 1 : 0);
+        case 5: {
+            uint8_t lsr = 0x60 | (s->uart_rx_head != s->uart_rx_tail ? 1 : 0);
+            if (getenv("GENERIC_DEBUG_UARTRX")) {
+                static uint8_t last_head = 0xFF, last_tail = 0xFF;
+                static unsigned n;
+                if ((s->uart_rx_head != last_head ||
+                     s->uart_rx_tail != last_tail) && n++ < 200) {
+                    fprintf(stderr, "generic: uart LSR read -> 0x%02x "
+                            "head=%u tail=%u (edge)\n", lsr, s->uart_rx_head,
+                            s->uart_rx_tail);
+                    last_head = s->uart_rx_head;
+                    last_tail = s->uart_rx_tail;
+                }
+            }
+            return lsr;
+        }
         case 6:
             if (s->uart_mcr & 0x10) {
                 /* Loopback: modem status mirrors the control bits (RTS->CTS,
@@ -651,6 +704,15 @@ static void kbd_push(Ia64GenericState *s, uint8_t code) {
         return;   /* drop if full */
     s->kbd_fifo[s->kbd_tail] = code;
     s->kbd_tail = next;
+}
+
+static void uart_rx_push(Ia64GenericState *s, uint8_t byte) {
+    uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+    if (next != s->uart_rx_head)
+        s->uart_rx[s->uart_rx_tail++] = byte;
+    if (getenv("GENERIC_DEBUG_UARTRX"))
+        fprintf(stderr, "generic: uart_rx_push byte=0x%02x head=%u tail=%u\n",
+                byte, s->uart_rx_head, s->uart_rx_tail);
 }
 
 static uint8_t kbd_pop(Ia64GenericState *s) {
@@ -1208,6 +1270,21 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         memcpy(&v, s->qemu_nvram + (addr - GENERIC_QEMU_NVRAM_BASE), size);
         return v;
     }
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_RTC_BASE &&
+        addr + size <= GENERIC_QEMU_RTC_BASE + GENERIC_QEMU_RTC_SIZE) {
+        /*
+         * Match ia64-vpc's firmware RTC: one coherent, aligned 64-bit
+         * seconds-since-the-Unix-epoch register at offset zero.  EFI
+         * RuntimeServices.GetTime depends on this after the OS loader has
+         * taken over; returning open-bus all-ones makes its elapsed-time
+         * loops permanent.
+         */
+        if (addr == GENERIC_QEMU_RTC_BASE && size == sizeof(uint64_t)) {
+            time_t now = time(NULL);
+            return now < 0 ? 0 : (uint64_t)now;
+        }
+        return 0;
+    }
     if (s->qemu_firmware && addr >= GENERIC_QEMU_VGA_FB_BASE &&
         addr + size <= GENERIC_QEMU_VGA_FB_BASE + GENERIC_QEMU_VGA_FB_SIZE) {
         uint64_t v = 0;
@@ -1230,7 +1307,7 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         if (off < 6)
             return s->acpi_pm1_control | 1u; /* SCI_EN: ACPI mode active */
         if (off >= 8 && off < 12)
-            return (uint32_t)s->cpu->ninsts;       /* monotonic PM timer */
+            return generic_acpi_pm_ticks();
         return 0;
     }
     if (addr >= GENERIC_IOSAPIC_BASE &&
@@ -1352,6 +1429,11 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
         /* The handoff advertises volatile NVRAM, so the commit sentinel is
          * intentionally just another in-memory write. */
         memcpy(s->qemu_nvram + (addr - GENERIC_QEMU_NVRAM_BASE), &val, size);
+        return;
+    }
+    if (s->qemu_firmware && addr >= GENERIC_QEMU_RTC_BASE &&
+        addr + size <= GENERIC_QEMU_RTC_BASE + GENERIC_QEMU_RTC_SIZE) {
+        /* Platform RTC is read-only, as on the reference ia64-vpc. */
         return;
     }
     if (s->qemu_firmware && addr >= GENERIC_QEMU_VGA_FB_BASE &&
@@ -1611,10 +1693,23 @@ static void generic_custom_cmd(Ia64GenericState *s) {
     }
     if (txt && strncmp(txt, "key ", 4) == 0) {
         const char *arg = txt + 4;
-        if (strcmp(arg, "up") == 0) kbd_push(s, GENERIC_KBD_KEY_UP);
-        else if (strcmp(arg, "down") == 0) kbd_push(s, GENERIC_KBD_KEY_DOWN);
-        else if (strcmp(arg, "enter") == 0) kbd_push(s, GENERIC_KBD_KEY_ENTER);
-        else printf("usage: key <up|down|enter>\n");
+        if (s->qemu_firmware) {
+            if (strcmp(arg, "enter") == 0) uart_rx_push(s, '\r');
+            else if (strcmp(arg, "space") == 0) uart_rx_push(s, ' ');
+            else if (strcmp(arg, "escape") == 0) uart_rx_push(s, 0x1b);
+            else if (arg[0] != '\0' && arg[1] == '\0')
+                uart_rx_push(s, (uint8_t)arg[0]);
+            else
+                printf("usage: key <character|space|enter|escape>\n");
+        } else if (strcmp(arg, "up") == 0) {
+            kbd_push(s, GENERIC_KBD_KEY_UP);
+        } else if (strcmp(arg, "down") == 0) {
+            kbd_push(s, GENERIC_KBD_KEY_DOWN);
+        } else if (strcmp(arg, "enter") == 0) {
+            kbd_push(s, GENERIC_KBD_KEY_ENTER);
+        } else {
+            printf("usage: key <up|down|enter>\n");
+        }
         return;
     }
     if (txt && strncmp(txt, "peek ", 5) == 0) {
@@ -1625,6 +1720,28 @@ static void generic_custom_cmd(Ia64GenericState *s) {
             printf("peek 0x%" PRIx64 " = 0x%016" PRIx64 "\n", addr, v);
         } else {
             printf("peek: address out of range\n");
+        }
+        return;
+    }
+    if (txt && strncmp(txt, "poke1 ", 6) == 0) {
+        uint64_t addr, val;
+        if (sscanf(txt + 6, "%" SCNx64 " %" SCNx64, &addr, &val) == 2 &&
+            addr < s->ram_size) {
+            s->ram[addr] = (uint8_t)val;
+            printf("poke1 0x%" PRIx64 " = 0x%02x\n", addr, (unsigned)(uint8_t)val);
+        } else {
+            printf("poke1: bad args or address out of range\n");
+        }
+        return;
+    }
+    if (txt && strncmp(txt, "regpoke ", 8) == 0) {
+        unsigned reg;
+        uint64_t val;
+        if (sscanf(txt + 8, "%u %" SCNx64, &reg, &val) == 2 && reg < 128) {
+            merced_ia32_gr_write(s->cpu, reg, val);
+            printf("regpoke r%u = 0x%" PRIx64 "\n", reg, val);
+        } else {
+            printf("regpoke: bad args (usage: regpoke <regnum> <hexvalue>)\n");
         }
         return;
     }
@@ -1862,6 +1979,15 @@ void ia64_generic_destroy(Ia64GenericState *s) {
 void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
     (void)cfg;
     gemu_monitor_start(s->monitor);
+    /*
+     * The QEMU-compatible firmware advertises a 200 MHz ITC (20 ticks per
+     * 100 ns).  Tie that clock to elapsed machine time: an interpreter that
+     * advances ITC once per executed slot makes a five-second Windows delay
+     * take minutes on the host.  CPU-only tests retain their deterministic
+     * instruction clock because external mode is enabled only here.
+     */
+    merced_set_external_itc(s->cpu, s->qemu_firmware);
+    uint64_t itc_last_ns = generic_monotonic_ns();
 
     bool running = true;
     while (running) {
@@ -1914,6 +2040,20 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
         }
         if (!running)
             break;
+
+        if (s->qemu_firmware) {
+            uint64_t now_ns = generic_monotonic_ns();
+            if (gemu_monitor_is_paused(s->monitor) || s->halted) {
+                itc_last_ns = now_ns;
+            } else {
+                uint64_t ticks =
+                    (now_ns - itc_last_ns) / GENERIC_IA64_ITC_TICK_NS;
+                if (ticks != 0) {
+                    merced_advance_itc(s->cpu, ticks);
+                    itc_last_ns += ticks * GENERIC_IA64_ITC_TICK_NS;
+                }
+            }
+        }
 
         if (!gemu_monitor_is_paused(s->monitor) && !s->halted) {
             for (int i = 0; i < INSTR_PER_FRAME; i++) {
@@ -1984,11 +2124,8 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
                     else if (ev.keysym == 0xFF09)   cp = '\t';
                     else if (ev.keysym == 0xFF1B)   cp = 0x1b;
                     else if (ev.keysym == 0xFFFF)   cp = 0x7f;
-                    if (cp) {
-                        uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
-                        if (next != s->uart_rx_head)
-                            s->uart_rx[s->uart_rx_tail++] = (uint8_t)cp;
-                    }
+                    if (cp)
+                        uart_rx_push(s, (uint8_t)cp);
                 }
             }
         }

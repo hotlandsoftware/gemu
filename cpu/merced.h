@@ -45,8 +45,8 @@
  * counts).  PAL_VM_SUMMARY reports these, and an OS installs pinned
  * translations at the slot numbers it reads back from there - so a symmetric
  * guess here makes a guest's DTR 20 land on some other slot entirely. */
-#define MERCED_N_ITR      8
-#define MERCED_N_DTR      48
+#define MERCED_N_ITR      64
+#define MERCED_N_DTR      64
 #define MERCED_N_TR       MERCED_N_DTR   /* legacy alias: the larger file */
 #define MERCED_N_TC       512  /* per side; amortize software VHPT refills */
 #define MERCED_TRACE_HISTORY 512
@@ -94,6 +94,7 @@ typedef struct {
     uint32_t rid;
     uint8_t  ps;                /* page size (log2) */
     uint8_t  valid;
+    uint8_t  pending_purge;     /* visible until the matching srlz completes */
     uint64_t itir, pte;         /* raw insert values, for debugging */
 } MercedTlbEntry;
 
@@ -103,6 +104,9 @@ typedef struct Merced {
     /* --- architectural state --- */
     uint64_t ip;                        /* bundle address | slot (0-2) */
     uint64_t psr;
+    /* An IC transition is not visible to nested-TLB classification until
+     * the following data serialization operation completes. */
+    uint8_t psr_ic_inflight;
     uint64_t cfm;
     uint64_t pr;                        /* 64 predicate bits, pr0 forced 1 */
 
@@ -127,7 +131,24 @@ typedef struct Merced {
     uint64_t rse_anchor_addr;
     int64_t  rse_anchor_regs;
     int64_t  rse_flushed_regs;
-
+    /*
+     * The implementation models the RSE's dirty/clean/invalid partitions
+     * with a compact circular register file.  A real interruption protects
+     * the interrupted partition while its handler executes cover/flushrs
+     * and may switch BSPSTORE.  Preserve that implementation-private state
+     * until the matching rfi; architectural CR/AR state remains guest-owned.
+     */
+    struct {
+        uint64_t iip, ipsr;
+        uint64_t gr_stack[MERCED_RSE_CAPACITY];
+        uint8_t  nat_stack[MERCED_RSE_CAPACITY];
+        uint32_t bof;
+        uint64_t bof_total;
+        uint64_t anchor_addr;
+        int64_t  anchor_regs;
+        int64_t  flushed_regs;
+    } interruption_rse[4];
+    uint8_t interruption_rse_depth;
     MercedFpReg fr[MERCED_N_FR];
     uint64_t br[MERCED_N_BR];
     uint64_t ar[MERCED_N_AR];
@@ -169,12 +190,20 @@ typedef struct Merced {
     uint8_t  timer_pending;
     uint8_t  external_pending;
     uint8_t  external_vector;
+    uint8_t  external_itc;
 
     /* --- bookkeeping --- */
     uint8_t  taken;       /* set when the executed slot redirected IP */
+    uint8_t  group_start; /* true if the next slot begins a new instruction
+                            * group (stop bit, or a taken branch, precedes
+                            * it) - alloc/cover validate against this */
+    uint8_t  slot_stop_after; /* scratch: does the slot about to execute have
+                                * a stop bit immediately after it (per its
+                                * bundle template) - cover validates this */
     uint64_t trace_n;     /* stderr-trace this many slots (debug) */
     struct {
-        uint64_t ip, raw, src2, src3, r25, b0;
+        uint64_t ip, raw, src2, src3, r8, r25, r32, r33, r34, r35, r36;
+        uint64_t b0, pr;
         uint8_t unit, qp;
     } trace_history[MERCED_TRACE_HISTORY];
     uint32_t trace_history_next;
@@ -185,6 +214,7 @@ typedef struct Merced {
     uint32_t call_history_next;
     uint64_t ninsts;
     uint64_t nfaults;
+    uint64_t last_successful_bundle;
     char     halt_msg[256];
     uint64_t halt_ip;
 
@@ -220,6 +250,10 @@ typedef struct Merced {
 Merced *merced_create(const MercedBus *bus);
 void    merced_destroy(Merced *m);
 void    merced_reset(Merced *m);
+/* Select a machine-supplied ITC clock.  The default remains one tick per
+ * interpreted slot for deterministic tests and standalone CPU users. */
+void    merced_set_external_itc(Merced *m, bool enabled);
+void    merced_advance_itc(Merced *m, uint64_t ticks);
 
 /* Overrides the stepping Windows/firmware sees in cpuid[3]'s revision
  * field (bits 15:8). Takes effect immediately and persists across

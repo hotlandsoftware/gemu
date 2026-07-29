@@ -133,7 +133,7 @@ def run_microprogram(text: str):
                     state[k] = int(v, 16)
                 except ValueError:
                     state[k] = v
-    return state
+    return state, out
 
 
 def compare(expected: dict, actual: dict):
@@ -147,6 +147,24 @@ def compare(expected: dict, actual: dict):
             unsupported.append(key)
             continue
         if key == "ip":
+            # The reference's require_uncollected_reserved_field cases set
+            # "ip" to the same address as "fault_ip": that reference harness
+            # observes the raw exception at helper_raise_exception() (which
+            # sets env->ip = fault_ip directly) rather than after a full
+            # architectural fault delivery. Our microprogram harness runs a
+            # real CPU that *does* complete fault delivery (vectoring to
+            # iva+vector, per ia64_translation_insert_fields_valid()'s own
+            # vector table), so the guest-visible ip legitimately moves on.
+            # cr.iip is what stays pinned at the faulting instruction's
+            # address in both models, so that is the correct field to check
+            # for this expectation instead of the final running ip.
+            if expected.get("fault_ip") == want:
+                got = actual.get("iip")
+                if got is None:
+                    unsupported.append(key)
+                elif (got & ~0xF) != (want & ~0xF):
+                    mismatches.append((key, want, got))
+                continue
             got = actual.get("ip", 0) & ~0xF
             if got != (want & ~0xF):
                 mismatches.append((key, want, got))
@@ -223,11 +241,11 @@ def main() -> int:
         else:
             terminal = exp.get("ip")
         text = render(bundles, entry, terminal, memory, encoding)
-        actual = run_microprogram(text)
+        actual, output = run_microprogram(text)
         captured[name] = dict(expected=dict(expected or {}), actual=actual)
         # Run here rather than in the caller so the handful of cases that
         # assert on the result in Python get a real one back.
-        return RunResult(actual, text)
+        return RunResult(actual, output)
     encoding.run_program = capture
 
     if args.group and args.group != "all":
@@ -262,6 +280,8 @@ def main() -> int:
                     print(f"ERROR  {name}: {exc}")
                 continue
             body_error = exc
+            if args.verbose:
+                print(f"ASSERT {name}: {exc}")
         for cname, c in captured.items():
             ran += 1
             actual = c["actual"]

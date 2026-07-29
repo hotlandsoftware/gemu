@@ -100,6 +100,25 @@ static void emit_state(const Merced *m, const char *stop_reason) {
     for (unsigned a = 0; a < 128; a++)
         if (m->ar[a])
             printf("IA64TEST ar%u=%" PRIX64 "\n", a, m->ar[a]);
+    /*
+     * A few reference cases inspect the translation-cache dump directly
+     * instead of expressing the expected entry as a register value.  Keep
+     * this compatible with QEMU's `info registers` spelling.
+     */
+    for (unsigned i = 0; i < MERCED_N_TC; i++) {
+        const MercedTlbEntry *e = &m->dtc[i];
+        if (!e->valid)
+            continue;
+        unsigned ar = (unsigned)((e->pte >> 9) & 7);
+        unsigned pl = (unsigned)((e->pte >> 7) & 3);
+        unsigned perm = (e->pte & 1) ? ar : 0;
+        printf("DTLB[%u] TC va=0x%016" PRIx64
+               " pa=0x%016" PRIx64 " ps=0x%016x"
+               " rid=0x%06" PRIx32 " key=0x000000"
+               " ar=%u pl=%u perm=0x%x pte=0x%016" PRIx64 "\n",
+               i, e->va_start, e->pfn_base, e->ps, e->rid,
+               ar, pl, perm, e->pte);
+    }
 }
 
 int ia64_selftest_main(const char *path) {
@@ -147,6 +166,16 @@ int ia64_selftest_main(const char *path) {
     /* merced_reset() leaves the core at the architected reset vector in
      * physical mode; the cases want to start at their own entry instead. */
     m->ip = entry;
+    /* merced_reset() also sets cfm.sof=96 ("whole stacked file addressable")
+     * as a deliberate, non-architectural convenience so real firmware can
+     * touch r32+ before its first alloc. The conformance suite is written
+     * against true architectural reset state (cfm=0: no stacked registers
+     * allocated until software calls alloc), so undo that convenience here -
+     * this only affects -microprogram runs, not real machine boot. */
+    m->cfm = 0;
+    /* Keep the architected PALE_RESET PSR.  Individual conformance programs
+     * enable IC explicitly when they require collected interruption state;
+     * forcing it here destroys tests of 0->1 in-flight IC transitions. */
 
     const char *reason = "maxinsts";
     for (uint64_t i = 0; i < maxinsts; i++) {

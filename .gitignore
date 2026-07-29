@@ -8,3 +8,5 @@ reference/
 snapshots/
 .claude/
 tools/*.pyc
+*.bin
+*.dis
