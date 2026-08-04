@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="altair2" family="rca" description="Cidelsa Altair II"
+<machine name="altair2" family="rca" description="Cidelsa Altair II (1981)"
          alias="destroyer" tv="pal">
     <rom name="alta2-2716.ic7"  addr="0x0000" sha256="e103b4f3171ae4f945d4663cce841d4ef8bf247c10fa636d59e7ef65287d1e46"/>
     <rom name="alta2-2716.ic8"  addr="0x0800" sha256="1c1ad37bcca3a250e0f4d50e23eb4b8cf8e6ba7954b5cfa1ff59e5a27f0204a3"/>

@@ -6,7 +6,7 @@
 /*
  * NES/RP2C02 composite (NTSC) encoder.
  *
- * Converts the PPU's raw per-dot hue+luma buffer (vga/rp2c02.h's
+ * Converts the PPU's raw per-dot hue+luma buffer (vga/mos/rp2c02.h's
  * Rp2c02.pixels[] — NOT pixels_argb, which is already lossy RGB) into an
  * oversampled composite signal ready for crt/ntsc_decode.h. Each pixels[]
  * byte is the same 6-bit value (hue in bits 0-3, luma tier in bits 4-5)

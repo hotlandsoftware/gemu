@@ -253,7 +253,7 @@ static uint32_t near_target(X86 *x, int32_t rel) {
  * real VGA registers/memory the rest of this file already talks to.
  *
  * VGA ports live behind the generic machine's own MMIO window
- * (GENERIC_VGA_IO_BASE in hardware/generic.h) rather than the standard
+ * (GENERIC_VGA_IO_BASE in hardware/ia64/generic.h) rather than the standard
  * IA-64 sparse I/O port space x86 in/out normally routes through - this
  * shim reads/writes them (and the BDA/text VRAM, both addressed exactly
  * like the existing int/iret code already addresses the real-mode IVT:

@@ -4,6 +4,7 @@ roms/
 .ninja_deps
 .ninja_log
 build.ninja*.log
+build.ninja
 reference/
 snapshots/
 .claude/

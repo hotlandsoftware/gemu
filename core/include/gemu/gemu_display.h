@@ -91,6 +91,8 @@ typedef struct {
     int                  n_actions;
     const char          *ini_section; /* gemu.ini section, e.g. "nes-controller" */
     bool                 no_rebind;   /* show menu but hide the Input/rebind page */
+    bool                 no_menu;     /* Tab never opens the InputMenu at all
+                                        * (machine XML's menu="disabled") */
 
     /* Optional per-device pages; NULL means all actions on one page (ini_section). */
     const GemuInputPage *pages;

@@ -1,6 +1,6 @@
 #pragma once
-/* Two independent implementations share this API: vga/hex_editor.c (GTK,
- * used when GEMU_GTK) and vga/hex_editor_win32.c (plain Win32, used when
+/* Two independent implementations share this API: hardware/device/hex_editor.c (GTK,
+ * used when GEMU_GTK) and hardware/device/hex_editor_win32.c (plain Win32, used when
  * _WIN32 && !GEMU_GTK). Exactly one is compiled into any given build. */
 #if defined(GEMU_GTK) || defined(_WIN32)
 #include <stdint.h>

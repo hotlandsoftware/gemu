@@ -9,7 +9,7 @@
  * ppu2c0x_device, reusing its register/scanline/vblank timing wholesale, but
  * replacing the background/sprite pixel pipeline).
  *
- * Differences from a plain NES RP2C02 (vga/rp2c02.c), all verified against
+ * Differences from a plain NES RP2C02 (vga/mos/rp2c02.c), all verified against
  * the MAME source:
  *   - No separate CHR ROM/mapper: the PPU owns a flat, CPU-writable 64 KB
  *     VRAM (populated via PPUDATA writes or the machine's DMA controller -
@@ -44,7 +44,7 @@
 #define SH6578_PALETTE_SIZE 0x40
 
 /* $2000 PPUCTRL / $2001 PPUMASK / $2002 PPUSTATUS bit layouts are numerically
- * identical to standard NES - see vga/rp2c02.h's PPUCTRL_, PPUMASK_ and
+ * identical to standard NES - see vga/mos/rp2c02.h's PPUCTRL_, PPUMASK_ and
  * PPUSTAT_ bit-value macros, which ppu_sh6578.c reuses directly (along with
  * the 64-colour NTSC palette table, since this chip's palette RAM holds
  * plain indices into that very same master palette). */
@@ -108,5 +108,5 @@ void    ppu_sh6578_oam_dma(Sh6578Ppu *ppu, const uint8_t *bytes256);
 
 /* Advance the PPU by one CPU cycle. Sets ppu->dirty when a frame completes
  * and ppu->nmi_pending when VBlank NMI should fire (caller must clear both
- * after acting on them, matching the vga/rp2c02.c convention). */
+ * after acting on them, matching the vga/mos/rp2c02.c convention). */
 void    ppu_sh6578_tick(Sh6578Ppu *ppu);

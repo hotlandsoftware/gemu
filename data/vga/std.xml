@@ -1,0 +1,3 @@
+<?xml version="1.0"?>
+<vga name="std" description="Standard VGA" 
+    requires="ia64" status="working"/>

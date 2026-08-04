@@ -17,7 +17,7 @@
 #define NES_LUA_MEM_HOOK_MAX 64
 
 /* NES controller shift-register bit order (hardware fact, not a GEMU
- * internal detail - kept in sync with NES_BTN_* in hardware/nes.h). */
+ * internal detail - kept in sync with NES_BTN_* in hardware/mos/nes.h). */
 static const char   *joy_btn_names[8] = {
     "A", "B", "select", "start", "up", "down", "left", "right",
 };

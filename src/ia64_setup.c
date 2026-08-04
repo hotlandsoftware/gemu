@@ -20,11 +20,12 @@ typedef struct {
     const char *tv;
     const char *ram;
     const char *devices;
+    const char *menu;
 } MachineDef;
 
 static const MachineDef machine_defs[] = {
 #include "generated/machine_defaults.inc"
-    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
+    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
 /* src/ia64_selftest.c - architectural microprogram conformance harness. */
@@ -38,12 +39,18 @@ static const GemuDevDesc cpus[] = {
     { "merced",   "Intel Itanium (Merced) [preliminary]" },
 };
 
+static const GemuDevDesc vgas[] = {
+#include "generated/vgas_ia64.inc"
+};
+
 static const GemuArgsDef def = {
     .prog         = "gemu",
     .machines     = machines,
     .n_machines   = (int)(sizeof machines / sizeof *machines),
     .cpus         = cpus,
     .n_cpus       = (int)(sizeof cpus / sizeof *cpus),
+    .vgas         = vgas,
+    .n_vgas       = (int)(sizeof vgas / sizeof *vgas),
     .display_mask = GEMU_DISP_F(GEMU_DISPLAY_SDL) | GEMU_DISP_F(GEMU_DISPLAY_NONE)
 #ifdef GEMU_GTK
                   | GEMU_DISP_F(GEMU_DISPLAY_GTK)
@@ -151,6 +158,18 @@ int ia64_setup(int argc, char *argv[]) {
         }
     }
 
+    /* Re-resolved by alias (not the -M lookup above) so the legacy
+     * gemu-ia64 argv[0] entry point, which never sets args.machine and
+     * falls back to the hardcoded "i2000" alias, still picks up i2000's
+     * menu="disabled" default. */
+    for (int i = 0; machine_defs[i].name; i++) {
+        if (strcmp(alias, machine_defs[i].canonical) == 0) {
+            cfg.menu_disabled = machine_defs[i].menu &&
+                                 strcmp(machine_defs[i].menu, "disabled") == 0;
+            break;
+        }
+    }
+
     if (args.cpu && strcmp(args.cpu, "merced") != 0 &&
         strcmp(args.cpu, "mckinley") != 0) {
         fprintf(stderr, "gemu: unknown ia64 CPU '%s' (use -cpu ? to list)\n", args.cpu);
@@ -197,7 +216,7 @@ int ia64_setup(int argc, char *argv[]) {
     cfg.display_scale = args.display_scale;
     cfg.no_shutdown = args.no_shutdown;
 
-    if (serial_spec && strcmp(alias, "generic") != 0) {
+    if (serial_spec && strcmp(alias, "generic-ia64") != 0) {
         fprintf(stderr, "gemu: -serial is only supported by the generic machine\n");
         return 1;
     }
@@ -208,7 +227,7 @@ int ia64_setup(int argc, char *argv[]) {
         return 1;
     }
 
-    if (strcmp(alias, "generic") == 0) {
+    if (strcmp(alias, "generic-ia64") == 0) {
         GenericConfig gcfg = {
             .ram_size = cfg.ram_size,
             .display_type = cfg.display_type,
@@ -219,6 +238,7 @@ int ia64_setup(int argc, char *argv[]) {
             .cpu = args.cpu,
             .serial_spec = serial_spec,
             .vnc_addr = args.vnc_addr,
+            .menu_disabled = cfg.menu_disabled,
         };
         Ia64GenericState *g = ia64_generic_create(&gcfg);
         if (!g)

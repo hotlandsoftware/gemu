@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="5clown" family="mos" description="Five Clown (IGS, 1993)"
+<machine name="5clown" family="mos" description="Five Clown (1993)"
          cpu="6502" soundhw="ay8910,msm6295" status="working">
     <rom name="4.u2"           region="prg"      addr="0x0000" sha256="aff03c77882515ffe59c05d250efe641882cc35646f4bd705ba8acc581f792d2"/>
     <rom name="7.u34"          region="gfxbanks" addr="0x0000" sha256="b1c3d4d6626ff8992e36b80503336f50d66ddb1fabac2e74669212c82b3bebbb"/>

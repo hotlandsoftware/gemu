@@ -63,6 +63,7 @@ typedef struct {
     GemuDisplayType display_type;
     int             display_scale;
     bool            no_shutdown;
+    bool            menu_disabled; /* machine XML's menu="disabled" */
 } Ia64Config;
 
 typedef struct Ia64I2000State Ia64I2000State;

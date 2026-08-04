@@ -370,7 +370,7 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
     /* Combined gfx blob is gfx[0x0000:0x2000]=gfx2, [0x2000:0x4000]=gfx1,
      * [0x4000:0x6000]=gfx0 (per ROM_LOAD order in the driver). Only specific
      * 2KB slices of each file actually feed the tile/char decoders - this
-     * is a verified real-hardware quirk (see hardware/magicfly.h), not a
+     * is a verified real-hardware quirk (see hardware/mos/magicfly.h), not a
      * bug, and is identical between Magic Fly and 7 e Mezzo:
      *   gfxbnk0 (chars, 1bpp)   = gfx[0x1800:0x2000] = gfx2[0x1800:0x2000]
      *   gfxbnk1 plane0 (tiles)  = gfx[0x1000:0x1800] = gfx2[0x1000:0x1800]

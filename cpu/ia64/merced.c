@@ -2931,7 +2931,7 @@ static uint64_t vhpt_load_u64(Merced *m, uint64_t pa) {
 static uint64_t dbg_vhpt_calls, dbg_vhpt_disabled, dbg_vhpt_hit,
                 dbg_vhpt_unmapped, dbg_vhpt_tagfail, dbg_vhpt_np;
 
-/* Temporary diagnostic accessor (see machine_generic.c's "vhptstats"
+/* Temporary diagnostic accessor (see machine_generic_ia64.c's "vhptstats"
  * monitor command) for measuring how often the hardware VHPT walk above
  * actually resolves a miss vs. falling back to the software path - remove
  * both once that question is answered. */

@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="apple1" family="mos" description="Apple I"
+<machine name="apple1" family="mos" description="Apple I (1976)"
          cpu="6502" chargen="auto" tv="ntsc" ram="8K">
     <device name="a1ci"/>
     <rom name="apple-a1.a1" region="video-prom" addr="0x0000" sha256="58865000ea5f2e36ec926498b0a3f2a050a4243f44c07a2aa6689d410471cfc1"/>

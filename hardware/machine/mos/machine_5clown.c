@@ -358,7 +358,7 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
     }
 
     /* Decrypt main program (whole-byte XOR) then split into the CPU's two
-     * visible ROM windows - see hardware/5clown.h for the layout. */
+     * visible ROM windows - see hardware/mos/5clown.h for the layout. */
     for (int i = 0; i < 0x8000; i++) prg_raw[i] = (uint8_t)(prg_raw[i] ^ 0x20);
     s->prg = malloc(0x8000);
     memcpy(s->prg,          prg_raw,          0x6000); /* -> $2000-$7FFF */

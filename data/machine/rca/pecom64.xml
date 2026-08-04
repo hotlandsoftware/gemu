@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="pecom64" family="rca" description="Pecom 64 (alias for pecom32)"
+<machine name="pecom64" family="rca" description="Pecom 64 (1985) (alias for pecom32)"
          alias="pecom32" tv="pal">
     <rom name="rom_1_g_24.02.88_l.bin"  addr="0x0000" sha256="c482015b19328c20d2f848aa8766a3215b01f7a531f1e02c4a59633fb3200438"/>
     <rom name="rom_2_g_24.02.88_d.bin"  addr="0x4000" sha256="ff253c34a0e26e00c335ec44c16813535700cadd19d404c59dfc2d77c0b62dc1"/>

@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <machine name="i2000" family="ia64" description="HP i2000 (2001)"
-        cpu="merced" ram="2G" status="preliminary">
+        cpu="merced" ram="2G" status="preliminary" menu="disabled">
     <rom name="EFI 0.99 Debug SDV.bin"  addr="0x0000" sha256="3a2ab2ecfd1b700ab6328fbc13c2b3d37111b1f1fdda17544dd1374c52aa5983"/>
     <rom name="Unknown Ver EFI.bin"  addr="0x0000" sha256="0dded5eeffc1c717891b22204dd192ae44006f1c46208bc7ffdeed5bfb759c64"/>
     <rom name="bios130.BIN"  addr="0x0000" sha256="d2675a1478b6f18b1b5b53719a305e6db63f2b937bdf808c4d1e45594cf005a3"/>

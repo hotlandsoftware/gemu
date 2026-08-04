@@ -29,11 +29,12 @@ typedef struct {
     const char *tv;
     const char *ram;
     const char *devices;
+    const char *menu;
 } MachineDef;
 
 static const MachineDef machine_defs[] = {
 #include "generated/machine_defaults.inc"
-    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
+    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
 static bool parse_machine_feature_opts(MosConfig *cfg, const char *opts) {

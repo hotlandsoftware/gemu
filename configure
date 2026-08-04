@@ -44,39 +44,39 @@ CORE_SRC_GTK = [
 
 FAMILY_SRC = {
     'chip8': [
-        'cpu/chip8_cpu.c', 'cpu/octo.c',
-        'hardware/machine/machine_chip8.c',
-        'vga/input_menu.c',
+        'cpu/chip8/chip8_cpu.c', 'cpu/chip8/octo.c',
+        'hardware/machine/chip8/machine_chip8.c',
+        'vga/multi/input_menu.c',
         'src/chip8_setup.c',
     ],
     'ia64': [
-        'cpu/merced.c',
-        'cpu/merced_ia32.c',
-        'hardware/machine/machine_i2000.c',
-        'hardware/machine/machine_generic.c',
+        'cpu/ia64/merced.c',
+        'cpu/ia64/merced_ia32.c',
+        'hardware/machine/ia64/machine_i2000.c',
+        'hardware/machine/ia64/machine_generic_ia64.c',
         'hardware/romdb.c',
-        'vga/input_menu.c',
-        'vga/vga_ibm.c',
-        'vga/vgafont16.c',
-        'vga/vgabios_rom.c',
+        'vga/multi/input_menu.c',
+        'vga/multi/vga_ibm.c',
+        'vga/multi/vgafont16.c',
+        'vga/multi/vgabios_rom.c',
         'src/ia64_setup.c',
         'src/ia64_selftest.c',
     ],
     'mitsu': [
-        'hardware/machine/machine_tvgame6.c',
+        'hardware/machine/other/machine_tvgame6.c',
         'src/mitsu_setup.c',
     ],
     'mos': [
-        'cpu/mos6502.c',
-        'vga/rp2c02.c', 'vga/ppu_sh6578.c', 'vga/input_menu.c',
+        'cpu/mos/mos6502.c',
+        'vga/mos/rp2c02.c', 'vga/mos/ppu_sh6578.c', 'vga/multi/input_menu.c',
         'audio/apu2a03.c', 'audio/okim6295.c',
-        'hardware/machine/machine_mos.c', 'hardware/machine/machine_apple1.c',
-        'hardware/machine/machine_nes.c', 'hardware/machine/machine_kim1.c',
-        'hardware/machine/machine_5clown.c', 'hardware/device/pia6821.c',
-        'hardware/machine/machine_magicfly.c',
-        'hardware/machine/machine_um6578.c',
-        'hardware/machine/machine_atari400.c',
-        'vga/antic.c', 'audio/pokey.c',
+        'hardware/machine/mos/machine_mos.c', 'hardware/machine/mos/machine_apple1.c',
+        'hardware/machine/mos/machine_nes.c', 'hardware/machine/mos/machine_kim1.c',
+        'hardware/machine/mos/machine_5clown.c', 'hardware/device/pia6821.c',
+        'hardware/machine/mos/machine_magicfly.c',
+        'hardware/machine/mos/machine_um6578.c',
+        'hardware/machine/mos/machine_atari400.c',
+        'vga/mos/antic.c', 'audio/pokey.c',
         'crt/ntsc_decode.c', 'crt/nes_ntsc_encode.c', 'crt/crt_tube.c',
         'hardware/device/fds.c', 'hardware/device/fds_hle.c',
         'hardware/device/vt100.c', 'hardware/romdb.c',
@@ -84,22 +84,22 @@ FAMILY_SRC = {
         # #if defined(_WIN32) && !defined(GEMU_GTK), so it compiles to an
         # empty translation unit everywhere else (Linux, or --enable-gtk
         # on Windows, which still uses the GTK implementation instead).
-        'vga/hex_editor_win32.c',
+        'hardware/device/hex_editor_win32.c',
         'src/mos_setup.c',
     ],
     'rca': [
-        'cpu/cdp1802.c',
-        'vga/cdp1861.c', 'vga/cdp1869.c', 'vga/input_menu.c',
+        'cpu/rca/cdp1802.c',
+        'vga/rca/cdp1861.c', 'vga/rca/cdp1869.c', 'vga/multi/input_menu.c',
         'audio/pcspk.c',
-        'hardware/machine/machine_vip.c', 'hardware/machine/machine_destroyer.c',
-        'hardware/machine/machine_studio2.c', 'hardware/machine/machine_pecom.c',
+        'hardware/machine/rca/machine_vip.c', 'hardware/machine/rca/machine_destroyer.c',
+        'hardware/machine/rca/machine_studio2.c', 'hardware/machine/rca/machine_pecom.c',
         'hardware/device/rca_keyboard.c', 'hardware/device/tape.c', 'hardware/romdb.c',
         'src/rca_setup.c',
     ],
 }
 
 FAMILY_SRC_GTK = {
-    'mos': ['vga/hex_editor.c'],
+    'mos': ['hardware/device/hex_editor.c'],
 }
 
 FAMILY_SRC_ALSA = {
@@ -178,6 +178,9 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         name   = root.get('name')
         family = root.get('family')
         desc   = root.get('description', '')
+        menu   = root.get('menu', '')
+        if menu and menu != 'disabled':
+            die(f"{path}: invalid menu '{menu}' (expected 'disabled')")
         roms   = [{'name': r.get('name'), 'region': r.get('region', ''),
                    'addr': int(r.get('addr', '0'), 16),
                    'sha256': r.get('sha256', '')}
@@ -197,6 +200,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             'tv':     root.get('tv',     ''),
             'ram':    root.get('ram',    ''),
             'devices': ','.join(devices),
+            'menu':   menu,
             'status': status,
         })
         machine_family[name] = family
@@ -252,7 +256,8 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
             f'    {{ "{m["name"]}", "{m["canonical"]}", '
             f'{cstr(m["cpu"])}, {cstr(m["vga"])}, '
             f'{cstr(m["soundhw"])}, {cstr(m["chargen"])}, '
-            f'"{tv}", {cstr(m["ram"])}, {cstr(m["devices"])} }},\n'
+            f'"{tv}", {cstr(m["ram"])}, {cstr(m["devices"])}, '
+            f'{cstr(m["menu"])} }},\n'
         )
     with open(os.path.join(gen_dir, 'machine_defaults.inc'), 'w', encoding='utf-8') as f:
         f.writelines(dlines)
@@ -567,6 +572,13 @@ def main():
     # All sources share a single unified include path - no per-family separation.
     inc_dirs = ['core/include', 'cpu', 'vga', 'audio', 'crt',
                 'hardware', 'hardware/machine', 'hardware/device',
+                'hardware/chip8', 'hardware/ia64', 'hardware/mos',
+                'hardware/other', 'hardware/rca',
+                'hardware/machine/chip8', 'hardware/machine/ia64',
+                'hardware/machine/mos', 'hardware/machine/other',
+                'hardware/machine/rca',
+                'vga/ia64', 'vga/mos', 'vga/rca', 'vga/multi',
+                'cpu/chip8', 'cpu/ia64', 'cpu/mos', 'cpu/rca',
                 'src', build_dir]
     inc_flags = ' '.join(f'-I{d}' for d in inc_dirs)
 
@@ -615,7 +627,7 @@ def main():
         if have_winmidi:
             ld_parts += ['-lwinmm']
         if 'mos' in targets and not want_gtk:
-            # Native Win32 hex editor (vga/hex_editor_win32.c): tab control
+            # Native Win32 hex editor (hardware/device/hex_editor_win32.c): tab control
             # + SetWindowSubclass need comctl32, and the GDI text/bitmap
             # calls need gdi32 - neither is in MinGW's default link set
             # (user32, pulled in by the existing SDL File-menu code, is).

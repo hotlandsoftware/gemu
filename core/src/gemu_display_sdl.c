@@ -550,8 +550,9 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
 
     /* InputMenu: create whenever ini_section is set so Tab always opens a menu
      * (at minimum: Reset / Close Menu / Quit).  When no_rebind is set or there
-     * are no rebindable actions, pass 0 buttons so the Input page is hidden. */
-    if (cfg->ini_section) {
+     * are no rebindable actions, pass 0 buttons so the Input page is hidden.
+     * no_menu suppresses this entirely - Tab does nothing. */
+    if (cfg->ini_section && !cfg->no_menu) {
         int nb = (cfg->no_rebind || !cfg->actions || cfg->n_actions <= 0)
                  ? 0 : cfg->n_actions;
         SDL_Keycode *defaults = nb ? calloc((size_t)nb, sizeof(SDL_Keycode)) : NULL;

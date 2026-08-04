@@ -6,12 +6,12 @@
 #include "apu2a03.h"
 #include "gemu/gemu_display.h"
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
-#  include "../audio/apu_midi.h"
+#  include "apu_midi.h"
 #endif
 #include "gemu/vnc.h"
 #include "gemu/monitor.h"
 #if defined(GEMU_GTK) || defined(_WIN32)
-#  include "../vga/hex_editor.h"
+#  include "hex_editor.h"
 #endif
 #ifdef HAVE_ROB
 #  include "rob.h"

@@ -99,7 +99,7 @@
 #define GENERIC_LEGACY_IO_BASE 0x000000800010000000ull
 /* Real IA-64 HAL never addresses this window with a plain linear port
  * offset - it uses the architectural "sparse I/O space" encoding (see
- * sparse_io_decode() in machine_generic.c), which needs ~4 bytes of
+ * sparse_io_decode() in machine_generic_ia64.c), which needs ~4 bytes of
  * address space per port bit rather than 1. Sized to comfortably cover
  * every port we implement (COM1, ATAPI, PCI config) once sparse-encoded,
  * matching reference/qemu-system-ia64's IA64_PCI_IO_SIZE convention. */
@@ -119,7 +119,7 @@
 
 /* CD-ROM controller: sector-at-a-time raw block access, plus a
  * file-by-path interface for the embedded El Torito EFI boot image
- * (see cdrom_open_file() in machine_generic.c - it's a FAT12 floppy
+ * (see cdrom_open_file() in machine_generic_ia64.c - it's a FAT12 floppy
  * image, standard for Microsoft's IA-64 EFI install media of this era;
  * ISO 9660 + El Torito + FAT12 parsing all happen host-side in C, same
  * "our own firmware is the only client" reasoning as the rest of this
@@ -157,7 +157,7 @@
  * placement, not disk access, but it's the same kind of file-format
  * mechanics as the FAT12 work above, and far more reliable done once in
  * tested C than as a hand-unrolled assembly loop (see the whole point of
- * this device's design in the block comment above hardware/generic.h).
+ * this device's design in the block comment above hardware/ia64/generic.h).
  * The result of the last READ/OPEN/chunk-read is memory-mapped
  * read-only at GENERIC_CDROM_BUF_BASE. */
 /* Hard disk: a raw, read-write image in 512-byte sectors (create one with
@@ -220,6 +220,7 @@ typedef struct {
      * `screendump` command for visual feedback instead. NULL = no VNC
      * server. Format: "host:display" or ":display" (port = 5900+display). */
     const char     *vnc_addr;
+    bool            menu_disabled; /* machine XML's menu="disabled" */
 } GenericConfig;
 
 typedef struct Ia64GenericState Ia64GenericState;

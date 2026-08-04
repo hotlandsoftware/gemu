@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="vssmb" family="mos" description="VS. Super Mario Bros. (arcade)"
+<machine name="vssmb" family="mos" description="VS. Super Mario Bros. (1986) (arcade)"
          alias="nes" vga="rp2c04-0004" soundhw="2a03" tv="vs" status="working">
     <!-- MAME suprmrio layout: offsets are relative to the named ROM region.
          PRG region offset 0 maps to CPU $8000. -->

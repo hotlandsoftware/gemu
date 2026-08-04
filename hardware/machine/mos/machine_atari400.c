@@ -1,5 +1,5 @@
 /*
- * Atari 400 machine - see hardware/atari400.h for the memory map and the
+ * Atari 400 machine - see hardware/mos/atari400.h for the memory map and the
  * modelling scope of each chip.
  */
 #include "atari400.h"

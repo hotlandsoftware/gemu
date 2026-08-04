@@ -5,7 +5,7 @@
 #include "gemu/util.h"
 #include "wozmon_rom.h"
 #if defined(GEMU_GTK) || defined(_WIN32)
-#  include "../vga/hex_editor.h"
+#  include "hex_editor.h"
 #endif
 #include <SDL2/SDL.h>
 #include <errno.h>

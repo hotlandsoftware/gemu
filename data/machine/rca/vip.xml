@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="vip" family="rca" description="RCA COSMAC VIP"
+<machine name="vip" family="rca" description="RCA COSMAC VIP (1977)"
          cpu="cdp1802" vga="cdp1861" soundhw="pcspk" tv="ntsc" ram="4K">
     <rom name="fpb_color.bin" addr="0x0000" sha256="292dd825ca0ed779e78d55fbab81c898be84ade5f87a661cae9d4509f9df62b8"/>
     <rom name="vip.32.rom"    addr="0x0400" sha256="2fd9b152573adfe1c13f7f4c76900efd6980836a8dc52f6bc59c1af784ce6024"/>

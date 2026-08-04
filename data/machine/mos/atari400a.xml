@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="atari400a" family="mos" description="Atari 400 (OS rev A) (alias for atari400)"
+<machine name="atari400a" family="mos" description="Atari 400 (1979) (OS rev A) (alias for atari400)"
          alias="atari400" tv="ntsc" ram="48K" status="imperfect">
     <device name="keyboard"/>
     <device name="atari810"/>

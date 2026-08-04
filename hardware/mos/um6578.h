@@ -16,7 +16,7 @@
  * Plug'N'Play, TimeTop, etc). Reference: MAME src/mame/nintendo/nes_sh6578.cpp.
  *
  * Single real M6502 (full decimal mode, unlike the NES's decimal-less
- * 2A03), a bespoke PPU (vga/ppu_sh6578.c - see that file for how its video
+ * 2A03), a bespoke PPU (vga/mos/ppu_sh6578.c - see that file for how its video
  * differs from a plain NES PPU), the NES's own 2A03 APU reused verbatim for
  * sound, an 8-bank (4 KB each) ROM windowing scheme addressing up to 1 MB
  * (2 MB on some titles, selected by a coarse half-select bank not modelled

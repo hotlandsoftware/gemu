@@ -1,3 +1,3 @@
 <?xml version="1.0"?>
-<machine name="dendy" family="mos" description="Dendy NES Famiclone (PAL 50 Hz, NTSC PPU timing)"
+<machine name="dendy" family="mos" description="Dendy NES Famiclone (1992)"
          alias="nes" tv="dendy" status="working"/>

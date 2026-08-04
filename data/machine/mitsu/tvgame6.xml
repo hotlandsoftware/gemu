@@ -1,3 +1,3 @@
 <?xml version="1.0"?>
-<machine name="tvgame6" family="mitsu" description="Nintendo Color TV-Game 6"
+<machine name="tvgame6" family="mitsu" description="Nintendo Color TV-Game 6 (1977)"
          soundhw="none" tv="ntsc" status="preliminary"/>

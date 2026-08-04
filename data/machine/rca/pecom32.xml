@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="pecom32" family="rca" description="Pecom 32"
+<machine name="pecom32" family="rca" description="Pecom 32 (1985)"
          cpu="cdp1802" vga="cdp1869" soundhw="pcspk" tv="pal">
     <rom name="090786.bin" addr="0x0000" sha256="a8104b9bf317828bd480874d8c434bdbf6eb3990a81f45fc7ac4010a1aa70f36"/>
 </machine>

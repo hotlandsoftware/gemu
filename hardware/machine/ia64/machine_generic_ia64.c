@@ -175,7 +175,7 @@ struct Ia64GenericState {
 
     /* -serial: a 16550-style UART at COM1 (port 0x3F8, inside the legacy
      * I/O window). Register semantics ported from i2000's COM1
-     * (hardware/machine/machine_i2000.c) minus its SDL front-panel echo,
+     * (hardware/machine/ia64/machine_i2000.c) minus its SDL front-panel echo,
      * which doesn't exist on this machine. The point is letting a real
      * Windows kernel debugger (WinDbg/KD) attach over a serial transport
      * instead of us reverse-engineering unsymbolized binaries by hand.
@@ -995,7 +995,7 @@ static void cdrom_do_read_dma(Ia64GenericState *s) {
  * x86 boot-sector code (its FAT12 boot sector looks like one, but that's
  * just the on-disk format's provenance, not how this actually boots).
  * All of that lives here on the host side, in ordinary tested C - see the
- * comment on the CD-ROM controller in hardware/generic.h for why. */
+ * comment on the CD-ROM controller in hardware/ia64/generic.h for why. */
 
 static bool cdrom_find_eltorito_boot_lba(Ia64GenericState *s, uint32_t *out_lba) {
     uint8_t sec[2048];
@@ -1581,7 +1581,7 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
 }
 
 /* Code and data share the same view - our own firmware, no legacy shadow
- * dance to model (see hardware/generic.h). */
+ * dance to model (see hardware/ia64/generic.h). */
 static uint64_t bus_fetch(void *ud, uint64_t addr, unsigned size) {
     return bus_read(ud, addr, size);
 }
@@ -1886,7 +1886,7 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
     /* Windows for Itanium refuses to proceed past "pre-B3 stepping" -
      * real historical behavior. This machine doesn't run i2000's
      * firmware, so its cpuid revision cross-check doesn't apply here
-     * (see the comment on cpuid[3] in cpu/merced.c). */
+     * (see the comment on cpuid[3] in cpu/ia64/merced.c). */
     merced_set_cpu_revision(s->cpu, 6);
     if (cfg->cpu && strcmp(cfg->cpu, "mckinley") == 0)
         merced_set_cpu_model(s->cpu, 1);
@@ -1972,6 +1972,7 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
             .fb_height = FB_H,
             .scale = cfg->display_scale,
             .ini_section = "generic",
+            .no_menu = cfg->menu_disabled,
             .actions = generic_kbd_actions,
             .n_actions = (int)(sizeof generic_kbd_actions / sizeof *generic_kbd_actions),
         };

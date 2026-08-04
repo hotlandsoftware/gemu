@@ -1958,7 +1958,7 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
      * loop at FFFE2020.
      *
      * This must stay consistent with cpuid[3]'s family/model/revision in
-     * merced_reset() (cpu/merced.c) - firmware cross-checks the two, and a
+     * merced_reset() (cpu/ia64/merced.c) - firmware cross-checks the two, and a
      * mismatch also lands in the FFFE2020 park loop as if no (recognized)
      * processor were present. */
     s->memcard_cfg[0][2][0x02] = 4;  /* processor present */
@@ -2040,6 +2040,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
             .fb_height = FB_H,
             .scale = cfg->display_scale,
             .ini_section = "i2000",
+            .no_menu = cfg->menu_disabled,
         };
         s->display = gemu_display_create(cfg->display_type, &dc);
         if (!s->display) {
