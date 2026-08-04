@@ -65,6 +65,7 @@ static int merced_dbg(void) {
  * dispatches on this to decide between retrying with PSR.ed and running its
  * real fault handler, so a delivered ld.s fault must report it. */
 #define ISR_SP (1ull << 36)
+#define ISR_ED (1ull << 43)
 
 /* PTE fields (SDM Vol.2 4.1, "Translation Insertion Format"). */
 #define PTE_PRESENT   (1ull << 0)
@@ -139,6 +140,10 @@ static void warn_once(Merced *m, uint32_t bit, const char *msg) {
 
 /* ── Register files ──────────────────────────────────────────────────────── */
 
+static uint64_t debug_bank1_r27_nat_set_ip;
+static uint64_t debug_bank1_r27_nat_set_ninsts;
+static bool debug_b520_fault_active;
+
 static unsigned stacked_phys(const Merced *m, unsigned r) {
     unsigned idx = r - 32;
     unsigned sor8 = CFM_SOR(m->cfm) * 8;
@@ -170,6 +175,12 @@ static uint8_t gr_nat(Merced *m, unsigned r) {
 static void alat_invalidate_reg(Merced *m, unsigned reg) {
     for (unsigned i = 0; i < 32; i++)
         if (m->alat[i].valid && m->alat[i].reg == reg)
+            m->alat[i].valid = 0;
+}
+
+static void alat_invalidate_stacked(Merced *m) {
+    for (unsigned i = 0; i < 32; i++)
+        if (m->alat[i].valid && m->alat[i].reg >= 32)
             m->alat[i].valid = 0;
 }
 
@@ -221,6 +232,15 @@ static bool alat_check_reg(Merced *m, unsigned reg, bool clear) {
 
 static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
     if (r == 0) return;   /* writes to r0 fault on HW; ignore here */
+    if (r == 19 && debug_b520_fault_active &&
+        getenv("MERCED_DEBUG_R19_NAT")) {
+        static unsigned n;
+        if (n++ < 256)
+            fprintf(stderr, "merced: R19-WRITE ip=%016" PRIX64
+                    " value=%016" PRIX64 " nat=%u bn=%u cfm=%016" PRIX64
+                    " ninsts=%" PRIu64 "\n", m->ip, v, !!nat,
+                    !!(m->psr & PSR_BN), m->cfm, m->ninsts);
+    }
     if (r == 8 && v == UINT64_C(0xE000010600000000) &&
         getenv("MERCED_DEBUG_ALLOC_BAD")) {
         static unsigned alloc_bad_count;
@@ -256,7 +276,13 @@ static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
      * store occurred. */
     if (r < 16) { m->gr_static[r] = v; m->nat_static[r] = nat; return; }
     if (r < 32) {
-        if (m->psr & PSR_BN) { m->gr_static[r] = v; m->nat_static[r] = nat; }
+        if (m->psr & PSR_BN) {
+            if (r == 27 && nat) {
+                debug_bank1_r27_nat_set_ip = m->ip;
+                debug_bank1_r27_nat_set_ninsts = m->ninsts;
+            }
+            m->gr_static[r] = v; m->nat_static[r] = nat;
+        }
         else {
             m->gr_bank0[r - 16] = v; m->nat_bank0[r - 16] = nat;
         }
@@ -300,6 +326,28 @@ static uint64_t rsc_value_for_write(const Merced *m, uint64_t value) {
 static void pr_write(Merced *m, unsigned i, int v) {
     if (i == 0) return;
     unsigned p = pr_phys(m, i);
+    if ((i == 1 || i == 14) &&
+        m->ip >= UINT64_C(0xE00000008355B000) &&
+        m->ip < UINT64_C(0xE00000008355B600) &&
+        getenv("MERCED_DEBUG_B520_PREDS")) {
+        static unsigned pred_n;
+        if (pred_n++ < 512)
+            fprintf(stderr, "merced: B520-PRED ip=%016" PRIX64
+                    " p%u=%d old=%d raw-pr=%016" PRIX64
+                    " r28=%016" PRIX64 "/nat%u ninsts=%" PRIu64 "\n",
+                    m->ip, i, !!v,
+                    !!(m->pr & (UINT64_C(1) << p)), m->pr,
+                    gr_read(m, 28, NULL), gr_nat(m, 28), m->ninsts);
+    }
+    if (v && i >= 44 && !(m->pr & (UINT64_C(1) << p)) &&
+        getenv("MERCED_DEBUG_HIGH_PR")) {
+        static unsigned n;
+        if (n++ < 256)
+            fprintf(stderr, "merced: HIGH-PR ip=%016" PRIX64
+                    " logical=p%u physical=p%u raw-pr=%016" PRIX64
+                    " cfm=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                    m->ip, i, p, m->pr, m->cfm, m->ninsts);
+    }
     if (v) m->pr |= 1ull << p; else m->pr &= ~(1ull << p);
 }
 
@@ -514,11 +562,20 @@ void merced_advance_itc(Merced *m, uint64_t ticks) {
     itc_advance(m, ticks);
 }
 
+static void ext_pending_set(Merced *m, uint8_t vector) {
+    m->external_pending[vector >> 3] |= (uint8_t)(1u << (vector & 7));
+}
+
+static void ext_pending_clear(Merced *m, uint8_t vector) {
+    m->external_pending[vector >> 3] &= (uint8_t)~(1u << (vector & 7));
+}
+
+static bool ext_pending_test(const Merced *m, uint8_t vector) {
+    return (m->external_pending[vector >> 3] >> (vector & 7)) & 1;
+}
+
 void merced_raise_external(Merced *m, uint8_t vector) {
-    if (!m->external_pending) {
-        m->external_vector = vector;
-        m->external_pending = 1;
-    }
+    ext_pending_set(m, vector);
 }
 
 /* An external interrupt is eligible only when its priority class exceeds
@@ -531,6 +588,19 @@ static bool interrupt_unmasked(Merced *m, uint8_t vector) {
     if (tpr & (UINT64_C(1) << 16))
         return false;
     return (vector & 0xF0u) > (tpr & 0xF0u);
+}
+
+/* The highest-priority pending external vector that also clears the
+ * current cr.tpr, or -1.  Vectors 0-15 are architecturally reserved (fault/
+ * trap vector space), so the platform-interrupt range starts at 16.  Real
+ * I/O SAPIC hardware resolves cr.ivr the same way: independently-latched
+ * vectors, highest priority wins, lower ones stay pending underneath. */
+static int ext_highest_unmasked(Merced *m) {
+    for (int v = 255; v >= 16; v--) {
+        if (ext_pending_test(m, (uint8_t)v) && interrupt_unmasked(m, (uint8_t)v))
+            return v;
+    }
+    return -1;
 }
 
 static uint64_t fault_vector_counts[0x5B];
@@ -717,6 +787,90 @@ static bool rse_restore_interrupted_partition(Merced *m, uint64_t iip,
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     m->nfaults++;
+    /* XP/IA-64 currently reaches KeBugCheckEx with
+     * STATUS_REG_NAT_CONSUMPTION after executing the bundle at 8355b4e0.
+     * Preserve the pre-interruption register/NaT state here: once control
+     * reaches the bugcheck path the consumed operand is no longer visible.
+     * This is intentionally opt-in because NaT faults are otherwise normal
+     * while exercising the architecture conformance suite. */
+    if (vec == VEC_NAT && getenv("MERCED_DEBUG_NAT_CRASH") &&
+        (m->ip >> 61) == 7) {
+        static bool dumped;
+        if (!dumped) {
+            dumped = true;
+            fprintf(stderr, "merced: NAT-CRASH ip=%016" PRIX64
+                    " slot=%u isr=%016" PRIX64 " ifa=%016" PRIX64
+                    " set_ifa=%u psr=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                    m->ip, (unsigned)(m->ip & 3), isr, ifa, set_ifa,
+                    m->psr, m->ninsts);
+            fprintf(stderr, "merced: NAT-ORIGIN bank1-r27 set-ip=%016" PRIX64
+                    " set-ninsts=%" PRIu64 " age=%" PRIu64 "\n",
+                    debug_bank1_r27_nat_set_ip,
+                    debug_bank1_r27_nat_set_ninsts,
+                    m->ninsts - debug_bank1_r27_nat_set_ninsts);
+            for (unsigned base = 0; base < 128; base += 4) {
+                fprintf(stderr, "merced: NAT-GR");
+                for (unsigned r = base; r < base + 4; r++) {
+                    uint8_t nat = 0;
+                    uint64_t value = gr_read(m, r, &nat);
+                    fprintf(stderr, " r%u=%016" PRIX64 "/nat%u",
+                            r, value, !!nat);
+                }
+                fputc('\n', stderr);
+            }
+            if (getenv("MERCED_DEBUG_NAT_CRASH_FULL")) {
+                fprintf(stderr, "merced: NAT-CRASH preceding instructions\n");
+                merced_dump_trace(m, 128, stderr);
+            }
+            fflush(stderr);
+        }
+    }
+    if (getenv("MERCED_DEBUG_FAULTHIST")) {
+        static uint64_t vec_counts[32];
+        static uint64_t site_ip[64], site_vec[64];
+        static uint32_t site_counts[64];
+        static unsigned site_nseen;
+        static uint64_t total;
+        total++;
+        unsigned vslot = (vec >> 8) & 31;
+        vec_counts[vslot]++;
+        uint64_t site_key_ip = m->ip & ~UINT64_C(0xF);
+        unsigned s;
+        for (s = 0; s < site_nseen; s++) {
+            if (site_ip[s] == site_key_ip && site_vec[s] == vec) {
+                site_counts[s]++;
+                break;
+            }
+        }
+        if (s == site_nseen && site_nseen < 64) {
+            site_ip[site_nseen] = site_key_ip;
+            site_vec[site_nseen] = vec;
+            site_counts[site_nseen] = 1;
+            site_nseen++;
+        }
+        if (total % 500000 == 0) {
+            fprintf(stderr, "merced: FAULTHIST total=%" PRIu64
+                    " ninsts=%" PRIu64 "\n", total, m->ninsts);
+            for (unsigned v = 0; v < 32; v++)
+                if (vec_counts[v])
+                    fprintf(stderr, "  vec=%04X count=%" PRIu64 "\n",
+                            v << 8, vec_counts[v]);
+            /* Top 15 fault sites by count, simple selection sort on a copy. */
+            unsigned idx[64];
+            for (unsigned k = 0; k < site_nseen; k++) idx[k] = k;
+            for (unsigned a = 0; a < site_nseen && a < 15; a++) {
+                unsigned best = a;
+                for (unsigned b = a + 1; b < site_nseen; b++)
+                    if (site_counts[idx[b]] > site_counts[idx[best]])
+                        best = b;
+                unsigned t = idx[a]; idx[a] = idx[best]; idx[best] = t;
+                fprintf(stderr, "  site ip=%016" PRIX64 " vec=%04X count=%u\n",
+                        site_ip[idx[a]], (unsigned)site_vec[idx[a]],
+                        site_counts[idx[a]]);
+            }
+            fflush(stderr);
+        }
+    }
     /*
      * Interruption collection is a translation serialization event.  A
      * purge issued before the interruption must therefore be complete when
@@ -746,6 +900,71 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                     gr_read(m, 16, NULL), gr_read(m, 26, NULL),
                     gr_read(m, 30, NULL), m->ninsts);
             fflush(stderr);
+        }
+    }
+    if (set_ifa && getenv("MERCED_DEBUG_B520_FAULT") &&
+        (m->ip & ~UINT64_C(0xF)) == UINT64_C(0xE00000008355B520)) {
+        debug_b520_fault_active = true;
+        static unsigned b520_faults;
+        if (b520_faults++ == 0) {
+            fprintf(stderr, "merced: B520-FAULT vec=%04X ip=%016" PRIX64
+                    " ifa=%016" PRIX64 " isr=%016" PRIX64
+                    " psr=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                    vec, m->ip, ifa, isr, m->psr, m->ninsts);
+            for (unsigned r = 0; r < 64; r += 4)
+                fprintf(stderr, "merced: B520-GR r%u=%016" PRIX64 "/%u"
+                        " r%u=%016" PRIX64 "/%u r%u=%016" PRIX64 "/%u"
+                        " r%u=%016" PRIX64 "/%u\n",
+                        r, gr_read(m, r, NULL), gr_nat(m, r),
+                        r + 1, gr_read(m, r + 1, NULL), gr_nat(m, r + 1),
+                        r + 2, gr_read(m, r + 2, NULL), gr_nat(m, r + 2),
+                        r + 3, gr_read(m, r + 3, NULL), gr_nat(m, r + 3));
+            merced_dump_trace(m, 96, stderr);
+            fflush(stderr);
+        }
+    }
+    if (vec == VEC_BREAK && getenv("MERCED_DEBUG_BREAKTRACE")) {
+        static uint64_t seen_iip[64], seen_iim[64], seen_count[64];
+        static unsigned nseen;
+        uint64_t iip = m->ip & ~UINT64_C(0xF);
+        uint64_t iim = m->cr[CR_IIM];
+        unsigned i;
+        for (i = 0; i < nseen; i++)
+            if (seen_iip[i] == iip && seen_iim[i] == iim) break;
+        if (i == nseen && nseen < 64) {
+            seen_iip[nseen] = iip;
+            seen_iim[nseen] = iim;
+            seen_count[nseen] = 0;
+            nseen++;
+            fprintf(stderr, "GEMU-FAULT-NEW excp=BREAK vector=0x2c00 iip=0x%016"
+                    PRIX64 " iim=0x%016" PRIX64 " isr=0x%016" PRIX64
+                    " ninsts=%" PRIu64 "\n", iip, iim, isr, m->ninsts);
+            fflush(stderr);
+        }
+        if (i < nseen) seen_count[i]++;
+    }
+    if (vec == VEC_BREAK &&
+        (m->ip & ~UINT64_C(0xF)) == UINT64_C(0xE0000000830245B0) &&
+        gr_read(m, 2, NULL) == 4 && getenv("MERCED_DEBUG_WAIT4_HIST")) {
+        static unsigned hit_n;
+        unsigned h_this = hit_n++;
+        if (h_this == 0) {
+            fprintf(stderr, "merced: WAIT4-CALLCHAIN hit=%u ninsts=%" PRIu64 "\n",
+                    h_this, m->ninsts);
+            unsigned avail = m->call_history_next < MERCED_CALL_HISTORY
+                           ? m->call_history_next : MERCED_CALL_HISTORY;
+            for (unsigned i = m->call_history_next - avail;
+                 i < m->call_history_next; i++) {
+                unsigned h = i % MERCED_CALL_HISTORY;
+                fprintf(stderr, "merced:   %s %016" PRIX64 " -> %016" PRIX64 "\n",
+                        m->call_history[h].is_return ? "ret " : "call",
+                        m->call_history[h].from & ~UINT64_C(0xF),
+                        m->call_history[h].to & ~UINT64_C(0xF));
+            }
+            fflush(stderr);
+        } else if (h_this < 3 || (h_this % 1000) == 0) {
+            fprintf(stderr, "merced: WAIT4-CALLCHAIN hit=%u ninsts=%" PRIu64
+                    " (history omitted)\n", h_this, m->ninsts);
         }
     }
     if (vec == VEC_EXTINT && getenv("MERCED_DEBUG_EXTINT")) {
@@ -1174,6 +1393,18 @@ static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
             fflush(stderr);
         }
     }
+    if (!ifetch && !spec &&
+        (m->ip & ~UINT64_C(0xF)) == UINT64_C(0xE00000008301BE20) &&
+        getenv("MERCED_DEBUG_XP_PTE_LOOP")) {
+        static unsigned xp_pte_loop_reads;
+        if (xp_pte_loop_reads++ == 1) {
+            fprintf(stderr, "merced: XP-PTE-LOOP second read va=%016" PRIX64
+                    " value=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                    va, ok ? phys_read(m, *pa, 8) : 0, m->ninsts);
+            merced_dump_trace(m, 800, stderr);
+            fflush(stderr);
+        }
+    }
     return ok;
 }
 
@@ -1343,6 +1574,14 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
     /* A speculative reference whose fault is not deferred still reports that
      * it was speculative. */
     uint64_t spec_isr = spec ? ISR_SP : 0;
+    /* ISR.ed describes the translation of the instruction which issued a
+     * data reference, not the data translation itself.  When its code-page
+     * PTE has ED set, all deferrable data faults report ISR.ed so the OS can
+     * choose its deferred-exception path.  NT maps the PFN initialization
+     * loop this way; omitting ED made its VHPT handler treat the fault as an
+     * ordinary miss and retry the same store forever.  NaT-page consumption
+     * is the architectural exception and forces ED clear below. */
+    uint64_t code_ed_isr = (!ifetch && code_page_ed(m)) ? ISR_ED : 0;
     *st = MERCED_OK;
     bool on = force ||
               (ifetch ? (m->psr & PSR_IT) != 0 : (m->psr & PSR_DT) != 0);
@@ -1353,6 +1592,14 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
     unsigned vrn = (unsigned)(va >> 61);
     uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
     uint64_t lookup_va = va;
+    /* Firmware owns this identity window while its IVT is installed, and
+     * while runtime firmware code is executing during the IVA handoff.  It
+     * must take precedence over stale/temporary guest TRs: firmware's RFI
+     * exception self-test deliberately installs an alternate translation
+     * for the same VA, then verifies that changing IVA hands precedence to
+     * that translation. */
+    if (firmware_identity_pa(m, va, pa))
+        return true;
     const MercedTlbEntry *e =
         tlb_search(ifetch ? m->itr : m->dtr,
                    ifetch ? MERCED_N_ITR : MERCED_N_DTR, rid, lookup_va);
@@ -1371,8 +1618,6 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         if (!e)
             e = tlb_search(m->itc, MERCED_N_TC, rid, lookup_va);
     }
-    if (!e && firmware_identity_pa(m, va, pa))
-        return true;
     /*
      * The loader and early NT kernel retain pointers through the region-7
      * KSEG alias VA payload = 0x80000000 + PA.  It remains valid after the
@@ -1424,7 +1669,7 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         } else if (walk == VHPT_NOT_PRESENT) {
             if (spec && (silent_probe || spec_defers(m, VEC_PAGE_NOT_PRESENT))) return false;
             *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT,
-                                isr_access | spec_isr, va, true);
+                                isr_access | spec_isr | code_ed_isr, va, true);
             return false;
         } else if (walk == VHPT_TRANSLATION) {
             if (spec && (silent_probe || spec_defers(m, VEC_VHPT))) return false;
@@ -1432,7 +1677,8 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
              * entry itself was absent.  This is not an ordinary ITLB/DTLB
              * miss: vector 0 lets the OS make its page-table backing
              * resident before retrying the original reference. */
-            *st = deliver_fault(m, VEC_VHPT, isr_access | spec_isr, va, true);
+            *st = deliver_fault(m, VEC_VHPT,
+                                isr_access | spec_isr | code_ed_isr, va, true);
             return false;
         }
     }
@@ -1453,13 +1699,14 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
             fvec = walker ? VEC_DTLB : VEC_ALT_DTLB;
         if (spec && (silent_probe || spec_defers(m, fvec)))
             return false;         /* ld.s: caller sets NaT, no fault */
-        *st = deliver_fault(m, fvec, isr_access | spec_isr, va, true);
+        *st = deliver_fault(m, fvec,
+                            isr_access | spec_isr | code_ed_isr, va, true);
         return false;
     }
     if (!(e->pte & PTE_PRESENT)) {
         if (spec && (silent_probe || spec_defers(m, VEC_PAGE_NOT_PRESENT))) return false;
         *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT,
-                            isr_access | spec_isr, va, true);
+                            isr_access | spec_isr | code_ed_isr, va, true);
         return false;
     }
     {
@@ -1476,9 +1723,11 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
             /* A control-speculative load defers a deferrable fault rather
              * than raising it; the caller turns our refusal into a NaT. */
             if (spec && (silent_probe || spec_defers(m, fvec))) return false;
-            uint64_t fault_isr = isr_access | spec_isr;
-            if (fvec == VEC_NAT)
+            uint64_t fault_isr = isr_access | spec_isr | code_ed_isr;
+            if (fvec == VEC_NAT) {
+                fault_isr &= ~ISR_ED;
                 fault_isr |= UINT64_C(0x20); /* NaT-page consumption code */
+            }
             *st = deliver_fault(m, fvec, fault_isr, va, true);
             return false;
         }
@@ -1573,6 +1822,26 @@ static void watch_init(void) {
 
 static void phys_write(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
     pa &= MERCED_PHYS_MASK;
+    if (pa <= UINT64_C(0x0E000590) &&
+        pa + size > UINT64_C(0x0E000590) && v &&
+        getenv("MERCED_DEBUG_XP_PTE_WRITER")) {
+        static bool xp_pte_writer_dumped;
+        if (!xp_pte_writer_dumped) {
+            xp_pte_writer_dumped = true;
+            fprintf(stderr, "merced: XP-PTE-WRITER pa=%016" PRIX64
+                    " value=%016" PRIX64 " size=%u ip=%016" PRIX64
+                    " ninsts=%" PRIu64 "\n", pa, v, size, m->ip, m->ninsts);
+            for (unsigned r = 0; r < 64; r += 4)
+                fprintf(stderr, "merced: XPW r%u=%016" PRIX64
+                        " r%u=%016" PRIX64 " r%u=%016" PRIX64
+                        " r%u=%016" PRIX64 "\n",
+                        r, gr_read(m, r, NULL), r + 1, gr_read(m, r + 1, NULL),
+                        r + 2, gr_read(m, r + 2, NULL),
+                        r + 3, gr_read(m, r + 3, NULL));
+            merced_dump_trace(m, 128, stderr);
+            fflush(stderr);
+        }
+    }
     if (pa <= UINT64_C(0x2714000) &&
         pa + size > UINT64_C(0x2714000)) {
         static unsigned target_pte_lifetime_writes;
@@ -1757,9 +2026,7 @@ static void do_call(Merced *m, unsigned b1, uint64_t target) {
      * caller; NT's lock-free page-list code uses exactly this pattern.
      * Static-register entries remain valid across a call.
      */
-    for (unsigned i = 0; i < 32; i++)
-        if (m->alat[i].valid && m->alat[i].reg >= 32)
-            m->alat[i].valid = 0;
+    alat_invalidate_stacked(m);
     m->bof = (m->bof + sol) % MERCED_RSE_CAPACITY;
     m->bof_total += sol;
     uint64_t sof = CFM_SOF(m->cfm) - sol;
@@ -1780,6 +2047,11 @@ static void do_ret(Merced *m, uint64_t target) {
     m->bof_total -= sol;
     m->cfm = new_cfm;
     m->ar[AR_EC] = (pfs >> 52) & 0x3F;
+    /* Returning changes the stacked-register name mapping just as a call
+     * does.  An ALAT association made in the callee must not accidentally
+     * validate an ld.c in the caller that now has the same architectural
+     * register number. */
+    alat_invalidate_stacked(m);
     m->ip = target;
     m->taken = 1;
 }
@@ -2117,6 +2389,19 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         if (x6 <= 0x07) {                       /* cmpxchg.acq/.rel */
             uint64_t old = phys_read(m, pa, size);
             uint64_t ccv = m->ar[AR_CCV];
+            if (getenv("MERCED_DEBUG_XP_PTE_LOOP") &&
+                m->ip >= UINT64_C(0xE00000008301B000) &&
+                m->ip < UINT64_C(0xE00000008301C000)) {
+                static unsigned xp_cmpxchg_debug;
+                if (xp_cmpxchg_debug++ < 64)
+                    fprintf(stderr, "merced: XP-CMPXCHG ip=%016" PRIX64
+                            " r1=%u r2=%u r3=%u va=%016" PRIX64
+                            " size=%u old=%016" PRIX64
+                            " ccv=%016" PRIX64 " new=%016" PRIX64
+                            " match=%u ninsts=%" PRIu64 "\n",
+                            m->ip, r1, r2, r3, va, size, old, ccv,
+                            gr_read(m, r2, &n2), old == ccv, m->ninsts);
+            }
             if (target_trap_slot_armed) {
                 static unsigned target_cmpxchg_debug;
                 if (target_cmpxchg_debug++ < 64)
@@ -2201,14 +2486,54 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
             if (major == 4 && mbit)
                 reg_inc = gr_read(m, r2, &reg_inc_nat);
             int spec = (type == 1 || type == 3);   /* .s / .sa */
+            bool debug_handler_spec = false;
+            if (spec && getenv("MERCED_DEBUG_XP_SPEC") &&
+                m->ip >= UINT64_C(0xE000000083018000) &&
+                m->ip < UINT64_C(0xE000000083020000)) {
+                static unsigned n;
+                debug_handler_spec = n++ < 256;
+                if (debug_handler_spec)
+                    fprintf(stderr, "merced: XP-SPEC ip=%016" PRIX64
+                            " x6=%02X r1=r%u r3=r%u va=%016" PRIX64
+                            "/nat%u dcr=%016" PRIX64 " psr=%016" PRIX64
+                            " ninsts=%" PRIu64 "\n", m->ip, x6, r1, r3,
+                            va, !!n3, m->cr[CR_DCR], m->psr, m->ninsts);
+            }
             if (x6 == 0x1B) size = 8;              /* ld8.fill */
-            if (!va_translate(m, va, false, spec, ISR_R, &pa, &st)) {
+            /* An ordinary load consumes a NaT address as a non-access
+             * register NaT fault.  Speculative loads defer it by producing
+             * a NaT destination, just like any other deferrable fault. */
+            if (n3 && !spec)
+                return deliver_fault(m, VEC_NAT,
+                                     ISR_NA | ISR_R | UINT64_C(0x10),
+                                     0, false);
+            if (n3) {
+                gr_write(m, r1, 0, 1);
+                if (debug_handler_spec)
+                    fprintf(stderr, "merced: XP-SPEC result=nat-address\n");
+            } else if (!va_translate(m, va, false, spec, ISR_R, &pa, &st)) {
                 if (st != MERCED_OK) return st;
                 gr_write(m, r1, 0, 1);             /* NaT on deferred spec load */
+                if (debug_handler_spec)
+                    fprintf(stderr, "merced: XP-SPEC result=deferred-nat\n");
             } else {
                 bool check = x6 >= 0x20 && x6 <= 0x2B;
                 bool clear = x6 >= 0x20 && x6 <= 0x23;
-                if (!check || !alat_check(m, r1, pa, size, clear)) {
+                bool alat_hit = check && alat_check(m, r1, pa, size, clear);
+                if (check && getenv("MERCED_DEBUG_XP_PTE_LOOP") &&
+                    (m->ip & ~UINT64_C(0xF)) ==
+                        UINT64_C(0xE00000008301BE20)) {
+                    static unsigned xp_check_debug;
+                    if (xp_check_debug++ < 64)
+                        fprintf(stderr, "merced: XP-CHECK r%u old=%016" PRIX64
+                            " va=%016" PRIX64 " pa=%016" PRIX64
+                            " size=%u hit=%u clear=%u ninsts=%" PRIu64 "\n",
+                            r1, gr_read(m, r1, NULL), va, pa, size,
+                            alat_hit, clear, m->ninsts);
+                    if (xp_check_debug <= 64)
+                        fflush(stderr);
+                }
+                if (!check || !alat_hit) {
                     uint64_t v = phys_read(m, pa, size);
                     uint8_t nat = 0;
                     static unsigned target_load_debug;
@@ -2228,6 +2553,9 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
                     if (x6 == 0x1B)                /* ld8.fill: NaT from UNAT */
                         nat = (uint8_t)((m->ar[AR_UNAT] >> ((va >> 3) & 0x3F)) & 1);
                     gr_write(m, r1, v, nat);
+                    if (debug_handler_spec)
+                        fprintf(stderr, "merced: XP-SPEC result=value=%016"
+                                PRIX64 " pa=%016" PRIX64 "\n", v, pa);
                     /* ld.a and ld.sa establish the value/address
                      * association consumed by a later ld.c. */
                     if ((x6 >= 0x08 && x6 <= 0x0F) ||
@@ -2254,8 +2582,17 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
             if (major == 4 && mbit)
                 reg_inc = gr_read(m, r1, &reg_inc_nat);
             if (x6 == 0x3B) size = 8;              /* st8.spill */
-            if (!va_translate(m, va, false, false, ISR_W, &pa, &st)) return st;
+            if (n3)
+                return deliver_fault(m, VEC_NAT,
+                                     ISR_NA | ISR_W | UINT64_C(0x10),
+                                     0, false);
+            /* st8.spill is the one store which preserves a NaT source in
+             * ar.unat; every ordinary store consumes it. */
             uint64_t v = gr_read(m, r2, &n2);
+            if (x6 != 0x3B && n2)
+                return deliver_fault(m, VEC_NAT,
+                                     ISR_W | UINT64_C(0x10), 0, false);
+            if (!va_translate(m, va, false, false, ISR_W, &pa, &st)) return st;
             if (x6 == 0x3B) {
                 unsigned bit = (unsigned)((va >> 3) & 0x3F);
                 if (n2) m->ar[AR_UNAT] |= 1ull << bit;
@@ -2545,12 +2882,27 @@ static int vhpt_entry_pa(Merced *m, uint64_t entry_va, uint64_t *pa) {
     unsigned perm = tlb_effective_perm(
         (unsigned)((pte >> PTE_AR_SHIFT) & 7),
         (unsigned)((pte >> PTE_PL_SHIFT) & 3), 0);
+    uint32_t key = (uint32_t)((e->itir >> 8) & 0xFFFFFFull);
+    uint32_t key_fault = (m->psr & PSR_PK)
+        ? key_fault_vector(m, key, PERM_R, false) : 0;
     if (!(pte & PTE_PRESENT) || ma != 0 || !(perm & PERM_R) ||
-        (!(pte & PTE_ACCESSED) && !(m->psr & PSR_DA)) ||
-        ((m->psr & PSR_PK) &&
-         key_fault_vector(m, (uint32_t)((e->itir >> 8) & 0xFFFFFFull),
-                          PERM_R, false)))
+        (!(pte & PTE_ACCESSED) && !(m->psr & PSR_DA)) || key_fault) {
+        if (getenv("MERCED_MMU_DEBUG")) {
+            static unsigned vhpt_abort_debug;
+            static unsigned vhpt_target_abort_debug;
+            bool target = (entry_va & UINT64_C(0xFFFFFFFFFFFFE000)) ==
+                          UINT64_C(0xFFF80000597CC000);
+            if (vhpt_abort_debug++ < 64 ||
+                (target && vhpt_target_abort_debug++ < 8))
+                fprintf(stderr, "merced: VHPT backing abort entry=%016" PRIX64
+                        " pte=%016" PRIX64 " itir=%016" PRIX64
+                        " ma=%u perm=%u a=%u da=%u pk=%u key=%06X kvec=%X\n",
+                        entry_va, pte, e->itir, ma, perm,
+                        !!(pte & PTE_ACCESSED), !!(m->psr & PSR_DA),
+                        !!(m->psr & PSR_PK), key, key_fault);
+        }
         return VHPT_ENTRY_ABORT;
+    }
 
     *pa = (e->pfn_base + (entry_va - e->va_start)) & MERCED_PHYS_MASK;
     return VHPT_ENTRY_TRANSLATED;
@@ -2673,6 +3025,42 @@ static int vhpt_walk(Merced *m, uint64_t va, bool ifetch) {
     uint64_t entry_pa;
     int entry_status = vhpt_entry_pa(m, entry_va, &entry_pa);
     if (entry_status != VHPT_ENTRY_TRANSLATED) {
+        static bool b520_vhpt_dumped;
+        if (!b520_vhpt_dumped && getenv("MERCED_DEBUG_B520_FAULT") &&
+            (m->ip & ~UINT64_C(0xF)) ==
+                UINT64_C(0xE00000008355B520)) {
+            b520_vhpt_dumped = true;
+            uint32_t entry_rid = (uint32_t)
+                ((m->rr[entry_va >> 61] >> 8) & 0xFFFFFFull);
+            fprintf(stderr, "merced: B520-VHPT va=%016" PRIX64
+                    " entry_va=%016" PRIX64 " status=%d"
+                    " pta=%016" PRIX64 " rr=%016" PRIX64
+                    " entry_rid=%06X\n",
+                    va, entry_va, entry_status, pta, rr, entry_rid);
+            for (unsigned i = 0; i < MERCED_N_DTR; i++) {
+                const MercedTlbEntry *x = &m->dtr[i];
+                if (x->valid)
+                    fprintf(stderr, "merced: B520-DTR[%u] rid=%06X"
+                            " va=%016" PRIX64 "-%016" PRIX64
+                            " pa=%016" PRIX64 " pte=%016" PRIX64
+                            " itir=%016" PRIX64 "\n",
+                            i, x->rid, x->va_start, x->va_end, x->pfn_base,
+                            x->pte, x->itir);
+            }
+            for (unsigned i = 0; i < MERCED_N_TC; i++) {
+                const MercedTlbEntry *x = &m->dtc[i];
+                if (x->valid && (x->rid == entry_rid ||
+                                 (x->va_start <= entry_va &&
+                                  entry_va <= x->va_end)))
+                    fprintf(stderr, "merced: B520-DTC[%u] rid=%06X"
+                            " va=%016" PRIX64 "-%016" PRIX64
+                            " pa=%016" PRIX64 " pte=%016" PRIX64
+                            " itir=%016" PRIX64 "\n",
+                            i, x->rid, x->va_start, x->va_end, x->pfn_base,
+                            x->pte, x->itir);
+            }
+            fflush(stderr);
+        }
         static unsigned mmu_debug_unmapped;
         if ((m->ip >> 61) == 7 && getenv("MERCED_MMU_DEBUG") &&
             mmu_debug_unmapped++ < 512)
@@ -4054,9 +4442,10 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         uint64_t v = m->cr[cr3];
         if (cr3 == CR_IVR) {
             /* Reading ivr reports and acknowledges the pending vector. */
-            if (m->external_pending) {
-                v = m->external_vector;
-                m->external_pending = 0;
+            int ext = ext_highest_unmasked(m);
+            if (ext >= 0) {
+                v = (uint64_t)ext;
+                ext_pending_clear(m, (uint8_t)ext);
             } else if (m->timer_pending) {
                 v = m->cr[CR_ITV] & 0xFFull;
                 m->timer_pending = 0;
@@ -4142,6 +4531,11 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x2C: case 0x3C: {                         /* mov cr3=r2 */
         unsigned cr3 = (unsigned)bits(raw, 20, 7);
         m->cr[cr3] = gr_read(m, r2, &n2);
+        if (cr3 == CR_TPR && getenv("TPR_DEBUG")) {
+            fprintf(stderr, "merced: cr.tpr <- %016" PRIX64 " at ip=%016"
+                    PRIX64 " ninsts=%" PRIu64 "\n", m->cr[cr3], m->ip,
+                    m->ninsts);
+        }
         if (cr3 == CR_IVA) {
             static unsigned n;
             if (merced_dbg() && n < 16) {
@@ -4159,6 +4553,19 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         return MERCED_OK;
     }
     case 0x2E: {                                    /* itc.d */
+        if (getenv("MERCED_DEBUG_XP_VHPT_ITC") &&
+            (m->cr[CR_IIP] == UINT64_C(0xE00000008355B4E0) ||
+             m->cr[CR_IIP] == UINT64_C(0xE00000008355B520))) {
+            static unsigned xp_vhpt_itc;
+            if (xp_vhpt_itc++ < 32)
+                fprintf(stderr, "merced: XP-VHPT-ITC outer=%016" PRIX64
+                        " ifa=%016" PRIX64 " iha=%016" PRIX64
+                        " itir=%016" PRIX64 " pte=%016" PRIX64
+                        " rr=%016" PRIX64 " ip=%016" PRIX64 "\n",
+                        m->cr[CR_IIP], m->cr[CR_IFA], m->cr[CR_IHA],
+                        m->cr[CR_ITIR], gr_read(m, r2, NULL),
+                        m->rr[m->cr[CR_IFA] >> 61], m->ip);
+        }
         if ((m->cr[CR_IFA] >= watch_va_base &&
              m->cr[CR_IFA] < watch_va_end) ||
             (target_trap_slot_armed &&
@@ -4347,8 +4754,13 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
         }
         if (x3 == 2) {                              /* mov pr.rot=imm44 */
             if (!qp) return MERCED_OK;
-            uint64_t imm = (uint64_t)sext((bits(raw, 36, 1) << 43) |
-                                          (bits(raw, 6, 27) << 16), 44);
+            /* The instruction carries an unsigned 28-bit immediate which
+             * occupies PR[16..43].  Bit 27 is stored in raw bit 36; it is
+             * not a sign bit.  Sign-extending it used to force PR[44..63]
+             * to one, making NT execute normally-false predicated paths in
+             * its VHPT interruption handler forever. */
+            uint64_t imm = ((bits(raw, 36, 1) << 27) |
+                            bits(raw, 6, 27)) << 16;
             for (unsigned i = 16; i < 64; i++)
                 pr_write(m, i, (int)((imm >> i) & 1));
             return MERCED_OK;
@@ -4398,6 +4810,23 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             unsigned c  = (unsigned)bits(raw, 12, 1);
             unsigned p1 = (unsigned)bits(raw, 6, 6);
             uint64_t v = gr_read(m, r3, &n3);
+            /* tbit is a NaT-aware compare, not an ordinary consuming
+             * integer operation.  A NaT source suppresses OR-family
+             * updates; all other forms clear both destination predicates.
+             * NT's interruption handler deliberately applies tbit to a
+             * banked scratch GR that can contain NaT.  Raising VEC_NAT here
+             * recursively faulted the handler and produced bugcheck 0x8e /
+             * STATUS_REG_NAT_CONSUMPTION at KiSystemException entry. */
+            if (!y && n3) {
+                if (!ta && tb) {                    /* and */
+                    pr_write(m, p1, 0);
+                    pr_write(m, p2, 0);
+                } else if (!ta && !tb) {            /* normal / unc */
+                    pr_write(m, p1, 0);
+                    pr_write(m, p2, 0);
+                }                                   /* or / or.andcm: no-op */
+                return MERCED_OK;
+            }
             int bitval;
             if (y) bitval = n3;                     /* tnat */
             else   bitval = (int)((v >> bits(raw, 14, 6)) & 1);
@@ -4775,6 +5204,7 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
             m->bof = (m->bof + CFM_SOF(old)) % MERCED_RSE_CAPACITY;
             m->bof_total += CFM_SOF(old);
             m->cfm = 0;
+            alat_invalidate_stacked(m);
             if (!(m->psr & PSR_IC))
                 m->cr[CR_IFS] = (old & CFM_MASK) | (1ull << 63);
             return MERCED_OK;
@@ -4812,6 +5242,11 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
                 }
                 m->cfm = new_cfm;
             }
+            /* RFI restores a different stacked-register frame.  QEMU and
+             * the architecture's ALAT rules discard stacked associations
+             * at this boundary; retaining them can turn NT's ld.c.clr into
+             * a false hit and skip the software TLB refill. */
+            alat_invalidate_stacked(m);
             m->taken = 1;
             return rse_spill_excess(m);
         }
@@ -5399,7 +5834,24 @@ MercedStatus merced_step(Merced *m) {
         }
     }
 
-    if (m->external_pending && interrupt_unmasked(m, m->external_vector) &&
+    /* External interrupts are only architecturally recognized at instruction
+     * group boundaries (SDM: interruption collection/recognition happens at
+     * "interruption points", and instruction groups - the run of slots
+     * between stop bits - are atomic with respect to asynchronous
+     * interruptions, since real out-of-order-capable hardware has no
+     * well-defined partial-completion state mid-group). merced_step() is
+     * called once per SLOT, not once per bundle or group, so without this
+     * check an external/timer interrupt could be recognized between two
+     * slots of the same unstoppped group. Ordinary sequential code tolerates
+     * this silently (it just resumes at the next slot), but it corrupts
+     * software-pipelined rotating-register loops (br.ctop/pr.rot), whose
+     * compiler-assumed atomicity this violates - confirmed live via
+     * MERCED_DEBUG_MIDGROUP instrumentation catching dozens of real
+     * mid-group timer deliveries per boot, coinciding with a WinXP IA-64
+     * setup freeze in a rotating PFN-table-init loop. m->group_start is
+     * only true when the current slot legitimately begins a fresh group. */
+    if (m->group_start &&
+        ext_highest_unmasked(m) >= 0 &&
         (m->psr & PSR_I) && (m->psr & PSR_IC)) {
         MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
         m->ninsts++;
@@ -5411,7 +5863,8 @@ MercedStatus merced_step(Merced *m) {
      * real hardware: delivery clears psr.i (via deliver_fault below), so
      * this naturally can't re-fire until firmware explicitly re-enables
      * interrupts or acks the timer through a cr.ivr read. */
-    if (m->timer_pending && !(m->cr[CR_ITV] & (1ull << 16)) &&
+    if (m->group_start &&
+        m->timer_pending && !(m->cr[CR_ITV] & (1ull << 16)) &&
         interrupt_unmasked(m, (uint8_t)m->cr[CR_ITV]) &&
         (m->psr & PSR_I) && (m->psr & PSR_IC)) {
         MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
@@ -5604,6 +6057,181 @@ MercedStatus merced_step(Merced *m) {
     m->taken = 0;
     uint64_t faults_before = m->nfaults;
 
+    if (slot == 0 && bundle_va == UINT64_C(0xE00000008310D320) &&
+        getenv("MERCED_DEBUG_FIRSTENTRY")) {
+        static bool dumped;
+        if (!dumped && gr_read(m, 32, NULL) == 0x8E) {
+            dumped = true;
+            fprintf(stderr, "merced: FIRSTENTRY-8310D320 ninsts=%" PRIu64
+                    " r32=%016" PRIX64 " r33=%016" PRIX64 " r34=%016" PRIX64
+                    " r35=%016" PRIX64 " b0=%016" PRIX64 "\n", m->ninsts,
+                    gr_read(m, 32, NULL), gr_read(m, 33, NULL),
+                    gr_read(m, 34, NULL), gr_read(m, 35, NULL), m->br[0]);
+            unsigned avail = m->call_history_next < MERCED_CALL_HISTORY
+                           ? m->call_history_next : MERCED_CALL_HISTORY;
+            for (unsigned i = m->call_history_next - avail;
+                 i < m->call_history_next; i++) {
+                unsigned h = i % MERCED_CALL_HISTORY;
+                fprintf(stderr, "merced:   %s %016" PRIX64 " -> %016" PRIX64 "\n",
+                        m->call_history[h].is_return ? "ret " : "call",
+                        m->call_history[h].from & ~UINT64_C(0xF),
+                        m->call_history[h].to & ~UINT64_C(0xF));
+            }
+            fflush(stderr);
+        }
+    }
+    if (slot == 1 && bundle_va == UINT64_C(0xE0000000812734D0) &&
+        getenv("MERCED_DEBUG_TBITCHECK")) {
+        static uint64_t n;
+        n++;
+        if (n <= 20 || (n % 5000) == 0) {
+            uint64_t r8v = gr_read(m, 8, NULL);
+            fprintf(stderr, "merced: TBITCHECK #%" PRIu64 " ninsts=%" PRIu64
+                    " r8=%016" PRIX64 " bit5=%d\n", n, m->ninsts, r8v,
+                    (int)((r8v >> 5) & 1));
+            fflush(stderr);
+        }
+    }
+    if (slot == 0 && bundle_va == UINT64_C(0xE0000000834F3A70) &&
+        getenv("MERCED_DEBUG_CHUNKLOOP")) {
+        static uint64_t n;
+        n++;
+        if (n <= 40 || (n % 5000) == 0) {
+            fprintf(stderr, "merced: CHUNKLOOP #%" PRIu64 " ninsts=%" PRIu64
+                    " r38(chunk)=%016" PRIX64 " r40(remain)=%016" PRIX64
+                    " r32(buf)=%016" PRIX64 "\n", n, m->ninsts,
+                    gr_read(m, 38, NULL), gr_read(m, 40, NULL),
+                    gr_read(m, 32, NULL));
+            fflush(stderr);
+        }
+    }
+    if (slot == 0 && bundle_va == UINT64_C(0xE000000081273280) &&
+        getenv("MERCED_DEBUG_EFISTALL")) {
+        static uint64_t n;
+        n++;
+        if (n <= 3 || (n % 2000) == 0) {
+            fprintf(stderr, "merced: EFISTALL #%" PRIu64 " ninsts=%" PRIu64
+                    " b0=%016" PRIX64 " r8=%016" PRIX64 "\n", n, m->ninsts,
+                    m->br[0], gr_read(m, 8, NULL));
+            if (n <= 3) {
+                unsigned avail = m->call_history_next < MERCED_CALL_HISTORY
+                               ? m->call_history_next : MERCED_CALL_HISTORY;
+                for (unsigned i = m->call_history_next - avail;
+                     i < m->call_history_next; i++) {
+                    unsigned h = i % MERCED_CALL_HISTORY;
+                    fprintf(stderr, "merced:   %s %016" PRIX64 " -> %016"
+                            PRIX64 "\n",
+                            m->call_history[h].is_return ? "ret " : "call",
+                            m->call_history[h].from & ~UINT64_C(0xF),
+                            m->call_history[h].to & ~UINT64_C(0xF));
+                }
+            }
+            fflush(stderr);
+        }
+    }
+    if (slot == 0 && bundle_va == UINT64_C(0xE00000008310CA30) &&
+        getenv("MERCED_DEBUG_POLLNODE")) {
+        static uint64_t n;
+        static uint64_t nonone_seen;
+        static uint64_t r8_hist[16];
+        uint64_t r8v = gr_read(m, 8, NULL);
+        n++;
+        if (r8v != 1 && nonone_seen < 40) {
+            nonone_seen++;
+            fprintf(stderr, "merced: POLLNODE-NONONE #%" PRIu64
+                    " ninsts=%" PRIu64 " r8=%016" PRIX64 " r37=%016" PRIX64
+                    " r39=%016" PRIX64 "\n", n, m->ninsts, r8v,
+                    gr_read(m, 37, NULL), gr_read(m, 39, NULL));
+        }
+        r8_hist[(unsigned)(r8v & 0xF)]++;
+        if (n <= 60 || (n % 20000) == 0) {
+            fprintf(stderr, "merced: POLLNODE #%" PRIu64 " ninsts=%" PRIu64
+                    " r8=%016" PRIX64 " r37=%016" PRIX64 " r39=%016" PRIX64
+                    " r40=%016" PRIX64 " r8hist[0..3]=%" PRIu64 ",%" PRIu64
+                    ",%" PRIu64 ",%" PRIu64 "\n", n, m->ninsts, r8v,
+                    gr_read(m, 37, NULL), gr_read(m, 39, NULL),
+                    gr_read(m, 40, NULL), r8_hist[0], r8_hist[1],
+                    r8_hist[2], r8_hist[3]);
+            fflush(stderr);
+        }
+    }
+    if (slot == 0 && bundle_va == UINT64_C(0xE0000000830245C0) &&
+        getenv("MERCED_DEBUG_WAIT4_RESULT")) {
+        static uint64_t n;
+        uint64_t r8v = gr_read(m, 8, NULL);
+        n++;
+        if (n <= 20 || (n % 1000) == 0) {
+            fprintf(stderr, "merced: WAIT4-RESULT #%" PRIu64 " ninsts=%"
+                    PRIu64 " r8(status)=%016" PRIX64 "\n", n, m->ninsts, r8v);
+            fflush(stderr);
+        }
+    }
+    if (slot == 1 && bundle_va == UINT64_C(0xE00000008310E040) &&
+        getenv("MERCED_DEBUG_R57FLAG")) {
+        static uint64_t n, nonzero_seen;
+        uint64_t r57v = gr_read(m, 57, NULL);
+        n++;
+        if (r57v != 0 && nonzero_seen < 20) {
+            nonzero_seen++;
+            fprintf(stderr, "merced: R57FLAG-NONZERO #%" PRIu64 " ninsts=%"
+                    PRIu64 " r57=%016" PRIX64 "\n", n, m->ninsts, r57v);
+            fflush(stderr);
+        }
+        if (n <= 20 || (n % 1000) == 0) {
+            fprintf(stderr, "merced: R57FLAG #%" PRIu64 " ninsts=%" PRIu64
+                    " r57=%016" PRIX64 " nonzero_seen=%" PRIu64 "\n", n,
+                    m->ninsts, r57v, nonzero_seen);
+            fflush(stderr);
+        }
+    }
+    if (bundle_va == UINT64_C(0xE0000000835532D0) &&
+        getenv("MERCED_DEBUG_5532D0")) {
+        static unsigned n;
+        if (n++ < 32) {
+            unsigned r2 = (unsigned)bits(raw, 13, 7);
+            unsigned r3 = (unsigned)bits(raw, 20, 7);
+            uint8_t n2 = 0, n3 = 0;
+            uint64_t v2 = gr_read(m, r2, &n2);
+            uint64_t v3 = gr_read(m, r3, &n3);
+            fprintf(stderr, "merced: 5532D0.%u unit=%c raw=%011" PRIX64
+                    " qp=p%u=%d r2=r%u=%016" PRIX64 "/nat%u"
+                    " r3=r%u=%016" PRIX64 "/nat%u cfm=%016" PRIX64
+                    " ninsts=%" PRIu64 "\n", slot, unit, raw,
+                    (unsigned)bits(raw, 0, 6), qp, r2, v2, n2,
+                    r3, v3, n3, m->cfm, m->ninsts);
+            fflush(stderr);
+        }
+    }
+    if (debug_b520_fault_active && getenv("MERCED_DEBUG_XP_HANDLER") &&
+        bundle_va >= UINT64_C(0xE00000008301BB00) &&
+        bundle_va < UINT64_C(0xE00000008301BE60)) {
+        static unsigned n;
+        if (n++ < 600) {
+            fprintf(stderr, "GEMU-XP ip=%016" PRIX64
+                    " pr=%016" PRIX64 " r30=%016" PRIX64
+                    " r31=%016" PRIX64 " r36=%016" PRIX64
+                    " r40=%016" PRIX64 " r45=%016" PRIX64
+                    " r74=%016" PRIX64 " r76=%016" PRIX64
+                    " nat31=%u nat74=%u nat76=%u\n",
+                    bundle_va | slot, m->pr, gr_read(m, 30, NULL),
+                    gr_read(m, 31, NULL), gr_read(m, 36, NULL),
+                    gr_read(m, 40, NULL), gr_read(m, 45, NULL),
+                    gr_read(m, 74, NULL), gr_read(m, 76, NULL),
+                    gr_nat(m, 31), gr_nat(m, 74), gr_nat(m, 76));
+        }
+    }
+    if (debug_b520_fault_active &&
+        bundle_va == UINT64_C(0xE00000008301BB00) && slot == 0 &&
+        getenv("MERCED_DEBUG_B520_ENTRY")) {
+        static bool entry_dumped;
+        if (!entry_dumped) {
+            entry_dumped = true;
+            fprintf(stderr, "merced: B520 entered software walker; preceding dispatch\n");
+            merced_dump_trace(m, 512, stderr);
+            fflush(stderr);
+        }
+    }
+
     if (!capture_hi || (bundle_va >= capture_lo && bundle_va < capture_hi)) {
         unsigned hist = m->trace_history_next++ % MERCED_TRACE_HISTORY;
         m->trace_history[hist].ip = bundle_va | slot;
@@ -5634,6 +6262,23 @@ MercedStatus merced_step(Merced *m) {
                 (unsigned)bits(raw, 0, 6), qp,
                 (unsigned)bits(raw, 6, 7), (unsigned)bits(raw, 13, 7),
                 (unsigned)bits(raw, 20, 7));
+    }
+
+    if (getenv("MERCED_DEBUG_ZERO_LOOP") &&
+        bundle_va >= UINT64_C(0xE000000083006280) &&
+        bundle_va < UINT64_C(0xE000000083006340)) {
+        static unsigned zero_loop_debug;
+        if (zero_loop_debug++ < 256)
+            fprintf(stderr, "merced: ZERO-LOOP ip=%016" PRIX64 ".%u"
+                    " unit=%c raw=%011" PRIX64 " qp=p%u=%d"
+                    " lc=%" PRIu64 " ec=%" PRIu64
+                    " r15=%016" PRIX64 " r16=%016" PRIX64
+                    " r25=%016" PRIX64 " r26=%016" PRIX64 "\n",
+                    bundle_va, slot, unit, (uint64_t)raw,
+                    (unsigned)bits(raw, 0, 6), qp,
+                    m->ar[AR_LC], m->ar[AR_EC],
+                    gr_read(m, 15, NULL), gr_read(m, 16, NULL),
+                    gr_read(m, 25, NULL), gr_read(m, 26, NULL));
     }
 
     switch (unit) {
@@ -5762,10 +6407,22 @@ void merced_dump_state(const Merced *m, char *buf, size_t len) {
       m->cr[CR_IVA], m->cr[CR_IIP], m->cr[CR_IPSR], m->cr[CR_ISR]);
     P("ifa %016" PRIX64 "  itir %016" PRIX64 "  halt: %s\n",
       m->cr[CR_IFA], m->cr[CR_ITIR], m->halt_msg);
-    P("itc %016" PRIX64 "  itm %016" PRIX64 "  itv %016" PRIX64
-      "  timer_pending=%u external_pending=%u\n",
-      m->ar[AR_ITC], m->cr[CR_ITM], m->cr[CR_ITV],
-      m->timer_pending, m->external_pending);
+    {
+        unsigned ext_count = 0;
+        int ext_highest = -1;
+        for (int v = 255; v >= 16; v--) {
+            if ((m->external_pending[v >> 3] >> (v & 7)) & 1) {
+                ext_count++;
+                if (ext_highest < 0) ext_highest = v;
+            }
+        }
+        P("itc %016" PRIX64 "  itm %016" PRIX64 "  itv %016" PRIX64
+          "  timer_pending=%u external_pending=%u highest=%#x\n",
+          m->ar[AR_ITC], m->cr[CR_ITM], m->cr[CR_ITV],
+          m->timer_pending, ext_count, (unsigned)ext_highest);
+    }
+    P("tpr %016" PRIX64 "  ivr %016" PRIX64 "\n",
+      m->cr[CR_TPR], m->cr[CR_IVR]);
     P("rr  %016" PRIX64 " %016" PRIX64 " %016" PRIX64 " %016" PRIX64 "\n",
       m->rr[0], m->rr[1], m->rr[2], m->rr[3]);
     P("    %016" PRIX64 " %016" PRIX64 " %016" PRIX64 " %016" PRIX64 "\n",

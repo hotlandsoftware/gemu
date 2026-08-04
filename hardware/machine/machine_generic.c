@@ -116,6 +116,10 @@ struct Ia64GenericState {
     uint8_t   atapi_error, atapi_features, atapi_count;
     uint8_t   atapi_lba_low, atapi_lba_mid, atapi_lba_high, atapi_device;
     uint8_t   atapi_status, atapi_packet[12];
+    /* ATA IRQ14 is a level, not a fire-and-forget edge.  Keep the line
+     * asserted until the guest reads the command/status register so an
+     * interrupt raised while the I/O SAPIC entry is masked is not lost. */
+    uint8_t   ide_irq_asserted;
     unsigned  atapi_packet_pos;
     uint8_t  *atapi_data;
     size_t    atapi_data_len, atapi_data_pos;
@@ -297,6 +301,12 @@ static void generic_raise_irq(Ia64GenericState *s, unsigned irq) {
         merced_raise_external(s->cpu, vector);
 }
 
+static void generic_set_ide_irq(Ia64GenericState *s, bool asserted) {
+    s->ide_irq_asserted = asserted;
+    if (asserted)
+        generic_raise_irq(s, 14);
+}
+
 static void atapi_set_data(Ia64GenericState *s, const void *data, size_t len) {
     free(s->atapi_data);
     s->atapi_data = NULL;
@@ -321,7 +331,7 @@ static void atapi_set_data(Ia64GenericState *s, const void *data, size_t len) {
     s->atapi_lba_mid = (uint8_t)block_len;
     s->atapi_lba_high = (uint8_t)(block_len >> 8);
     s->atapi_status = len ? 0x48 : 0x40;
-    generic_raise_irq(s, 14);
+    generic_set_ide_irq(s, true);
 }
 
 static void atapi_reply(Ia64GenericState *s) {
@@ -528,7 +538,7 @@ static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size
                 } else {
                     s->atapi_status = 0x40; s->atapi_count = 3;
                 }
-                generic_raise_irq(s, 14);
+                generic_set_ide_irq(s, true);
             }
             return v;
         }
@@ -536,7 +546,14 @@ static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size
         case 1: return s->atapi_error; case 2: return s->atapi_count;
         case 3: return s->atapi_lba_low; case 4: return s->atapi_lba_mid;
         case 5: return s->atapi_lba_high; case 6: return s->atapi_device;
-        case 7: return s->atapi_status;
+        case 7: {
+            uint8_t status = s->atapi_status;
+            /* Reading the primary status register acknowledges INTRQ.
+             * The alternate-status register (3f6) deliberately does not. */
+            if (port == 0x1F7)
+                generic_set_ide_irq(s, false);
+            return status;
+        }
         }
     }
     if (s->serial_enabled && port >= GENERIC_COM1_PORT && port < GENERIC_COM1_PORT + 8) {
@@ -640,6 +657,7 @@ static void legacy_io_write(Ia64GenericState *s, unsigned port, uint64_t val, un
         case 5: s->atapi_lba_high = (uint8_t)val; return;
         case 6: s->atapi_device = (uint8_t)val; return;
         case 7:
+            generic_set_ide_irq(s, false);
             s->atapi_error = 0;
             if ((uint8_t)val == 0xA0) {
                 /* 1F4/1F5 hold the driver's declared max DRQ block size for
@@ -1469,6 +1487,11 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
             uint32_t reg = s->iosapic_select & 0xFFu;
             if (reg >= 0x10 && reg < 0x40)
                 s->iosapic_redir[reg - 0x10] = (uint32_t)val;
+            /* A level may already be active when NT unmasks/reprograms its
+             * redirection entry.  Real I/O SAPIC hardware presents it
+             * immediately; the old edge-only model silently discarded it. */
+            if (reg == 0x10 + 14 * 2 && s->ide_irq_asserted)
+                generic_raise_irq(s, 14);
         }
         return;
     }

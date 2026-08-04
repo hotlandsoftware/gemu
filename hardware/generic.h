@@ -71,7 +71,7 @@
  */
 
 #define GENERIC_RAM_MAX      0x80000000ull                       /* 2 GiB */
-#define GENERIC_ROM_SIZE      0x100000u                          /* 1 MiB */
+#define GENERIC_ROM_SIZE      0x400000u                          /* 4 MiB, matches -h's "top-aligned, max 4 MiB" */
 #define GENERIC_ROM_BASE      (0x100000000ull - GENERIC_ROM_SIZE)
 #define GENERIC_VGA_IO_BASE   0x00000000C0000000ull
 #define GENERIC_VGA_IO_SIZE   0x30u                    /* ports 3B0h-3DFh */

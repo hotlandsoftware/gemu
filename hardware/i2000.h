@@ -15,6 +15,14 @@
  *          ram_size    +--------------------------+
  *                      | (open bus - 460GX SAC/   |
  *                      |  PXB/IFB decode later)   |
+ *   0x000000007FF00000 +--------------------------+
+ *                      | chipset scratch (1 MiB), |
+ *                      | always backed regardless |
+ *                      | of ram_size - firmware   |
+ *                      | places fixed-address     |
+ *                      | descriptors here         |
+ *   0x0000000080000000 +--------------------------+
+ *                      | (open bus)               |
  *   0x00000000FFC00000 +--------------------------+
  *                      | 4 MiB firmware flash     |
  *                      | (PAL + SAL + EFI, e.g.   |
@@ -31,6 +39,21 @@
 #define I2000_FLASH_BASE   (0x100000000ull - I2000_FLASH_SIZE)    /* 0xFFC00000 */
 #define I2000_RAM_MAX      0x80000000ull                          /* 2 GiB */
 #define IA64_RESET_VECTOR  0xFFFFFFB0ull
+
+/* The SDV 0.99 debug BIOS places a small per-processor descriptor just
+ * below I2000_RAM_MAX regardless of how much RAM is actually configured:
+ * confirmed live (ar.lc tracing with -m 64M) that it zeroes a field there,
+ * reads it straight back to compute a loop trip-count, and separately
+ * stores a pointer ~0x3E000 below the same boundary into that descriptor.
+ * Real chipsets route this whole architected window even when DRAM below
+ * I2000_RAM_MAX isn't fully populated - the open-bus fallback elsewhere in
+ * bus_read() returns all-ones, not the zero this probe expects, so it read
+ * back garbage and spun forever. Backing it separately from `ram` keeps it
+ * present at any -m size without inflating detected RAM. Sized well above
+ * the largest offset seen so far (~0x3E000) since more of this pattern may
+ * turn up with further tracing. */
+#define I2000_CHIPSET_SCRATCH_SIZE 0x100000ull                    /* 1 MiB */
+#define I2000_CHIPSET_SCRATCH_BASE (I2000_RAM_MAX - I2000_CHIPSET_SCRATCH_SIZE)
 
 typedef struct {
     uint64_t        ram_size;

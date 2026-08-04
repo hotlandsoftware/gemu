@@ -39,6 +39,35 @@
 #define I2000_SAC_CBNR  0x0000FEB00CB0ull
 #define I2000_SAC_CCSR  0x0000FEB00CC0ull
 
+/* I/O SAPIC #0 (SSDM 248704-001 sec. 2.6.2/4.1.3, Figure 4-2): fixed
+ * memory-mapped indirect-register interface, the real platform interrupt-
+ * delivery path for this chipset. */
+#define IOSAPIC_BASE        0xFEC00000ull
+#define IOSAPIC_REGSEL_OFF  0x00u
+#define IOSAPIC_WINDOW_OFF  0x10u
+#define IOSAPIC_EOI_OFF     0x40u
+#define IOSAPIC_SIZE        0x50u
+#define IOSAPIC_RTE_MASK    (UINT64_C(1) << 16)
+
+/* SMBus host controller I/O registers (IFB function 3, SSDM 248704-001
+ * sec. 14.3), offsets from the base programmed into SMBBA. */
+#define SMB_HSTSTS   0x00
+#define SMB_HSTCNT   0x02
+#define SMB_HSTCMD   0x03
+#define SMB_HSTADD   0x04
+#define SMB_HSTDAT0  0x05
+#define SMB_HSTDAT1  0x06
+#define SMB_REGSPAN  0x07  /* highest register offset we implement */
+#define SMB_HSTSTS_INTER     (1u << 1)  /* command completed */
+#define SMB_HSTSTS_DEV_ERR   (1u << 2)  /* no such slave / bad command */
+#define SMB_HSTCNT_START     (1u << 6)
+#define SMB_PROT_BYTE_DATA   2          /* smbhstcnt[4:2]: byte data r/w */
+#define SMB_PROT_QUICK       0
+/* Up to 8 simulated DIMM slots (SMBus slave addresses 0x50-0x57), matching
+ * one 460GX Memory Card's row count (SSDM sec. 5.1/5.5.1) - see spd_init(). */
+#define I2000_SPD_SLOTS 8
+#define I2000_SPD_BASE_ADDR 0x50
+
 /* front panel framebuffer */
 #define FB_W 640
 #define FB_H 400
@@ -49,7 +78,7 @@
 #define CON_ROWS 30              /* serial console area at the bottom */
 
 #define INSTR_PER_FRAME 500000
-#define MMIO_LOG_N 24
+#define MMIO_LOG_N 768
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES  32
 
@@ -68,6 +97,9 @@ struct Ia64I2000State {
 
     uint8_t  *ram;
     uint64_t  ram_size;
+    /* Backs [I2000_CHIPSET_SCRATCH_BASE, I2000_RAM_MAX) independent of
+     * ram_size - see the comment on I2000_CHIPSET_SCRATCH_SIZE in i2000.h. */
+    uint8_t  *chipset_scratch;
     uint8_t  *flash;
     char      flash_file[512];
     uint32_t  flash_image_size;
@@ -101,6 +133,29 @@ struct Ia64I2000State {
     uint16_t  pit0_reload, pit0_latch;
     uint8_t   pit0_write_phase;
     uint64_t  pit0_next_irq;
+    /* PIT channel 1 (port 0x41): unlike channel 0, this has no standard
+     * ISA IRQ wiring on real hardware (classically DRAM refresh, not an
+     * interrupt source) and firmware never touches any I/O SAPIC RTE to
+     * configure it either - confirmed live (IOSAPIC_DEBUG) that every RTE
+     * stays at its default masked reset value the whole time this SDV
+     * BIOS spins waiting on a channel-1-armed count. Delivered directly
+     * at the vector firmware itself put in cr.itv (0x80) despite masking
+     * cr.itv's own local-timer path - the working theory being that 0x80
+     * is just firmware's conventional timer-ISR vector, fed here by
+     * whichever physical timer is actually active. */
+    uint16_t  pit1_reload, pit1_latch;
+    uint8_t   pit1_write_phase;
+    uint64_t  pit1_next_irq;
+    /* I/O SAPIC #0 (SSDM 248704-001 sec. 2.6.2/2.6.3): the real platform
+     * interrupt-delivery path once past legacy 8259 compatibility mode -
+     * legacy_irq_routed above is permanently false (nothing ever sets it),
+     * so this is the only functional interrupt-delivery mechanism. Fixed
+     * at FEC00000h; regsel/window give indirect access to id/version/arb
+     * (00h-02h) and 64 redirection-table entries (10h-8Fh, two dwords
+     * each). GSI N is assumed == legacy ISA IRQ N (no ACPI interrupt
+     * source overrides modeled). */
+    uint32_t  iosapic_regsel;
+    uint64_t  iosapic_rte[64];
     uint8_t   kbc_command_byte;
     uint8_t   kbc_pending_write; /* 0=keyboard data, 1=command byte, 2=output port, 3=aux */
     uint8_t   kbc_out[8];
@@ -112,6 +167,17 @@ struct Ia64I2000State {
     uint8_t   ifb_cfg[256];
     uint8_t   ifb_usb_cfg[256];
     uint8_t   ifb_smbus_cfg[256];
+    /* SMBus host-controller interface (IFB function 3, I/O regs at the
+     * base programmed into ifb_smbus_cfg[0x20..0x23] - SSDM 248704-001
+     * sec. 14.3). Firmware uses this to read Serial Presence Detect (SPD)
+     * data from each DIMM row to compute total installed memory (sec.
+     * 5.5.1) rather than probing addresses; without real SPD data behind
+     * it, firmware fell back to an assumed max-memory layout regardless
+     * of -m, faulting on whatever wasn't actually backed. */
+    uint8_t   smb_hststs, smb_hstcnt, smb_hstcmd, smb_hstadd;
+    uint8_t   smb_hstdat0, smb_hstdat1;
+    bool      spd_present[I2000_SPD_SLOTS];
+    uint8_t   spd[I2000_SPD_SLOTS][256];
     uint8_t   cmd649_cfg[256];
     uint8_t   acpi_io[64];
     FILE     *cdrom;
@@ -485,17 +551,104 @@ static void cmos_sync_live_clock(Ia64I2000State *s) {
     s->cmos[0x09] = cmos_bcd((unsigned)(tmv.tm_year % 100));
 }
 
+/* SMBus host controller (IFB function 3) I/O-register access - see the
+ * SMB_* offsets/bits defined near I2000_IO_BASE. Every transaction
+ * completes synchronously (there's no real bus latency to model), so
+ * HOST_BUSY is always seen clear and status is ready the instant a comand
+ * finishes. */
+static uint64_t smbus_reg_read(Ia64I2000State *s, uint64_t off, unsigned size) {
+    if (size != 1)
+        return ~0ull;
+    switch (off) {
+    case SMB_HSTSTS:  return s->smb_hststs;
+    case SMB_HSTCNT:  return 0;  /* START always reads back 0 */
+    case SMB_HSTCMD:  return s->smb_hstcmd;
+    case SMB_HSTADD:  return s->smb_hstadd;
+    case SMB_HSTDAT0: return s->smb_hstdat0;
+    case SMB_HSTDAT1: return s->smb_hstdat1;
+    default: return ~0ull;
+    }
+}
+
+static void smbus_reg_write(Ia64I2000State *s, uint64_t off, uint64_t val,
+                            unsigned size) {
+    if (size != 1)
+        return;
+    switch (off) {
+    case SMB_HSTSTS:
+        s->smb_hststs &= (uint8_t)~val;  /* write-1-to-clear */
+        return;
+    case SMB_HSTCMD:  s->smb_hstcmd  = (uint8_t)val; return;
+    case SMB_HSTADD:  s->smb_hstadd  = (uint8_t)val; return;
+    case SMB_HSTDAT0: s->smb_hstdat0 = (uint8_t)val; return;
+    case SMB_HSTDAT1: s->smb_hstdat1 = (uint8_t)val; return;
+    case SMB_HSTCNT: {
+        if (!(val & SMB_HSTCNT_START))
+            return;
+        unsigned protocol = (unsigned)((val >> 2) & 7);
+        unsigned slave = (unsigned)(s->smb_hstadd >> 1);
+        bool is_read = (s->smb_hstadd & 1) != 0;
+        unsigned dimm = slave - I2000_SPD_BASE_ADDR;
+        bool present = dimm < I2000_SPD_SLOTS && s->spd_present[dimm];
+        if (getenv("SMBUS_DEBUG"))
+            fprintf(stderr, "i2000: SMBUS start slave=%#x rw=%s proto=%u "
+                    "cmd=%#x dimm=%u present=%d\n", slave,
+                    is_read ? "read" : "write", protocol, s->smb_hstcmd,
+                    dimm, present);
+        if (!present) {
+            s->smb_hststs |= SMB_HSTSTS_DEV_ERR | SMB_HSTSTS_INTER;
+            return;
+        }
+        if (protocol == SMB_PROT_QUICK) {
+            s->smb_hststs |= SMB_HSTSTS_INTER;
+            return;
+        }
+        if (protocol == SMB_PROT_BYTE_DATA) {
+            if (is_read)
+                s->smb_hstdat0 = s->spd[dimm][s->smb_hstcmd];
+            /* SPD EEPROMs are effectively read-only here (no firmware
+             * write-back path needs modeling); accept writes silently. */
+            s->smb_hststs |= SMB_HSTSTS_INTER;
+            return;
+        }
+        s->smb_hststs |= SMB_HSTSTS_DEV_ERR | SMB_HSTSTS_INTER;
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+/* The SMBus base is whatever firmware programs into SMBBA (ifb_smbus_cfg
+ * offset 0x20-0x23, bits[15:4]) - see smbus_reg_read/write's callers. */
+static bool smbus_port_offset(Ia64I2000State *s, uint64_t port, uint64_t *off) {
+    uint32_t bar;
+    memcpy(&bar, &s->ifb_smbus_cfg[0x20], sizeof(bar));
+    if (!(bar & 1))
+        return false;  /* SMBBA not yet programmed as an I/O BAR */
+    uint32_t base = bar & 0xFFF0u;
+    if (base == 0 || port < base || port - base > SMB_REGSPAN)
+        return false;
+    *off = port - base;
+    return true;
+}
+
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     static unsigned debug_reads;
     if (size == 1 && vga_port(port))
         return vga_ibm_io_read(&s->vga, (uint16_t)port);
+    {
+        uint64_t off;
+        if (smbus_port_offset(s, port, &off))
+            return smbus_reg_read(s, off, size);
+    }
     if (port >= 0x1000 && port + size <= 0x1008) {
         /* Firmware busy-polls a status byte here waiting for bit 0 to
-         * clear (the CMD649 SMBus function's reg 20h BAR turned out to be
-         * an unrelated 64-bit *memory* BAR at the same numeric value -
-         * 0x1004 has its I/O-space bit clear - so this isn't actually
-         * that device's I/O space; what real hardware is mapped at this
-         * port isn't established). No real device backs it, so read as
+         * clear before SMBBA gets programmed (see smbus_port_offset()
+         * above, which takes over this same port range once it has) - or
+         * for whatever else turns out to share this range; what real
+         * hardware is mapped at this port outside of SMBus isn't
+         * established. No real device backs it otherwise, so read as
          * idle/complete unconditionally rather than falling through to
          * the generic all-ones "unmapped" response, which left bit 0
          * permanently set and the poll spinning forever. */
@@ -609,11 +762,19 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
      * A floating ATA bus reports status zero; returning the generic unmapped
      * value 0xFF makes firmware believe BSY is asserted forever. */
     if (size == 1 && (port == 0x1F7 || port == 0x177 ||
-                      port == 0x3F6 || port == 0x376))
+                      port == 0x3F6 || port == 0x376)) {
+        if (getenv("ATA_DEBUG"))
+            fprintf(stderr, "i2000: ATA status read port=%#x -> 0x00 "
+                    "ninsts=%" PRIu64 "\n", (unsigned)port, s->cpu->ninsts);
         return 0x00;
+    }
     if (size == 1 && ((port >= 0x1F0 && port <= 0x1F6) ||
-                      (port >= 0x170 && port <= 0x176)))
+                      (port >= 0x170 && port <= 0x176))) {
+        if (getenv("ATA_DEBUG"))
+            fprintf(stderr, "i2000: ATA read port=%#x -> 0x00 ninsts=%"
+                    PRIu64 "\n", (unsigned)port, s->cpu->ninsts);
         return 0x00;
+    }
     mmio_log(s, I2000_IO_BASE + port, 0, size, false);
     return ~0ull;
 }
@@ -624,6 +785,13 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
     if (size == 1 && vga_port(port)) {
         vga_ibm_io_write(&s->vga, (uint16_t)port, (uint8_t)val);
         return;
+    }
+    {
+        uint64_t off;
+        if (smbus_port_offset(s, port, &off)) {
+            smbus_reg_write(s, off, val, size);
+            return;
+        }
     }
     if (port >= 0x1000 && port + size <= 0x1008)
         return; /* no real device behind it - see io_port_read */
@@ -674,6 +842,17 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
             s->pit0_reload = s->pit0_latch | ((uint16_t)(uint8_t)val << 8);
             s->pit0_write_phase = 0;
             s->pit0_next_irq = s->cpu->ninsts + 100000;
+        }
+        return;
+    }
+    if (port == 0x41 && size == 1) {
+        if (!s->pit1_write_phase) {
+            s->pit1_latch = (uint8_t)val;
+            s->pit1_write_phase = 1;
+        } else {
+            s->pit1_reload = s->pit1_latch | ((uint16_t)(uint8_t)val << 8);
+            s->pit1_write_phase = 0;
+            s->pit1_next_irq = s->cpu->ninsts + 100000;
         }
         return;
     }
@@ -771,8 +950,15 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         return;
     }
     if (port == 0x43) {
+        if (getenv("PIT_DEBUG"))
+            fprintf(stderr, "i2000: PIT command byte %#04x (channel=%u "
+                    "mode=%u) ninsts=%" PRIu64 "\n", (unsigned)(uint8_t)val,
+                    (unsigned)((uint8_t)val >> 6), (unsigned)(((uint8_t)val >> 1) & 7),
+                    s->cpu->ninsts);
         if (((uint8_t)val >> 6) == 0)
             s->pit0_write_phase = 0;
+        else if (((uint8_t)val >> 6) == 1)
+            s->pit1_write_phase = 0;
         return;
     }
     if (port == 0x61) {
@@ -849,8 +1035,12 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         }
     }
     if (size == 1 && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6 ||
-                      (port >= 0x170 && port <= 0x177) || port == 0x376))
+                      (port >= 0x170 && port <= 0x177) || port == 0x376)) {
+        if (getenv("ATA_DEBUG"))
+            fprintf(stderr, "i2000: ATA write port=%#x <- %#x ninsts=%"
+                    PRIu64 "\n", (unsigned)port, (unsigned)val, s->cpu->ninsts);
         return;                                     /* empty CMD-649 channels */
+    }
     mmio_log(s, I2000_IO_BASE + port, val, size, true);
 }
 
@@ -899,6 +1089,78 @@ static bool vga_rom_window(uint64_t addr, unsigned size, uint32_t *voff) {
     return true;
 }
 
+/* I/O SAPIC indirect register access (SSDM sec. 2.6.3): iosapic_regsel
+ * selects id(00h)/version(01h)/arbitration(02h)/RTE-low-or-high(10h-8Fh),
+ * manipulated through the window register. */
+static uint32_t iosapic_indirect_read(Ia64I2000State *s) {
+    unsigned reg = s->iosapic_regsel & 0xFF;
+    if (reg == 0x00)
+        return 1u << 15;             /* DT=1 (SAPIC delivery), ID=0 */
+    if (reg == 0x01)
+        return 0x003F0021u;          /* MAX_REDIR=63 (64 entries), VERSION=0x21 */
+    if (reg >= 0x10 && reg <= 0x8F) {
+        unsigned entry = (reg - 0x10) / 2;
+        bool high = ((reg - 0x10) & 1) != 0;
+        uint64_t rte = s->iosapic_rte[entry];
+        return high ? (uint32_t)(rte >> 32) : (uint32_t)rte;
+    }
+    return 0;  /* arbitration ID and reserved registers */
+}
+
+static void iosapic_indirect_write(Ia64I2000State *s, uint32_t val) {
+    unsigned reg = s->iosapic_regsel & 0xFF;
+    if (reg < 0x10 || reg > 0x8F)
+        return;  /* id/version/arbitration: not writable in this model */
+    unsigned entry = (reg - 0x10) / 2;
+    bool high = ((reg - 0x10) & 1) != 0;
+    uint64_t rte = s->iosapic_rte[entry];
+    if (high)
+        rte = (rte & 0x00000000FFFFFFFFull) | ((uint64_t)val << 32);
+    else
+        rte = (rte & 0xFFFFFFFF00000000ull) | val;
+    s->iosapic_rte[entry] = rte;
+    if (getenv("IOSAPIC_DEBUG"))
+        fprintf(stderr, "i2000: IOSAPIC RTE[%u] <- %016" PRIX64
+                " (mask=%d vector=%#x dmode=%u) ninsts=%" PRIu64 "\n",
+                entry, rte, !!(rte & IOSAPIC_RTE_MASK), (unsigned)(rte & 0xFF),
+                (unsigned)((rte >> 8) & 7), s->cpu->ninsts);
+}
+
+/* Deliver global system interrupt `gsi` if its redirection-table entry
+ * isn't masked (SSDM Table 2-10). GSI N == legacy ISA IRQ N (no ACPI
+ * interrupt source overrides modeled). Every entry defaults masked at
+ * reset, so nothing fires until firmware programs it. */
+static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi) {
+    if (gsi >= 64)
+        return;
+    uint64_t rte = s->iosapic_rte[gsi];
+    if (getenv("IOSAPIC_DEBUG")) {
+        static uint64_t n;
+        if (n++ < 20 || (n % 5000) == 0)
+            fprintf(stderr, "i2000: iosapic_raise_gsi(%u) rte=%016" PRIX64
+                    " masked=%d ninsts=%" PRIu64 "\n", gsi, rte,
+                    !!(rte & IOSAPIC_RTE_MASK), s->cpu->ninsts);
+    }
+    if (rte & IOSAPIC_RTE_MASK)
+        return;
+    unsigned delivery_mode = (unsigned)((rte >> 8) & 7);
+    if (delivery_mode == 7) {
+        /* ExtINT: routed to the external 8259A-compatible controller,
+         * which supplies the vector via the legacy PIC's own base. */
+        if (getenv("IOSAPIC_DEBUG"))
+            fprintf(stderr, "i2000: iosapic delivering ExtINT vector=%#x "
+                    "ninsts=%" PRIu64 "\n", s->pic_master_base, s->cpu->ninsts);
+        merced_raise_external(s->cpu, s->pic_master_base);
+        return;
+    }
+    /* Fixed SAPIC mode (000/001, the LSB is a redirection hint this model
+     * doesn't act on): deliver the RTE's own vector directly. */
+    if (getenv("IOSAPIC_DEBUG"))
+        fprintf(stderr, "i2000: iosapic delivering fixed vector=%#x "
+                "ninsts=%" PRIu64 "\n", (unsigned)(uint8_t)rte, s->cpu->ninsts);
+    merced_raise_external(s->cpu, (uint8_t)rte);
+}
+
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64I2000State *s = ud;
     uint32_t voff;
@@ -917,6 +1179,17 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         uint64_t v = 0;
         memcpy(&v, s->ram + addr, size);
         return v;
+    }
+    if (addr >= I2000_CHIPSET_SCRATCH_BASE && addr + size <= I2000_RAM_MAX) {
+        uint64_t v = 0;
+        memcpy(&v, s->chipset_scratch + (addr - I2000_CHIPSET_SCRATCH_BASE), size);
+        return v;
+    }
+    if (addr >= IOSAPIC_BASE && addr < IOSAPIC_BASE + IOSAPIC_SIZE && size == 4) {
+        uint32_t off = (uint32_t)(addr - IOSAPIC_BASE);
+        if (off == IOSAPIC_REGSEL_OFF) return s->iosapic_regsel & 0xFF;
+        if (off == IOSAPIC_WINDOW_OFF) return iosapic_indirect_read(s);
+        return 0;
     }
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
         if (s->flash_read_status) {
@@ -993,6 +1266,18 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
         return;
     if (addr + size <= s->ram_size) {
         memcpy(s->ram + addr, &val, size);
+        return;
+    }
+    if (addr >= I2000_CHIPSET_SCRATCH_BASE && addr + size <= I2000_RAM_MAX) {
+        memcpy(s->chipset_scratch + (addr - I2000_CHIPSET_SCRATCH_BASE), &val, size);
+        return;
+    }
+    if (addr >= IOSAPIC_BASE && addr < IOSAPIC_BASE + IOSAPIC_SIZE && size == 4) {
+        uint32_t off = (uint32_t)(addr - IOSAPIC_BASE);
+        if (off == IOSAPIC_REGSEL_OFF) { s->iosapic_regsel = (uint32_t)val & 0xFF; return; }
+        if (off == IOSAPIC_WINDOW_OFF) { iosapic_indirect_write(s, (uint32_t)val); return; }
+        /* EOI (off == IOSAPIC_EOI_OFF): we don't model level-triggered RIRR
+         * resampling, so there's nothing to do here beyond accepting it. */
         return;
     }
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
@@ -1228,7 +1513,7 @@ static bool i2000_screendump(void *ud, const char *path) {
  * than hand-listing every scalar field, and it stays correct automatically
  * as fields get added. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 1u
+#define I2000_SNAPSHOT_VERSION 2u  /* v2 adds chipset_scratch */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -1241,6 +1526,8 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fwrite(&s->ram_size, sizeof(s->ram_size), 1, f) == 1;
     ok &= fwrite(s->ram, 1, s->ram_size, f) == s->ram_size;
     ok &= fwrite(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
+    ok &= fwrite(s->chipset_scratch, 1, I2000_CHIPSET_SCRATCH_SIZE, f) ==
+          I2000_CHIPSET_SCRATCH_SIZE;
     uint64_t atapi_len = (uint64_t)s->atapi_data_len;
     ok &= fwrite(&atapi_len, sizeof(atapi_len), 1, f) == 1;
     if (atapi_len)
@@ -1252,6 +1539,7 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     snap.cpu = NULL;
     snap.ram = NULL;
     snap.flash = NULL;
+    snap.chipset_scratch = NULL;
     snap.cdrom = NULL;
     snap.atapi_data = NULL;
     ok &= fwrite(&snap, sizeof(snap), 1, f) == 1;
@@ -1281,6 +1569,8 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     }
     ok &= fread(s->ram, 1, s->ram_size, f) == s->ram_size;
     ok &= fread(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
+    ok &= fread(s->chipset_scratch, 1, I2000_CHIPSET_SCRATCH_SIZE, f) ==
+          I2000_CHIPSET_SCRATCH_SIZE;
 
     uint64_t atapi_len = 0;
     ok &= fread(&atapi_len, sizeof(atapi_len), 1, f) == 1;
@@ -1296,6 +1586,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     Merced *cpu = s->cpu;
     uint8_t *ram = s->ram;
     uint8_t *flash = s->flash;
+    uint8_t *chipset_scratch = s->chipset_scratch;
     uint8_t *atapi_data = s->atapi_data;
     if (s->cdrom) fclose(s->cdrom);
     Ia64I2000State loaded;
@@ -1307,6 +1598,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->cpu = cpu;
         s->ram = ram;
         s->flash = flash;
+        s->chipset_scratch = chipset_scratch;
         s->atapi_data = atapi_data;
         s->cdrom = s->cdrom_file[0] ? fopen(s->cdrom_file, "rb") : NULL;
         /* Restart the autosave clock from now, not from whatever wall time
@@ -1446,6 +1738,87 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
 }
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
+
+/* Encode one DIMM row's Serial Presence Detect content for `bytes` of
+ * capacity (must be a power of two) per the Intel/JEDEC "PC SDRAM Serial
+ * Presence Detect" spec (JESD21-C sec. 4.1.2.5) that SSDM 248704-001
+ * sec. 5.5.1 cites. Only the fields firmware's memory-sizing path actually
+ * needs are filled in with confidence (type, row/column address counts,
+ * physical banks, data width, banks-per-device); everything else is left
+ * at conservative, spec-legal defaults since nothing here validates DIMM
+ * timing against real electrical constraints anyway. Size formula used:
+ * bytes = 2^(rows+cols) * (width_bits/8) * banks_per_device * phys_banks,
+ * fixed here at width=64 bits, banks_per_device=1, phys_banks=1, so
+ * rows+cols = log2(bytes) - 3. */
+static void spd_encode(uint8_t out[256], uint64_t bytes) {
+    memset(out, 0, 256);
+    unsigned total_bits = 0;
+    for (uint64_t b = bytes; b > 1; b >>= 1)
+        total_bits++;
+    unsigned addr_bits = total_bits - 3;
+    unsigned cols = addr_bits / 2;
+    unsigned rows = addr_bits - cols;
+    out[0]  = 128;   /* bytes used by module manufacturer */
+    out[1]  = 8;     /* total SPD EEPROM size = 2^8 = 256 bytes */
+    out[2]  = 4;     /* fundamental memory type: SDRAM */
+    out[3]  = (uint8_t)rows;
+    out[4]  = (uint8_t)cols;
+    out[5]  = 1;     /* physical banks (ranks) on this DIMM */
+    out[6]  = 64;    /* module data width, LSB (bits) */
+    out[7]  = 0;     /* module data width, MSB */
+    out[8]  = 4;     /* voltage interface: LVTTL */
+    out[9]  = 0x75;  /* SDRAM cycle time @ max CAS latency: 7.5 ns */
+    out[10] = 0x60;  /* access time from clock: 6.0 ns */
+    out[11] = 0;     /* config type: non-parity, non-ECC */
+    out[12] = 0x82;  /* refresh: normal rate, self-refresh supported */
+    out[13] = 8;     /* primary SDRAM width (bits per chip) */
+    out[16] = 0x0E;  /* burst lengths supported: 2, 4, 8 */
+    out[17] = 1;     /* banks per SDRAM device */
+    out[18] = 0x06;  /* CAS latencies supported: CL2, CL3 */
+    out[62] = 0x11;  /* SPD revision 1.1 */
+    unsigned sum = 0;
+    for (unsigned i = 0; i < 63; i++)
+        sum += out[i];
+    out[63] = (uint8_t)sum;  /* checksum over bytes 0-62 */
+}
+
+/* Populate simulated DIMM SPD content matching the actually-configured
+ * ram_size, so firmware's real memory-detection path (SSDM sec. 5.5.1)
+ * reports the true size instead of assuming a fixed maximum. Decomposes
+ * ram_size into one DIMM per set bit (its binary representation) - exact
+ * for any byte count, and typical -m values (512M, 1G, 2G, ...) need just
+ * one slot. Slots beyond I2000_SPD_SLOTS are folded into the last one if
+ * ram_size is unusually fragmented. */
+static void spd_init(Ia64I2000State *s) {
+    memset(s->spd_present, 0, sizeof(s->spd_present));
+    memset(s->spd, 0, sizeof(s->spd));
+    unsigned slot = 0;
+    uint64_t remaining = s->ram_size;
+    for (int bit = 63; bit >= 0 && remaining; bit--) {
+        uint64_t chunk = UINT64_C(1) << bit;
+        if (!(remaining & chunk))
+            continue;
+        if (slot == I2000_SPD_SLOTS - 1) {
+            /* Last available slot: absorb everything left instead of
+             * dropping it, even though that makes this one DIMM larger
+             * than any single real row the datasheet's table lists. */
+            chunk = remaining;
+            /* spd_encode() requires a power of two; round down to one and
+             * let the next reset attempt (there won't be one, ram_size is
+             * fixed for the process's life) - in practice this path is
+             * only reachable with more than 8 fragments, which no normal
+             * -m value produces. */
+            while (chunk & (chunk - 1))
+                chunk &= chunk - 1;
+        }
+        spd_encode(s->spd[slot], chunk);
+        s->spd_present[slot] = true;
+        remaining -= chunk;
+        slot++;
+        if (slot >= I2000_SPD_SLOTS)
+            break;
+    }
+}
 
 static void chipset_cfg_reset(Ia64I2000State *s) {
     s->flash_read_status = false;
@@ -1592,6 +1965,14 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->memcard_cfg[0][2][0x03] = 7;  /* Itanium family */
     s->memcard_cfg[0][2][0x04] = 0;  /* Merced model */
     s->memcard_cfg[0][2][0x05] = 0;  /* revision - must match cpuid[3] */
+
+    s->smb_hststs = s->smb_hstcnt = s->smb_hstcmd = s->smb_hstadd = 0;
+    s->smb_hstdat0 = s->smb_hstdat1 = 0;
+    spd_init(s);
+
+    s->iosapic_regsel = 0;
+    for (unsigned i = 0; i < 64; i++)
+        s->iosapic_rte[i] = 0x10000;  /* mask bit set, per SSDM Table 2-10 */
 }
 
 Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
@@ -1607,7 +1988,8 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     s->ram_size = cfg->ram_size;
     s->ram = calloc(1, (size_t)s->ram_size);
     s->flash = malloc(I2000_FLASH_SIZE);
-    if (!s->ram || !s->flash) {
+    s->chipset_scratch = calloc(1, I2000_CHIPSET_SCRATCH_SIZE);
+    if (!s->ram || !s->flash || !s->chipset_scratch) {
         fprintf(stderr, "gemu: cannot allocate %" PRIu64 " MiB guest RAM\n",
                 cfg->ram_size >> 20);
         ia64_i2000_destroy(s);
@@ -1677,6 +2059,7 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
     free(s->atapi_data);
     if (s->cdrom) fclose(s->cdrom);
     free(s->flash);
+    free(s->chipset_scratch);
     free(s->ram);
     free(s);
 }
@@ -1684,10 +2067,33 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
 /* ── Execution ───────────────────────────────────────────────────────────── */
 
 static void i2000_poll_interrupts(Ia64I2000State *s) {
-    if (s->legacy_irq_routed && !(s->pic_master_mask & 1) && s->pit0_next_irq &&
-        s->cpu->ninsts >= s->pit0_next_irq) {
-        merced_raise_external(s->cpu, s->pic_master_base);
+    /* legacy_irq_routed is permanently false (nothing ever sets it) - this
+     * platform delivers real interrupts through I/O SAPIC #0 instead (see
+     * iosapic_raise_gsi()), gated on the RTE's own mask bit rather than
+     * the legacy 8259's, matching real hardware once past compatibility
+     * mode. pit0_next_irq itself still only gets armed once firmware
+     * actually programs the PIT reload count (port 0x40). */
+    if (s->pit0_next_irq && s->cpu->ninsts >= s->pit0_next_irq) {
+        iosapic_raise_gsi(s, 0);  /* GSI 0 == legacy PIT/IRQ0 */
         s->pit0_next_irq = s->cpu->ninsts + 100000;
+    }
+    /* Channel 1 has no IOSAPIC RTE ever configured for it (confirmed live,
+     * IOSAPIC_DEBUG) - see the struct comment on pit1_reload. Deliver
+     * directly at the vector firmware itself staged in cr.itv (0x80)
+     * despite masking cr.itv's own path, on the theory that this is
+     * firmware's fixed timer-ISR vector regardless of physical source. */
+    if (s->pit1_next_irq && s->cpu->ninsts >= s->pit1_next_irq) {
+        if (getenv("IOSAPIC_DEBUG"))
+            fprintf(stderr, "i2000: pit1 tick -> vector 0x80/0xD0 ninsts=%"
+                    PRIu64 "\n", s->cpu->ninsts);
+        merced_raise_external(s->cpu, 0x80);
+        /* EXPERIMENT: also latch a class-0xD vector, to test whether
+         * firmware's raised-tpr (0xC0, confirmed live around ATA identify)
+         * critical sections are satisfied by ANY sufficiently high-class
+         * external interrupt via the shared VEC_EXTINT entry, or whether
+         * dispatch is genuinely vector-specific. */
+        merced_raise_external(s->cpu, 0xD0);
+        s->pit1_next_irq = s->cpu->ninsts + 100000;
     }
 }
 
@@ -1789,6 +2195,9 @@ static void i2000_reset(Ia64I2000State *s) {
     s->pit0_reload = s->pit0_latch = 0;
     s->pit0_write_phase = 0;
     s->pit0_next_irq = 0;
+    s->pit1_reload = s->pit1_latch = 0;
+    s->pit1_write_phase = 0;
+    s->pit1_next_irq = 0;
     chipset_cfg_reset(s);
     s->mmio_log_n = 0;
     memset(s->mmio_log, 0, sizeof(s->mmio_log));

@@ -50,7 +50,7 @@
 #define MERCED_N_TR       MERCED_N_DTR   /* legacy alias: the larger file */
 #define MERCED_N_TC       512  /* per side; amortize software VHPT refills */
 #define MERCED_TRACE_HISTORY 512
-#define MERCED_CALL_HISTORY 128
+#define MERCED_CALL_HISTORY 65536
 
 #define MERCED_PHYS_MASK  0x000FFFFFFFFFFFFFull  /* strip UC bit + unimpl */
 
@@ -181,15 +181,22 @@ typedef struct Merced {
         uint8_t  reg;
         uint8_t  valid;
     } alat[32];
-
     /* Interval-timer external interrupt: edge-latched when ar.itc crosses
      * cr.itm, delivered at the next instruction boundary if psr.i is set,
      * acknowledged (cleared) by a cr.ivr read. Real firmware relies on this
      * for cooperative timeouts during driver/protocol enumeration; without
      * it, any code that waits on a timer tick spins forever. */
     uint8_t  timer_pending;
-    uint8_t  external_pending;
-    uint8_t  external_vector;
+    /* External (platform) interrupts: a 256-bit per-vector pending bitmap,
+     * mirroring a real I/O SAPIC's independent per-vector latches rather
+     * than a single-slot "one interrupt at a time" simplification. That
+     * matters because cr.tpr masks delivery by priority *class*: a vector
+     * raised while its class is masked must stay latched without blocking
+     * a later, higher-class vector from also becoming pending and getting
+     * delivered first - confirmed live on the i2000 SDV BIOS, which raises
+     * tpr around ATA identify/enumeration and stalls forever once a
+     * lower-class periodic tick occupies the old single pending slot. */
+    uint8_t  external_pending[32];
     uint8_t  external_itc;
 
     /* --- bookkeeping --- */
