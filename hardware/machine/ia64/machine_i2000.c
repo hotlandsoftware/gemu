@@ -1838,16 +1838,22 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         if (addr >= mmio && addr + size <= mmio + RAGE128_MMIO_SIZE)
             return rage128_mmio_read(s, (unsigned)(addr - mmio), size);
     }
-    if (vga_mem_window(s, addr, size, &voff)) {
-        uint64_t v = 0;
-        for (unsigned i = 0; i < size; i++)
-            v |= (uint64_t)vga_ibm_mem_read(&s->vga, voff + i) << (i * 8);
-        return v;
-    }
-    if (vga_rom_window(addr, size, &voff)) {
-        uint64_t v = 0;
-        memcpy(&v, s->vga_rom_shadow + voff, size);
-        return v;
+    /* vga_mem_window()/vga_rom_window() can only ever match addr < 0xD0000
+     * (the legacy VGA aperture + option-ROM shadow window) - skip both
+     * calls for the overwhelming majority of accesses, which land well
+     * above that legacy hole. */
+    if (addr < 0xD0000) {
+        if (vga_mem_window(s, addr, size, &voff)) {
+            uint64_t v = 0;
+            for (unsigned i = 0; i < size; i++)
+                v |= (uint64_t)vga_ibm_mem_read(&s->vga, voff + i) << (i * 8);
+            return v;
+        }
+        if (vga_rom_window(addr, size, &voff)) {
+            uint64_t v = 0;
+            memcpy(&v, s->vga_rom_shadow + voff, size);
+            return v;
+        }
     }
     if (region6 && addr + size <= I2000_FLASH_BASE) {
         uint32_t saved = s->pci_cfg_addr;
@@ -1967,17 +1973,22 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
             return;
         }
     }
-    if (vga_mem_window(s, addr, size, &voff)) {
-        for (unsigned i = 0; i < size; i++)
-            vga_ibm_mem_write(&s->vga, voff + i, (uint8_t)(val >> (i * 8)));
-        return;
+    /* See the matching comment in bus_read(): both window checks can only
+     * ever match addr < 0xD0000. */
+    if (addr < 0xD0000) {
+        if (vga_mem_window(s, addr, size, &voff)) {
+            for (unsigned i = 0; i < size; i++)
+                vga_ibm_mem_write(&s->vga, voff + i, (uint8_t)(val >> (i * 8)));
+            return;
+        }
+        /* Read-only, like a real (locked) option ROM shadow: this is what
+         * keeps a generic "clear all of system RAM" firmware loop from
+         * wiping the video BIOS out before it's ever used, since real
+         * hardware wouldn't report this range as regular RAM in the first
+         * place. */
+        if (vga_rom_window(addr, size, &voff))
+            return;
     }
-    /* Read-only, like a real (locked) option ROM shadow: this is what keeps
-     * a generic "clear all of system RAM" firmware loop from wiping the
-     * video BIOS out before it's ever used, since real hardware wouldn't
-     * report this range as regular RAM in the first place. */
-    if (vga_rom_window(addr, size, &voff))
-        return;
     if (region6 && addr + size <= I2000_FLASH_BASE) {
         uint32_t saved = s->pci_cfg_addr;
         s->pci_cfg_addr = 0x80000000u | ((uint32_t)addr & 0xfffffffcu);
@@ -3163,6 +3174,67 @@ static void i2000_report_halt(Ia64I2000State *s) {
     fputs(buf, stderr);
 }
 
+static uint64_t i2000_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+/* GEMU_BENCH_NINSTS=<N> [+ optional GEMU_BENCH_WARMUP=<W>]: measures a
+ * windowed slots/sec rate from ninsts==W (default 0) to ninsts==N, then
+ * prints and exits. The warmup point matters because a few hand-patched
+ * fast paths in merced_step() (e.g. the SAL RAM-clear idiom) advance ninsts
+ * by hundreds of millions in a single call without doing per-slot
+ * interpretation - a window starting at ninsts==0 would measure that
+ * shortcut's speed, not the interpreter's. Set GEMU_BENCH_WARMUP past the
+ * point where those one-shot jumps have already happened so the window only
+ * covers genuine bundle-by-bundle execution. Resolved once - see the
+ * getenv()-per-instruction cost warning near watch_init() in merced.c, same
+ * reasoning applies to any check made from the per-slice loop below. */
+static void i2000_bench_targets(uint64_t *warmup, uint64_t *target) {
+    static uint64_t w, t;
+    static bool resolved;
+    if (!resolved) {
+        resolved = true;
+        const char *wspec = getenv("GEMU_BENCH_WARMUP");
+        const char *tspec = getenv("GEMU_BENCH_NINSTS");
+        if (wspec) w = strtoull(wspec, NULL, 0);
+        if (tspec) t = strtoull(tspec, NULL, 0);
+    }
+    *warmup = w;
+    *target = t;
+}
+
+static void i2000_bench_check(Ia64I2000State *s) {
+    uint64_t warmup, target;
+    i2000_bench_targets(&warmup, &target);
+    if (!target)
+        return;
+
+    static uint64_t window_start_ninsts;
+    static uint64_t window_start_ns;
+    static bool window_open;
+    if (!window_open) {
+        if (s->cpu->ninsts < warmup)
+            return;
+        window_open = true;
+        window_start_ninsts = s->cpu->ninsts;
+        window_start_ns = i2000_monotonic_ns();
+    }
+
+    if (s->cpu->ninsts < target)
+        return;
+    uint64_t ninsts_delta = s->cpu->ninsts - window_start_ninsts;
+    double elapsed_s = (double)(i2000_monotonic_ns() - window_start_ns) / 1e9;
+    double slots_per_sec = (double)ninsts_delta / elapsed_s;
+    printf("gemu-bench: window=[%" PRIu64 ",%" PRIu64 "] ninsts_delta=%"
+           PRIu64 " elapsed=%.3fs slots/sec=%.0f bundle-equiv/sec=%.0f\n",
+           window_start_ninsts, s->cpu->ninsts, ninsts_delta, elapsed_s,
+           slots_per_sec, slots_per_sec / 3.0);
+    fflush(stdout);
+    exit(0);
+}
+
 static void i2000_run_slice(Ia64I2000State *s) {
     if (s->halted)
         return;
@@ -3353,6 +3425,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             i2000_run_slice(s);
             if (!s->halted)
                 i2000_autosave_tick(s);
+            i2000_bench_check(s);
         }
 
         if (s->display) {

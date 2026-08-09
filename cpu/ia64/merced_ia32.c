@@ -537,15 +537,17 @@ MercedStatus merced_ia32_step(Merced *m) {
     unsigned size = x.op32 ? 4 : 2;
     bool branch = false;
 
-    unsigned hi = m->trace_history_next++ % MERCED_TRACE_HISTORY;
+    unsigned hi = m->trace_history_next % MERCED_TRACE_HISTORY;
+    unsigned hi_ext = m->trace_history_next % MERCED_TRACE_EXT_HISTORY;
+    m->trace_history_next++;
     m->trace_history[hi].ip = x.start;
     m->trace_history[hi].raw = op;
-    m->trace_history[hi].src2 = gr(&x, 8);
-    m->trace_history[hi].src3 = eflags(&x);
-    m->trace_history[hi].r25 = gr(&x, 25);
     m->trace_history[hi].b0 = m->br[0];
     m->trace_history[hi].unit = 'x';
     m->trace_history[hi].qp = 0;
+    m->trace_history_ext[hi_ext].src2 = gr(&x, 8);
+    m->trace_history_ext[hi_ext].src3 = eflags(&x);
+    m->trace_history_ext[hi_ext].r25 = gr(&x, 25);
 
     if (op == 0xf4) {
         /* HLT is an IA-32 instruction intercept.  Keep m->ip at x.start:

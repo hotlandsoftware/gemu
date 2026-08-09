@@ -1279,6 +1279,19 @@ static bool acpi_pm_window(uint64_t addr, unsigned size, uint32_t *off) {
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64GenericState *s = ud;
     uint32_t voff;
+    /* Fast path for the hottest case (ordinary RAM), ahead of the ~13
+     * MMIO range checks below. Bounded by the lowest MMIO base rather than
+     * ram_size alone, since ram_size isn't clamped to GENERIC_RAM_MAX - an
+     * oversized -m would otherwise let this shadow a real MMIO range. */
+    {
+        uint64_t ram_fast_max = s->ram_size < GENERIC_IOSAPIC_BASE
+                               ? s->ram_size : GENERIC_IOSAPIC_BASE;
+        if (addr + size <= ram_fast_max) {
+            uint64_t v = 0;
+            memcpy(&v, s->ram + addr, size);
+            return v;
+        }
+    }
     if (s->qemu_firmware && addr >= GENERIC_QEMU_PCI_ECAM_BASE &&
         addr + size <= GENERIC_QEMU_PCI_ECAM_BASE + GENERIC_QEMU_PCI_ECAM_SIZE)
         return qemu_pci_cfg_read(s, addr, size);
@@ -1437,6 +1450,15 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                 " pa=%08" PRIX64 " size=%u value=%016" PRIX64 "\n",
                 s->cpu ? s->cpu->ip : 0, addr, size, val);
     uint32_t voff;
+    /* See the matching fast path in bus_read(). */
+    {
+        uint64_t ram_fast_max = s->ram_size < GENERIC_IOSAPIC_BASE
+                               ? s->ram_size : GENERIC_IOSAPIC_BASE;
+        if (addr + size <= ram_fast_max) {
+            memcpy(s->ram + addr, &val, size);
+            return;
+        }
+    }
     if (s->qemu_firmware && addr >= GENERIC_QEMU_PCI_ECAM_BASE &&
         addr + size <= GENERIC_QEMU_PCI_ECAM_BASE + GENERIC_QEMU_PCI_ECAM_SIZE) {
         qemu_pci_cfg_write(s, addr, val, size);

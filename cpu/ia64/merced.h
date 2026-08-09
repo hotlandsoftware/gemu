@@ -50,6 +50,16 @@
 #define MERCED_N_TR       MERCED_N_DTR   /* legacy alias: the larger file */
 #define MERCED_N_TC       512  /* per side; amortize software VHPT refills */
 #define MERCED_TRACE_HISTORY 512
+/* Register-value fields (src2/src3/r8/r25/r32-r36) live in a separate,
+ * much smaller ring than the cheap ip/raw/unit/qp/b0/pr fields below - they
+ * still get captured (9 gr_read() calls) every slot like before, since the
+ * point of this ring is "whatever the last N happen to be before an
+ * unpredictable halt", but keeping them out of the big 512-entry array
+ * means far fewer bytes get written into that array per slot. This size is
+ * exactly what i2000_report_halt()'s default HALT_TRACE_LINES=32 dump
+ * reads; deep opt-in dumps (MERCED_DEBUG_* env vars requesting more) just
+ * see the cheap fields only for anything older than this. */
+#define MERCED_TRACE_EXT_HISTORY 32
 #define MERCED_CALL_HISTORY 65536
 
 #define MERCED_PHYS_MASK  0x000FFFFFFFFFFFFFull  /* strip UC bit + unimpl */
@@ -171,6 +181,26 @@ typedef struct Merced {
     MercedTlbEntry itr[MERCED_N_ITR], dtr[MERCED_N_DTR];
     MercedTlbEntry itc[MERCED_N_TC], dtc[MERCED_N_TC];
     uint32_t itc_next, dtc_next;
+    /* Last-hit index per TR/TC array, checked by tlb_search() before its
+     * linear scan. Self-validating: the hint is only ever used after
+     * re-checking that entry's live valid/rid/va_start/va_end fields, so a
+     * purged or overwritten slot just falls through to the full scan
+     * instead of returning stale data - no invalidation bookkeeping needed
+     * anywhere a TR/TC entry gets inserted or purged. */
+    uint32_t itr_hint, dtr_hint, itc_hint, dtc_hint;
+
+    /* merced_step() is called once per instruction SLOT, so straight-line
+     * code re-fetches and re-decodes the same 16-byte bundle up to 3 times
+     * (once per slot). This caches the last fetched bundle's raw lo/hi
+     * words keyed by (bundle_va, pa) - both must still match (not just
+     * bundle_va) so a translation change for the same VA (TLB purge/remap)
+     * can't serve stale bytes. Invalidated explicitly on any store that
+     * overlaps the cached physical bundle (see phys_write()) and on the
+     * SAL RAM-clear fast path's bulk fill, so self-modifying code can't
+     * observe stale cached bytes either. */
+    bool     bundle_cache_valid;
+    uint64_t bundle_cache_va, bundle_cache_pa;
+    uint64_t bundle_cache_lo, bundle_cache_hi;
 
     /* Integer Advanced Load Address Table.  Merced exposes 32 ALAT entries;
      * an entry associates an advanced-load destination register with the
@@ -181,6 +211,11 @@ typedef struct Merced {
         uint8_t  reg;
         uint8_t  valid;
     } alat[32];
+    /* Bit i mirrors alat[i].valid - kept in sync via alat_set_valid() so
+     * every store doesn't need to scan the full 32-entry array when the
+     * ALAT (populated only by advanced loads, architecturally rare) is
+     * empty, which is the common case. */
+    uint32_t alat_valid_mask;
     /* Interval-timer external interrupt: edge-latched when ar.itc crosses
      * cr.itm, delivered at the next instruction boundary if psr.i is set,
      * acknowledged (cleared) by a cr.ivr read. Real firmware relies on this
@@ -209,10 +244,13 @@ typedef struct Merced {
                                 * bundle template) - cover validates this */
     uint64_t trace_n;     /* stderr-trace this many slots (debug) */
     struct {
-        uint64_t ip, raw, src2, src3, r8, r25, r32, r33, r34, r35, r36;
+        uint64_t ip, raw;
         uint64_t b0, pr;
         uint8_t unit, qp;
     } trace_history[MERCED_TRACE_HISTORY];
+    struct {
+        uint64_t src2, src3, r8, r25, r32, r33, r34, r35, r36;
+    } trace_history_ext[MERCED_TRACE_EXT_HISTORY];
     uint32_t trace_history_next;
     struct {
         uint64_t from, to;
