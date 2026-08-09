@@ -78,7 +78,7 @@
 
 /* front panel framebuffer */
 #define FB_W 640
-#define FB_H 400
+#define FB_H 480
 #define CELL_W 6
 #define CELL_H 8
 #define COLS (FB_W / CELL_W)     /* 106 */
@@ -2300,6 +2300,59 @@ static void i2000_render_frame(Ia64I2000State *s) {
                 }
             }
             return;
+        }
+    }
+    if (getenv("VGA_TEXT_DEBUG")) {
+        static unsigned printed;
+        if (printed < 20) {
+            printed++;
+            fprintf(stderr, "i2000: VGA-TEXT #%u ninsts=%" PRIu64 " crtc[1]=%02x crtc[7]=%02x "
+                    "crtc[9]=%02x crtc[0x12]=%02x crtc[0x13]=%02x "
+                    "crtc[0x14]=%02x crtc[0x17]=%02x seq[4]=%02x gc[6]=%02x\n",
+                    printed, s->cpu->ninsts, s->vga.crtc[1], s->vga.crtc[7],
+                    s->vga.crtc[9], s->vga.crtc[0x12], s->vga.crtc[0x13],
+                    s->vga.crtc[0x14], s->vga.crtc[0x17], s->vga.seq[4],
+                    s->vga.gc[6]);
+            fprintf(stderr, "i2000: VGA-WRITEREGS seq[2]=%02x gc[0]=%02x "
+                    "gc[1]=%02x gc[3]=%02x gc[4]=%02x gc[5]=%02x gc[8]=%02x "
+                    "attr[0x11]=%02x attr[0x12]=%02x\n",
+                    s->vga.seq[2], s->vga.gc[0], s->vga.gc[1], s->vga.gc[3],
+                    s->vga.gc[4], s->vga.gc[5], s->vga.gc[8],
+                    s->vga.attr[0x11], s->vga.attr[0x12]);
+            fprintf(stderr, "i2000: VGA-ATTR ");
+            for (int i = 0; i < 16; i++)
+                fprintf(stderr, "%02x ", s->vga.attr[i]);
+            fprintf(stderr, "\ni2000: VGA-DAC(idx0-3) ");
+            for (int i = 0; i < 4; i++)
+                fprintf(stderr, "[%u]=%02x,%02x,%02x ", i,
+                        s->vga.dac[i][0], s->vga.dac[i][1], s->vga.dac[i][2]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "\ni2000: VGA-DAC(idx4-7) ");
+            for (int i = 4; i < 8; i++)
+                fprintf(stderr, "[%u]=%02x,%02x,%02x ", i,
+                        s->vga.dac[i][0], s->vga.dac[i][1], s->vga.dac[i][2]);
+            fprintf(stderr, "\n");
+            for (int plane = 0; plane < 4; plane++) {
+                for (int row = 0; row < 4; row++) {
+                    fprintf(stderr, "i2000: VGA-TITLE plane%d row%d[0..15]=",
+                            plane, row);
+                    for (int i = 0; i < 16; i++)
+                        fprintf(stderr, "%02x ",
+                                s->vga.vram[plane][row * 80 + i]);
+                    fprintf(stderr, "\n");
+                }
+            }
+            for (int plane = 0; plane < 4; plane++) {
+                for (int row = 16; row < 22; row++) {
+                    fprintf(stderr, "i2000: VGA-TEXT plane%d row%d[0..47]=",
+                            plane, row);
+                    for (int i = 0; i < 48; i++)
+                        fprintf(stderr, "%02x ",
+                                s->vga.vram[plane][row * 80 + i]);
+                    fprintf(stderr, "\n");
+                }
+            }
+            fflush(stderr);
         }
     }
     vga_ibm_render(&s->vga, s->fb, FB_W, FB_H, vgafont16);

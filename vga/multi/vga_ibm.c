@@ -6,6 +6,8 @@
  * so it's implemented as a standalone, reusable device.
  */
 #include "vga_ibm.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 void vga_ibm_reset(VgaIbm *v) {
@@ -71,6 +73,14 @@ void vga_ibm_mem_write(VgaIbm *v, uint32_t addr, uint8_t val) {
     uint8_t enable_sr = v->gc[1];
     unsigned map_mask = forced ? (1u << plane) : (v->seq[2] & 0xF);
 
+    if (idx == 1280 && getenv("VGA_WRITE_DEBUG")) {
+        fprintf(stderr, "vga_ibm: WRITE idx=%u addr=%u val=%02x write_mode=%u "
+                "map_mask=%02x set_reset=%02x enable_sr=%02x forced=%d "
+                "func=%u bitmask=%02x latch=%02x,%02x,%02x,%02x\n",
+                idx, addr, val, write_mode, map_mask, set_reset, enable_sr, forced,
+                func, bitmask, v->latch[0], v->latch[1], v->latch[2], v->latch[3]);
+        fflush(stderr);
+    }
     for (int p = 0; p < 4; p++) {
         if (!(map_mask & (1u << p))) continue;
         uint8_t data;
@@ -138,6 +148,10 @@ uint8_t vga_ibm_io_read(VgaIbm *v, uint16_t port) {
 }
 
 void vga_ibm_io_write(VgaIbm *v, uint16_t port, uint8_t val) {
+    if (getenv("VGA_REG_DEBUG"))
+        fprintf(stderr, "vga_ibm: IOWRITE port=%04x val=%02x "
+                "(seq_idx=%02x crtc_idx=%02x gc_idx=%02x)\n",
+                port, val, v->seq_index, v->crtc_index, v->gc_index);
     switch (port) {
     case 0x3C0:
         if (!v->attr_flipflop) v->attr_index = val;
