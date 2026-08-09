@@ -2118,7 +2118,7 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
                     }
                 }
             }
-            gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
+            gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor) || s->halted);
             generic_render_frame(s);
             gemu_display_render(s->display, s->fb, FB_W, FB_H);
             gemu_sleep_ms(s->halted ? 30 : 1);

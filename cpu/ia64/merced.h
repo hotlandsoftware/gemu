@@ -285,11 +285,18 @@ bool merced_ia32_read(Merced *m, uint64_t va, unsigned size,
                       bool ifetch, uint64_t *value);
 bool merced_ia32_write(Merced *m, uint64_t va, unsigned size,
                        uint64_t value);
+MercedStatus merced_ia32_instruction_intercept(Merced *m, uint64_t iim,
+                                                uint16_t code);
 uint64_t merced_ia32_gr_read(Merced *m, unsigned reg);
 void merced_ia32_gr_write(Merced *m, unsigned reg, uint64_t value);
 
 /* Latch a platform interrupt for delivery through cr.ivr. */
 void merced_raise_external(Merced *m, uint8_t vector);
+void merced_ack_external(Merced *m, uint8_t vector);
+
+/* Force cr.tpr directly - EXPERIMENTAL hook for the i2000 ATA controller,
+ * see the call site in machine_i2000.c for why. */
+void merced_set_tpr(Merced *m, uint64_t tpr);
 
 /* Full register dump for the monitor. */
 void merced_dump_state(const Merced *m, char *buf, size_t len);

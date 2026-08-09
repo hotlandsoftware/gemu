@@ -110,7 +110,7 @@ def run_microprogram(text: str):
         fh.write(text)
         path = fh.name
     try:
-        out = subprocess.run([str(GEMU), "-M", "generic", "-microprogram", path],
+        out = subprocess.run([str(GEMU), "-M", "generic-ia64", "-microprogram", path],
                              capture_output=True, text=True, timeout=60).stdout
     finally:
         Path(path).unlink(missing_ok=True)

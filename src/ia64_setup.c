@@ -214,6 +214,8 @@ int ia64_setup(int argc, char *argv[]) {
 
     cfg.display_type = args.display_type;
     cfg.display_scale = args.display_scale;
+    cfg.vnc_addr = args.vnc_addr;
+    cfg.vga = args.vga ? args.vga : "std";
     cfg.no_shutdown = args.no_shutdown;
 
     if (serial_spec && strcmp(alias, "generic-ia64") != 0) {

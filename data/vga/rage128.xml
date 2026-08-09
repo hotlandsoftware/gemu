@@ -1,0 +1,3 @@
+<?xml version="1.0"?>
+<vga name="rage128" description="ATI Rage 128 PF" 
+    requires="ia64" status="preliminary"/>

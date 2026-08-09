@@ -62,6 +62,8 @@ typedef struct {
     const char     *hda_path;
     GemuDisplayType display_type;
     int             display_scale;
+    const char     *vnc_addr;
+    const char     *vga;
     bool            no_shutdown;
     bool            menu_disabled; /* machine XML's menu="disabled" */
 } Ia64Config;

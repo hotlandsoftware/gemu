@@ -122,6 +122,7 @@ enum {
     VEC_INST_ACCESS_RIGHTS = 0x5200, VEC_DATA_ACCESS_RIGHTS = 0x5300,
     VEC_GENERAL = 0x5400,
     VEC_NAT = 0x5600, VEC_SPEC = 0x5700, VEC_UNALIGNED = 0x5A00,
+    VEC_IA32_INTERCEPT = 0x6A00,
 };
 
 /* one-shot warning ids */
@@ -157,6 +158,15 @@ static uint64_t gr_read(Merced *m, unsigned r, uint8_t *nat) {
     if (r == 0) return 0;
     if (r < 16) { if (nat) *nat = m->nat_static[r]; return m->gr_static[r]; }
     if (r < 32) {
+        if (r == 29 && getenv("R29_DEBUG") &&
+            (m->ip & ~UINT64_C(0xF)) >= UINT64_C(0x7FF0FD90) &&
+            (m->ip & ~UINT64_C(0xF)) <= UINT64_C(0x7FF0FEF0)) {
+            fprintf(stderr, "merced: R29-READ ip=%016" PRIX64
+                    " bn=%u bank0=%016" PRIX64 " bank1=%016" PRIX64
+                    " ninsts=%" PRIu64 "\n", m->ip, !!(m->psr & PSR_BN),
+                    m->gr_bank0[13], m->gr_static[29], m->ninsts);
+            fflush(stderr);
+        }
         if (m->psr & PSR_BN) { if (nat) *nat = m->nat_static[r]; return m->gr_static[r]; }
         if (nat) *nat = m->nat_bank0[r - 16];
         return m->gr_bank0[r - 16];
@@ -232,6 +242,36 @@ static bool alat_check_reg(Merced *m, unsigned reg, bool clear) {
 
 static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
     if (r == 0) return;   /* writes to r0 fault on HW; ignore here */
+    if (r == 24 && getenv("R24_DEBUG") &&
+        (m->ip & ~UINT64_C(0xF)) >= UINT64_C(0x7FF0DF60) &&
+        (m->ip & ~UINT64_C(0xF)) <= UINT64_C(0x7FF0E120)) {
+        fprintf(stderr, "merced: R24-WRITE ip=%016" PRIX64 " value=%016"
+                PRIX64 " nat=%u ninsts=%" PRIu64 "\n",
+                m->ip, v, !!nat, m->ninsts);
+        fflush(stderr);
+    }
+    if (r == 8 && getenv("R8_DEBUG") &&
+        (m->ip & ~UINT64_C(0xF)) >= UINT64_C(0x7FE30000) &&
+        (m->ip & ~UINT64_C(0xF)) <= UINT64_C(0x7FE40000)) {
+        fprintf(stderr, "merced: R8-WRITE ip=%016" PRIX64 " value=%016"
+                PRIX64 " nat=%u ninsts=%" PRIu64 "\n",
+                m->ip, v, !!nat, m->ninsts);
+        fflush(stderr);
+    }
+    if (r == 5 && getenv("R5_DEBUG")) {
+        fprintf(stderr, "merced: R5-WRITE ip=%016" PRIX64 " value=%016"
+                PRIX64 " nat=%u ninsts=%" PRIu64 "\n",
+                m->ip, v, !!nat, m->ninsts);
+        fflush(stderr);
+    }
+    if (r == 29 && getenv("R29_DEBUG") &&
+        (m->ip & ~UINT64_C(0xF)) >= UINT64_C(0x7FE3EB00) &&
+        (m->ip & ~UINT64_C(0xF)) <= UINT64_C(0x7FF0FEF0)) {
+        fprintf(stderr, "merced: R29-WRITE ip=%016" PRIX64 " value=%016"
+                PRIX64 " nat=%u bn=%u ninsts=%" PRIu64 "\n",
+                m->ip, v, !!nat, !!(m->psr & PSR_BN), m->ninsts);
+        fflush(stderr);
+    }
     if (r == 19 && debug_b520_fault_active &&
         getenv("MERCED_DEBUG_R19_NAT")) {
         static unsigned n;
@@ -570,6 +610,10 @@ static void ext_pending_clear(Merced *m, uint8_t vector) {
     m->external_pending[vector >> 3] &= (uint8_t)~(1u << (vector & 7));
 }
 
+void merced_ack_external(Merced *m, uint8_t vector) {
+    ext_pending_clear(m, vector);
+}
+
 static bool ext_pending_test(const Merced *m, uint8_t vector) {
     return (m->external_pending[vector >> 3] >> (vector & 7)) & 1;
 }
@@ -578,24 +622,50 @@ void merced_raise_external(Merced *m, uint8_t vector) {
     ext_pending_set(m, vector);
 }
 
+void merced_set_tpr(Merced *m, uint64_t tpr) {
+    m->cr[CR_TPR] = tpr;
+}
+
 /* An external interrupt is eligible only when its priority class exceeds
  * cr.tpr.mic.  NT represents IRQL in the high nibble of the vector and
  * writes that value directly to CR.TPR; ignoring it permits a clock vector
  * to re-enter its own queued-spinlock path and deadlock the sole processor.
- * CR.TPR.mmi (bit 16) masks all maskable interrupts. */
+ * CR.TPR.mmi (bit 16) masks all maskable interrupts.
+ *
+ * Vectors 0 and 2 are architecturally special (SDM Vol.2 5.6/5.7, confirmed
+ * against reference/qemu-system-ia64-merced's sapic_vector_unmasked()):
+ * vector 2 is the local SAPIC's NMI delivery mode - never masked, not even
+ * by TPR.mmi. Vector 0 is ExtINT delivery mode - the legacy-8259-compatible
+ * path a real chipset uses to signal the CPU when a classic PIC IRQ fires,
+ * gated only by TPR.mmi, NOT by TPR.mic's priority class (real legacy PC
+ * interrupts have no notion of IA-64 IRQL). Getting this wrong is exactly
+ * what caused the i2000 SDV BIOS to hang forever: it raises tpr to 0xC0
+ * around ATA identify and never lowers it again, which permanently masks
+ * any normal (>=16) vector but must NOT mask ExtINT. */
 static bool interrupt_unmasked(Merced *m, uint8_t vector) {
     uint64_t tpr = m->cr[CR_TPR];
+    if (vector == 2)
+        return true;
+    if (vector == 0)
+        return !(tpr & (UINT64_C(1) << 16));
     if (tpr & (UINT64_C(1) << 16))
         return false;
     return (vector & 0xF0u) > (tpr & 0xF0u);
 }
 
 /* The highest-priority pending external vector that also clears the
- * current cr.tpr, or -1.  Vectors 0-15 are architecturally reserved (fault/
- * trap vector space), so the platform-interrupt range starts at 16.  Real
- * I/O SAPIC hardware resolves cr.ivr the same way: independently-latched
- * vectors, highest priority wins, lower ones stay pending underneath. */
+ * current cr.tpr, or -1.  Vectors 1 and 3-15 are architecturally reserved
+ * (fault/trap vector space) and never legal external-interrupt vectors;
+ * 0 (ExtINT) and 2 (NMI) are legal but outrank every normal (>=16) vector -
+ * they're delivery *modes*, not priority-classed platform interrupts, so
+ * they're checked first regardless of numeric value. Real I/O SAPIC
+ * hardware resolves cr.ivr the same way: independently-latched vectors,
+ * highest priority wins, lower ones stay pending underneath. */
 static int ext_highest_unmasked(Merced *m) {
+    if (ext_pending_test(m, 2) && interrupt_unmasked(m, 2))
+        return 2;
+    if (ext_pending_test(m, 0) && interrupt_unmasked(m, 0))
+        return 0;
     for (int v = 255; v >= 16; v--) {
         if (ext_pending_test(m, (uint8_t)v) && interrupt_unmasked(m, (uint8_t)v))
             return v;
@@ -1298,6 +1368,16 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
         }
     }
     bool ia32 = (m->psr & PSR_IS) != 0;
+    /* IA-32 CSD/SSD live in mapped GR25/GR26 while PSR.is is set, but in
+     * AR.CSD/AR.SSD while native IA-64 code handles the interruption.  The
+     * transition copies are architectural (SDM Vol. 1, 6.4.3).  Omitting
+     * this lost the real-mode CS base across the first PIT interruption:
+     * F000:FEA5's near jump was consequently resolved from base zero and
+     * landed at 0000:E06F instead of F000:E06F. */
+    if (ia32) {
+        m->ar[25] = gr_read(m, 25, NULL); /* AR.CSD */
+        m->ar[26] = gr_read(m, 26, NULL); /* AR.SSD */
+    }
     unsigned slot = ia32 ? 0 : (unsigned)(m->ip & 3);
     uint64_t interrupted_iip =
         ia32 ? (uint32_t)m->ip : (m->ip & ~UINT64_C(0xF));
@@ -4453,6 +4533,10 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                 v = 15;
             }
         }
+        if (getenv("EXTR_DEBUG") && cr3 == CR_ISR)
+            fprintf(stderr, "merced: MOVCR r1=%u isr=%016" PRIX64
+                    " ip=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                    r1, v, m->ip, m->ninsts);
         gr_write(m, r1, v, 0);
         return MERCED_OK;
     }
@@ -4848,15 +4932,23 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             unsigned pos = (unsigned)bits(raw, 14, 6);
             unsigned len = (unsigned)bits(raw, 27, 6) + 1;
             unsigned sgn = (unsigned)bits(raw, 13, 1);
+            uint64_t src_before = gr_read(m, r3, &n3);
             /* A field extending past bit 63 is truncated at the source
              * register boundary.  Sign extension uses the top bit that
              * actually exists, not an implied zero beyond the register. */
             if (len > 64 - pos)
                 len = 64 - pos;
-            uint64_t v = gr_read(m, r3, &n3) >> pos;
+            uint64_t v = src_before >> pos;
             if (len < 64) {
                 v &= (1ull << len) - 1;
                 if (sgn) v = (uint64_t)sext(v, len);
+            }
+            if (getenv("EXTR_DEBUG") && r1 == 29) {
+                fprintf(stderr, "merced: EXTR r1=%u r3=%u pos=%u len=%u sgn=%u "
+                        "src=%016" PRIX64 " result=%016" PRIX64 " ip=%016" PRIX64
+                        " ninsts=%" PRIu64 "\n", r1, r3, pos, len, sgn,
+                        src_before, v, m->ip, m->ninsts);
+                fflush(stderr);
             }
             gr_write(m, r1, v, n3);
             return MERCED_OK;
@@ -5214,6 +5306,23 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
         case 0x08: {                                /* rfi */
             uint64_t ipsr = m->cr[CR_IPSR];
             uint64_t iip = m->cr[CR_IIP];
+            if ((ipsr & PSR_IS) && !(m->psr & PSR_IS) &&
+                getenv("IA32_ENTRY_DEBUG")) {
+                /* Genuine native->IA32 transition only - excludes the
+                 * far more common IA32->IA32 case (an ITLB/DTLB miss
+                 * fault while already executing IA-32 code, refilled and
+                 * retried via this same rfi instruction with ipsr.is
+                 * simply carried over from the interrupted context). */
+                uint64_t r12 = gr_read(m, 12, NULL);
+                uint64_t retfield = 0xdeadbeef;
+                dbg_read(m, r12 + 416, &retfield, 8);
+                fprintf(stderr, "merced: IA32 ENTRY (native->ia32) "
+                        "target=%#" PRIx64 " rfi_ip=%#" PRIx64 " r12=%#"
+                        PRIx64 " [r12+416]=%#" PRIx64 " b0=%#" PRIx64
+                        " ninsts=%" PRIu64 "\n",
+                        (uint64_t)(uint32_t)iip, m->ip, r12, retfield,
+                        m->br[0], m->ninsts);
+            }
             bool restored_rse =
                 rse_restore_interrupted_partition(m, iip, ipsr);
             /* rfi is an instruction and data translation serialization
@@ -5223,6 +5332,13 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
             tlb_serialize_instruction(m);
             psr_trans_log(m, ipsr, "rfi");
             m->psr = ipsr & ~(3ull << PSR_RI_SHIFT);
+            if (ipsr & PSR_IS) {
+                /* GR16..GR31 are banked.  Restore PSR.bn first so the
+                 * IA-32 descriptor copies land in the interrupted context's
+                 * bank, not the native interruption handler's bank. */
+                gr_write(m, 25, m->ar[25], 0); /* CSD -> mapped GR25 */
+                gr_write(m, 26, m->ar[26], 0); /* SSD -> mapped GR26 */
+            }
             if (ipsr & PSR_IS)
                 m->ip = (uint32_t)iip;
             else
@@ -5696,6 +5812,16 @@ bool merced_ia32_write(Merced *m, uint64_t va, unsigned size,
     return true;
 }
 
+MercedStatus merced_ia32_instruction_intercept(Merced *m, uint64_t iim,
+                                                uint16_t code) {
+    /* IA-32 system instructions (including HLT) are intercepted into the
+     * IA-64 IVT rather than executed directly on Itanium.  ISR.vector zero
+     * identifies an instruction intercept; IIM carries any instruction-
+     * specific immediate (zero for HLT). */
+    m->cr[CR_IIM] = iim;
+    return deliver_fault(m, VEC_IA32_INTERCEPT, code, 0, false);
+}
+
 uint64_t merced_ia32_gr_read(Merced *m, unsigned reg) {
     return gr_read(m, reg, NULL);
 }
@@ -5766,8 +5892,29 @@ MercedStatus merced_step(Merced *m) {
             fflush(stderr);
         }
     }
-    if (m->psr & PSR_IS)
+    if (m->psr & PSR_IS) {
+        /* IA-32 instructions are interruption points too.  This check must
+         * precede the dispatch to merced_ia32_step(): otherwise a pending
+         * PIT/ExtINT remains invisible for the entire IA-32 run and is first
+         * recognized only after an instruction intercept has already moved
+         * execution into the native IVT.  The SDV BIOS then saves a native
+         * intercept frame as though it were the interrupted x86 frame and
+         * eventually IRETs into its F3:F4/data sentinel at F000:71A8. */
+        if (ext_highest_unmasked(m) >= 0 &&
+            (m->psr & PSR_I) && (m->psr & PSR_IC)) {
+            MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
+            m->ninsts++;
+            return ist;
+        }
+        if (m->timer_pending && !(m->cr[CR_ITV] & (1ull << 16)) &&
+            interrupt_unmasked(m, (uint8_t)m->cr[CR_ITV]) &&
+            (m->psr & PSR_I) && (m->psr & PSR_IC)) {
+            MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
+            m->ninsts++;
+            return ist;
+        }
         return merced_ia32_step(m);
+    }
 
     /* The generic EFI ROM's SAL entry point.  IA-64 operating systems use
      * SAL_PCI_CONFIG_{READ,WRITE}, not legacy CF8/CFC instructions, to
