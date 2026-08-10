@@ -532,6 +532,9 @@ static MercedFpReg fp_recip_estimate(MercedFpReg den) {
 /* ── Memory / translation ────────────────────────────────────────────────── */
 
 static MercedStatus mhalt(Merced *m, const char *fmt, ...);
+static uint64_t rfi_generation;
+
+uint64_t merced_rfi_generation(void) { return rfi_generation; }
 
 static const MercedTlbEntry *tlb_search(const MercedTlbEntry *t, int n,
                                         uint32_t rid, uint64_t va,
@@ -641,6 +644,10 @@ void merced_set_external_itc(Merced *m, bool enabled) {
 
 void merced_advance_itc(Merced *m, uint64_t ticks) {
     itc_advance(m, ticks);
+}
+
+uint64_t merced_get_itc(const Merced *m) {
+    return m->ar[AR_ITC];
 }
 
 static void ext_pending_set(Merced *m, uint8_t vector) {
@@ -5423,6 +5430,7 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
              * a false hit and skip the software TLB refill. */
             alat_invalidate_stacked(m);
             m->taken = 1;
+            rfi_generation++;
             return rse_spill_excess(m);
         }
         case 0x0C: m->psr &= ~PSR_BN; return MERCED_OK;             /* bsw.0 */

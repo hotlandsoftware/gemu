@@ -85,22 +85,15 @@
 #define ROWS (FB_H / CELL_H)     /* 50  */
 #define CON_ROWS 30              /* serial console area at the bottom */
 
-#define INSTR_PER_FRAME 500000
+#define INSTR_PER_FRAME 50000
 
 /* Minimum instruction gap between a mouse byte being serviced and the next
  * one being offered - see the ack handler's mouse branch for why this can't
  * be zero (synchronous re-raise corrupts the guest ISR's return frame).
  * Matches the PIT's own tick granularity, which is already known safe. */
-#define MOUSE_RETRY_DELAY_INSTS 100000u
-
-/* Minimum instruction gap between one mouse PACKET being fully drained and
- * a brand new one being allowed to raise - much larger than
- * MOUSE_RETRY_DELAY_INSTS (which only spaces out bytes *within* one
- * packet). Live testing showed separate packets arriving faster than
- * roughly this apart can wedge the guest into a stable spin loop that
- * never recovers, even though same-packet byte spacing at
- * MOUSE_RETRY_DELAY_INSTS is fine - see the ack handler's mouse branch. */
-#define MOUSE_INTERPACKET_COOLDOWN_INSTS 5000000u
+#define MOUSE_RETRY_DELAY_INSTS 1000u
+#define I2000_ITC_HZ UINT64_C(200000000)
+#define I2000_ITC_TICK_NS 5u
 #define MMIO_LOG_N 768
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES  32
@@ -321,19 +314,27 @@ struct Ia64I2000State {
      * instruction gap (mirrors the PIT's own known-safe 100000-instruction
      * tick granularity) closes off that risk for free.
      *
-     * Caveat: a rapid synthetic packet burst (10-20 "mousemove" monitor
-     * commands ~0.1s apart) still reproducibly parks the CPU at psr.i=0
-     * with aux_out stuck full, even with this deferral in place and even
-     * though a live trace shows a *stable*, non-corrupted spin loop
-     * (repeatedly polling port 0x60 directly, IP fixed at one bundle) -
-     * not the corrupted/unpredictable state a clobbered return frame would
-     * produce. That loop's address matches where the ROM's own "Mouse 8042
-     * Initialization: Waiting." POST self-test lives, so it may simply be
-     * a one-shot diagnostic that gives up after an unexpected amount of
-     * data and never revisits mouse servicing again this boot - not
-     * something this field can fix by itself. Unconfirmed against a real
-     * cold boot reaching the actual GUI event loop as of this writing. */
+     * Update: a rapid synthetic packet burst could still reproducibly park
+     * the CPU at psr.i=0 in a stable, non-corrupted spin loop even with
+     * this field's deferral in place, as long as *new* packets kept being
+     * queued while the guest was only partway through draining an earlier
+     * one. It wasn't a one-shot POST self-test artifact after all - it
+     * also reproduced at the real BIOS Configuration Manager GUI. The real
+     * fix turned out to be at the call site: aux_out must be completely
+     * empty (not just "has room") and this deadline must have passed
+     * before a brand new packet is queued at all, not merely before it's
+     * raised - see the per-frame mouse-polling block in ia64_i2000_run().
+     * v9 replaces that arbitrary cooldown with completion of the actual
+     * interrupt return, and accumulates host motion while a packet drains. */
     uint64_t mouse_retry_ninsts;
+    /* v9: use the real PIC EOI handshake as mouse-flow control instead of
+     * an arbitrary multi-million-instruction cooldown.  Host motion is
+     * accumulated while a report is in flight and emitted in bounded PS/2
+     * chunks, avoiding both dropped movement and large cursor teleports. */
+    uint64_t mouse_wait_rfi_generation;
+    int32_t mouse_accum_dx, mouse_accum_dy;
+    bool mouse_host_left, mouse_host_right;
+    uint64_t mouse_next_report_itc;
 };
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -430,6 +431,8 @@ static void mouse_device_command(Ia64I2000State *s, uint8_t cmd) {
         s->mouse_sample_rate = 100;
         s->mouse_scaling_2to1 = false;
         s->mouse_prev_left = s->mouse_prev_right = false;
+        s->mouse_host_left = s->mouse_host_right = false;
+        s->mouse_accum_dx = s->mouse_accum_dy = 0;
         break;
     case 0xF6: /* set defaults */
         aux_queue_byte(s, 0xFA);
@@ -1679,7 +1682,7 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
             else
                 s->pic_slave_icw = 1;
         }
-        /* Other commands are OCWs (including EOI). */
+        /* Other commands are OCWs. */
         return;
     }
     if (port == 0x40 && size == 1) {
@@ -2190,26 +2193,10 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
              * POST self-test, not something this delay alone resolves -
              * see mouse_retry_ninsts's struct comment. Mirrors the PIT's
              * own known-safe 100000-instruction tick granularity. */
-            if (s->aux_out_pos < s->aux_out_len) {
-                s->mouse_retry_ninsts = s->cpu->ninsts + MOUSE_RETRY_DELAY_INSTS;
-            } else {
+            s->mouse_wait_rfi_generation = merced_rfi_generation() + 1;
+            s->mouse_retry_ninsts = UINT64_MAX;
+            if (s->aux_out_pos >= s->aux_out_len) {
                 s->mouse_irq_pending = false;
-                /* This packet is fully drained, but don't let a brand new
-                 * one raise immediately either - see aux_queue_byte()'s
-                 * cooldown check. A live repro (10 packets at 0.1s/each,
-                 * i.e. comfortably slower than one-per-frame real mouse
-                 * motion could produce) showed the guest reliably wedging
-                 * into a stable, non-corrupting spin loop shortly after -
-                 * no crash, but no recovery either, even after a multi-
-                 * second wait with zero further input. A slower manual
-                 * test (0.8s/packet) drained and tracked cleanly every
-                 * time, so the guest appears to need real breathing room
-                 * between *separate* mouse events, not just non-overlap
-                 * within one. MOUSE_RETRY_DELAY_INSTS alone (100000, tuned
-                 * for mid-packet byte-to-byte spacing) isn't long enough
-                 * for that - hence the larger, separate cooldown here. */
-                s->mouse_retry_ninsts =
-                    s->cpu->ninsts + MOUSE_INTERPACKET_COOLDOWN_INSTS;
             }
             return (uint64_t)(s->pic_slave_base + 4); /* IRQ12 = slave IRQ4 */
         }
@@ -2755,7 +2742,7 @@ static bool i2000_screendump(void *ud, const char *path) {
  * than hand-listing every scalar field, and it stays correct automatically
  * as fields get added. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 8u  /* v8 adds mouse_retry_ninsts (deferred retry) */
+#define I2000_SNAPSHOT_VERSION 9u  /* v9 adds EOI-driven mouse flow control */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -2868,6 +2855,8 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         state_size = offsetof(Ia64I2000State, mouse_enabled);
     else if (version == 7u)
         state_size = offsetof(Ia64I2000State, mouse_retry_ninsts);
+    else if (version == 8u)
+        state_size = offsetof(Ia64I2000State, mouse_wait_rfi_generation);
     else
         state_size = sizeof(*loaded);
     ok &= fread(loaded, state_size, 1, f) == 1;
@@ -2902,6 +2891,14 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         if (version < 7u) {
             s->mouse_enabled = configured_mouse_enabled;
         }
+        if (version < 9u) {
+            s->mouse_accum_dx = s->mouse_accum_dy = 0;
+            s->mouse_host_left = s->mouse_prev_left;
+            s->mouse_host_right = s->mouse_prev_right;
+            /* Old snapshots may contain the former 3M-instruction
+             * cooldown. It is no longer meaningful under EOI flow control. */
+            s->mouse_retry_ninsts = s->cpu->ninsts;
+        }
     }
     free(loaded);
 
@@ -2911,6 +2908,10 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     if (ok) {
         *s->cpu = loaded_cpu;
         s->cpu->bus = bus;
+        /* rfi_generation is process-local rather than snapshot state, so an
+         * absolute saved target cannot be meaningful after load. */
+        s->mouse_wait_rfi_generation = 0;
+        s->mouse_next_report_itc = merced_get_itc(s->cpu);
         i2000_repair_saved_mode12(s);
     }
 
@@ -3597,6 +3598,17 @@ static void i2000_ensure_legacy_runtime(Ia64I2000State *s) {
 }
 
 static void i2000_poll_interrupts(Ia64I2000State *s) {
+    if (s->mouse_wait_rfi_generation &&
+        merced_rfi_generation() >= s->mouse_wait_rfi_generation) {
+        s->mouse_wait_rfi_generation = 0;
+        s->mouse_retry_ninsts = s->cpu->ninsts + MOUSE_RETRY_DELAY_INSTS;
+        if (s->aux_out_pos >= s->aux_out_len) {
+            unsigned rate = s->mouse_sample_rate ? s->mouse_sample_rate : 100;
+            uint64_t interval = I2000_ITC_HZ / rate;
+            if (interval < 5000) interval = 5000;
+            s->mouse_next_report_itc = merced_get_itc(s->cpu) + interval;
+        }
+    }
     /* legacy_irq_routed is permanently false (nothing ever sets it) - this
      * firmware never configures a single I/O SAPIC RTE (confirmed live,
      * IOSAPIC_DEBUG: every RTE stays at its masked reset value for the
@@ -3651,6 +3663,7 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * not this flag. */
     if (s->aux_out_pos < s->aux_out_len &&
         s->cpu->ninsts >= s->mouse_retry_ninsts &&
+        s->mouse_wait_rfi_generation == 0 &&
         !(s->pic_slave_mask & 0x10) && !(s->pic_master_mask & 0x04)) {
         s->mouse_irq_pending = true;
         merced_raise_external(s->cpu, 0);
@@ -3856,8 +3869,27 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
 
     gemu_monitor_start(s->monitor);
 
+    /* PAL_FREQ_RATIOS advertises a 200 MHz ITC.  Drive it from elapsed
+     * machine time, not interpreted slots: otherwise a firmware 10 ms input
+     * timer takes roughly half a second on a 3.8 Mslot/s host. */
+    merced_set_external_itc(s->cpu, true);
+    uint64_t itc_last_ns = i2000_monotonic_ns();
+
     bool running = true;
     while (running) {
+        /* loadvm restores this CPU flag too, so reassert machine policy.
+         * Paused time must not become one enormous timer jump on resume. */
+        merced_set_external_itc(s->cpu, true);
+        uint64_t now_ns = i2000_monotonic_ns();
+        if (gemu_monitor_is_paused(s->monitor) || s->halted) {
+            itc_last_ns = now_ns;
+        } else {
+            uint64_t ticks = (now_ns - itc_last_ns) / I2000_ITC_TICK_NS;
+            if (ticks) {
+                merced_advance_itc(s->cpu, ticks);
+                itc_last_ns += ticks * I2000_ITC_TICK_NS;
+            }
+        }
         if (s->display) {
             gemu_display_poll(s->display);
             uint32_t cp;
@@ -3917,39 +3949,42 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                 left = p.button; right = p.right_button;
                 have_pointer = true;
             }
-            if (have_pointer && s->mouse_streaming &&
-                (rel_x || rel_y || left != s->mouse_prev_left ||
-                 right != s->mouse_prev_right) &&
-                /* Strictly "queue is empty AND cooldown elapsed", not just
-                 * "3 bytes of room" - see aux_queue_byte()'s and
-                 * i2000_poll_interrupts()'s comments. A queue that's merely
-                 * "not full" still lets a new packet be offered while the
-                 * guest is only partway through draining the previous one,
-                 * which is exactly the pattern that reproducibly wedged the
-                 * guest (confirmed live, including via the user's own
-                 * interactive session freezing at the Itanium splash
-                 * screen). Real PS/2 mouse hardware has the same natural
-                 * one-report-in-flight-at-a-time behavior via clock-line
-                 * flow control; this just makes it explicit instead of
-                 * relying on host mouse motion happening to be slow enough
-                 * on its own. */
+            if (have_pointer && s->mouse_streaming) {
+                int64_t ax = (int64_t)s->mouse_accum_dx + rel_x;
+                int64_t ay = (int64_t)s->mouse_accum_dy - rel_y;
+                s->mouse_accum_dx = (int32_t)(ax < -1024 ? -1024 : ax > 1024 ? 1024 : ax);
+                s->mouse_accum_dy = (int32_t)(ay < -1024 ? -1024 : ay > 1024 ? 1024 : ay);
+                s->mouse_host_left = left;
+                s->mouse_host_right = right;
+            }
+            if (s->mouse_streaming &&
+                (s->mouse_accum_dx || s->mouse_accum_dy ||
+                 s->mouse_host_left != s->mouse_prev_left ||
+                 s->mouse_host_right != s->mouse_prev_right) &&
+                /* Only one PS/2 report is in flight at a time. Motion that
+                 * arrives meanwhile stays in the bounded accumulator above,
+                 * and is drained in <=127-count chunks after the real PIC
+                 * EOI handshake completes. */
                 s->aux_out_len == 0 &&
-                s->cpu->ninsts >= s->mouse_retry_ninsts) {
-                /* Host Y grows down, PS/2 Y grows up. */
-                int dy = -rel_y;
-                bool x_overflow = rel_x < -127 || rel_x > 127;
-                bool y_overflow = dy < -127 || dy > 127;
-                int8_t cdx = (int8_t)(rel_x < -127 ? -127 : rel_x > 127 ? 127 : rel_x);
-                int8_t cdy = (int8_t)(dy < -127 ? -127 : dy > 127 ? 127 : dy);
-                uint8_t flags = (uint8_t)((left ? 0x01 : 0) | (right ? 0x02 : 0) |
+                s->mouse_wait_rfi_generation == 0 &&
+                s->cpu->ninsts >= s->mouse_retry_ninsts &&
+                (int64_t)(merced_get_itc(s->cpu) -
+                          s->mouse_next_report_itc) >= 0) {
+                int8_t cdx = (int8_t)(s->mouse_accum_dx < -127 ? -127 :
+                                      s->mouse_accum_dx > 127 ? 127 : s->mouse_accum_dx);
+                int8_t cdy = (int8_t)(s->mouse_accum_dy < -127 ? -127 :
+                                      s->mouse_accum_dy > 127 ? 127 : s->mouse_accum_dy);
+                uint8_t flags = (uint8_t)((s->mouse_host_left ? 0x01 : 0) |
+                                          (s->mouse_host_right ? 0x02 : 0) |
                                           0x08 |
-                                          (cdx < 0 ? 0x10 : 0) | (cdy < 0 ? 0x20 : 0) |
-                                          (x_overflow ? 0x40 : 0) | (y_overflow ? 0x80 : 0));
+                                          (cdx < 0 ? 0x10 : 0) | (cdy < 0 ? 0x20 : 0));
                 aux_queue_byte(s, flags);
                 aux_queue_byte(s, (uint8_t)cdx);
                 aux_queue_byte(s, (uint8_t)cdy);
-                s->mouse_prev_left = left;
-                s->mouse_prev_right = right;
+                s->mouse_accum_dx -= cdx;
+                s->mouse_accum_dy -= cdy;
+                s->mouse_prev_left = s->mouse_host_left;
+                s->mouse_prev_right = s->mouse_host_right;
             }
         }
 

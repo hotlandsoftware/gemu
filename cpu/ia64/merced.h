@@ -299,6 +299,7 @@ void    merced_reset(Merced *m);
  * interpreted slot for deterministic tests and standalone CPU users. */
 void    merced_set_external_itc(Merced *m, bool enabled);
 void    merced_advance_itc(Merced *m, uint64_t ticks);
+uint64_t merced_get_itc(const Merced *m);
 
 /* Overrides the stepping Windows/firmware sees in cpuid[3]'s revision
  * field (bits 15:8). Takes effect immediately and persists across
@@ -331,6 +332,9 @@ void merced_ia32_gr_write(Merced *m, unsigned reg, uint64_t value);
 /* Latch a platform interrupt for delivery through cr.ivr. */
 void merced_raise_external(Merced *m, uint8_t vector);
 void merced_ack_external(Merced *m, uint8_t vector);
+/* Monotonic count of completed rfi instructions, used by platform devices
+ * to avoid reasserting a level interrupt before its handler has returned. */
+uint64_t merced_rfi_generation(void);
 
 /* Force cr.tpr directly - EXPERIMENTAL hook for the i2000 ATA controller,
  * see the call site in machine_i2000.c for why. */
