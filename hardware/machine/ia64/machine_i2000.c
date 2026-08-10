@@ -86,6 +86,21 @@
 #define CON_ROWS 30              /* serial console area at the bottom */
 
 #define INSTR_PER_FRAME 500000
+
+/* Minimum instruction gap between a mouse byte being serviced and the next
+ * one being offered - see the ack handler's mouse branch for why this can't
+ * be zero (synchronous re-raise corrupts the guest ISR's return frame).
+ * Matches the PIT's own tick granularity, which is already known safe. */
+#define MOUSE_RETRY_DELAY_INSTS 100000u
+
+/* Minimum instruction gap between one mouse PACKET being fully drained and
+ * a brand new one being allowed to raise - much larger than
+ * MOUSE_RETRY_DELAY_INSTS (which only spaces out bytes *within* one
+ * packet). Live testing showed separate packets arriving faster than
+ * roughly this apart can wedge the guest into a stable spin loop that
+ * never recovers, even though same-packet byte spacing at
+ * MOUSE_RETRY_DELAY_INSTS is fine - see the ack handler's mouse branch. */
+#define MOUSE_INTERPACKET_COOLDOWN_INSTS 5000000u
 #define MMIO_LOG_N 768
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES  32
@@ -271,11 +286,60 @@ struct Ia64I2000State {
     uint16_t int10_response_len, int10_response_pos;
     uint8_t int10_signature_words;
     uint16_t int10_mode;
+
+    /* v7 snapshot tail: PS/2 mouse (-device mouse), routed through the
+     * existing 8042 aux-device path (kbc_pending_write==3, port 0xD4/0x60)
+     * that was previously always a no-op. Kept in its own queue rather than
+     * sharing kbc_out[] because the 0x60/0x64 write handlers unconditionally
+     * clear kbc_out on every keyboard-channel command, which would wipe an
+     * in-flight mouse ACK/packet. */
+    bool     mouse_enabled;
+    bool     mouse_streaming;
+    uint8_t  aux_out[16];
+    uint8_t  aux_out_pos, aux_out_len;
+    bool     mouse_prev_left, mouse_prev_right;
+    uint8_t  mouse_param_cmd;   /* 0xE8 or 0xF3 awaiting its 1 param byte, 0=none */
+    uint8_t  mouse_resolution, mouse_sample_rate;
+    bool     mouse_scaling_2to1;
+    /* Legacy-ExtINT ack disambiguation (see the comment on
+     * I2000_LEGACY_ACK_ADDR's read handler): this firmware never touches
+     * an I/O SAPIC RTE for the mouse either (confirmed live), so IRQ12
+     * must be delivered the same legacy-8259/ExtINT way as the PIT's
+     * IRQ0 - which means the single shared ack address needs to know
+     * which of the two actually caused the pending ExtINT. */
+    bool     pit_irq_pending;
+    bool     mouse_irq_pending;
+    /* v8 tail: deferred multi-byte mouse-packet retry (see the ack handler's
+     * mouse branch). Re-raising vector 0 synchronously, from within the same
+     * legacy-ack dispatch that's still servicing the CURRENT byte, risks
+     * corrupting the guest ISR: cr.ipsr/cr.iip/cr.isr are single non-stacked
+     * registers, and per merced.c's deliver_fault, a second delivery landing
+     * before this ISR invocation truly completes would overwrite its not-
+     * yet-consumed return frame - the same class of "IRQ0 handler's STI
+     * immediately re-enter[ing]" risk the pre-existing ack-arbitration
+     * comment already warned about for PIT. Deferring the retry by a real
+     * instruction gap (mirrors the PIT's own known-safe 100000-instruction
+     * tick granularity) closes off that risk for free.
+     *
+     * Caveat: a rapid synthetic packet burst (10-20 "mousemove" monitor
+     * commands ~0.1s apart) still reproducibly parks the CPU at psr.i=0
+     * with aux_out stuck full, even with this deferral in place and even
+     * though a live trace shows a *stable*, non-corrupted spin loop
+     * (repeatedly polling port 0x60 directly, IP fixed at one bundle) -
+     * not the corrupted/unpredictable state a clobbered return frame would
+     * produce. That loop's address matches where the ROM's own "Mouse 8042
+     * Initialization: Waiting." POST self-test lives, so it may simply be
+     * a one-shot diagnostic that gives up after an unexpected amount of
+     * data and never revisits mouse servicing again this boot - not
+     * something this field can fix by itself. Unconfirmed against a real
+     * cold boot reaching the actual GUI event loop as of this writing. */
+    uint64_t mouse_retry_ninsts;
 };
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
                      unsigned size, bool is_write);
 static void i2000_reset(Ia64I2000State *s);
+static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi);
 
 static void kbc_queue_byte(Ia64I2000State *s, uint8_t byte) {
     /* Controller replies and keyboard scan codes share the 8042 output
@@ -288,6 +352,144 @@ static void kbc_queue_byte(Ia64I2000State *s, uint8_t byte) {
     }
     if (s->kbc_out_len < sizeof(s->kbc_out))
         s->kbc_out[s->kbc_out_len++] = byte;
+}
+
+static void aux_queue_byte(Ia64I2000State *s, uint8_t byte) {
+    /* Mirrors kbc_queue_byte(), but for the separate PS/2 aux (mouse)
+     * output buffer - see the field comment on aux_out[] for why this
+     * can't just share kbc_out[]. Unlike the keyboard (which this
+     * firmware polls OBF for, so no interrupt is needed), its mouse
+     * driver is interrupt-driven - confirmed empirically: without this,
+     * queued packets just piled up in aux_out[] forever, never read out,
+     * because the guest was sitting in an interrupt wait that never
+     * fired. This firmware never configures an I/O SAPIC RTE for the
+     * mouse either (same as the PIT/IRQ0 case documented in
+     * i2000_poll_interrupts()) - it stays in legacy-8259-compatible mode
+     * the whole time, so IRQ12 has to be delivered the same way: ExtINT
+     * (vector 0), gated by the slave PIC's IRQ12 mask bit (0x10) and the
+     * master's cascade line (IRQ2, 0x04). */
+    if (s->aux_out_pos) {
+        memmove(s->aux_out, s->aux_out + s->aux_out_pos,
+                s->aux_out_len - s->aux_out_pos);
+        s->aux_out_len -= s->aux_out_pos;
+        s->aux_out_pos = 0;
+    }
+    if (s->aux_out_len < sizeof(s->aux_out))
+        s->aux_out[s->aux_out_len++] = byte;
+    /* Deliberately does NOT raise here. This used to raise unconditionally
+     * on every push, reasoning that merced_raise_external() just OR's a
+     * single shared per-vector bit and is therefore idempotent/harmless to
+     * call redundantly. That's true at the bit level, but it misses a real
+     * race one level up: if a NEW packet arrives (via a fresh host mouse
+     * event) while the guest is still mid-ISR servicing an EARLIER byte -
+     * interrupts briefly re-enabled before that ISR's own cleanup/rfi has
+     * finished, the same "IRQ0 handler's STI immediately re-enter[ing]"
+     * class of risk the ack-arbitration comment below already describes for
+     * PIT - this raise could hand the CPU a second, unwanted ExtINT
+     * delivery right then, clobbering the first invocation's not-yet-
+     * consumed cr.ipsr/cr.iip. Confirmed live: a realistic mouse-movement
+     * test (8 packets, 0.3s apart, at the actual BIOS Configuration Manager
+     * GUI, not just a synthetic burst) corrupted cr.iip to a near-null
+     * 0x180 and halted the guest in a dead loop trying to execute there -
+     * matching the user's own original report of the emulator freezing
+     * entirely on real mouse movement early in boot.
+     *
+     * i2000_poll_interrupts() is the single place that actually raises
+     * vector 0 on mouse's behalf now (both for this fresh-packet case and
+     * for the ack handler's same-packet retry case below), gated on
+     * mouse_retry_ninsts - which this function does NOT touch, so an
+     * in-progress cooldown from the previous packet's drain naturally
+     * carries over and delays this new byte's delivery too. Nothing
+     * "unraises" here even when a cooldown is active: the byte is queued
+     * now, and poll_interrupts will pick it up as soon as it's safe to. */
+}
+
+/* PS/2 mouse command handler, reached from the 8042's aux-write routing
+ * (0x64<-0xD4 then 0x60<-cmd) once a real mouse is attached via
+ * -device mouse. Modeled on the standard PS/2 mouse command set - see
+ * hardware/machine/mos/machine_um6578.c's um6578_mouse_device_command()
+ * for the sibling implementation this was cross-checked against. */
+static void mouse_device_command(Ia64I2000State *s, uint8_t cmd) {
+    if (s->mouse_param_cmd) {
+        /* Second byte of a two-byte command: the value itself. */
+        if (s->mouse_param_cmd == 0xE8)
+            s->mouse_resolution = cmd;
+        else if (s->mouse_param_cmd == 0xF3)
+            s->mouse_sample_rate = cmd;
+        s->mouse_param_cmd = 0;
+        aux_queue_byte(s, 0xFA);
+        return;
+    }
+    switch (cmd) {
+    case 0xFF: /* reset */
+        aux_queue_byte(s, 0xFA);
+        aux_queue_byte(s, 0xAA);
+        aux_queue_byte(s, 0x00);
+        s->mouse_streaming = false;
+        s->mouse_resolution = 2;
+        s->mouse_sample_rate = 100;
+        s->mouse_scaling_2to1 = false;
+        s->mouse_prev_left = s->mouse_prev_right = false;
+        break;
+    case 0xF6: /* set defaults */
+        aux_queue_byte(s, 0xFA);
+        s->mouse_streaming = false;
+        s->mouse_resolution = 2;
+        s->mouse_sample_rate = 100;
+        s->mouse_scaling_2to1 = false;
+        break;
+    case 0xF4: /* enable data reporting */
+        aux_queue_byte(s, 0xFA);
+        s->mouse_streaming = true;
+        break;
+    case 0xF5: /* disable data reporting */
+        aux_queue_byte(s, 0xFA);
+        s->mouse_streaming = false;
+        break;
+    case 0xE6: /* set scaling 1:1 */
+        aux_queue_byte(s, 0xFA);
+        s->mouse_scaling_2to1 = false;
+        break;
+    case 0xE7: /* set scaling 2:1 */
+        aux_queue_byte(s, 0xFA);
+        s->mouse_scaling_2to1 = true;
+        break;
+    case 0xE8: /* set resolution: one param byte follows */
+        aux_queue_byte(s, 0xFA);
+        s->mouse_param_cmd = 0xE8;
+        break;
+    case 0xF3: /* set sample rate: one param byte follows */
+        aux_queue_byte(s, 0xFA);
+        s->mouse_param_cmd = 0xF3;
+        break;
+    case 0xF2: /* get device ID */
+        aux_queue_byte(s, 0xFA);
+        aux_queue_byte(s, 0x00); /* standard PS/2 mouse, no wheel */
+        break;
+    case 0xE9: /* status request */
+        aux_queue_byte(s, 0xFA);
+        aux_queue_byte(s, (uint8_t)((s->mouse_scaling_2to1 ? 0x10 : 0) |
+                                     (s->mouse_streaming ? 0x20 : 0) |
+                                     (s->mouse_prev_left ? 0x01 : 0) |
+                                     (s->mouse_prev_right ? 0x04 : 0)));
+        aux_queue_byte(s, s->mouse_resolution);
+        aux_queue_byte(s, s->mouse_sample_rate);
+        break;
+    case 0xEB: /* read data (remote/poll mode): ACK + one packet, all-zero
+                * delta since this stub doesn't track a separate polled
+                * sample - streaming mode is what actually drives the
+                * cursor and is what every BIOS/OS driver uses in practice. */
+        aux_queue_byte(s, 0xFA);
+        aux_queue_byte(s, (uint8_t)(0x08 | (s->mouse_prev_left ? 0x01 : 0) |
+                                     (s->mouse_prev_right ? 0x02 : 0)));
+        aux_queue_byte(s, 0x00);
+        aux_queue_byte(s, 0x00);
+        break;
+    default: /* forgiving default: ACK anything unrecognized rather than
+              * wedge the guest's init state machine on a vendor probe. */
+        aux_queue_byte(s, 0xFA);
+        break;
+    }
 }
 
 static void kbc_queue_ascii(Ia64I2000State *s, uint32_t cp) {
@@ -1202,17 +1404,55 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     if (port == 0x1110 && size == 1)
         return 0;
     if (port == 0x60 && size == 1) {               /* 8042 data */
-        if (s->kbc_out_pos >= s->kbc_out_len)
-            return 0;
-        uint8_t v = s->kbc_out[s->kbc_out_pos++];
-        if (s->kbc_out_pos == s->kbc_out_len)
-            s->kbc_out_pos = s->kbc_out_len = 0;
-        return v;
+        if (s->kbc_out_pos < s->kbc_out_len) {
+            uint8_t v = s->kbc_out[s->kbc_out_pos++];
+            if (s->kbc_out_pos == s->kbc_out_len)
+                s->kbc_out_pos = s->kbc_out_len = 0;
+            return v;
+        }
+        if (s->aux_out_pos < s->aux_out_len) {
+            uint8_t v = s->aux_out[s->aux_out_pos++];
+            if (getenv("MOUSE_DEBUG"))
+                fprintf(stderr, "MOUSE_DEBUG: port60 read popped %02x "
+                        "pos=%u len=%u ninsts=%" PRIu64 "\n", v,
+                        s->aux_out_pos, s->aux_out_len, s->cpu->ninsts);
+            if (s->aux_out_pos == s->aux_out_len)
+                s->aux_out_pos = s->aux_out_len = 0;
+            /* Do NOT re-raise here. This firmware's ISR reads port 0x60
+             * BEFORE the legacy-ack address, all within the same dispatch
+             * cycle - a re-raise issued right here gets immediately
+             * consumed by that same cycle's own ack read (which
+             * unconditionally clears mouse_irq_pending), never surviving
+             * long enough to trigger a fresh ExtINT for the next byte.
+             * Confirmed live: aux_out kept growing to its 16-byte cap with
+             * aux_out_pos stuck at 0/1 forever under a rapid packet burst,
+             * because each "re-raise" here was cancelled microseconds
+             * later by the same ISR entry's own ack read. The level-
+             * triggered re-fire instead happens in the ack handler below,
+             * which runs *after* this read and can see whether data still
+             * remains. */
+            return v;
+        }
+        return 0;
     }
     if (port == 0x64 && size == 1) {               /* 8042 status */
         /* Commands are consumed synchronously, so IBF (bit 1) is clear.
-         * OBF reflects queued controller/keyboard response bytes. */
-        return (s->kbc_out_len ? 0x01 : 0) | 0x04; /* system flag */
+         * OBF reflects queued controller/keyboard response bytes; bit 5
+         * (0x20) tells the firmware the byte port 0x60 will return next
+         * came from the aux/mouse device rather than the keyboard - only
+         * meaningful once a byte is actually queued there, so this is
+         * automatically inert when no mouse is attached (aux_out_len can
+         * never become nonzero without -device mouse). Keyboard bytes win
+         * priority when both queues happen to be nonempty. */
+        bool aux_next = s->kbc_out_len == 0 && s->aux_out_len > 0;
+        uint8_t st64 = ((s->kbc_out_len || s->aux_out_len) ? 0x01 : 0) |
+                       (aux_next ? 0x20 : 0) | 0x04; /* system flag */
+        if (getenv("MOUSE_DEBUG"))
+            fprintf(stderr, "MOUSE_DEBUG: port64 status read -> %02x "
+                    "kbc_len=%u aux_len=%u aux_pos=%u ninsts=%" PRIu64 "\n",
+                    st64, s->kbc_out_len, s->aux_out_len, s->aux_out_pos,
+                    s->cpu->ninsts);
+        return st64;
     }
     if ((port == 0x71 || port == 0x73) && size == 1)
     {
@@ -1429,6 +1669,10 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         return;
     }
     if (port == 0x20 || port == 0xA0) {
+        if (getenv("MOUSE_DEBUG"))
+            fprintf(stderr, "MOUSE_DEBUG: PIC cmd port=%#02x val=%#02x "
+                    "ninsts=%" PRIu64 "\n", (unsigned)port, (unsigned)val,
+                    s->cpu->ninsts);
         if ((val & 0x10) != 0) {
             if (port == 0x20)
                 s->pic_master_icw = 1;
@@ -1475,8 +1719,9 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         case 0xAB: /* keyboard interface test */
             s->kbc_out[0] = 0x00; s->kbc_out_len = 1;
             break;
-        case 0xA9: /* auxiliary interface test: no PS/2 mouse attached */
-            s->kbc_out[0] = 0x01; s->kbc_out_len = 1;
+        case 0xA9: /* auxiliary interface test */
+            s->kbc_out[0] = s->mouse_enabled ? 0x00 : 0x01;
+            s->kbc_out_len = 1;
             break;
         case 0xAD: s->kbc_command_byte |= 0x10; break;
         case 0xAE: s->kbc_command_byte &= (uint8_t)~0x10; break;
@@ -1497,9 +1742,12 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         if (s->kbc_pending_write == 1) {
             s->kbc_command_byte = data;
         } else if (s->kbc_pending_write == 3) {
-            /* No auxiliary PS/2 device is attached.  Consume the routed
+            /* 0xD4-routed byte: forward to the real PS/2 mouse command
+             * handler if -device mouse attached one; otherwise consume the
              * byte but leave OBF clear so the firmware's mouse probe times
              * out and does not instantiate a phantom mouse driver. */
+            if (s->mouse_enabled)
+                mouse_device_command(s, data);
         } else if (s->kbc_pending_write == 0) {
             /* An empty PS/2 keyboard still acknowledges commands.  Reset
              * additionally reports a successful BAT result. */
@@ -1881,8 +2129,16 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     /* Legacy ExtINT acknowledge: IA-64 has no INTA pin, so SAL substitutes
      * a memory-mapped byte read to learn which 8259-relative IRQ won
      * arbitration - the same information a real INTA cycle would return
-     * on the data bus (ICW2 base + IRQ number). Only IRQ0 (the PIT) is
-     * wired to ExtINT on this model, so the offset is always 0. */
+     * on the data bus (ICW2 base + IRQ number). IRQ0 (the PIT) and, once
+     * -device mouse attaches one, IRQ12 (the aux/mouse device, cascaded
+     * through the slave PIC) both share this single ack address on real
+     * hardware's single physical INTA-replacement cycle, so whichever one
+     * is actually pending decides what gets returned - PIT wins if both
+     * happen to be pending at once, matching real 8259 priority (IRQ0
+     * outranks any slave-cascaded IRQ). A slave-originated vector is
+     * reported relative to the slave's own programmed base (ICW2), not
+     * the master's - real hardware's second INTA cycle addresses the
+     * slave chip directly. */
     if (addr == I2000_LEGACY_ACK_ADDR && size == 1) {
         /* This MMIO read replaces the pair of INTA bus cycles on IA-64.
          * It therefore acknowledges the local-SAPIC ExtINT request as well
@@ -1890,7 +2146,74 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
          * the IRQ0 handler's STI immediately re-enter the same interrupt,
          * corrupting its real-mode IRET frame before the eventual PIC EOI. */
         merced_ack_external(s->cpu, 0);
-        return s->pic_master_base;
+        if (getenv("MOUSE_DEBUG"))
+            fprintf(stderr, "MOUSE_DEBUG: ack read pit_pending=%d "
+                    "mouse_pending=%d ninsts=%" PRIu64 "\n",
+                    s->pit_irq_pending, s->mouse_irq_pending, s->cpu->ninsts);
+        if (s->pit_irq_pending) {
+            s->pit_irq_pending = false;
+            /* merced_ack_external() just cleared the ONE shared CPU-level
+             * pending bit for vector 0, which both IRQ0 and IRQ12 share.
+             * If IRQ12 is also still latched, don't re-raise synchronously
+             * here - see the mouse branch below for why that corrupts the
+             * guest ISR. Just leave mouse_irq_pending set with its retry
+             * deadline (already scheduled by whichever aux_queue_byte()/ack
+             * call set it) and let i2000_poll_interrupts() fire it once
+             * that deadline passes. */
+            return s->pic_master_base;
+        }
+        if (s->mouse_irq_pending) {
+            /* Real 8042 aux OBF is level-triggered: IRQ12 stays asserted as
+             * long as unread aux data remains, re-firing for each
+             * subsequent byte of a multi-byte packet rather than once per
+             * packet. This firmware's ISR reads port 0x60 (consuming one
+             * byte) *before* reaching this ack read, so aux_out already
+             * reflects the post-read state - if bytes remain, more service
+             * is needed.
+             *
+             * That next raise should NOT happen synchronously, right here:
+             * cr.ipsr/cr.iip/cr.isr are single, non-stacked registers, and
+             * a second delivery landing before this ISR invocation is fully
+             * done servicing the current byte would clobber its not-yet-
+             * consumed return frame - the same class of corruption the
+             * pre-existing PIT-arbitration comment above already warned
+             * about ("the IRQ0 handler's STI immediately re-enter[ing] the
+             * same interrupt"). Deferring by a real instruction gap and
+             * letting i2000_poll_interrupts() (which runs outside any
+             * interrupt-handling context) do the actual raise once it's due
+             * costs nothing and closes off that entire class of risk, even
+             * though the specific rapid-burst wedge this was written to
+             * chase (CPU stuck at psr.i=0, aux_out permanently stuck full)
+             * turned out on closer inspection to be a stable spin loop
+             * polling port 0x60 directly from what looks like this
+             * firmware's own one-shot "Mouse 8042 Initialization: Waiting"
+             * POST self-test, not something this delay alone resolves -
+             * see mouse_retry_ninsts's struct comment. Mirrors the PIT's
+             * own known-safe 100000-instruction tick granularity. */
+            if (s->aux_out_pos < s->aux_out_len) {
+                s->mouse_retry_ninsts = s->cpu->ninsts + MOUSE_RETRY_DELAY_INSTS;
+            } else {
+                s->mouse_irq_pending = false;
+                /* This packet is fully drained, but don't let a brand new
+                 * one raise immediately either - see aux_queue_byte()'s
+                 * cooldown check. A live repro (10 packets at 0.1s/each,
+                 * i.e. comfortably slower than one-per-frame real mouse
+                 * motion could produce) showed the guest reliably wedging
+                 * into a stable, non-corrupting spin loop shortly after -
+                 * no crash, but no recovery either, even after a multi-
+                 * second wait with zero further input. A slower manual
+                 * test (0.8s/packet) drained and tracked cleanly every
+                 * time, so the guest appears to need real breathing room
+                 * between *separate* mouse events, not just non-overlap
+                 * within one. MOUSE_RETRY_DELAY_INSTS alone (100000, tuned
+                 * for mid-packet byte-to-byte spacing) isn't long enough
+                 * for that - hence the larger, separate cooldown here. */
+                s->mouse_retry_ninsts =
+                    s->cpu->ninsts + MOUSE_INTERPACKET_COOLDOWN_INSTS;
+            }
+            return (uint64_t)(s->pic_slave_base + 4); /* IRQ12 = slave IRQ4 */
+        }
+        return s->pic_master_base; /* spurious/unattributed: old behavior */
     }
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
         if (s->flash_read_status) {
@@ -1920,8 +2243,13 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     }
     if (addr - I2000_IO_BASE < I2000_IO_SIZE) {
         uint64_t port;
-        if (sparse_io_port(addr - I2000_IO_BASE, &port))
+        if (sparse_io_port(addr - I2000_IO_BASE, &port)) {
+            if (getenv("MOUSE_DEBUG") && (port == 0x60 || port == 0x64))
+                fprintf(stderr, "MOUSE_DEBUG: sparse MMIO read port=%#x "
+                        "size=%u ninsts=%" PRIu64 "\n", (unsigned)port,
+                        size, s->cpu->ninsts);
             return io_port_read(s, port, size);
+        }
     }
     if (addr == I2000_SAC_CBNR && size == 4)
         return s->sac_cbnr;
@@ -2104,6 +2432,10 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     if (addr - I2000_IO_BASE < I2000_IO_SIZE) {
         uint64_t port;
         if (sparse_io_port(addr - I2000_IO_BASE, &port)) {
+            if (getenv("MOUSE_DEBUG") && (port == 0x60 || port == 0x64))
+                fprintf(stderr, "MOUSE_DEBUG: sparse MMIO write port=%#x "
+                        "size=%u val=%#" PRIx64 " ninsts=%" PRIu64 "\n",
+                        (unsigned)port, size, val, s->cpu->ninsts);
             io_port_write(s, port, val, size);
             return;
         }
@@ -2333,21 +2665,44 @@ static void i2000_render_frame(Ia64I2000State *s) {
             fprintf(stderr, "i2000: VGA-ATTR ");
             for (int i = 0; i < 16; i++)
                 fprintf(stderr, "%02x ", s->vga.attr[i]);
-            fprintf(stderr, "\ni2000: VGA-DAC(idx0-3) ");
-            for (int i = 0; i < 4; i++)
+            fprintf(stderr, "\ni2000: VGA-ATTR-MODE attr[0x10]=%02x attr[0x13]=%02x "
+                    "attr[0x14]=%02x\n", s->vga.attr[0x10], s->vga.attr[0x13],
+                    s->vga.attr[0x14]);
+            fprintf(stderr, "i2000: VGA-DAC(idx0-15) ");
+            for (int i = 0; i < 16; i++)
+                fprintf(stderr, "[%u]=%02x,%02x,%02x ", i,
+                        s->vga.dac[i][0], s->vga.dac[i][1], s->vga.dac[i][2]);
+            fprintf(stderr, "\ni2000: VGA-DAC(idx16-63) ");
+            for (int i = 16; i < 64; i++)
                 fprintf(stderr, "[%u]=%02x,%02x,%02x ", i,
                         s->vga.dac[i][0], s->vga.dac[i][1], s->vga.dac[i][2]);
             fprintf(stderr, "\n");
-            fprintf(stderr, "\ni2000: VGA-DAC(idx4-7) ");
-            for (int i = 4; i < 8; i++)
-                fprintf(stderr, "[%u]=%02x,%02x,%02x ", i,
-                        s->vga.dac[i][0], s->vga.dac[i][1], s->vga.dac[i][2]);
-            fprintf(stderr, "\n");
+            {
+                /* Verified against exact pixel samples of a screendump:
+                 * y=10 = solid blue outer margin/frame (no text),
+                 * y=30 = teal band with "BIOS Configuration Manager" text,
+                 * y=65 = black tab-row band, y=200 = content pane. */
+                static const struct { const char *name; int row; } regions[] = {
+                    { "MARGIN", 10 }, { "REALTITLE", 30 },
+                    { "TABROW", 65 }, { "CONTENT", 200 },
+                    { "BOTTOMBAND", 440 }, { "CONTENTEDGE", 425 },
+                };
+                for (size_t r = 0; r < sizeof(regions) / sizeof(regions[0]); r++) {
+                    for (int plane = 0; plane < 4; plane++) {
+                        fprintf(stderr, "i2000: VGA-%s plane%d row%d[20..45]=",
+                                regions[r].name, plane, regions[r].row);
+                        for (int i = 20; i < 45; i++)
+                            fprintf(stderr, "%02x ",
+                                    s->vga.vram[plane][regions[r].row * 80 + i]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
             for (int plane = 0; plane < 4; plane++) {
-                for (int row = 0; row < 4; row++) {
-                    fprintf(stderr, "i2000: VGA-TITLE plane%d row%d[0..15]=",
+                for (int row = 200; row < 204; row++) {
+                    fprintf(stderr, "i2000: VGA-BODY plane%d row%d[0..15]=",
                             plane, row);
-                    for (int i = 0; i < 16; i++)
+                    for (int i = 20; i < 30; i++)
                         fprintf(stderr, "%02x ",
                                 s->vga.vram[plane][row * 80 + i]);
                     fprintf(stderr, "\n");
@@ -2400,7 +2755,7 @@ static bool i2000_screendump(void *ud, const char *path) {
  * than hand-listing every scalar field, and it stays correct automatically
  * as fields get added. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 6u  /* v6 adds the INT 10h/VBE bridge */
+#define I2000_SNAPSHOT_VERSION 8u  /* v8 adds mouse_retry_ninsts (deferred retry) */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -2491,6 +2846,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     GemuDisplay *display = s->display;
     GemuVncServer *vnc = s->vnc;
     bool configured_rage128 = s->rage128_enabled;
+    bool configured_mouse_enabled = s->mouse_enabled;
     Merced *cpu = s->cpu;
     uint8_t *ram = s->ram;
     uint8_t *flash = s->flash;
@@ -2508,6 +2864,10 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         state_size = offsetof(Ia64I2000State, rage128_enabled);
     else if (version == 5u)
         state_size = offsetof(Ia64I2000State, int10_req);
+    else if (version == 6u)
+        state_size = offsetof(Ia64I2000State, mouse_enabled);
+    else if (version == 7u)
+        state_size = offsetof(Ia64I2000State, mouse_retry_ninsts);
     else
         state_size = sizeof(*loaded);
     ok &= fread(loaded, state_size, 1, f) == 1;
@@ -2538,6 +2898,9 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
             memset(&s->int10_req, 0,
                    sizeof(*s) - offsetof(Ia64I2000State, int10_req));
             i2000_load_vga_option_rom(s);
+        }
+        if (version < 7u) {
+            s->mouse_enabled = configured_mouse_enabled;
         }
     }
     free(loaded);
@@ -2639,6 +3002,129 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
     if (txt && strncmp(txt, "calls", 5) == 0) {
         merced_dump_calls(s->cpu, MERCED_CALL_HISTORY, stderr);
         return;
+    }
+    if (txt && strncmp(txt, "mousestate", 10) == 0) {
+        fprintf(stderr, "i2000: ninsts=%" PRIu64 " ip=%016" PRIx64
+                " psr=%016" PRIx64
+                " psr.i=%d tpr=%016" PRIx64 " tpr.mmi=%d\n",
+                s->cpu->ninsts, s->cpu->ip, s->cpu->psr,
+                !!(s->cpu->psr & (UINT64_C(1) << 14)),
+                s->cpu->cr[66] /* CR_TPR */,
+                !!(s->cpu->cr[66] & (UINT64_C(1) << 16)));
+        merced_dump_trace(s->cpu, 12, stderr);
+        fprintf(stderr, "i2000: mouse_enabled=%d mouse_streaming=%d "
+                "kbc_command_byte=%02x aux_out_len=%u aux_out_pos=%u "
+                "mouse_param_cmd=%02x mouse_prev_left=%d mouse_prev_right=%d "
+                "mouse_resolution=%u mouse_sample_rate=%u kbc_out_len=%u "
+                "kbc_pending_write=%u\n",
+                s->mouse_enabled, s->mouse_streaming, s->kbc_command_byte,
+                s->aux_out_len, s->aux_out_pos, s->mouse_param_cmd,
+                s->mouse_prev_left, s->mouse_prev_right, s->mouse_resolution,
+                s->mouse_sample_rate, s->kbc_out_len, s->kbc_pending_write);
+        fprintf(stderr, "i2000: iosapic_rte[12]=%016" PRIX64 " masked=%d "
+                "pic_master_mask=%02x pic_slave_mask=%02x\n",
+                s->iosapic_rte[12], !!(s->iosapic_rte[12] & IOSAPIC_RTE_MASK),
+                s->pic_master_mask, s->pic_slave_mask);
+        fflush(stderr);
+        return;
+    }
+    {
+        int mdx = 0, mdy = 0;
+        char mbtn[8] = "";
+        int nmatch = txt ? sscanf(txt, "mousemove %d %d %7s", &mdx, &mdy, mbtn) : 0;
+        if (nmatch >= 2) {
+            /* Synthetic PS/2 packet injection for headless testing - see
+             * um6578's own "mousemove"/"mouse" monitor commands for the
+             * sibling feature. Goes through the exact same aux_queue_byte()/
+             * ExtINT path a real host mouse event would, so this exercises
+             * the full pipeline (packet build, IRQ delivery, ack) without
+             * needing a live display. */
+            if (!s->mouse_enabled) {
+                printf("mousemove: no mouse attached (-device mouse)\n");
+            } else if (!s->mouse_streaming) {
+                printf("mousemove: mouse attached but guest hasn't enabled "
+                       "streaming yet (mouse_streaming=0)\n");
+            } else if (s->aux_out_len != 0 ||
+                       s->cpu->ninsts < s->mouse_retry_ninsts) {
+                /* Matches the real per-frame polling path's backpressure
+                 * guard (ia64_i2000_run()) - real host mouse motion never
+                 * queues a new packet while the previous one is still even
+                 * partially undrained or its cooldown hasn't elapsed,
+                 * letting the guest fully finish with one report before
+                 * being offered the next. */
+                printf("mousemove: previous packet not yet drained/cooled "
+                       "down (aux_out_len=%u), dropped\n", s->aux_out_len);
+            } else {
+                bool left = strcmp(mbtn, "left") == 0;
+                bool right = strcmp(mbtn, "right") == 0;
+                int dy = -mdy;
+                bool x_overflow = mdx < -127 || mdx > 127;
+                bool y_overflow = dy < -127 || dy > 127;
+                int8_t cdx = (int8_t)(mdx < -127 ? -127 : mdx > 127 ? 127 : mdx);
+                int8_t cdy = (int8_t)(dy < -127 ? -127 : dy > 127 ? 127 : dy);
+                uint8_t flags = (uint8_t)((left ? 0x01 : 0) | (right ? 0x02 : 0) |
+                                          0x08 |
+                                          (cdx < 0 ? 0x10 : 0) | (cdy < 0 ? 0x20 : 0) |
+                                          (x_overflow ? 0x40 : 0) | (y_overflow ? 0x80 : 0));
+                aux_queue_byte(s, flags);
+                aux_queue_byte(s, (uint8_t)cdx);
+                aux_queue_byte(s, (uint8_t)cdy);
+                s->mouse_prev_left = left;
+                s->mouse_prev_right = right;
+                printf("mousemove: dx=%d dy=%d left=%d right=%d queued\n",
+                       mdx, mdy, left, right);
+            }
+            return;
+        }
+    }
+    if (txt && strncmp(txt, "mousekick", 9) == 0) {
+        /* Debug-only: unconditionally re-raise IRQ12 if aux_out has any
+         * unread bytes, regardless of the empty->nonempty transition
+         * aux_queue_byte()/the 0x60 read handler normally require. For
+         * recovering a stuck backlog from an old snapshot saved before
+         * mouse_irq_pending existed, not part of the real device model. */
+        if (s->aux_out_pos < s->aux_out_len &&
+            !(s->pic_slave_mask & 0x10) && !(s->pic_master_mask & 0x04)) {
+            s->mouse_irq_pending = true;
+            merced_raise_external(s->cpu, 0);
+            printf("mousekick: re-raised (aux_out_pos=%u aux_out_len=%u)\n",
+                   s->aux_out_pos, s->aux_out_len);
+        } else {
+            printf("mousekick: nothing to do (aux_out_pos=%u aux_out_len=%u "
+                   "pic_slave_mask=%02x pic_master_mask=%02x)\n",
+                   s->aux_out_pos, s->aux_out_len, s->pic_slave_mask,
+                   s->pic_master_mask);
+        }
+        return;
+    }
+    {
+        char keyname[32];
+        if (txt && sscanf(txt, "key %31s", keyname) == 1) {
+            /* Monitor-scripted key injection for headless UI testing - the
+             * -display/-vnc input paths only ever feed kbc_queue_ascii()
+             * printable/control ASCII, so arrows (needed for the graphical
+             * setup's tab bar per its own on-screen instructions) have no
+             * other way in. Set-1 make codes, extended (0xE0-prefixed) for
+             * the arrow keys, matching kbc_queue_ascii()'s existing
+             * make-code-only convention (no break code sent either). */
+            uint8_t scan = 0, ext = 0;
+            if (!strcmp(keyname, "right")) { ext = 0xE0; scan = 0x4D; }
+            else if (!strcmp(keyname, "left"))  { ext = 0xE0; scan = 0x4B; }
+            else if (!strcmp(keyname, "up"))    { ext = 0xE0; scan = 0x48; }
+            else if (!strcmp(keyname, "down"))  { ext = 0xE0; scan = 0x50; }
+            else if (!strcmp(keyname, "enter")) { scan = 0x1c; }
+            else if (!strcmp(keyname, "tab"))   { scan = 0x0f; }
+            else if (!strcmp(keyname, "esc"))   { scan = 0x01; }
+            if (scan) {
+                if (ext) kbc_queue_byte(s, ext);
+                kbc_queue_byte(s, scan);
+                printf("key %s queued\n", keyname);
+            } else {
+                printf("unknown key '%s' (right/left/up/down/enter/tab/esc)\n",
+                       keyname);
+            }
+            return;
+        }
     }
     {
         uint64_t daddr, dlen;
@@ -2927,6 +3413,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
 
     s->pic_master_mask = 0xFF;
     s->pic_slave_mask = 0xFF;
+    s->mouse_enabled = cfg->mouse_enabled;
 
     s->ram_size = cfg->ram_size;
     s->ram = calloc(1, (size_t)s->ram_size);
@@ -3001,6 +3488,10 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
             .scale = cfg->display_scale,
             .ini_section = "i2000",
             .no_menu = cfg->menu_disabled,
+            /* VM-style click-to-capture, same as um6578: the guest firmware
+             * draws its own cursor sprite, so the host cursor should be
+             * hidden/captured on click rather than tracked in parallel. */
+            .capture_pointer = cfg->mouse_enabled,
         };
         s->display = gemu_display_create(cfg->display_type, &dc);
         if (!s->display) {
@@ -3124,8 +3615,10 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
     if (s->pit0_next_irq && s->cpu->ninsts >= s->pit0_next_irq) {
         i2000_ensure_legacy_runtime(s);
         iosapic_raise_gsi(s, 0);  /* GSI 0 == legacy PIT/IRQ0, forward-compat */
-        if (!(s->pic_master_mask & 1))
+        if (!(s->pic_master_mask & 1)) {
+            s->pit_irq_pending = true;
             merced_raise_external(s->cpu, 0);  /* ExtINT: IRQ0 unmasked */
+        }
         s->pit0_next_irq = s->cpu->ninsts + 100000;
     }
     /* Channel 1 has no standard ISA IRQ wiring on real hardware (classically
@@ -3135,6 +3628,32 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * here raises an interrupt for it. */
     if (s->pit1_next_irq && s->cpu->ninsts >= s->pit1_next_irq) {
         s->pit1_next_irq = s->cpu->ninsts + 100000;
+    }
+    /* The single place that actually raises vector 0 on mouse's behalf -
+     * covers both a brand new packet (aux_queue_byte() only queues bytes,
+     * it doesn't raise) and a same-packet retry for the next byte
+     * (scheduled by the legacy-ack handler's mouse branch). Runs outside
+     * any interrupt-handling context, unlike the ack handler itself, which
+     * is exactly why it's safe to raise from here - see the long comments
+     * on aux_queue_byte() and the ack handler's mouse branch for what goes
+     * wrong when this is done synchronously or without a cooldown.
+     * mouse_retry_ninsts defaults to 0 (calloc'd), so a fresh packet with
+     * no prior cooldown scheduled raises as soon as it's queued.
+     *
+     * Deliberately does NOT gate on !mouse_irq_pending: the ack handler's
+     * retry case leaves mouse_irq_pending TRUE (on purpose, so ack
+     * arbitration can still attribute the eventual ack to mouse) while it
+     * still wants this loop to keep re-raising every time the retry
+     * deadline is hit. merced_raise_external() is a plain OR of an
+     * already-possibly-set bit, so raising here on every eligible
+     * instruction between the deadline and the guest actually taking it is
+     * harmless, not a flood - mouse_retry_ninsts is the real rate limiter,
+     * not this flag. */
+    if (s->aux_out_pos < s->aux_out_len &&
+        s->cpu->ninsts >= s->mouse_retry_ninsts &&
+        !(s->pic_slave_mask & 0x10) && !(s->pic_master_mask & 0x04)) {
+        s->mouse_irq_pending = true;
+        merced_raise_external(s->cpu, 0);
     }
 }
 
@@ -3277,11 +3796,17 @@ static void i2000_run_slice(Ia64I2000State *s) {
 
 static void i2000_reset(Ia64I2000State *s) {
     bool rage128_enabled = s->rage128_enabled;
+    bool mouse_enabled = s->mouse_enabled;
     merced_reset(s->cpu);
     vga_ibm_reset(&s->vga);
     rage128_init(s, rage128_enabled);
     memset(&s->int10_req, 0,
            sizeof(*s) - offsetof(Ia64I2000State, int10_req));
+    /* mouse_enabled is a CLI-configured setting (-device mouse), not
+     * protocol state - a reset should clear the aux device's transient
+     * state (queue, streaming flag, etc, all zeroed by the memset above)
+     * without un-attaching the mouse itself. */
+    s->mouse_enabled = mouse_enabled;
     /* Selected VGA option ROM, shadowed at its conventional address so any
      * legacy option-ROM scan (0x55 0xAA signature check) finds it, the same
      * way a real add-in VGA card's ROM would appear at boot. */
@@ -3374,6 +3899,57 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                     }
                     kbc_queue_ascii(s, cp);
                 }
+            }
+        }
+
+        if (s->mouse_enabled) {
+            int rel_x = 0, rel_y = 0;
+            bool left = s->mouse_prev_left, right = s->mouse_prev_right;
+            bool have_pointer = false;
+            if (s->display) {
+                GemuPointerState p = gemu_display_get_pointer(s->display);
+                rel_x = p.rel_x; rel_y = p.rel_y;
+                left = p.button; right = p.right_button;
+                have_pointer = true;
+            } else if (s->vnc) {
+                GemuVncPointerState p = gemu_vnc_get_pointer(s->vnc);
+                rel_x = p.rel_x; rel_y = p.rel_y;
+                left = p.button; right = p.right_button;
+                have_pointer = true;
+            }
+            if (have_pointer && s->mouse_streaming &&
+                (rel_x || rel_y || left != s->mouse_prev_left ||
+                 right != s->mouse_prev_right) &&
+                /* Strictly "queue is empty AND cooldown elapsed", not just
+                 * "3 bytes of room" - see aux_queue_byte()'s and
+                 * i2000_poll_interrupts()'s comments. A queue that's merely
+                 * "not full" still lets a new packet be offered while the
+                 * guest is only partway through draining the previous one,
+                 * which is exactly the pattern that reproducibly wedged the
+                 * guest (confirmed live, including via the user's own
+                 * interactive session freezing at the Itanium splash
+                 * screen). Real PS/2 mouse hardware has the same natural
+                 * one-report-in-flight-at-a-time behavior via clock-line
+                 * flow control; this just makes it explicit instead of
+                 * relying on host mouse motion happening to be slow enough
+                 * on its own. */
+                s->aux_out_len == 0 &&
+                s->cpu->ninsts >= s->mouse_retry_ninsts) {
+                /* Host Y grows down, PS/2 Y grows up. */
+                int dy = -rel_y;
+                bool x_overflow = rel_x < -127 || rel_x > 127;
+                bool y_overflow = dy < -127 || dy > 127;
+                int8_t cdx = (int8_t)(rel_x < -127 ? -127 : rel_x > 127 ? 127 : rel_x);
+                int8_t cdy = (int8_t)(dy < -127 ? -127 : dy > 127 ? 127 : dy);
+                uint8_t flags = (uint8_t)((left ? 0x01 : 0) | (right ? 0x02 : 0) |
+                                          0x08 |
+                                          (cdx < 0 ? 0x10 : 0) | (cdy < 0 ? 0x20 : 0) |
+                                          (x_overflow ? 0x40 : 0) | (y_overflow ? 0x80 : 0));
+                aux_queue_byte(s, flags);
+                aux_queue_byte(s, (uint8_t)cdx);
+                aux_queue_byte(s, (uint8_t)cdy);
+                s->mouse_prev_left = left;
+                s->mouse_prev_right = right;
             }
         }
 

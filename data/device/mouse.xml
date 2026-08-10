@@ -1,4 +1,5 @@
 <?xml version="1.0"?>
 <device name="mouse" description="Generic PS/2 Mouse" status="working">
+    <machine name="i2000"/>
     <machine name="um6578"/>
 </device>

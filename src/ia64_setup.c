@@ -206,6 +206,19 @@ int ia64_setup(int argc, char *argv[]) {
                 return 1;
             }
             serial_spec = spec;
+        } else if (strcmp(rem[i], "-device") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -device requires an argument\n"); return 1; }
+            const char *dev = rem[++i];
+            if (strcmp(dev, "mouse") == 0) {
+                if (strcmp(alias, "i2000") != 0) {
+                    fprintf(stderr, "gemu: -device mouse is supported by i2000 only\n");
+                    return 1;
+                }
+                cfg.mouse_enabled = true;
+            } else {
+                fprintf(stderr, "gemu: unknown device '%s' (use -device ? to list)\n", dev);
+                return 1;
+            }
         } else {
             fprintf(stderr, "gemu: unknown option '%s' (try -h)\n", rem[i]);
             return 1;

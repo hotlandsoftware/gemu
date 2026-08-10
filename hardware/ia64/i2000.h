@@ -66,6 +66,7 @@ typedef struct {
     const char     *vga;
     bool            no_shutdown;
     bool            menu_disabled; /* machine XML's menu="disabled" */
+    bool            mouse_enabled; /* -device mouse (i2000 only) */
 } Ia64Config;
 
 typedef struct Ia64I2000State Ia64I2000State;

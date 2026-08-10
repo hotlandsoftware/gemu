@@ -200,7 +200,15 @@ bool vga_ibm_is_text_mode(const VgaIbm *v) {
 }
 
 static uint32_t dac_to_argb(const VgaIbm *v, unsigned idx) {
-    unsigned r = v->dac[idx][0] & 0x3F, g = v->dac[idx][1] & 0x3F, b = v->dac[idx][2] & 0x3F;
+    /* This firmware's palette-load routine writes DAC entries as B,G,R
+     * rather than the standard R,G,B triplet order - confirmed against raw
+     * VRAM: index 4's stored bytes (42,0,0) must display as blue (0,0,170)
+     * to match the reference, not red (170,0,0), which only happens by
+     * reading the first stored byte as Blue and the third as Red. This is
+     * purely how this firmware happens to have programmed the DAC - the
+     * write path (0x3C9) still stores exactly what's written, readback is
+     * unaffected, only the render-time interpretation swaps here. */
+    unsigned r = v->dac[idx][2] & 0x3F, g = v->dac[idx][1] & 0x3F, b = v->dac[idx][0] & 0x3F;
     /* 6-bit DAC channels scaled to 8-bit. */
     r = (r << 2) | (r >> 4); g = (g << 2) | (g >> 4); b = (b << 2) | (b >> 4);
     return 0xFF000000u | (r << 16) | (g << 8) | b;
