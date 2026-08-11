@@ -4,6 +4,7 @@
 #include "vga_ibm.h"
 #include "vgafont16.h"
 #include "vgabios_rom.h"
+#include "rage128.h"
 #include "gemu/gemu_display.h"
 #include "gemu/vnc.h"
 #include "gemu/monitor.h"
@@ -100,14 +101,12 @@
 #define HALT_CALL_LINES  32
 
 #define RAGE128_PCI_DEV       5u
-#define RAGE128_VENDOR_ID     0x1002u
-#define RAGE128_DEVICE_ID     0x5046u
 #define RAGE128_FB_BASE       0xC4000000ull
-#define RAGE128_FB_APER_SIZE  0x04000000ull
-#define RAGE128_VRAM_SIZE     0x00800000u
 #define RAGE128_IO_BASE       0xC300u
 #define RAGE128_MMIO_BASE     0xC8000000ull
-#define RAGE128_MMIO_SIZE     0x4000u
+#define I2000_HIGH_DRAM_TAG   UINT64_C(0x00000e0000000000)
+#define I2000_HIGH_DRAM_SIZE  (UINT64_C(64) * 1024 * 1024)
+#define I2000_HIGH_DRAM_BASE  (I2000_RAM_MAX - I2000_HIGH_DRAM_SIZE)
 
 typedef struct {
     uint64_t addr;
@@ -268,10 +267,9 @@ struct Ia64I2000State {
     /* v5 snapshot tail.  Rage128 needs only the display engine and linear
      * framebuffer for EFI/Windows setup; AGP and 3D are intentionally out
      * of scope.  The 64 MiB PCI aperture mirrors the installed 8 MiB VRAM. */
-    bool rage128_enabled;
-    uint8_t rage128_cfg[256];
-    uint8_t rage128_mmio[RAGE128_MMIO_SIZE];
-    uint8_t rage128_vram[RAGE128_VRAM_SIZE];
+    /* Keep this in the former enabled/cfg/mmio/vram position: Rage128 has
+     * the same byte layout, preserving legacy i2000 snapshot compatibility. */
+    Rage128 rage128;
 
     /* v6 snapshot tail: IA64-VPC-compatible INT 10h/VBE bridge. */
     struct { uint16_t ax, bx, cx, dx, di, es; } int10_req, int10_res;
@@ -337,6 +335,16 @@ struct Ia64I2000State {
     int32_t mouse_accum_dx, mouse_accum_dy;
     bool mouse_host_left, mouse_host_right;
     uint64_t mouse_next_report_itc;
+    /* v10 tail: separately-backed top of the 0xe00 memory-card aperture. */
+    uint8_t *high_dram;
+    /* v11: persistent writable flash overlay (the ROM itself stays clean). */
+    char nvram_path[512];
+    bool nvram_dirty;
+    /* v12: legacy IRQ1 latch for queued 8042 keyboard/controller output. */
+    bool keyboard_irq_pending;
+    /* v13: channel-0 read sequencing and counter epoch. */
+    uint8_t pit0_read_phase;
+    uint64_t pit0_epoch_ninsts;
 };
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -760,29 +768,6 @@ static bool chipset_device_present(unsigned dev) {
     return dev == 0 || dev == 1 || dev == 4 || (dev >= 0x10 && dev <= 0x17);
 }
 
-static void rage128_init(Ia64I2000State *s, bool enabled) {
-    s->rage128_enabled = enabled;
-    memset(s->rage128_cfg, 0, sizeof(s->rage128_cfg));
-    memset(s->rage128_mmio, 0, sizeof(s->rage128_mmio));
-    memset(s->rage128_vram, 0, sizeof(s->rage128_vram));
-    if (!enabled)
-        return;
-    uint16_t w;
-    uint32_t d;
-    w = RAGE128_VENDOR_ID; memcpy(s->rage128_cfg + 0x00, &w, 2);
-    w = RAGE128_DEVICE_ID; memcpy(s->rage128_cfg + 0x02, &w, 2);
-    w = 0x0003; memcpy(s->rage128_cfg + 0x04, &w, 2); /* I/O + memory */
-    s->rage128_cfg[0x0b] = 0x03;                    /* display/VGA */
-    d = (uint32_t)RAGE128_FB_BASE | 0x08u;          /* prefetchable */
-    memcpy(s->rage128_cfg + 0x10, &d, 4);
-    d = RAGE128_IO_BASE | 1u; memcpy(s->rage128_cfg + 0x14, &d, 4);
-    d = (uint32_t)RAGE128_MMIO_BASE; memcpy(s->rage128_cfg + 0x18, &d, 4);
-    w = 0x1af4; memcpy(s->rage128_cfg + 0x2c, &w, 2);
-    w = 0x1100; memcpy(s->rage128_cfg + 0x2e, &w, 2);
-    s->rage128_cfg[0x3c] = 17;
-    s->rage128_cfg[0x3d] = 1;
-}
-
 enum {
     INT10_AX, INT10_BX, INT10_CX, INT10_DX,
     INT10_DI, INT10_ES, INT10_EXEC, INT10_DATA
@@ -856,7 +841,7 @@ static void i2000_make_int10_rom(uint8_t rom[512]) {
 static void i2000_load_vga_option_rom(Ia64I2000State *s) {
     memset(s->vga_rom_shadow, 0xff, sizeof(s->vga_rom_shadow));
     memcpy(s->vga_rom_shadow, vgabios_rom, vgabios_rom_len);
-    if (s->rage128_enabled) {
+    if (s->rage128.enabled) {
         /* Keep the proven SeaVGABIOS execution path, but make its PCI data
          * agree with the Rage128 function firmware discovered at 00:05.0. */
         for (size_t i = 0; i + 8 <= vgabios_rom_len; i++) {
@@ -891,17 +876,8 @@ static void int10_response(Ia64I2000State *s, size_t len) {
 
 static void int10_program_mode(Ia64I2000State *s, const I2000VbeMode *m,
                                bool no_clear) {
-    unsigned fmt = m->bpp == 16 ? 4 : m->bpp == 24 ? 5 : 6;
-    uint32_t gen = fmt << 8;
-    uint32_t hdisp = ((m->width / 8) - 1) << 16;
-    uint32_t vdisp = (m->height - 1) << 16;
-    uint32_t pitch = (m->width / 8) & 0x7ff;
-    memcpy(s->rage128_mmio + 0x0050, &gen, 4);
-    memcpy(s->rage128_mmio + 0x0200, &hdisp, 4);
-    memcpy(s->rage128_mmio + 0x0208, &vdisp, 4);
-    memset(s->rage128_mmio + 0x0224, 0, 4);
-    memcpy(s->rage128_mmio + 0x022c, &pitch, 4);
-    if (!no_clear) memset(s->rage128_vram, 0, sizeof(s->rage128_vram));
+    rage128_program_mode(&s->rage128, m->width, m->height, m->bpp,
+                         no_clear);
     s->int10_mode = m->number;
     if (getenv("RAGE128_DEBUG"))
         fprintf(stderr, "i2000: INT10 set VBE mode %#x %ux%ux%u\n",
@@ -1013,19 +989,6 @@ static void int10_io_write(Ia64I2000State *s, unsigned reg, uint16_t v) {
     }
 }
 
-static uint64_t rage128_cfg_read(Ia64I2000State *s, unsigned reg,
-                                 unsigned size) {
-    uint64_t v = 0;
-    memcpy(&v, s->rage128_cfg + reg, size);
-    if (size == 4 && reg == 0x10 && (uint32_t)v == 0xffffffffu)
-        return 0xfc000008u;
-    if (size == 4 && reg == 0x14 && (uint32_t)v == 0xffffffffu)
-        return 0xffffff01u;
-    if (size == 4 && reg == 0x18 && (uint32_t)v == 0xffffffffu)
-        return 0xffffc000u;
-    return v;
-}
-
 static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     uint32_t a = s->pci_cfg_addr;
     if (!(a & 0x80000000u) || lane + size > 4)
@@ -1034,9 +997,9 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
-    if (s->rage128_enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
-        fun == 0 && reg + size <= sizeof(s->rage128_cfg))
-        return rage128_cfg_read(s, reg, size);
+    if (s->rage128.enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
+        fun == 0 && reg + size <= sizeof(s->rage128.cfg))
+        return rage128_pci_read(&s->rage128, reg, size);
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == 0 &&
         reg + size <= sizeof(s->ifb_cfg)) {
         uint64_t v = 0;
@@ -1104,13 +1067,9 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
-    if (s->rage128_enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
-        fun == 0 && reg + size <= sizeof(s->rage128_cfg)) {
-        for (unsigned i = 0; i < size; i++) {
-            unsigned off = reg + i;
-            if (off >= 4 && !(off >= 8 && off < 16) && off < 0x40)
-                s->rage128_cfg[off] = (uint8_t)(val >> (i * 8));
-        }
+    if (s->rage128.enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
+        fun == 0 && reg + size <= sizeof(s->rage128.cfg)) {
+        rage128_pci_write(&s->rage128, reg, val, size);
         return;
     }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == 0 &&
@@ -1224,38 +1183,6 @@ static bool vga_port(uint64_t port) {
     return port == 0x3B4 || port == 0x3B5 || port == 0x3BA ||
            (port >= 0x3C0 && port <= 0x3CF) ||
            port == 0x3D4 || port == 0x3D5 || port == 0x3DA;
-}
-
-static uint32_t rage128_reg32(const Ia64I2000State *s, unsigned off) {
-    uint32_t v = 0;
-    if (off + 4 <= sizeof(s->rage128_mmio))
-        memcpy(&v, s->rage128_mmio + off, 4);
-    return v;
-}
-
-static uint64_t rage128_mmio_read(Ia64I2000State *s, unsigned off,
-                                  unsigned size) {
-    uint64_t v = 0;
-    if (off == 0x00f8 && size == 4) /* CONFIG_MEMSIZE */
-        return RAGE128_VRAM_SIZE;
-    if (off + size <= sizeof(s->rage128_mmio))
-        memcpy(&v, s->rage128_mmio + off, size);
-    return v;
-}
-
-static void rage128_mmio_write(Ia64I2000State *s, unsigned off,
-                               uint64_t val, unsigned size) {
-    if (off + size <= sizeof(s->rage128_mmio))
-        memcpy(s->rage128_mmio + off, &val, size);
-}
-
-static uint32_t rage128_bar(const Ia64I2000State *s, unsigned off,
-                            uint32_t fallback, uint32_t mask) {
-    uint32_t bar = 0;
-    memcpy(&bar, s->rage128_cfg + off, 4);
-    if (bar == 0xffffffffu || !(bar & mask))
-        return fallback;
-    return bar & mask;
 }
 
 static uint8_t cmos_bcd(unsigned v) {
@@ -1384,14 +1311,15 @@ static bool smbus_port_offset(Ia64I2000State *s, uint64_t port, uint64_t *off) {
 
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     static unsigned debug_reads;
-    if (s->rage128_enabled && size == 2 && port >= INT10_IO_BASE &&
+    if (s->rage128.enabled && size == 2 && port >= INT10_IO_BASE &&
         port < INT10_IO_BASE + 16 && !(port & 1))
         return int10_io_read(s, (unsigned)(port - INT10_IO_BASE) / 2);
-    if (s->rage128_enabled) {
-        uint32_t base = rage128_bar(s, 0x14, RAGE128_IO_BASE,
+    if (s->rage128.enabled) {
+        uint32_t base = rage128_bar(&s->rage128, 0x14, RAGE128_IO_BASE,
                                    ~UINT32_C(0xff));
         if (port >= base && port + size <= base + 0x100)
-            return rage128_mmio_read(s, (unsigned)(port - base), size);
+            return rage128_mmio_read(&s->rage128,
+                                     (unsigned)(port - base), size);
     }
     if (size == 1 && vga_port(port))
         return vga_ibm_io_read(&s->vga, (uint16_t)port);
@@ -1531,11 +1459,29 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     }
     if (port == 0x21) return s->pic_master_mask;
     if (port == 0xA1) return s->pic_slave_mask;
+    if (port == 0x40 && size == 1) {
+        /* EFI reads the 8254 channel-0 count as low byte followed by high
+         * byte and uses the difference to calibrate its stall routine.  A
+         * constant 0xff (the old unimplemented-port result) makes that
+         * difference zero and trips var.c's NumberOfTicks assertion.
+         *
+         * Tie the counter to executed slots. Exact wall-clock frequency is
+         * not important here, but it must count down and both bytes of one
+         * read must describe essentially the same sample. */
+        uint32_t reload = s->pit0_reload ? s->pit0_reload : 0x10000u;
+        uint64_t ticks = (s->cpu->ninsts - s->pit0_epoch_ninsts) / 8u;
+        uint16_t count = (uint16_t)(reload - (ticks % reload));
+        uint8_t v = s->pit0_read_phase ? (uint8_t)(count >> 8)
+                                       : (uint8_t)count;
+        s->pit0_read_phase ^= 1;
+        return v;
+    }
     if (port == 0x404)
-        /* System status/GPIO word. The bootstrap reads this once: bits 24
-         * and 19 both set means the BIOS recovery jumper is installed and
-         * sends the whole boot into PspRecover. 0 = Normal position. */
-        return 0;
+        /* System status/GPIO word. Bit 24 reports J29 in its normal running
+         * position. Returning zero reports OVRD/CLRCMOS instead, making the
+         * SDV firmware stop with "Hardware Override / Power off and reset
+         * hardware jumper!". Other strap bits remain deasserted. */
+        return UINT32_C(0x01000000);
     if (port >= 0x400 && port + size <= 0x440) {
         uint64_t v = 0;
         memcpy(&v, &s->acpi_io[port - 0x400], size);
@@ -1543,7 +1489,11 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     }
     if (port == 0x61) {                            /* PIT channel-2 gate/output */
         if (s->pit2_polls < 2) s->pit2_polls++;
-        return s->port61 | (s->pit2_polls >= 2 ? 0x20 : 0);
+        /* Bit 4 is the PIT channel-1 refresh-request toggle. Legacy BIOS
+         * delay code waits for both its rising and falling edges; holding
+         * it constant traps the IRQ1 handler in a permanent spin. */
+        uint8_t refresh = (s->cpu->ninsts >> 8) & 1 ? 0x10 : 0;
+        return s->port61 | refresh | (s->pit2_polls >= 2 ? 0x20 : 0);
     }
     if (s->cdrom && ((port >= 0x170 && port <= 0x177) || port == 0x376)) {
         unsigned reg = port == 0x376 ? 7 : (unsigned)(port - 0x170);
@@ -1624,17 +1574,18 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
     static unsigned debug_writes;
-    if (s->rage128_enabled && size == 2 && port >= INT10_IO_BASE &&
+    if (s->rage128.enabled && size == 2 && port >= INT10_IO_BASE &&
         port < INT10_IO_BASE + 16 && !(port & 1)) {
         int10_io_write(s, (unsigned)(port - INT10_IO_BASE) / 2,
                        (uint16_t)val);
         return;
     }
-    if (s->rage128_enabled) {
-        uint32_t base = rage128_bar(s, 0x14, RAGE128_IO_BASE,
+    if (s->rage128.enabled) {
+        uint32_t base = rage128_bar(&s->rage128, 0x14, RAGE128_IO_BASE,
                                    ~UINT32_C(0xff));
         if (port >= base && port + size <= base + 0x100) {
-            rage128_mmio_write(s, (unsigned)(port - base), val, size);
+            rage128_mmio_write(&s->rage128,
+                               (unsigned)(port - base), val, size);
             return;
         }
     }
@@ -1713,6 +1664,8 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         } else {
             s->pit0_reload = s->pit0_latch | ((uint16_t)(uint8_t)val << 8);
             s->pit0_write_phase = 0;
+            s->pit0_read_phase = 0;
+            s->pit0_epoch_ninsts = s->cpu->ninsts;
             s->pit0_next_irq = s->cpu->ninsts + 100000;
         }
         return;
@@ -1831,9 +1784,10 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                     "mode=%u) ninsts=%" PRIu64 "\n", (unsigned)(uint8_t)val,
                     (unsigned)((uint8_t)val >> 6), (unsigned)(((uint8_t)val >> 1) & 7),
                     s->cpu->ninsts);
-        if (((uint8_t)val >> 6) == 0)
+        if (((uint8_t)val >> 6) == 0) {
             s->pit0_write_phase = 0;
-        else if (((uint8_t)val >> 6) == 1)
+            s->pit0_read_phase = 0;
+        } else if (((uint8_t)val >> 6) == 1)
             s->pit1_write_phase = 0;
         return;
     }
@@ -2086,29 +2040,51 @@ static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi) {
     merced_raise_external(s->cpu, (uint8_t)rte);
 }
 
+/* SDV's 460GX memory map carries the memory-card/port selector in physical
+ * address bits 43:32.  Aperture 0xe00 is distinct from the low firmware
+ * mapping: EFI uses both at once, so folding it onto low RAM corrupts its
+ * stacks. Back the top 64 MiB separately; this covers the top-down EFI pool
+ * while avoiding another full 2 GiB host allocation. */
+static inline bool i2000_high_dram_addr(uint64_t addr, uint64_t *off) {
+    if ((addr & UINT64_C(0x00000fff00000000)) != I2000_HIGH_DRAM_TAG)
+        return false;
+    uint64_t low = (uint32_t)addr;
+    if (low < I2000_HIGH_DRAM_BASE || low >= I2000_RAM_MAX)
+        return false;
+    *off = low - I2000_HIGH_DRAM_BASE;
+    return true;
+}
+
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64I2000State *s = ud;
+    for (unsigned i = 0; i < size; i++)
+        gemu_monitor_check_read(s->monitor, (uint32_t)(addr + i));
     /* IA-64 region-6 uncached aliases carry 0xC in the top nibble.  The
      * chipset sees the physical address after those region bits are
      * stripped; retaining them made SDV's MMIO PCI configuration cycles
      * miss every device. */
     bool region6 = (addr >> 60) == 0xC;
     addr &= MERCED_PHYS_MASK;
+    uint64_t high_off;
+    if (i2000_high_dram_addr(addr, &high_off) &&
+        high_off + size <= I2000_HIGH_DRAM_SIZE) {
+        uint64_t v = 0;
+        memcpy(&v, s->high_dram + high_off, size);
+        return v;
+    }
     uint32_t voff;
-    if (s->rage128_enabled) {
-        uint64_t fb = rage128_bar(s, 0x10, RAGE128_FB_BASE,
+    if (s->rage128.enabled) {
+        uint64_t fb = rage128_bar(&s->rage128, 0x10, RAGE128_FB_BASE,
                                  ~UINT32_C(0x03ffffff));
-        uint64_t mmio = rage128_bar(s, 0x18, RAGE128_MMIO_BASE,
+        uint64_t mmio = rage128_bar(&s->rage128, 0x18, RAGE128_MMIO_BASE,
                                    ~UINT32_C(0x3fff));
         if (addr >= fb && addr + size <= fb + RAGE128_FB_APER_SIZE) {
-            uint64_t v = 0;
             uint32_t off = (uint32_t)(addr - fb) & (RAGE128_VRAM_SIZE - 1);
-            if (off + size <= RAGE128_VRAM_SIZE)
-                memcpy(&v, s->rage128_vram + off, size);
-            return v;
+            return rage128_vram_read(&s->rage128, off, size);
         }
         if (addr >= mmio && addr + size <= mmio + RAGE128_MMIO_SIZE)
-            return rage128_mmio_read(s, (unsigned)(addr - mmio), size);
+            return rage128_mmio_read(&s->rage128,
+                                     (unsigned)(addr - mmio), size);
     }
     /* vga_mem_window()/vga_rom_window() can only ever match addr < 0xD0000
      * (the legacy VGA aperture + option-ROM shadow window) - skip both
@@ -2185,6 +2161,10 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
              * call set it) and let i2000_poll_interrupts() fire it once
              * that deadline passes. */
             return s->pic_master_base;
+        }
+        if (s->keyboard_irq_pending) {
+            s->keyboard_irq_pending = false;
+            return (uint64_t)(s->pic_master_base + 1); /* IRQ1 */
         }
         if (s->mouse_irq_pending) {
             /* Real 8042 aux OBF is level-triggered: IRQ12 stays asserted as
@@ -2290,22 +2270,35 @@ static uint64_t bus_fetch(void *ud, uint64_t addr, unsigned size) {
 
 static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     Ia64I2000State *s = ud;
+    for (unsigned i = 0; i < size; i++) {
+        if (gemu_monitor_check_write(s->monitor, (uint32_t)(addr + i)))
+            fprintf(stderr, "i2000: watched write pa=%016" PRIX64
+                    " size=%u val=%016" PRIX64 " ip=%016" PRIX64
+                    " ninsts=%" PRIu64 "\n", addr, size, val,
+                    s->cpu->ip, s->cpu->ninsts);
+    }
     bool region6 = (addr >> 60) == 0xC;
     addr &= MERCED_PHYS_MASK;
+    uint64_t high_off;
+    if (i2000_high_dram_addr(addr, &high_off) &&
+        high_off + size <= I2000_HIGH_DRAM_SIZE) {
+        memcpy(s->high_dram + high_off, &val, size);
+        return;
+    }
     uint32_t voff;
-    if (s->rage128_enabled) {
-        uint64_t fb = rage128_bar(s, 0x10, RAGE128_FB_BASE,
+    if (s->rage128.enabled) {
+        uint64_t fb = rage128_bar(&s->rage128, 0x10, RAGE128_FB_BASE,
                                  ~UINT32_C(0x03ffffff));
-        uint64_t mmio = rage128_bar(s, 0x18, RAGE128_MMIO_BASE,
+        uint64_t mmio = rage128_bar(&s->rage128, 0x18, RAGE128_MMIO_BASE,
                                    ~UINT32_C(0x3fff));
         if (addr >= fb && addr + size <= fb + RAGE128_FB_APER_SIZE) {
             uint32_t off = (uint32_t)(addr - fb) & (RAGE128_VRAM_SIZE - 1);
-            if (off + size <= RAGE128_VRAM_SIZE)
-                memcpy(s->rage128_vram + off, &val, size);
+            rage128_vram_write(&s->rage128, off, val, size);
             return;
         }
         if (addr >= mmio && addr + size <= mmio + RAGE128_MMIO_SIZE) {
-            rage128_mmio_write(s, (unsigned)(addr - mmio), val, size);
+            rage128_mmio_write(&s->rage128,
+                               (unsigned)(addr - mmio), val, size);
             return;
         }
     }
@@ -2382,7 +2375,15 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
             if (s->flash_cmd == 0x40 || s->flash_cmd == 0x10) {
                 /* Intel byte-program operation.  Keep NVRAM updates in the
                  * in-memory image; the user's ROM file remains untouched. */
-                s->flash[off] &= (uint8_t)val;
+                uint8_t old = s->flash[off];
+                /* FMMW presents module updates as byte-program cycles after
+                 * handling erase/rewrite internally. Its erase operation is
+                 * not exposed as the raw Intel 0x20 sequence, and legitimate
+                 * CDB updates include 0->1 transitions (for example 21->27).
+                 * Committing only old&new makes verification fail with FMMW
+                 * status 0x40 despite a successful high-level rewrite. */
+                s->flash[off] = (uint8_t)val;
+                s->nvram_dirty |= s->flash[off] != old;
                 s->flash_status = 0x80;
                 s->flash_read_status = true;
                 s->flash_read_id = false;
@@ -2392,8 +2393,10 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
             if (s->flash_cmd == 0x20) {
                 if ((uint8_t)val == 0xD0) {
                     uint64_t block = s->flash_cmd_addr & ~0xFFFFull;
-                    if (block < I2000_FLASH_SIZE)
+                    if (block < I2000_FLASH_SIZE) {
                         memset(s->flash + block, 0xFF, 0x10000);
+                        s->nvram_dirty = true;
+                    }
                     s->flash_status = 0x80;
                 } else {
                     s->flash_status = 0xB0; /* ready + erase error */
@@ -2411,7 +2414,7 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                 s->flash_read_status = true;
                 s->flash_read_id = false;
                 return;
-            case 0x90:                         /* read identifier codes */
+            case 0x90: case 0x91:              /* read identifier codes */
                 s->flash_read_status = false;
                 s->flash_read_id = true;
                 return;
@@ -2476,6 +2479,80 @@ static bool i2000_bus_fill(void *ud, uint64_t addr, uint8_t val, uint64_t len) {
 
 /* ── Firmware ────────────────────────────────────────────────────────────── */
 
+static bool i2000_nvram_repair_bad_prefix(Ia64I2000State *s,
+                                          const uint8_t *rom_prefix) {
+    static const uint32_t factory[2] = { 0x390000, 0x3A0000 };
+    /* An earlier emulator version copied these ROM-resident factory record
+     * lists verbatim into the writable banks. They are input records, not
+     * formatted runtime CDB banks: firmware reports "No CDB found" and
+     * parks with status 5. Recognize only that exact emulator-created image
+     * so genuine guest NVRAM is never discarded. */
+    bool copied_factory =
+        !memcmp(s->flash, s->flash + factory[0], 0x10000) &&
+        !memcmp(s->flash + 0x10000, s->flash + factory[1], 0x10000);
+    bool erased = true;
+    for (uint32_t i = 0; i < 0x20000 && erased; i++)
+        erased = s->flash[i] == 0xff;
+    if (!copied_factory && !erased)
+        return false;
+    /* This prefix is not wholly NVRAM: the firmware image contains required
+     * CDB data around 0x17d20. Restore it byte-for-byte from the pristine
+     * ROM rather than erasing the whole range. */
+    memcpy(s->flash, rom_prefix, 0x20000);
+    return true;
+}
+
+static void i2000_nvram_load(Ia64I2000State *s) {
+    gemu_config_path(s->nvram_path, sizeof(s->nvram_path), "i2000.nvram");
+    FILE *f = fopen(s->nvram_path, "rb");
+    if (!f)
+        return;
+    uint8_t *image = malloc(I2000_FLASH_SIZE);
+    size_t got = image ? fread(image, 1, I2000_FLASH_SIZE, f) : 0;
+    int extra = fgetc(f);
+    fclose(f);
+    if (got != I2000_FLASH_SIZE || extra != EOF) {
+        fprintf(stderr, "i2000: ignoring malformed NVRAM '%s'\n",
+                s->nvram_path);
+        free(image);
+        return;
+    }
+    uint8_t *rom_prefix = malloc(0x20000);
+    if (!rom_prefix) {
+        free(image);
+        return;
+    }
+    memcpy(rom_prefix, s->flash, 0x20000);
+    memcpy(s->flash, image, I2000_FLASH_SIZE);
+    free(image);
+    if (i2000_nvram_repair_bad_prefix(s, rom_prefix)) {
+        s->nvram_dirty = true;
+        printf("i2000: repaired corrupted NVRAM/ROM prefix\n");
+    }
+    free(rom_prefix);
+    printf("i2000: loaded NVRAM '%s'\n", s->nvram_path);
+}
+
+static void i2000_nvram_save(Ia64I2000State *s) {
+    if (!s->nvram_dirty || !s->nvram_path[0] || !s->flash)
+        return;
+    gemu_ensure_parent_dir(s->nvram_path);
+    char tmp[sizeof(s->nvram_path) + 5];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", s->nvram_path);
+    FILE *f = fopen(tmp, "wb");
+    bool ok = f && fwrite(s->flash, 1, I2000_FLASH_SIZE, f) ==
+                   I2000_FLASH_SIZE && fflush(f) == 0;
+    if (f && fclose(f) != 0)
+        ok = false;
+    if (!ok || rename(tmp, s->nvram_path) != 0) {
+        remove(tmp);
+        fprintf(stderr, "i2000: cannot save NVRAM '%s'\n", s->nvram_path);
+        return;
+    }
+    s->nvram_dirty = false;
+    printf("i2000: saved NVRAM '%s'\n", s->nvram_path);
+}
+
 bool ia64_i2000_load_firmware(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -2502,6 +2579,7 @@ bool ia64_i2000_load_firmware(Ia64I2000State *s, const char *path) {
     snprintf(s->flash_file, sizeof(s->flash_file), "%s", path);
     s->flash_image_size = (uint32_t)len;
     s->flash_loaded = true;
+    i2000_nvram_load(s);
     gemu_monitor_register_rom(s->monitor, (uint32_t)(I2000_FLASH_BASE + off),
                               (uint32_t)len, path);
     return true;
@@ -2615,44 +2693,9 @@ static void i2000_repair_saved_mode12(Ia64I2000State *s) {
 }
 
 static void i2000_render_frame(Ia64I2000State *s) {
-    if (s->rage128_enabled) {
-        uint32_t gen = rage128_reg32(s, 0x0050);
-        unsigned fmt = (gen >> 8) & 7;
-        if (fmt >= 3) {
-            unsigned w = (((rage128_reg32(s, 0x0200) >> 16) & 0x7ff) + 1) * 8;
-            unsigned h = ((rage128_reg32(s, 0x0208) >> 16) & 0xfff) + 1;
-            unsigned bpp = fmt == 3 ? 2 : fmt == 4 ? 2 : fmt == 5 ? 3 : 4;
-            unsigned pitch = (rage128_reg32(s, 0x022c) & 0x7ff) * 8;
-            unsigned start = rage128_reg32(s, 0x0224) & 0x07ffffff;
-            if (!w || w > 2048) w = 640;
-            if (!h || h > 1536) h = 480;
-            if (!pitch) pitch = w;
-            for (unsigned y = 0; y < FB_H; y++) {
-                unsigned sy = y * h / FB_H;
-                for (unsigned x = 0; x < FB_W; x++) {
-                    unsigned sx = x * w / FB_W;
-                    size_t off = start + ((size_t)sy * pitch + sx) * bpp;
-                    uint32_t rgb = 0;
-                    if (off + bpp <= RAGE128_VRAM_SIZE) {
-                        const uint8_t *p = s->rage128_vram + off;
-                        if (bpp == 2) {
-                            uint16_t q; memcpy(&q, p, 2);
-                            if (fmt == 3)
-                                rgb = ((q & 0x7c00) << 9) |
-                                      ((q & 0x03e0) << 6) | ((q & 0x001f) << 3);
-                            else
-                                rgb = ((q & 0xf800) << 8) |
-                                      ((q & 0x07e0) << 5) | ((q & 0x001f) << 3);
-                        } else {
-                            rgb = (uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0];
-                        }
-                    }
-                    s->fb[y * FB_W + x] = 0xff000000u | rgb;
-                }
-            }
-            return;
-        }
-    }
+    if (s->rage128.enabled &&
+        rage128_render(&s->rage128, s->fb, FB_W, FB_H))
+        return;
     if (getenv("VGA_TEXT_DEBUG")) {
         static unsigned printed;
         if (printed < 20) {
@@ -2734,16 +2777,17 @@ static void i2000_render_frame(Ia64I2000State *s) {
 
 static bool i2000_screendump(void *ud, const char *path) {
     Ia64I2000State *s = ud;
-    if (s->rage128_enabled) {
-        size_t nonzero = 0;
-        for (size_t i = 0; i < sizeof(s->rage128_vram); i++)
-            nonzero += s->rage128_vram[i] != 0;
+    if (s->rage128.enabled) {
+        size_t nonzero = rage128_nonzero_vram(&s->rage128);
         fprintf(stderr,
                 "i2000: Rage128 screen gen=%08X hdisp=%08X vdisp=%08X "
                 "offset=%08X pitch=%08X nonzero_vram=%zu int10=%02X%02X:%02X%02X\n",
-                rage128_reg32(s, 0x0050), rage128_reg32(s, 0x0200),
-                rage128_reg32(s, 0x0208), rage128_reg32(s, 0x0224),
-                rage128_reg32(s, 0x022c), nonzero, s->ram[0x43], s->ram[0x42],
+                rage128_reg32(&s->rage128, 0x0050),
+                rage128_reg32(&s->rage128, 0x0200),
+                rage128_reg32(&s->rage128, 0x0208),
+                rage128_reg32(&s->rage128, 0x0224),
+                rage128_reg32(&s->rage128, 0x022c), nonzero,
+                s->ram[0x43], s->ram[0x42],
                 s->ram[0x41], s->ram[0x40]);
     }
     i2000_render_frame(s);
@@ -2763,7 +2807,7 @@ static bool i2000_screendump(void *ud, const char *path) {
  * than hand-listing every scalar field, and it stays correct automatically
  * as fields get added. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 9u  /* v9 adds EOI-driven mouse flow control */
+#define I2000_SNAPSHOT_VERSION 13u /* v13 adds a readable PIT0 counter */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -2778,6 +2822,8 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fwrite(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
     ok &= fwrite(s->chipset_scratch, 1, I2000_CHIPSET_SCRATCH_SIZE, f) ==
           I2000_CHIPSET_SCRATCH_SIZE;
+    ok &= fwrite(s->high_dram, 1, I2000_HIGH_DRAM_SIZE, f) ==
+          I2000_HIGH_DRAM_SIZE;
     uint64_t atapi_len = (uint64_t)s->atapi_data_len;
     ok &= fwrite(&atapi_len, sizeof(atapi_len), 1, f) == 1;
     if (atapi_len)
@@ -2797,6 +2843,7 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     snap->ram = NULL;
     snap->flash = NULL;
     snap->chipset_scratch = NULL;
+    snap->high_dram = NULL;
     snap->cdrom = NULL;
     snap->atapi_data = NULL;
     snap->hda = NULL;
@@ -2823,15 +2870,24 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fread(&version, sizeof(version), 1, f) == 1;
     ok &= fread(&ram_size, sizeof(ram_size), 1, f) == 1;
     if (!ok || magic != I2000_SNAPSHOT_MAGIC ||
-        (version < 3u || version > I2000_SNAPSHOT_VERSION) ||
+        (version < 9u || version > I2000_SNAPSHOT_VERSION) ||
         ram_size != s->ram_size) {
         fclose(f);
         return false;
     }
+    uint8_t rom_prefix[0x20000];
+    memcpy(rom_prefix, s->flash, sizeof(rom_prefix));
     ok &= fread(s->ram, 1, s->ram_size, f) == s->ram_size;
     ok &= fread(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
     ok &= fread(s->chipset_scratch, 1, I2000_CHIPSET_SCRATCH_SIZE, f) ==
           I2000_CHIPSET_SCRATCH_SIZE;
+    if (version >= 10u)
+        ok &= fread(s->high_dram, 1, I2000_HIGH_DRAM_SIZE, f) ==
+              I2000_HIGH_DRAM_SIZE;
+    else
+        memset(s->high_dram, 0, I2000_HIGH_DRAM_SIZE);
+    if (ok && i2000_nvram_repair_bad_prefix(s, rom_prefix))
+        printf("i2000: repaired corrupted snapshot NVRAM/ROM prefix\n");
 
     uint64_t atapi_len = 0;
     ok &= fread(&atapi_len, sizeof(atapi_len), 1, f) == 1;
@@ -2853,12 +2909,13 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     GemuMonitor *monitor = s->monitor;
     GemuDisplay *display = s->display;
     GemuVncServer *vnc = s->vnc;
-    bool configured_rage128 = s->rage128_enabled;
+    bool configured_rage128 = s->rage128.enabled;
     bool configured_mouse_enabled = s->mouse_enabled;
     Merced *cpu = s->cpu;
     uint8_t *ram = s->ram;
     uint8_t *flash = s->flash;
     uint8_t *chipset_scratch = s->chipset_scratch;
+    uint8_t *high_dram = s->high_dram;
     uint8_t *atapi_data = s->atapi_data;
     uint8_t *ata_data = s->ata_data;
     if (s->cdrom) fclose(s->cdrom);
@@ -2869,7 +2926,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     if (version == 3u)
         state_size = offsetof(Ia64I2000State, vnc);
     else if (version == 4u)
-        state_size = offsetof(Ia64I2000State, rage128_enabled);
+        state_size = offsetof(Ia64I2000State, rage128);
     else if (version == 5u)
         state_size = offsetof(Ia64I2000State, int10_req);
     else if (version == 6u)
@@ -2878,10 +2935,23 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         state_size = offsetof(Ia64I2000State, mouse_retry_ninsts);
     else if (version == 8u)
         state_size = offsetof(Ia64I2000State, mouse_wait_rfi_generation);
+    else if (version == 9u)
+        state_size = offsetof(Ia64I2000State, high_dram);
+    else if (version == 10u)
+        state_size = offsetof(Ia64I2000State, nvram_path);
+    else if (version == 11u)
+        /* v11 ended after a bool, but sizeof(struct) included tail padding
+         * to its 8-byte alignment. Consume that padding or every following
+         * snapshot section becomes byte-shifted. */
+        state_size = (offsetof(Ia64I2000State, keyboard_irq_pending) + 7u) & ~7u;
+    else if (version == 12u)
+        state_size = (offsetof(Ia64I2000State, pit0_read_phase) + 7u) & ~7u;
     else
         state_size = sizeof(*loaded);
     ok &= fread(loaded, state_size, 1, f) == 1;
     if (ok) {
+        char nvram_path[sizeof(s->nvram_path)];
+        snprintf(nvram_path, sizeof(nvram_path), "%s", s->nvram_path);
         *s = *loaded;
         s->monitor = monitor;
         s->display = display;
@@ -2890,6 +2960,12 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->ram = ram;
         s->flash = flash;
         s->chipset_scratch = chipset_scratch;
+        s->high_dram = high_dram;
+        snprintf(s->nvram_path, sizeof(s->nvram_path), "%s", nvram_path);
+        /* Loading a VM state must not implicitly overwrite persistent
+         * machine NVRAM. A subsequent guest flash program/erase will set
+         * this again and be persisted normally. */
+        s->nvram_dirty = false;
         s->atapi_data = atapi_data;
         s->ata_data = ata_data;
         s->cdrom = s->cdrom_file[0] ? fopen(s->cdrom_file, "rb") : NULL;
@@ -2902,7 +2978,9 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
          * fix for whatever caused that halt. Don't leave it stuck. */
         s->halted = false;
         if (version < 5u) {
-            rage128_init(s, configured_rage128);
+            rage128_init(&s->rage128, configured_rage128,
+                         RAGE128_FB_BASE, RAGE128_IO_BASE,
+                         RAGE128_MMIO_BASE, 17);
         }
         if (version < 6u) {
             memset(&s->int10_req, 0,
@@ -3022,7 +3100,11 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
         return;
     }
     if (txt && strncmp(txt, "calls", 5) == 0) {
-        merced_dump_calls(s->cpu, MERCED_CALL_HISTORY, stderr);
+        unsigned count = MERCED_CALL_HISTORY;
+        if (sscanf(txt + 5, "%u", &count) != 1)
+            count = MERCED_CALL_HISTORY;
+        if (count > MERCED_CALL_HISTORY) count = MERCED_CALL_HISTORY;
+        merced_dump_calls(s->cpu, count, stderr);
         return;
     }
     if (txt && strncmp(txt, "mousestate", 10) == 0) {
@@ -3190,17 +3272,23 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
  * physical banks, data width, banks-per-device); everything else is left
  * at conservative, spec-legal defaults since nothing here validates DIMM
  * timing against real electrical constraints anyway. Size formula used:
- * bytes = 2^(rows+cols) * (width_bits/8) * banks_per_device * phys_banks,
- * fixed here at width=64 bits, banks_per_device=1, phys_banks=1, so
- * rows+cols = log2(bytes) - 3. */
+ * bytes = 2^(rows+cols) * (width_bits/8) * banks_per_device * phys_banks.
+ * PC100/PC133 SDRAM devices have four internal banks; advertising one made
+ * the SDV firmware derive a nonsensical top-of-memory value whose upper
+ * half contained SPD byte 16 (0x0e), eventually producing addresses such as
+ * 0x00000e007ffff000.  Keep one physical rank and a 64-bit module width, so
+ * rows+cols = log2(bytes) - 5. */
 static void spd_encode(uint8_t out[256], uint64_t bytes) {
     memset(out, 0, 256);
     unsigned total_bits = 0;
     for (uint64_t b = bytes; b > 1; b >>= 1)
         total_bits++;
-    unsigned addr_bits = total_bits - 3;
-    unsigned cols = addr_bits / 2;
-    unsigned rows = addr_bits - cols;
+    unsigned addr_bits = total_bits - 5;
+    /* Period SDRAM DIMMs normally use 12-13 row bits and 9-11 column bits.
+     * Bias the split toward rows instead of generating impossible 14-column
+     * devices for large modules. */
+    unsigned rows = addr_bits > 10 ? 13 : (addr_bits + 1) / 2;
+    unsigned cols = addr_bits - rows;
     out[0]  = 128;   /* bytes used by module manufacturer */
     out[1]  = 8;     /* total SPD EEPROM size = 2^8 = 256 bytes */
     out[2]  = 4;     /* fundamental memory type: SDRAM */
@@ -3216,7 +3304,7 @@ static void spd_encode(uint8_t out[256], uint64_t bytes) {
     out[12] = 0x82;  /* refresh: normal rate, self-refresh supported */
     out[13] = 8;     /* primary SDRAM width (bits per chip) */
     out[16] = 0x0E;  /* burst lengths supported: 2, 4, 8 */
-    out[17] = 1;     /* banks per SDRAM device */
+    out[17] = 4;     /* internal banks per SDRAM device */
     out[18] = 0x06;  /* CAS latencies supported: CL2, CL3 */
     out[62] = 0x11;  /* SPD revision 1.1 */
     unsigned sum = 0;
@@ -3227,39 +3315,26 @@ static void spd_encode(uint8_t out[256], uint64_t bytes) {
 
 /* Populate simulated DIMM SPD content matching the actually-configured
  * ram_size, so firmware's real memory-detection path (SSDM sec. 5.5.1)
- * reports the true size instead of assuming a fixed maximum. Decomposes
- * ram_size into one DIMM per set bit (its binary representation) - exact
- * for any byte count, and typical -m values (512M, 1G, 2G, ...) need just
- * one slot. Slots beyond I2000_SPD_SLOTS are folded into the last one if
- * ram_size is unusually fragmented. */
+ * reports the true size instead of assuming a fixed maximum.  The i2000's
+ * eight slots predate multi-gigabyte SDRAM DIMMs, so populate them with at
+ * most 256 MiB each.  Representing 2 GiB as one fictional 2 GiB PC100 DIMM
+ * overflowed fields in the firmware's SPD geometry calculation. */
 static void spd_init(Ia64I2000State *s) {
     memset(s->spd_present, 0, sizeof(s->spd_present));
     memset(s->spd, 0, sizeof(s->spd));
     unsigned slot = 0;
     uint64_t remaining = s->ram_size;
-    for (int bit = 63; bit >= 0 && remaining; bit--) {
-        uint64_t chunk = UINT64_C(1) << bit;
-        if (!(remaining & chunk))
-            continue;
-        if (slot == I2000_SPD_SLOTS - 1) {
-            /* Last available slot: absorb everything left instead of
-             * dropping it, even though that makes this one DIMM larger
-             * than any single real row the datasheet's table lists. */
-            chunk = remaining;
-            /* spd_encode() requires a power of two; round down to one and
-             * let the next reset attempt (there won't be one, ram_size is
-             * fixed for the process's life) - in practice this path is
-             * only reachable with more than 8 fragments, which no normal
-             * -m value produces. */
-            while (chunk & (chunk - 1))
-                chunk &= chunk - 1;
-        }
+    while (remaining && slot < I2000_SPD_SLOTS) {
+        uint64_t chunk = remaining > UINT64_C(256) * 1024 * 1024
+                       ? UINT64_C(256) * 1024 * 1024 : remaining;
+        /* SPD geometry describes powers of two.  Use the largest module
+         * that fits; ordinary supported -m sizes divide exactly. */
+        while (chunk & (chunk - 1))
+            chunk &= chunk - 1;
         spd_encode(s->spd[slot], chunk);
         s->spd_present[slot] = true;
         remaining -= chunk;
         slot++;
-        if (slot >= I2000_SPD_SLOTS)
-            break;
     }
 }
 
@@ -3443,7 +3518,8 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     s->ram = calloc(1, (size_t)s->ram_size);
     s->flash = malloc(I2000_FLASH_SIZE);
     s->chipset_scratch = calloc(1, I2000_CHIPSET_SCRATCH_SIZE);
-    if (!s->ram || !s->flash || !s->chipset_scratch) {
+    s->high_dram = calloc(1, I2000_HIGH_DRAM_SIZE);
+    if (!s->ram || !s->flash || !s->chipset_scratch || !s->high_dram) {
         fprintf(stderr, "gemu: cannot allocate %" PRIu64 " MiB guest RAM\n",
                 cfg->ram_size >> 20);
         ia64_i2000_destroy(s);
@@ -3451,7 +3527,9 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     }
     memset(s->flash, 0xFF, I2000_FLASH_SIZE);
     vga_ibm_reset(&s->vga);
-    rage128_init(s, cfg->vga && strcmp(cfg->vga, "rage128") == 0);
+    rage128_init(&s->rage128,
+                 cfg->vga && strcmp(cfg->vga, "rage128") == 0,
+                 RAGE128_FB_BASE, RAGE128_IO_BASE, RAGE128_MMIO_BASE, 17);
     i2000_load_vga_option_rom(s);
     if (cfg->cdrom_path) {
         s->cdrom = fopen(cfg->cdrom_path, "rb");
@@ -3542,6 +3620,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
 void ia64_i2000_destroy(Ia64I2000State *s) {
     if (!s)
         return;
+    i2000_nvram_save(s);
     gemu_display_destroy(s->display);
     gemu_vnc_destroy(s->vnc);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
@@ -3552,6 +3631,7 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
     if (s->hda) fclose(s->hda);
     free(s->flash);
     free(s->chipset_scratch);
+    free(s->high_dram);
     free(s->ram);
     free(s);
 }
@@ -3663,6 +3743,17 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * here raises an interrupt for it. */
     if (s->pit1_next_irq && s->cpu->ninsts >= s->pit1_next_irq) {
         s->pit1_next_irq = s->cpu->ninsts + 100000;
+    }
+    /* Controller replies and host keystrokes assert legacy IRQ1 whenever
+     * the keyboard output buffer becomes non-empty. Previously we queued
+     * the byte but never signalled the CPU, leaving firmware event waits in
+     * CdbPim blocked with an unread 8042 byte. Keep the latch asserted until
+     * the firmware performs its ExtINT acknowledge; if more bytes remain,
+     * the next poll naturally reasserts it. */
+    if (s->kbc_out_pos < s->kbc_out_len &&
+        !(s->pic_master_mask & 0x02)) {
+        s->keyboard_irq_pending = true;
+        merced_raise_external(s->cpu, 0);
     }
     /* The single place that actually raises vector 0 on mouse's behalf -
      * covers both a brand new packet (aux_queue_byte() only queues bytes,
@@ -3798,6 +3889,11 @@ static void i2000_run_slice(Ia64I2000State *s) {
             return;
         i2000_poll_interrupts(s);
         MercedStatus st = merced_step(s->cpu);
+        /* A memory watchpoint can be raised from inside the bus callback.
+         * Stop this execution slice immediately so the reported IP remains
+         * the instruction that performed the access. */
+        if (gemu_monitor_is_paused(s->monitor))
+            return;
         if (s->reset_requested) {
             fprintf(stderr, "i2000: firmware requested a platform reset\n");
             /* CF9 resets the processor while the 460GX retains the sticky
@@ -3831,11 +3927,12 @@ static void i2000_run_slice(Ia64I2000State *s) {
 }
 
 static void i2000_reset(Ia64I2000State *s) {
-    bool rage128_enabled = s->rage128_enabled;
+    bool rage128_enabled = s->rage128.enabled;
     bool mouse_enabled = s->mouse_enabled;
     merced_reset(s->cpu);
     vga_ibm_reset(&s->vga);
-    rage128_init(s, rage128_enabled);
+    rage128_init(&s->rage128, rage128_enabled, RAGE128_FB_BASE,
+                 RAGE128_IO_BASE, RAGE128_MMIO_BASE, 17);
     memset(&s->int10_req, 0,
            sizeof(*s) - offsetof(Ia64I2000State, int10_req));
     /* mouse_enabled is a CLI-configured setting (-device mouse), not
@@ -3863,6 +3960,8 @@ static void i2000_reset(Ia64I2000State *s) {
     s->pic_master_icw = s->pic_slave_icw = 0;
     s->pit0_reload = s->pit0_latch = 0;
     s->pit0_write_phase = 0;
+    s->pit0_read_phase = 0;
+    s->pit0_epoch_ninsts = s->cpu->ninsts;
     s->pit0_next_irq = 0;
     s->pit1_reload = s->pit1_latch = 0;
     s->pit1_write_phase = 0;

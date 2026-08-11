@@ -6727,10 +6727,11 @@ void merced_dump_state(const Merced *m, char *buf, size_t len) {
       (unsigned)((m->psr >> 36) & 1), (unsigned)((m->psr >> 17) & 1),
       (unsigned)((m->psr >> 27) & 1), (unsigned)((m->psr >> 44) & 1),
       (unsigned)((m->psr >> 3) & 1));
-    P("CFM sof=%u sol=%u sor=%u rrb=%u/%u/%u  bof=%u  PR %016" PRIX64 "\n",
+    P("CFM sof=%u sol=%u sor=%u rrb=%u/%u/%u  bof=%u/%" PRIu64
+      "  PR %016" PRIX64 "\n",
       CFM_SOF(m->cfm), CFM_SOL(m->cfm), CFM_SOR(m->cfm),
       CFM_RRB_GR(m->cfm), CFM_RRB_FR(m->cfm), CFM_RRB_PR(m->cfm),
-      m->bof, m->pr);
+      m->bof, m->bof_total, m->pr);
     for (unsigned r = 0; r < 32; r += 4) {
         P("r%-3u %016" PRIX64 " %016" PRIX64 " %016" PRIX64 " %016" PRIX64 "\n",
           r,
@@ -6750,6 +6751,9 @@ void merced_dump_state(const Merced *m, char *buf, size_t len) {
       m->br[4], m->br[5], m->br[6], m->br[7]);
     P("pfs %016" PRIX64 "  lc %" PRIu64 "  ec %" PRIu64 "  unat %016" PRIX64 "\n",
       m->ar[AR_PFS], m->ar[AR_LC], m->ar[AR_EC], m->ar[AR_UNAT]);
+    P("bsp %016" PRIX64 "  bspstore %016" PRIX64 "  rnat %016" PRIX64
+      "  rsc %016" PRIX64 "\n",
+      m->ar[AR_BSP], m->ar[AR_BSPSTORE], m->ar[AR_RNAT], m->ar[AR_RSC]);
     P("iva %016" PRIX64 "  iip %016" PRIX64 "  ipsr %016" PRIX64 "  isr %016" PRIX64 "\n",
       m->cr[CR_IVA], m->cr[CR_IIP], m->cr[CR_IPSR], m->cr[CR_ISR]);
     P("ifa %016" PRIX64 "  itir %016" PRIX64 "  halt: %s\n",

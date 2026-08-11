@@ -56,6 +56,7 @@ FAMILY_SRC = {
         'hardware/machine/ia64/machine_generic_ia64.c',
         'hardware/romdb.c',
         'vga/multi/input_menu.c',
+        'vga/multi/rage128.c',
         'vga/multi/vga_ibm.c',
         'vga/multi/vgafont16.c',
         'vga/multi/vgabios_rom.c',

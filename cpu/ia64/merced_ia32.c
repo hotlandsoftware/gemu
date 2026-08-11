@@ -79,13 +79,19 @@ static void setflags(X86 *x, uint32_t f) {
     x->m->ar[24] = (x->m->ar[24] & ~UINT64_C(0xffffffff)) | f | 2;
 }
 
+static bool ia32_active(const X86 *x) {
+    return (x->m->psr & (UINT64_C(1) << 34)) != 0; /* PSR.is */
+}
+
 static bool rb(X86 *x, uint32_t a, unsigned size, bool fetch, uint32_t *v) {
     uint64_t q;
+    if (!ia32_active(x)) return false;
     if (!merced_ia32_read(x->m, a, size, fetch, &q)) return false;
     *v = (uint32_t)q;
     return true;
 }
 static bool wb(X86 *x, uint32_t a, unsigned size, uint32_t v) {
+    if (!ia32_active(x)) return false;
     return merced_ia32_write(x->m, a, size, v);
 }
 static uint64_t ioaddr(X86 *x, uint16_t port) {
@@ -94,11 +100,13 @@ static uint64_t ioaddr(X86 *x, uint16_t port) {
 }
 static bool ioread(X86 *x, uint16_t port, unsigned size, uint32_t *v) {
     uint64_t q;
+    if (!ia32_active(x)) return false;
     if (!merced_ia32_read(x->m, ioaddr(x, port), size, false, &q)) return false;
     *v = (uint32_t)q;
     return true;
 }
 static bool iowrite(X86 *x, uint16_t port, unsigned size, uint32_t v) {
+    if (!ia32_active(x)) return false;
     return merced_ia32_write(x->m, ioaddr(x, port), size, v);
 }
 static bool fetch(X86 *x, unsigned size, uint32_t *v) {
@@ -665,6 +673,17 @@ MercedStatus merced_ia32_step(Merced *m) {
     } else if (op == 0x9d) {
         if (!pop(&x, size, &q)) goto fault;
         setflags(&x, q);
+    } else if (op == 0x9e) {                       /* sahf */
+        uint32_t mask = FL_SF|FL_ZF|FL_AF|FL_PF|FL_CF;
+        setflags(&x, (eflags(&x) & ~mask) | (xr(&x, 4, 1) & mask));
+    } else if (op == 0x9f) {                       /* lahf */
+        uint32_t mask = FL_SF|FL_ZF|FL_AF|FL_PF|FL_CF;
+        setxr(&x, 4, 1, (eflags(&x) & mask) | 0x02);
+    } else if (op == 0x98) {                       /* cbw / cwde */
+        if (size == 2)
+            setxr(&x, 0, 2, (uint16_t)(int16_t)(int8_t)xr(&x, 0, 1));
+        else
+            setxr(&x, 0, 4, (uint32_t)(int32_t)(int16_t)xr(&x, 0, 2));
     } else if (op == 0x99) {                       /* cwd / cdq */
         uint32_t a = xr(&x, 0, size);
         setxr(&x, 2, size,
@@ -694,6 +713,18 @@ MercedStatus merced_ia32_step(Merced *m) {
     } else if (op == 0xe8) {
         if (!fetch(&x,size,&q) || !push(&x,size,x.pc-sbase(&x,X_CS))) goto fault;
         x.pc=near_target(&x,size==2?(int16_t)q:(int32_t)q); branch=true;
+    } else if (op == 0x9a) {                       /* call ptr16:16/32 */
+        uint32_t off, cs;
+        if (!fetch(&x,size,&off) || !fetch(&x,2,&cs)) goto fault;
+        /* A far return pops the offset first and CS second, so CALL pushes
+         * the old CS first, followed by the next instruction's offset.
+         * The offset width follows the operand-size prefix; CS is always a
+         * 16-bit selector. This matches the already-supported FF /3 form. */
+        if (!push(&x,2,sel(&x,X_CS)) ||
+            !push(&x,size,x.pc-sbase(&x,X_CS))) goto fault;
+        setseg_real(&x,X_CS,(uint16_t)cs);
+        x.pc=sbase(&x,X_CS)+(off&(size==2?UINT16_MAX:UINT32_MAX));
+        branch=true;
     } else if (op == 0xea) {
         uint32_t off, cs;
         if (!fetch(&x,size,&off) || !fetch(&x,2,&cs)) goto fault;
@@ -721,6 +752,12 @@ MercedStatus merced_ia32_step(Merced *m) {
             /* No real video BIOS ROM behind the IVT to jump to - service
              * the call directly instead (see int10_handler()'s comment). */
             int10_handler(&x);
+            /* The HLE handler uses the normal IA-32 MMU for BDA, VRAM and
+             * VGA-I/O accesses. A miss transfers control to the native IVT
+             * and clears PSR.is. Do not retire INT or overwrite that IVT IP
+             * with x.pc; rfi will restore IA-32 mode and retry precisely. */
+            if (!ia32_active(&x))
+                return MERCED_OK;
         } else {
             uint32_t ip_lo, cs_lo;
             if (!push(&x,2,(uint16_t)eflags(&x)) ||
@@ -742,6 +779,9 @@ MercedStatus merced_ia32_step(Merced *m) {
         branch = true;
     } else if (op == 0xfa) setflags(&x, eflags(&x) & ~FL_IF);   /* cli */
     else if (op == 0xfb) setflags(&x, eflags(&x) | FL_IF);      /* sti */
+    else if (op == 0xf8) setflags(&x, eflags(&x) & ~FL_CF);      /* clc */
+    else if (op == 0xf9) setflags(&x, eflags(&x) | FL_CF);       /* stc */
+    else if (op == 0xf5) setflags(&x, eflags(&x) ^ FL_CF);       /* cmc */
     else if (op == 0xe4 || op == 0xe5 || op == 0xe6 || op == 0xe7 ||
              op == 0xec || op == 0xed || op == 0xee || op == 0xef) {
         bool out = op == 0xe6 || op == 0xe7 || op == 0xee || op == 0xef;
@@ -900,6 +940,13 @@ MercedStatus merced_ia32_step(Merced *m) {
         if(sub==5||sub==7)sub_flags(&x,a,imm,v,n);
         else if(sub==0)add_flags(&x,a,imm,v,n);
         else logic_flags(&x,v,n);
+    } else if (op == 0xa8 || op == 0xa9) {
+        /* TEST AL/AX/EAX, imm: update arithmetic flags without storing the
+         * result. Legacy IRQ handlers use A8 to test controller status. */
+        unsigned n = op == 0xa8 ? 1 : size;
+        uint32_t imm;
+        if (!fetch(&x, n, &imm)) goto fault;
+        logic_flags(&x, xr(&x, 0, n) & imm, n);
     } else if (op == 0xa4 || op == 0xa5) {
         unsigned n=op==0xa4?1:size; uint32_t count=x.rep?xr(&x,1,x.addr32?4:2):1;
         int step=(eflags(&x)&FL_DF)?-(int)n:(int)n;
