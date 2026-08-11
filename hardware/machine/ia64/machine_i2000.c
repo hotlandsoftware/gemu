@@ -92,6 +92,7 @@
  * be zero (synchronous re-raise corrupts the guest ISR's return frame).
  * Matches the PIT's own tick granularity, which is already known safe. */
 #define MOUSE_RETRY_DELAY_INSTS 1000u
+#define MOUSE_BACKLOG_MAX       254
 #define I2000_ITC_HZ UINT64_C(200000000)
 #define I2000_ITC_TICK_NS 5u
 #define MMIO_LOG_N 768
@@ -328,9 +329,10 @@ struct Ia64I2000State {
      * interrupt return, and accumulates host motion while a packet drains. */
     uint64_t mouse_retry_ninsts;
     /* v9: use the real PIC EOI handshake as mouse-flow control instead of
-     * an arbitrary multi-million-instruction cooldown.  Host motion is
-     * accumulated while a report is in flight and emitted in bounded PS/2
-     * chunks, avoiding both dropped movement and large cursor teleports. */
+     * an arbitrary multi-million-instruction cooldown. Host motion is
+     * coalesced while a report is in flight. Direction reversals discard
+     * stale motion in the old direction, and each axis is capped at two
+     * packets so a slow guest cannot build a long cursor backlog. */
     uint64_t mouse_wait_rfi_generation;
     int32_t mouse_accum_dx, mouse_accum_dy;
     bool mouse_host_left, mouse_host_right;
@@ -341,6 +343,19 @@ static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
                      unsigned size, bool is_write);
 static void i2000_reset(Ia64I2000State *s);
 static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi);
+
+static int32_t mouse_accumulate_axis(int32_t pending, int delta) {
+    if (!delta)
+        return pending;
+    if ((pending > 0 && delta < 0) || (pending < 0 && delta > 0))
+        pending = 0;
+    int64_t next = (int64_t)pending + delta;
+    if (next > MOUSE_BACKLOG_MAX)
+        return MOUSE_BACKLOG_MAX;
+    if (next < -MOUSE_BACKLOG_MAX)
+        return -MOUSE_BACKLOG_MAX;
+    return (int32_t)next;
+}
 
 static void kbc_queue_byte(Ia64I2000State *s, uint8_t byte) {
     /* Controller replies and keyboard scan codes share the 8042 output
@@ -1407,7 +1422,13 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     if (port == 0x1110 && size == 1)
         return 0;
     if (port == 0x60 && size == 1) {               /* 8042 data */
-        if (s->kbc_out_pos < s->kbc_out_len) {
+        /* A real 8042 has one ordered output buffer.  Our keyboard and aux
+         * queues are separate, so preserve a mouse packet already exposed
+         * through AUX/IRQ12: letting a later keyboard/controller byte jump
+         * ahead here substitutes it for a packet byte and destroys PS/2
+         * framing (random X/Y sign reversals are the visible result). */
+        if (s->aux_out_pos >= s->aux_out_len &&
+            s->kbc_out_pos < s->kbc_out_len) {
             uint8_t v = s->kbc_out[s->kbc_out_pos++];
             if (s->kbc_out_pos == s->kbc_out_len)
                 s->kbc_out_pos = s->kbc_out_len = 0;
@@ -1447,7 +1468,7 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
          * automatically inert when no mouse is attached (aux_out_len can
          * never become nonzero without -device mouse). Keyboard bytes win
          * priority when both queues happen to be nonempty. */
-        bool aux_next = s->kbc_out_len == 0 && s->aux_out_len > 0;
+        bool aux_next = s->aux_out_pos < s->aux_out_len;
         uint8_t st64 = ((s->kbc_out_len || s->aux_out_len) ? 0x01 : 0) |
                        (aux_next ? 0x20 : 0) | 0x04; /* system flag */
         if (getenv("MOUSE_DEBUG"))
@@ -3016,11 +3037,13 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
         fprintf(stderr, "i2000: mouse_enabled=%d mouse_streaming=%d "
                 "kbc_command_byte=%02x aux_out_len=%u aux_out_pos=%u "
                 "mouse_param_cmd=%02x mouse_prev_left=%d mouse_prev_right=%d "
-                "mouse_resolution=%u mouse_sample_rate=%u kbc_out_len=%u "
+                "mouse_accum=(%d,%d) mouse_resolution=%u "
+                "mouse_sample_rate=%u kbc_out_len=%u "
                 "kbc_pending_write=%u\n",
                 s->mouse_enabled, s->mouse_streaming, s->kbc_command_byte,
                 s->aux_out_len, s->aux_out_pos, s->mouse_param_cmd,
-                s->mouse_prev_left, s->mouse_prev_right, s->mouse_resolution,
+                s->mouse_prev_left, s->mouse_prev_right,
+                s->mouse_accum_dx, s->mouse_accum_dy, s->mouse_resolution,
                 s->mouse_sample_rate, s->kbc_out_len, s->kbc_pending_write);
         fprintf(stderr, "i2000: iosapic_rte[12]=%016" PRIX64 " masked=%d "
                 "pic_master_mask=%02x pic_slave_mask=%02x\n",
@@ -3950,10 +3973,11 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                 have_pointer = true;
             }
             if (have_pointer && s->mouse_streaming) {
-                int64_t ax = (int64_t)s->mouse_accum_dx + rel_x;
-                int64_t ay = (int64_t)s->mouse_accum_dy - rel_y;
-                s->mouse_accum_dx = (int32_t)(ax < -1024 ? -1024 : ax > 1024 ? 1024 : ax);
-                s->mouse_accum_dy = (int32_t)(ay < -1024 ? -1024 : ay > 1024 ? 1024 : ay);
+                s->mouse_accum_dx =
+                    mouse_accumulate_axis(s->mouse_accum_dx, rel_x);
+                /* SDL/VNC positive Y is down; PS/2 positive Y is up. */
+                s->mouse_accum_dy =
+                    mouse_accumulate_axis(s->mouse_accum_dy, -rel_y);
                 s->mouse_host_left = left;
                 s->mouse_host_right = right;
             }
@@ -3966,6 +3990,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                  * and is drained in <=127-count chunks after the real PIC
                  * EOI handshake completes. */
                 s->aux_out_len == 0 &&
+                s->kbc_out_len == 0 &&
                 s->mouse_wait_rfi_generation == 0 &&
                 s->cpu->ninsts >= s->mouse_retry_ninsts &&
                 (int64_t)(merced_get_itc(s->cpu) -

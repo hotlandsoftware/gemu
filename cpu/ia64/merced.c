@@ -533,6 +533,17 @@ static MercedFpReg fp_recip_estimate(MercedFpReg den) {
 
 static MercedStatus mhalt(Merced *m, const char *fmt, ...);
 static uint64_t rfi_generation;
+/* Set when the interruption currently in service was delivered via
+ * VEC_EXTINT, cleared at the matching rfi (see deliver_fault() and the rfi
+ * case in exec_b()). IA-64 doesn't stack interruption context - by the time
+ * a guest reaches rfi it can only be returning from the single most recent
+ * delivery - so a flag, not a counter, is enough to identify which rfi that
+ * was. Without this, rfi_generation counted every rfi system-wide,
+ * including the ones ending completely unrelated TLB-miss/fault handlers
+ * that fire far more often than any interrupt; platform code waiting on it
+ * to mean "the external ISR returned" was actually satisfied by the next
+ * unrelated fault instead, in practice almost immediately. */
+static bool ext_interrupt_in_service;
 
 uint64_t merced_rfi_generation(void) { return rfi_generation; }
 
@@ -651,11 +662,17 @@ uint64_t merced_get_itc(const Merced *m) {
 }
 
 static void ext_pending_set(Merced *m, uint8_t vector) {
-    m->external_pending[vector >> 3] |= (uint8_t)(1u << (vector & 7));
+    uint8_t bit = (uint8_t)(1u << (vector & 7));
+    if (!(m->external_pending[vector >> 3] & bit))
+        m->ext_pending_count++;
+    m->external_pending[vector >> 3] |= bit;
 }
 
 static void ext_pending_clear(Merced *m, uint8_t vector) {
-    m->external_pending[vector >> 3] &= (uint8_t)~(1u << (vector & 7));
+    uint8_t bit = (uint8_t)(1u << (vector & 7));
+    if (m->external_pending[vector >> 3] & bit)
+        m->ext_pending_count--;
+    m->external_pending[vector >> 3] &= (uint8_t)~bit;
 }
 
 void merced_ack_external(Merced *m, uint8_t vector) {
@@ -710,6 +727,8 @@ static bool interrupt_unmasked(Merced *m, uint8_t vector) {
  * hardware resolves cr.ivr the same way: independently-latched vectors,
  * highest priority wins, lower ones stay pending underneath. */
 static int ext_highest_unmasked(Merced *m) {
+    if (!m->ext_pending_count)
+        return -1;
     if (ext_pending_test(m, 2) && interrupt_unmasked(m, 2))
         return 2;
     if (ext_pending_test(m, 0) && interrupt_unmasked(m, 0))
@@ -905,6 +924,8 @@ static bool rse_restore_interrupted_partition(Merced *m, uint64_t iip,
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     m->nfaults++;
+    if (vec == VEC_EXTINT)
+        ext_interrupt_in_service = true;
     /* XP/IA-64 currently reaches KeBugCheckEx with
      * STATUS_REG_NAT_CONSUMPTION after executing the bundle at 8355b4e0.
      * Preserve the pre-interruption register/NaT state here: once control
@@ -2279,6 +2300,10 @@ static void set_preds(Merced *m, unsigned p1, unsigned p2, int qp, int res, int 
 
 /* ── A-unit (executes on M and I) ────────────────────────────────────────── */
 
+static inline bool major_is_alu(unsigned major) {
+    return major == 8 || major == 9 || (major >= 0xC && major <= 0xE);
+}
+
 static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
     unsigned major = (unsigned)bits(raw, 37, 4);
     unsigned r1 = (unsigned)bits(raw, 6, 7);
@@ -3319,30 +3344,46 @@ static void tlb_purge(Merced *m, MercedTlbEntry *t, int n, uint32_t rid,
     }
 }
 
-static void tlb_mark_purge(MercedTlbEntry *t, int n, uint32_t rid,
+static void tlb_mark_purge(Merced *m, MercedTlbEntry *t, int n, uint32_t rid,
                            uint64_t va, uint64_t len) {
     for (int i = 0; i < n; i++)
         if (t[i].valid && t[i].rid == rid &&
-            t[i].va_start < va + len && va <= t[i].va_end)
+            t[i].va_start < va + len && va <= t[i].va_end &&
+            !t[i].pending_purge) {
             t[i].pending_purge = 1;
+            m->tlb_purge_pending++;
+        }
 }
 
-static void tlb_complete_pending(MercedTlbEntry *t, int n) {
+static void tlb_complete_pending(Merced *m, MercedTlbEntry *t, int n) {
     for (int i = 0; i < n; i++) {
         if (!t[i].pending_purge) continue;
         t[i].pending_purge = 0;
         t[i].valid = 0;
+        m->tlb_purge_pending--;
     }
 }
 
+/* ptc.* (tlb_mark_purge) is rare; srlz.d/srlz.i/rfi (these) run on every
+ * serialization point, which in some firmware spin loops is every slot.
+ * m->tlb_purge_pending mirrors alat_valid_mask/ext_pending_count: skip the
+ * up-to-512-entry scans below entirely when nothing is pending anywhere. */
 static void tlb_serialize_data(Merced *m) {
-    tlb_complete_pending(m->dtr, MERCED_N_DTR);
-    tlb_complete_pending(m->dtc, MERCED_N_TC);
+    if (!m->tlb_purge_pending) return;
+    tlb_complete_pending(m, m->dtr, MERCED_N_DTR);
+    tlb_complete_pending(m, m->dtc, MERCED_N_TC);
 }
 
 static void tlb_serialize_instruction(Merced *m) {
-    tlb_complete_pending(m->itr, MERCED_N_ITR);
-    tlb_complete_pending(m->itc, MERCED_N_TC);
+    /* The cached fetch translation is valid only until the next instruction
+     * serialization point.  Besides completing ptc/ptr, srlz.i makes earlier
+     * changes to psr.it and region registers visible to instruction fetch.
+     * Dropping it here lets merced_step() reuse the PA within a bundle while
+     * preserving those architectural visibility rules. */
+    m->bundle_cache_translation_valid = false;
+    if (!m->tlb_purge_pending) return;
+    tlb_complete_pending(m, m->itr, MERCED_N_ITR);
+    tlb_complete_pending(m, m->itc, MERCED_N_TC);
 }
 
 /* ── RSE backing store ───────────────────────────────────────────────────── */
@@ -4344,8 +4385,8 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                         hit ? hit->pte : 0, m->ninsts);
             }
         }
-        tlb_mark_purge(m->itc, MERCED_N_TC, rid, va, len);
-        tlb_mark_purge(m->dtc, MERCED_N_TC, rid, va, len);
+        tlb_mark_purge(m, m->itc, MERCED_N_TC, rid, va, len);
+        tlb_mark_purge(m, m->dtc, MERCED_N_TC, rid, va, len);
         return MERCED_OK;
     }
     case 0x0C: case 0x0D: {                         /* ptr.d / ptr.i */
@@ -4356,11 +4397,11 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         uint32_t rid = (uint32_t)((m->rr[va >> 61] >> 8) & 0xFFFFFFull);
         uint64_t len = ps >= 64 ? ~0ull : 1ull << ps;
         if (x6 == 0x0C) {
-            tlb_mark_purge(m->dtr, MERCED_N_DTR, rid, va, len);
-            tlb_mark_purge(m->dtc, MERCED_N_TC, rid, va, len);
+            tlb_mark_purge(m, m->dtr, MERCED_N_DTR, rid, va, len);
+            tlb_mark_purge(m, m->dtc, MERCED_N_TC, rid, va, len);
         } else {
-            tlb_mark_purge(m->itr, MERCED_N_ITR, rid, va, len);
-            tlb_mark_purge(m->itc, MERCED_N_TC, rid, va, len);
+            tlb_mark_purge(m, m->itr, MERCED_N_ITR, rid, va, len);
+            tlb_mark_purge(m, m->itc, MERCED_N_TC, rid, va, len);
         }
         return MERCED_OK;
     }
@@ -4805,8 +4846,10 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
      * still clears both destination predicates.  Let the A-unit decoder see
      * the instruction first, then discard every other predicated-off I op
      * before opcode validation. */
-    if (exec_alu(m, raw, qp, &st)) return st;
-    if (st != MERCED_OK) return st;
+    if (major_is_alu(major)) {
+        if (exec_alu(m, raw, qp, &st)) return st;
+        if (st != MERCED_OK) return st;
+    }
     if (!qp) return MERCED_OK;
 
     switch (major) {
@@ -5326,8 +5369,10 @@ static MercedStatus exec_m_fetchadd_compact(Merced *m, uint64_t raw, int qp) {
 static MercedStatus exec_m(Merced *m, uint64_t raw, int qp) {
     unsigned major = (unsigned)bits(raw, 37, 4);
     MercedStatus st;
-    if (exec_alu(m, raw, qp, &st)) return st;
-    if (st != MERCED_OK) return st;
+    if (major_is_alu(major)) {
+        if (exec_alu(m, raw, qp, &st)) return st;
+        if (st != MERCED_OK) return st;
+    }
     if (major <= 1) return exec_m_sys(m, raw, qp);
     if (major == 2 && !bits(raw, 36, 1) && !bits(raw, 12, 1))
         return exec_m_xchg_compact(m, raw, qp);
@@ -5430,7 +5475,10 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
              * a false hit and skip the software TLB refill. */
             alat_invalidate_stacked(m);
             m->taken = 1;
-            rfi_generation++;
+            if (ext_interrupt_in_service) {
+                ext_interrupt_in_service = false;
+                rfi_generation++;
+            }
             return rse_spill_excess(m);
         }
         case 0x0C: m->psr &= ~PSR_BN; return MERCED_OK;             /* bsw.0 */
@@ -6146,24 +6194,60 @@ MercedStatus merced_step(Merced *m) {
             }
         }
     }
-    if (!va_translate(m, bundle_va, true, false, ISR_X, &pa, &st))
-        return st;   /* ITLB miss delivered (or halt) */
-
     uint64_t lo, hi;
-    if (m->bundle_cache_valid && m->bundle_cache_va == bundle_va &&
-        m->bundle_cache_pa == pa) {
+    unsigned tmpl;
+    uint64_t slots[3];
+    if (m->bundle_cache_valid && m->bundle_cache_translation_valid &&
+        m->bundle_cache_va == bundle_va) {
+        /* Slots 1/2 of a sequential bundle have the same fetch translation
+         * as slot 0.  Self-modifying stores invalidate this cache in
+         * phys_write(), and instruction serialization invalidates it in
+         * tlb_serialize_instruction(), so no translation-affecting change
+         * can leave this PA live past its architectural visibility point. */
+        pa = m->bundle_cache_pa;
         lo = m->bundle_cache_lo;
         hi = m->bundle_cache_hi;
+        tmpl = m->bundle_cache_tmpl;
+        slots[0] = m->bundle_cache_slots[0];
+        slots[1] = m->bundle_cache_slots[1];
+        slots[2] = m->bundle_cache_slots[2];
     } else {
-        lo = phys_fetch(m, pa, 8);
-        hi = phys_fetch(m, pa + 8, 8);
-        m->bundle_cache_valid = true;
-        m->bundle_cache_va = bundle_va;
-        m->bundle_cache_pa = pa;
-        m->bundle_cache_lo = lo;
-        m->bundle_cache_hi = hi;
+        /* Physical instruction mode is common in PAL/SAL and needs no TLB
+         * machinery.  Keep this tiny path in the fetch loop instead of
+         * entering the general translation/fault/debug path once per
+         * bundle (or after each serialization point). */
+        if (!(m->psr & PSR_IT)) {
+            pa = bundle_va & MERCED_PHYS_MASK;
+        } else if (!va_translate(m, bundle_va, true, false, ISR_X, &pa, &st)) {
+            return st;   /* ITLB miss delivered (or halt) */
+        }
+        if (m->bundle_cache_valid && m->bundle_cache_va == bundle_va &&
+            m->bundle_cache_pa == pa) {
+            lo = m->bundle_cache_lo;
+            hi = m->bundle_cache_hi;
+            tmpl = m->bundle_cache_tmpl;
+            slots[0] = m->bundle_cache_slots[0];
+            slots[1] = m->bundle_cache_slots[1];
+            slots[2] = m->bundle_cache_slots[2];
+        } else {
+            lo = phys_fetch(m, pa, 8);
+            hi = phys_fetch(m, pa + 8, 8);
+            tmpl = (unsigned)(lo & 0x1F);
+            slots[0] = (lo >> 5) & 0x1FFFFFFFFFFull;
+            slots[1] = ((lo >> 46) | (hi << 18)) & 0x1FFFFFFFFFFull;
+            slots[2] = (hi >> 23) & 0x1FFFFFFFFFFull;
+            m->bundle_cache_valid = true;
+            m->bundle_cache_va = bundle_va;
+            m->bundle_cache_pa = pa;
+            m->bundle_cache_lo = lo;
+            m->bundle_cache_hi = hi;
+            m->bundle_cache_tmpl = (uint8_t)tmpl;
+            m->bundle_cache_slots[0] = slots[0];
+            m->bundle_cache_slots[1] = slots[1];
+            m->bundle_cache_slots[2] = slots[2];
+        }
+        m->bundle_cache_translation_valid = true;
     }
-    unsigned tmpl = (unsigned)(lo & 0x1F);
     const char *units = bundle_units[tmpl];
     if (units[0] == '?') {
         /* A reserved bundle template is an Illegal Operation, which the
@@ -6176,11 +6260,6 @@ MercedStatus merced_step(Merced *m) {
          * and IA64_EXCP_ILLEGAL both vector to 0x5400. */
         return deliver_fault(m, VEC_GENERAL, 0, 0, false);
     }
-
-    uint64_t slots[3];
-    slots[0] = (lo >> 5) & 0x1FFFFFFFFFFull;
-    slots[1] = ((lo >> 46) | (hi << 18)) & 0x1FFFFFFFFFFull;
-    slots[2] = (hi >> 23) & 0x1FFFFFFFFFFull;
 
     /* SAL clears discovered RAM with two post-increment stores and a
      * br.cloop.  A 2 GiB clear otherwise costs over 400 million interpreted
@@ -6556,6 +6635,21 @@ MercedStatus merced_step(Merced *m) {
     else
         m->ip = bundle_va | (slot + 1);
     return MERCED_OK;
+}
+
+MercedStatus merced_run(Merced *m, unsigned max_slots, unsigned *executed) {
+    unsigned n = 0;
+    MercedStatus st = MERCED_OK;
+
+    while (n < max_slots) {
+        st = merced_step(m);
+        n++;
+        if (st != MERCED_OK)
+            break;
+    }
+    if (executed)
+        *executed = n;
+    return st;
 }
 
 /* ── Debug dump ──────────────────────────────────────────────────────────── */

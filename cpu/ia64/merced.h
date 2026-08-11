@@ -188,19 +188,35 @@ typedef struct Merced {
      * instead of returning stale data - no invalidation bookkeeping needed
      * anywhere a TR/TC entry gets inserted or purged. */
     uint32_t itr_hint, dtr_hint, itc_hint, dtc_hint;
+    /* Count of TLB entries (across itr/dtr/itc/dtc combined) currently
+     * carrying pending_purge=1. ptc.* marks entries pending; srlz.d/srlz.i/
+     * rfi complete them. Purges are architecturally rare, but completion
+     * runs on every srlz - mirrors alat_valid_mask below: skip the 4x
+     * up-to-512-entry scan entirely when nothing is pending, which is the
+     * overwhelming common case. */
+    uint32_t tlb_purge_pending;
 
     /* merced_step() is called once per instruction SLOT, so straight-line
      * code re-fetches and re-decodes the same 16-byte bundle up to 3 times
      * (once per slot). This caches the last fetched bundle's raw lo/hi
-     * words keyed by (bundle_va, pa) - both must still match (not just
-     * bundle_va) so a translation change for the same VA (TLB purge/remap)
-     * can't serve stale bytes. Invalidated explicitly on any store that
+     * words keyed by (bundle_va, pa). bundle_cache_translation_valid permits
+     * reusing that PA between instruction-serialization points; after one,
+     * fetch translation is repeated but matching cached physical bytes can
+     * still be reused. Invalidated explicitly on any store that
      * overlaps the cached physical bundle (see phys_write()) and on the
      * SAL RAM-clear fast path's bulk fill, so self-modifying code can't
      * observe stale cached bytes either. */
     bool     bundle_cache_valid;
+    bool     bundle_cache_translation_valid;
     uint64_t bundle_cache_va, bundle_cache_pa;
     uint64_t bundle_cache_lo, bundle_cache_hi;
+    /* Template and per-slot 41-bit fields are pure functions of lo/hi, so
+     * they're exactly as valid as the raw bytes above whenever the cache
+     * hits - caching them too skips re-deriving all three slots' worth of
+     * shifts/masks on the 2 of 3 merced_step() calls per bundle that
+     * previously redid this from scratch. */
+    uint8_t  bundle_cache_tmpl;
+    uint64_t bundle_cache_slots[3];
 
     /* Integer Advanced Load Address Table.  Merced exposes 32 ALAT entries;
      * an entry associates an advanced-load destination register with the
@@ -232,6 +248,13 @@ typedef struct Merced {
      * tpr around ATA identify/enumeration and stalls forever once a
      * lower-class periodic tick occupies the old single pending slot. */
     uint8_t  external_pending[32];
+    /* Count of set bits in external_pending, maintained incrementally by
+     * ext_pending_set()/ext_pending_clear() - same technique as
+     * alat_valid_mask/tlb_purge_pending. External interrupts are rare
+     * relative to instructions executed, so this lets ext_highest_unmasked()
+     * skip its full 240-vector priority scan in the common no-interrupt
+     * case instead of running it on every slot. */
+    uint16_t ext_pending_count;
     uint8_t  external_itc;
 
     /* --- bookkeeping --- */
@@ -315,6 +338,7 @@ void    merced_set_cpu_model(Merced *m, uint8_t model);
 /* Execute one instruction slot. On anything but MERCED_OK, halt_msg
  * describes why and the CPU is stopped at the offending IP. */
 MercedStatus merced_step(Merced *m);
+MercedStatus merced_run(Merced *m, unsigned max_slots, unsigned *executed);
 
 /* IA-32 compatibility engine.  These hooks deliberately use the IA-64
  * translation machinery: IA-32 code and data references share the Merced
@@ -332,8 +356,12 @@ void merced_ia32_gr_write(Merced *m, unsigned reg, uint64_t value);
 /* Latch a platform interrupt for delivery through cr.ivr. */
 void merced_raise_external(Merced *m, uint8_t vector);
 void merced_ack_external(Merced *m, uint8_t vector);
-/* Monotonic count of completed rfi instructions, used by platform devices
- * to avoid reasserting a level interrupt before its handler has returned. */
+/* Monotonic count of completed *external-interrupt* servicing specifically
+ * (an rfi whose matching entry was VEC_EXTINT) - NOT every rfi in the
+ * system, which would also include unrelated fault/trap handlers (e.g.
+ * TLB-miss refills) that return far more often than any interrupt does.
+ * Platform devices use this to avoid reasserting a level interrupt before
+ * its own handler has actually returned. */
 uint64_t merced_rfi_generation(void);
 
 /* Force cr.tpr directly - EXPERIMENTAL hook for the i2000 ATA controller,
