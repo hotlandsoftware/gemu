@@ -432,6 +432,50 @@ static void int10_mode12(X86 *x) {
     uint32_t dummy; ioread(x, 0x3da, 1, &dummy); iowrite(x, 0x3c0, 1, 0x20);
 }
 
+static void int10_mode3(X86 *x, bool no_clear) {
+    /* Standard 80x25 color text mode.  The SDV firmware requests AX=0083h
+     * during the handoff to its text console: bit 7 means preserve display
+     * memory, while the actual BIOS mode number is still 03h. */
+    static const uint8_t seq[5] = { 0x03,0x00,0x03,0x00,0x02 };
+    static const uint8_t crtc[25] = {
+        0x5f,0x4f,0x50,0x82,0x55,0x81,0xbf,0x1f,0x00,0x4f,0x0d,0x0e,0x00,
+        0x00,0x00,0x50,0x9c,0x0e,0x8f,0x28,0x1f,0x96,0xb9,0xa3,0xff
+    };
+    static const uint8_t gc[9] = { 0,0,0,0,0,0x10,0x0e,0,0xff };
+    static const uint8_t attr[21] = {
+        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0x0c,0,0x0f,0x08,0
+    };
+    static const uint8_t ega[16][3] = {
+        {0,0,0},{0,0,42},{0,42,0},{0,42,42},{42,0,0},{42,0,42},{42,21,0},{42,42,42},
+        {21,21,21},{21,21,63},{21,63,21},{21,63,63},{63,21,21},{63,21,63},{63,63,21},{63,63,63}
+    };
+    iowrite(x, 0x3c2, 1, 0x67);
+    for (unsigned i = 0; i < 5; i++) {
+        iowrite(x, 0x3c4, 1, i); iowrite(x, 0x3c5, 1, seq[i]);
+    }
+    iowrite(x, 0x3d4, 1, 0x11); iowrite(x, 0x3d5, 1, crtc[0x11] & 0x7f);
+    for (unsigned i = 0; i < 25; i++) {
+        iowrite(x, 0x3d4, 1, i); iowrite(x, 0x3d5, 1, crtc[i]);
+    }
+    for (unsigned i = 0; i < 9; i++) {
+        iowrite(x, 0x3ce, 1, i); iowrite(x, 0x3cf, 1, gc[i]);
+    }
+    for (unsigned i = 0; i < 21; i++) {
+        uint32_t dummy; ioread(x, 0x3da, 1, &dummy);
+        iowrite(x, 0x3c0, 1, i); iowrite(x, 0x3c0, 1, attr[i]);
+    }
+    iowrite(x, 0x3c6, 1, 0xff); iowrite(x, 0x3c8, 1, 0);
+    for (unsigned i = 0; i < 16; i++)
+        for (unsigned c = 0; c < 3; c++) iowrite(x, 0x3c9, 1, ega[i][c]);
+    uint32_t dummy; ioread(x, 0x3da, 1, &dummy); iowrite(x, 0x3c0, 1, 0x20);
+    if (!no_clear) {
+        for (unsigned i = 0; i < 80 * 25; i++) {
+            wb(x, INT10_VRAM_BASE + i * 2, 1, ' ');
+            wb(x, INT10_VRAM_BASE + i * 2 + 1, 1, 0x07);
+        }
+    }
+}
+
 static void int10_handler(X86 *x) {
     unsigned ah = xr(x, 4, 1), al = xr(x, 0, 1) & 0xFF;
     static unsigned int10_debug;
@@ -486,9 +530,11 @@ static void int10_handler(X86 *x) {
         break;
     }
     case 0x00:                                       /* set video mode */
-        if (al == 0x12)
+        if ((al & 0x7f) == 0x03)
+            int10_mode3(x, (al & 0x80) != 0);
+        else if ((al & 0x7f) == 0x12)
             int10_mode12(x);
-        wb(x, INT10_BDA_MODE, 1, al);
+        wb(x, INT10_BDA_MODE, 1, al & 0x7f);
         break;
     default:
         /* Unimplemented function: no-op rather than halting, so a rare

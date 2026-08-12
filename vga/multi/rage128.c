@@ -1,3 +1,10 @@
+/* ATI Rage 128 PF graphics card from late 1990s.
+   This emulation is extremely primitive, essentially only emulating
+   enough of the Rage 128 to get the basic output. The 2D/3D engine,
+   command processor, acceleration, AGP behavior, hardware cursor, overlays,
+   TMDS circuitry, etc, are not emulated yet. Colors are also inaccurate.
+*/
+
 #include "rage128.h"
 
 #include <string.h>

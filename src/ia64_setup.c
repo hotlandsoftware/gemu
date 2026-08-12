@@ -61,8 +61,10 @@ static const GemuArgsDef def = {
         "\nIA64 options:\n"
         "  -rom FILE       Load firmware flash image (top-aligned, max 4 MiB)\n"
         "  -rom DIR|ZIP    Scan for known firmware by SHA-256\n"
-        "  -m SIZE         RAM size, K/M/G suffix (default 512M, i2000 max 2G)\n"
+        "  -m SIZE         RAM size, K/M/G suffix (default 512M)\n"
         "  -cdrom FILE     Attach a read-only ISO image as an ATAPI CD-ROM\n"
+        "  -net nic,model=i82559\n"
+        "                  Attach the i2000 Intel 82559 NIC (baset alias)\n"
         "  -microprogram F Run an architectural microprogram on a bare core\n"
         "                  and print the resulting state (conformance testing;\n"
         "                  see tools/ia64_conformance.py)\n"
@@ -198,6 +200,18 @@ int ia64_setup(int argc, char *argv[]) {
         } else if (strcmp(rem[i], "-cdrom") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cdrom requires an argument\n"); return 1; }
             cfg.cdrom_path = rem[++i];
+        } else if (strcmp(rem[i], "-net") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -net requires an argument\n"); return 1; }
+            const char *net = rem[++i];
+            if (strcmp(alias, "i2000") != 0 ||
+                (strcmp(net, "nic,model=i82559") != 0 &&
+                 strcmp(net, "nic,model=baset") != 0)) {
+                fprintf(stderr,
+                        "gemu: -net currently supports only "
+                        "'nic,model=i82559' (or 'baset') on i2000\n");
+                return 1;
+            }
+            cfg.i82559_enabled = true;
         } else if (strcmp(rem[i], "-serial") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -serial requires an argument\n"); return 1; }
             const char *spec = rem[++i];

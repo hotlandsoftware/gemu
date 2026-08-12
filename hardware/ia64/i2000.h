@@ -67,6 +67,7 @@ typedef struct {
     bool            no_shutdown;
     bool            menu_disabled; /* machine XML's menu="disabled" */
     bool            mouse_enabled; /* -device mouse (i2000 only) */
+    bool            i82559_enabled; /* -net nic,model=i82559/baset */
 } Ia64Config;
 
 typedef struct Ia64I2000State Ia64I2000State;

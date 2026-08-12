@@ -5,6 +5,7 @@
 #include "vgafont16.h"
 #include "vgabios_rom.h"
 #include "rage128.h"
+#include "network/i82559.h"
 #include "gemu/gemu_display.h"
 #include "gemu/vnc.h"
 #include "gemu/monitor.h"
@@ -104,6 +105,9 @@
 #define RAGE128_FB_BASE       0xC4000000ull
 #define RAGE128_IO_BASE       0xC300u
 #define RAGE128_MMIO_BASE     0xC8000000ull
+#define I82559_PCI_DEV          6u
+#define I82559_MMIO_BASE        0xC8100000u
+#define I82559_IO_BASE          0xC400u
 #define I2000_HIGH_DRAM_TAG   UINT64_C(0x00000e0000000000)
 #define I2000_HIGH_DRAM_SIZE  (UINT64_C(64) * 1024 * 1024)
 #define I2000_HIGH_DRAM_BASE  (I2000_RAM_MAX - I2000_HIGH_DRAM_SIZE)
@@ -345,6 +349,8 @@ struct Ia64I2000State {
     /* v13: channel-0 read sequencing and counter epoch. */
     uint8_t pit0_read_phase;
     uint64_t pit0_epoch_ninsts;
+    /* v14: optional onboard Intel 82559-compatible 10/100 Base-T NIC. */
+    I82559 i82559;
 };
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -1000,6 +1006,12 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     if (s->rage128.enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
         fun == 0 && reg + size <= sizeof(s->rage128.cfg))
         return rage128_pci_read(&s->rage128, reg, size);
+    if (s->i82559.enabled && bus == 0 && dev == I82559_PCI_DEV &&
+        fun == 0 && reg + size <= sizeof(s->i82559.cfg)) {
+        if (getenv("I82559_DEBUG"))
+            fprintf(stderr, "i82559: pci read reg=%02x size=%u\n", reg, size);
+        return i82559_pci_read(&s->i82559, reg, size);
+    }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == 0 &&
         reg + size <= sizeof(s->ifb_cfg)) {
         uint64_t v = 0;
@@ -1070,6 +1082,11 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
     if (s->rage128.enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
         fun == 0 && reg + size <= sizeof(s->rage128.cfg)) {
         rage128_pci_write(&s->rage128, reg, val, size);
+        return;
+    }
+    if (s->i82559.enabled && bus == 0 && dev == I82559_PCI_DEV &&
+        fun == 0 && reg + size <= sizeof(s->i82559.cfg)) {
+        i82559_pci_write(&s->i82559, reg, val, size);
         return;
     }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == 0 &&
@@ -1321,6 +1338,12 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
             return rage128_mmio_read(&s->rage128,
                                      (unsigned)(port - base), size);
     }
+    if (s->i82559.enabled) {
+        uint32_t base = i82559_bar(&s->i82559, 0x14, I82559_IO_BASE,
+                                  ~UINT32_C(0x3f));
+        if (port >= base && port + size <= base + I82559_IO_SIZE)
+            return i82559_reg_read(&s->i82559, (unsigned)(port - base), size);
+    }
     if (size == 1 && vga_port(port))
         return vga_ibm_io_read(&s->vga, (uint16_t)port);
     {
@@ -1340,14 +1363,14 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
          * permanently set and the poll spinning forever. */
         return 0;
     }
-    /* Post-IBV firmware polls the byte at 0x1110 before entering the
-     * presentation application.  This is a status register in the i2000's
-     * firmware-programmed legacy-I/O block; no asynchronous device is
-     * currently modeled behind it, so its truthful quiescent value is zero.
-     * Falling through to the floating-bus value (0xff) leaves the busy/error
-     * bits asserted permanently and traps the firmware in a 29-instruction
-     * retry loop. */
-    if (port == 0x1110 && size == 1)
+    /* Post-IBV firmware polls this byte before entering the presentation
+     * application.  PCI resource allocation places it at 0x1110 without
+     * the optional NIC and at 0x1160 when the i82559 consumes the preceding
+     * I/O aperture.  No asynchronous device is currently modeled behind
+     * this legacy-I/O status register, so its quiescent value is zero.
+     * Returning floating-bus 0xff leaves its busy/error bits asserted and
+     * traps firmware in a tight retry loop. */
+    if ((port == 0x1110 || port == 0x1160) && size == 1)
         return 0;
     if (port == 0x60 && size == 1) {               /* 8042 data */
         /* A real 8042 has one ordered output buffer.  Our keyboard and aux
@@ -1586,6 +1609,14 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         if (port >= base && port + size <= base + 0x100) {
             rage128_mmio_write(&s->rage128,
                                (unsigned)(port - base), val, size);
+            return;
+        }
+    }
+    if (s->i82559.enabled) {
+        uint32_t base = i82559_bar(&s->i82559, 0x14, I82559_IO_BASE,
+                                  ~UINT32_C(0x3f));
+        if (port >= base && port + size <= base + I82559_IO_SIZE) {
+            i82559_reg_write(&s->i82559, (unsigned)(port - base), val, size);
             return;
         }
     }
@@ -2086,6 +2117,21 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
             return rage128_mmio_read(&s->rage128,
                                      (unsigned)(addr - mmio), size);
     }
+    if (s->i82559.enabled) {
+        uint64_t mmio = i82559_bar(&s->i82559, 0x10, I82559_MMIO_BASE,
+                                  ~UINT32_C(0xfff));
+        if (addr >= mmio && addr + size <= mmio + I82559_MMIO_SIZE)
+            return i82559_reg_read(&s->i82559, (unsigned)(addr - mmio), size);
+        uint32_t rombar = 0;
+        memcpy(&rombar, s->i82559.cfg + 0x30, sizeof(rombar));
+        uint64_t rombase = rombar & ~UINT32_C(0x7ff);
+        if ((rombar & 1) && s->i82559.option_rom && addr >= rombase &&
+            addr + size <= rombase + s->i82559.option_rom_size) {
+            uint64_t v = 0;
+            memcpy(&v, s->i82559.option_rom + (addr - rombase), size);
+            return v;
+        }
+    }
     /* vga_mem_window()/vga_rom_window() can only ever match addr < 0xD0000
      * (the legacy VGA aperture + option-ROM shadow window) - skip both
      * calls for the overwhelming majority of accesses, which land well
@@ -2299,6 +2345,14 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
         if (addr >= mmio && addr + size <= mmio + RAGE128_MMIO_SIZE) {
             rage128_mmio_write(&s->rage128,
                                (unsigned)(addr - mmio), val, size);
+            return;
+        }
+    }
+    if (s->i82559.enabled) {
+        uint64_t mmio = i82559_bar(&s->i82559, 0x10, I82559_MMIO_BASE,
+                                  ~UINT32_C(0xfff));
+        if (addr >= mmio && addr + size <= mmio + I82559_MMIO_SIZE) {
+            i82559_reg_write(&s->i82559, (unsigned)(addr - mmio), val, size);
             return;
         }
     }
@@ -2807,7 +2861,7 @@ static bool i2000_screendump(void *ud, const char *path) {
  * than hand-listing every scalar field, and it stays correct automatically
  * as fields get added. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 13u /* v13 adds a readable PIT0 counter */
+#define I2000_SNAPSHOT_VERSION 14u /* v14 adds the optional Base-T NIC */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -2848,6 +2902,10 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     snap->atapi_data = NULL;
     snap->hda = NULL;
     snap->ata_data = NULL;
+    snap->i82559.guest_read = NULL;
+    snap->i82559.guest_write = NULL;
+    snap->i82559.guest_opaque = NULL;
+    snap->i82559.option_rom = NULL;
     ok &= fwrite(snap, sizeof(*snap), 1, f) == 1;
     free(snap);
 
@@ -2911,6 +2969,9 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     GemuVncServer *vnc = s->vnc;
     bool configured_rage128 = s->rage128.enabled;
     bool configured_mouse_enabled = s->mouse_enabled;
+    bool configured_i82559 = s->i82559.enabled;
+    uint8_t *i82559_option_rom = s->i82559.option_rom;
+    size_t i82559_option_rom_size = s->i82559.option_rom_size;
     Merced *cpu = s->cpu;
     uint8_t *ram = s->ram;
     uint8_t *flash = s->flash;
@@ -2946,6 +3007,8 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         state_size = (offsetof(Ia64I2000State, keyboard_irq_pending) + 7u) & ~7u;
     else if (version == 12u)
         state_size = (offsetof(Ia64I2000State, pit0_read_phase) + 7u) & ~7u;
+    else if (version == 13u)
+        state_size = offsetof(Ia64I2000State, i82559);
     else
         state_size = sizeof(*loaded);
     ok &= fread(loaded, state_size, 1, f) == 1;
@@ -2998,6 +3061,17 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
              * cooldown. It is no longer meaningful under EOI flow control. */
             s->mouse_retry_ninsts = s->cpu->ninsts;
         }
+        if (version < 14u) {
+            i82559_init(&s->i82559, configured_i82559, I82559_MMIO_BASE,
+                        I82559_IO_BASE, 18, bus_read, bus_write, s);
+        } else {
+            /* Snapshot callback pointers refer to the saving process. */
+            s->i82559.guest_read = bus_read;
+            s->i82559.guest_write = bus_write;
+            s->i82559.guest_opaque = s;
+        }
+        s->i82559.option_rom = i82559_option_rom;
+        s->i82559.option_rom_size = i82559_option_rom_size;
     }
     free(loaded);
 
@@ -3530,6 +3604,8 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     rage128_init(&s->rage128,
                  cfg->vga && strcmp(cfg->vga, "rage128") == 0,
                  RAGE128_FB_BASE, RAGE128_IO_BASE, RAGE128_MMIO_BASE, 17);
+    i82559_init(&s->i82559, cfg->i82559_enabled, I82559_MMIO_BASE,
+                I82559_IO_BASE, 18, bus_read, bus_write, s);
     i2000_load_vga_option_rom(s);
     if (cfg->cdrom_path) {
         s->cdrom = fopen(cfg->cdrom_path, "rb");
@@ -3625,6 +3701,7 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
     gemu_vnc_destroy(s->vnc);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     merced_destroy(s->cpu);
+    i82559_destroy(&s->i82559);
     free(s->atapi_data);
     if (s->cdrom) fclose(s->cdrom);
     free(s->ata_data);
@@ -3928,6 +4005,9 @@ static void i2000_run_slice(Ia64I2000State *s) {
 
 static void i2000_reset(Ia64I2000State *s) {
     bool rage128_enabled = s->rage128.enabled;
+    bool i82559_enabled = s->i82559.enabled;
+    uint8_t *i82559_option_rom = s->i82559.option_rom;
+    size_t i82559_option_rom_size = s->i82559.option_rom_size;
     bool mouse_enabled = s->mouse_enabled;
     merced_reset(s->cpu);
     vga_ibm_reset(&s->vga);
@@ -3935,6 +4015,10 @@ static void i2000_reset(Ia64I2000State *s) {
                  RAGE128_IO_BASE, RAGE128_MMIO_BASE, 17);
     memset(&s->int10_req, 0,
            sizeof(*s) - offsetof(Ia64I2000State, int10_req));
+    i82559_init(&s->i82559, i82559_enabled, I82559_MMIO_BASE,
+                I82559_IO_BASE, 18, bus_read, bus_write, s);
+    s->i82559.option_rom = i82559_option_rom;
+    s->i82559.option_rom_size = i82559_option_rom_size;
     /* mouse_enabled is a CLI-configured setting (-device mouse), not
      * protocol state - a reset should clear the aux device's transient
      * state (queue, streaming flag, etc, all zeroed by the memset above)
