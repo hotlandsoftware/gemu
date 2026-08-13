@@ -6,6 +6,7 @@
 #include "vgabios_rom.h"
 #include "rage128.h"
 #include "network/i82559.h"
+#include "ps2_keyboard.h"
 #include "gemu/gemu_display.h"
 #include "gemu/vnc.h"
 #include "gemu/monitor.h"
@@ -94,6 +95,38 @@
  * be zero (synchronous re-raise corrupts the guest ISR's return frame).
  * Matches the PIT's own tick granularity, which is already known safe. */
 #define MOUSE_RETRY_DELAY_INSTS 1000u
+#define KEYBOARD_RETRY_DELAY_INSTS 10000u
+
+enum {
+    I2000_KEY_UP,
+    I2000_KEY_DOWN,
+    I2000_KEY_LEFT,
+    I2000_KEY_RIGHT,
+    I2000_KEY_HOME,
+    I2000_KEY_END,
+    I2000_KEY_PAGEUP,
+    I2000_KEY_PAGEDOWN,
+    I2000_KEY_INSERT,
+    I2000_KEY_DELETE,
+};
+
+static const GemuActionDef i2000_keyboard_actions[] = {
+    { "key_up",       GEMU_ACTION(I2000_KEY_UP),       "Up" },
+    { "key_down",     GEMU_ACTION(I2000_KEY_DOWN),     "Down" },
+    { "key_left",     GEMU_ACTION(I2000_KEY_LEFT),     "Left" },
+    { "key_right",    GEMU_ACTION(I2000_KEY_RIGHT),    "Right" },
+    { "key_home",     GEMU_ACTION(I2000_KEY_HOME),     "Home" },
+    { "key_end",      GEMU_ACTION(I2000_KEY_END),      "End" },
+    { "key_page_up",  GEMU_ACTION(I2000_KEY_PAGEUP),   "PageUp" },
+    { "key_page_down",GEMU_ACTION(I2000_KEY_PAGEDOWN), "PageDown" },
+    { "key_insert",   GEMU_ACTION(I2000_KEY_INSERT),   "Insert" },
+    { "key_delete",   GEMU_ACTION(I2000_KEY_DELETE),   "Delete" },
+};
+
+static const uint32_t i2000_keyboard_keysyms[] = {
+    0xff52, 0xff54, 0xff51, 0xff53, 0xff50,
+    0xff57, 0xff55, 0xff56, 0xff63, 0xffff,
+};
 #define MOUSE_BACKLOG_MAX       254
 #define I2000_ITC_HZ UINT64_C(200000000)
 #define I2000_ITC_TICK_NS 5u
@@ -351,6 +384,9 @@ struct Ia64I2000State {
     uint64_t pit0_epoch_ninsts;
     /* v14: optional onboard Intel 82559-compatible 10/100 Base-T NIC. */
     I82559 i82559;
+    /* v15: reusable PS/2 keyboard device behind this machine's 8042. */
+    Ps2Keyboard ps2_keyboard;
+    uint64_t keyboard_retry_ninsts;
 };
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -369,19 +405,6 @@ static int32_t mouse_accumulate_axis(int32_t pending, int delta) {
     if (next < -MOUSE_BACKLOG_MAX)
         return -MOUSE_BACKLOG_MAX;
     return (int32_t)next;
-}
-
-static void kbc_queue_byte(Ia64I2000State *s, uint8_t byte) {
-    /* Controller replies and keyboard scan codes share the 8042 output
-     * buffer.  The firmware polls OBF, so no interrupt is required here. */
-    if (s->kbc_out_pos) {
-        memmove(s->kbc_out, s->kbc_out + s->kbc_out_pos,
-                s->kbc_out_len - s->kbc_out_pos);
-        s->kbc_out_len -= s->kbc_out_pos;
-        s->kbc_out_pos = 0;
-    }
-    if (s->kbc_out_len < sizeof(s->kbc_out))
-        s->kbc_out[s->kbc_out_len++] = byte;
 }
 
 static void aux_queue_byte(Ia64I2000State *s, uint8_t byte) {
@@ -524,19 +547,6 @@ static void mouse_device_command(Ia64I2000State *s, uint8_t cmd) {
     }
 }
 
-static void kbc_queue_ascii(Ia64I2000State *s, uint32_t cp) {
-    /* Set-1 make codes used by the SDV BIOS keyboard driver.  Enter is the
-     * important boot/UI key; include the other common control keys too. */
-    uint8_t scan = 0;
-    if (cp == '\r' || cp == '\n') scan = 0x1c;
-    else if (cp == '\b')         scan = 0x0e;
-    else if (cp == '\t')         scan = 0x0f;
-    else if (cp == 0x1b)         scan = 0x01;
-    else if (cp == ' ')          scan = 0x39;
-    if (scan)
-        kbc_queue_byte(s, scan);
-}
-
 static uint64_t size_mask(unsigned size) {
     return size >= 8 ? ~0ull : (1ull << (size * 8)) - 1;
 }
@@ -561,18 +571,38 @@ static void atapi_set_data(Ia64I2000State *s, const void *data, size_t len) {
     s->atapi_status = len ? 0x48 : 0x40; /* DRDY|DRQ / DRDY */
 }
 
+static void atapi_no_medium(Ia64I2000State *s) {
+    free(s->atapi_data);
+    s->atapi_data = NULL;
+    s->atapi_data_len = s->atapi_data_pos = 0;
+    s->atapi_count = 0x03; /* command completion, I/O to host */
+    s->atapi_error = 0x20; /* sense key: NOT READY */
+    s->atapi_status = 0x41; /* DRDY|ERR */
+}
+
 static void atapi_reply(Ia64I2000State *s) {
     const uint8_t *p = s->atapi_packet;
     uint8_t reply[64] = {0};
     uint32_t blocks = (uint32_t)(s->cdrom_size / 2048);
     switch (p[0]) {
     case 0x00: /* TEST UNIT READY */
+        if (!s->cdrom) {
+            atapi_no_medium(s);
+            break;
+        }
+        atapi_set_data(s, NULL, 0);
+        break;
     case 0x1B: /* START STOP UNIT */
     case 0x1E: /* PREVENT/ALLOW MEDIUM REMOVAL */
         atapi_set_data(s, NULL, 0);
         break;
     case 0x03: /* REQUEST SENSE */
-        reply[0] = 0x70; reply[7] = 10;
+        reply[0] = 0x70;
+        if (!s->cdrom) {
+            reply[2] = 0x02; /* NOT READY */
+            reply[12] = 0x3a; /* medium not present */
+        }
+        reply[7] = 10;
         atapi_set_data(s, reply, p[4] < 18 ? p[4] : 18);
         break;
     case 0x12: { /* INQUIRY */
@@ -586,6 +616,10 @@ static void atapi_reply(Ia64I2000State *s) {
         break;
     }
     case 0x25: /* READ CAPACITY */
+        if (!s->cdrom) {
+            atapi_no_medium(s);
+            break;
+        }
         if (blocks) blocks--;
         reply[0] = blocks >> 24; reply[1] = blocks >> 16;
         reply[2] = blocks >> 8;  reply[3] = blocks;
@@ -593,6 +627,10 @@ static void atapi_reply(Ia64I2000State *s) {
         atapi_set_data(s, reply, 8);
         break;
     case 0x43: { /* READ TOC: one data track, lead-out */
+        if (!s->cdrom) {
+            atapi_no_medium(s);
+            break;
+        }
         reply[1] = 0x12; reply[2] = 1; reply[3] = 1;
         reply[5] = 0x14; reply[6] = 1;
         reply[13] = 0x14; reply[14] = 0xAA;
@@ -1385,6 +1423,9 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
                 s->kbc_out_pos = s->kbc_out_len = 0;
             return v;
         }
+        if (s->aux_out_pos >= s->aux_out_len &&
+            ps2_keyboard_has_data(&s->ps2_keyboard))
+            return ps2_keyboard_read(&s->ps2_keyboard);
         if (s->aux_out_pos < s->aux_out_len) {
             uint8_t v = s->aux_out[s->aux_out_pos++];
             if (getenv("MOUSE_DEBUG"))
@@ -1420,7 +1461,8 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
          * never become nonzero without -device mouse). Keyboard bytes win
          * priority when both queues happen to be nonempty. */
         bool aux_next = s->aux_out_pos < s->aux_out_len;
-        uint8_t st64 = ((s->kbc_out_len || s->aux_out_len) ? 0x01 : 0) |
+        uint8_t st64 = ((s->kbc_out_len || s->aux_out_len ||
+                         ps2_keyboard_has_data(&s->ps2_keyboard)) ? 0x01 : 0) |
                        (aux_next ? 0x20 : 0) | 0x04; /* system flag */
         if (getenv("MOUSE_DEBUG"))
             fprintf(stderr, "MOUSE_DEBUG: port64 status read -> %02x "
@@ -1518,7 +1560,7 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         uint8_t refresh = (s->cpu->ninsts >> 8) & 1 ? 0x10 : 0;
         return s->port61 | refresh | (s->pit2_polls >= 2 ? 0x20 : 0);
     }
-    if (s->cdrom && ((port >= 0x170 && port <= 0x177) || port == 0x376)) {
+    if ((port >= 0x170 && port <= 0x177) || port == 0x376) {
         unsigned reg = port == 0x376 ? 7 : (unsigned)(port - 0x170);
         if (reg == 0) {
             uint64_t v = 0;
@@ -1757,14 +1799,7 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
             if (s->mouse_enabled)
                 mouse_device_command(s, data);
         } else if (s->kbc_pending_write == 0) {
-            /* An empty PS/2 keyboard still acknowledges commands.  Reset
-             * additionally reports a successful BAT result. */
-            s->kbc_out[0] = 0xFA;
-            s->kbc_out_len = 1;
-            if (data == 0xFF) {
-                s->kbc_out[1] = 0xAA;
-                s->kbc_out_len = 2;
-            }
+            ps2_keyboard_command(&s->ps2_keyboard, data);
         }
         s->kbc_pending_write = 0;
         return;
@@ -1826,7 +1861,7 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         s->port61 = (uint8_t)val & 0x0F;
         return;
     }
-    if (s->cdrom && ((port >= 0x170 && port <= 0x177) || port == 0x376)) {
+    if ((port >= 0x170 && port <= 0x177) || port == 0x376) {
         unsigned reg = port == 0x376 ? 8 : (unsigned)(port - 0x170);
         if (reg == 0) {
             for (unsigned i = 0; i < size && s->atapi_packet_pos < 12; i++)
@@ -2210,6 +2245,14 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         }
         if (s->keyboard_irq_pending) {
             s->keyboard_irq_pending = false;
+            /* The SDV thunk performs several native/IA-32 rfi transitions
+             * while servicing one byte, so the global rfi counter cannot
+             * identify completion of this particular IRQ1.  Keep the next
+             * byte quiet long enough for the thunk and BIOS handler to
+             * unwind before another shared ExtINT can overwrite cr.iip and
+             * cr.ipsr. */
+            s->keyboard_retry_ninsts =
+                s->cpu->ninsts + KEYBOARD_RETRY_DELAY_INSTS;
             return (uint64_t)(s->pic_master_base + 1); /* IRQ1 */
         }
         if (s->mouse_irq_pending) {
@@ -2861,7 +2904,7 @@ static bool i2000_screendump(void *ud, const char *path) {
  * than hand-listing every scalar field, and it stays correct automatically
  * as fields get added. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 14u /* v14 adds the optional Base-T NIC */
+#define I2000_SNAPSHOT_VERSION 15u /* v15 adds the reusable PS/2 keyboard */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -3009,6 +3052,8 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         state_size = (offsetof(Ia64I2000State, pit0_read_phase) + 7u) & ~7u;
     else if (version == 13u)
         state_size = offsetof(Ia64I2000State, i82559);
+    else if (version == 14u)
+        state_size = offsetof(Ia64I2000State, ps2_keyboard);
     else
         state_size = sizeof(*loaded);
     ok &= fread(loaded, state_size, 1, f) == 1;
@@ -3072,6 +3117,8 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         }
         s->i82559.option_rom = i82559_option_rom;
         s->i82559.option_rom_size = i82559_option_rom_size;
+        if (version < 15u)
+            ps2_keyboard_init(&s->ps2_keyboard);
     }
     free(loaded);
 
@@ -3084,6 +3131,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         /* rfi_generation is process-local rather than snapshot state, so an
          * absolute saved target cannot be meaningful after load. */
         s->mouse_wait_rfi_generation = 0;
+        s->keyboard_retry_ninsts = s->cpu->ninsts;
         s->mouse_next_report_itc = merced_get_itc(s->cpu);
         i2000_repair_saved_mode12(s);
     }
@@ -3296,8 +3344,16 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
             else if (!strcmp(keyname, "tab"))   { scan = 0x0f; }
             else if (!strcmp(keyname, "esc"))   { scan = 0x01; }
             if (scan) {
-                if (ext) kbc_queue_byte(s, ext);
-                kbc_queue_byte(s, scan);
+                if (ext) {
+                    uint32_t keysym = scan == 0x4d ? 0xff53 :
+                                      scan == 0x4b ? 0xff51 :
+                                      scan == 0x48 ? 0xff52 : 0xff54;
+                    ps2_keyboard_tap(&s->ps2_keyboard, keysym);
+                } else {
+                    uint32_t keysym = scan == 0x1c ? '\r' :
+                                      scan == 0x0f ? '\t' : 0x1b;
+                    ps2_keyboard_tap(&s->ps2_keyboard, keysym);
+                }
                 printf("key %s queued\n", keyname);
             } else {
                 printf("unknown key '%s' (right/left/up/down/enter/tab/esc)\n",
@@ -3444,7 +3500,9 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->atapi_lba_mid = 0x14;
     s->atapi_lba_high = 0xEB;
     s->atapi_device = 0xA0;
-    s->atapi_status = s->cdrom ? 0x40 : 0;
+    /* The secondary-master ATAPI drive exists even with its tray empty.
+     * Media presence affects SCSI packet results, not ATA device presence. */
+    s->atapi_status = 0x40;
     s->atapi_packet_pos = 0;
     free(s->atapi_data);
     s->atapi_data = NULL;
@@ -3606,6 +3664,31 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
                  RAGE128_FB_BASE, RAGE128_IO_BASE, RAGE128_MMIO_BASE, 17);
     i82559_init(&s->i82559, cfg->i82559_enabled, I82559_MMIO_BASE,
                 I82559_IO_BASE, 18, bus_read, bus_write, s);
+    if (cfg->i82559_enabled) {
+        /* The SDV EFI expects the integrated 82559 to supply an EFI UNDI
+         * driver through its PCI expansion ROM.  Merely exposing the PCI
+         * function leaves Boot Manager's network-device cleanup on a broken
+         * firmware error path ("Could not load UNDI" followed by a pool
+         * assertion).  Prefer an installed ROM, with the in-tree QEMU ROM as
+         * the development-tree fallback.  i82559_load_option_rom() retags
+         * its EEPRO100 PCI ID to the integrated controller's 8086:1229 ID. */
+        static const char *const undi_rom_paths[] = {
+            "roms/efi-eepro100.rom",
+            "reference/qemu-system-ia64/pc-bios/efi-eepro100.rom",
+            "reference/qemu-system-ia64-merced/pc-bios/efi-eepro100.rom",
+        };
+        bool loaded = false;
+        for (unsigned i = 0;
+             i < sizeof(undi_rom_paths) / sizeof(undi_rom_paths[0]); i++) {
+            if (i82559_load_option_rom(&s->i82559, undi_rom_paths[i])) {
+                loaded = i82559_keep_efi_option_rom(&s->i82559, 0x0200);
+                break;
+            }
+        }
+        if (!loaded)
+            fprintf(stderr, "i2000: warning: i82559 EFI UNDI ROM not found\n");
+    }
+    ps2_keyboard_init(&s->ps2_keyboard);
     i2000_load_vga_option_rom(s);
     if (cfg->cdrom_path) {
         s->cdrom = fopen(cfg->cdrom_path, "rb");
@@ -3664,6 +3747,9 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
             .fb_width = FB_W,
             .fb_height = FB_H,
             .scale = cfg->display_scale,
+            .actions = i2000_keyboard_actions,
+            .n_actions = (int)(sizeof(i2000_keyboard_actions) /
+                               sizeof(i2000_keyboard_actions[0])),
             .ini_section = "i2000",
             .no_menu = cfg->menu_disabled,
             /* VM-style click-to-capture, same as um6578: the guest firmware
@@ -3827,7 +3913,9 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * CdbPim blocked with an unread 8042 byte. Keep the latch asserted until
      * the firmware performs its ExtINT acknowledge; if more bytes remain,
      * the next poll naturally reasserts it. */
-    if (s->kbc_out_pos < s->kbc_out_len &&
+    if ((s->kbc_out_pos < s->kbc_out_len ||
+         ps2_keyboard_has_data(&s->ps2_keyboard)) &&
+        s->cpu->ninsts >= s->keyboard_retry_ninsts &&
         !(s->pic_master_mask & 0x02)) {
         s->keyboard_irq_pending = true;
         merced_raise_external(s->cpu, 0);
@@ -4019,6 +4107,7 @@ static void i2000_reset(Ia64I2000State *s) {
                 I82559_IO_BASE, 18, bus_read, bus_write, s);
     s->i82559.option_rom = i82559_option_rom;
     s->i82559.option_rom_size = i82559_option_rom_size;
+    ps2_keyboard_init(&s->ps2_keyboard);
     /* mouse_enabled is a CLI-configured setting (-device mouse), not
      * protocol state - a reset should clear the aux device's transient
      * state (queue, streaming flag, etc, all zeroed by the memset above)
@@ -4080,6 +4169,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
      * timer takes roughly half a second on a 3.8 Mslot/s host. */
     merced_set_external_itc(s->cpu, true);
     uint64_t itc_last_ns = i2000_monotonic_ns();
+    uint32_t display_keys_held = 0;
 
     bool running = true;
     while (running) {
@@ -4097,14 +4187,25 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             }
         }
         if (s->display) {
-            gemu_display_poll(s->display);
+            uint32_t keys_held = gemu_display_poll(s->display);
+            uint32_t keys_changed = keys_held ^ display_keys_held;
+            for (unsigned i = 0;
+                 i < sizeof(i2000_keyboard_keysyms) /
+                     sizeof(i2000_keyboard_keysyms[0]); i++) {
+                uint32_t bit = GEMU_ACTION(i);
+                if (keys_changed & bit)
+                    ps2_keyboard_key(&s->ps2_keyboard,
+                                     i2000_keyboard_keysyms[i],
+                                     (keys_held & bit) != 0);
+            }
+            display_keys_held = keys_held;
             uint32_t cp;
             while ((cp = gemu_display_pop_raw_key(s->display)) != 0) {
                 uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
                 if (next != s->uart_rx_head && cp <= 0x7F) {
                     s->uart_rx[s->uart_rx_tail] = (uint8_t)cp;
                     s->uart_rx_tail = next;
-                    kbc_queue_ascii(s, cp);
+                    ps2_keyboard_tap(&s->ps2_keyboard, cp);
                 }
             }
             if (gemu_display_should_quit(s->display)) {
@@ -4120,8 +4221,6 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
         if (s->vnc) {
             GemuVncKeyEvent ev;
             while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-                if (!ev.down)
-                    continue;
                 uint32_t cp = 0;
                 if (ev.keysym <= 0x7F)        cp = ev.keysym;
                 else if (ev.keysym == 0xFF0D) cp = '\r';
@@ -4129,14 +4228,15 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                 else if (ev.keysym == 0xFF09) cp = '\t';
                 else if (ev.keysym == 0xFF1B) cp = 0x1b;
                 else if (ev.keysym == 0xFFFF) cp = 0x7f;
-                if (cp) {
+                if (cp && ev.down) {
                     uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
                     if (next != s->uart_rx_head) {
                         s->uart_rx[s->uart_rx_tail] = (uint8_t)cp;
                         s->uart_rx_tail = next;
                     }
-                    kbc_queue_ascii(s, cp);
                 }
+                ps2_keyboard_key(&s->ps2_keyboard,
+                                 cp ? cp : ev.keysym, ev.down);
             }
         }
 
@@ -4174,6 +4274,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                  * EOI handshake completes. */
                 s->aux_out_len == 0 &&
                 s->kbc_out_len == 0 &&
+                !ps2_keyboard_has_data(&s->ps2_keyboard) &&
                 s->mouse_wait_rfi_generation == 0 &&
                 s->cpu->ninsts >= s->mouse_retry_ninsts &&
                 (int64_t)(merced_get_itc(s->cpu) -

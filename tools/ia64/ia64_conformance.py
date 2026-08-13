@@ -13,7 +13,7 @@ That turns "guess which semantic differs, then boot Windows for twelve minutes
 to find out" into a finite list of precise failures that run in milliseconds.
 
 Usage:
-    tools/ia64_conformance.py [--group mmu] [--name substring] [-v]
+    tools/ia64/ia64_conformance.py [--group mmu] [--name substring] [-v]
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 REF = REPO / "reference/qemu-system-ia64"
 GEMU = REPO / "bin/gemu"
 

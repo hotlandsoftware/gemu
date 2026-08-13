@@ -145,6 +145,47 @@ bool i82559_load_option_rom(I82559 *n, const char *path) {
     return true;
 }
 
+bool i82559_keep_efi_option_rom(I82559 *n, uint16_t machine_type) {
+    /* A combined PCI ROM normally begins with a legacy IA-32 image and
+     * chains to an EFI image.  The SDV's option-ROM dispatcher attempts to
+     * execute that first image in compatibility mode even when an EFI image
+     * follows it.  Keep only the EFI image for IA-64 machines; generic/x86
+     * users of i82559_load_option_rom() still retain the combined ROM. */
+    if (!n->option_rom)
+        return false;
+    for (size_t image = 0; image + 0x20 <= n->option_rom_size;) {
+        uint8_t *rom = n->option_rom;
+        if (rom[image] != 0x55 || rom[image + 1] != 0xaa)
+            break;
+        uint16_t pcir = (uint16_t)(rom[image + 0x18] |
+                                   rom[image + 0x19] << 8);
+        if (image + pcir + 0x16 > n->option_rom_size ||
+            memcmp(rom + image + pcir, "PCIR", 4) != 0)
+            break;
+        size_t p = image + pcir;
+        size_t image_len =
+            (size_t)(rom[p + 0x10] | rom[p + 0x11] << 8) * 512;
+        if (!image_len || image + image_len > n->option_rom_size)
+            break;
+        /* EFI PCI expansion ROM header: EFI signature at +4, subsystem at
+         * +8 and PE machine type at +10.  Code type 3 alone is insufficient:
+         * QEMU's current eepro100 ROM contains an x86-64 EFI image, which an
+         * Itanium EFI cannot execute. */
+        uint16_t image_machine = (uint16_t)(rom[image + 10] |
+                                            rom[image + 11] << 8);
+        if (rom[p + 0x14] == 3 && image_machine == machine_type) {
+            memmove(rom, rom + image, image_len);
+            n->option_rom_size = image_len;
+            return true;
+        }
+        image += image_len;
+    }
+    free(n->option_rom);
+    n->option_rom = NULL;
+    n->option_rom_size = 0;
+    return false;
+}
+
 void i82559_destroy(I82559 *n) {
     free(n->option_rom);
     n->option_rom = NULL;
@@ -214,20 +255,69 @@ static uint16_t eeprom_read(const I82559 *n) {
     return v;
 }
 
-static void complete_cb(I82559 *n, uint32_t addr) {
+static void set_cu_state(I82559 *n, uint8_t state) {
+    n->regs[SCB_STATUS] = (uint8_t)((n->regs[SCB_STATUS] & 0x3f) |
+                                    ((state & 3) << 6));
+}
+
+static void set_ru_state(I82559 *n, uint8_t state) {
+    n->regs[SCB_STATUS] = (uint8_t)((n->regs[SCB_STATUS] & 0xc3) |
+                                    ((state & 0x0f) << 2));
+}
+
+static void run_command_list(I82559 *n, uint32_t first) {
     if (!n->guest_read || !n->guest_write)
         return;
-    uint16_t status = (uint16_t)n->guest_read(n->guest_opaque, addr, 2);
-    n->guest_write(n->guest_opaque, addr, status | 0xa000u, 2);
-    n->regs[1] |= 0xa0; /* command complete + CU no longer active */
+    uint32_t offset = first;
+    set_cu_state(n, 2); /* active */
+    /* Real lists are normally only a few entries long.  Bound traversal so
+     * malformed guest links cannot hang the emulator. */
+    for (unsigned count = 0; count < 64; count++) {
+        uint32_t addr = n->cu_base + offset;
+        uint16_t status =
+            (uint16_t)n->guest_read(n->guest_opaque, addr, 2);
+        uint16_t command =
+            (uint16_t)n->guest_read(n->guest_opaque, addr + 2, 2);
+        uint32_t link =
+            (uint32_t)n->guest_read(n->guest_opaque, addr + 4, 4);
+        /* NOP, IA setup, configure, multicast, transmit, TDR and diagnose
+         * all complete successfully. Networking is intentionally absent,
+         * but UNDI initialization depends on their completion handshake. */
+        n->guest_write(n->guest_opaque, addr, status | 0xa000u, 2);
+        if (getenv("I82559_DEBUG"))
+            fprintf(stderr, "i82559: CB %08x command=%04x link=%08x done\n",
+                    addr, command, link);
+        if (command & 0x8000) { /* end of list */
+            set_cu_state(n, 0); /* idle */
+            return;
+        }
+        offset = link;
+        if (command & 0x4000) { /* suspend after completion */
+            n->scb_pointer = offset;
+            set_cu_state(n, 1); /* suspended */
+            return;
+        }
+    }
+    set_cu_state(n, 0);
 }
 
 static void command_write(I82559 *n, uint16_t command) {
     uint8_t ru = command & 0x0f;
     uint8_t cu = command & 0xf0;
-    if (ru == 0x06) n->ru_base = n->scb_pointer;
-    if (cu == 0x60) n->cu_base = n->scb_pointer;
-    if (cu == 0x10) complete_cb(n, n->cu_base + n->scb_pointer);
+    if (ru == 0x06) {
+        n->ru_base = n->scb_pointer;
+        set_ru_state(n, 0); /* idle */
+    } else if (ru == 0x01 || ru == 0x02 || ru == 0x07) {
+        set_ru_state(n, 4); /* ready */
+    } else if (ru == 0x04) {
+        set_ru_state(n, 0); /* aborted/idle */
+    }
+    if (cu == 0x60)
+        n->cu_base = n->scb_pointer;
+    else if (cu == 0x10)
+        run_command_list(n, n->scb_pointer);
+    else if (cu == 0x20 || cu == 0xa0)
+        run_command_list(n, n->scb_pointer);
     /* Hardware clears the command acceptance byte when accepted. */
     n->regs[SCB_COMMAND] = 0;
     n->regs[SCB_COMMAND + 1] = (uint8_t)(command >> 8);

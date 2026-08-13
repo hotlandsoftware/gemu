@@ -54,6 +54,7 @@ FAMILY_SRC = {
         'cpu/ia64/merced_ia32.c',
         'hardware/machine/ia64/machine_i2000.c',
         'hardware/machine/ia64/machine_generic_ia64.c',
+        'hardware/device/ps2_keyboard.c',
         'hardware/device/network/i82559.c',
         'hardware/romdb.c',
         'vga/multi/input_menu.c',

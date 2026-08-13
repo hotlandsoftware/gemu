@@ -50,4 +50,5 @@ uint32_t i82559_bar(const I82559 *n, unsigned reg, uint32_t fallback,
 uint64_t i82559_reg_read(I82559 *n, unsigned reg, unsigned size);
 void i82559_reg_write(I82559 *n, unsigned reg, uint64_t value, unsigned size);
 bool i82559_load_option_rom(I82559 *n, const char *path);
+bool i82559_keep_efi_option_rom(I82559 *n, uint16_t machine_type);
 void i82559_destroy(I82559 *n);

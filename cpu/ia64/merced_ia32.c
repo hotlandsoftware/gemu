@@ -145,12 +145,13 @@ static bool decode_rm(X86 *x, uint8_t modrm, RM *rm) {
     unsigned mod = modrm >> 6, r = modrm & 7;
     if (mod == 3) { rm->is_reg = true; rm->reg = r; return true; }
     rm->is_reg = false;
-    unsigned seg = x->seg_override >= 0 ? (unsigned)x->seg_override : X_DS;
+    unsigned seg = X_DS;
     int32_t disp = 0;
     if (!x->addr32) {
         static const int8_t base[8] = {3,3,5,5,6,7,5,3};
         static const int8_t index[8] = {6,7,6,7,-1,-1,-1,-1};
         if ((r >= 2 && r <= 3) || (r == 6 && mod != 0)) seg = X_SS;
+        if (x->seg_override >= 0) seg = (unsigned)x->seg_override;
         uint32_t off = base[r] < 0 ? 0 : xr(x, base[r], 2);
         if (index[r] >= 0) off += xr(x, index[r], 2);
         uint32_t q;
@@ -170,6 +171,7 @@ static bool decode_rm(X86 *x, uint8_t modrm, RM *rm) {
         else { off += xr(x, b, 4); if (b == 4 || b == 5) seg = X_SS; }
     } else if (r == 5 && mod == 0) { if (!fetch(x, 4, &off)) return false; }
     else { off = xr(x, r, 4); if (r == 4 || r == 5) seg = X_SS; }
+    if (x->seg_override >= 0) seg = (unsigned)x->seg_override;
     if (mod == 1) { if (!fetch(x, 1, &q)) return false; disp = (int8_t)q; }
     else if (mod == 2) { if (!fetch(x, 4, &q)) return false; disp = (int32_t)q; }
     rm->off = off + disp;
@@ -919,6 +921,15 @@ MercedStatus merced_ia32_step(Merced *m) {
         if (!fetch(&x,1,&q)) goto fault;
         uint32_t a=xr(&x,0,1), v=a-(uint8_t)q;
         sub_flags(&x,a,(uint8_t)q,v,1);
+    } else if (op == 0xd7) {                       /* xlatb */
+        /* AL <- byte ptr DS:[(E)BX + unsigned AL].  Address-size selects
+         * BX versus EBX; an explicit segment override replaces DS. */
+        unsigned seg = x.seg_override >= 0 ? (unsigned)x.seg_override : X_DS;
+        uint32_t base = xr(&x, 3, x.addr32 ? 4 : 2);
+        uint32_t off = base + xr(&x, 0, 1);
+        if (!x.addr32) off = (uint16_t)off;
+        if (!rb(&x, sbase(&x, seg) + off, 1, false, &q)) goto fault;
+        setxr(&x, 0, 1, q);
     } else if (op == 0xc0 || op == 0xc1 ||
                op == 0xd0 || op == 0xd1 || op == 0xd2 || op == 0xd3) {
         if (!fetch(&x,1,&q)) goto fault;

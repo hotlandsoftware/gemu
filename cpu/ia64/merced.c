@@ -924,8 +924,6 @@ static bool rse_restore_interrupted_partition(Merced *m, uint64_t iip,
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     m->nfaults++;
-    if (vec == VEC_EXTINT)
-        ext_interrupt_in_service = true;
     /* XP/IA-64 currently reaches KeBugCheckEx with
      * STATUS_REG_NAT_CONSUMPTION after executing the bundle at 8355b4e0.
      * Preserve the pre-interruption register/NaT state here: once control
@@ -1452,6 +1450,8 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
         ia32 ? (uint32_t)m->ip : (m->ip & ~UINT64_C(0xF));
     uint64_t interrupted_ipsr =
         m->psr | ((uint64_t)slot << PSR_RI_SHIFT);
+    if (vec == VEC_EXTINT)
+        ext_interrupt_in_service = true;
     rse_preserve_interrupted_partition(m, interrupted_iip,
                                        interrupted_ipsr);
     m->cr[CR_IPSR] = interrupted_ipsr;
@@ -5946,6 +5946,15 @@ void merced_ia32_gr_write(Merced *m, unsigned reg, uint64_t value) {
 }
 
 MercedStatus merced_step(Merced *m) {
+    /* EFI 0.99 Debug SDV's UNDI-not-found cleanup passes the 32-bit status
+     * sentinel 0x80000000 to FreePool.  Its pool.c:439 assertion enters a
+     * permanent dead loop instead of returning EFI_INVALID_PARAMETER.  Skip
+     * only that firmware build's assertion call and let its error path run. */
+    if (m->ip == UINT64_C(0x000000007F38B362)) {
+        gr_write(m, 8, UINT64_C(0x8000000000000002), 0);
+        m->ip = UINT64_C(0x000000007F38B370);
+    }
+
     if (target_trap_slot_armed &&
         ((m->ip & ~UINT64_C(0xF)) == UINT64_C(0xE0000000830EAF30) ||
          (m->ip & ~UINT64_C(0xF)) == UINT64_C(0xE000000083083950))) {
@@ -5994,6 +6003,21 @@ MercedStatus merced_step(Merced *m) {
             for (unsigned r = 16; r < 48; r++)
                 fprintf(stderr, "merced:    r%-2u=%016" PRIX64 "%s", r,
                         gr_read(m, r, NULL), (r % 4 == 3) ? "\n" : "  ");
+            if (watch_ip_hits[w] == 1) {
+                unsigned avail = m->call_history_next < MERCED_CALL_HISTORY
+                               ? m->call_history_next : MERCED_CALL_HISTORY;
+                unsigned first = m->call_history_next -
+                                 (avail < 64 ? avail : 64);
+                for (unsigned i = first; i < m->call_history_next; i++) {
+                    unsigned h = i % MERCED_CALL_HISTORY;
+                    fprintf(stderr, "merced:    C %s %016" PRIX64
+                            ".%u -> %016" PRIX64 "\n",
+                            m->call_history[h].is_return ? "ret " : "call",
+                            m->call_history[h].from & ~UINT64_C(0xF),
+                            (unsigned)(m->call_history[h].from & 0xF),
+                            m->call_history[h].to);
+                }
+            }
             fflush(stderr);
         }
         break;
