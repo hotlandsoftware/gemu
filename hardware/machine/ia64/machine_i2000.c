@@ -2912,13 +2912,22 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                 /* Intel byte-program operation.  Keep NVRAM updates in the
                  * in-memory image; the user's ROM file remains untouched. */
                 uint8_t old = s->flash[off];
-                /* FMMW presents module updates as byte-program cycles after
-                 * handling erase/rewrite internally. Its erase operation is
-                 * not exposed as the raw Intel 0x20 sequence, and legitimate
-                 * CDB updates include 0->1 transitions (for example 21->27).
-                 * Committing only old&new makes verification fail with FMMW
-                 * status 0x40 despite a successful high-level rewrite. */
-                s->flash[off] = (uint8_t)val;
+                /* Intel NOR programming can only clear bits.  FMM relies on
+                 * that property to commit a record header in stages: writes
+                 * such as 3f -> 2f -> 23 -> f5 -> f1 must leave 0x21, not
+                 * replace it with 0xf1.  Treating program data as an ordinary
+                 * RAM store changes the record class and CDBFMM returns 0x2d.
+                 * A preceding block erase is what permits 0 -> 1 changes. */
+                s->flash[off] = old & (uint8_t)val;
+                /* The 460GX firmware window is shadowed into RAM after
+                 * relocation.  FMM programs through the top-of-4GiB FWH
+                 * alias but may verify through the low RAM shadow.  Keep
+                 * both views coherent; otherwise a successful program is
+                 * immediately read back as the stale pre-program byte and
+                 * CDBFMM rejects the completed transaction. */
+                if (s->fw_shadow_enabled &&
+                    I2000_FW_SHADOW_BASE + off < s->ram_size)
+                    s->ram[I2000_FW_SHADOW_BASE + off] = s->flash[off];
                 s->nvram_dirty |= s->flash[off] != old;
                 chip->status = 0x80;
                 chip->read_status = true;
@@ -2933,6 +2942,11 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                                      (chip->cmd_addr & ~0xFFFFu);
                     if (block + 0x10000 <= I2000_FLASH_SIZE) {
                         memset(s->flash + block, 0xFF, 0x10000);
+                        if (s->fw_shadow_enabled &&
+                            I2000_FW_SHADOW_BASE + block + 0x10000 <=
+                                s->ram_size)
+                            memset(s->ram + I2000_FW_SHADOW_BASE + block,
+                                   0xFF, 0x10000);
                         s->nvram_dirty = true;
                     }
                     chip->status = 0x80;
@@ -3126,6 +3140,10 @@ static void i2000_nvram_load(Ia64I2000State *s) {
 }
 
 static void i2000_nvram_save(Ia64I2000State *s) {
+    /* A diagnostic pristine-ROM boot must not overwrite the user's saved
+     * database with a transaction interrupted by a firmware assertion. */
+    if (getenv("I2000_IGNORE_NVRAM"))
+        return;
     if (!s->nvram_dirty || !s->nvram_path[0] || !s->flash)
         return;
     gemu_ensure_parent_dir(s->nvram_path);

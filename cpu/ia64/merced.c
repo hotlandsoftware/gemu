@@ -1785,8 +1785,10 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         }
     }
     /* Before ExitBootServices, the SAL environment owns the IVT and services
-     * loader translation misses with identity mappings.  This is firmware
-     * handoff behavior, not a permanent region shortcut: it is active only
+     * loader translation misses with identity mappings, including the 460GX
+     * 0xe00 high-DRAM aperture used for the firmware RSE backing store. This
+     * is firmware handoff behavior, not a permanent region shortcut: it is
+     * active only
      * while a generic firmware IVA is installed and interruption state is
      * collectible.  Explicit guest TR/TC entries above always win.  This
      * matches ia64_sal_boot_virtual_pa() in the reference IA-64 QEMU core,
@@ -1796,10 +1798,10 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
      * installs its IVT at 0xFFF80000, inside its top-aligned ROM image (see
      * that file's cr.iva setup); both are legitimate firmware images this
      * emulator boots, so both IVA values get the same boot-time shortcut. */
-    if (!e && (m->cr[CR_IVA] == UINT64_C(0x0000000000010000) ||
+    if (!e && (m->cr[CR_IVA] == 0 ||
+               m->cr[CR_IVA] == UINT64_C(0x0000000000010000) ||
                m->cr[CR_IVA] == UINT64_C(0x00000000FFF80000)) &&
-        (m->psr & PSR_IC) && vrn == 0 &&
-        va < UINT64_C(0x0000010000000000)) {
+        (m->psr & PSR_IC) && vrn == 0 && va <= MERCED_PHYS_MASK) {
         *pa = va;
         if (getenv("MERCED_MMU_DEBUG")) {
             static unsigned sal_identity_debug;
@@ -3135,10 +3137,42 @@ enum {
 static bool firmware_identity_pa(Merced *m, uint64_t va, uint64_t *pa) {
     const uint64_t base = UINT64_C(0x00100000);
     const uint64_t end = UINT64_C(0x00200000);
+    const uint64_t payload_mask = (UINT64_C(1) << 61) - 1;
     unsigned cpl = (unsigned)((m->psr >> PSR_CPL_SHIFT) & 3);
     bool firmware_iva = m->cr[CR_IVA] == 0 ||
                         m->cr[CR_IVA] == UINT64_C(0x00010000);
     bool firmware_ip = m->ip >= base && m->ip < end;
+    bool ami_firmware_ip = m->ip >= UINT64_C(0x7F000000) &&
+                           m->ip < UINT64_C(0x80000000);
+
+    /* The i2000's 460GX encodes its high DRAM card/aperture selector in
+     * physical bits 43:32.  AMI places the RSE backing store in the top
+     * 64 MiB of that aperture.  It must remain physically addressable even
+     * with interruption collection disabled inside a miss handler; the
+     * later pre-ExitBootServices fallback cannot recover a nested miss. */
+    if (cpl == 0 && firmware_iva &&
+        (va & UINT64_C(0x00000fff00000000)) ==
+            UINT64_C(0x00000e0000000000) &&
+        (uint32_t)va >= UINT32_C(0x7c000000) &&
+        (uint32_t)va < UINT32_C(0x80000000)) {
+        *pa = va;
+        return true;
+    }
+
+    /* AMI's FMM physical-access primitive zero-extends a 32-bit platform
+     * address and ORs in region 4 (the uncacheable physical alias) before
+     * loading it.  While SAL owns the region-0 IVT these references are
+     * firmware physical accesses, even if psr.dt is set.  Sending them
+     * through the guest TLB eventually strands the firmware at vector 0xc00
+     * when it probes 0xc0000024, accumulating billions of nested faults.
+     * Keep this strictly within the firmware-owned, CPL0 phase; an OS with
+     * its own IVA continues through the normal region/TLB translation path. */
+    if (cpl == 0 && (firmware_iva || ami_firmware_ip) &&
+        (va >> 61) == 4 &&
+        (va & payload_mask) <= UINT32_MAX) {
+        *pa = va & UINT32_MAX;
+        return true;
+    }
 
     if (cpl == 0 && (firmware_iva || firmware_ip) &&
         va >= base && va < end) {
@@ -6180,6 +6214,19 @@ MercedStatus merced_step(Merced *m) {
             fflush(stderr);
         }
     }
+    /* AMI briefly clears IVA while switching from its POST-time vector table
+     * to the SAL environment.  An interrupt recognized in that interval has
+     * nowhere valid to go: low memory contains zero bundles, so vector 0x3000
+     * immediately raises break and recursively spins at vector 0x2c00.  Keep
+     * the interrupt latched until firmware installs its next IVT, just as the
+     * platform interrupt gate does during this handoff.  The window includes
+     * AMI's IA-32 compatibility calls: their low IP no longer identifies the
+     * surrounding native firmware, but PSR.is does. */
+    bool ami_ivt_handoff = m->cr[CR_IVA] == 0 &&
+                           ((m->ip >= UINT64_C(0x7F000000) &&
+                             m->ip < UINT64_C(0x80000000)) ||
+                            (m->psr & PSR_IS));
+
     if (m->psr & PSR_IS) {
         /* IA-32 instructions are interruption points too.  This check must
          * precede the dispatch to merced_ia32_step(): otherwise a pending
@@ -6188,13 +6235,14 @@ MercedStatus merced_step(Merced *m) {
          * execution into the native IVT.  The SDV BIOS then saves a native
          * intercept frame as though it were the interrupted x86 frame and
          * eventually IRETs into its F3:F4/data sentinel at F000:71A8. */
-        if (ext_highest_unmasked(m) >= 0 &&
+        if (!ami_ivt_handoff && ext_highest_unmasked(m) >= 0 &&
             (m->psr & PSR_I) && (m->psr & PSR_IC)) {
             MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
             m->ninsts++;
             return ist;
         }
-        if (m->timer_pending && !(m->cr[CR_ITV] & (1ull << 16)) &&
+        if (!ami_ivt_handoff && m->timer_pending &&
+            !(m->cr[CR_ITV] & (1ull << 16)) &&
             interrupt_unmasked(m, (uint8_t)m->cr[CR_ITV]) &&
             (m->psr & PSR_I) && (m->psr & PSR_IC)) {
             MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
@@ -6285,7 +6333,7 @@ MercedStatus merced_step(Merced *m) {
      * mid-group timer deliveries per boot, coinciding with a WinXP IA-64
      * setup freeze in a rotating PFN-table-init loop. m->group_start is
      * only true when the current slot legitimately begins a fresh group. */
-    if (m->group_start &&
+    if (!ami_ivt_handoff && m->group_start &&
         ext_highest_unmasked(m) >= 0 &&
         (m->psr & PSR_I) && (m->psr & PSR_IC)) {
         MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
@@ -6298,7 +6346,7 @@ MercedStatus merced_step(Merced *m) {
      * real hardware: delivery clears psr.i (via deliver_fault below), so
      * this naturally can't re-fire until firmware explicitly re-enables
      * interrupts or acks the timer through a cr.ivr read. */
-    if (m->group_start &&
+    if (!ami_ivt_handoff && m->group_start &&
         m->timer_pending && !(m->cr[CR_ITV] & (1ull << 16)) &&
         interrupt_unmasked(m, (uint8_t)m->cr[CR_ITV]) &&
         (m->psr & PSR_I) && (m->psr & PSR_IC)) {
