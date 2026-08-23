@@ -4352,9 +4352,21 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                  * the trampoline's own br.many b0 instead of faulting. */
                 if (imm == UINT64_C(0x100000))
                     return pal_dispatch(m);
-                if (getenv("BREAK_DEBUG"))
-                    fprintf(stderr, "BREAK: imm=%#" PRIX64 " ip=%016" PRIX64 " gr28=%#" PRIX64 "\n",
-                            imm, m->ip, gr_read(m, 28, &(uint8_t){0}));
+                if (getenv("BREAK_DEBUG")) {
+                    static unsigned break_debug_count;
+                    if (break_debug_count++ < 16) {
+                        fprintf(stderr, "BREAK: imm=%#" PRIX64
+                                " ip=%016" PRIX64 " gr28=%#" PRIX64 "\n",
+                                imm, m->ip,
+                                gr_read(m, 28, &(uint8_t){0}));
+                        if (m->ip == 0 && break_debug_count == 1) {
+                            fprintf(stderr, "BREAK: first null-entry call "
+                                    "history:\n");
+                            merced_dump_calls(m, 32, stderr);
+                            merced_dump_trace(m, 64, stderr);
+                        }
+                    }
+                }
                 /* Architecturally a Break Instruction fault, delivered to
                  * firmware's own handler (which decides what a given
                  * immediate means - PAL call, OS call, debug trap, etc.),
