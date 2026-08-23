@@ -1521,6 +1521,14 @@ bool gemu_monitor_check_exec(GemuMonitor *mon, uint32_t addr) {
     return false;
 }
 
+bool gemu_monitor_has_exec_breakpoints(const GemuMonitor *mon) {
+    return mon && mon->has_exec_bp;
+}
+
+bool gemu_monitor_has_mem_breakpoints(const GemuMonitor *mon) {
+    return mon && mon->has_mem_bp;
+}
+
 bool gemu_monitor_check_read(GemuMonitor *mon, uint32_t addr) {
     if (!mon || !mon->has_mem_bp) return false;
     for (int i = 0; i < mon->n_bps; i++) {

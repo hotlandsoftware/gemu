@@ -50,15 +50,10 @@
 #define MERCED_N_TR       MERCED_N_DTR   /* legacy alias: the larger file */
 #define MERCED_N_TC       512  /* per side; amortize software VHPT refills */
 #define MERCED_TRACE_HISTORY 512
-/* Register-value fields (src2/src3/r8/r25/r32-r36) live in a separate,
- * much smaller ring than the cheap ip/raw/unit/qp/b0/pr fields below - they
- * still get captured (9 gr_read() calls) every slot like before, since the
- * point of this ring is "whatever the last N happen to be before an
- * unpredictable halt", but keeping them out of the big 512-entry array
- * means far fewer bytes get written into that array per slot. This size is
- * exactly what i2000_report_halt()'s default HALT_TRACE_LINES=32 dump
- * reads; deep opt-in dumps (MERCED_DEBUG_* env vars requesting more) just
- * see the cheap fields only for anything older than this. */
+/* Instruction history is opt-in because recording it in merced_step() costs
+ * throughput on every guest slot.  MERCED_TRACE_HISTORY=1 enables the cheap
+ * ip/raw/unit/qp/b0/pr ring; MERCED_TRACE_REGS=1 also enables the smaller
+ * register-value ring below (and implies instruction history). */
 #define MERCED_TRACE_EXT_HISTORY 32
 #define MERCED_CALL_HISTORY 65536
 
@@ -313,11 +308,17 @@ typedef struct Merced {
 
     /* Upper bound of the persistent region-7 KSEG physical alias. */
     uint64_t region7_directmap_limit;
+
+    /* Host-only decoded translation cache.  Kept opaque here so the cache
+     * layout can evolve independently of architectural/snapshot state. */
+    void *translation_cache;
 } Merced;
 
 Merced *merced_create(const MercedBus *bus);
 void    merced_destroy(Merced *m);
 void    merced_reset(Merced *m);
+/* Drop host-only decoded/translated code after restoring guest state. */
+void    merced_flush_translation_cache(Merced *m);
 /* Select a machine-supplied ITC clock.  The default remains one tick per
  * interpreted slot for deterministic tests and standalone CPU users. */
 void    merced_set_external_itc(Merced *m, bool enabled);

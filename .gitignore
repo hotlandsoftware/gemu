@@ -11,3 +11,4 @@ snapshots/
 tools/*.pyc
 *.bin
 *.dis
+*.log

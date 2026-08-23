@@ -93,6 +93,8 @@ typedef enum {
 bool gemu_monitor_check_exec (GemuMonitor *mon, uint32_t addr);
 bool gemu_monitor_check_read (GemuMonitor *mon, uint32_t addr);
 bool gemu_monitor_check_write(GemuMonitor *mon, uint32_t addr);
+bool gemu_monitor_has_exec_breakpoints(const GemuMonitor *mon);
+bool gemu_monitor_has_mem_breakpoints (const GemuMonitor *mon);
 
 /* Start the stdin reader thread (no-op if not a TTY). */
 void         gemu_monitor_start(GemuMonitor *mon);

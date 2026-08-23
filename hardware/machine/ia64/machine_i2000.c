@@ -89,6 +89,7 @@
 #define CON_ROWS 30              /* serial console area at the bottom */
 
 #define INSTR_PER_FRAME 50000
+#define IRQ_POLL_QUANTUM 16
 
 /* Minimum instruction gap between a mouse byte being serviced and the next
  * one being offered - see the ack handler's mouse branch for why this can't
@@ -130,6 +131,18 @@ static const uint32_t i2000_keyboard_keysyms[] = {
 #define MOUSE_BACKLOG_MAX       254
 #define I2000_ITC_HZ UINT64_C(200000000)
 #define I2000_ITC_TICK_NS 5u
+#define I8254_INPUT_HZ UINT64_C(1193182)
+/* Command completion must not be visible in the same CPU instant as the
+ * command-register write - AtaPim arms its waiter after submission, so an
+ * instantaneous interrupt would fire before anything is listening. But the
+ * delay must also stay well inside AtaPim's own polling patience: observed
+ * behavior is a tight status-poll loop advancing ~41 ninsts/iteration for
+ * 100+ iterations before falling back to a Stall()-spaced slow poll, and an
+ * interrupt arriving only after that patience is exhausted (100000 ninsts
+ * was tried and is far past it) gets acknowledged by unrelated generic code
+ * without ever reaching back to drain the data register. Comfortably above
+ * one instruction, comfortably below the observed give-up point. */
+#define ATAPI_IRQ_LATENCY_NINSTS UINT64_C(2000)
 #define MMIO_LOG_N 768
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES  32
@@ -144,6 +157,8 @@ static const uint32_t i2000_keyboard_keysyms[] = {
 #define I2000_HIGH_DRAM_TAG   UINT64_C(0x00000e0000000000)
 #define I2000_HIGH_DRAM_SIZE  (UINT64_C(64) * 1024 * 1024)
 #define I2000_HIGH_DRAM_BASE  (I2000_RAM_MAX - I2000_HIGH_DRAM_SIZE)
+#define I2000_FLASH_CHIP_SIZE UINT64_C(0x100000)
+#define I2000_FLASH_CHIPS     (I2000_FLASH_SIZE / I2000_FLASH_CHIP_SIZE)
 
 typedef struct {
     uint64_t addr;
@@ -152,6 +167,14 @@ typedef struct {
     uint8_t  is_write;
     uint8_t  size;
 } MmioLogEnt;
+
+typedef struct {
+    bool read_status;
+    bool read_id;
+    uint8_t status;
+    uint8_t cmd;
+    uint32_t cmd_addr;
+} I2000FlashChip;
 
 struct Ia64I2000State {
     GemuMonitor *monitor;
@@ -387,6 +410,28 @@ struct Ia64I2000State {
     /* v15: reusable PS/2 keyboard device behind this machine's 8042. */
     Ps2Keyboard ps2_keyboard;
     uint64_t keyboard_retry_ninsts;
+    /* v16: secondary IDE interrupt latch. ATAPI is on slave-PIC IRQ15. */
+    bool atapi_irq_pending;
+    /* v17: in-service state established by the legacy acknowledge cycle. */
+    uint8_t pic_master_isr, pic_slave_isr;
+    /* v18: command completion is not visible in the same CPU instant as
+     * the command-register write. AtaPim arms its waiter after submission. */
+    uint64_t atapi_irq_ready_ninsts;
+    /* v19: the 4 MiB firmware array is four independently-commanded Intel
+     * 1 MiB devices. A read-array command sent to one device must not reset
+     * identifier/status mode in another. The legacy scalar fields near the
+     * start of this structure remain solely for old snapshot compatibility. */
+    I2000FlashChip flash_chip[I2000_FLASH_CHIPS];
+    /* v21: ATAPI PIO transfers are split at the host-programmed byte limit
+     * and interrupt once per data phase. */
+    uint32_t atapi_byte_limit;
+    size_t atapi_phase_end;
+    /* v22: ATA command execution has a real BSY interval.  AtaPim first
+     * waits for BSY to assert, then waits for it to clear before using DRQ. */
+    uint64_t atapi_status_ready_ninsts;
+    uint8_t atapi_ready_status;
+    bool atapi_status_pending;
+    bool atapi_ready_irq;
 };
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -547,14 +592,70 @@ static void mouse_device_command(Ia64I2000State *s, uint8_t cmd) {
     }
 }
 
+static uint64_t pit_interval_itc(uint16_t reload) {
+    uint64_t count = reload ? reload : UINT64_C(0x10000);
+    return (count * I2000_ITC_HZ + I8254_INPUT_HZ - 1) / I8254_INPUT_HZ;
+}
+
 static uint64_t size_mask(unsigned size) {
     return size >= 8 ? ~0ull : (1ull << (size * 8)) - 1;
+}
+
+static bool atapi_debug_enabled(void) {
+    const char *value = getenv("ATA_DEBUG");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static const char *atapi_packet_name(uint8_t opcode) {
+    switch (opcode) {
+    case 0x00: return "TEST UNIT READY";
+    case 0x03: return "REQUEST SENSE";
+    case 0x12: return "INQUIRY";
+    case 0x1B: return "START STOP UNIT";
+    case 0x1E: return "PREVENT/ALLOW MEDIUM REMOVAL";
+    case 0x25: return "READ CAPACITY";
+    case 0x28: return "READ(10)";
+    case 0x43: return "READ TOC";
+    case 0xA8: return "READ(12)";
+    default:   return "unknown";
+    }
+}
+
+static void atapi_defer_ready(Ia64I2000State *s, bool raise_irq) {
+    s->atapi_ready_status = s->atapi_status;
+    s->atapi_status = 0x80; /* BSY */
+    s->atapi_status_pending = true;
+    s->atapi_ready_irq = raise_irq;
+    s->atapi_status_ready_ninsts =
+        s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
+    /* The completion interrupt belongs to the ready transition, not to the
+     * command-register write while the device is still busy. */
+    s->atapi_irq_pending = false;
+}
+
+static void atapi_begin_data_phase(Ia64I2000State *s) {
+    size_t remaining = s->atapi_data_len - s->atapi_data_pos;
+    size_t phase = remaining;
+    uint32_t limit = s->atapi_byte_limit ? s->atapi_byte_limit : 65536u;
+    if (phase > limit)
+        phase = limit;
+    /* ATAPI PIO byte counts are even except for a final odd byte. */
+    if (phase > 1 && (phase & 1) && phase < remaining)
+        phase--;
+    s->atapi_phase_end = s->atapi_data_pos + phase;
+    s->atapi_count = 0x02; /* data phase: CoD=0, I/O=device-to-host */
+    s->atapi_lba_mid = (uint8_t)phase;
+    s->atapi_lba_high = (uint8_t)(phase >> 8);
+    s->atapi_status = 0x48; /* DRDY|DRQ */
+    s->atapi_irq_pending = true;
+    s->atapi_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
 }
 
 static void atapi_set_data(Ia64I2000State *s, const void *data, size_t len) {
     free(s->atapi_data);
     s->atapi_data = NULL;
     s->atapi_data_len = s->atapi_data_pos = 0;
+    s->atapi_phase_end = 0;
     if (len) {
         s->atapi_data = malloc(len);
         if (!s->atapi_data) {
@@ -565,25 +666,51 @@ static void atapi_set_data(Ia64I2000State *s, const void *data, size_t len) {
         memcpy(s->atapi_data, data, len);
         s->atapi_data_len = len;
     }
-    s->atapi_count = 0x02; /* command/data phase, I/O to host */
-    s->atapi_lba_mid = (uint8_t)len;
-    s->atapi_lba_high = (uint8_t)(len >> 8);
-    s->atapi_status = len ? 0x48 : 0x40; /* DRDY|DRQ / DRDY */
+    if (len) {
+        atapi_begin_data_phase(s);
+    } else {
+        s->atapi_phase_end = 0;
+        s->atapi_count = 0x03; /* command complete: CoD=1, I/O=1 */
+        s->atapi_lba_mid = s->atapi_lba_high = 0;
+        s->atapi_status = 0x40;
+        s->atapi_irq_pending = true;
+        s->atapi_irq_ready_ninsts =
+            s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
+    }
+    if (atapi_debug_enabled())
+        fprintf(stderr, "i2000: ATAPI response bytes=%zu status=%#04x "
+                "reason=%#04x\n", len, s->atapi_status, s->atapi_count);
 }
 
 static void atapi_no_medium(Ia64I2000State *s) {
     free(s->atapi_data);
     s->atapi_data = NULL;
     s->atapi_data_len = s->atapi_data_pos = 0;
+    s->atapi_phase_end = 0;
     s->atapi_count = 0x03; /* command completion, I/O to host */
     s->atapi_error = 0x20; /* sense key: NOT READY */
     s->atapi_status = 0x41; /* DRDY|ERR */
+    s->atapi_irq_pending = true;
+    s->atapi_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
+    if (atapi_debug_enabled())
+        fprintf(stderr, "i2000: ATAPI no medium status=%#04x error=%#04x\n",
+                s->atapi_status, s->atapi_error);
 }
 
 static void atapi_reply(Ia64I2000State *s) {
     const uint8_t *p = s->atapi_packet;
     uint8_t reply[64] = {0};
     uint32_t blocks = (uint32_t)(s->cdrom_size / 2048);
+    if (atapi_debug_enabled()) {
+        unsigned byte_limit = (unsigned)s->atapi_lba_mid |
+                              ((unsigned)s->atapi_lba_high << 8);
+        fprintf(stderr, "i2000: ATAPI packet %-28s opcode=%#04x "
+                "host-byte-limit=%u bytes=", atapi_packet_name(p[0]), p[0],
+                byte_limit ? byte_limit : 65536u);
+        for (unsigned i = 0; i < sizeof(s->atapi_packet); i++)
+            fprintf(stderr, "%s%02x", i ? " " : "", p[i]);
+        fputc('\n', stderr);
+    }
     switch (p[0]) {
     case 0x00: /* TEST UNIT READY */
         if (!s->cdrom) {
@@ -648,11 +775,23 @@ static void atapi_reply(Ia64I2000State *s) {
                          ((uint32_t)p[6] << 24) | ((uint32_t)p[7] << 16) |
                          ((uint32_t)p[8] << 8) | p[9];
         size_t len = (size_t)count * 2048;
+        if (atapi_debug_enabled())
+            fprintf(stderr, "i2000: ATAPI %s lba=%" PRIu32
+                    " sectors=%" PRIu32 " bytes=%zu image-blocks=%" PRIu32
+                    "\n", atapi_packet_name(p[0]), lba, count, len, blocks);
         uint8_t *buf = len ? malloc(len) : NULL;
         if ((len && !buf) || lba >= blocks || count > blocks - lba ||
             fseek(s->cdrom, (long)((uint64_t)lba * 2048), SEEK_SET) != 0 ||
             (len && fread(buf, 1, len, s->cdrom) != len)) {
             free(buf); s->atapi_error = 0x50; s->atapi_status = 0x41;
+            s->atapi_count = 0x03;
+            s->atapi_irq_pending = true;
+            s->atapi_irq_ready_ninsts =
+                s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
+            if (atapi_debug_enabled())
+                fprintf(stderr, "i2000: ATAPI read failed lba=%" PRIu32
+                        " sectors=%" PRIu32 " status=%#04x error=%#04x\n",
+                        lba, count, s->atapi_status, s->atapi_error);
         } else {
             atapi_set_data(s, buf, len);
             free(buf);
@@ -663,6 +802,10 @@ static void atapi_reply(Ia64I2000State *s) {
         fprintf(stderr, "i2000: ATAPI unsupported packet command %02X\n", p[0]);
         s->atapi_error = 0x50;
         s->atapi_status = 0x41;
+        s->atapi_count = 0x03;
+        s->atapi_irq_pending = true;
+        s->atapi_irq_ready_ninsts =
+            s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
         break;
     }
 }
@@ -1080,6 +1223,12 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
         reg + size <= sizeof(s->cmd649_cfg)) {
         uint64_t v = 0;
         memcpy(&v, &s->cmd649_cfg[reg], size);
+        if (atapi_debug_enabled() && reg < 4) {
+            static unsigned identity_reads;
+            if (identity_reads++ < 16)
+                fprintf(stderr, "i2000: ATAPI controller PCI identity read "
+                        "reg=%#x size=%u -> %#" PRIx64 "\n", reg, size, v);
+        }
         return v;
     }
 
@@ -1191,6 +1340,9 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
 /* ── Serial console ──────────────────────────────────────────────────────── */
 
 static void con_newline(Ia64I2000State *s) {
+    if (getenv("CON_TIME_DEBUG") && s->console[s->con_row][0])
+        fprintf(stderr, "i2000: CON [%s] itc=%" PRIu64 " ninsts=%" PRIu64 "\n",
+                s->console[s->con_row], merced_get_itc(s->cpu), s->cpu->ninsts);
     s->con_col = 0;
     if (++s->con_row >= CON_ROWS) {
         memmove(s->console[0], s->console[1], sizeof(s->console) - sizeof(s->console[0]));
@@ -1207,6 +1359,39 @@ static void con_putc(Ia64I2000State *s, char c) {
     if (s->con_col >= COLS) con_newline(s);
     s->console[s->con_row][s->con_col++] = c;
     s->console[s->con_row][s->con_col] = 0;
+    if (getenv("CDB_FAIL_TRACE") &&
+        strstr(s->console[s->con_row], "failed to update CDB")) {
+        static bool traced;
+        if (!traced) {
+            traced = true;
+            fprintf(stderr, "i2000: CDB failure text emitted, ip=%016" PRIx64
+                    " ninsts=%" PRIu64 " call history:\n", s->cpu->ip,
+                    s->cpu->ninsts);
+            merced_dump_calls(s->cpu, 600, stderr);
+        }
+    }
+    if (getenv("MFG_TRACE") &&
+        strstr(s->console[s->con_row], "MFG Mode detected")) {
+        static bool traced;
+        if (!traced) {
+            traced = true;
+            fprintf(stderr, "i2000: MFG Mode text emitted, ip=%016" PRIx64
+                    " ninsts=%" PRIu64 " call history:\n", s->cpu->ip,
+                    s->cpu->ninsts);
+            merced_dump_calls(s->cpu, 600, stderr);
+        }
+    }
+    if (getenv("MFG_TRACE") &&
+        strstr(s->console[s->con_row], "Entering CDB Save")) {
+        static bool traced;
+        if (!traced) {
+            traced = true;
+            fprintf(stderr, "i2000: Entering-CDB-Save text emitted, ip=%016"
+                    PRIx64 " ninsts=%" PRIu64 " call history:\n", s->cpu->ip,
+                    s->cpu->ninsts);
+            merced_dump_calls(s->cpu, 600, stderr);
+        }
+    }
 }
 
 /* ── Physical bus ────────────────────────────────────────────────────────── */
@@ -1482,6 +1667,11 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         if ((s->cmos_index & 0x7F) < 0x0A)
             cmos_sync_live_clock(s);
         uint8_t v = s->cmos[s->cmos_index & 0x7F];
+        if (getenv("CMOS_DEBUG"))
+            fprintf(stderr, "i2000: CMOS read reg=%#04x -> %#04x "
+                    "ninsts=%" PRIu64 " itc=%" PRIu64 " ip=%016" PRIx64 "\n",
+                    s->cmos_index & 0x7F, v, s->cpu->ninsts,
+                    merced_get_itc(s->cpu), s->cpu->ip);
         if ((s->cmos_index & 0x7F) == 0x0A)
             /* Status Register A bit 7 is UIP (update in progress). We don't
              * emulate the real ~244us-per-second update window, and nothing
@@ -1522,6 +1712,18 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         case 7: return s->uart_scr;
         }
     }
+    if (port == 0x20 && size == 1) {
+        if (getenv("ATA_IRQ_TRACE"))
+            fprintf(stderr, "i2000: PIC master ISR read -> %#04x ninsts=%" PRIu64 "\n",
+                    s->pic_master_isr, s->cpu->ninsts);
+        return s->pic_master_isr;
+    }
+    if (port == 0xA0 && size == 1) {
+        if (getenv("ATA_IRQ_TRACE"))
+            fprintf(stderr, "i2000: PIC slave ISR read -> %#04x ninsts=%" PRIu64 "\n",
+                    s->pic_slave_isr, s->cpu->ninsts);
+        return s->pic_slave_isr;
+    }
     if (port == 0x21) return s->pic_master_mask;
     if (port == 0xA1) return s->pic_slave_mask;
     if (port == 0x40 && size == 1) {
@@ -1534,7 +1736,8 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
          * not important here, but it must count down and both bytes of one
          * read must describe essentially the same sample. */
         uint32_t reload = s->pit0_reload ? s->pit0_reload : 0x10000u;
-        uint64_t ticks = (s->cpu->ninsts - s->pit0_epoch_ninsts) / 8u;
+        uint64_t elapsed = merced_get_itc(s->cpu) - s->pit0_epoch_ninsts;
+        uint64_t ticks = (elapsed * I8254_INPUT_HZ) / I2000_ITC_HZ;
         uint16_t count = (uint16_t)(reload - (ticks % reload));
         uint8_t v = s->pit0_read_phase ? (uint8_t)(count >> 8)
                                        : (uint8_t)count;
@@ -1562,27 +1765,86 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     }
     if ((port >= 0x170 && port <= 0x177) || port == 0x376) {
         unsigned reg = port == 0x376 ? 7 : (unsigned)(port - 0x170);
+        /* Only the secondary-channel master exists.  The firmware probes
+         * the slave with IDENTIFY DEVICE; an absent ATA target floats the
+         * task file instead of borrowing the master's ATAPI state/IRQ. */
+        if ((s->atapi_device & 0x10) != 0)
+            return reg == 6 ? s->atapi_device : 0;
         if (reg == 0) {
             uint64_t v = 0;
+            size_t pos_before = s->atapi_data_pos;
             for (unsigned i = 0; i < size; i++) {
-                if (s->atapi_data_pos < s->atapi_data_len)
+                if (s->atapi_data_pos < s->atapi_data_len &&
+                    s->atapi_data_pos < s->atapi_phase_end)
                     v |= (uint64_t)s->atapi_data[s->atapi_data_pos++] << (i * 8);
             }
-            if (s->atapi_data_pos >= s->atapi_data_len && s->atapi_status & 0x08) {
-                s->atapi_status = 0x40;
-                s->atapi_count = 0x03; /* command complete */
+            if (getenv("ATA_DATA_TRACE"))
+                fprintf(stderr, "i2000: ATAPI data read size=%u pos=%zu/%zu "
+                        "-> %#04" PRIx64 " ip=%016" PRIx64 " ninsts=%"
+                        PRIu64 "\n", size, pos_before, s->atapi_data_len, v,
+                        s->cpu->ip, s->cpu->ninsts);
+            if (s->atapi_data_pos >= s->atapi_phase_end &&
+                s->atapi_status & 0x08) {
+                if (s->atapi_data_pos < s->atapi_data_len) {
+                    atapi_begin_data_phase(s);
+                    if (atapi_debug_enabled())
+                        fprintf(stderr, "i2000: ATAPI next PIO phase pos=%zu "
+                                "end=%zu total=%zu\n", s->atapi_data_pos,
+                                s->atapi_phase_end, s->atapi_data_len);
+                } else {
+                    s->atapi_status = 0x40;
+                    s->atapi_count = 0x03; /* command complete */
+                    s->atapi_lba_mid = s->atapi_lba_high = 0;
+                    /* The interrupt that announced this final data phase
+                     * also announces command completion once the host has
+                     * drained DRQ.  Raising a second IRQ here leaves IRQ15
+                     * in service after IDENTIFY and makes EFI mistake it
+                     * for completion of the following READ(10). */
+                    s->atapi_irq_pending = false;
+                    if (atapi_debug_enabled())
+                        fprintf(stderr, "i2000: ATAPI PIO complete bytes=%zu "
+                                "status=%#04x reason=%#04x\n",
+                                s->atapi_data_len, s->atapi_status,
+                                s->atapi_count);
+                }
             }
             return v;
         }
+        uint64_t result;
         switch (reg) {
-        case 1: return s->atapi_error;
-        case 2: return s->atapi_count;
-        case 3: return s->atapi_lba_low;
-        case 4: return s->atapi_lba_mid;
-        case 5: return s->atapi_lba_high;
-        case 6: return s->atapi_device;
-        case 7: return s->atapi_status;
+        case 1: result = s->atapi_error; break;
+        case 2: result = s->atapi_count; break;
+        case 3: result = s->atapi_lba_low; break;
+        case 4: result = s->atapi_lba_mid; break;
+        case 5: result = s->atapi_lba_high; break;
+        case 6: result = s->atapi_device; break;
+        case 7: result = s->atapi_status; break;
+        default: result = 0; break;
         }
+        if (getenv("ATA_TASKFILE_TRACE") || getenv("ATA_LOOP_TRACE")) {
+            static unsigned taskfile_reads;
+            static uint64_t prev_result = UINT64_MAX, prev_ip = UINT64_MAX;
+            static bool loop_dumped;
+            unsigned n = taskfile_reads++;
+            bool changed = result != prev_result || s->cpu->ip != prev_ip;
+            if (reg != 7 || n < 128 || changed || (n % 500) == 0) {
+                fprintf(stderr, "i2000: ATAPI taskfile read port=%#x reg=%u -> %#04" PRIx64
+                        " ip=%016" PRIx64 " ninsts=%" PRIu64 " n=%u%s\n",
+                        (unsigned)port, reg, result, s->cpu->ip,
+                        s->cpu->ninsts, n, changed ? " CHANGED" : "");
+            }
+            if (reg == 7 && n == 50 && !loop_dumped && getenv("ATA_LOOP_TRACE")) {
+                loop_dumped = true;
+                fprintf(stderr, "i2000: ATAPI status-poll loop, dumping call "
+                        "history + next bundles from ip=%016" PRIx64 ":\n",
+                        s->cpu->ip);
+                merced_dump_calls(s->cpu, 16, stderr);
+                s->cpu->trace_n = 60;
+            }
+            prev_result = result;
+            prev_ip = s->cpu->ip;
+        }
+        return result;
     }
     if (s->hda && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
         unsigned reg = port == 0x3F6 ? 7 : (unsigned)(port - 0x1F0);
@@ -1697,7 +1959,8 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         s->pic_master_mask = (uint8_t)val;
         if (!(s->pic_master_mask & 1) && s->pit0_reload &&
             !s->pit0_next_irq)
-            s->pit0_next_irq = s->cpu->ninsts + 100000;
+            s->pit0_next_irq = merced_get_itc(s->cpu) +
+                               pit_interval_itc(s->pit0_reload);
         return;
     }
     if (port == 0xA1 && size == 1) {
@@ -1727,6 +1990,12 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
             else
                 s->pic_slave_icw = 1;
         }
+        if ((val & 0x20) != 0) { /* OCW2 non-specific EOI */
+            uint8_t *isr = port == 0x20 ? &s->pic_master_isr
+                                        : &s->pic_slave_isr;
+            for (int bit = 7; bit >= 0; bit--)
+                if (*isr & (1u << bit)) { *isr &= ~(1u << bit); break; }
+        }
         /* Other commands are OCWs. */
         return;
     }
@@ -1738,8 +2007,14 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
             s->pit0_reload = s->pit0_latch | ((uint16_t)(uint8_t)val << 8);
             s->pit0_write_phase = 0;
             s->pit0_read_phase = 0;
-            s->pit0_epoch_ninsts = s->cpu->ninsts;
-            s->pit0_next_irq = s->cpu->ninsts + 100000;
+            s->pit0_epoch_ninsts = merced_get_itc(s->cpu);
+            s->pit0_next_irq = s->pit0_epoch_ninsts +
+                               pit_interval_itc(s->pit0_reload);
+            if (getenv("PIT_DEBUG"))
+                fprintf(stderr, "i2000: PIT0 reload=%u epoch_itc=%" PRIu64
+                        " next_irq_itc=%" PRIu64 " ninsts=%" PRIu64 "\n",
+                        s->pit0_reload, s->pit0_epoch_ninsts,
+                        s->pit0_next_irq, s->cpu->ninsts);
         }
         return;
     }
@@ -1750,7 +2025,12 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         } else {
             s->pit1_reload = s->pit1_latch | ((uint16_t)(uint8_t)val << 8);
             s->pit1_write_phase = 0;
-            s->pit1_next_irq = s->cpu->ninsts + 100000;
+            s->pit1_next_irq = merced_get_itc(s->cpu) +
+                               pit_interval_itc(s->pit1_reload);
+            if (getenv("PIT_DEBUG"))
+                fprintf(stderr, "i2000: PIT1 reload=%u next_irq_itc=%" PRIu64
+                        " ninsts=%" PRIu64 "\n",
+                        s->pit1_reload, s->pit1_next_irq, s->cpu->ninsts);
         }
         return;
     }
@@ -1864,10 +2144,13 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
     if ((port >= 0x170 && port <= 0x177) || port == 0x376) {
         unsigned reg = port == 0x376 ? 8 : (unsigned)(port - 0x170);
         if (reg == 0) {
+            unsigned old_pos = s->atapi_packet_pos;
             for (unsigned i = 0; i < size && s->atapi_packet_pos < 12; i++)
                 s->atapi_packet[s->atapi_packet_pos++] = (uint8_t)(val >> (i * 8));
-            if (s->atapi_packet_pos == 12)
+            if (old_pos < 12 && s->atapi_packet_pos == 12) {
                 atapi_reply(s);
+                atapi_defer_ready(s, true);
+            }
             return;
         }
         switch (reg) {
@@ -1876,16 +2159,64 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         case 3: s->atapi_lba_low = (uint8_t)val; return;
         case 4: s->atapi_lba_mid = (uint8_t)val; return;
         case 5: s->atapi_lba_high = (uint8_t)val; return;
-        case 6: s->atapi_device = (uint8_t)val; return;
+        case 6: {
+            bool was_slave = (s->atapi_device & 0x10) != 0;
+            s->atapi_device = (uint8_t)val;
+            bool is_slave = (s->atapi_device & 0x10) != 0;
+            if (is_slave != was_slave) {
+                /* This model has no secondary slave.  Do not let a failed
+                 * slave probe leave an interrupt that can complete the
+                 * master's next PACKET request prematurely. */
+                s->atapi_irq_pending = false;
+                s->atapi_status_pending = false;
+                if (!is_slave) {
+                    s->atapi_error = 0;
+                    s->atapi_status = 0x40;
+                    s->atapi_count = 1;
+                    s->atapi_lba_low = 1;
+                    s->atapi_lba_mid = 0x14;
+                    s->atapi_lba_high = 0xeb;
+                }
+            }
+            return;
+        }
         case 7:
+            if (s->atapi_device & 0x10) {
+                if (atapi_debug_enabled())
+                    fprintf(stderr, "i2000: ignored ATA command=%#04x for "
+                            "absent secondary slave\n",
+                            (unsigned)(uint8_t)val);
+                return;
+            }
+            /* A new command supersedes any unacknowledged completion from
+             * the previous one. The command below will latch IRQ15 again
+             * when its data or completion phase becomes available. */
+            s->atapi_irq_pending = false;
+            s->atapi_status_pending = false;
             s->atapi_error = 0;
+            if (atapi_debug_enabled())
+                fprintf(stderr, "i2000: ATAPI ATA command=%#04x device=%#04x "
+                        "features=%#04x byte-limit=%u itc=%" PRIu64
+                        " ninsts=%" PRIu64 "\n", (unsigned)(uint8_t)val,
+                        s->atapi_device, s->atapi_features,
+                        (unsigned)s->atapi_lba_mid |
+                        ((unsigned)s->atapi_lba_high << 8),
+                        merced_get_itc(s->cpu), s->cpu->ninsts);
             if ((uint8_t)val == 0xA0) { /* PACKET */
+                unsigned limit = (unsigned)s->atapi_lba_mid |
+                                 ((unsigned)s->atapi_lba_high << 8);
+                s->atapi_byte_limit = limit ? limit : 65536u;
                 s->atapi_packet_pos = 0;
                 memset(s->atapi_packet, 0, sizeof(s->atapi_packet));
                 s->atapi_count = 0x01;
                 s->atapi_status = 0x48;
+                atapi_defer_ready(s, false);
             } else if ((uint8_t)val == 0xA1) { /* IDENTIFY PACKET DEVICE */
                 uint8_t id[512] = {0};
+                uint8_t saved_count = s->atapi_count;
+                uint8_t saved_lba_low = s->atapi_lba_low;
+                uint8_t saved_lba_mid = s->atapi_lba_mid;
+                uint8_t saved_lba_high = s->atapi_lba_high;
                 id[0] = 0xC0; id[1] = 0x85;       /* removable ATAPI CD-ROM */
                 id[98] = 0x00; id[99] = 0x02;     /* LBA supported */
                 char model[40];
@@ -1894,15 +2225,39 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                 for (unsigned i = 0; i < 40; i += 2) {
                     id[54 + i] = model[i + 1]; id[55 + i] = model[i];
                 }
+                s->atapi_byte_limit = sizeof(id);
                 atapi_set_data(s, id, sizeof(id));
+                /* IDENTIFY PACKET is an ATA PIO-data command, not an ATAPI
+                 * PACKET data phase.  Sector Count is therefore not an
+                 * interrupt-reason register here, and Cylinder Low/High
+                 * are not a transfer byte count. Preserve the task-file
+                 * signature/inputs that were present when A1 was issued. */
+                s->atapi_count = saved_count;
+                s->atapi_lba_low = saved_lba_low;
+                s->atapi_lba_mid = saved_lba_mid;
+                s->atapi_lba_high = saved_lba_high;
+                atapi_defer_ready(s, true);
             } else if ((uint8_t)val == 0x08) { /* DEVICE RESET */
                 s->atapi_status = 0x40;
                 s->atapi_count = 1; s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB;
             } else {
                 s->atapi_error = 0x04; s->atapi_status = 0x41;
+                s->atapi_irq_pending = true;
+                s->atapi_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
+                if (atapi_debug_enabled())
+                    fprintf(stderr, "i2000: ATAPI unsupported ATA command=%#04x "
+                            "status=%#04x error=%#04x\n",
+                            (unsigned)(uint8_t)val, s->atapi_status,
+                            s->atapi_error);
             }
             return;
         case 8: /* device control / software reset */
+            if (atapi_debug_enabled())
+                fprintf(stderr, "i2000: ATAPI device-control=%#04x (%s reset)\n",
+                        (unsigned)(uint8_t)val,
+                        (val & 4) ? "assert" : "deassert");
+            s->atapi_irq_pending = false;
+            s->atapi_status_pending = false;
             if (val & 4) s->atapi_status = 0x80;
             else { s->atapi_status = 0x40; s->atapi_count = 1;
                    s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB; }
@@ -2211,8 +2566,8 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
      * a memory-mapped byte read to learn which 8259-relative IRQ won
      * arbitration - the same information a real INTA cycle would return
      * on the data bus (ICW2 base + IRQ number). IRQ0 (the PIT) and, once
-     * -device mouse attaches one, IRQ12 (the aux/mouse device, cascaded
-     * through the slave PIC) both share this single ack address on real
+     * -device mouse attaches one, IRQ12 (the aux/mouse device), and IRQ15
+     * (secondary IDE) all share this single ack address on real
      * hardware's single physical INTA-replacement cycle, so whichever one
      * is actually pending decides what gets returned - PIT wins if both
      * happen to be pending at once, matching real 8259 priority (IRQ0
@@ -2290,21 +2645,49 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
             }
             return (uint64_t)(s->pic_slave_base + 4); /* IRQ12 = slave IRQ4 */
         }
+        if (s->atapi_irq_pending) {
+            s->atapi_irq_pending = false;
+            s->pic_master_isr |= 0x04; /* IRQ2 cascade */
+            s->pic_slave_isr |= 0x80;  /* IRQ15 */
+            if (atapi_debug_enabled()) {
+                fprintf(stderr, "i2000: ATAPI IRQ15 acknowledged vector=%#04x "
+                        "ip=%016" PRIx64 " itc=%" PRIu64 " ninsts=%" PRIu64 "\n",
+                        (unsigned)(s->pic_slave_base + 7), s->cpu->ip,
+                        merced_get_itc(s->cpu), s->cpu->ninsts);
+                if (getenv("ATA_IRQ_TRACE")) {
+                    fprintf(stderr, "i2000: ATAPI IRQ15 ack call history:\n");
+                    merced_dump_calls(s->cpu, 24, stderr);
+                    s->cpu->trace_n = 4000;
+                }
+            }
+            return (uint64_t)(s->pic_slave_base + 7); /* IRQ15 = slave IRQ7 */
+        }
         return s->pic_master_base; /* spurious/unattributed: old behavior */
     }
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
-        if (s->flash_read_status) {
+        uint64_t off = addr - I2000_FLASH_BASE;
+        unsigned chip_index = (unsigned)(off / I2000_FLASH_CHIP_SIZE);
+        uint64_t chip_off = off % I2000_FLASH_CHIP_SIZE;
+        I2000FlashChip *chip = &s->flash_chip[chip_index];
+        if (chip->read_status) {
             uint64_t v = 0;
             for (unsigned i = 0; i < size; i++)
-                v |= (uint64_t)s->flash_status << (i * 8);
+                v |= (uint64_t)chip->status << (i * 8);
             return v;
         }
-        if (s->flash_read_id) {
+        if (chip->read_id) {
             uint64_t v = 0;
-            uint64_t off = addr - I2000_FLASH_BASE;
             for (unsigned i = 0; i < size; i++) {
-                /* Intel manufacturer, firmware-recognized 1 MiB device. */
-                uint8_t id = ((off + i) & 1) ? 0xAC : 0x89;
+                /* 82802AC identifier space is decoded within every 64 KiB
+                 * block: manufacturer and device codes are at +0/+1, while
+                 * +2 is that block's lock-status register.  Returning the
+                 * manufacturer ID for every even byte made +2 read as 0x89,
+                 * whose bit 0 tells FMM that every block is locked; CDB then
+                 * reported "not enough space" without issuing a write. */
+                uint32_t id_off = (uint32_t)(chip_off + i) & 0xFFFFu;
+                uint8_t id = id_off == 0 ? 0x89 :
+                             id_off == 1 ? 0xAC :
+                             id_off == 2 ? 0x00 : 0xFF;
                 v |= (uint64_t)id << (i * 8);
             }
             return v;
@@ -2313,7 +2696,7 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
          * recovery-image scan depends on it); only writes divert into the
          * RAM shadow, where the firmware reads them back through the low
          * alias. */
-        uint64_t v = 0, off = addr - I2000_FLASH_BASE;
+        uint64_t v = 0;
         if (off + size <= I2000_FLASH_SIZE)
             memcpy(&v, s->flash + off, size);
         return v;
@@ -2464,12 +2847,15 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     }
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
         uint64_t off = addr - I2000_FLASH_BASE;
+        unsigned chip_index = (unsigned)(off / I2000_FLASH_CHIP_SIZE);
+        uint64_t chip_off = off % I2000_FLASH_CHIP_SIZE;
+        I2000FlashChip *chip = &s->flash_chip[chip_index];
         /* BIOS 1.30 probes the Intel flash device with the standard
          * clear-status/read-status/read-array command sequence.  Without
         * command-state handling the status read returns an array byte and
         * platform initialization reports EFI_OUT_OF_RESOURCES. */
         if (size == 1) {
-            if (s->flash_cmd == 0x40 || s->flash_cmd == 0x10) {
+            if (chip->cmd == 0x40 || chip->cmd == 0x10) {
                 /* Intel byte-program operation.  Keep NVRAM updates in the
                  * in-memory image; the user's ROM file remains untouched. */
                 uint8_t old = s->flash[off];
@@ -2481,52 +2867,77 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                  * status 0x40 despite a successful high-level rewrite. */
                 s->flash[off] = (uint8_t)val;
                 s->nvram_dirty |= s->flash[off] != old;
-                s->flash_status = 0x80;
-                s->flash_read_status = true;
-                s->flash_read_id = false;
-                s->flash_cmd = 0;
+                chip->status = 0x80;
+                chip->read_status = true;
+                chip->read_id = false;
+                chip->cmd = 0;
                 return;
             }
-            if (s->flash_cmd == 0x20) {
+            if (chip->cmd == 0x20) {
                 if ((uint8_t)val == 0xD0) {
-                    uint64_t block = s->flash_cmd_addr & ~0xFFFFull;
-                    if (block < I2000_FLASH_SIZE) {
+                    uint64_t block = (uint64_t)chip_index *
+                                     I2000_FLASH_CHIP_SIZE +
+                                     (chip->cmd_addr & ~0xFFFFu);
+                    if (block + 0x10000 <= I2000_FLASH_SIZE) {
                         memset(s->flash + block, 0xFF, 0x10000);
                         s->nvram_dirty = true;
                     }
-                    s->flash_status = 0x80;
+                    chip->status = 0x80;
                 } else {
-                    s->flash_status = 0xB0; /* ready + erase error */
+                    chip->status = 0xB0; /* ready + erase error */
                 }
-                s->flash_read_status = true;
-                s->flash_read_id = false;
-                s->flash_cmd = 0;
+                if (getenv("FLASH_DEBUG"))
+                    fprintf(stderr, "i2000: FLASH erase confirm off=%#" PRIx64
+                            " val=%#04x -> status=%#04x ninsts=%" PRIu64 "\n",
+                            off, (unsigned)(uint8_t)val,
+                            chip->status, s->cpu->ninsts);
+                chip->read_status = true;
+                chip->read_id = false;
+                chip->cmd = 0;
                 return;
+            }
+            if (getenv("FLASH_DEBUG") && (uint8_t)val != 0x70 &&
+                (uint8_t)val >= 0x10)
+                fprintf(stderr, "i2000: FLASH cmd=%#04x off=%#" PRIx64
+                        " ninsts=%" PRIu64 "\n", (unsigned)(uint8_t)val, off,
+                        s->cpu->ninsts);
+            if (((uint8_t)val == 0x90 || (uint8_t)val == 0x91) &&
+                off == 0xc0000 && s->cpu->ninsts > 5000000000ull &&
+                getenv("FLASH_ID_TRACE")) {
+                static bool traced;
+                if (!traced) {
+                    traced = true;
+                    fprintf(stderr, "i2000: FLASH ID probe off=0xc0000 ip=%016"
+                            PRIx64 " ninsts=%" PRIu64 " call history:\n",
+                            s->cpu->ip, s->cpu->ninsts);
+                    merced_dump_calls(s->cpu, 24, stderr);
+                    s->cpu->trace_n = 150;
+                }
             }
             switch ((uint8_t)val) {
             case 0x50:                         /* clear status register */
-                s->flash_status = 0x80;        /* ready, no errors */
+                chip->status = 0x80;           /* ready, no errors */
                 return;
             case 0x70:                         /* read status register */
-                s->flash_read_status = true;
-                s->flash_read_id = false;
+                chip->read_status = true;
+                chip->read_id = false;
                 return;
             case 0x90: case 0x91:              /* read identifier codes */
-                s->flash_read_status = false;
-                s->flash_read_id = true;
+                chip->read_status = false;
+                chip->read_id = true;
                 return;
             case 0x10: case 0x40:              /* byte program setup */
-                s->flash_cmd = (uint8_t)val;
-                s->flash_cmd_addr = off;
+                chip->cmd = (uint8_t)val;
+                chip->cmd_addr = (uint32_t)chip_off;
                 return;
             case 0x20:                         /* block erase setup */
-                s->flash_cmd = 0x20;
-                s->flash_cmd_addr = off;
+                chip->cmd = 0x20;
+                chip->cmd_addr = (uint32_t)chip_off;
                 return;
             case 0xFF:                         /* read array */
-                s->flash_read_status = false;
-                s->flash_read_id = false;
-                s->flash_cmd = 0;
+                chip->read_status = false;
+                chip->read_id = false;
+                chip->cmd = 0;
                 return;
             }
         }
@@ -2575,6 +2986,32 @@ static bool i2000_bus_fill(void *ud, uint64_t addr, uint8_t val, uint64_t len) {
 }
 
 /* ── Firmware ────────────────────────────────────────────────────────────── */
+
+static bool i2000_repair_sdv_boot_timeout(Ia64I2000State *s) {
+    static const uint8_t name[] = {
+        'T',0,'i',0,'m',0,'e',0,'o',0,'u',0,'t',0,0,0
+    };
+    /* A former menu workaround changed this CDB-backed value directly.  That
+     * bypassed the firmware's CDB bookkeeping, so EFI detected an altered CDB
+     * and eventually failed trying to save it.  Undo only values that GEMU's
+     * workaround used; leave genuine guest configuration untouched.  This is
+     * also needed for snapshots and NVRAM files created by that version. */
+    for (size_t off = 0; off + sizeof(name) + 2 <= I2000_FLASH_SIZE; off++) {
+        if (memcmp(s->flash + off, name, sizeof(name)) != 0)
+            continue;
+        uint8_t *value = s->flash + off + sizeof(name);
+        uint16_t timeout = (uint16_t)value[0] | (uint16_t)value[1] << 8;
+        if (timeout != 60 && timeout != 3600 && timeout != 30000 &&
+            timeout != 65534)
+            continue;
+        value[0] = 7;
+        value[1] = 0;
+        fprintf(stderr, "i2000: repaired obsolete GEMU SDV boot timeout "
+                "(%u -> 7)\n", timeout);
+        return true;
+    }
+    return false;
+}
 
 static bool i2000_nvram_repair_bad_prefix(Ia64I2000State *s,
                                           const uint8_t *rom_prefix) {
@@ -2677,6 +3114,8 @@ bool ia64_i2000_load_firmware(Ia64I2000State *s, const char *path) {
     s->flash_image_size = (uint32_t)len;
     s->flash_loaded = true;
     i2000_nvram_load(s);
+    if (i2000_repair_sdv_boot_timeout(s))
+        s->nvram_dirty = true;
     gemu_monitor_register_rom(s->monitor, (uint32_t)(I2000_FLASH_BASE + off),
                               (uint32_t)len, path);
     return true;
@@ -2904,7 +3343,7 @@ static bool i2000_screendump(void *ud, const char *path) {
  * than hand-listing every scalar field, and it stays correct automatically
  * as fields get added. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 15u /* v15 adds the reusable PS/2 keyboard */
+#define I2000_SNAPSHOT_VERSION 22u /* v22 adds ATA BSY-to-ready transitions */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -2954,6 +3393,7 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
 
     Merced cpu_snap = *s->cpu;
     memset(&cpu_snap.bus, 0, sizeof(cpu_snap.bus));
+    cpu_snap.translation_cache = NULL;
     ok &= fwrite(&cpu_snap, sizeof(cpu_snap), 1, f) == 1;
 
     fclose(f);
@@ -2980,6 +3420,8 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     memcpy(rom_prefix, s->flash, sizeof(rom_prefix));
     ok &= fread(s->ram, 1, s->ram_size, f) == s->ram_size;
     ok &= fread(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
+    if (ok)
+        i2000_repair_sdv_boot_timeout(s);
     ok &= fread(s->chipset_scratch, 1, I2000_CHIPSET_SCRATCH_SIZE, f) ==
           I2000_CHIPSET_SCRATCH_SIZE;
     if (version >= 10u)
@@ -3013,6 +3455,10 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     bool configured_rage128 = s->rage128.enabled;
     bool configured_mouse_enabled = s->mouse_enabled;
     bool configured_i82559 = s->i82559.enabled;
+    char configured_cdrom_file[sizeof(s->cdrom_file)];
+    snprintf(configured_cdrom_file, sizeof(configured_cdrom_file), "%s",
+             s->cdrom ? s->cdrom_file : "");
+    uint64_t configured_cdrom_size = s->cdrom ? s->cdrom_size : 0;
     uint8_t *i82559_option_rom = s->i82559.option_rom;
     size_t i82559_option_rom_size = s->i82559.option_rom_size;
     Merced *cpu = s->cpu;
@@ -3054,6 +3500,19 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         state_size = offsetof(Ia64I2000State, i82559);
     else if (version == 14u)
         state_size = offsetof(Ia64I2000State, ps2_keyboard);
+    else if (version == 15u)
+        state_size = offsetof(Ia64I2000State, atapi_irq_pending);
+    else if (version == 16u)
+        /* v16 ended in a bool and sizeof(struct) included tail padding. */
+        state_size = (offsetof(Ia64I2000State, pic_master_isr) + 7u) & ~7u;
+    else if (version == 17u)
+        state_size = offsetof(Ia64I2000State, atapi_irq_ready_ninsts);
+    else if (version == 18u)
+        state_size = offsetof(Ia64I2000State, flash_chip);
+    else if (version == 19u || version == 20u)
+        state_size = offsetof(Ia64I2000State, atapi_byte_limit);
+    else if (version == 21u)
+        state_size = offsetof(Ia64I2000State, atapi_status_ready_ninsts);
     else
         state_size = sizeof(*loaded);
     ok &= fread(loaded, state_size, 1, f) == 1;
@@ -3076,6 +3535,13 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->nvram_dirty = false;
         s->atapi_data = atapi_data;
         s->ata_data = ata_data;
+        /* Explicit -cdrom media belongs to this run, not to the historical
+         * snapshot.  This makes a firmware checkpoint reusable with any ISO. */
+        if (configured_cdrom_file[0]) {
+            snprintf(s->cdrom_file, sizeof(s->cdrom_file), "%s",
+                     configured_cdrom_file);
+            s->cdrom_size = configured_cdrom_size;
+        }
         s->cdrom = s->cdrom_file[0] ? fopen(s->cdrom_file, "rb") : NULL;
         s->hda = s->hda_file[0] ? fopen(s->hda_file, "r+b") : NULL;
         /* Restart the autosave clock from now, not from whatever wall time
@@ -3085,6 +3551,25 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
          * of loading it back in - to keep going, typically to retest a
          * fix for whatever caused that halt. Don't leave it stuck. */
         s->halted = false;
+        if (version < 19u) {
+            for (unsigned i = 0; i < I2000_FLASH_CHIPS; i++) {
+                s->flash_chip[i].read_status = s->flash_read_status;
+                s->flash_chip[i].read_id = s->flash_read_id;
+                s->flash_chip[i].status = s->flash_status;
+                s->flash_chip[i].cmd = s->flash_cmd;
+                s->flash_chip[i].cmd_addr =
+                    (uint32_t)(s->flash_cmd_addr % I2000_FLASH_CHIP_SIZE);
+            }
+        }
+        if (version < 21u) {
+            s->atapi_byte_limit = 65536u;
+            s->atapi_phase_end = (s->atapi_status & 0x08)
+                               ? s->atapi_data_len : s->atapi_data_pos;
+        }
+        if (version < 22u) {
+            s->atapi_status_pending = false;
+            s->atapi_ready_irq = false;
+        }
         if (version < 5u) {
             rage128_init(&s->rage128, configured_rage128,
                          RAGE128_FB_BASE, RAGE128_IO_BASE,
@@ -3119,20 +3604,54 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->i82559.option_rom_size = i82559_option_rom_size;
         if (version < 15u)
             ps2_keyboard_init(&s->ps2_keyboard);
+        if (version < 16u)
+            s->cmd649_cfg[0x3C] = 15; /* PCI Interrupt Line: legacy IRQ15 */
+        /* Snapshots made by the short-lived DSC experiment can contain
+         * 0x58/0x50. This SDV's AtaPim waits for the ATAPI form without
+         * DSC (0x48/0x40), so normalize those states when replaying them. */
+        s->atapi_status &= ~0x10u;
+        if (s->atapi_data_len == 512 && s->atapi_data_pos == 0 &&
+            (s->atapi_status & 0x08)) {
+            s->atapi_count = 1;
+            s->atapi_lba_low = 1;
+            s->atapi_lba_mid = 0x14;
+            s->atapi_lba_high = 0xEB;
+        }
     }
     free(loaded);
 
     MercedBus bus = s->cpu->bus;
+    void *translation_cache = s->cpu->translation_cache;
     Merced loaded_cpu;
-    ok &= fread(&loaded_cpu, sizeof(loaded_cpu), 1, f) == 1;
+    memset(&loaded_cpu, 0, sizeof(loaded_cpu));
+    size_t cpu_state_size = version < 20u
+                          ? offsetof(Merced, translation_cache)
+                          : sizeof(loaded_cpu);
+    ok &= fread(&loaded_cpu, cpu_state_size, 1, f) == 1;
     if (ok) {
         *s->cpu = loaded_cpu;
         s->cpu->bus = bus;
+        s->cpu->translation_cache = translation_cache;
+        merced_flush_translation_cache(s->cpu);
+        if (version < 18u && s->atapi_irq_pending)
+            s->atapi_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
         /* rfi_generation is process-local rather than snapshot state, so an
          * absolute saved target cannot be meaningful after load. */
         s->mouse_wait_rfi_generation = 0;
         s->keyboard_retry_ninsts = s->cpu->ninsts;
         s->mouse_next_report_itc = merced_get_itc(s->cpu);
+        /* PIT deadlines describe host-time progression and must never be
+         * resumed as absolute snapshot values.  This also upgrades older
+         * snapshots whose fields used the former instruction-count clock. */
+        bool pit0_armed = s->pit0_next_irq != 0;
+        bool pit1_armed = s->pit1_next_irq != 0;
+        s->pit0_epoch_ninsts = merced_get_itc(s->cpu);
+        s->pit0_next_irq = pit0_armed
+                         ? s->pit0_epoch_ninsts +
+                           pit_interval_itc(s->pit0_reload) : 0;
+        s->pit1_next_irq = pit1_armed
+                         ? s->pit0_epoch_ninsts +
+                           pit_interval_itc(s->pit1_reload) : 0;
         i2000_repair_saved_mode12(s);
     }
 
@@ -3149,14 +3668,14 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
  * particular stretch of firmware executes. Silent no-op until the first
  * period has elapsed, so a quick one-off run doesn't pay for a snapshot it
  * will never use. */
-static void i2000_autosave_tick(Ia64I2000State *s) {
+static bool i2000_autosave_tick(Ia64I2000State *s) {
     time_t now = time(NULL);
     if (s->last_autosave == 0) {
         s->last_autosave = now;
-        return;
+        return false;
     }
     if (now - s->last_autosave < I2000_AUTOSAVE_PERIOD_SEC)
-        return;
+        return false;
     s->last_autosave = now;
     char path[256];
     snprintf(path, sizeof(path), "%s/autosave_%u.vmstate",
@@ -3167,6 +3686,7 @@ static void i2000_autosave_tick(Ia64I2000State *s) {
                path, s->cpu->ninsts);
     else
         fprintf(stderr, "i2000: autosave to %s FAILED\n", path);
+    return true;
 }
 
 /* monitor "x 0xADDR [count]": physical memory hexdump
@@ -3185,6 +3705,29 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
     uint64_t n;
     char panel_path[256];
     char vm_path[256];
+    if (txt && (strcmp(txt, "input") == 0 || strcmp(txt, "input-state") == 0)) {
+        printf("8042: command=%02X out=%u/%u aux=%u/%u "
+               "kbd=%u/%u irq1=%u retry=%" PRIu64 " ninsts=%" PRIu64 "\n",
+               s->kbc_command_byte,
+               s->kbc_out_pos, s->kbc_out_len,
+               s->aux_out_pos, s->aux_out_len,
+               s->ps2_keyboard.queue_pos, s->ps2_keyboard.queue_len,
+               s->keyboard_irq_pending, s->keyboard_retry_ninsts,
+               s->cpu->ninsts);
+        printf("PIT0: reload=%u next=%" PRIu64 " now=%" PRIu64
+               " pending=%u mask=%02X\n",
+               s->pit0_reload ? (unsigned)s->pit0_reload : 65536u,
+               s->pit0_next_irq, merced_get_itc(s->cpu),
+               s->pit_irq_pending, s->pic_master_mask);
+        if (ps2_keyboard_has_data(&s->ps2_keyboard)) {
+            printf("keyboard bytes:");
+            for (unsigned i = s->ps2_keyboard.queue_pos;
+                 i < s->ps2_keyboard.queue_len; i++)
+                printf(" %02X", s->ps2_keyboard.queue[i]);
+            putchar('\n');
+        }
+        return;
+    }
     if (txt && sscanf(txt, "savevm %255s", vm_path) == 1) {
         if (i2000_save_snapshot(s, vm_path))
             printf("saved snapshot to %s (ninsts=%" PRIu64 ")\n",
@@ -3326,38 +3869,36 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
         return;
     }
     {
-        char keyname[32];
-        if (txt && sscanf(txt, "key %31s", keyname) == 1) {
+        if (txt && strncmp(txt, "key ", 4) == 0 && txt[4]) {
+            const char *keyarg = txt + 4;
             /* Monitor-scripted key injection for headless UI testing - the
              * -display/-vnc input paths only ever feed kbc_queue_ascii()
              * printable/control ASCII, so arrows (needed for the graphical
              * setup's tab bar per its own on-screen instructions) have no
-             * other way in. Set-1 make codes, extended (0xE0-prefixed) for
-             * the arrow keys, matching kbc_queue_ascii()'s existing
-             * make-code-only convention (no break code sent either). */
-            uint8_t scan = 0, ext = 0;
-            if (!strcmp(keyname, "right")) { ext = 0xE0; scan = 0x4D; }
-            else if (!strcmp(keyname, "left"))  { ext = 0xE0; scan = 0x4B; }
-            else if (!strcmp(keyname, "up"))    { ext = 0xE0; scan = 0x48; }
-            else if (!strcmp(keyname, "down"))  { ext = 0xE0; scan = 0x50; }
-            else if (!strcmp(keyname, "enter")) { scan = 0x1c; }
-            else if (!strcmp(keyname, "tab"))   { scan = 0x0f; }
-            else if (!strcmp(keyname, "esc"))   { scan = 0x01; }
-            if (scan) {
-                if (ext) {
-                    uint32_t keysym = scan == 0x4d ? 0xff53 :
-                                      scan == 0x4b ? 0xff51 :
-                                      scan == 0x48 ? 0xff52 : 0xff54;
-                    ps2_keyboard_tap(&s->ps2_keyboard, keysym);
-                } else {
-                    uint32_t keysym = scan == 0x1c ? '\r' :
-                                      scan == 0x0f ? '\t' : 0x1b;
-                    ps2_keyboard_tap(&s->ps2_keyboard, keysym);
-                }
-                printf("key %s queued\n", keyname);
+             * other way in. A non-special argument is typed verbatim, which
+             * permits commands such as "key map -r" at the EFI shell. */
+            uint32_t special = 0;
+            if (!strcmp(keyarg, "right"))     special = 0xff53;
+            else if (!strcmp(keyarg, "left")) special = 0xff51;
+            else if (!strcmp(keyarg, "up"))   special = 0xff52;
+            else if (!strcmp(keyarg, "down")) special = 0xff54;
+            else if (!strcmp(keyarg, "enter")) special = '\r';
+            else if (!strcmp(keyarg, "tab"))   special = '\t';
+            else if (!strcmp(keyarg, "esc"))   special = 0x1b;
+            if (special) {
+                ps2_keyboard_tap(&s->ps2_keyboard, special);
+                printf("key %s queued\n", keyarg);
             } else {
-                printf("unknown key '%s' (right/left/up/down/enter/tab/esc)\n",
-                       keyname);
+                size_t queued = 0;
+                for (const unsigned char *p = (const unsigned char *)keyarg;
+                     *p; p++) {
+                    if (*p < 0x20 || *p > 0x7e)
+                        continue;
+                    ps2_keyboard_tap(&s->ps2_keyboard, *p);
+                    queued++;
+                }
+                printf("key: queued %zu character%s; use 'key enter' to "
+                       "submit\n", queued, queued == 1 ? "" : "s");
             }
             return;
         }
@@ -3474,6 +4015,9 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->flash_status = 0x80;
     s->flash_cmd = 0;
     s->flash_cmd_addr = 0;
+    memset(s->flash_chip, 0, sizeof(s->flash_chip));
+    for (unsigned i = 0; i < I2000_FLASH_CHIPS; i++)
+        s->flash_chip[i].status = 0x80;
     s->pci_cfg_addr = 0;
     s->ifb_smbus_cmd_read_once = false;
     s->chipset_bus = 0xFF;   /* 460GX power-on CBN default: top bus number */
@@ -3504,6 +4048,11 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
      * Media presence affects SCSI packet results, not ATA device presence. */
     s->atapi_status = 0x40;
     s->atapi_packet_pos = 0;
+    s->atapi_byte_limit = 65536u;
+    s->atapi_phase_end = 0;
+    s->atapi_irq_pending = false;
+    s->atapi_status_pending = false;
+    s->atapi_ready_irq = false;
     free(s->atapi_data);
     s->atapi_data = NULL;
     s->atapi_data_len = s->atapi_data_pos = 0;
@@ -3562,6 +4111,7 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->cmd649_cfg[0x0A] = 0x01;                    /* IDE subclass */
     s->cmd649_cfg[0x0B] = 0x01;                    /* mass storage */
     s->cmd649_cfg[0x0E] = 0x00;                    /* normal header */
+    s->cmd649_cfg[0x3C] = 15;                      /* secondary IDE IRQ15 */
     s->cmd649_cfg[0x3D] = 0x01;                    /* INTA */
     /* Device numbers and roles per SSDM 248704-001 Table 2-1 (Device
      * Mapping on Bus CBN): 00h/01h = SAC (82461GX), 04h = SDC (82462GX,
@@ -3706,6 +4256,10 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
         }
         s->cdrom_size = (uint64_t)end;
         snprintf(s->cdrom_file, sizeof(s->cdrom_file), "%s", cfg->cdrom_path);
+        if (atapi_debug_enabled())
+            fprintf(stderr, "i2000: ATAPI media attached '%s' bytes=%" PRIu64
+                    " sectors=%" PRIu64 "\n", s->cdrom_file, s->cdrom_size,
+                    s->cdrom_size / 2048);
     }
     if (cfg->hda_path) {
         s->hda = fopen(cfg->hda_path, "r+b");
@@ -3890,22 +4444,23 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * vector is exactly why this used to hang forever: firmware raises
      * cr.tpr to 0xC0 around ATA identify and never lowers it again, which
      * permanently masks any normal vector but must NOT mask ExtINT. */
-    if (s->pit0_next_irq && s->cpu->ninsts >= s->pit0_next_irq) {
+    uint64_t now_itc = merced_get_itc(s->cpu);
+    if (s->pit0_next_irq && (int64_t)(now_itc - s->pit0_next_irq) >= 0) {
         i2000_ensure_legacy_runtime(s);
         iosapic_raise_gsi(s, 0);  /* GSI 0 == legacy PIT/IRQ0, forward-compat */
         if (!(s->pic_master_mask & 1)) {
             s->pit_irq_pending = true;
             merced_raise_external(s->cpu, 0);  /* ExtINT: IRQ0 unmasked */
         }
-        s->pit0_next_irq = s->cpu->ninsts + 100000;
+        s->pit0_next_irq = now_itc + pit_interval_itc(s->pit0_reload);
     }
     /* Channel 1 has no standard ISA IRQ wiring on real hardware (classically
      * DRAM refresh, not an interrupt source) and firmware never configures
      * any delivery path for it either - the reload-count register (port
      * 0x41) is still modeled since real chipsets expose it, but nothing
      * here raises an interrupt for it. */
-    if (s->pit1_next_irq && s->cpu->ninsts >= s->pit1_next_irq) {
-        s->pit1_next_irq = s->cpu->ninsts + 100000;
+    if (s->pit1_next_irq && (int64_t)(now_itc - s->pit1_next_irq) >= 0) {
+        s->pit1_next_irq = now_itc + pit_interval_itc(s->pit1_reload);
     }
     /* Controller replies and host keystrokes assert legacy IRQ1 whenever
      * the keyboard output buffer becomes non-empty. Previously we queued
@@ -3945,6 +4500,30 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
         s->mouse_wait_rfi_generation == 0 &&
         !(s->pic_slave_mask & 0x10) && !(s->pic_master_mask & 0x04)) {
         s->mouse_irq_pending = true;
+        merced_raise_external(s->cpu, 0);
+    }
+    /* The CMD-649 secondary channel is legacy IRQ15 (slave IRQ7). AtaPim
+     * waits for this interrupt after IDENTIFY/PACKET rather than polling
+     * DRQ continuously. Keep the device latch asserted until the firmware
+     * performs the shared legacy acknowledge read. */
+    /* CMD649 is a PCI device.  Its INTA reaches the platform's ExtINT
+     * bridge even while the firmware has the legacy slave-PIC mask set;
+     * AtaPim installs the IRQ15 handler before it submits the command. */
+    if (s->atapi_status_pending &&
+        s->cpu->ninsts >= s->atapi_status_ready_ninsts) {
+        s->atapi_status_pending = false;
+        s->atapi_status = s->atapi_ready_status;
+        if (s->atapi_ready_irq) {
+            s->atapi_irq_pending = true;
+            s->atapi_irq_ready_ninsts = s->cpu->ninsts;
+        }
+        if (atapi_debug_enabled())
+            fprintf(stderr, "i2000: ATAPI BSY cleared status=%#04x "
+                    "reason=%#04x ninsts=%" PRIu64 "\n",
+                    s->atapi_status, s->atapi_count, s->cpu->ninsts);
+    }
+    if (s->atapi_irq_pending &&
+        s->cpu->ninsts >= s->atapi_irq_ready_ninsts) {
         merced_raise_external(s->cpu, 0);
     }
 }
@@ -4049,15 +4628,24 @@ static void i2000_bench_check(Ia64I2000State *s) {
 static void i2000_run_slice(Ia64I2000State *s) {
     if (s->halted)
         return;
+    bool check_exec = gemu_monitor_has_exec_breakpoints(s->monitor);
+    bool check_mem = gemu_monitor_has_mem_breakpoints(s->monitor);
     for (int i = 0; i < INSTR_PER_FRAME; i++) {
-        if (gemu_monitor_check_exec(s->monitor, (uint32_t)s->cpu->ip))
+        if (check_exec &&
+            gemu_monitor_check_exec(s->monitor, (uint32_t)s->cpu->ip))
             return;
-        i2000_poll_interrupts(s);
+        /* Device callbacks raise already-ready interrupts directly.  Only
+         * deadline-driven sources (PIT and retry timers) need this platform
+         * poll, and checking those on every IA-64 slot was a large fraction
+         * of execution time.  A 16-slot quantum is far below the latency of
+         * the modeled hardware while bounding delivery skew to 15 slots. */
+        if ((i & (IRQ_POLL_QUANTUM - 1)) == 0)
+            i2000_poll_interrupts(s);
         MercedStatus st = merced_step(s->cpu);
         /* A memory watchpoint can be raised from inside the bus callback.
          * Stop this execution slice immediately so the reported IP remains
          * the instruction that performed the access. */
-        if (gemu_monitor_is_paused(s->monitor))
+        if (check_mem && gemu_monitor_is_paused(s->monitor))
             return;
         if (s->reset_requested) {
             fprintf(stderr, "i2000: firmware requested a platform reset\n");
@@ -4131,10 +4719,11 @@ static void i2000_reset(Ia64I2000State *s) {
     s->pic_master_base = 0x08;
     s->pic_slave_base = 0x70;
     s->pic_master_icw = s->pic_slave_icw = 0;
+    s->pic_master_isr = s->pic_slave_isr = 0;
     s->pit0_reload = s->pit0_latch = 0;
     s->pit0_write_phase = 0;
     s->pit0_read_phase = 0;
-    s->pit0_epoch_ninsts = s->cpu->ninsts;
+    s->pit0_epoch_ninsts = merced_get_itc(s->cpu);
     s->pit0_next_irq = 0;
     s->pit1_reload = s->pit1_latch = 0;
     s->pit1_write_phase = 0;
@@ -4331,6 +4920,11 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             }
             case GEMU_MON_CUSTOM:
                 i2000_custom_cmd(s);
+                /* Snapshot I/O can block for several seconds with 2 GiB of
+                 * guest RAM.  That host maintenance time is not guest time:
+                 * counting it on the next loop can expire an EFI menu timer
+                 * immediately after loadvm/savevm returns. */
+                itc_last_ns = i2000_monotonic_ns();
                 break;
             default:
                 break;
@@ -4343,8 +4937,8 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             i2000_run_slice(s);
-            if (!s->halted)
-                i2000_autosave_tick(s);
+            if (!s->halted && i2000_autosave_tick(s))
+                itc_last_ns = i2000_monotonic_ns();
             i2000_bench_check(s);
         }
 

@@ -98,15 +98,27 @@ static uint64_t ioaddr(X86 *x, uint16_t port) {
     return x->m->ar[0] | ((uint64_t)(port & 0xfffc) << 10) |
            (port & 0x0fff);
 }
+static unsigned ia32_ata_trace_left;
 static bool ioread(X86 *x, uint16_t port, unsigned size, uint32_t *v) {
     uint64_t q;
     if (!ia32_active(x)) return false;
     if (!merced_ia32_read(x->m, ioaddr(x, port), size, false, &q)) return false;
     *v = (uint32_t)q;
+    if (getenv("IA32_ATA_TRACE") &&
+        ((port >= 0x170 && port <= 0x177) || port == 0x376))
+        fprintf(stderr, "merced: IA32-ATA read ip=%08X port=%#x size=%u val=%#x ninsts=%" PRIu64 "\n",
+                x->start, port, size, *v, x->m->ninsts);
     return true;
 }
 static bool iowrite(X86 *x, uint16_t port, unsigned size, uint32_t v) {
     if (!ia32_active(x)) return false;
+    if (getenv("IA32_ATA_TRACE") &&
+        ((port >= 0x170 && port <= 0x177) || port == 0x376)) {
+        fprintf(stderr, "merced: IA32-ATA write ip=%08X port=%#x size=%u val=%#x ninsts=%" PRIu64 "\n",
+                x->start, port, size, v, x->m->ninsts);
+        if (port == 0x177 && size == 1 && v == 0xa1)
+            ia32_ata_trace_left = 500;
+    }
     return merced_ia32_write(x->m, ioaddr(x, port), size, v);
 }
 static bool fetch(X86 *x, unsigned size, uint32_t *v) {
@@ -987,14 +999,19 @@ MercedStatus merced_ia32_step(Merced *m) {
         unsigned n=op==0x80?1:size;
         uint32_t a,imm; if(!rmread(&x,rm,n,&a)||!fetch(&x,op==0x83?1:n,&imm))goto fault;
         if(op==0x83) imm=(uint32_t)(int32_t)(int8_t)imm;
+        uint32_t cf_in = !!(eflags(&x) & FL_CF);
         uint32_t v; if(sub==0)v=a+imm;
         else if(sub==1)v=a|imm;
+        else if(sub==2)v=a+imm+cf_in;
+        else if(sub==3)v=a-imm-cf_in;
         else if(sub==4)v=a&imm;
         else if(sub==6)v=a^imm;
         else if(sub==5||sub==7)v=a-imm;
         else return xhalt(&x,"IA-32 group1 /%u unimplemented at %08X",sub,x.start);
         if(sub!=7&&!rmwrite(&x,rm,n,v))goto fault;
-        if(sub==5||sub==7)sub_flags(&x,a,imm,v,n);
+        if(sub==3)sbb_flags(&x,a,imm,cf_in,v,n);
+        else if(sub==2)adc_flags(&x,a,imm,cf_in,v,n);
+        else if(sub==5||sub==7)sub_flags(&x,a,imm,v,n);
         else if(sub==0)add_flags(&x,a,imm,v,n);
         else logic_flags(&x,v,n);
     } else if (op == 0xa8 || op == 0xa9) {
@@ -1004,6 +1021,41 @@ MercedStatus merced_ia32_step(Merced *m) {
         uint32_t imm;
         if (!fetch(&x, n, &imm)) goto fault;
         logic_flags(&x, xr(&x, 0, n) & imm, n);
+    } else if (op >= 0x6c && op <= 0x6f) {
+        /* String port I/O. ATA BIOS code uses REP INSW to consume the
+         * 256-word IDENTIFY response; implementing only scalar IN/OUT left
+         * DRQ asserted forever even though the device data was ready. */
+        bool out = op >= 0x6e;
+        unsigned n = (op & 1) ? size : 1;
+        unsigned asize = x.addr32 ? 4 : 2;
+        uint32_t count = x.rep ? xr(&x, 1, asize) : 1;
+        uint16_t port = (uint16_t)xr(&x, 2, 2);
+        int step = (eflags(&x) & FL_DF) ? -(int)n : (int)n;
+        unsigned source_seg = x.seg_override >= 0
+                            ? (unsigned)x.seg_override : X_DS;
+        while (count) {
+            uint32_t v;
+            if (out) {
+                uint32_t si = xr(&x, 6, asize);
+                if (!rb(&x, sbase(&x, source_seg) + si, n, false, &v) ||
+                    !iowrite(&x, port, n, v))
+                    goto fault;
+                setxr(&x, 6, asize, si + step);
+            } else {
+                uint32_t di = xr(&x, 7, asize);
+                /* INS destination is always ES:(E)DI; segment overrides do
+                 * not apply to it. Perform the port read only after the
+                 * destination is known writable enough for the ordinary
+                 * success path used by this firmware. */
+                if (!ioread(&x, port, n, &v) ||
+                    !wb(&x, sbase(&x, X_ES) + di, n, v))
+                    goto fault;
+                setxr(&x, 7, asize, di + step);
+            }
+            count--;
+            if (x.rep)
+                setxr(&x, 1, asize, count);
+        }
     } else if (op == 0xa4 || op == 0xa5) {
         unsigned n=op==0xa4?1:size; uint32_t count=x.rep?xr(&x,1,x.addr32?4:2):1;
         int step=(eflags(&x)&FL_DF)?-(int)n:(int)n;
@@ -1185,6 +1237,16 @@ MercedStatus merced_ia32_step(Merced *m) {
         } else return xhalt(&x,"IA-32 0F %02X unimplemented at %08X",op2,x.start);
     } else return xhalt(&x,"IA-32 opcode %02X unimplemented at %08X",op,x.start);
 
+    if (ia32_ata_trace_left) {
+        fprintf(stderr, "merced: IA32-ATA-TRACE from=%08X op=%02X to=%08X"
+                " ax=%08X bx=%08X cx=%08X dx=%08X si=%08X di=%08X"
+                " flags=%08X branch=%u ninsts=%" PRIu64 "\n",
+                x.start, op, x.pc, xr(&x, 0, 4), xr(&x, 3, 4),
+                xr(&x, 1, 4), xr(&x, 2, 4), xr(&x, 6, 4), xr(&x, 7, 4),
+                eflags(&x), branch, m->ninsts);
+        fflush(stderr);
+        ia32_ata_trace_left--;
+    }
     if (getenv("IA32_TRACE_AFTER")) {
         static unsigned trace_count;
         uint64_t after = strtoull(getenv("IA32_TRACE_AFTER"), NULL, 0);
