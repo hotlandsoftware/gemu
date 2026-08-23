@@ -194,6 +194,9 @@ struct Ia64I2000State {
     bool      flash_read_id;
     uint8_t   flash_status;
     uint8_t   flash_cmd;
+    /* Legacy scalar flash command address retained for old snapshots.  The
+     * per-chip command state superseded it; at runtime it now tracks the
+     * active top-of-aperture SAL scratch alias. */
     uint64_t  flash_cmd_addr;
 
     bool      halted;
@@ -1370,6 +1373,17 @@ static void con_putc(Ia64I2000State *s, char c) {
             merced_dump_calls(s->cpu, 600, stderr);
         }
     }
+    if (getenv("CDB_FAIL_TRACE") &&
+        strstr(s->console[s->con_row], "CDBFMM.c")) {
+        static bool assertion_traced;
+        if (!assertion_traced) {
+            assertion_traced = true;
+            fprintf(stderr, "i2000: CDBFMM assertion emitted, ip=%016" PRIx64
+                    " ninsts=%" PRIu64 " call history:\n", s->cpu->ip,
+                    s->cpu->ninsts);
+            merced_dump_calls(s->cpu, 600, stderr);
+        }
+    }
     if (getenv("MFG_TRACE") &&
         strstr(s->console[s->con_row], "MFG Mode detected")) {
         static bool traced;
@@ -2482,6 +2496,27 @@ static inline bool i2000_high_dram_addr(uint64_t addr, uint64_t *off) {
     return true;
 }
 
+/* The 460GX aliases sign-extended SAL scratch addresses into its 2-GiB DRAM
+ * aperture.  The production AMI SAL saves state at 0x7fffa030 and restores
+ * it through ffffffffffffa030, so these addresses must meet in RAM. */
+static inline uint64_t i2000_normalize_pa(Ia64I2000State *s, uint64_t addr) {
+    addr &= MERCED_PHYS_MASK;
+    if ((addr & UINT64_C(0x000fffff00000000)) ==
+        UINT64_C(0x000fffff00000000)) {
+        uint64_t base = s->flash_cmd_addr;
+        if (!base)
+            base = UINT64_C(0x7fff0000);
+        addr = base | (addr & UINT64_C(0xffff));
+    } else if (s->flash_cmd_addr &&
+               ((addr & UINT64_C(0xffff)) == UINT64_C(0x6030) ||
+                (addr & UINT64_C(0xffff)) == UINT64_C(0xa030))) {
+        uint64_t aperture_end = (addr & ~UINT64_C(0xffff)) + 0x10000;
+        if (aperture_end && !(aperture_end & (aperture_end - 1)))
+            addr = s->flash_cmd_addr | (addr & UINT64_C(0xffff));
+    }
+    return addr;
+}
+
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64I2000State *s = ud;
     for (unsigned i = 0; i < size; i++)
@@ -2491,7 +2526,7 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
      * stripped; retaining them made SDV's MMIO PCI configuration cycles
      * miss every device. */
     bool region6 = (addr >> 60) == 0xC;
-    addr &= MERCED_PHYS_MASK;
+    addr = i2000_normalize_pa(s, addr);
     uint64_t high_off;
     if (i2000_high_dram_addr(addr, &high_off) &&
         high_off + size <= I2000_HIGH_DRAM_SIZE) {
@@ -2727,7 +2762,7 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
 
 static uint64_t bus_fetch(void *ud, uint64_t addr, unsigned size) {
     Ia64I2000State *s = ud;
-    addr &= MERCED_PHYS_MASK;
+    addr = i2000_normalize_pa(s, addr);
     /* Code fetches in the shadow window come from the flash ROM: on real
      * hardware the firmware executes through the top-of-4GiB ROM alias
      * while its data lives in the RAM shadow at the same offsets. Serving
@@ -2756,7 +2791,19 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                     s->cpu->ip, s->cpu->ninsts);
     }
     bool region6 = (addr >> 60) == 0xC;
-    addr &= MERCED_PHYS_MASK;
+    addr = i2000_normalize_pa(s, addr);
+    /* SAL first runs in a small bootstrap DRAM aperture and later in the
+     * fully-sized one.  It saves its two restore words at the top of the
+     * currently active aperture, then reloads them through sign-extended
+     * addresses.  Remember the aperture selected by the real save rather
+     * than assuming that it is always the final 2-GiB top. */
+    if (size == 8 && ((addr & UINT64_C(0xffff)) == UINT64_C(0x6030) ||
+                      (addr & UINT64_C(0xffff)) == UINT64_C(0xa030)) &&
+        addr < s->ram_size) {
+        uint64_t aperture_end = (addr & ~UINT64_C(0xffff)) + 0x10000;
+        if (aperture_end && !(aperture_end & (aperture_end - 1)))
+            s->flash_cmd_addr = addr & ~UINT64_C(0xffff);
+    }
     uint64_t high_off;
     if (i2000_high_dram_addr(addr, &high_off) &&
         high_off + size <= I2000_HIGH_DRAM_SIZE) {
@@ -3043,7 +3090,12 @@ static bool i2000_nvram_repair_bad_prefix(Ia64I2000State *s,
 }
 
 static void i2000_nvram_load(Ia64I2000State *s) {
-    gemu_config_path(s->nvram_path, sizeof(s->nvram_path), "i2000.nvram");
+    if (!s->nvram_path[0])
+        gemu_config_path(s->nvram_path, sizeof(s->nvram_path), "i2000.nvram");
+    if (getenv("I2000_IGNORE_NVRAM")) {
+        printf("i2000: ignoring saved NVRAM by request\n");
+        return;
+    }
     FILE *f = fopen(s->nvram_path, "rb");
     if (!f)
         return;
@@ -3119,6 +3171,22 @@ bool ia64_i2000_load_firmware(Ia64I2000State *s, const char *path) {
     snprintf(s->flash_file, sizeof(s->flash_file), "%s", path);
     s->flash_image_size = (uint32_t)len;
     s->flash_loaded = true;
+
+    /* A CDB is meaningful only with the firmware image which formatted it.
+     * Sharing the old i2000.nvram between the SDV debug image and an HP/AMI
+     * production image lets one BIOS replace the other's code and database,
+     * eventually tripping CDBFMM's format assertion.  Key persistence by the
+     * pristine, fully-positioned flash image so each firmware has an
+     * independent configuration database. */
+    uint64_t firmware_id = UINT64_C(1469598103934665603);
+    for (uint32_t i = 0; i < I2000_FLASH_SIZE; i++) {
+        firmware_id ^= s->flash[i];
+        firmware_id *= UINT64_C(1099511628211);
+    }
+    char nvram_name[64];
+    snprintf(nvram_name, sizeof(nvram_name), "i2000-%016" PRIx64 ".nvram",
+             firmware_id);
+    gemu_config_path(s->nvram_path, sizeof(s->nvram_path), nvram_name);
     i2000_nvram_load(s);
     if (i2000_repair_sdv_boot_timeout(s))
         s->nvram_dirty = true;

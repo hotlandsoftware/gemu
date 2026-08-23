@@ -6907,6 +6907,36 @@ MercedStatus merced_step(Merced *m) {
                     m->ninsts);
     }
 
+    /* Production i2000 firmware CDB/FMM error propagation path.  These
+     * addresses are deliberately only diagnostics: unlike the older SDV
+     * image, fwver130 does not use the validator entry points above. */
+    if (cdb_validator_debug_on && m->ninsts > 7200000000ull &&
+        (bundle_va == UINT64_C(0x7FEACF30) ||
+         bundle_va == UINT64_C(0x7FEAD1D0) ||
+         bundle_va == UINT64_C(0x7FEAD1E0) ||
+         bundle_va == UINT64_C(0x7FEAD650) ||
+         bundle_va == UINT64_C(0x7FEAF130) ||
+         bundle_va == UINT64_C(0x7FEAF140) ||
+         bundle_va == UINT64_C(0x7FEAF1E0))) {
+        static unsigned cdb_path_hits;
+        unsigned h = cdb_path_hits++;
+        if (h < 120)
+            fprintf(stderr, "merced: CDB-PATH #%u ip=%016" PRIX64
+                    ":%u b0=%016" PRIX64 " r8=%016" PRIX64
+                    " r32=%016" PRIX64 " r33=%016" PRIX64
+                    " r34=%016" PRIX64 " r35=%016" PRIX64
+                    " r36=%016" PRIX64 " r37=%016" PRIX64
+                    " r38=%016" PRIX64 " r39=%016" PRIX64
+                    " r40=%016" PRIX64 " pr=%016" PRIX64
+                    " ninsts=%" PRIu64 "\n",
+                    h, bundle_va, slot, m->br[0], gr_read(m, 8, NULL),
+                    gr_read(m, 32, NULL), gr_read(m, 33, NULL),
+                    gr_read(m, 34, NULL), gr_read(m, 35, NULL),
+                    gr_read(m, 36, NULL), gr_read(m, 37, NULL),
+                    gr_read(m, 38, NULL), gr_read(m, 39, NULL),
+                    gr_read(m, 40, NULL), m->pr, m->ninsts);
+    }
+
     if (atapi_trap_debug_on && bundle_va == UINT64_C(0x7FE7CAA0) && slot == 0) {
         static bool dumped;
         if (!dumped) {
