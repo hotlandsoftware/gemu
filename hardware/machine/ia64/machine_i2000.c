@@ -2149,7 +2149,13 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                 s->atapi_packet[s->atapi_packet_pos++] = (uint8_t)(val >> (i * 8));
             if (old_pos < 12 && s->atapi_packet_pos == 12) {
                 atapi_reply(s);
-                atapi_defer_ready(s, true);
+                /* The SDV's legacy EFI thunk checks the data phase
+                 * synchronously after writing the final PACKET word.  A0
+                 * itself must assert BSY (AtaPim explicitly waits for that
+                 * edge), but inserting another artificial BSY interval
+                 * here makes the thunk abandon PIO before its data read.
+                 * atapi_reply()/atapi_set_data() already expose DRQ and
+                 * schedule the normal data-ready IRQ. */
             }
             return;
         }
