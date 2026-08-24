@@ -106,7 +106,7 @@ jobs:
       # fail at compile time, PE subsystem version set to 5.1.
       - name: Configure
         run: >-
-          python3 configure --target-list="chip8,mos,rca" --disable-crypto
+          python3 configure --target-list="chip8,mos,rca,ia64" --disable-crypto
           --extra-cflags="-D_WIN32_WINNT=0x0502 -DWINVER=0x0502"
           --extra-ldflags="-Wl,--major-subsystem-version=5 -Wl,--minor-subsystem-version=1"
 
