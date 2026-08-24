@@ -23,13 +23,13 @@ jobs:
             libsdl2-dev libsdl2-ttf-dev libncurses-dev
 
       - name: Configure
-        run: ./configure --target-list="chip8,mos,rca"
+        run: ./configure --target-list="chip8,mos,rca,ia64"
 
       - name: Build
         run: ninja
 
       - name: Package
-        run: tar czf gemu-linux-x86_64.tar.gz -C bin gemu gemu-chip8 gemu-mos gemu-rca
+        run: tar czf gemu-linux-x86_64.tar.gz -C bin gemu gemu-chip8 gemu-mos gemu-rca gemu-ia64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -58,7 +58,7 @@ jobs:
             mingw-w64-x86_64-python
 
       - name: Configure
-        run: python3 configure --target-list="chip8,mos,rca"
+        run: python3 configure --target-list="chip8,mos,rca,ia64"
 
       - name: Build
         run: ninja
