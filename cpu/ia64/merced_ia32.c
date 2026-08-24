@@ -1044,10 +1044,16 @@ MercedStatus merced_ia32_step(Merced *m) {
             } else {
                 uint32_t di = xr(&x, 7, asize);
                 /* INS destination is always ES:(E)DI; segment overrides do
-                 * not apply to it. Perform the port read only after the
-                 * destination is known writable enough for the ordinary
-                 * success path used by this firmware. */
-                if (!ioread(&x, port, n, &v) ||
+                 * not apply to it.  Probe the destination before consuming
+                 * the port value: a page fault must leave the I/O device
+                 * untouched so the restarted instruction reads the same
+                 * word.  Without this probe REP INSW dropped one ATAPI word
+                 * at every new destination page.  The following write uses
+                 * the translation established by the probe; these firmware
+                 * buffers are ordinary read/write RAM. */
+                uint32_t ignored;
+                if (!rb(&x, sbase(&x, X_ES) + di, n, false, &ignored) ||
+                    !ioread(&x, port, n, &v) ||
                     !wb(&x, sbase(&x, X_ES) + di, n, v))
                     goto fault;
                 setxr(&x, 7, asize, di + step);

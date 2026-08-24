@@ -2246,16 +2246,13 @@ void merced_reset(Merced *m) {
      *   - i2000's own firmware cross-checks it against
      *     machine_i2000.c's memcard_cfg[0][2][0x05] (CBN:05.2 processor
      *     descriptor) - a mismatch reads as "no recognized processor"
-     *     and parks SAL at FFFE2020. Revision 6 ("C2" stepping)
-     *     diverges into a firmware code path that isn't understood yet
-     *     (see SALE_ENTRY reason-dispatch panic in commit 69fab2c); 0
-     *     is what's confirmed working there, and remains the default.
+     *     and parks SAL at FFFE2020.  Revision 0 is therefore used during
+     *     that firmware's early enumeration; the machine promotes CPUID to
+     *     production Merced C0 when it hands off to a loaded EFI image.
      *   - Windows for Itanium (SETUPLDR.EFI on the generic machine)
      *     refuses to proceed on anything it reads as "pre-B3 stepping" -
      *     real historical behavior, not an emulator bug. The generic
-     *     machine sets revision 6 for this reason; it doesn't run
-     *     i2000's firmware, so that machine's SALE_ENTRY concern doesn't
-     *     apply to it. */
+     *     machines expose revision 6 for this reason. */
     memcpy(&m->cpuid[0], "GenuineI", 8);
     memcpy(&m->cpuid[1], "ntel\0\0\0\0", 8);
     m->cpuid[2] = 0;
@@ -6221,10 +6218,14 @@ MercedStatus merced_step(Merced *m) {
      * the interrupt latched until firmware installs its next IVT, just as the
      * platform interrupt gate does during this handoff.  The window includes
      * AMI's IA-32 compatibility calls: their low IP no longer identifies the
-     * surrounding native firmware, but PSR.is does. */
+     * surrounding native firmware, but PSR.is does.  The i2000 loader also
+     * enters EFI applications through the 460GX tagged high-DRAM aperture
+     * (00000eXX...), before the application's IVT is installed. */
     bool ami_ivt_handoff = m->cr[CR_IVA] == 0 &&
                            ((m->ip >= UINT64_C(0x7F000000) &&
                              m->ip < UINT64_C(0x80000000)) ||
+                            ((m->ip & UINT64_C(0x00000fff00000000)) ==
+                             UINT64_C(0x00000e0000000000)) ||
                             (m->psr & PSR_IS));
 
     if (m->psr & PSR_IS) {

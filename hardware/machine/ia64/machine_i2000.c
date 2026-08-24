@@ -2483,9 +2483,9 @@ static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi) {
 
 /* SDV's 460GX memory map carries the memory-card/port selector in physical
  * address bits 43:32.  Aperture 0xe00 is distinct from the low firmware
- * mapping: EFI uses both at once, so folding it onto low RAM corrupts its
- * stacks. Back the top 64 MiB separately; this covers the top-down EFI pool
- * while avoiding another full 2 GiB host allocation. */
+ * mapping for data: EFI uses both at once, so folding tagged stores onto low
+ * RAM corrupts its executable image and stacks. Back the top 64 MiB as a
+ * complete private code-and-data aperture. */
 static inline bool i2000_high_dram_addr(uint64_t addr, uint64_t *off) {
     if ((addr & UINT64_C(0x00000fff00000000)) != I2000_HIGH_DRAM_TAG)
         return false;
@@ -4266,7 +4266,7 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->memcard_cfg[0][2][0x02] = 4;  /* processor present */
     s->memcard_cfg[0][2][0x03] = 7;  /* Itanium family */
     s->memcard_cfg[0][2][0x04] = 0;  /* Merced model */
-    s->memcard_cfg[0][2][0x05] = 0;  /* revision - must match cpuid[3] */
+    s->memcard_cfg[0][2][0x05] = 0;  /* SDV prototype revision; see run loop */
 
     s->smb_hststs = s->smb_hstcnt = s->smb_hstcmd = s->smb_hstadd = 0;
     s->smb_hstdat0 = s->smb_hstdat1 = 0;
@@ -4382,7 +4382,6 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
         ia64_i2000_destroy(s);
         return NULL;
     }
-
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_cpu_state_cb(s->monitor, i2000_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, i2000_screendump, s);
@@ -4733,6 +4732,18 @@ static void i2000_run_slice(Ia64I2000State *s) {
          * the modeled hardware while bounding delivery skew to 15 slots. */
         if ((i & (IRQ_POLL_QUANTUM - 1)) == 0)
             i2000_poll_interrupts(s);
+        /* The 0.99 SDV firmware only completes SAL initialization when its
+         * prototype processor descriptor and CPUID both report revision 0.
+         * Windows/IA-64, however, deliberately rejects pre-B3 silicon.  EFI
+         * applications are loaded into the 460GX tagged high-DRAM aperture;
+         * once execution enters one, processor enumeration is complete and
+         * it is safe to expose the production Merced C0 revision (CPUID
+         * 0007000604).  This keeps the firmware's early cross-check coherent
+         * without presenting obsolete prototype silicon to the OS loader. */
+        if (s->cpu->cpu_revision == 0 &&
+            (s->cpu->ip & UINT64_C(0x00000fff00000000)) ==
+                I2000_HIGH_DRAM_TAG)
+            merced_set_cpu_revision(s->cpu, 6);
         MercedStatus st = merced_step(s->cpu);
         /* A memory watchpoint can be raised from inside the bus callback.
          * Stop this execution slice immediately so the reported IP remains
