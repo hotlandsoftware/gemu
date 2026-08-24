@@ -72,6 +72,7 @@ static bool r18_debug_on, r48_debug_on, zero_loop_debug_on, bad_store_debug_on;
  * dispatches on this to decide between retrying with PSR.ed and running its
  * real fault handler, so a delivered ld.s fault must report it. */
 #define ISR_SP (1ull << 36)
+#define ISR_RS (1ull << 37) /* register-stack-engine reference */
 #define ISR_ED (1ull << 43)
 
 /* PTE fields (SDM Vol.2 4.1, "Translation Insertion Format"). */
@@ -881,11 +882,11 @@ static void nt_debugprint(Merced *m) {
     fflush(stderr);
 }
 
-static void rse_preserve_interrupted_partition(Merced *m, uint64_t iip,
+static bool rse_preserve_interrupted_partition(Merced *m, uint64_t iip,
                                                 uint64_t ipsr) {
     if (m->interruption_rse_depth >=
         sizeof(m->interruption_rse) / sizeof(m->interruption_rse[0]))
-        return;
+        return false;
     typeof(m->interruption_rse[0]) *s =
         &m->interruption_rse[m->interruption_rse_depth++];
     s->iip = iip;
@@ -897,6 +898,7 @@ static void rse_preserve_interrupted_partition(Merced *m, uint64_t iip,
     s->anchor_addr = m->rse_anchor_addr;
     s->anchor_regs = m->rse_anchor_regs;
     s->flushed_regs = m->rse_flushed_regs;
+    return true;
 }
 
 static bool rse_restore_interrupted_partition(Merced *m, uint64_t iip,
@@ -924,6 +926,13 @@ static bool rse_restore_interrupted_partition(Merced *m, uint64_t iip,
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     m->nfaults++;
+    /* Interruption delivery is both an instruction- and data-serialization
+     * event (SDM Vol. 2, 3.1.4).  In particular, a ptc/ptr issued by a page
+     * fault handler must have completed before any nested handler lookup.
+     * Leaving the invalidation pending let NT immediately re-hit a cached
+     * P=0 VHPT entry and fault forever at "Setup is starting Windows". */
+    tlb_serialize_data(m);
+    tlb_serialize_instruction(m);
     /* XP/IA-64 currently reaches KeBugCheckEx with
      * STATUS_REG_NAT_CONSUMPTION after executing the bundle at 8355b4e0.
      * Preserve the pre-interruption register/NaT state here: once control
@@ -1732,8 +1741,10 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
      * is the architectural exception and forces ED clear below. */
     uint64_t code_ed_isr = (!ifetch && code_page_ed(m)) ? ISR_ED : 0;
     *st = MERCED_OK;
+    bool is_rse = !ifetch && (isr_access & ISR_RS) != 0;
     bool on = force ||
-              (ifetch ? (m->psr & PSR_IT) != 0 : (m->psr & PSR_DT) != 0);
+              (ifetch ? (m->psr & PSR_IT) != 0
+                      : (m->psr & (is_rse ? PSR_RT : PSR_DT)) != 0);
     if (!on) {
         *pa = va & MERCED_PHYS_MASK;
         return true;
@@ -1871,7 +1882,7 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         if (isr_access & ISR_W) needed |= PERM_W;
         if (isr_access & ISR_X) needed |= PERM_X;
         fvec = translation_fault_vector(m, e, needed, ifetch,
-                                        (isr_access & ISR_W) != 0, false);
+                                        (isr_access & ISR_W) != 0, is_rse);
         if (fvec) {
             /* A control-speculative load defers a deferrable fault rather
              * than raising it; the caller turns our refusal into a NaT. */
@@ -3017,6 +3028,24 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
 static unsigned tlb_debug_events;
 #define TLB_DEBUG_MAX 48
 
+static bool tlb_payload_overlaps(uint64_t entry_start, uint64_t entry_end,
+                                 uint64_t va, uint64_t len) {
+    const uint64_t mask = (UINT64_C(1) << 61) - 1;
+    uint64_t start = entry_start & mask;
+    uint64_t end = entry_end & mask;
+    uint64_t purge_start = va & mask;
+    uint64_t purge_end = purge_start + len - 1;
+
+    /* A TC/TR tag contains the RID and VPN, not the virtual region number.
+     * Match the same 61-bit payload tlb_search() uses.  A very large purge
+     * can wrap at the payload boundary and therefore covers two intervals. */
+    if (len == 0 || len > (UINT64_C(1) << 61))
+        return true;
+    if (purge_end <= mask)
+        return start <= purge_end && purge_start <= end;
+    return start <= (purge_end & mask) || purge_start <= end;
+}
+
 /* debug: log transitions of PSR.it / PSR.dt with their source */
 static void psr_trans_log(Merced *m, uint64_t newpsr, const char *src) {
     static unsigned n;
@@ -3042,6 +3071,7 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
     uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
     uint64_t new_start = ifa & page;
     uint64_t new_end = new_start + (ps >= 64 ? ~0ull : (1ull << ps) - 1);
+    uint64_t new_len = ps >= 61 ? (UINT64_C(1) << 61) : (UINT64_C(1) << ps);
 
     /* An ITC insertion replaces any overlapping TC translation for the
      * same region ID.  Keeping both is not harmless: lookup order would
@@ -3050,7 +3080,8 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
     MercedTlbEntry *tc = instruction ? m->itc : m->dtc;
     for (unsigned i = 0; i < MERCED_N_TC; i++) {
         if (&tc[i] != e && tc[i].valid && tc[i].rid == rid &&
-            tc[i].va_start <= new_end && new_start <= tc[i].va_end)
+            tlb_payload_overlaps(tc[i].va_start, tc[i].va_end,
+                                 new_start, new_len))
             tc[i].valid = 0;
     }
     /* TC occupancy and PTE.p are distinct architectural state.  A VHPT
@@ -3478,7 +3509,7 @@ static void tlb_purge(Merced *m, MercedTlbEntry *t, int n, uint32_t rid,
                       uint64_t va, uint64_t len) {
     for (int i = 0; i < n; i++) {
         if (t[i].valid && t[i].rid == rid &&
-            t[i].va_start < va + len && va <= t[i].va_end) {
+            tlb_payload_overlaps(t[i].va_start, t[i].va_end, va, len)) {
             if (getenv("MERCED_MMU_DEBUG"))
                 fprintf(stderr, "merced: XLATE purge ip=%016" PRIX64
                         " va=%016" PRIX64 " len=%016" PRIX64
@@ -3502,7 +3533,7 @@ static void tlb_mark_purge(Merced *m, MercedTlbEntry *t, int n, uint32_t rid,
                            uint64_t va, uint64_t len) {
     for (int i = 0; i < n; i++)
         if (t[i].valid && t[i].rid == rid &&
-            t[i].va_start < va + len && va <= t[i].va_end &&
+            tlb_payload_overlaps(t[i].va_start, t[i].va_end, va, len) &&
             !t[i].pending_purge) {
             t[i].pending_purge = 1;
             m->tlb_purge_pending++;
@@ -3619,7 +3650,8 @@ static MercedStatus rse_store_through(Merced *m, int64_t end) {
         uint32_t idx = rse_stack_slot(m, p);
         uint64_t pa;
         MercedStatus st;
-        if (!va_translate(m, rse_addr(m, p), false, false, ISR_W, &pa, &st))
+        if (!va_translate(m, rse_addr(m, p), false, false,
+                          ISR_W | ISR_RS, &pa, &st))
             return st;
         if (getenv("MERCED_R36_DEBUG") && idx == 291 && dbg_store291++ < 64)
             fprintf(stderr, "merced: RSE store slot291 pos=%" PRId64
@@ -3676,7 +3708,8 @@ static MercedStatus rse_load(Merced *m, uint64_t loadrs_bytes) {
         uint32_t idx = rse_stack_slot(m, p);
         uint64_t pa;
         MercedStatus st;
-        if (!va_translate(m, rse_addr(m, p), false, false, ISR_R, &pa, &st))
+        if (!va_translate(m, rse_addr(m, p), false, false,
+                          ISR_R | ISR_RS, &pa, &st))
             return st;
         uint64_t value = phys_read(m, pa, 8);
         if (m->ar[AR_RSC] & (UINT64_C(1) << 4))
@@ -7316,10 +7349,10 @@ void merced_dump_state(const Merced *m, char *buf, size_t len) {
       (unsigned)((m->psr >> 27) & 1), (unsigned)((m->psr >> 44) & 1),
       (unsigned)((m->psr >> 3) & 1));
     P("CFM sof=%u sol=%u sor=%u rrb=%u/%u/%u  bof=%u/%" PRIu64
-      "  PR %016" PRIX64 "\n",
+      "  PR %016" PRIX64 "  irq-rse-depth=%u\n",
       CFM_SOF(m->cfm), CFM_SOL(m->cfm), CFM_SOR(m->cfm),
       CFM_RRB_GR(m->cfm), CFM_RRB_FR(m->cfm), CFM_RRB_PR(m->cfm),
-      m->bof, m->bof_total, m->pr);
+      m->bof, m->bof_total, m->pr, m->interruption_rse_depth);
     for (unsigned r = 0; r < 32; r += 4) {
         P("r%-3u %016" PRIX64 " %016" PRIX64 " %016" PRIX64 " %016" PRIX64 "\n",
           r,
