@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <inttypes.h>
 #ifdef _WIN32
 #  include <direct.h>
 #  define strcasecmp      _stricmp
@@ -2451,6 +2452,193 @@ void nes_destroy(NesState *s) {
     free(s);
 }
 
+/* ── Snapshots (monitor "savevm"/"loadvm") ──────────────────────────────────
+ *
+ * Dumps the whole NesState verbatim (CPU/PPU/APU/mapper registers, work RAM,
+ * OAM, etc. are all plain embedded arrays/scalars) plus the CHR banks when
+ * they're RAM rather than ROM. Pointer/handle fields (display, monitor, the
+ * PRG/CHR ROM buffers, callback wiring set up once in nes_create(), the live
+ * SDL audio device, ...) are never meaningful to persist - they're captured
+ * before the struct is overwritten and spliced back in afterward, the same
+ * pattern machine_i2000.c uses for its savevm/loadvm. */
+
+#define NES_SNAPSHOT_MAGIC    0x314D5645534d454eULL /* "NEMSVE1" */
+#define NES_SNAPSHOT_VERSION  1u
+
+static bool nes_save_snapshot(NesState *s, const char *path) {
+    if (s->fds_enabled) {
+        fprintf(stderr, "nes: savevm not supported for FDS yet\n");
+        return false;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = true;
+    uint64_t magic   = NES_SNAPSHOT_MAGIC;
+    uint32_t version = NES_SNAPSHOT_VERSION;
+    ok &= fwrite(&magic,   sizeof(magic),   1, f) == 1;
+    ok &= fwrite(&version, sizeof(version), 1, f) == 1;
+    ok &= fwrite(&s->cart, sizeof(s->cart), 1, f) == 1;
+
+    uint64_t chr_len = s->chr_is_ram ? (uint64_t)s->cart.chr_banks * 0x2000u : 0;
+    ok &= fwrite(&chr_len, sizeof(chr_len), 1, f) == 1;
+    if (chr_len)
+        ok &= fwrite(s->chr, 1, chr_len, f) == chr_len;
+
+    NesState *snap = malloc(sizeof(*snap));
+    if (!snap) { fclose(f); return false; }
+    *snap = *s;
+    snap->cfg     = NULL;
+    snap->prg     = NULL;
+    snap->chr     = NULL;
+    snap->display = NULL;
+    snap->vnc     = NULL;
+    snap->monitor = NULL;
+    snap->crt_signal       = NULL;
+    snap->crt_decoded_argb = NULL;
+    snap->crt_argb         = NULL;
+    snap->cpu.mem_read  = NULL; snap->cpu.mem_write  = NULL; snap->cpu.mem_ud  = NULL;
+    snap->ppu.chr_read  = NULL; snap->ppu.chr_write  = NULL; snap->ppu.chr_ud  = NULL;
+    snap->ppu.nt_read   = NULL; snap->ppu.nt_write   = NULL; snap->ppu.nt_ud   = NULL;
+    snap->ppu.irq_scanline  = NULL; snap->ppu.irq_ud = NULL;
+    snap->ppu.alt_palette_rgb = NULL;
+    snap->apu.mem_read     = NULL; snap->apu.mem_ud       = NULL;
+    snap->apu.write_tap    = NULL; snap->apu.write_tap_ud = NULL;
+    snap->apu.audio_dev    = 0;
+    snap->fds.raw_disk = NULL;
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
+    snap->apu_midi.out = NULL;
+#endif
+#if defined(GEMU_GTK) || defined(_WIN32)
+    snap->hex_editor = NULL;
+#endif
+#ifdef HAVE_ROB
+    snap->rob_window = NULL;
+#endif
+#ifdef HAVE_LUA
+    snap->lua = NULL;
+#endif
+    ok &= fwrite(snap, sizeof(*snap), 1, f) == 1;
+    free(snap);
+
+    fclose(f);
+    return ok;
+}
+
+static bool nes_load_snapshot(NesState *s, const char *path) {
+    if (s->fds_enabled) {
+        fprintf(stderr, "nes: loadvm not supported for FDS yet\n");
+        return false;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    bool ok = true;
+    uint64_t magic   = 0;
+    uint32_t version = 0;
+    NesCart  cart     = {0};
+    ok &= fread(&magic,   sizeof(magic),   1, f) == 1;
+    ok &= fread(&version, sizeof(version), 1, f) == 1;
+    ok &= fread(&cart,    sizeof(cart),    1, f) == 1;
+    if (!ok || magic != NES_SNAPSHOT_MAGIC || version != NES_SNAPSHOT_VERSION ||
+        cart.mapper != s->cart.mapper || cart.prg_banks != s->cart.prg_banks ||
+        cart.chr_banks != s->cart.chr_banks) {
+        fprintf(stderr, "nes: loadvm: snapshot doesn't match the loaded cartridge\n");
+        fclose(f);
+        return false;
+    }
+
+    uint64_t chr_len = 0;
+    ok &= fread(&chr_len, sizeof(chr_len), 1, f) == 1;
+    if (chr_len && (!s->chr_is_ram || chr_len != (uint64_t)s->cart.chr_banks * 0x2000u)) {
+        fprintf(stderr, "nes: loadvm: CHR RAM size mismatch\n");
+        fclose(f);
+        return false;
+    }
+    if (chr_len)
+        ok &= fread(s->chr, 1, chr_len, f) == chr_len;
+
+    NesState *loaded = malloc(sizeof(*loaded));
+    if (!loaded) { fclose(f); return false; }
+    ok &= fread(loaded, sizeof(*loaded), 1, f) == 1;
+    if (!ok) { free(loaded); fclose(f); return false; }
+
+    const MosConfig *cfg     = s->cfg;
+    uint8_t          *prg     = s->prg;
+    uint8_t          *chr     = s->chr;
+    GemuDisplay      *display = s->display;
+    GemuVncServer    *vnc     = s->vnc;
+    GemuMonitor      *monitor = s->monitor;
+    float            *crt_signal       = s->crt_signal;
+    uint32_t         *crt_decoded_argb = s->crt_decoded_argb;
+    uint32_t         *crt_argb         = s->crt_argb;
+    void *cpu_mem_ud  = s->cpu.mem_ud;
+    void *ppu_chr_ud  = s->ppu.chr_ud;
+    void *ppu_nt_ud   = s->ppu.nt_ud;
+    void *ppu_irq_ud  = s->ppu.irq_ud;
+    const uint32_t *ppu_alt_palette = s->ppu.alt_palette_rgb;
+    void *apu_mem_ud       = s->apu.mem_ud;
+    void *apu_write_tap_ud = s->apu.write_tap_ud;
+    SDL_AudioDeviceID audio_dev = s->apu.audio_dev;
+    uint8_t *fds_raw_disk = s->fds.raw_disk;
+    typeof(s->cpu.mem_read)   cpu_mem_read   = s->cpu.mem_read;
+    typeof(s->cpu.mem_write)  cpu_mem_write  = s->cpu.mem_write;
+    typeof(s->ppu.chr_read)   ppu_chr_read   = s->ppu.chr_read;
+    typeof(s->ppu.chr_write)  ppu_chr_write  = s->ppu.chr_write;
+    typeof(s->ppu.nt_read)    ppu_nt_read    = s->ppu.nt_read;
+    typeof(s->ppu.nt_write)   ppu_nt_write   = s->ppu.nt_write;
+    typeof(s->ppu.irq_scanline) ppu_irq_scanline = s->ppu.irq_scanline;
+    typeof(s->apu.mem_read)   apu_mem_read   = s->apu.mem_read;
+    typeof(s->apu.write_tap)  apu_write_tap  = s->apu.write_tap;
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
+    MidiOut *apu_midi_out = s->apu_midi.out;
+#endif
+#if defined(GEMU_GTK) || defined(_WIN32)
+    HexEditor *hex_editor = s->hex_editor;
+#endif
+#ifdef HAVE_ROB
+    RobWindow *rob_window = s->rob_window;
+#endif
+#ifdef HAVE_LUA
+    NesLua *lua = s->lua;
+#endif
+
+    *s = *loaded;
+    free(loaded);
+
+    s->cfg     = cfg;
+    s->prg     = prg;
+    s->chr     = chr;
+    s->display = display;
+    s->vnc     = vnc;
+    s->monitor = monitor;
+    s->crt_signal       = crt_signal;
+    s->crt_decoded_argb = crt_decoded_argb;
+    s->crt_argb         = crt_argb;
+    s->cpu.mem_read  = cpu_mem_read;  s->cpu.mem_write = cpu_mem_write; s->cpu.mem_ud = cpu_mem_ud;
+    s->ppu.chr_read  = ppu_chr_read;  s->ppu.chr_write = ppu_chr_write; s->ppu.chr_ud = ppu_chr_ud;
+    s->ppu.nt_read   = ppu_nt_read;   s->ppu.nt_write  = ppu_nt_write;  s->ppu.nt_ud  = ppu_nt_ud;
+    s->ppu.irq_scanline = ppu_irq_scanline; s->ppu.irq_ud = ppu_irq_ud;
+    s->ppu.alt_palette_rgb = ppu_alt_palette;
+    s->apu.mem_read = apu_mem_read; s->apu.mem_ud = apu_mem_ud;
+    s->apu.write_tap = apu_write_tap; s->apu.write_tap_ud = apu_write_tap_ud;
+    s->apu.audio_dev = audio_dev;
+    s->fds.raw_disk = fds_raw_disk;
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
+    s->apu_midi.out = apu_midi_out;
+#endif
+#if defined(GEMU_GTK) || defined(_WIN32)
+    s->hex_editor = hex_editor;
+#endif
+#ifdef HAVE_ROB
+    s->rob_window = rob_window;
+#endif
+#ifdef HAVE_LUA
+    s->lua = lua;
+#endif
+
+    fclose(f);
+    return true;
+}
+
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
 /* Fallback frame duration when audio is off (headless / -soundhw none). */
@@ -2487,7 +2675,20 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             else if (cmd == GEMU_MON_CUSTOM) {
                 const char *text = gemu_monitor_command_text(s->monitor);
                 while (*text == ' ' || *text == '\t') text++;
-                if (s->cfg->is_arcade &&
+                char vm_path[256];
+                if (text && sscanf(text, "savevm %255s", vm_path) == 1) {
+                    if (nes_save_snapshot(s, vm_path))
+                        printf("saved snapshot to %s (frame=%" PRIu64 ")\n",
+                               vm_path, s->ppu.frame);
+                    else
+                        printf("failed to save snapshot to %s\n", vm_path);
+                } else if (text && sscanf(text, "loadvm %255s", vm_path) == 1) {
+                    if (nes_load_snapshot(s, vm_path))
+                        printf("loaded snapshot from %s (frame=%" PRIu64 ")\n",
+                               vm_path, s->ppu.frame);
+                    else
+                        printf("failed to load snapshot from %s\n", vm_path);
+                } else if (s->cfg->is_arcade &&
                     strncasecmp(text, "dipswitch", 9) == 0 &&
                     (text[9] == '\0' || text[9] == ' ' || text[9] == '\t'))
                     vs_dip_cmd(s, text + 9);
