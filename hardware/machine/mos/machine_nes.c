@@ -2688,6 +2688,34 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                                vm_path, s->ppu.frame);
                     else
                         printf("failed to load snapshot from %s\n", vm_path);
+                } else if (strncasecmp(text, "peek", 4) == 0 &&
+                           (text[4] == '\0' || text[4] == ' ' || text[4] == '\t')) {
+                    unsigned addr = 0, len = 16;
+                    int n = sscanf(text + 4, "%x %u", &addr, &len);
+                    if (n >= 1) {
+                        if (len > 256) len = 256;
+                        printf("RAM $%04X:", addr & 0x7FFu);
+                        for (unsigned i = 0; i < len; i++)
+                            printf(" %02X", s->ram[(addr + i) & 0x7FFu]);
+                        printf("\n");
+                    } else {
+                        printf("peek: usage: peek ADDR_HEX [len]\n");
+                    }
+                } else if (strncasecmp(text, "regs", 4) == 0 &&
+                           (text[4] == '\0' || text[4] == ' ' || text[4] == '\t')) {
+                    printf("CPU: PC=%04X A=%02X X=%02X Y=%02X SP=%02X P=%02X "
+                           "insn=%" PRIu64 " cyc=%" PRIu64 "\n",
+                           s->cpu.PC, s->cpu.A, s->cpu.X, s->cpu.Y, s->cpu.SP, s->cpu.P,
+                           s->cpu.insn_count, s->cpu.cycle_count);
+                } else if (strncasecmp(text, "mapperdump", 10) == 0 &&
+                           (text[10] == '\0' || text[10] == ' ' || text[10] == '\t')) {
+                    printf("mapper=%u bank_sel=%02X regs=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                           s->cart.mapper, s->mmc3_bank_sel,
+                           s->mmc3_regs[0], s->mmc3_regs[1], s->mmc3_regs[2], s->mmc3_regs[3],
+                           s->mmc3_regs[4], s->mmc3_regs[5], s->mmc3_regs[6], s->mmc3_regs[7]);
+                    printf("prg_offsets($8000,$A000,$C000,$E000)=%06X %06X %06X %06X\n",
+                           s->mmc3_prg_offsets[0], s->mmc3_prg_offsets[1],
+                           s->mmc3_prg_offsets[2], s->mmc3_prg_offsets[3]);
                 } else if (s->cfg->is_arcade &&
                     strncasecmp(text, "dipswitch", 9) == 0 &&
                     (text[9] == '\0' || text[9] == ' ' || text[9] == '\t'))
