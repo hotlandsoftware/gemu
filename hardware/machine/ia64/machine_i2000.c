@@ -3460,6 +3460,57 @@ static bool i2000_screendump(void *ud, const char *path) {
     return gemu_screendump_argb(path, s->fb, FB_W, FB_H);
 }
 
+/* The SDV EFI presentation environment leaves cr.iva at zero and obtains
+ * console keys through its CSM/INT16-compatible BIOS data-area ring.  On
+ * real hardware the legacy IRQ1 thunk transfers 8042 scan codes into this
+ * buffer.  GEMU deliberately suppresses interrupts while IVA is zero (the
+ * native vector at 0x3000 is empty), so complete that transfer here for host
+ * input while execution is in the 0x7fxxxxxx firmware presentation code.
+ * Outside that narrowly identified environment the real PS/2 path remains
+ * authoritative, avoiding duplicate keys for an OS with a live IRQ1 stack. */
+static uint8_t i2000_bios_scan(uint8_t ascii) {
+    static const uint8_t letters[26] = {
+        0x1e,0x30,0x2e,0x20,0x12,0x21,0x22,0x23,0x17,0x24,0x25,0x26,0x32,
+        0x31,0x18,0x19,0x10,0x13,0x1f,0x14,0x16,0x2f,0x11,0x2d,0x15,0x2c
+    };
+    if (ascii >= 'a' && ascii <= 'z') return letters[ascii - 'a'];
+    if (ascii >= 'A' && ascii <= 'Z') return letters[ascii - 'A'];
+    if (ascii >= '1' && ascii <= '9') return (uint8_t)(ascii - '1' + 2);
+    if (ascii == '0') return 0x0b;
+    switch (ascii) {
+    case '\r': case '\n': return 0x1c;
+    case '\b': return 0x0e;
+    case '\t': return 0x0f;
+    case 0x1b: return 0x01;
+    case ' ': return 0x39;
+    case '-': return 0x0c; case '=': return 0x0d;
+    case '[': return 0x1a; case ']': return 0x1b;
+    case ';': return 0x27; case '\'': return 0x28;
+    case '`': return 0x29; case '\\': return 0x2b;
+    case ',': return 0x33; case '.': return 0x34; case '/': return 0x35;
+    default: return 0;
+    }
+}
+
+static void i2000_efi_bios_key(Ia64I2000State *s, uint8_t ascii) {
+    if (!ascii || s->ram_size <= 0x43d || s->cpu->cr[2] != 0 ||
+        s->cpu->ip < UINT64_C(0x7f000000) ||
+        s->cpu->ip >= UINT64_C(0x80000000))
+        return;
+    uint16_t head = (uint16_t)(s->ram[0x41a] | (s->ram[0x41b] << 8));
+    uint16_t tail = (uint16_t)(s->ram[0x41c] | (s->ram[0x41d] << 8));
+    if (head < 0x1e || head >= 0x3e || (head & 1) ||
+        tail < 0x1e || tail >= 0x3e || (tail & 1))
+        return;
+    uint16_t next = (uint16_t)(tail + 2);
+    if (next >= 0x3e) next = 0x1e;
+    if (next == head) return; /* BIOS ring full */
+    s->ram[0x400 + tail] = ascii;
+    s->ram[0x401 + tail] = i2000_bios_scan(ascii);
+    s->ram[0x41c] = (uint8_t)next;
+    s->ram[0x41d] = (uint8_t)(next >> 8);
+}
+
 /* Snapshot format: full-machine save/restore so a slow, deterministic boot
  * only ever has to run once. Everything in Ia64I2000State and Merced is
  * plain data (fixed-size arrays and scalars) except a handful of pointers
@@ -4017,6 +4068,20 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
             else if (!strcmp(keyarg, "esc"))   special = 0x1b;
             if (special) {
                 ps2_keyboard_tap(&s->ps2_keyboard, special);
+                /* EFI's built-in shell uses the polled serial console in
+                 * this firmware revision (cr.iva remains zero, so it does
+                 * not consume PS/2 IRQ1 scan codes).  Real SDL/VNC ASCII
+                 * input is mirrored into UART RX; monitor injection must do
+                 * the same or `key` appears to succeed while the shell sees
+                 * nothing. */
+                if (special <= 0x7f) {
+                    uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+                    if (next != s->uart_rx_head) {
+                        s->uart_rx[s->uart_rx_tail] = (uint8_t)special;
+                        s->uart_rx_tail = next;
+                    }
+                    i2000_efi_bios_key(s, (uint8_t)special);
+                }
                 printf("key %s queued\n", keyarg);
             } else {
                 size_t queued = 0;
@@ -4025,6 +4090,12 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
                     if (*p < 0x20 || *p > 0x7e)
                         continue;
                     ps2_keyboard_tap(&s->ps2_keyboard, *p);
+                    uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+                    if (next != s->uart_rx_head) {
+                        s->uart_rx[s->uart_rx_tail] = *p;
+                        s->uart_rx_tail = next;
+                    }
+                    i2000_efi_bios_key(s, *p);
                     queued++;
                 }
                 printf("key: queued %zu character%s; use 'key enter' to "
@@ -4940,6 +5011,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                     s->uart_rx[s->uart_rx_tail] = (uint8_t)cp;
                     s->uart_rx_tail = next;
                     ps2_keyboard_tap(&s->ps2_keyboard, cp);
+                    i2000_efi_bios_key(s, (uint8_t)cp);
                 }
             }
             if (gemu_display_should_quit(s->display)) {
@@ -4968,6 +5040,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                         s->uart_rx[s->uart_rx_tail] = (uint8_t)cp;
                         s->uart_rx_tail = next;
                     }
+                    i2000_efi_bios_key(s, (uint8_t)cp);
                 }
                 ps2_keyboard_key(&s->ps2_keyboard,
                                  cp ? cp : ev.keysym, ev.down);

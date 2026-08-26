@@ -539,6 +539,12 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     });
     if (!b->video) { free(b); return NULL; }
 
+    /* Printable keys are deliberately sourced from SDL_TEXTINPUT rather
+     * than KEYDOWN so host layout/Shift handling stays correct.  Linux
+     * backends commonly enable text events implicitly; Windows does not do
+     * so reliably after focus/capture transitions. */
+    SDL_StartTextInput();
+
     if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0) {
         SDL_GameControllerEventState(SDL_ENABLE);
         open_first_controller(b);
