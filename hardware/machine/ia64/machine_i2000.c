@@ -18,6 +18,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 /*
  * HP i2000 system model. See i2000.h for the memory map.
@@ -1471,7 +1474,11 @@ static void cmos_sync_live_clock(Ia64I2000State *s) {
         t = time(NULL);
     }
     struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
     localtime_r(&t, &tmv);
+#endif
     s->cmos[0x00] = cmos_bcd((unsigned)tmv.tm_sec);
     s->cmos[0x02] = cmos_bcd((unsigned)tmv.tm_min);
     s->cmos[0x04] = cmos_bcd((unsigned)tmv.tm_hour);
@@ -4282,7 +4289,11 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     if (!s)
         return NULL;
 
+#ifdef _WIN32
+    _mkdir(I2000_AUTOSAVE_DIR); /* ignore EEXIST/already-there */
+#else
     mkdir(I2000_AUTOSAVE_DIR, 0755); /* ignore EEXIST/already-there */
+#endif
 
     s->pic_master_mask = 0xFF;
     s->pic_slave_mask = 0xFF;
