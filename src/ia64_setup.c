@@ -2,6 +2,7 @@
 #include "generic.h"
 #include "romdb.h"
 #include "gemu/args.h"
+#include "gemu/drive.h"
 #include "gemu/monitor.h"
 #include <SDL2/SDL.h>
 #include <inttypes.h>
@@ -63,6 +64,13 @@ static const GemuArgsDef def = {
         "  -rom DIR|ZIP    Scan for known firmware by SHA-256\n"
         "  -m SIZE         RAM size, K/M/G suffix (default 512M)\n"
         "  -cdrom FILE     Attach a read-only ISO image as an ATAPI CD-ROM\n"
+        "                  (alias for -drive file=FILE,if=ide,media=cdrom)\n"
+        "  -drive file=FILE,if=ide,media=disk|cdrom[,index=0][,readonly=on|off]\n"
+        "                  QEMU-style drive attach. i2000 exposes one IDE\n"
+        "                  drive per channel (index=0 only): media=disk\n"
+        "                  goes to the primary ATA HDD (like -hda), media=\n"
+        "                  cdrom goes to the secondary ATAPI CD-ROM (like\n"
+        "                  -cdrom)\n"
         "  -net nic,model=i82559\n"
         "                  Attach the i2000 Intel 82559 NIC (baset alias)\n"
         "  -microprogram F Run an architectural microprogram on a bare core\n"
@@ -180,6 +188,12 @@ int ia64_setup(int argc, char *argv[]) {
 
     const char *rom_arg = args.rom_path;
     const char *serial_spec = NULL;
+    /* Backing storage for -drive's parsed file= path: cfg.hda_path/
+     * cdrom_path just hold a pointer, and GemuDriveSpec is stack-local to
+     * the branch below, so the string needs a buffer that outlives the
+     * loop. */
+    char drive_hda_file[512] = {0};
+    char drive_cdrom_file[512] = {0};
     for (int i = 0; i < nrem; i++) {
         if (strcmp(rem[i], "-rom") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -rom requires an argument\n"); return 1; }
@@ -196,10 +210,53 @@ int ia64_setup(int argc, char *argv[]) {
             return ia64_selftest_main(rem[++i]);
         } else if (strcmp(rem[i], "-hda") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -hda requires an argument\n"); return 1; }
+            if (cfg.hda_path) {
+                fprintf(stderr, "gemu: -hda/-drive: hard disk already attached\n");
+                return 1;
+            }
             cfg.hda_path = rem[++i];
         } else if (strcmp(rem[i], "-cdrom") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cdrom requires an argument\n"); return 1; }
+            if (cfg.cdrom_path) {
+                fprintf(stderr, "gemu: -cdrom/-drive: CD-ROM drive already attached\n");
+                return 1;
+            }
             cfg.cdrom_path = rem[++i];
+        } else if (strcmp(rem[i], "-drive") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -drive requires an argument\n"); return 1; }
+            GemuDriveSpec spec;
+            if (!gemu_parse_drive_spec(rem[++i], &spec))
+                return 1;
+            if (spec.if_type != GEMU_DRIVE_IF_IDE) {
+                fprintf(stderr, "gemu: -drive: i2000 only exposes an IDE bus (if=ide)\n");
+                return 1;
+            }
+            if (spec.index != 0) {
+                fprintf(stderr, "gemu: -drive: i2000 emulates a single drive per "
+                                "IDE channel (index=0 only) - no slave/secondary "
+                                "devices\n");
+                return 1;
+            }
+            if (spec.media == GEMU_DRIVE_MEDIA_CDROM) {
+                if (cfg.cdrom_path) {
+                    fprintf(stderr, "gemu: -drive/-cdrom: CD-ROM drive already attached\n");
+                    return 1;
+                }
+                snprintf(drive_cdrom_file, sizeof(drive_cdrom_file), "%s", spec.file);
+                cfg.cdrom_path = drive_cdrom_file;
+            } else {
+                if (spec.readonly) {
+                    fprintf(stderr, "gemu: -drive: media=disk with readonly=on is not "
+                                    "supported (i2000's ATA HDD is always read-write)\n");
+                    return 1;
+                }
+                if (cfg.hda_path) {
+                    fprintf(stderr, "gemu: -drive/-hda: hard disk already attached\n");
+                    return 1;
+                }
+                snprintf(drive_hda_file, sizeof(drive_hda_file), "%s", spec.file);
+                cfg.hda_path = drive_hda_file;
+            }
         } else if (strcmp(rem[i], "-net") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -net requires an argument\n"); return 1; }
             const char *net = rem[++i];

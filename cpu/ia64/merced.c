@@ -13,6 +13,40 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Debug switches are process-startup configuration.  Looking them up through
+ * the CRT from instruction/MMU hot paths is especially expensive on MinGW.
+ * Cache by the string-literal address: call sites use literals, so the steady
+ * state is a couple of pointer operations without hashing the string. */
+typedef struct MercedEnvCacheEntry {
+    const char *name;
+    const char *value;
+} MercedEnvCacheEntry;
+
+static const char *merced_cached_getenv(const char *name) {
+    enum { ENV_CACHE_SIZE = 256 };
+    static MercedEnvCacheEntry cache[ENV_CACHE_SIZE];
+    uintptr_t h = ((uintptr_t)name >> 4) ^ ((uintptr_t)name >> 13);
+    unsigned slot = (unsigned)h & (ENV_CACHE_SIZE - 1);
+
+    for (unsigned probe = 0; probe < ENV_CACHE_SIZE; probe++) {
+        MercedEnvCacheEntry *entry =
+            &cache[(slot + probe) & (ENV_CACHE_SIZE - 1)];
+        if (entry->name == name)
+            return entry->value;
+        if (!entry->name) {
+            entry->value = getenv(name);
+            entry->name = name;
+            return entry->value;
+        }
+    }
+    return getenv(name); /* Defensive fallback; current call-site count < 256. */
+}
+
+/* All getenv uses below describe immutable startup/debug configuration.
+ * Keep the spelling at call sites readable while ensuring none can regress
+ * into a per-instruction CRT lookup. */
+#define getenv(name) merced_cached_getenv(name)
+
 /* ── Field helpers ───────────────────────────────────────────────────────── */
 
 static inline uint64_t bits(uint64_t v, unsigned lo, unsigned w) {

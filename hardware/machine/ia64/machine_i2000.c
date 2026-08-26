@@ -22,6 +22,37 @@
 #include <direct.h>
 #endif
 
+/* Device debug flags are immutable startup configuration.  Several checks
+ * live in port/MMIO handlers, so consulting MinGW's CRT environment on every
+ * guest access can dominate execution.  String literals have stable
+ * addresses, making a pointer-keyed cache both sufficient and very cheap. */
+typedef struct I2000EnvCacheEntry {
+    const char *name;
+    const char *value;
+} I2000EnvCacheEntry;
+
+static const char *i2000_cached_getenv(const char *name) {
+    enum { ENV_CACHE_SIZE = 128 };
+    static I2000EnvCacheEntry cache[ENV_CACHE_SIZE];
+    uintptr_t h = ((uintptr_t)name >> 4) ^ ((uintptr_t)name >> 13);
+    unsigned slot = (unsigned)h & (ENV_CACHE_SIZE - 1);
+
+    for (unsigned probe = 0; probe < ENV_CACHE_SIZE; probe++) {
+        I2000EnvCacheEntry *entry =
+            &cache[(slot + probe) & (ENV_CACHE_SIZE - 1)];
+        if (entry->name == name)
+            return entry->value;
+        if (!entry->name) {
+            entry->value = getenv(name);
+            entry->name = name;
+            return entry->value;
+        }
+    }
+    return getenv(name);
+}
+
+#define getenv(name) i2000_cached_getenv(name)
+
 /*
  * HP i2000 system model. See i2000.h for the memory map.
  *

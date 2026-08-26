@@ -62,9 +62,15 @@ fs0:\> .\efi\boot\bootia64.efi
 Seeing `blk0` and `blk1` in addition to `fs0:` is normal: EFI publishes both
 the ATAPI block devices and the filesystem found on the CD.
 
+`-cdrom FILE` is sugar for QEMU-style `-drive file=FILE,if=ide,media=cdrom`;
+a raw read-write HDD image (`-hda FILE`) is likewise `-drive file=FILE,if=ide,
+media=disk`. i2000 exposes exactly one IDE drive per channel, so `-drive`
+only accepts `index=0` - there's no slave/secondary device to attach a
+second image to.
+
 The monitor supports `savevm PATH` and `loadvm PATH`. Keep the same `-rom` and
-`-cdrom` arguments when restoring a checkpoint; explicitly configured CD media
-is retained across the restore.
+`-cdrom`/`-drive` arguments when restoring a checkpoint; explicitly configured
+CD media is retained across the restore.
 
 NVRAM is stored per firmware image under the GEMU configuration directory.
 If firmware state becomes unusable after changing ROMs, remove only the

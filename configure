@@ -31,7 +31,7 @@ CORE_SRC = [
     'core/src/memory.c', 'core/src/tcg.c', 'core/src/monitor.c',
     'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/args.c',
     'core/src/sha256.c', 'core/src/screendump.c', 'core/src/util.c',
-    'core/src/gemu_display_term.c',
+    'core/src/gemu_display_term.c', 'core/src/drive.c',
     'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
 ]
 

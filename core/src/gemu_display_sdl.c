@@ -390,7 +390,6 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
 
         case SDL_KEYDOWN: {
             SDL_Keycode kc = ev.key.keysym.sym;
-            if (kc == SDLK_ESCAPE) { d->quit = true; break; }
 
             uint32_t bits = key_to_bits(b, kc);
             held_set(b, kc, bits, true);
