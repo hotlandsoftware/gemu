@@ -469,6 +469,9 @@ struct Ia64I2000State {
     uint8_t atapi_ready_status;
     bool atapi_status_pending;
     bool atapi_ready_irq;
+    /* v23: OCW3 read-register selection for each legacy 8259. False is
+     * IRR (the reset/default selection), true is ISR. */
+    bool pic_master_read_isr, pic_slave_read_isr;
 };
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -1765,16 +1768,27 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         }
     }
     if (port == 0x20 && size == 1) {
+        uint8_t irr = 0;
+        if (s->pit_irq_pending) irr |= 0x01;
+        if (s->keyboard_irq_pending) irr |= 0x02;
+        if (s->mouse_irq_pending || s->atapi_irq_pending) irr |= 0x04;
         if (getenv("ATA_IRQ_TRACE"))
-            fprintf(stderr, "i2000: PIC master ISR read -> %#04x ninsts=%" PRIu64 "\n",
-                    s->pic_master_isr, s->cpu->ninsts);
-        return s->pic_master_isr;
+            fprintf(stderr, "i2000: PIC master %s read -> %#04x ninsts=%" PRIu64 "\n",
+                    s->pic_master_read_isr ? "ISR" : "IRR",
+                    s->pic_master_read_isr ? s->pic_master_isr : irr,
+                    s->cpu->ninsts);
+        return s->pic_master_read_isr ? s->pic_master_isr : irr;
     }
     if (port == 0xA0 && size == 1) {
+        uint8_t irr = 0;
+        if (s->mouse_irq_pending) irr |= 0x10;
+        if (s->atapi_irq_pending) irr |= 0x80;
         if (getenv("ATA_IRQ_TRACE"))
-            fprintf(stderr, "i2000: PIC slave ISR read -> %#04x ninsts=%" PRIu64 "\n",
-                    s->pic_slave_isr, s->cpu->ninsts);
-        return s->pic_slave_isr;
+            fprintf(stderr, "i2000: PIC slave %s read -> %#04x ninsts=%" PRIu64 "\n",
+                    s->pic_slave_read_isr ? "ISR" : "IRR",
+                    s->pic_slave_read_isr ? s->pic_slave_isr : irr,
+                    s->cpu->ninsts);
+        return s->pic_slave_read_isr ? s->pic_slave_isr : irr;
     }
     if (port == 0x21) return s->pic_master_mask;
     if (port == 0xA1) return s->pic_slave_mask;
@@ -1847,12 +1861,13 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
                     s->atapi_status = 0x40;
                     s->atapi_count = 0x03; /* command complete */
                     s->atapi_lba_mid = s->atapi_lba_high = 0;
-                    /* The interrupt that announced this final data phase
-                     * also announces command completion once the host has
-                     * drained DRQ.  Raising a second IRQ here leaves IRQ15
-                     * in service after IDENTIFY and makes EFI mistake it
-                     * for completion of the following READ(10). */
-                    s->atapi_irq_pending = false;
+                    /* Packet PIO completion is a separate interrupt from
+                     * the one that announced the final data phase.  AtaPim
+                     * drains DRQ and then waits for this command-complete
+                     * phase (CoD=1, I/O=1). */
+                    s->atapi_irq_pending = true;
+                    s->atapi_irq_ready_ninsts =
+                        s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
                     if (atapi_debug_enabled())
                         fprintf(stderr, "i2000: ATAPI PIO complete bytes=%zu "
                                 "status=%#04x reason=%#04x\n",
@@ -2047,6 +2062,13 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                                         : &s->pic_slave_isr;
             for (int bit = 7; bit >= 0; bit--)
                 if (*isr & (1u << bit)) { *isr &= ~(1u << bit); break; }
+        }
+        /* OCW3 RR=1 selects which register a subsequent command-port read
+         * returns; RIS=0 chooses IRR (0x0A), RIS=1 chooses ISR (0x0B). */
+        if ((val & 0x18) == 0x08 && (val & 0x02)) {
+            bool *read_isr = port == 0x20 ? &s->pic_master_read_isr
+                                          : &s->pic_slave_read_isr;
+            *read_isr = (val & 0x01) != 0;
         }
         /* Other commands are OCWs. */
         return;
@@ -3524,7 +3546,7 @@ static void i2000_efi_bios_key(Ia64I2000State *s, uint8_t ascii) {
  * than hand-listing every scalar field, and it stays correct automatically
  * as fields get added. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 22u /* v22 adds ATA BSY-to-ready transitions */
+#define I2000_SNAPSHOT_VERSION 23u /* v23 adds PIC OCW3 IRR/ISR selection */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -3694,6 +3716,10 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         state_size = offsetof(Ia64I2000State, atapi_byte_limit);
     else if (version == 21u)
         state_size = offsetof(Ia64I2000State, atapi_status_ready_ninsts);
+    else if (version == 22u)
+        /* v22 ended in bool fields and sizeof(struct) included tail padding
+         * to the structure's 8-byte alignment. */
+        state_size = (offsetof(Ia64I2000State, pic_master_read_isr) + 7u) & ~7u;
     else
         state_size = sizeof(*loaded);
     ok &= fread(loaded, state_size, 1, f) == 1;
@@ -3821,6 +3847,21 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->mouse_wait_rfi_generation = 0;
         s->keyboard_retry_ninsts = s->cpu->ninsts;
         s->mouse_next_report_itc = merced_get_itc(s->cpu);
+        /* A snapshot can land between making an ATAPI PIO phase visible
+         * (DRQ plus unread bytes) and delivering/acknowledging its legacy
+         * IRQ15.  Older runs could consequently save neither ownership
+         * latch: irq_pending was clear and the slave PIC ISR did not yet
+         * contain IRQ15.  AtaPim then waits in its 8254-backed IRQ timeout
+         * loop forever instead of consuming the already-ready phase.
+         * Re-latch only that otherwise ownerless DRQ state; an acknowledged
+         * interrupt remains represented by pic_slave_isr bit 7 and is not
+         * duplicated. */
+        if ((s->atapi_status & 0x08) &&
+            s->atapi_data_pos < s->atapi_phase_end &&
+            !s->atapi_irq_pending && !(s->pic_slave_isr & 0x80)) {
+            s->atapi_irq_pending = true;
+            s->atapi_irq_ready_ninsts = s->cpu->ninsts;
+        }
         /* PIT deadlines describe host-time progression and must never be
          * resumed as absolute snapshot values.  This also upgrades older
          * snapshots whose fields used the former instruction-count clock. */
@@ -4147,6 +4188,19 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
                 printf(" %s=%" PRIu64, vectors[i].name,
                        counts[vectors[i].slot]);
         printf("\n");
+        return;
+    }
+    if (txt && strncmp(txt, "atapistate", 10) == 0) {
+        printf("atapi: status=%#04x error=%#04x count=%#04x device=%#04x "
+               "irq_pending=%u irq_ready=%" PRIu64 " status_pending=%u "
+               "status_ready=%" PRIu64 " ready_status=%#04x ready_irq=%u "
+               "data=%zu/%zu phase_end=%zu ninsts=%" PRIu64 "\n",
+               s->atapi_status, s->atapi_error, s->atapi_count,
+               s->atapi_device, s->atapi_irq_pending,
+               s->atapi_irq_ready_ninsts, s->atapi_status_pending,
+               s->atapi_status_ready_ninsts, s->atapi_ready_status,
+               s->atapi_ready_irq, s->atapi_data_pos, s->atapi_data_len,
+               s->atapi_phase_end, s->cpu->ninsts);
         return;
     }
     if (txt && sscanf(txt, "x %" SCNx64 " %d", &addr, &count) >= 1) {

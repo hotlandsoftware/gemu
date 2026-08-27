@@ -39,6 +39,8 @@ python configure --enable-gtk && ninja -j$(nproc) # for GTK support
 ```
 
 ## Windows
+
+**MSYS2**
 Install [MSYS2](https://www.msys2.org/), then from an **MSYS2 MinGW64** shell (not the plain MSYS2 shell):
 ```
 pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-SDL2 mingw-w64-x86_64-ninja mingw-w64-x86_64-python
@@ -52,6 +54,12 @@ $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
 python configure && ninja
 ```
 `bin\gemu.exe` is dynamically linked against MSYS2's mingw64 DLLs (SDL2 etc.), so run it either from a shell that has `mingw64\bin` on `PATH`, or copy the DLLs `ldd` reports next to the executable - see the `build-windows` job in [.github/workflows/build.yml](.github/workflows/build.yml) for the exact list this project ships with releases.
+
+**Cygwin**
+TODO
+
+**Visual Studio**
+TODO
 
 # Transparency
 This entire program is vibe coded, though I have some experience with programming which helps make it not completely horrible. I mainly started this as a way to see how far AI agents have come - and now I'm curious to see how many different machines and devices I can make AI emulate with little reference (simply feeding it datasheets, manuals, expected behavior etc)
