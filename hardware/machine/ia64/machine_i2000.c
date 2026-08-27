@@ -4121,6 +4121,34 @@ static void i2000_custom_cmd(Ia64I2000State *s) {
             return;
         }
     }
+    if (txt && strncmp(txt, "vhptstats", 9) == 0) {
+        uint64_t calls, disabled, hit, unmapped, tagfail, np;
+        merced_vhpt_stats(&calls, &disabled, &hit, &unmapped, &tagfail, &np);
+        printf("vhpt: calls=%" PRIu64 " disabled=%" PRIu64 " hit=%" PRIu64
+               " unmapped=%" PRIu64 " tagfail=%" PRIu64 " np=%" PRIu64 "\n",
+               calls, disabled, hit, unmapped, tagfail, np);
+        return;
+    }
+    if (txt && strncmp(txt, "faultstats", 10) == 0) {
+        uint64_t counts[0x5B] = {0};
+        merced_fault_stats(counts, sizeof(counts) / sizeof(counts[0]));
+        static const struct { unsigned slot; const char *name; } vectors[] = {
+            { 0x00, "vhpt" }, { 0x04, "itlb" }, { 0x08, "dtlb" },
+            { 0x0c, "alt-itlb" }, { 0x10, "alt-dtlb" },
+            { 0x14, "nested-dtlb" }, { 0x20, "dirty" },
+            { 0x24, "iaccess" }, { 0x28, "daccess" },
+            { 0x2c, "break" }, { 0x30, "extint" },
+            { 0x50, "page-not-present" }, { 0x54, "general" },
+            { 0x56, "nat" }, { 0x57, "spec" }, { 0x5a, "unaligned" },
+        };
+        printf("faults:");
+        for (unsigned i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++)
+            if (counts[vectors[i].slot])
+                printf(" %s=%" PRIu64, vectors[i].name,
+                       counts[vectors[i].slot]);
+        printf("\n");
+        return;
+    }
     if (txt && sscanf(txt, "x %" SCNx64 " %d", &addr, &count) >= 1) {
         if (count > 1024) count = 1024;
         for (int i = 0; i < count; i += 16) {
