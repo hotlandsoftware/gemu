@@ -66,6 +66,8 @@ typedef struct {
 #ifdef _WIN32
     void (*hex_toggle_cb)(void *ud);
     void  *hex_toggle_ud;
+    int    menu_client_w, menu_client_h;
+    bool   restore_menu_client_size;
 #endif
 } SdlBackend;
 
@@ -468,6 +470,17 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         }
     }
 
+#ifdef _WIN32
+    /* SetMenu() changes the Win32 non-client area while SDL is still
+     * creating the window.  Restore the requested drawable size from the
+     * settled event loop so SDL itself can account for the title and menu
+     * decorations. */
+    if (b->restore_menu_client_size && win) {
+        SDL_SetWindowSize(win, b->menu_client_w, b->menu_client_h);
+        b->restore_menu_client_size = false;
+    }
+#endif
+
     return held_mask(b) | controller_mask(b);
 }
 
@@ -638,6 +651,9 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
             }
             SetMenu(hwnd, bar);
             DrawMenuBar(hwnd);
+            b->menu_client_w = ww;
+            b->menu_client_h = wh;
+            b->restore_menu_client_size = true;
         }
     }
 #endif
