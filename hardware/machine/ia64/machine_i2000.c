@@ -5193,8 +5193,8 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             i2000_render_frame(s);
             gemu_display_render(s->display, s->fb, FB_W, FB_H);
             gemu_sleep_ms(s->halted ? 30 : 1);
-        } else {
-            gemu_sleep_ms(s->halted ? 30 : 0);
+        } else if (s->halted) {
+            gemu_sleep_ms(30);
         }
     }
     gemu_monitor_stop(s->monitor);
