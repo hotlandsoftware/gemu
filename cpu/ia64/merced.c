@@ -2631,8 +2631,6 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
             a = (int64_t)au;
             nat |= n2;
         }
-        (void)nat;   /* NaT on compare → both preds 0; approximate: ignore */
-
         int64_t sb = (int64_t)b;
         uint64_t ub = b;
         if (cmp4) {
@@ -2648,6 +2646,15 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
             else if (ta && !c)  rel = (0 >= sb);         /* ge  */
             else                rel = (0 < sb);          /* lt  */
             ctype = (major == 0xC) ? 2 : (major == 0xD) ? 3 : 4;
+            if (nat && qp) {
+                /* A NaT operand makes AND comparisons clear both targets;
+                 * OR and OR.ANDCM comparisons leave them unchanged. */
+                if (ctype == 2) {
+                    pr_write(m, p1, 0);
+                    pr_write(m, p2, 0);
+                }
+                return 1;
+            }
             if (getenv("CMP_A7_DEBUG") && r3 == 9 && major == 0xC) {
                 static unsigned a7_debug;
                 if (a7_debug++ < 100)
@@ -2666,6 +2673,13 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
             /* careful: c selects ne */
             res = c ? (au != ub) : (au == ub);
             ctype = (major == 0xC) ? 2 : (major == 0xD) ? 3 : 4;
+            if (nat && qp) {
+                if (ctype == 2) {
+                    pr_write(m, p1, 0);
+                    pr_write(m, p2, 0);
+                }
+                return 1;
+            }
             set_preds(m, p1, p2, qp, res, ctype);
             return 1;
         }
@@ -2674,6 +2688,11 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
         case 0xC: res = a < sb; break;                   /* lt (signed) */
         case 0xD: res = au < ub; break;                  /* ltu */
         default:  res = au == ub; break;                 /* eq */
+        }
+        if (nat && qp) {
+            pr_write(m, p1, 0);
+            pr_write(m, p2, 0);
+            return 1;
         }
         set_preds(m, p1, p2, qp, res, c ? 1 : 0);
         return 1;

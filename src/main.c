@@ -18,6 +18,9 @@ int mos_setup(int argc, char *argv[]);
 #ifdef HAVE_RCA
 int rca_setup(int argc, char *argv[]);
 #endif
+#ifdef HAVE_X86
+int x86_setup(int argc, char *argv[]);
+#endif
 
 typedef int (*SetupFn)(int argc, char *argv[]);
 
@@ -175,6 +178,9 @@ int main(int argc, char *argv[]) {
 #endif
 #ifdef HAVE_RCA
     if (strcmp(base, "gemu-rca") == 0)   return rca_setup(argc, argv);
+#endif
+#ifdef HAVE_X86
+    if (strcmp(base, "gemu-x86") == 0)   return x86_setup(argc, argv);
 #endif
 
     print_usage(prog);

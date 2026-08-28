@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<machine name="ibm5150" family="x86" description="IBM PC 5150 (1981)"
+        cpu="8088" vga="cga" ram="640K" status="skeleton">
+    <rom name="BIOS_5150_19OCT81_U33.BIN" region="bios"  addr="0x0000"
+         sha256="0932d30f91df12761e05bb0229508b4255329990e76264fdc8f1cdc3bf07c0e4"/>
+    <rom name="ibm-basic-1.00.rom"        region="basic" addr="0x0000"
+         sha256="2452b03b4b724b5b81e8cc367809c521144f5fe4e0425caee42ac71240b9b102"/>
+</machine>

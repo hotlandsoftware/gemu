@@ -1,0 +1,3 @@
+<?xml version="1.0"?>
+<vga name="cga" description="IBM Color Graphics Adapter (1981, text mode)"
+    requires="x86" status="skeleton"/>
