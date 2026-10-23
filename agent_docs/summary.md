@@ -115,3 +115,8 @@ core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
   " [Paused]" - formatted by `gemu_window_title()` (gemu_display.h).
   `GemuDisplayConfig` has no title field; machines must not set titles.
   Secondary windows pass a role ("VT100 Terminal", "Hex Editor").
+- VNC is universal (QEMU syntax, `core/src/vnc.c`): the display layer
+  mirrors `gemu_display_render()` frames and merges VNC input into action
+  bits / `is_key_held()` / raw keys / pointer (`core/src/gemu_display_vnc.c`).
+  Machines must not contain VNC code; guard display creation with
+  `gemu_display_wanted()` so `-display none -vnc` works.

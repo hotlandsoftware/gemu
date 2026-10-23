@@ -118,7 +118,6 @@ static uint8_t a400_consol(const Atari400State *s) {
     if (s->held_actions & GEMU_ACTION(A400_ACT_START))  v &= (uint8_t)~0x01;
     if (s->held_actions & GEMU_ACTION(A400_ACT_SELECT)) v &= (uint8_t)~0x02;
     if (s->held_actions & GEMU_ACTION(A400_ACT_OPTION)) v &= (uint8_t)~0x04;
-    v &= (uint8_t)~s->vnc_console;
     return v;
 }
 
@@ -370,38 +369,6 @@ static bool a400_mon_write(void *ud, uint64_t addr, uint8_t val) {
     }
     if (addr < s->ram_size) { s->ram[addr] = val; return true; }
     return false;
-}
-
-/* ── VNC keyboard ───────────────────────────────────────────────────────── */
-
-static void a400_poll_vnc(Atari400State *s) {
-    if (!s->vnc) return;
-    GemuVncKeyEvent ev;
-    while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-        uint32_t k = ev.keysym;
-        /* Console keys follow key level; everything else queues on press. */
-        if (k >= 0xFFBFu && k <= 0xFFC1u) {          /* F2..F4 */
-            uint8_t bit = (uint8_t)(1u << (k - 0xFFBFu));
-            if (ev.down) s->vnc_console |= bit;
-            else         s->vnc_console &= (uint8_t)~bit;
-            continue;
-        }
-        if (!s->cfg->generic_keyboard) continue;
-        if (!ev.down) continue;
-        switch (k) {
-        case 0xFF0Du: case 0xFF8Du: a400_queue_char(s, '\r');  break;
-        case 0xFF08u:               a400_queue_char(s, '\b');  break;
-        case 0xFF1Bu:               a400_queue_char(s, 0x1B);  break;
-        case 0xFF09u:               a400_queue_char(s, '\t');  break;
-        case 0xFF52u: a400_queue_key(s, 0x8E); break;  /* Up    */
-        case 0xFF54u: a400_queue_key(s, 0x8F); break;  /* Down  */
-        case 0xFF51u: a400_queue_key(s, 0x86); break;  /* Left  */
-        case 0xFF53u: a400_queue_key(s, 0x87); break;  /* Right */
-        default:
-            if (k >= 0x20u && k <= 0x7Eu) a400_queue_char(s, k);
-            break;
-        }
-    }
 }
 
 /* ── ROM / cartridge loading ────────────────────────────────────────────── */
@@ -751,16 +718,7 @@ Atari400State *atari400_create(const MosConfig *cfg) {
         snprintf(cart_dev.file, sizeof(cart_dev.file), "%s", cfg->cart_path);
     gemu_monitor_register_media(s->monitor, &cart_dev);
 
-    if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, ANTIC_FB_W, ANTIC_FB_H);
-        if (s->vnc)
-            gemu_vnc_set_palette(s->vnc, antic_palette_rgb, 256);
-        else
-            fprintf(stderr, "atari400: failed to start VNC at %s\n", cfg->vnc_addr);
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
-
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
         s->display = gemu_display_create(cfg->display_type, &(GemuDisplayConfig){
             .fb_width    = ANTIC_FB_W,
             .fb_height   = ANTIC_FB_H,
@@ -781,7 +739,6 @@ void atari400_destroy(Atari400State *s) {
     if (!s) return;
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
-    gemu_vnc_destroy(s->vnc);
     free(s->disk_data);
     free(s->cart);
     free(s->axlon_ram);
@@ -819,7 +776,6 @@ void atari400_run(Atari400State *s, const MosConfig *cfg) {
                 (gemu_display_last_pressed(s->display) & GEMU_ACTION(A400_ACT_BREAK)))
                 pokey_break_key(&s->pokey);
         }
-        a400_poll_vnc(s);
 
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
@@ -879,8 +835,6 @@ void atari400_run(Atari400State *s, const MosConfig *cfg) {
                 gemu_display_render(s->display, s->antic.pixels_argb,
                                     ANTIC_FB_W, ANTIC_FB_H);
         }
-        if (s->vnc)
-            gemu_vnc_update(s->vnc, s->antic.pixels, ANTIC_FB_W, ANTIC_FB_H);
 
         Uint32 dt = SDL_GetTicks() - t0;
         if (dt < frame_ms) SDL_Delay(frame_ms - dt);

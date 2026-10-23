@@ -1,6 +1,7 @@
 #include "gemu/args.h"
 #include "gemu/gemu.h"
 #include "gemu/gemu_display.h"
+#include "gemu/vnc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,8 +41,7 @@ static void print_usage(const GemuArgsDef *def) {
         printf("  %-14s Video chip        (use -vga ? to list)\n", "-vga TYPE");
     printf("  %-14s Display backend   (use -display ? to list)\n", "-display TYPE");
     printf("  %-14s Window scale factor\n", "-scale N");
-    if (def->vnc_support)
-        printf("  %-14s VNC server (use -vnc ? for address format)\n", "-vnc ADDR");
+    printf("  %-14s VNC server, QEMU syntax (use -vnc ? for details)\n", "-vnc ADDR");
     printf("  %-14s Pause/halt instead of exiting on monitor shutdown\n", "-no-shutdown");
     printf("  %-14s Name the VM: window title becomes \"GEMU (NAME)\"\n", "-name NAME");
     printf("  %-14s Monitor: stdio | none | telnet:HOST:PORT,server,nowait\n",
@@ -257,11 +257,18 @@ static void list_displays(unsigned mask) {
 }
 
 static void print_vnc_help(void) {
-    printf("VNC address format:\n"
-           "  :N            listen on all interfaces, port 5900+N\n"
-           "  host:N        listen on host, port 5900+N\n"
-           "  unix:/path    listen on a Unix domain socket (POSIX only)\n"
-           "Examples:  :0   127.0.0.1:0   0.0.0.0:1\n");
+    printf("-vnc ADDR[,OPTION...]  (same syntax as QEMU)\n"
+           "  :N               listen on all interfaces, port 5900+N\n"
+           "  host:N           listen on host (name or address; [v6] in brackets)\n"
+           "  unix:/path       listen on a Unix domain socket (POSIX only)\n"
+           "  none             no VNC server\n"
+           "Options:\n"
+           "  password=on      require a password; set it from the monitor with\n"
+           "                   'change vnc password' or 'set_password vnc PASSWORD'\n"
+           "  to=L             if 5900+N is in use, try displays up to L\n"
+           "  share=allow-exclusive|force-shared|ignore\n"
+           "Without -display, -vnc runs without a local window.\n"
+           "Examples:  -vnc :0   -vnc localhost:1   -vnc :1,password=on\n");
 }
 
 static void split_machine_spec(const char *spec, char *machine, size_t machine_sz,
@@ -481,11 +488,8 @@ bool gemu_args_parse(int argc, char **argv,
             }
             const char *v = argv[++i];
             if (is_help(v)) { print_vnc_help(); exit(0); }
-            if (!def->vnc_support) {
-                fprintf(stderr, "%s: -vnc not supported\n", def->prog);
-                return false;
-            }
-            out->vnc_addr = v;
+            if (!gemu_vnc_configure(v)) return false;
+            out->vnc_addr = gemu_vnc_configured() ? v : NULL;   /* "-vnc none" */
             continue;
         }
 

@@ -297,11 +297,24 @@ static void scan_keyboard(Ibm5150State *s) {
     for (int i = 0; i < XT_KEYMAP_N; i++)
         if (gemu_display_is_key_held(s->display, XT_KEYMAP[i].name))
             now[XT_KEYMAP[i].code] = true;
-    for (int code = 1; code < 128; code++) {
-        if (now[code] == s->key_down[code]) continue;
-        s->key_down[code] = now[code];
-        if (s->kbq_len < (int)sizeof(s->kbq))
-            s->kbq[s->kbq_len++] = (uint8_t)(now[code] ? code : (code | 0x80));
+    /* Keys that changed together in one frame (common with VNC, which
+     * delivers Shift and the letter back to back) are sent in the order a
+     * typist produces them: releases before presses, and modifiers inside
+     * ordinary keys - otherwise Shift+P can arrive as "p", or the key after
+     * a shifted one gets shifted too. */
+    static const uint8_t modifiers[] = { 0x1D, 0x2A, 0x36, 0x38 };
+    for (int pass = 0; pass < 4; pass++) {
+        bool want_mod  = pass == 1 || pass == 2;   /* 0: key up, 1: mod up, */
+        bool want_down = pass >= 2;                /* 2: mod down, 3: key down */
+        for (int code = 1; code < 128; code++) {
+            if (now[code] == s->key_down[code]) continue;
+            bool mod = memchr(modifiers, code, sizeof(modifiers)) != NULL;
+            if (mod != want_mod || now[code] != want_down)
+                continue;
+            s->key_down[code] = now[code];
+            if (s->kbq_len < (int)sizeof(s->kbq))
+                s->kbq[s->kbq_len++] = (uint8_t)(now[code] ? code : (code | 0x80));
+        }
     }
 }
 
@@ -483,7 +496,7 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     gemu_monitor_set_screendump_cb(s->monitor, ibm5150_screendump, s);
     gemu_monitor_bind(s->monitor, "sendkey", ibm5150_cmd_sendkey, s);
 
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
             .fb_width = IBM5150_FB_W, .fb_height = IBM5150_FB_H,
             .scale = cfg->display_scale > 0 ? cfg->display_scale : 1, /* 640x400 is big enough at 1x */

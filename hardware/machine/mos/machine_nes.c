@@ -1744,16 +1744,7 @@ static void nes_media_status(void *ud, char *buf, size_t buf_len) {
              s->cart_path_buf[0] ? s->cart_path_buf : "no cartridge");
 }
 
-/* ── VNC key → controller ─────────────────────────────────────────────────── */
-
-/* X11 keysym constants used by VNC */
-#define XK_Left   0xFF51u
-#define XK_Up     0xFF52u
-#define XK_Right  0xFF53u
-#define XK_Down   0xFF54u
-#define XK_Return 0xFF0Du
-#define XK_ShiftR 0xFFE2u
-#define XK_F2     0xFFBFu
+/* ── Controller input ────────────────────────────────────────────────────── */
 
 /* held: bitmask returned by gemu_display_poll() this frame (0 if headless) */
 static void nes_handle_keys(NesState *s, uint32_t held) {
@@ -1770,44 +1761,6 @@ static void nes_handle_keys(NesState *s, uint32_t held) {
             s->vs_coin_prev[0] = coin1;
             s->vs_coin_prev[1] = coin2;
         }
-        if (s->vnc) {
-            GemuVncKeyEvent ev;
-            while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-                uint8_t btn = 0;
-                int page = 0;
-                switch (ev.keysym) {
-                case 'z': case 'Z': btn = NES_BTN_A;     page = 1; break;
-                case 'x': case 'X': btn = NES_BTN_B;     page = 1; break;
-                case XK_Return:     btn = VS_BTN_START;  page = 1; break;
-                case XK_Up:         btn = NES_BTN_UP;    page = 1; break;
-                case XK_Down:       btn = NES_BTN_DOWN;  page = 1; break;
-                case XK_Left:       btn = NES_BTN_LEFT;  page = 1; break;
-                case XK_Right:      btn = NES_BTN_RIGHT; page = 1; break;
-                case 'd': case 'D': btn = NES_BTN_A;     break;
-                case 'f': case 'F': btn = NES_BTN_B;     break;
-                case 'g': case 'G': btn = VS_BTN_START;  break;
-                case 'r': case 'R': btn = NES_BTN_UP;    break;
-                case 'v': case 'V': btn = NES_BTN_DOWN;  break;
-                case 'c': case 'C': btn = NES_BTN_LEFT;  break;
-                case 'b': case 'B': btn = NES_BTN_RIGHT; break;
-                case '5':
-                    if (ev.down) s->vs_coin_latch[0] = 15;
-                    break;
-                case '6':
-                    if (ev.down) s->vs_coin_latch[1] = 15;
-                    break;
-                case XK_F2:
-                    s->vs_service = ev.down;
-                    break;
-                default:
-                    break;
-                }
-                if (btn) {
-                    if (ev.down) s->ctrl_state[page] |=  btn;
-                    else         s->ctrl_state[page] &= (uint8_t)~btn;
-                }
-            }
-        }
         if (s->ctrl_inject_frames > 0) {
             s->ctrl_state[0] |= s->ctrl_inject_mask;
             s->ctrl_inject_frames--;
@@ -1816,8 +1769,8 @@ static void nes_handle_keys(NesState *s, uint32_t held) {
     }
 
     if (!s->display) {
-        /* Headless: clear state unless VNC is feeding us events */
-        if (!s->vnc) { s->ctrl_state[0] = 0; s->ctrl_state[1] = 0; }
+        /* Headless: no input source */
+        s->ctrl_state[0] = 0; s->ctrl_state[1] = 0;
     } else {
         /* Action bits 0-7 and 8-15 map directly to NES_BTN_* for ports 1/2. */
         if (s->cfg->ports[0] == NES_DEVICE_CONTROLLER)
@@ -1853,30 +1806,6 @@ static void nes_handle_keys(NesState *s, uint32_t held) {
     if (s->ctrl_inject_frames > 0) {
         s->ctrl_state[0] |= s->ctrl_inject_mask;
         s->ctrl_inject_frames--;
-    }
-
-    /* VNC: drain key queue; translate to controller buttons */
-    if (s->vnc) {
-        GemuVncKeyEvent ev;
-        while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-            if (s->cfg->ports[0] != NES_DEVICE_CONTROLLER) continue;
-            uint8_t btn = 0;
-            switch (ev.keysym) {
-            case 'z': case 'Z':   btn = NES_BTN_A;      break;
-            case 'x': case 'X':   btn = NES_BTN_B;      break;
-            case XK_Return:        btn = NES_BTN_START;  break;
-            case XK_ShiftR:        btn = NES_BTN_SELECT; break;
-            case XK_Up:            btn = NES_BTN_UP;     break;
-            case XK_Down:          btn = NES_BTN_DOWN;   break;
-            case XK_Left:          btn = NES_BTN_LEFT;   break;
-            case XK_Right:         btn = NES_BTN_RIGHT;  break;
-            default: break;
-            }
-            if (btn) {
-                if (ev.down) s->ctrl_state[0] |=  btn;
-                else         s->ctrl_state[0] &= ~btn;
-            }
-        }
     }
 }
 
@@ -2302,7 +2231,7 @@ NesState *nes_create(const MosConfig *cfg) {
         gemu_monitor_register_media(s->monitor, &cart_dev);
     }
 
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
         bool two_controllers = cfg->ports[0] == NES_DEVICE_CONTROLLER &&
                                cfg->ports[1] == NES_DEVICE_CONTROLLER;
         bool has_fc2_mic     = cfg->ports[1] == NES_DEVICE_FC2_MIC;
@@ -2348,8 +2277,8 @@ NesState *nes_create(const MosConfig *cfg) {
     }
 
     /* -device crt: independent of display_type -- also drives screendump
-     * and (later) VNC output for headless "-display none" runs, so it must
-     * not be gated on an interactive display window existing. */
+     * on headless "-display none" runs, so it must not be gated on a
+     * display existing. */
     if (cfg->crt_type != MOS_CRT_NONE) {
         s->crt_signal = calloc((size_t)RP2C02_WIDTH * NES_NTSC_OVERSAMPLE *
                                RP2C02_HEIGHT, sizeof(float));
@@ -2379,20 +2308,6 @@ NesState *nes_create(const MosConfig *cfg) {
         s->ppu.nt_write     = mmc5_nt_write;
         s->ppu.nt_ud        = s;
     }
-
-    if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr,
-                                 RP2C02_WIDTH  * cfg->display_scale,
-                                 RP2C02_HEIGHT * cfg->display_scale);
-        if (s->vnc)
-            gemu_vnc_set_palette(s->vnc,
-                                 s->ppu.alt_palette_rgb ? s->ppu.alt_palette_rgb
-                                                        : rp2c02_palette_rgb,
-                                 64);
-        else
-            fprintf(stderr, "nes: failed to start VNC at %s\n", cfg->vnc_addr);
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
 #ifdef HAVE_ROB
     for (int p = 0; p < cfg->n_ports; p++) {
@@ -2449,7 +2364,6 @@ void nes_destroy(NesState *s) {
     rob_window_destroy(s->rob_window);  /* must happen before display destroy */
 #endif
     gemu_display_destroy(s->display);
-    gemu_vnc_destroy(s->vnc);
     free(s->crt_signal);
     free(s->crt_decoded_argb);
     free(s->crt_argb);
@@ -2497,7 +2411,6 @@ static bool nes_save_snapshot(NesState *s, const char *path) {
     snap->prg     = NULL;
     snap->chr     = NULL;
     snap->display = NULL;
-    snap->vnc     = NULL;
     snap->monitor = NULL;
     snap->crt_signal       = NULL;
     snap->crt_decoded_argb = NULL;
@@ -2571,7 +2484,6 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
     uint8_t          *prg     = s->prg;
     uint8_t          *chr     = s->chr;
     GemuDisplay      *display = s->display;
-    GemuVncServer    *vnc     = s->vnc;
     GemuMonitor      *monitor = s->monitor;
     float            *crt_signal       = s->crt_signal;
     uint32_t         *crt_decoded_argb = s->crt_decoded_argb;
@@ -2614,7 +2526,6 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
     s->prg     = prg;
     s->chr     = chr;
     s->display = display;
-    s->vnc     = vnc;
     s->monitor = monitor;
     s->crt_signal       = crt_signal;
     s->crt_decoded_argb = crt_decoded_argb;
@@ -2983,7 +2894,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
         if (s->display)
             gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
 
-        /* Input: display action bits + VNC events */
+        /* Input: display action bits (includes VNC input) */
         nes_handle_keys(s, held);
 #ifdef HAVE_LUA
         nes_lua_pre_frame(s->lua, s->ctrl_state);
@@ -3021,8 +2932,8 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             /* -device crt: re-derive the frame from the PPU's raw hue+luma
              * values (ppu.pixels[], not the already-quantized pixels_argb)
              * through a genuine NTSC composite encode+decode into
-             * crt_argb. Independent of s->display so screendump/VNC still
-             * get a decoded frame on headless "-display none" runs. Note
+             * crt_argb. Independent of s->display so screendump still
+             * gets a decoded frame on headless "-display none" runs. Note
              * this means anything drawn as an emulator-only overlay
              * straight into pixels_argb (e.g. the Lua gui.* API above)
              * won't appear in CRT mode — correctly so, since it was never
@@ -3057,9 +2968,6 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                 gemu_display_render(s->display, s->ppu.pixels_argb,
                                     RP2C02_WIDTH, RP2C02_HEIGHT);
             }
-            if (s->vnc)
-                gemu_vnc_update(s->vnc, s->ppu.pixels,
-                                RP2C02_WIDTH, RP2C02_HEIGHT);
 #ifdef HAVE_ROB
             if (s->cfg->n_ports > 1 && nes_device_is_rob(s->cfg->ports[1])) {
                 rob_frame(&s->rob, s->ppu.pixels_argb, RP2C02_WIDTH, RP2C02_HEIGHT);

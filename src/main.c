@@ -2,6 +2,7 @@
 #include "gemu/args.h"
 #include "gemu/monitor.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef HAVE_CHIP8
@@ -122,6 +123,16 @@ static void machine_spec_name(const char *spec, char *out, size_t out_sz) {
 
 int main(int argc, char *argv[]) {
     const char *prog = argv[0];
+
+    /* SIGINT/SIGTERM end the emulator cleanly via the monitor, like QEMU.
+     * SDL must not install its own handlers: they turn the signal into an
+     * SDL_QUIT event that headless runs (-display none, VNC) never read. */
+    gemu_monitor_install_signal_handlers();
+#ifdef _WIN32
+    _putenv("SDL_NO_SIGNAL_HANDLERS=1");
+#else
+    setenv("SDL_NO_SIGNAL_HANDLERS", "1", 1);
+#endif
 
     /* Global -device ? and -soundhw ? - list across all families without -M */
     for (int i = 1; i < argc - 1; i++) {

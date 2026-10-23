@@ -5,7 +5,6 @@
 #include "okim6295.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
-#include "gemu/vnc.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -126,13 +125,11 @@ typedef struct FiveClownState {
     uint32_t held_actions; /* cached each frame from gemu_display_poll() */
 
     uint32_t pixels_argb[FIVECLOWN_FB_WIDTH * FIVECLOWN_FB_HEIGHT];
-    uint8_t  pixels_idx[FIVECLOWN_FB_WIDTH * FIVECLOWN_FB_HEIGHT]; /* palette index, for VNC */
 
     char     sav_path[512];
 
     GemuDisplay   *display;
     GemuMonitor   *monitor;
-    GemuVncServer *vnc;
 
     uint64_t frame;
 } FiveClownState;

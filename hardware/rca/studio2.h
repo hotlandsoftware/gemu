@@ -4,7 +4,6 @@
 #include "rca.h"
 #include "pcspk.h"
 #include "gemu/monitor.h"
-#include "gemu/vnc.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -38,7 +37,6 @@ typedef struct RcaStudio2State {
     bool     keys_b[10];   /* Player B: keys 0-9 */
 
     GemuMonitor  *monitor;
-    GemuVncServer *vnc;
     RcaPcSpeaker  *speaker;
 } RcaStudio2State;
 

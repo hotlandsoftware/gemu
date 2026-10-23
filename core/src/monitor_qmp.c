@@ -12,6 +12,7 @@
  */
 #include "monitor_priv.h"
 #include "cJSON.h"
+#include "gemu/vnc.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -194,17 +195,76 @@ static cJSON *qmp_human_monitor_command(QmpConn *c, const cJSON *args, QmpError 
     return r;
 }
 
+/* set_password / expire_password: {"protocol": "vnc", ...}, like QEMU. */
+static bool vnc_protocol(const cJSON *args, QmpError *err) {
+    const cJSON *proto = cJSON_GetObjectItemCaseSensitive(args, "protocol");
+    if (!cJSON_IsString(proto)) {
+        set_error(err, "GenericError", "Parameter '%s' is missing", "protocol");
+        return false;
+    }
+    if (strcmp(proto->valuestring, "vnc") != 0) {
+        set_error(err, "GenericError", "Unsupported protocol '%s'", proto->valuestring);
+        return false;
+    }
+    return true;
+}
+
+static cJSON *qmp_set_password(QmpConn *c, const cJSON *args, QmpError *err) {
+    (void)c;
+    if (!vnc_protocol(args, err)) return NULL;
+    const cJSON *pw = cJSON_GetObjectItemCaseSensitive(args, "password");
+    if (!cJSON_IsString(pw)) {
+        set_error(err, "GenericError", "Parameter '%s' is missing", "password");
+        return NULL;
+    }
+    char msg[160];
+    if (!gemu_vnc_set_password(gemu_vnc_get(), pw->valuestring, msg, sizeof(msg)))
+        set_error(err, "GenericError", "%s", msg);
+    return NULL;
+}
+
+static cJSON *qmp_expire_password(QmpConn *c, const cJSON *args, QmpError *err) {
+    (void)c;
+    if (!vnc_protocol(args, err)) return NULL;
+    const cJSON *time = cJSON_GetObjectItemCaseSensitive(args, "time");
+    if (!cJSON_IsString(time)) {
+        set_error(err, "GenericError", "Parameter '%s' is missing", "time");
+        return NULL;
+    }
+    if (strcmp(time->valuestring, "now") == 0)
+        gemu_vnc_expire_password(gemu_vnc_get());
+    else if (strcmp(time->valuestring, "never") != 0)
+        set_error(err, "GenericError", "%s", "only 'now' and 'never' are supported");
+    return NULL;
+}
+
+static cJSON *qmp_query_vnc(QmpConn *c, const cJSON *args, QmpError *err) {
+    (void)c; (void)args; (void)err;
+    GemuVncServer *vnc = gemu_vnc_get();
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "enabled", vnc != NULL);
+    if (vnc) {
+        char info[2048];
+        gemu_vnc_info(vnc, info, sizeof(info));
+        cJSON_AddStringToObject(r, "info", info);
+    }
+    return r;
+}
+
 static const struct {
     const char *name;
     QmpFn       fn;
 } qmp_cmds[] = {
     { "cont",                  qmp_cont },
+    { "expire_password",       qmp_expire_password },
     { "human-monitor-command", qmp_human_monitor_command },
     { "qmp_capabilities",      qmp_capabilities },
     { "query-commands",        qmp_query_commands },
     { "query-status",          qmp_query_status },
     { "query-version",         qmp_query_version },
+    { "query-vnc",             qmp_query_vnc },
     { "quit",                  qmp_quit },
+    { "set_password",          qmp_set_password },
     { "stop",                  qmp_stop },
     { "system_reset",          qmp_system_reset },
 };

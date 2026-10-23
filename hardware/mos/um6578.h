@@ -5,7 +5,6 @@
 #include "apu2a03.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
-#include "gemu/vnc.h"
 #include <SDL2/SDL.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -167,7 +166,6 @@ typedef struct Um6578State {
 
     GemuDisplay   *display;
     GemuMonitor   *monitor;
-    GemuVncServer *vnc;
 
     uint64_t frame;
 } Um6578State;

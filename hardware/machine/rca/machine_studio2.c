@@ -321,12 +321,6 @@ RcaStudio2State *rca_studio2_create(const RcaConfig *cfg) {
             snprintf(cart_dev.file, sizeof(cart_dev.file), "%s", s->cart_path);
         gemu_monitor_register_media(s->monitor, &cart_dev);
     }
-    if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr,
-                                 STUDIO2_DISPLAY_W * cfg->display_scale,
-                                 STUDIO2_DISPLAY_H * cfg->display_scale);
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     rca_studio2_reset(s, cfg);
     return s;
@@ -344,21 +338,10 @@ void rca_studio2_destroy(RcaStudio2State *s) {
     if (!s) return;
     rca_pcspk_destroy(s->speaker);
     gemu_monitor_destroy(s->monitor);
-    gemu_vnc_destroy(s->vnc);
     free(s);
 }
 
 /* ── Action table ────────────────────────────────────────────────────────── */
-
-/* X11 keysyms used by VNC for Studio II keys (separate from display input) */
-static const uint32_t vnc_keys_a[10] = {
-    0xffe9, /* Alt_L  */ 'q', 'w', 'e', 'a', 's', 'd', 'z', 'x', 'c',
-};
-static const uint32_t vnc_keys_b[10] = {
-    0xffb0, /* KP_0 */ 0xffb7, 0xffb8, 0xffb9,   /* 7 8 9 */
-    0xffb4, 0xffb5, 0xffb6,                         /* 4 5 6 */
-    0xffb1, 0xffb2, 0xffb3,                         /* 1 2 3 */
-};
 
 /* Bits 0-9: P1 keys 0-9 | Bits 10-19: P2 keys 0-9 | Bit 20: RESET */
 static const GemuActionDef studio2_actions[] = {
@@ -394,19 +377,6 @@ static void studio2_update_ef(RcaStudio2State *s) {
 }
 
 /* ── Main loop ───────────────────────────────────────────────────────────── */
-
-static void studio2_poll_vnc(RcaStudio2State *s) {
-    if (!s->vnc) return;
-    GemuVncKeyEvent ev;
-    while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-        bool down = ev.down;
-        uint32_t k = ev.keysym;
-        for (int i = 0; i < 10; i++) {
-            if (k == vnc_keys_a[i]) { s->keys_a[i] = down; break; }
-            if (k == vnc_keys_b[i]) { s->keys_b[i] = down; break; }
-        }
-    }
-}
 
 void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
     GemuDisplay *display = gemu_display_create(cfg->display_type,
@@ -448,7 +418,6 @@ void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
             s->keys_a[i] = (held >> i) & 1;
             s->keys_b[i] = (held >> (i + 10)) & 1;
         }
-        studio2_poll_vnc(s);
         studio2_update_ef(s);
 
         /* Monitor commands */
@@ -487,12 +456,6 @@ void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
             for (int i = 0; i < STUDIO2_DISPLAY_W * STUDIO2_DISPLAY_H; i++)
                 argb[i] = s->vram[i] ? 0xFFFFFFFFu : 0xFF000000u;
             gemu_display_render(display, argb, STUDIO2_DISPLAY_W, STUDIO2_DISPLAY_H);
-            if (s->vnc) {
-                static uint8_t px[STUDIO2_DISPLAY_W * STUDIO2_DISPLAY_H];
-                for (int i = 0; i < STUDIO2_DISPLAY_W * STUDIO2_DISPLAY_H; i++)
-                    px[i] = s->vram[i] ? 1u : 0u;
-                gemu_vnc_update(s->vnc, px, STUDIO2_DISPLAY_W, STUDIO2_DISPLAY_H);
-            }
         }
 
         gemu_sleep_ms(frame_ms);

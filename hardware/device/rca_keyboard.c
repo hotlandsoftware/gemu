@@ -35,14 +35,3 @@ const char *rca_vip_keyboard_name(RcaKeyboardType keyboard) {
     default:                   return "unknown";
     }
 }
-
-
-
-int rca_vp601_vnc_keysym_to_ascii(uint32_t sym) {
-    if (sym >= 'a' && sym <= 'z') return (int)(sym - 32u);
-    if (sym >= 0x20 && sym <= 0x7E) return (int)sym;
-    if (sym == 0x0D || sym == 0x0A || sym == 0xFF0D || sym == 0xFF8D) return '\r';
-    if (sym == 0x08 || sym == 0x7F || sym == 0xFF08 || sym == 0xFFFF) return '\b';
-    if (sym == 0xFF1B) return 0x1B;
-    return -1;
-}

@@ -121,11 +121,6 @@ Chip8State *chip8_machine_create(const Chip8Config *cfg) {
         .read = chip8_mon_read, .write = chip8_mon_write, .ud = s,
         .addr_bits = 12, .big_endian = true });
     gemu_monitor_set_cpu_state_cb(s->monitor, chip8_mon_cpu_state, s);
-    if (cfg->vnc_addr)
-        s->vnc = gemu_vnc_create(cfg->vnc_addr,
-                                 CHIP8_DISPLAY_W * cfg->display_scale,
-                                 CHIP8_DISPLAY_H * cfg->display_scale);
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     memcpy(s->mem + CHIP8_FONT_BASE, chip8_font, CHIP8_FONT_BYTES);
 
@@ -164,7 +159,6 @@ void chip8_machine_destroy(Chip8State *s) {
     if (!s) return;
     gemu_tb_cache_flush(&s->tb_cache);
     gemu_monitor_destroy(s->monitor);
-    gemu_vnc_destroy(s->vnc);
     free(s);
 }
 
@@ -190,8 +184,10 @@ static const GemuActionDef chip8_actions[CHIP8_NUM_KEYS] = {
 /* ── Run loop ─────────────────────────────────────────────────────────────── */
 
 void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
-    /* Headless: no display, VNC-only or silent bench */
-    if (cfg->display_type == GEMU_DISPLAY_NONE) {
+    /* Headless: nobody sees the screen (-display none without -vnc), e.g. a
+     * silent bench.  With -vnc, gemu_display_create() returns a headless
+     * display and the normal loop below runs. */
+    if (!gemu_display_wanted(cfg->display_type)) {
         const int insns_frame = cfg->cpu_hz; /* cpu_hz is cycles per frame */
         gemu_monitor_start(s->monitor);
         bool running = true;
@@ -209,17 +205,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
                 chip8_sleep_frame();
                 continue;
             }
-            memcpy(s->keys_prev, s->keys, CHIP8_NUM_KEYS);
-            gemu_vnc_get_keys(s->vnc, s->keys);
-            if (s->wait_key) {
-                for (int k = 0; k < CHIP8_NUM_KEYS; k++) {
-                    if (s->keys[k] && !s->keys_prev[k]) {
-                        s->V[s->wait_reg] = (uint8_t)k;
-                        s->wait_key = false;
-                        s->PC += 2;
-                        break;
-                    }
-                }
+            if (s->wait_key) {   /* no input source: keypad stays released */
                 chip8_sleep_frame();
                 continue;
             }
@@ -233,10 +219,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
             }
             if (s->delay > 0) s->delay--;
             if (s->sound > 0) s->sound--;
-            if (s->draw_flag) {
-                gemu_vnc_update(s->vnc, s->vram, CHIP8_DISPLAY_W, CHIP8_DISPLAY_H);
-                s->draw_flag = false;
-            }
+            s->draw_flag = false;
             chip8_sleep_frame();
         }
         printf("gemu-chip8: %llu instructions executed, %llu TB hits, %llu misses\n",
@@ -247,7 +230,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
         return;
     }
 
-    /* Display-backed run loop (SDL, GTK, caca) */
+    /* Display-backed run loop (SDL, GTK, curses, or headless for VNC) */
     GemuDisplayGtkExtras gtk_extras = { .monitor = s->monitor };
     GemuDisplay *display = gemu_display_create(cfg->display_type,
         &(GemuDisplayConfig){
@@ -334,7 +317,6 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
             for (int i = 0; i < CHIP8_DISPLAY_W * CHIP8_DISPLAY_H; i++)
                 argb[i] = s->vram[i] ? cfg->fg_argb : cfg->bg_argb;
             gemu_display_render(display, argb, CHIP8_DISPLAY_W, CHIP8_DISPLAY_H);
-            gemu_vnc_update(s->vnc, s->vram, CHIP8_DISPLAY_W, CHIP8_DISPLAY_H);
             s->draw_flag = false;
         }
 

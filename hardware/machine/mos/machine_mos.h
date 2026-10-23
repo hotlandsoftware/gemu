@@ -1,7 +1,6 @@
 #pragma once
 #include "mos6502.h"
 #include "mos6502cfg.h"
-#include "gemu/vnc.h"
 #include "gemu/monitor.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -56,7 +55,6 @@ typedef struct MosGenericState {
     uint8_t  serial_rxq_w;     /* write index (0-15) */
     uint8_t  serial_rxq_cnt;   /* bytes currently in FIFO */
 
-    GemuVncServer   *vnc;
     GemuMonitor     *monitor;
 } MosGenericState;
 

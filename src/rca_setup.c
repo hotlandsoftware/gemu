@@ -77,7 +77,6 @@ static const GemuArgsDef def = {
                   | GEMU_DISP_F(GEMU_DISPLAY_GTK)
 #endif
     ,
-    .vnc_support  = true,
     .extra_help =
         "\nArguments:\n"
         "  -rom ADDR:FILE   Load a ROM/blob at address ADDR; may be repeated\n"
@@ -321,10 +320,7 @@ int rca_setup(int argc, char *argv[]) {
 
     cfg.display_type  = args.display_type;
     cfg.display_scale = args.display_scale;
-    cfg.vnc_addr      = args.vnc_addr;
     cfg.no_shutdown   = args.no_shutdown;
-    if (cfg.vnc_addr)
-        cfg.sound_hw = RCA_SOUND_NONE;
     if (cfg.n_roms == 0 && cfg.machine != RCA_MACHINE_GENERIC) {
         const char *alias = args.machine ? args.machine : "studio2";
         romdb_print_needed(alias);

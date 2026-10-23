@@ -86,7 +86,6 @@ struct GemuMonitor {
 
     GemuMediaDevice media[MEDIA_DEVICE_MAX];
     int             n_media;
-    GemuVncServer  *vnc;
     void          (*input_reset_cb)(void *ud);
     void           *input_reset_ud;
     MonRomEntry     rom_entries[ROM_ENTRY_MAX];

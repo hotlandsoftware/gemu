@@ -6,7 +6,6 @@
 #include "pcspk.h"
 #include "tape.h"
 #include "gemu/monitor.h"
-#include "gemu/vnc.h"
 #include <stdlib.h>
 
 /* ── COSMAC VIP machine state ────────────────────────────────────────────── */
@@ -20,7 +19,6 @@ typedef struct RcaVipState {
     const RcaConfig *cfg;
     uint8_t  mem[VIP_MEM_SIZE];
     GemuMonitor *monitor;
-    GemuVncServer *vnc;
     RcaPcSpeaker *speaker;
 
     /* Compact cassette tape */

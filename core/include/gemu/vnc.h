@@ -1,49 +1,65 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+
+/*
+ * VNC server (RFB 3.3/3.7/3.8), configured like QEMU's -vnc:
+ *
+ *   -vnc host:N        listen on host (name or address), port 5900+N
+ *   -vnc :N            listen on all interfaces
+ *   -vnc unix:/path    listen on a Unix domain socket (POSIX)
+ *   -vnc none          no server
+ *   options (comma-separated, after the address):
+ *     password=on      require VNC authentication; clients are refused until a
+ *                      password is set from the monitor ("change vnc password"
+ *                      or "set_password vnc PASSWORD")
+ *     to=L             if port 5900+N is busy, try N+1 .. L
+ *     share=allow-exclusive|force-shared|ignore
+ *                      what a client asking for exclusive access does
+ *                      (default allow-exclusive: it disconnects the others)
+ *
+ * There is one server per process.  Machines never talk to it: the display
+ * layer (gemu_display.h) mirrors every rendered frame to it and merges VNC
+ * keyboard/pointer input into its own input state, so -vnc works with every
+ * machine, with or without a local window.
+ */
 
 typedef struct GemuVncServer GemuVncServer;
 
 typedef struct {
-    uint32_t keysym;
+    uint32_t keysym;   /* X11 keysym */
     bool     down;
 } GemuVncKeyEvent;
 
 typedef struct {
-    int  x, y;
-    int  rel_x, rel_y;
-    bool button;
-    bool pressed;
-    bool right_button;
-    bool right_pressed;
+    int  x, y;         /* framebuffer pixels; -1 before the first event */
+    int  rel_x, rel_y; /* motion since the last call */
+    bool button, pressed;              /* left: held / went down */
+    bool right_button, right_pressed;  /* right: held / went down */
 } GemuVncPointerState;
 
-/* addr: "host:display" or ":display"  (port = 5900 + display)
- * fb_w/fb_h: framebuffer dimensions in pixels                */
-GemuVncServer *gemu_vnc_create(const char *addr, int fb_w, int fb_h);
-void           gemu_vnc_destroy(GemuVncServer *vnc);
-void           gemu_vnc_set_password(GemuVncServer *vnc, const char *password);
-void           gemu_vnc_set_colors(GemuVncServer *vnc,
-                                   uint32_t fg_rgb, uint32_t bg_rgb);
-void           gemu_vnc_set_palette(GemuVncServer *vnc,
-                                    const uint32_t *palette, int n_colors);
+/* Process-wide configuration from -vnc (validated; false on a bad spec). */
+bool           gemu_vnc_configure(const char *spec);
+bool           gemu_vnc_configured(void);
 
-/* Called whenever the guest's display changes.
- * vram: 1 byte/pixel. Without a palette: 0=background, non-zero=foreground.
- * With a palette: byte values index the configured RGB table. */
-void           gemu_vnc_update(GemuVncServer *vnc,
-                               const uint8_t *vram, int vw, int vh);
+/* The process's server, started on first use; NULL if -vnc wasn't given or
+ * the server couldn't listen. */
+GemuVncServer *gemu_vnc_get(void);
+void           gemu_vnc_shutdown(void);
 
-/* Copy the current VNC key state into keys[16] (CHIP-8 layout).
- * Safe to call from any thread.                               */
-void           gemu_vnc_get_keys(GemuVncServer *vnc, uint8_t keys[16]);
+/* Publish a frame (0xAARRGGBB).  Clients are sent only what changed; a
+ * different size is announced to clients that support desktop resizing. */
+void           gemu_vnc_update_argb(GemuVncServer *vnc, const uint32_t *argb,
+                                    int w, int h);
 
-/* Return one queued RFB keysym, or 0 if no key event is waiting. */
-uint32_t       gemu_vnc_pop_keysym(GemuVncServer *vnc);
-
-/* Return one queued RFB key press/release event. */
-bool           gemu_vnc_pop_key_event(GemuVncServer *vnc,
-                                      GemuVncKeyEvent *event);
-
-/* Return current pointer state and clear one-frame relative/pressed fields. */
+bool           gemu_vnc_pop_key_event(GemuVncServer *vnc, GemuVncKeyEvent *ev);
 GemuVncPointerState gemu_vnc_get_pointer(GemuVncServer *vnc);
+
+/* Authentication (requires password=on, like QEMU). */
+bool           gemu_vnc_set_password(GemuVncServer *vnc, const char *password,
+                                     char *err, size_t err_len);
+void           gemu_vnc_expire_password(GemuVncServer *vnc);
+
+/* Human-readable status for the monitor's "info vnc". */
+void           gemu_vnc_info(GemuVncServer *vnc, char *buf, size_t len);

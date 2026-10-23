@@ -5,7 +5,6 @@
 #include "gemu/gemu_display.h"
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
-#include "gemu/vnc.h"
 #include "gemu/util.h"
 #include <ctype.h>
 #include <inttypes.h>
@@ -84,7 +83,6 @@ static const GemuActionDef generic_kbd_actions[] = {
 struct Ia64GenericState {
     GemuMonitor   *monitor;
     GemuDisplay   *display;
-    GemuVncServer *vnc;
     Merced        *cpu;
 
     uint8_t  *ram;
@@ -1972,21 +1970,6 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
     gemu_monitor_set_cpu_state_cb(s->monitor, generic_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, generic_screendump, s);
 
-    if (cfg->vnc_addr) {
-        /* Keyboard-only: this machine's native framebuffer is 32-bit ARGB,
-         * which gemu_vnc_update() doesn't understand (it wants an 8bpp
-         * palette/mono surface) - so no video is exported here, only
-         * arrow/enter/ASCII key events. Use the monitor's `screendump`
-         * command for a look at the screen when driving this headlessly. */
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, FB_W, FB_H);
-        if (!s->vnc) {
-            fprintf(stderr, "gemu: cannot start VNC server on '%s'\n", cfg->vnc_addr);
-            ia64_generic_destroy(s);
-            return NULL;
-        }
-        gemu_monitor_set_vnc(s->monitor, s->vnc);
-    }
-
     if (cfg->hda_path) {
         /* Read-write: a hard disk that silently discarded writes would be
          * worse than no disk at all. */
@@ -2042,7 +2025,7 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
         return NULL;
     }
 
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
             .fb_width = FB_W,
             .fb_height = FB_H,
@@ -2066,7 +2049,6 @@ void ia64_generic_destroy(Ia64GenericState *s) {
         return;
     if (s->serial_enabled) generic_serial_disable(s);
     if (s->display) gemu_display_destroy(s->display);
-    if (s->vnc) gemu_vnc_destroy(s->vnc);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     if (s->cpu) merced_destroy(s->cpu);
     if (s->hdd) fclose(s->hdd);
@@ -2197,34 +2179,6 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
             gemu_sleep_ms(s->halted ? 30 : 1);
         } else {
             gemu_sleep_ms(s->halted ? 30 : 0);
-        }
-
-        if (s->vnc) {
-            /* Same two destinations as the local-display path above (the
-             * custom kbd controller's boot-menu FIFO, and qemu_firmware's
-             * UART ConIn ring), just fed from RFB KeyEvent messages
-             * instead of the display backend's own key queue. Only
-             * key-down edges matter here - this machine has no concept
-             * of held keys. */
-            GemuVncKeyEvent ev;
-            while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-                if (!ev.down)
-                    continue;
-                if (ev.keysym == 0xFF52)      kbd_push(s, GENERIC_KBD_KEY_UP);
-                else if (ev.keysym == 0xFF54) kbd_push(s, GENERIC_KBD_KEY_DOWN);
-                else if (ev.keysym == 0xFF0D) kbd_push(s, GENERIC_KBD_KEY_ENTER);
-                if (s->qemu_firmware) {
-                    uint32_t cp = 0;
-                    if (ev.keysym <= 0x7F)          cp = ev.keysym;      /* Latin-1/ASCII keysyms */
-                    else if (ev.keysym == 0xFF0D)   cp = '\r';
-                    else if (ev.keysym == 0xFF08)   cp = '\b';
-                    else if (ev.keysym == 0xFF09)   cp = '\t';
-                    else if (ev.keysym == 0xFF1B)   cp = 0x1b;
-                    else if (ev.keysym == 0xFFFF)   cp = 0x7f;
-                    if (cp)
-                        uart_rx_push(s, (uint8_t)cp);
-                }
-            }
         }
     }
     gemu_monitor_stop(s->monitor);

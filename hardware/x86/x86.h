@@ -29,6 +29,5 @@ typedef struct X86Config {
     uint32_t        ram_size; /* bytes */
     GemuDisplayType display_type;
     int             display_scale;
-    const char     *vnc_addr;
     bool            no_shutdown;
 } X86Config;

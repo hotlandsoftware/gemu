@@ -16,6 +16,7 @@
  */
 #include "monitor_priv.h"
 #include "gemu/gemu_display.h"
+#include "gemu/vnc.h"
 
 #include <ctype.h>
 #include <inttypes.h>
@@ -79,6 +80,8 @@ static GemuMonCmd cmd_x(GemuMonitor *, const char *);
 static GemuMonCmd cmd_peek(GemuMonitor *, const char *);
 static GemuMonCmd cmd_poke(GemuMonitor *, const char *);
 static GemuMonCmd cmd_memsave(GemuMonitor *, const char *);
+static GemuMonCmd cmd_set_password(GemuMonitor *, const char *);
+static GemuMonCmd cmd_expire_password(GemuMonitor *, const char *);
 
 static const MonCmdDef mon_cmds[] = {
     /* name          aliases         params                        help */
@@ -104,6 +107,8 @@ static const MonCmdDef mon_cmds[] = {
       "write len bytes (both hex) of the system bus to file", M_IA64, NULL, 0 },
     { "eject",       NULL,           "<device>",
       "eject media", NULL, cmd_eject, 0 },
+    { "expire_password", NULL,       "vnc now|never",
+      "expire the VNC password now (or keep it, 'never')", NULL, cmd_expire_password, 0 },
     { "faultstats",  NULL,           "",
       "show CPU fault counters", M_IA64, NULL, 0 },
     { "flip",        NULL,           "<device>",
@@ -163,6 +168,8 @@ static const MonCmdDef mon_cmds[] = {
       "press keys/buttons on the machine's input device", NULL, NULL, 0 },
     { "service",     NULL,           "",
       "press the service button", M_VS, NULL, 0 },
+    { "set_password", NULL,          "vnc <password>",
+      "set the VNC password (needs -vnc ...,password=on)", NULL, cmd_set_password, 0 },
     { "step",        "s",            "[count]",
       "execute count instructions (default 1), then stop", NULL, cmd_step, 0 },
     { "stop",        "halt",         "",
@@ -463,6 +470,12 @@ static void info_machine(GemuMonitor *mon) {
     mon_printf(mon, "%s\n", machine ? machine : "(unknown)");
 }
 
+static void info_vnc(GemuMonitor *mon) {
+    char buf[2048];
+    gemu_vnc_info(gemu_vnc_get(), buf, sizeof(buf));
+    mon_printf(mon, "%s", buf);
+}
+
 static void info_name(GemuMonitor *mon) {
     const char *name = gemu_vm_name();
     if (name) mon_printf(mon, "%s\n", name);
@@ -490,6 +503,7 @@ static const MonInfoDef info_cmds[] = {
     { "name",        NULL,        "show the VM name given with -name", info_name },
     { "roms",        NULL,        "list loaded ROM images",      info_roms },
     { "status",      NULL,        "show whether emulation is running", info_status },
+    { "vnc",         NULL,        "show the VNC server and its clients", info_vnc },
 };
 static const size_t n_info_cmds = sizeof(info_cmds) / sizeof(info_cmds[0]);
 
@@ -1069,5 +1083,36 @@ static GemuMonCmd cmd_memsave(GemuMonitor *mon, const char *args) {
     if (unreadable)
         mon_printf(mon, "memsave: %" PRIu64 " unreadable bytes were written as 00\n",
                    unreadable);
+    return GEMU_MON_NONE;
+}
+
+/* ── VNC passwords (QEMU's set_password / expire_password) ───────────────── */
+
+static GemuMonCmd cmd_set_password(GemuMonitor *mon, const char *args) {
+    char proto[16], pw[64];
+    const char *p = take_token(args, proto, sizeof(proto));
+    if (!p || strcasecmp(proto, "vnc") != 0 || !take_token(p, pw, sizeof(pw))) {
+        mon_printf(mon, "usage: set_password vnc <password>\n");
+        return GEMU_MON_NONE;
+    }
+    char err[160];
+    if (!gemu_vnc_set_password(gemu_vnc_get(), pw, err, sizeof(err)))
+        mon_printf(mon, "set_password: %s\n", err);
+    else if (strlen(pw) > 8)
+        mon_printf(mon, "warning: VNC passwords are limited to 8 characters; only the first 8 are used\n");
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd cmd_expire_password(GemuMonitor *mon, const char *args) {
+    char proto[16], when[32];
+    const char *p = take_token(args, proto, sizeof(proto));
+    if (!p || strcasecmp(proto, "vnc") != 0 || !take_token(p, when, sizeof(when)) ||
+        (strcasecmp(when, "now") != 0 && strcasecmp(when, "never") != 0)) {
+        mon_printf(mon, "usage: expire_password vnc now|never\n");
+        return GEMU_MON_NONE;
+    }
+    GemuVncServer *vnc = gemu_vnc_get();
+    if (!vnc) mon_printf(mon, "expire_password: VNC is not active\n");
+    else if (strcasecmp(when, "now") == 0) gemu_vnc_expire_password(vnc);
     return GEMU_MON_NONE;
 }

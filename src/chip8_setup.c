@@ -29,7 +29,6 @@ static const GemuArgsDef def = {
                   | GEMU_DISP_F(GEMU_DISPLAY_GTK)
 #endif
     ,
-    .vnc_support = true,
 };
 
 /* ── Chip8-specific extra flags ──────────────────────────────────────────── */
@@ -78,7 +77,6 @@ int chip8_setup(int argc, char *argv[]) {
     cfg.rom_path     = args.rom_path;
     cfg.display_type = args.display_type;
     cfg.display_scale = args.display_scale;
-    cfg.vnc_addr     = args.vnc_addr;
     cfg.no_shutdown  = args.no_shutdown;
 
     for (int i = 0; i < nrem; i++) {

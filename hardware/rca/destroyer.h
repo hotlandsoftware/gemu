@@ -4,7 +4,6 @@
 #include "cdp1869.h"
 #include "rca.h"
 #include "gemu/monitor.h"
-#include "gemu/vnc.h"
 #include "pcspk.h"
 #include "gemu/gemu_display.h"
 
@@ -17,7 +16,6 @@ typedef struct RcaDestroyerState {
     uint8_t mem[DESTRYER_MEM_SIZE];
     uint8_t rotated_bitmap[CDP1869_VISIBLE_W * CDP1869_VISIBLE_H];
     GemuMonitor *monitor;
-    GemuVncServer *vnc;
     RcaPcSpeaker *speaker;
 
     uint8_t in0;

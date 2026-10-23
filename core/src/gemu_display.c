@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gemu_display_priv.h"
 #include "gemu/util.h"
+#include "gemu/vnc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,8 +75,8 @@ void gemu_window_title(char *buf, size_t len, const char *role, bool paused) {
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-GemuDisplay *gemu_display_create(GemuDisplayType type,
-                                 const GemuDisplayConfig *cfg) {
+static GemuDisplay *create_backend(GemuDisplayType type,
+                                   const GemuDisplayConfig *cfg) {
     switch (type) {
     case GEMU_DISPLAY_SDL:
         return gemu_display_sdl_create(cfg);
@@ -104,14 +105,34 @@ GemuDisplay *gemu_display_create(GemuDisplayType type,
     }
 }
 
+/* The backend for `type`, plus VNC when -vnc was given (QEMU-style: VNC
+ * works with every machine and display, and -display none -vnc gives a
+ * VNC-only display).  NULL for -display none without VNC. */
+GemuDisplay *gemu_display_create(GemuDisplayType type,
+                                 const GemuDisplayConfig *cfg) {
+    GemuDisplay *d = type == GEMU_DISPLAY_NONE ? NULL : create_backend(type, cfg);
+    GemuVncServer *vnc = gemu_vnc_get();
+    if (!vnc || (cfg->terminal_text && d)) return d;   /* text-only output can't be mirrored */
+    if (!d) d = gemu_display_headless_create(cfg);
+    if (d) gemu_display_vnc_attach(d, vnc, cfg);
+    return d;
+}
+
+bool gemu_display_wanted(GemuDisplayType type) {
+    return type != GEMU_DISPLAY_NONE || gemu_vnc_configured();
+}
+
 void gemu_display_destroy(GemuDisplay *d) {
     if (!d) return;
+    gemu_display_vnc_detach(d);
     d->do_destroy(d);
     free(d);
 }
 
 void gemu_display_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
-    if (d && argb) d->do_render(d, argb, w, h);
+    if (!d || !argb) return;
+    d->do_render(d, argb, w, h);
+    gemu_display_vnc_frame(d, argb, w, h);
 }
 
 void gemu_display_render_text(GemuDisplay *d, const char *text, int rows, int cols) {
@@ -133,7 +154,7 @@ uint32_t gemu_display_poll(GemuDisplay *d) {
     d->pointer.rel_y = 0;
     d->pointer.pressed = false;
     d->pointer.right_pressed = false;
-    d->held        = d->do_poll(d);
+    d->held        = d->do_poll(d) | gemu_display_vnc_poll(d);
     d->last_pressed = d->held & ~d->held_prev;
     return d->held;
 }
@@ -162,8 +183,9 @@ uint32_t gemu_display_pop_raw_key(GemuDisplay *d) {
 }
 
 bool gemu_display_is_key_held(GemuDisplay *d, const char *name) {
-    if (!d || !d->do_is_key_held) return false;
-    return d->do_is_key_held(d, name);
+    if (!d) return false;
+    return (d->do_is_key_held && d->do_is_key_held(d, name)) ||
+           gemu_display_vnc_key_held(d, name);
 }
 
 

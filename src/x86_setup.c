@@ -48,7 +48,6 @@ static const GemuArgsDef def = {
     .vgas         = vgas,
     .n_vgas       = (int)(sizeof vgas / sizeof *vgas),
     .display_mask = GEMU_DISP_F(GEMU_DISPLAY_SDL) | GEMU_DISP_F(GEMU_DISPLAY_NONE),
-    .vnc_support  = false,
     .extra_help =
         "\nx86 options:\n"
         "  -rom FILE|DIR   Load a BIOS/BASIC image, or scan a directory for\n"

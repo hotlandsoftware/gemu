@@ -306,8 +306,6 @@ RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg) {
     s->iogroup     = 0;
 
     memset(s->keys,       0, sizeof(s->keys));
-    memset(s->keys_live,  0, sizeof(s->keys_live));
-    memset(s->keys_latch, 0, sizeof(s->keys_latch));
 
     cdp1802_init(&s->cpu, NULL, 0);
     s->cpu.mem_read  = pecom_mem_read;
@@ -329,20 +327,11 @@ RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg) {
         .addr_bits = 16, .big_endian = true });
     gemu_monitor_set_cpu_state_cb(s->monitor, pecom_mon_cpu_state, s);
 
-    if (cfg->sound_hw == RCA_SOUND_PCSPK && !cfg->vnc_addr) {
+    if (cfg->sound_hw == RCA_SOUND_PCSPK) {
         s->speaker = rca_pcspk_create(250u);
         if (!s->speaker)
             fprintf(stderr, "gemu-rca: pecom32: failed to init audio\n");
     }
-
-    if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr,
-                                 CDP1869_VISIBLE_W * cfg->display_scale,
-                                 CDP1869_VISIBLE_H * cfg->display_scale);
-        gemu_vnc_set_palette(s->vnc, pecom_palette,
-                             (int)(sizeof(pecom_palette) / sizeof(pecom_palette[0])));
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     /* Load ROM (16 KB for Pecom 32, 32 KB across two chips for Pecom 64) */
     s->rom_size = 0;
@@ -380,10 +369,9 @@ static void rca_pecom32_reset(RcaPecom32State *s, const RcaConfig *cfg) {
     s->key_ctrl    = false;
     s->key_esc     = false;
     s->caps_locked = false;
+    s->caps_key_prev = false;
 
     memset(s->keys,       0, sizeof(s->keys));
-    memset(s->keys_live,  0, sizeof(s->keys_live));
-    memset(s->keys_latch, 0, sizeof(s->keys_latch));
 
     s->rom_size = 0;
     for (int i = 0; i < cfg->n_roms; i++) {
@@ -399,11 +387,19 @@ void rca_pecom32_destroy(RcaPecom32State *s) {
     if (!s) return;
     rca_pcspk_destroy(s->speaker);
     gemu_monitor_destroy(s->monitor);
-    gemu_vnc_destroy(s->vnc);
     free(s);
 }
 
 /* ── Input polling ───────────────────────────────────────────────────────── */
+
+static void pecom_press(uint8_t keys[64], const char *name) {
+    for (size_t i = 0; i < PECOM_N_KEYS; i++) {
+        if (strcmp(name, pecom_keymap[i].name) == 0) {
+            keys[pecom_keymap[i].row] |= (uint8_t)(1u << pecom_keymap[i].bit);
+            return;
+        }
+    }
+}
 
 static void pecom_poll_keys(RcaPecom32State *s, GemuDisplay *display) {
     if (!display) return;
@@ -413,76 +409,47 @@ static void pecom_poll_keys(RcaPecom32State *s, GemuDisplay *display) {
         if (gemu_display_is_key_held(display, pecom_keymap[i].name))
             s->keys[pecom_keymap[i].row] |= (uint8_t)(1u << pecom_keymap[i].bit);
     }
+    /* Backspace is the Pecom's BS/DEL key (the "End" matrix position). */
+    if (gemu_display_is_key_held(display, "Backspace"))
+        pecom_press(s->keys, "End");
+
+    /* A key pressed and released within one frame (fast typists, VNC
+     * clients, paste) is no longer held when we poll, so also press each
+     * character typed this frame for one frame - long enough for the ROM's
+     * matrix scan to see it.  Only characters that are their own physical
+     * key; shifted symbols are left to the held state plus Shift. */
+    static const char us_shifted[] = "!@#$%^&*()_+{}|:\"~<>?";
+    uint32_t c;
+    while ((c = gemu_display_pop_raw_key(display)) != 0) {
+        char single[2] = {0, 0};
+        const char *name = NULL;
+        if      (c == '\r') name = "Return";
+        else if (c == '\b') name = "End";
+        else if (c == ' ')  name = "Space";
+        else if (c > 0x20 && c < 0x7f && !strchr(us_shifted, (int)c)) {
+            single[0] = (char)((c >= 'A' && c <= 'Z') ? (c | 0x20u) : c);
+            name = single;
+        }
+        if (name) pecom_press(s->keys, name);
+    }
 
     s->key_esc   = gemu_display_is_key_held(display, "Escape");
     s->key_shift = gemu_display_is_key_held(display, "Left Shift")
                 || gemu_display_is_key_held(display, "Right Shift");
     s->key_ctrl  = gemu_display_is_key_held(display, "Left Ctrl")
                 || gemu_display_is_key_held(display, "Right Ctrl");
-}
 
-static void pecom_vnc_apply_key(RcaPecom32State *s, uint32_t ks, bool down) {
-    switch (ks) {
-    case 0xffe1: case 0xffe2: s->key_shift = down; return;
-    case 0xffe3: case 0xffe4: s->key_ctrl  = down; return;
-    case 0xff1b:               s->key_esc   = down; return;
-    case 0xffe5: if (down) s->caps_locked = !s->caps_locked; return;
-    default: break;
-    }
-
-    /* Translate VNC special keysyms to keymap name strings */
-    const char *name = NULL;
-    char single[2] = {0, 0};
-    switch (ks) {
-    case 0xff08: name = "End";    break;  /* Backspace → BS/DEL key (row 0x0B) */
-    case 0xff0d: name = "Return"; break;
-    case 0xff50: name = "Home";   break;
-    case 0xff57: name = "End";    break;
-    case 0xff52: name = "Up";     break;
-    case 0xff54: name = "Down";   break;
-    case 0xff51: name = "Left";   break;
-    case 0xff53: name = "Right";  break;
-    case ' ':    name = "Space";  break;
-    default:
-        if (ks >= 'A' && ks <= 'Z') ks += 32u;
-        if (ks >= 0x21 && ks < 0x7f) { single[0] = (char)ks; name = single; }
-        break;
-    }
-    if (!name) return;
-
-    for (size_t i = 0; i < PECOM_N_KEYS; i++) {
-        if (strcmp(name, pecom_keymap[i].name) != 0) continue;
-        uint8_t row = pecom_keymap[i].row;
-        uint8_t bit = (uint8_t)(1u << pecom_keymap[i].bit);
-        if (down) {
-            s->keys_live[row]  |= bit;
-            s->keys_latch[row] |= bit;
-        } else {
-            s->keys_live[row]  &= (uint8_t)~bit;
-        }
-        break;
-    }
-}
-
-static void pecom_poll_vnc(RcaPecom32State *s) {
-    if (!s->vnc) return;
-
-    /* Clear the one-frame latch so fast taps don't linger across frames. */
-    memset(s->keys_latch, 0, sizeof(s->keys_latch));
-
-    GemuVncKeyEvent ev;
-    while (gemu_vnc_pop_key_event(s->vnc, &ev))
-        pecom_vnc_apply_key(s, (uint32_t)ev.keysym, ev.down);
-
-    for (size_t i = 0; i < 64u; i++)
-        s->keys[i] = s->keys_live[i] | s->keys_latch[i];
+    /* Caps Lock toggles the CAPS latch (EF3) on each press. */
+    bool caps = gemu_display_is_key_held(display, "CapsLock");
+    if (caps && !s->caps_key_prev) s->caps_locked = !s->caps_locked;
+    s->caps_key_prev = caps;
 }
 
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
 void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
     GemuDisplay *display = NULL;
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
         display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
                 .fb_width  = CDP1869_VISIBLE_W,
@@ -525,7 +492,6 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
             }
             pecom_poll_keys(s, display);
         }
-        pecom_poll_vnc(s);
 
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
@@ -564,8 +530,6 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
                     gemu_display_render(display, argb,
                                         CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
                 }
-                gemu_vnc_update(s->vnc, s->vis.bitmap,
-                                CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
             }
         }
 

@@ -120,7 +120,6 @@ static const GemuArgsDef def = {
                   | GEMU_DISP_F(GEMU_DISPLAY_CURSES)
 #endif
                   | GEMU_DISP_F(GEMU_DISPLAY_NONE),
-    .vnc_support  = true,
     .extra_help =
         "\nArguments:\n"
         "  -m SIZE            Amount of memory i.e. 4K, 32K, 64K, 1M, etc.\n"
@@ -665,7 +664,6 @@ int mos_setup(int argc, char *argv[]) {
 
     cfg.display_type  = args.display_type;
     cfg.display_scale = args.display_scale;
-    cfg.vnc_addr      = args.vnc_addr;
     cfg.no_shutdown   = args.no_shutdown;
 
     if ((cfg.machine == MOS_MACHINE_APPLE1 ||
@@ -675,7 +673,7 @@ int mos_setup(int argc, char *argv[]) {
          cfg.machine == MOS_MACHINE_MAGICFLY ||
          cfg.machine == MOS_MACHINE_UM6578 ||
          cfg.machine == MOS_MACHINE_ATARI400)
-        && !cfg.vnc_addr && !args.display_explicit) {
+        && !args.vnc_addr && !args.display_explicit) {
 #ifdef GEMU_GTK
         bool um6578_mouse = cfg.machine == MOS_MACHINE_UM6578 &&
                             cfg.n_ports > 0 &&

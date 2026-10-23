@@ -231,17 +231,7 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
         .addr_bits = 16, .big_endian = false });
     gemu_monitor_set_cpu_state_cb(s->monitor, generic_mon_cpu_state, s);
 
-    if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, 320 * cfg->display_scale,
-                                 200 * cfg->display_scale);
-        if (!s->vnc)
-            fprintf(stderr, "gemu-6502: failed to start VNC server at %s\n",
-                    cfg->vnc_addr);
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
-
     if (!load_roms(s, cfg)) {
-        gemu_vnc_destroy(s->vnc);
         gemu_monitor_destroy(s->monitor);
         free(s);
         return NULL;
@@ -274,7 +264,6 @@ static void mos_generic_reset(MosGenericState *s, const MosConfig *cfg) {
 
 void mos_generic_destroy(MosGenericState *s) {
     gemu_monitor_destroy(s->monitor);
-    gemu_vnc_destroy(s->vnc);
     free(s->mem);
     free(s->rom_map);
     free(s);
@@ -309,11 +298,6 @@ void mos_generic_run(MosGenericState *s, const MosConfig *cfg) {
             }
         }
         if (quit) break;
-
-        if (s->vnc) {
-            GemuVncKeyEvent ev_key;
-            while (gemu_vnc_pop_key_event(s->vnc, &ev_key)) { /* discard for now */ }
-        }
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             generic_poll_serial(s);

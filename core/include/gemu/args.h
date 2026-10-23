@@ -45,7 +45,6 @@ typedef struct {
     const GemuDevDesc *vgas;            /* NULL / n_vgas=0 → -vga not listed */
     int                n_vgas;
     unsigned           display_mask;    /* bitfield of supported GemuDisplayType */
-    bool               vnc_support;     /* whether -vnc is a valid option */
     const char        *extra_help;      /* optional binary-specific usage text */
 } GemuArgsDef;
 
@@ -62,7 +61,8 @@ typedef struct {
     const char     *vga;           /* NULL until -vga given */
     GemuDisplayType display_type;
     int             display_scale;
-    const char     *vnc_addr;      /* NULL = no VNC */
+    const char     *vnc_addr;      /* -vnc spec (NULL = none); the display layer
+                                    * runs the server - machines need nothing */
     const char     *monitor_spec;  /* NULL = stdio */
     bool            display_explicit; /* true if -display was given */
     bool            no_shutdown;   /* -no-shutdown: pause instead of monitor-quit */

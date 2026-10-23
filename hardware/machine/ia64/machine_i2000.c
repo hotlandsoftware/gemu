@@ -8,7 +8,6 @@
 #include "network/i82559.h"
 #include "ps2_keyboard.h"
 #include "gemu/gemu_display.h"
-#include "gemu/vnc.h"
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
 #include "gemu/util.h"
@@ -358,8 +357,11 @@ struct Ia64I2000State {
     unsigned   autosave_slot;
 
     /* Keep newly-added host-only pointers at the end: v3 snapshots contain
-     * every preceding byte and can therefore still be restored exactly. */
-    GemuVncServer *vnc;
+     * every preceding byte and can therefore still be restored exactly.
+     * This slot used to hold the per-machine VNC server pointer (VNC now
+     * lives in the display layer); it stays as an always-NULL placeholder
+     * so the raw struct layout - and thus every v4+ snapshot - is unchanged. */
+    void          *snapshot_reserved0;
 
     /* v5 snapshot tail.  Rage128 needs only the display engine and linear
      * framebuffer for EFI/Windows setup; AGP and 3D are intentionally out
@@ -3577,7 +3579,7 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     *snap = *s;
     snap->monitor = NULL;
     snap->display = NULL;
-    snap->vnc = NULL;
+    snap->snapshot_reserved0 = NULL;
     snap->cpu = NULL;
     snap->ram = NULL;
     snap->flash = NULL;
@@ -3654,7 +3656,6 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
 
     GemuMonitor *monitor = s->monitor;
     GemuDisplay *display = s->display;
-    GemuVncServer *vnc = s->vnc;
     bool configured_rage128 = s->rage128.enabled;
     bool configured_mouse_enabled = s->mouse_enabled;
     bool configured_i82559 = s->i82559.enabled;
@@ -3677,7 +3678,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     if (!loaded) { fclose(f); return false; }
     size_t state_size;
     if (version == 3u)
-        state_size = offsetof(Ia64I2000State, vnc);
+        state_size = offsetof(Ia64I2000State, snapshot_reserved0);
     else if (version == 4u)
         state_size = offsetof(Ia64I2000State, rage128);
     else if (version == 5u)
@@ -3729,7 +3730,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         *s = *loaded;
         s->monitor = monitor;
         s->display = display;
-        s->vnc = vnc;
+        s->snapshot_reserved0 = NULL;
         s->cpu = cpu;
         s->ram = ram;
         s->flash = flash;
@@ -4278,7 +4279,7 @@ static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
         return GEMU_MON_NONE;
     }
     /* Monitor-scripted key injection for headless UI testing - the
-     * -display/-vnc input paths only ever feed kbc_queue_ascii()
+     * display input path (SDL or VNC) only ever feeds kbc_queue_ascii()
      * printable/control ASCII, so arrows (needed for the graphical
      * setup's tab bar per its own on-screen instructions) have no
      * other way in. A non-special argument is typed verbatim, which
@@ -4295,7 +4296,7 @@ static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
         ps2_keyboard_tap(&s->ps2_keyboard, special);
         /* EFI's built-in shell uses the polled serial console in
          * this firmware revision (cr.iva remains zero, so it does
-         * not consume PS/2 IRQ1 scan codes).  Real SDL/VNC ASCII
+         * not consume PS/2 IRQ1 scan codes).  Real display ASCII
          * input is mirrored into UART RX; monitor injection must do
          * the same or `key` appears to succeed while the shell sees
          * nothing. */
@@ -4799,7 +4800,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     gemu_monitor_set_cpu_state_cb(s->monitor, i2000_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, i2000_screendump, s);
 
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
             .fb_width = FB_W,
             .fb_height = FB_H,
@@ -4820,19 +4821,6 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
             return NULL;
         }
     }
-    if (cfg->vnc_addr) {
-        /* The i2000 front-panel framebuffer is 32-bit, while the current
-         * VNC renderer accepts 8-bit surfaces.  Still expose an RFB server
-         * for keyboard input; monitor screendump remains the video path. */
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, FB_W, FB_H);
-        if (!s->vnc) {
-            fprintf(stderr, "gemu: cannot start VNC server on '%s'\n",
-                    cfg->vnc_addr);
-            ia64_i2000_destroy(s);
-            return NULL;
-        }
-        gemu_monitor_set_vnc(s->monitor, s->vnc);
-    }
     return s;
 }
 
@@ -4841,7 +4829,6 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
         return;
     i2000_nvram_save(s);
     gemu_display_destroy(s->display);
-    gemu_vnc_destroy(s->vnc);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     merced_destroy(s->cpu);
     i82559_destroy(&s->i82559);
@@ -5323,40 +5310,12 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             }
         }
 
-        if (s->vnc) {
-            GemuVncKeyEvent ev;
-            while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-                uint32_t cp = 0;
-                if (ev.keysym <= 0x7F)        cp = ev.keysym;
-                else if (ev.keysym == 0xFF0D) cp = '\r';
-                else if (ev.keysym == 0xFF08) cp = '\b';
-                else if (ev.keysym == 0xFF09) cp = '\t';
-                else if (ev.keysym == 0xFF1B) cp = 0x1b;
-                else if (ev.keysym == 0xFFFF) cp = 0x7f;
-                if (cp && ev.down) {
-                    uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
-                    if (next != s->uart_rx_head) {
-                        s->uart_rx[s->uart_rx_tail] = (uint8_t)cp;
-                        s->uart_rx_tail = next;
-                    }
-                    i2000_efi_bios_key(s, (uint8_t)cp);
-                }
-                ps2_keyboard_key(&s->ps2_keyboard,
-                                 cp ? cp : ev.keysym, ev.down);
-            }
-        }
-
         if (s->mouse_enabled) {
             int rel_x = 0, rel_y = 0;
             bool left = s->mouse_prev_left, right = s->mouse_prev_right;
             bool have_pointer = false;
             if (s->display) {
                 GemuPointerState p = gemu_display_get_pointer(s->display);
-                rel_x = p.rel_x; rel_y = p.rel_y;
-                left = p.button; right = p.right_button;
-                have_pointer = true;
-            } else if (s->vnc) {
-                GemuVncPointerState p = gemu_vnc_get_pointer(s->vnc);
                 rel_x = p.rel_x; rel_y = p.rel_y;
                 left = p.button; right = p.right_button;
                 have_pointer = true;

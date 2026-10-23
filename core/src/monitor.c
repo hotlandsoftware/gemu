@@ -16,6 +16,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <signal.h>
 #ifdef _WIN32
 #  include <io.h>
 #  include <ws2tcpip.h>
@@ -430,7 +431,8 @@ static bool read_password_telnet(GemuMonitor *mon, char *out, size_t out_len) {
 }
 
 static bool monitor_change_vnc_password(GemuMonitor *mon) {
-    if (!mon->vnc) {
+    GemuVncServer *vnc = gemu_vnc_get();
+    if (!vnc) {
         mon_printf(mon, "vnc: not active\n");
         return true;
     }
@@ -443,8 +445,11 @@ static bool monitor_change_vnc_password(GemuMonitor *mon) {
     if (!ok) return false;
     if (strlen(password) > 8)
         mon_printf(mon, "warning: VNC passwords are limited to 8 characters; only the first 8 will be used\n");
-    gemu_vnc_set_password(mon->vnc, password);
-    mon_printf(mon, "vnc: password changed\n");
+    char err[160];
+    if (gemu_vnc_set_password(vnc, password, err, sizeof(err)))
+        mon_printf(mon, "vnc: password changed\n");
+    else
+        mon_printf(mon, "vnc: %s\n", err);
     return true;
 }
 
@@ -614,10 +619,6 @@ bool gemu_monitor_register_media(GemuMonitor *mon,
     return true;
 }
 
-void gemu_monitor_set_vnc(GemuMonitor *mon, GemuVncServer *vnc) {
-    if (mon) mon->vnc = vnc;
-}
-
 void gemu_monitor_set_input_reset_cb(GemuMonitor *mon,
                                      void (*cb)(void *ud),
                                      void *ud) {
@@ -741,8 +742,34 @@ void gemu_monitor_stop(GemuMonitor *mon) {
         printf("\n"); /* tidy up any dangling prompt */
 }
 
+/* ── Termination signals ─────────────────────────────────────────────────── *
+ *
+ * Like QEMU, SIGINT/SIGTERM shut the emulator down: the first one makes
+ * gemu_monitor_poll() report GEMU_MON_QUIT so the machine exits through its
+ * normal path (saving battery RAM etc.); a second one exits immediately in
+ * case the machine isn't polling. */
+
+static volatile sig_atomic_t quit_signal;   /* a termination signal arrived */
+static bool                  quit_reported; /* ...and QUIT was handed out */
+
+static void on_terminate(int sig) {
+    if (quit_signal) _exit(128 + sig);
+    quit_signal = 1;
+    static const char msg[] = "gemu: terminating on signal\n";
+    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+}
+
+void gemu_monitor_install_signal_handlers(void) {
+    signal(SIGINT, on_terminate);
+    signal(SIGTERM, on_terminate);
+}
+
 GemuMonCmd gemu_monitor_poll(GemuMonitor *mon) {
     if (!mon) return GEMU_MON_NONE;
+    if (quit_signal && !quit_reported) {
+        quit_reported = true;   /* once; a second signal force-exits */
+        return GEMU_MON_QUIT;
+    }
     for (;;) {
         pthread_mutex_lock(&mon->lock);
         if (mon->head == mon->tail) {

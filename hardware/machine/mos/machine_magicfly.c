@@ -191,7 +191,6 @@ static void magicfly_render(MagicflyState *s) {
 
                 int py = ty * 8 + ra;
                 uint32_t *row = &s->pixels_argb[py * MAGICFLY_FB_WIDTH + tx * 8];
-                uint8_t  *idxrow = &s->pixels_idx[py * MAGICFLY_FB_WIDTH + tx * 8];
                 for (int n = 7; n >= 0; n--) {
                     int bit0 = (plane0 >> n) & 1;
                     int pen;
@@ -214,7 +213,6 @@ static void magicfly_render(MagicflyState *s) {
                     }
                     pen &= (MAGICFLY_N_PALETTE - 1);
                     *row++ = s->palette[pen];
-                    *idxrow++ = (uint8_t)pen;
                 }
             }
         }
@@ -239,63 +237,15 @@ static void magicfly_dac_flush(MagicflyState *s) {
     s->dac_frame_n = 0;
 }
 
-/* ── Input: local display actions + VNC key -> action mapping ──────────── */
-
-#define XK_Left   0xFF51u
-#define XK_Right  0xFF53u
-#define XK_Return 0xFF0Du
-#define XK_F2     0xFFBFu
+/* ── Input: local display actions (VNC input is merged in by the display) ── */
 
 static void magicfly_handle_keys(MagicflyState *s, uint32_t held) {
     if (s->display) {
         s->held_actions = held;
         uint32_t newly = gemu_display_last_pressed(s->display);
         if (newly & GEMU_ACTION(MAGICFLY_ACT_COIN)) s->coin_latch = 15;
-    } else if (!s->vnc) {
+    } else {
         s->held_actions = 0;
-    }
-
-    if (s->vnc) {
-        bool mf = !s->cfg->is_7mezzo;
-        GemuVncKeyEvent ev;
-        while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-            uint32_t bit = 0;
-            if (mf) {
-                switch (ev.keysym) {
-                case '6':           bit = GEMU_ACTION(MAGICFLY_ACT_COIN);      break;
-                case 'q': case 'Q': bit = GEMU_ACTION(MAGICFLY_ACT_PAYOUT);    break;
-                case XK_Right:      bit = GEMU_ACTION(MAGICFLY_ACT_JOY_RIGHT); break;
-                case XK_Left:       bit = GEMU_ACTION(MAGICFLY_ACT_JOY_LEFT);  break;
-                case 'c': case 'C': bit = GEMU_ACTION(MAGICFLY_ACT_DEAL);      break;
-                case 'v': case 'V': bit = GEMU_ACTION(MAGICFLY_ACT_CANCEL);    break;
-                case 'x': case 'X': bit = GEMU_ACTION(MAGICFLY_ACT_BET10);     break;
-                case 'z': case 'Z': bit = GEMU_ACTION(MAGICFLY_ACT_SELECT);    break;
-                case XK_F2:         bit = GEMU_ACTION(MAGICFLY_ACT_SERVICE);   break;
-                default: break;
-                }
-            } else {
-                switch (ev.keysym) {
-                case '6':           bit = GEMU_ACTION(MAGICFLY_ACT_COIN);    break;
-                case XK_Right:      bit = GEMU_ACTION(MAGICFLY_ACT_BIG);     break;
-                case XK_Left:       bit = GEMU_ACTION(MAGICFLY_ACT_SMALL);   break;
-                case 'p': case 'P': bit = GEMU_ACTION(MAGICFLY_ACT_PAYOUT);  break;
-                case 't': case 'T': bit = GEMU_ACTION(MAGICFLY_ACT_TAKE);    break;
-                case XK_Return:     bit = GEMU_ACTION(MAGICFLY_ACT_DEAL);    break;
-                case 's': case 'S': bit = GEMU_ACTION(MAGICFLY_ACT_STAND);   break;
-                case XK_F2:         bit = GEMU_ACTION(MAGICFLY_ACT_SERVICE); break;
-                case 'u': case 'U': bit = GEMU_ACTION(MAGICFLY_ACT_DUP);     break;
-                case 'b': case 'B': bit = GEMU_ACTION(MAGICFLY_ACT_BET);     break;
-                default: break;
-                }
-            }
-            if (!bit) continue;
-            if (ev.down) {
-                s->held_actions |= bit;
-                if (bit == GEMU_ACTION(MAGICFLY_ACT_COIN)) s->coin_latch = 15;
-            } else {
-                s->held_actions &= ~bit;
-            }
-        }
     }
 }
 
@@ -489,15 +439,6 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
     magicfly_build_sav_path(s->sav_path, sizeof(s->sav_path), name);
     magicfly_nvram_load(s);
 
-    if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, MAGICFLY_FB_WIDTH, MAGICFLY_FB_HEIGHT);
-        if (s->vnc)
-            gemu_vnc_set_palette(s->vnc, s->palette, MAGICFLY_N_PALETTE);
-        else
-            fprintf(stderr, "%s: failed to start VNC at %s\n", name, cfg->vnc_addr);
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
-
     if (cfg->sound == MOS_SOUND_PCSPK) {
         s->dac_clock_pps = (double)MAGICFLY_CPU_HZ / 44100.0;
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
@@ -509,7 +450,7 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
         }
     }
 
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
         const GemuActionDef *actions = mf ? magicfly_actions_mf : magicfly_actions_7m;
         int n_actions = mf ? (int)(sizeof(magicfly_actions_mf)/sizeof(magicfly_actions_mf[0]))
                            : (int)(sizeof(magicfly_actions_7m)/sizeof(magicfly_actions_7m[0]));
@@ -534,7 +475,6 @@ void magicfly_destroy(MagicflyState *s) {
     if (s->audio_dev) { SDL_CloseAudioDevice(s->audio_dev); SDL_QuitSubSystem(SDL_INIT_AUDIO); }
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
-    gemu_vnc_destroy(s->vnc);
     free(s->prg);
     free(s->gfxbnk0);
     free(s->gfxbnk1);
@@ -606,8 +546,6 @@ void magicfly_run(MagicflyState *s, const MosConfig *cfg) {
 
         if (s->display)
             gemu_display_render(s->display, s->pixels_argb, MAGICFLY_FB_WIDTH, MAGICFLY_FB_HEIGHT);
-        if (s->vnc)
-            gemu_vnc_update(s->vnc, s->pixels_idx, MAGICFLY_FB_WIDTH, MAGICFLY_FB_HEIGHT);
 
         Uint32 dt = SDL_GetTicks() - t0;
         Uint32 frame_ms = 1000u / 60u;

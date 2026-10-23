@@ -403,7 +403,7 @@ static void vip_poll_display(RcaVipState *s, const RcaConfig *cfg,
             if (ascii >= 'a' && ascii <= 'z') ascii -= 32;  /* uppercase */
             if (ascii == 0x7f) ascii = '\b';                /* Del → BS  */
             if ((ascii >= 0x20 && ascii <= 0x7e) ||
-                ascii == '\r' || ascii == '\b')
+                ascii == '\r' || ascii == '\b' || ascii == 0x1B)
                 s->ascii_key = ascii;
         }
     }
@@ -461,7 +461,7 @@ RcaVipState *rca_vip_create(const RcaConfig *cfg) {
             snprintf(tape_dev.file, sizeof(tape_dev.file), "%s", s->tape.path);
         gemu_monitor_register_media(s->monitor, &tape_dev);
     }
-    if (cfg->sound_hw == RCA_SOUND_PCSPK && !cfg->vnc_addr) {
+    if (cfg->sound_hw == RCA_SOUND_PCSPK) {
         s->speaker = rca_pcspk_create(250u);
         if (!s->speaker)
             fprintf(stderr, "gemu-rca: failed to initialize pcspk audio; continuing without sound\n");
@@ -469,17 +469,6 @@ RcaVipState *rca_vip_create(const RcaConfig *cfg) {
 
     cdp1861_init(&s->vdc, vip_dma_out, s);
     cdp1869_init(&s->vis);
-    if (cfg->vnc_addr) {
-        int w = (cfg->vga == RCA_VGA_CDP1869) ? CDP1869_VISIBLE_W : CDP1861_DISPLAY_W;
-        int h = (cfg->vga == RCA_VGA_CDP1869) ? CDP1869_VISIBLE_H : CDP1861_DISPLAY_H;
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, w * cfg->display_scale,
-                                 h * cfg->display_scale);
-        if (cfg->vga == RCA_VGA_CDP1861)
-            gemu_vnc_set_colors(s->vnc, 0xFFFFFFu, 0x100080u);
-        else if (cfg->vga == RCA_VGA_CDP1869)
-            gemu_vnc_set_palette(s->vnc, vip_vis_palette, 8);
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     s->key_down = -1;
     s->ascii_key = -1;
@@ -538,7 +527,6 @@ void rca_vip_destroy(RcaVipState *s) {
     vip_tape_destroy(&s->tape);
     rca_pcspk_destroy(s->speaker);
     gemu_monitor_destroy(s->monitor);
-    gemu_vnc_destroy(s->vnc);
     free(s);
 }
 
@@ -551,7 +539,7 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
     if (cfg->vga == RCA_VGA_CDP1869) { fw = CDP1869_VISIBLE_W; fh = CDP1869_VISIBLE_H; }
 
     GemuDisplay *display = NULL;
-    if (cfg->vga != RCA_VGA_NONE) {
+    if (cfg->vga != RCA_VGA_NONE && gemu_display_wanted(cfg->display_type)) {
         display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
                 .fb_width    = fw,
@@ -587,18 +575,11 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
             if (quit) break;
         }
 
-        /* VNC key input */
-        uint8_t vnc_keys[16];
-        gemu_vnc_get_keys(s->vnc, vnc_keys);
-        int vnc_ascii = rca_vp601_vnc_keysym_to_ascii(gemu_vnc_pop_keysym(s->vnc));
-        if (vnc_ascii >= 0 && rca_vip_has_vp601(cfg))
-            s->ascii_key = vnc_ascii;
-
         /* Resolve key_down (highest priority key index held) */
         s->key_down = -1;
         if (rca_vip_has_keypad(cfg)) {
             for (int k = 0; k < 16; k++)
-                if (s->keys[k] || vnc_keys[k]) { s->key_down = k; break; }
+                if (s->keys[k]) { s->key_down = k; break; }
         }
 
         /* EF4 is active-low for both VIP hex keypad and VP601 data-ready */
@@ -639,13 +620,10 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
                 for (int i = 0; i < CDP1869_VISIBLE_W * CDP1869_VISIBLE_H; i++)
                     argb[i] = vip_vis_palette[s->vis.bitmap[i] & 7];
                 gemu_display_render(display, argb, CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
-                gemu_vnc_update(s->vnc, s->vis.bitmap,
-                                CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
             } else if (s->draw_flag) {
                 for (int i = 0; i < CDP1861_DISPLAY_W * CDP1861_DISPLAY_H; i++)
                     argb[i] = s->vram[i] ? 0xFFFFFFFFu : 0xFF100080u;
                 gemu_display_render(display, argb, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
-                gemu_vnc_update(s->vnc, s->vram, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
                 s->draw_flag = false;
             }
         }

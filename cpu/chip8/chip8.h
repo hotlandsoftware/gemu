@@ -3,7 +3,6 @@
 #include <stdbool.h>
 #include "gemu/tcg.h"
 #include "gemu/monitor.h"
-#include "gemu/vnc.h"
 #include "gemu/display.h"
 
 /* ── Display ──────────────────────────────────────────────────────────────── */
@@ -90,7 +89,6 @@ typedef struct Chip8State {
     uint8_t  wait_reg;
     GemuTbCache  tb_cache;
     GemuMonitor *monitor;
-    GemuVncServer *vnc;
     uint64_t     insn_count;
     uint64_t     tb_hits;
     uint64_t     tb_misses;
@@ -104,7 +102,6 @@ typedef struct Chip8Config {
     int              display_scale;
     bool             quirk_shift;
     bool             quirk_jump;
-    const char      *vnc_addr;
     bool             no_shutdown;
     Chip8MachineType machine;
     uint32_t         fg_argb;     /* on-pixel color  (default: Octo yellow) */

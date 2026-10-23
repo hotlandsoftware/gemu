@@ -60,6 +60,10 @@ void         gemu_monitor_destroy(GemuMonitor *mon);
  * gmp:HOST:PORT, gmp-stdio. */
 void         gemu_monitor_set_default(const char *spec);
 
+/* Make SIGINT/SIGTERM quit the emulator through gemu_monitor_poll() (call
+ * once at startup, before SDL is initialized). */
+void         gemu_monitor_install_signal_handlers(void);
+
 /* Set the process-wide machine name (the -M argument).  Machine-restricted
  * commands are only accepted when this name is in their machine list. */
 void         gemu_monitor_set_machine(const char *name);
@@ -110,7 +114,6 @@ void         gemu_monitor_set_memory(GemuMonitor *mon, const GemuMonMemory *mem)
 
 bool         gemu_monitor_register_media(GemuMonitor *mon,
                                          const GemuMediaDevice *dev);
-void         gemu_monitor_set_vnc(GemuMonitor *mon, GemuVncServer *vnc);
 void         gemu_monitor_set_input_reset_cb(GemuMonitor *mon,
                                              void (*cb)(void *ud),
                                              void *ud);

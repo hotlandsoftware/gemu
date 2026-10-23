@@ -3,7 +3,6 @@
 #include "mos6502cfg.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
-#include "gemu/vnc.h"
 #include <SDL2/SDL.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -106,7 +105,6 @@ typedef struct MagicflyState {
     int coin_latch; /* coin-in pulse, frames remaining */
 
     uint32_t pixels_argb[MAGICFLY_FB_WIDTH * MAGICFLY_FB_HEIGHT];
-    uint8_t  pixels_idx[MAGICFLY_FB_WIDTH * MAGICFLY_FB_HEIGHT]; /* for VNC */
 
     /* 1-bit delta-sigma bitstream DAC (bit7 of $3000). Not a "PC speaker"
      * gated tone - the CPU shapes the actual waveform by toggling this bit
@@ -127,7 +125,6 @@ typedef struct MagicflyState {
 
     GemuDisplay   *display;
     GemuMonitor   *monitor;
-    GemuVncServer *vnc;
 
     uint64_t frame;
 } MagicflyState;

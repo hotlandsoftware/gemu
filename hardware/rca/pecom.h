@@ -4,7 +4,6 @@
 #include "rca.h"
 #include "pcspk.h"
 #include "gemu/monitor.h"
-#include "gemu/vnc.h"
 #include "gemu/gemu_display.h"
 #include <stdlib.h>
 
@@ -59,19 +58,16 @@ typedef struct RcaPecom32State {
      * in that row (active-high: 1 = pressed).
      * EF1 = CTRL (AND with VIS display), EF2 = SHIFT, EF3 = CAPS (pol=rev),
      * EF4 = ESC. */
-    uint8_t  keys[64];      /* key matrix read by ROM: live | latch */
-    uint8_t  keys_live[64]; /* VNC: current physical state (down=1, up=0) */
-    uint8_t  keys_latch[64];/* VNC: set on key-down, cleared each poll - ensures
-                             *  a fast tap (down+up in same frame) is held for
-                             *  at least one CPU frame so the ROM scan sees it */
+    uint8_t  keys[64];      /* key matrix read by ROM: held keys plus keys
+                             *  typed this frame (so a fast tap is seen) */
 
     bool     key_shift;
     bool     key_ctrl;
     bool     key_esc;
     bool     caps_locked;
+    bool     caps_key_prev; /* Caps Lock held last poll (edge detect) */
 
     GemuMonitor  *monitor;
-    GemuVncServer *vnc;
     RcaPcSpeaker *speaker;
 } RcaPecom32State;
 

@@ -160,16 +160,6 @@ static const struct { int x, y, w, h; } seg_rects[8] = {
 #define COLOUR_KEY_LIT    0xFF8A7A50u  /* key pressed highlight   */
 #define COLOUR_KEY_TEXT   0xFFFFFFFFu  /* key label text          */
 
-static const uint32_t kim1_vnc_palette[] = {
-    0x000000u, /* background */
-    0x301010u, /* LED off    */
-    0xFF2020u, /* LED lit    */
-    0x3F3F3Fu, /* key border */
-    0x6A6A68u, /* key body   */
-    0x8A7A50u, /* key active */
-    0xFFFFFFu, /* key text   */
-};
-
 /* ── Framebuffer helpers ────────────────────────────────────────────────── */
 
 static void fill_rect(uint32_t *fb, int fb_w, int x, int y,
@@ -190,39 +180,6 @@ static void draw_rect_border(uint32_t *fb, int fb_w, int x, int y,
     fill_rect(fb, fb_w, x, y + h - t, w, t, c);     /* bottom */
     fill_rect(fb, fb_w, x, y + t, t, h - 2 * t, c); /* left   */
     fill_rect(fb, fb_w, x + w - t, y + t, t, h - 2 * t, c); /* right */
-}
-
-static uint8_t kim1_vnc_index(uint32_t argb) {
-    uint32_t rgb = argb & 0x00FFFFFFu;
-    switch (rgb) {
-    case 0x000000u: return 0;
-    case 0x301010u: return 1;
-    case 0xFF2020u: return 2;
-    case 0x3F3F3Fu: return 3;
-    case 0x6A6A68u: return 4;
-    case 0x8A7A50u: return 5;
-    case 0xFFFFFFu: return 6;
-    default:
-        if (((rgb >> 16) & 0xFFu) > 0xC0u && (rgb & 0xFFFFu) < 0x8080u)
-            return 2;
-        if ((rgb & 0xFFu) > 0xC0u && ((rgb >> 8) & 0xFFu) > 0xC0u)
-            return 6;
-        return 0;
-    }
-}
-
-static void kim1_update_vnc(Kim1State *s) {
-    if (!s->vnc) return;
-
-    for (int y = 0; y < KIM1_PRESENT_HEIGHT; y++) {
-        int sy = y * KIM1_FB_HEIGHT / KIM1_PRESENT_HEIGHT;
-        for (int x = 0; x < KIM1_PRESENT_WIDTH; x++) {
-            int sx = x * KIM1_FB_WIDTH / KIM1_PRESENT_WIDTH;
-            s->vnc_fb[y * KIM1_PRESENT_WIDTH + x] =
-                kim1_vnc_index(s->fb[sy * KIM1_FB_WIDTH + sx]);
-        }
-    }
-    gemu_vnc_update(s->vnc, s->vnc_fb, KIM1_PRESENT_WIDTH, KIM1_PRESENT_HEIGHT);
 }
 
 /* ── Font rendering ─────────────────────────────────────────────────────── */
@@ -391,18 +348,6 @@ static uint32_t kim1_raw_key_to_action(uint32_t cp) {
     case 's': case 'S': return KIM1_ACT_ST;
     case 'r': case 'R': return KIM1_ACT_RS;
     default: return 0;
-    }
-}
-
-static void kim1_poll_vnc(Kim1State *s) {
-    if (!s->vnc) return;
-
-    GemuVncKeyEvent ev;
-    while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-        if (!ev.down)
-            continue;
-        uint32_t action = kim1_raw_key_to_action(ev.keysym);
-        kim1_queue_keypress(s, action);
     }
 }
 
@@ -1420,7 +1365,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         }
     }
 
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
 #if defined(GEMU_GTK) || defined(_WIN32)
         GemuDisplayGtkExtras gtk_extras = {
             .monitor       = s->monitor,
@@ -1489,18 +1434,6 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     }
 #endif /* GEMU_GTK || _WIN32 */
 
-    if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr,
-                                 KIM1_PRESENT_WIDTH  * cfg->display_scale,
-                                 KIM1_PRESENT_HEIGHT * cfg->display_scale);
-        if (s->vnc)
-            gemu_vnc_set_palette(s->vnc, kim1_vnc_palette,
-                                 (int)(sizeof(kim1_vnc_palette) / sizeof(kim1_vnc_palette[0])));
-        else
-            fprintf(stderr, "gemu-kim1: failed to start VNC at %s\n", cfg->vnc_addr);
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
-
     kim1_reset_rriots(s);
     s->serial = cfg->serial;
     s->display_dirty = true;
@@ -1516,7 +1449,6 @@ void kim1_destroy(Kim1State *s) {
     hex_editor_destroy(s->hex_editor);
 #endif
     gemu_display_destroy(s->display);
-    gemu_vnc_destroy(s->vnc);
     gemu_monitor_destroy(s->monitor);
     free(s->ext_ram);
     free(s);
@@ -1574,7 +1506,6 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
                 kim1_reset_rriots(s);
             }
         }
-        kim1_poll_vnc(s);
 
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
@@ -1601,14 +1532,11 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
         }
 
 
-        if ((s->display || s->vnc) && s->display_dirty) {
+        if (s->display && s->display_dirty) {
             kim1_render_fb(s);
             s->display_dirty = false;
-            if (s->display)
-                gemu_display_render(s->display, s->fb,
-                                    KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
-            if (s->vnc)
-                kim1_update_vnc(s);
+            gemu_display_render(s->display, s->fb,
+                                KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
         }
 
 #if defined(GEMU_GTK) || defined(_WIN32)

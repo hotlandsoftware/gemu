@@ -27,6 +27,8 @@ every reply echoes the request's `id`. Requests may span lines or share one.
 | `query-commands` | list the supported commands |
 | `query-status` | whether emulation is running or paused |
 | `query-version` | protocol/emulator version |
+| `query-vnc` | VNC server status |
+| `set_password`, `expire_password` | VNC password, as in QEMU (`"protocol": "vnc"`) |
 | `human-monitor-command` | run any monitor command below (`"arguments": {"command-line": "..."}`) and return its output as a string |
 | `stop`, `cont`, `system_reset`, `quit` | same as the monitor commands; the reply is sent once the command has taken effect |
 
@@ -65,6 +67,7 @@ Lists all commands, or describes one.
 | `info media` | media device status |
 | `info roms` | loaded ROM images |
 | `info status` | whether emulation is running or paused |
+| `info vnc` | the VNC server's address, authentication and connected clients |
 
 > ``quit`` / ``q``
 
@@ -142,9 +145,20 @@ Ejects media from a device.
 
 Flips disk media to the next side, useful for e.g. Famicom floppies or dual-sided DVDs.
 
+## VNC
+Every machine can be shown over VNC with `-vnc`, using QEMU's syntax: `-vnc :1` (all interfaces, port 5901), `-vnc localhost:1`, `-vnc unix:/path`, with options `password=on`, `to=L` and `share=`. Without `-display`, `-vnc` runs with no local window. See `-vnc ?`.
+
 > ``change vnc password``
 
-Changes/sets the VNC password, if the VNC server is enabled.
+Prompts for a new VNC password. Like QEMU, passwords only work when the server was started with `password=on`; until one is set, clients are refused.
+
+> ``set_password vnc <password>``
+
+Sets the VNC password without prompting.
+
+> ``expire_password vnc now|never``
+
+Expires the password immediately (clients are refused until a new one is set), or leaves it valid.
 
 ## Screen and input
 > ``screendump <file>[.png]``

@@ -24,6 +24,10 @@ struct GemuDisplay {
     bool paused_title;
     char title[128];
 
+    /* VNC mirroring/input (gemu_display_vnc.c); NULL without -vnc */
+    struct GemuDisplayVnc *vnc;
+    bool headless;          /* no local output: -display none with -vnc */
+
     /* Backend vtable */
     void     (*do_render)     (struct GemuDisplay *, const uint32_t *, int, int);
     void     (*do_render_text)(struct GemuDisplay *, const char *, int, int);
@@ -46,6 +50,16 @@ GemuDisplay *gemu_display_caca_create(const GemuDisplayConfig *cfg);
 #ifndef _WIN32
 GemuDisplay *gemu_display_term_create(const GemuDisplayConfig *cfg);
 #endif
+
+/* ── VNC (gemu_display_vnc.c) ────────────────────────────────────────────── */
+typedef struct GemuVncServer GemuVncServer;
+GemuDisplay *gemu_display_headless_create(const GemuDisplayConfig *cfg);
+void     gemu_display_vnc_attach(GemuDisplay *d, GemuVncServer *server,
+                                 const GemuDisplayConfig *cfg);
+void     gemu_display_vnc_detach(GemuDisplay *d);
+void     gemu_display_vnc_frame(GemuDisplay *d, const uint32_t *argb, int w, int h);
+uint32_t gemu_display_vnc_poll(GemuDisplay *d);
+bool     gemu_display_vnc_key_held(GemuDisplay *d, const char *name);
 
 /* ── INI helper (implemented in gemu_display.c) ──────────────────────────── */
 

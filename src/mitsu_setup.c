@@ -36,7 +36,6 @@ static const GemuArgsDef def = {
                   | GEMU_DISP_F(GEMU_DISPLAY_GTK)
 #endif
     ,
-    .vnc_support  = false,
     .extra_help =
         "\nMitsubishi/Nintendo dedicated console options:\n"
         "  -M tvgame6      Nintendo Color TV-Game 6\n"

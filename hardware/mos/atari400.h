@@ -6,7 +6,6 @@
 #include "pia6821.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
-#include "gemu/vnc.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -35,7 +34,7 @@
  * $4000-$7FFF; writes to $CFC0-$CFFF (conventionally $CFFF), or its
  * $0FC0-$0FFF mirror, select bank 0-63 (bank 0 is base RAM).
  *
- * Keyboard: host characters (SDL raw-key queue / VNC keysyms / monitor
+ * Keyboard: host characters (display raw-key queue, window or VNC / monitor
  * `sendkey`) are translated to POKEY scan codes and paced a few frames
  * apart so the OS debounce logic registers each one.  Ctrl+arrows send the
  * Atari cursor-movement codes; plain arrows and Left Alt drive joystick 1.
@@ -98,12 +97,10 @@ typedef struct Atari400State {
     int      key_gap_frames;    /* >0: wait before next queued key */
 
     uint32_t held_actions;
-    uint8_t  vnc_console;   /* console keys held via VNC (bit0-2) */
     bool     prev_arrow[4]; /* ctrl+arrow edge detection */
 
     GemuDisplay   *display;
     GemuMonitor   *monitor;
-    GemuVncServer *vnc;
 
     uint64_t frame;
 } Atari400State;

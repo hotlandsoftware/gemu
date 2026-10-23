@@ -245,7 +245,7 @@ MitsuTvGame6State *mitsu_tvgame6_create(const MitsuConfig *cfg) {
     gemu_monitor_set_cpu_state_cb(s->monitor, tvgame6_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, tvgame6_screendump, s);
 
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
             .fb_width = FB_W,
             .fb_height = FB_H,
@@ -659,7 +659,7 @@ void mitsu_tvgame6_run(MitsuTvGame6State *s, const MitsuConfig *cfg) {
     render_game(s);
     gemu_monitor_start(s->monitor);
 
-    if (cfg->display_type == GEMU_DISPLAY_NONE) {
+    if (!s->display) {
         bool running = true;
         while (running) {
             GemuMonCmd cmd;

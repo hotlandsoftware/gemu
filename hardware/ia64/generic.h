@@ -212,14 +212,6 @@ typedef struct {
      *                     client at a time - the one to point a real
      *                     debugger at */
     const char     *serial_spec;
-    /* -vnc ADDR: accept RFB keyboard input (arrow/enter, for the boot
-     * menu, and raw ASCII for qemu_firmware's UART ConIn path) over a
-     * VNC connection - the framebuffer itself is NOT exported this way
-     * (gemu_vnc_update() only understands 8bpp palette/mono surfaces,
-     * not this machine's native 32-bit ARGB one); use the monitor's
-     * `screendump` command for visual feedback instead. NULL = no VNC
-     * server. Format: "host:display" or ":display" (port = 5900+display). */
-    const char     *vnc_addr;
     bool            menu_disabled; /* machine XML's menu="disabled" */
 } GenericConfig;
 

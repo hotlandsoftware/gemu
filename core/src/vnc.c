@@ -1,4 +1,19 @@
+/*
+ * GEMU VNC server - RFB 3.3/3.7/3.8, configured like QEMU's -vnc.
+ *
+ * One server per process.  The display layer publishes every frame with
+ * gemu_vnc_update_argb() and drains input with gemu_vnc_pop_key_event() /
+ * gemu_vnc_get_pointer(), so machines need no VNC code of their own.
+ *
+ * Threads: one accept thread, and two per client - a reader that handles
+ * client messages (input, update requests) and a writer that waits until a
+ * requested update has something new and sends only the 16x16 tiles that
+ * changed since that client's last update.  Clients that support the
+ * DesktopSize pseudo-encoding are told when the frame size changes; others
+ * get the frame scaled to the size they connected with.
+ */
 #include "gemu/vnc.h"
+#include "gemu/gemu_display.h"
 #ifdef HAVE_CRYPTO
 #  include <openssl/rand.h>
 #  include <openssl/des.h>
@@ -13,162 +28,310 @@
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
 typedef SOCKET sock_t;
-#  define INVALID_SOCK   INVALID_SOCKET
-#  define sock_close(s)  closesocket(s)
+#  define INVALID_SOCK    INVALID_SOCKET
+#  define sock_close(s)   closesocket(s)
+#  define SHUT_RDWR       SD_BOTH
 #  ifndef MSG_NOSIGNAL
 #    define MSG_NOSIGNAL 0
 #  endif
 #else
 #  include <unistd.h>
+#  include <netdb.h>
 #  include <sys/select.h>
 #  include <sys/socket.h>
 #  include <sys/un.h>
 #  include <netinet/in.h>
 #  include <arpa/inet.h>
+#  include <errno.h>
 typedef int sock_t;
-#  define INVALID_SOCK   (-1)
-#  define sock_close(s)  close(s)
+#  define INVALID_SOCK    (-1)
+#  define sock_close(s)   close(s)
 #endif
 
-#define GEMU_VNC_KEY_QUEUE_CAP 64u
+#define VNC_PORT_BASE    5900
+#define VNC_MAX_CLIENTS  16
+#define VNC_KEY_QUEUE    256
+#define VNC_TILE         16
+#define VNC_MAX_LISTEN   4
+#define ENC_RAW          0
+#define ENC_DESKTOP_SIZE (-223)
+
+/* ── Configuration (-vnc) ────────────────────────────────────────────────── */
+
+typedef enum { SHARE_ALLOW_EXCLUSIVE, SHARE_FORCE_SHARED, SHARE_IGNORE } ShareMode;
+
+typedef struct {
+    bool      enabled;
+    bool      unix_socket;
+    char      host[256];       /* "" = all interfaces */
+    int       display, display_max;
+    char      path[108];
+    bool      password;
+    ShareMode share;
+} VncConfig;
+
+static VncConfig       g_cfg;
+static GemuVncServer  *g_server;
+static bool            g_server_tried;
+
+/* Parse "host:N[,opt=val...]" (QEMU syntax) into cfg. */
+static bool parse_spec(const char *spec, VncConfig *cfg, char *err, size_t err_len) {
+    memset(cfg, 0, sizeof(*cfg));
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", spec);
+    char *opts = strchr(buf, ',');
+    if (opts) *opts++ = '\0';
+
+    if (strcmp(buf, "none") == 0) return true;      /* disabled */
+
+    if (strncmp(buf, "unix:", 5) == 0) {
+#ifdef _WIN32
+        snprintf(err, err_len, "unix sockets aren't supported on Windows");
+        return false;
+#else
+        if (!buf[5] || strlen(buf + 5) >= sizeof(cfg->path)) {
+            snprintf(err, err_len, "bad unix socket path");
+            return false;
+        }
+        cfg->unix_socket = true;
+        snprintf(cfg->path, sizeof(cfg->path), "%s", buf + 5);
+#endif
+    } else {
+        char *colon = strrchr(buf, ':');
+        if (!colon) {
+            snprintf(err, err_len, "expected host:N, :N or unix:/path");
+            return false;
+        }
+        *colon = '\0';
+        char *end;
+        long n = strtol(colon + 1, &end, 10);
+        if (*end || colon[1] == '\0' || n < 0 || n > 65535 - VNC_PORT_BASE) {
+            snprintf(err, err_len, "bad display number '%s'", colon + 1);
+            return false;
+        }
+        cfg->display = cfg->display_max = (int)n;
+        char *host = buf;
+        size_t hl = strlen(host);
+        if (hl >= 2 && host[0] == '[' && host[hl - 1] == ']') {   /* [::1] */
+            host[hl - 1] = '\0';
+            host++;
+        }
+        snprintf(cfg->host, sizeof(cfg->host), "%s", host);
+    }
+
+    for (char *o = opts; o && *o; ) {
+        char *next = strchr(o, ',');
+        if (next) *next++ = '\0';
+        char *val = strchr(o, '=');
+        if (val) *val++ = '\0';
+        if (strcmp(o, "password") == 0) {
+            cfg->password = !val || strcmp(val, "on") == 0 || strcmp(val, "true") == 0;
+        } else if (strcmp(o, "to") == 0 && val) {
+            cfg->display_max = atoi(val);
+            if (cfg->display_max < cfg->display) cfg->display_max = cfg->display;
+        } else if (strcmp(o, "share") == 0 && val) {
+            if      (strcmp(val, "allow-exclusive") == 0) cfg->share = SHARE_ALLOW_EXCLUSIVE;
+            else if (strcmp(val, "force-shared") == 0)    cfg->share = SHARE_FORCE_SHARED;
+            else if (strcmp(val, "ignore") == 0)          cfg->share = SHARE_IGNORE;
+            else { snprintf(err, err_len, "bad share mode '%s'", val); return false; }
+        } else if (strcmp(o, "ipv4") == 0 || strcmp(o, "ipv6") == 0 ||
+                   strcmp(o, "lossy") == 0 || strcmp(o, "non-adaptive") == 0) {
+            /* accepted for QEMU compatibility; no effect */
+        } else {
+            snprintf(err, err_len, "unsupported option '%s'", o);
+            return false;
+        }
+        o = next;
+    }
+    cfg->enabled = true;
+    return true;
+}
+
+bool gemu_vnc_configure(const char *spec) {
+    char err[160] = "";
+    VncConfig cfg;
+    if (!parse_spec(spec ? spec : "none", &cfg, err, sizeof(err))) {
+        fprintf(stderr, "vnc: %s\n", err);
+        return false;
+    }
+    g_cfg = cfg;
+    return true;
+}
+
+bool gemu_vnc_configured(void) {
+    return g_cfg.enabled;
+}
+
+/* ── Server state ────────────────────────────────────────────────────────── */
+
+typedef struct {
+    int      bytes_pp;
+    bool     big_endian;
+    uint16_t r_max, g_max, b_max;
+    uint8_t  r_shift, g_shift, b_shift;
+} PixFmt;
+
+typedef struct VncClient VncClient;
 
 struct GemuVncServer {
-    sock_t          listen_fd;
-    pthread_t       thread;
+    sock_t          listen_fds[VNC_MAX_LISTEN];  /* one per address (v4/v6) */
+    int             n_listen;
+    pthread_t       accept_thread;
+    volatile bool   running;
+    char            where[300];          /* listening address, for info vnc */
+
     pthread_mutex_t lock;
-    uint8_t        *fb;          /* vram snapshot (1 byte/pixel) */
-    int             vram_w, vram_h;
-    int             fb_w, fb_h;  /* scaled output dimensions */
-    bool            running;
-    uint8_t         keys[16];    /* CHIP-8 key state from VNC clients */
-    uint32_t        queued_keysym;
-    GemuVncKeyEvent key_queue[GEMU_VNC_KEY_QUEUE_CAP];
+    pthread_cond_t  cond;                /* new frame, or a client state change */
+
+    uint32_t       *fb;                  /* published frame */
+    int             w, h;
+    uint64_t        frame_seq;
+
+    GemuVncKeyEvent keys[VNC_KEY_QUEUE];
     unsigned        key_head, key_count;
-    uint32_t        held_keysyms[GEMU_VNC_KEY_QUEUE_CAP];
-    unsigned        held_count;
-    int             pointer_x, pointer_y;
-    int             pointer_rel_x, pointer_rel_y;
-    bool            pointer_have_pos;
-    bool            pointer_button, pointer_pressed;
-    bool            pointer_right_button, pointer_right_pressed;
-    uint32_t        fg_rgb;
-    uint32_t        bg_rgb;
-    uint32_t        palette[256];
-    int             n_colors;
-    bool            password_set;
+    GemuVncPointerState pointer;
+    bool            have_pointer;
+
+    bool            password_required;
     char            password[9];
-    bool            unix_socket;
-    char            unix_path[108];
+    bool            password_valid;      /* set and not expired */
+    ShareMode       share;
+
+    VncClient      *clients[VNC_MAX_CLIENTS];
+    int             n_clients;
 };
 
-/* X11 keysyms matching the SDL/GTK CHIP-8 keypad layout:
- *   Keypad  1 2 3 C  →  1 2 3 4
- *           4 5 6 D  →  Q W E R
- *           7 8 9 E  →  A S D F
- *           A 0 B F  →  Z X C V     */
-static const uint32_t chip8_keysyms[16] = {
-    0x78, /* 0 → x */  0x31, /* 1 → 1 */  0x32, /* 2 → 2 */  0x33, /* 3 → 3 */
-    0x71, /* 4 → q */  0x77, /* 5 → w */  0x65, /* 6 → e */  0x61, /* 7 → a */
-    0x73, /* 8 → s */  0x64, /* 9 → d */  0x7a, /* A → z */  0x63, /* B → c */
-    0x34, /* C → 4 */  0x72, /* D → r */  0x66, /* E → f */  0x76, /* F → v */
+struct VncClient {
+    GemuVncServer *s;
+    sock_t         fd;
+    char           peer[64];
+    pthread_t      reader, writer;
+    bool           writer_started;
+    volatile bool  alive;
+
+    /* Guarded by s->lock: */
+    PixFmt         fmt;
+    bool           desktop_size;         /* client handles DesktopSize */
+    bool           req;                  /* an update request is pending */
+    bool           req_full;             /* ...and it's non-incremental */
+    uint64_t       sent_seq;
+    int            cw, ch;               /* size the client believes the screen is */
+
+    /* Writer-only: */
+    uint32_t      *last;                 /* frame as last sent (cw x ch, scaled) */
+    uint32_t       held[VNC_KEY_QUEUE];  /* keysyms held by this client */
+    unsigned       n_held;
 };
-
-static void enqueue_key_event(GemuVncServer *vnc, uint32_t keysym, bool down) {
-    if (vnc->key_count == GEMU_VNC_KEY_QUEUE_CAP) {
-        vnc->key_head = (vnc->key_head + 1u) % GEMU_VNC_KEY_QUEUE_CAP;
-        vnc->key_count--;
-    }
-
-    unsigned idx = (vnc->key_head + vnc->key_count) % GEMU_VNC_KEY_QUEUE_CAP;
-    vnc->key_queue[idx] = (GemuVncKeyEvent){
-        .keysym = keysym,
-        .down = down,
-    };
-    vnc->key_count++;
-}
-
-static void update_held_key(GemuVncServer *vnc, uint32_t keysym, bool down) {
-    for (unsigned i = 0; i < vnc->held_count; i++) {
-        if (vnc->held_keysyms[i] != keysym)
-            continue;
-        if (!down) {
-            vnc->held_count--;
-            vnc->held_keysyms[i] = vnc->held_keysyms[vnc->held_count];
-        }
-        return;
-    }
-
-    if (down && vnc->held_count < GEMU_VNC_KEY_QUEUE_CAP)
-        vnc->held_keysyms[vnc->held_count++] = keysym;
-}
-
-static void release_held_keys(GemuVncServer *vnc) {
-    pthread_mutex_lock(&vnc->lock);
-    for (unsigned i = 0; i < vnc->held_count; i++)
-        enqueue_key_event(vnc, vnc->held_keysyms[i], false);
-    vnc->held_count = 0;
-    memset(vnc->keys, 0, sizeof(vnc->keys));
-    vnc->pointer_button = false;
-    vnc->pointer_right_button = false;
-    pthread_mutex_unlock(&vnc->lock);
-}
 
 /* ── I/O helpers ─────────────────────────────────────────────────────────── */
 
 static bool recvall(sock_t fd, void *buf, size_t n) {
     char *p = buf;
-    while (n) { ssize_t r = recv(fd, p, (int)n, 0); if (r <= 0) return false; p += r; n -= (size_t)r; }
+    while (n) {
+        int r = (int)recv(fd, p, (int)n, 0);
+        if (r <= 0) return false;
+        p += r;
+        n -= (size_t)r;
+    }
     return true;
 }
+
 static bool sendall(sock_t fd, const void *buf, size_t n) {
     const char *p = buf;
-    while (n) { ssize_t r = send(fd, p, (int)n, MSG_NOSIGNAL); if (r <= 0) return false; p += r; n -= (size_t)r; }
+    while (n) {
+        int r = (int)send(fd, p, (int)n, MSG_NOSIGNAL);
+        if (r <= 0) return false;
+        p += r;
+        n -= (size_t)r;
+    }
     return true;
 }
 
-/* ── Per-connection pixel format ─────────────────────────────────────────── */
+static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static void put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+static uint16_t get16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
+static uint32_t get32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
 
-typedef struct {
-    int bytes_pp;
-    bool big_endian;
-    uint16_t r_max, g_max, b_max;
-    uint8_t r_shift, g_shift, b_shift;
-} PixFmt;
+/* ── Pixel formats ───────────────────────────────────────────────────────── */
 
 static PixFmt default_fmt(void) {
     return (PixFmt){ 4, false, 255, 255, 255, 16, 8, 0 };
 }
 
 static PixFmt parse_pixfmt(const uint8_t *b) {
-    /* b[0..15] = PixelFormat (bits-per-pixel at b[0], big-endian at b[2], ...) */
     PixFmt f;
-    f.bytes_pp   = b[0] / 8; if (f.bytes_pp < 1) f.bytes_pp = 4;
-    f.big_endian = (b[2] != 0);
-    memcpy(&f.r_max, b + 4, 2); f.r_max = ntohs(f.r_max);
-    memcpy(&f.g_max, b + 6, 2); f.g_max = ntohs(f.g_max);
-    memcpy(&f.b_max, b + 8, 2); f.b_max = ntohs(f.b_max);
-    f.r_shift = b[10];
-    f.g_shift = b[11];
-    f.b_shift = b[12];
+    f.bytes_pp   = b[0] / 8;
+    if (f.bytes_pp != 1 && f.bytes_pp != 2 && f.bytes_pp != 4) f.bytes_pp = 4;
+    f.big_endian = b[2] != 0;
+    f.r_max = get16(b + 4); f.g_max = get16(b + 6); f.b_max = get16(b + 8);
+    f.r_shift = b[10]; f.g_shift = b[11]; f.b_shift = b[12];
     return f;
 }
 
-static uint32_t pack_rgb(const PixFmt *fmt, uint32_t rgb) {
-    uint32_t r = (rgb >> 16) & 0xFFu;
-    uint32_t g = (rgb >> 8) & 0xFFu;
-    uint32_t b = rgb & 0xFFu;
-    r = (r * fmt->r_max + 127u) / 255u;
-    g = (g * fmt->g_max + 127u) / 255u;
-    b = (b * fmt->b_max + 127u) / 255u;
-    return (r << fmt->r_shift) | (g << fmt->g_shift) | (b << fmt->b_shift);
+static void put_pixel(uint8_t *dst, const PixFmt *f, uint32_t argb) {
+    uint32_t r = (argb >> 16) & 0xFF, g = (argb >> 8) & 0xFF, b = argb & 0xFF;
+    uint32_t v = ((r * f->r_max + 127) / 255) << f->r_shift |
+                 ((g * f->g_max + 127) / 255) << f->g_shift |
+                 ((b * f->b_max + 127) / 255) << f->b_shift;
+    for (int i = 0; i < f->bytes_pp; i++) {
+        int shift = f->big_endian ? (f->bytes_pp - 1 - i) * 8 : i * 8;
+        dst[i] = (uint8_t)(v >> shift);
+    }
 }
 
-static void write_pixel(uint8_t *dst, uint32_t val, int bpp, bool be) {
-    if (be) { for (int i = bpp-1; i >= 0; i--) { dst[i] = val & 0xFF; val >>= 8; } }
-    else    { for (int i = 0; i < bpp;  i++)   { dst[i] = val & 0xFF; val >>= 8; } }
+/* ── Input ───────────────────────────────────────────────────────────────── */
+
+/* Caller holds s->lock. */
+static void push_key(GemuVncServer *s, uint32_t keysym, bool down) {
+    if (s->key_count == VNC_KEY_QUEUE) {               /* drop the oldest */
+        s->key_head = (s->key_head + 1) % VNC_KEY_QUEUE;
+        s->key_count--;
+    }
+    s->keys[(s->key_head + s->key_count) % VNC_KEY_QUEUE] =
+        (GemuVncKeyEvent){ .keysym = keysym, .down = down };
+    s->key_count++;
 }
 
-/* ── RFB handshake ───────────────────────────────────────────────────────── */
+static void client_key(VncClient *c, uint32_t keysym, bool down) {
+    GemuVncServer *s = c->s;
+    pthread_mutex_lock(&s->lock);
+    unsigned i;
+    for (i = 0; i < c->n_held && c->held[i] != keysym; i++) {}
+    if (down && i == c->n_held && c->n_held < VNC_KEY_QUEUE) c->held[c->n_held++] = keysym;
+    if (!down && i < c->n_held) c->held[i] = c->held[--c->n_held];
+    push_key(s, keysym, down);
+    pthread_mutex_unlock(&s->lock);
+}
+
+static void client_pointer(VncClient *c, uint8_t mask, int x, int y) {
+    GemuVncServer *s = c->s;
+    pthread_mutex_lock(&s->lock);
+    /* Map from the client's (possibly stale-size) view to the frame. */
+    if (c->cw > 0 && c->ch > 0 && (c->cw != s->w || c->ch != s->h)) {
+        x = x * s->w / c->cw;
+        y = y * s->h / c->ch;
+    }
+    GemuVncPointerState *p = &s->pointer;
+    if (s->have_pointer) {
+        p->rel_x += x - p->x;
+        p->rel_y += y - p->y;
+    }
+    p->x = x;
+    p->y = y;
+    s->have_pointer = true;
+    bool left = mask & 0x01, right = mask & 0x04;
+    if (left && !p->button) p->pressed = true;
+    if (right && !p->right_button) p->right_pressed = true;
+    p->button = left;
+    p->right_button = right;
+    pthread_mutex_unlock(&s->lock);
+}
+
+/* ── Handshake ───────────────────────────────────────────────────────────── */
 
 #ifdef HAVE_CRYPTO
 static uint8_t reverse_bits(uint8_t v) {
@@ -177,458 +340,639 @@ static uint8_t reverse_bits(uint8_t v) {
     v = (uint8_t)(((v & 0xaau) >> 1) | ((v & 0x55u) << 1));
     return v;
 }
+#endif
 
-static bool vnc_authenticate(GemuVncServer *vnc, sock_t fd) {
-    uint8_t challenge[16];
-    if (RAND_bytes(challenge, (int)sizeof(challenge)) != 1) {
-        for (size_t i = 0; i < sizeof(challenge); i++)
-            challenge[i] = (uint8_t)(rand() & 0xff);
-    }
-    if (!sendall(fd, challenge, sizeof(challenge))) return false;
+/* VNC authentication: DES-encrypt a random challenge with the password. */
+static bool vnc_auth(VncClient *c) {
+    GemuVncServer *s = c->s;
+    uint8_t challenge[16], response[16];
+#ifdef HAVE_CRYPTO
+    if (RAND_bytes(challenge, (int)sizeof(challenge)) != 1)
+#endif
+        for (size_t i = 0; i < sizeof(challenge); i++) challenge[i] = (uint8_t)rand();
+    if (!sendall(c->fd, challenge, 16) || !recvall(c->fd, response, 16)) return false;
 
-    uint8_t response[16];
-    if (!recvall(fd, response, sizeof(response))) return false;
-
+    pthread_mutex_lock(&s->lock);
+    bool valid = s->password_valid;
     char password[9];
-    pthread_mutex_lock(&vnc->lock);
-    snprintf(password, sizeof(password), "%s", vnc->password);
-    pthread_mutex_unlock(&vnc->lock);
+    memcpy(password, s->password, sizeof(password));
+    pthread_mutex_unlock(&s->lock);
 
-    DES_cblock key;
-    memset(key, 0, sizeof(key));
-    for (int i = 0; i < 8 && password[i]; i++)
-        key[i] = reverse_bits((uint8_t)password[i]);
-    DES_key_schedule sched;
+    bool ok = false;
+#ifdef HAVE_CRYPTO
+    if (valid) {
+        DES_cblock key = {0};
+        for (int i = 0; i < 8 && password[i]; i++) key[i] = reverse_bits((uint8_t)password[i]);
+        DES_key_schedule sched;
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
-    DES_set_key_unchecked(&key, &sched);
-    DES_ecb_encrypt((const_DES_cblock *)challenge,
-                    (DES_cblock *)challenge, &sched, DES_ENCRYPT);
-    DES_ecb_encrypt((const_DES_cblock *)(challenge + 8),
-                    (DES_cblock *)(challenge + 8), &sched, DES_ENCRYPT);
+        DES_set_key_unchecked(&key, &sched);
+        DES_ecb_encrypt((const_DES_cblock *)challenge, (DES_cblock *)challenge, &sched, DES_ENCRYPT);
+        DES_ecb_encrypt((const_DES_cblock *)(challenge + 8), (DES_cblock *)(challenge + 8), &sched, DES_ENCRYPT);
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
-
-    uint32_t result = htonl(memcmp(challenge, response, sizeof(challenge)) == 0 ? 0u : 1u);
-    if (!sendall(fd, &result, 4)) return false;
-    return result == 0;
-}
+        ok = memcmp(challenge, response, 16) == 0;
+    }
 #else
-static bool vnc_authenticate(GemuVncServer *vnc, sock_t fd) {
-    /* Unreachable: without OpenSSL a password can never be set. */
-    (void)vnc; (void)fd;
-    return false;
-}
-#endif /* HAVE_CRYPTO */
-
-static bool vnc_handshake(GemuVncServer *vnc, sock_t fd) {
-    if (!sendall(fd, "RFB 003.008\n", 12)) return false;
-    char ver[13]; ver[12] = '\0';
-    if (!recvall(fd, ver, 12)) return false;
-    int major = 0, minor = 0;
-    sscanf(ver, "RFB %d.%03d", &major, &minor);
-
-    pthread_mutex_lock(&vnc->lock);
-    bool password_set = vnc->password_set;
-    pthread_mutex_unlock(&vnc->lock);
-
-    if (major == 3 && minor == 3) {
-        uint32_t sec = htonl(password_set ? 2u : 1u);
-        if (!sendall(fd, &sec, 4)) return false;
-        if (password_set && !vnc_authenticate(vnc, fd)) return false;
-    } else {
-        uint8_t offer[2] = {1, password_set ? 2u : 1u};
-        if (!sendall(fd, offer, 2)) return false;
-        uint8_t chosen; if (!recvall(fd, &chosen, 1)) return false;
-        if (chosen != (password_set ? 2u : 1u)) return false;
-        if (password_set) {
-            if (!vnc_authenticate(vnc, fd)) return false;
-        } else if (minor >= 8) {
-            uint32_t ok = 0; if (!sendall(fd, &ok, 4)) return false;
-        }
-    }
-    uint8_t shared; return recvall(fd, &shared, 1);
-}
-
-static bool vnc_send_server_init(GemuVncServer *vnc, sock_t fd) {
-    uint8_t msg[24];
-    uint16_t w = htons((uint16_t)vnc->fb_w), h = htons((uint16_t)vnc->fb_h);
-    memcpy(msg, &w, 2); memcpy(msg+2, &h, 2);
-    msg[4]=32; msg[5]=24; msg[6]=0; msg[7]=1;
-    uint16_t mx = htons(255);
-    memcpy(msg+8, &mx, 2); memcpy(msg+10, &mx, 2); memcpy(msg+12, &mx, 2);
-    msg[14]=16; msg[15]=8; msg[16]=0; msg[17]=msg[18]=msg[19]=0;
-    uint32_t nl = htonl(4); memcpy(msg+20, &nl, 4);
-    return sendall(fd, msg, 24) && sendall(fd, "GEMU", 4);
-}
-
-/* ── FramebufferUpdate ───────────────────────────────────────────────────── */
-
-static bool vnc_send_update(GemuVncServer *vnc, sock_t fd, const PixFmt *fmt) {
-    int npix = vnc->fb_w * vnc->fb_h;
-
-    pthread_mutex_lock(&vnc->lock);
-    int vw = vnc->vram_w, vh = vnc->vram_h;
-    uint8_t *vsnap = (vw > 0 && vh > 0) ? malloc((size_t)(vw * vh)) : NULL;
-    if (vsnap) memcpy(vsnap, vnc->fb, (size_t)(vw * vh));
-    uint32_t palette[256];
-    int n_colors = vnc->n_colors;
-    if (n_colors > 0)
-        memcpy(palette, vnc->palette, (size_t)n_colors * sizeof(palette[0]));
-    uint32_t fg_rgb = vnc->fg_rgb;
-    uint32_t bg_rgb = vnc->bg_rgb;
-    pthread_mutex_unlock(&vnc->lock);
-
-    size_t out_sz = (size_t)(npix * fmt->bytes_pp);
-    uint8_t *out  = malloc(out_sz);
-    if (!out) { free(vsnap); return false; }
-
-    uint32_t fg = pack_rgb(fmt, fg_rgb);
-    uint32_t bg = pack_rgb(fmt, bg_rgb);
-    for (int i = 0; i < npix; i++)
-        write_pixel(out + i * fmt->bytes_pp, bg, fmt->bytes_pp, fmt->big_endian);
-
-    if (vsnap) {
-        for (int y = 0; y < vnc->fb_h; y++) {
-            for (int x = 0; x < vnc->fb_w; x++) {
-                int sx = x * vw / vnc->fb_w, sy = y * vh / vnc->fb_h;
-                uint8_t idx = vsnap[sy * vw + sx];
-                uint32_t px = idx ? fg : bg;
-                if (n_colors > 0) {
-                    if (idx >= n_colors) idx = (uint8_t)(n_colors - 1);
-                    px = pack_rgb(fmt, palette[idx] & 0xFFFFFFu);
-                }
-                write_pixel(out + (y * vnc->fb_w + x) * fmt->bytes_pp,
-                            px, fmt->bytes_pp, fmt->big_endian);
-            }
-        }
-        free(vsnap);
-    }
-
-    uint8_t hdr[4]  = {0, 0, 0, 1};
-    uint8_t rect[12]; memset(rect, 0, 4);
-    uint16_t rw = htons((uint16_t)vnc->fb_w), rh = htons((uint16_t)vnc->fb_h);
-    memcpy(rect+4, &rw, 2); memcpy(rect+6, &rh, 2); memset(rect+8, 0, 4);
-
-    bool ok = sendall(fd, hdr, 4) && sendall(fd, rect, 12) && sendall(fd, out, out_sz);
-    free(out);
+    (void)valid; (void)password; (void)response;
+#endif
+    uint8_t result[4];
+    put32(result, ok ? 0 : 1);
+    sendall(c->fd, result, 4);
     return ok;
 }
 
-/* ── Client message loop ─────────────────────────────────────────────────── */
+static bool handshake(VncClient *c, bool *shared) {
+    GemuVncServer *s = c->s;
+    char ver[13] = {0};
+    if (!sendall(c->fd, "RFB 003.008\n", 12) || !recvall(c->fd, ver, 12)) return false;
+    int major = 0, minor = 0;
+    if (sscanf(ver, "RFB %d.%d", &major, &minor) != 2 || major != 3) return false;
 
-static void vnc_handle_client(GemuVncServer *vnc, sock_t fd) {
-    if (!vnc_handshake(vnc, fd) || !vnc_send_server_init(vnc, fd)) return;
-    PixFmt fmt = default_fmt();
-    while (vnc->running) {
-        uint8_t type; if (!recvall(fd, &type, 1)) break;
-        switch (type) {
-        case 0: { /* SetPixelFormat */
-            uint8_t b[19]; if (!recvall(fd, b, 19)) return;
-            fmt = parse_pixfmt(b + 3); break; /* b[0..2]=pad, b[3..18]=PixelFormat */
-        }
-        case 2: { /* SetEncodings */
-            uint8_t b[3]; if (!recvall(fd, b, 3)) return;
-            uint16_t cnt; memcpy(&cnt, b+1, 2); cnt = ntohs(cnt);
-            for (uint16_t i = 0; i < cnt; i++) { uint8_t e[4]; if (!recvall(fd, e, 4)) return; }
-            break;
-        }
-        case 3: { /* FramebufferUpdateRequest */
-            uint8_t b[9]; if (!recvall(fd, b, 9)) return;
-            if (!vnc_send_update(vnc, fd, &fmt)) return;
-            break;
-        }
-        case 4: { /* KeyEvent: 1 down-flag + 2 pad + 4 keysym */
-            uint8_t b[7]; if (!recvall(fd, b, 7)) return;
-            uint8_t down = b[0];
-            uint32_t sym; memcpy(&sym, b+3, 4); sym = ntohl(sym);
-            uint32_t raw_sym = sym;
-            if (sym >= 0x41 && sym <= 0x5A) sym |= 0x20; /* normalize to lowercase */
-            pthread_mutex_lock(&vnc->lock);
-            enqueue_key_event(vnc, sym, down != 0);
-            update_held_key(vnc, sym, down != 0);
-            if (down) vnc->queued_keysym = raw_sym;
-            for (int k = 0; k < 16; k++)
-                if (chip8_keysyms[k] == sym) { vnc->keys[k] = down; break; }
-            pthread_mutex_unlock(&vnc->lock);
-            break;
-        }
-        case 5: { /* PointerEvent: 1 button-mask + 2 x + 2 y */
-            uint8_t b[5]; if (!recvall(fd, b, 5)) return;
-            uint16_t x, y;
-            memcpy(&x, b + 1, 2); x = ntohs(x);
-            memcpy(&y, b + 3, 2); y = ntohs(y);
-            bool left = (b[0] & 0x01u) != 0;
-            bool right = (b[0] & 0x04u) != 0;
-            pthread_mutex_lock(&vnc->lock);
-            if (vnc->pointer_have_pos) {
-                vnc->pointer_rel_x += (int)x - vnc->pointer_x;
-                vnc->pointer_rel_y += (int)y - vnc->pointer_y;
-            }
-            vnc->pointer_x = (int)x;
-            vnc->pointer_y = (int)y;
-            vnc->pointer_have_pos = true;
-            if (left && !vnc->pointer_button)
-                vnc->pointer_pressed = true;
-            if (right && !vnc->pointer_right_button)
-                vnc->pointer_right_pressed = true;
-            vnc->pointer_button = left;
-            vnc->pointer_right_button = right;
-            pthread_mutex_unlock(&vnc->lock);
-            break;
-        }
-        case 6: { /* ClientCutText */
-            uint8_t b[7]; if (!recvall(fd, b, 7)) return;
-            uint32_t len; memcpy(&len, b+3, 4); len = ntohl(len);
-            while (len) { uint8_t t[256]; size_t c = len<256?len:256; if (!recvall(fd,t,c)) return; len-=(uint32_t)c; }
-            break;
-        }
-        case 150: { /* EnableContinuousUpdates (RealVNC/Tight) */
-            uint8_t b[9]; if (!recvall(fd, b, 9)) return; break;
-        }
-        case 248: { /* ClientFence */
-            uint8_t b[8]; if (!recvall(fd, b, 8)) return; /* 3 pad + 4 flags + 1 len */
-            uint8_t plen = b[7];
-            while (plen--) { uint8_t t; if (!recvall(fd, &t, 1)) return; }
-            break;
-        }
-        default: return;
-        }
+    uint8_t sec = s->password_required ? 2 : 1;
+    if (minor < 7) {                                   /* 3.3: server picks */
+        uint8_t b[4];
+        put32(b, sec);
+        if (!sendall(c->fd, b, 4)) return false;
+    } else {
+        uint8_t offer[2] = { 1, sec }, chosen;
+        if (!sendall(c->fd, offer, 2) || !recvall(c->fd, &chosen, 1) || chosen != sec)
+            return false;
     }
+    if (sec == 2) {
+        if (!vnc_auth(c)) return false;
+    } else if (minor >= 8) {
+        uint8_t ok[4] = {0};
+        if (!sendall(c->fd, ok, 4)) return false;
+    }
+
+    uint8_t shared_flag;
+    if (!recvall(c->fd, &shared_flag, 1)) return false;
+    *shared = shared_flag != 0;
+
+    /* ServerInit: size, our native pixel format (32bpp xRGB), name */
+    char name[200];
+    gemu_window_title(name, sizeof(name), NULL, false);
+    pthread_mutex_lock(&s->lock);
+    c->cw = s->w > 0 ? s->w : 640;
+    c->ch = s->h > 0 ? s->h : 480;
+    pthread_mutex_unlock(&s->lock);
+    uint8_t init[24] = {0};
+    put16(init, (uint16_t)c->cw);
+    put16(init + 2, (uint16_t)c->ch);
+    init[4] = 32; init[5] = 24; init[6] = 0; init[7] = 1;
+    put16(init + 8, 255); put16(init + 10, 255); put16(init + 12, 255);
+    init[14] = 16; init[15] = 8; init[16] = 0;
+    put32(init + 20, (uint32_t)strlen(name));
+    return sendall(c->fd, init, 24) && sendall(c->fd, name, strlen(name));
 }
 
-static void *vnc_thread(void *arg) {
-    GemuVncServer *vnc = arg;
-    while (vnc->running) {
-        fd_set fds; FD_ZERO(&fds); FD_SET(vnc->listen_fd, &fds);
-        struct timeval tv = {1, 0};
-        if (select((int)(vnc->listen_fd) + 1, &fds, NULL, NULL, &tv) <= 0) continue;
-        sock_t cfd = accept(vnc->listen_fd, NULL, NULL);
-        if (cfd == INVALID_SOCK) continue;
-        printf("vnc: client connected\n");
-        vnc_handle_client(vnc, cfd);
-        release_held_keys(vnc);
-        printf("vnc: client disconnected\n");
-        sock_close(cfd);
+/* ── Updates ─────────────────────────────────────────────────────────────── */
+
+/* Send one FramebufferUpdate to c from frame (fw x fh).  full = resend
+ * everything; resize = announce a new size first. */
+static bool send_update(VncClient *c, const uint32_t *frame, int fw, int fh,
+                        PixFmt fmt, bool full, bool resize) {
+    int cw = c->cw, ch = c->ch;
+    size_t npix = (size_t)cw * ch;
+
+    /* What the client should now show, at its size. */
+    uint32_t *want = malloc(npix * sizeof(uint32_t));
+    if (!want) return false;
+    if (fw == cw && fh == ch) {
+        memcpy(want, frame, npix * sizeof(uint32_t));
+    } else {
+        for (int y = 0; y < ch; y++)
+            for (int x = 0; x < cw; x++)
+                want[(size_t)y * cw + x] = frame[(size_t)(y * fh / ch) * fw + x * fw / cw];
+    }
+    if (!c->last || full || resize) {
+        free(c->last);
+        c->last = calloc(npix, sizeof(uint32_t));
+        if (!c->last) { free(want); return false; }
+        full = true;
+    }
+
+    /* Dirty tiles, merged into horizontal runs per tile row. */
+    int tx_n = (cw + VNC_TILE - 1) / VNC_TILE, ty_n = (ch + VNC_TILE - 1) / VNC_TILE;
+    int max_rects = tx_n * ty_n + 1;
+    int (*rects)[4] = malloc((size_t)max_rects * sizeof(*rects));
+    if (!rects) { free(want); return false; }
+    int n = 0;
+    for (int ty = 0; ty < ty_n; ty++) {
+        int y0 = ty * VNC_TILE, th = (y0 + VNC_TILE > ch) ? ch - y0 : VNC_TILE;
+        int run_start = -1;
+        for (int tx = 0; tx <= tx_n; tx++) {
+            bool dirty = false;
+            if (tx < tx_n) {
+                int x0 = tx * VNC_TILE, tw = (x0 + VNC_TILE > cw) ? cw - x0 : VNC_TILE;
+                dirty = full;
+                for (int y = y0; !dirty && y < y0 + th; y++)
+                    dirty = memcmp(want + (size_t)y * cw + x0, c->last + (size_t)y * cw + x0,
+                                   (size_t)tw * sizeof(uint32_t)) != 0;
+            }
+            if (dirty && run_start < 0) run_start = tx;
+            if (!dirty && run_start >= 0) {
+                int x0 = run_start * VNC_TILE, x1 = tx * VNC_TILE;
+                if (x1 > cw) x1 = cw;
+                rects[n][0] = x0; rects[n][1] = y0; rects[n][2] = x1 - x0; rects[n][3] = th;
+                n++;
+                run_start = -1;
+            }
+        }
+    }
+
+    uint8_t hdr[4] = { 0, 0 };
+    put16(hdr + 2, (uint16_t)(n + (resize ? 1 : 0)));
+    bool ok = sendall(c->fd, hdr, 4);
+    if (ok && resize) {
+        uint8_t r[12] = {0};
+        put16(r + 4, (uint16_t)cw); put16(r + 6, (uint16_t)ch);
+        put32(r + 8, (uint32_t)ENC_DESKTOP_SIZE);
+        ok = sendall(c->fd, r, 12);
+    }
+    uint8_t *row = malloc((size_t)cw * 4);
+    if (!row) ok = false;
+    for (int i = 0; ok && i < n; i++) {
+        int x0 = rects[i][0], y0 = rects[i][1], w = rects[i][2], h = rects[i][3];
+        uint8_t r[12];
+        put16(r, (uint16_t)x0); put16(r + 2, (uint16_t)y0);
+        put16(r + 4, (uint16_t)w); put16(r + 6, (uint16_t)h);
+        put32(r + 8, ENC_RAW);
+        ok = sendall(c->fd, r, 12);
+        for (int y = y0; ok && y < y0 + h; y++) {
+            const uint32_t *src = want + (size_t)y * cw + x0;
+            for (int x = 0; x < w; x++) put_pixel(row + x * fmt.bytes_pp, &fmt, src[x]);
+            ok = sendall(c->fd, row, (size_t)w * fmt.bytes_pp);
+        }
+    }
+    free(row);
+    free(rects);
+    if (ok) memcpy(c->last, want, npix * sizeof(uint32_t));
+    free(want);
+    return ok;
+}
+
+static void client_kill(VncClient *c) {
+    c->alive = false;
+    shutdown(c->fd, SHUT_RDWR);   /* wakes a blocked recv/send */
+}
+
+static void *writer_main(void *arg) {
+    VncClient *c = arg;
+    GemuVncServer *s = c->s;
+    uint32_t *frame = NULL;
+    size_t frame_cap = 0;
+    pthread_mutex_lock(&s->lock);
+    while (c->alive && s->running) {
+        bool size_changed = s->w > 0 && (s->w != c->cw || s->h != c->ch) && c->desktop_size;
+        bool ready = c->req && s->fb &&
+                     (c->req_full || size_changed || s->frame_seq != c->sent_seq);
+        if (!ready) {
+            pthread_cond_wait(&s->cond, &s->lock);
+            continue;
+        }
+        size_t need = (size_t)s->w * s->h;
+        if (need > frame_cap) {
+            free(frame);
+            frame = malloc(need * sizeof(uint32_t));
+            frame_cap = frame ? need : 0;
+            if (!frame) break;
+        }
+        memcpy(frame, s->fb, need * sizeof(uint32_t));
+        int fw = s->w, fh = s->h;
+        bool full = c->req_full;
+        if (size_changed) { c->cw = fw; c->ch = fh; }
+        PixFmt fmt = c->fmt;
+        c->req = c->req_full = false;
+        c->sent_seq = s->frame_seq;
+        pthread_mutex_unlock(&s->lock);
+
+        bool ok = send_update(c, frame, fw, fh, fmt, full, size_changed);
+
+        pthread_mutex_lock(&s->lock);
+        if (!ok) client_kill(c);
+    }
+    pthread_mutex_unlock(&s->lock);
+    free(frame);
+    return NULL;
+}
+
+/* ── Client lifecycle ────────────────────────────────────────────────────── */
+
+static void client_remove(VncClient *c) {
+    GemuVncServer *s = c->s;
+    pthread_mutex_lock(&s->lock);
+    for (int i = 0; i < s->n_clients; i++) {
+        if (s->clients[i] == c) {
+            s->clients[i] = s->clients[--s->n_clients];
+            break;
+        }
+    }
+    /* Release anything this client was holding so keys don't stick. */
+    for (unsigned i = 0; i < c->n_held; i++) push_key(s, c->held[i], false);
+    if (s->have_pointer) { s->pointer.button = s->pointer.right_button = false; }
+    pthread_cond_broadcast(&s->cond);
+    pthread_mutex_unlock(&s->lock);
+}
+
+static void *reader_main(void *arg) {
+    VncClient *c = arg;
+    GemuVncServer *s = c->s;
+    bool shared = true;
+    if (!handshake(c, &shared)) goto done;
+
+    pthread_mutex_lock(&s->lock);
+    /* An exclusive request disconnects everyone else (QEMU's default). */
+    if (!shared && s->share == SHARE_ALLOW_EXCLUSIVE)
+        for (int i = 0; i < s->n_clients; i++)
+            if (s->clients[i] != c) client_kill(s->clients[i]);
+    pthread_mutex_unlock(&s->lock);
+
+    fprintf(stderr, "vnc: client %s connected\n", c->peer);
+    if (pthread_create(&c->writer, NULL, writer_main, c) == 0) c->writer_started = true;
+    else goto done;
+
+    while (c->alive && s->running) {
+        uint8_t type;
+        if (!recvall(c->fd, &type, 1)) break;
+        switch (type) {
+        case 0: {                                          /* SetPixelFormat */
+            uint8_t b[19];
+            if (!recvall(c->fd, b, 19)) goto done;
+            pthread_mutex_lock(&s->lock);
+            c->fmt = parse_pixfmt(b + 3);
+            c->req_full = true;                          /* old pixels are stale */
+            pthread_mutex_unlock(&s->lock);
+            break;
+        }
+        case 2: {                                          /* SetEncodings */
+            uint8_t b[3];
+            if (!recvall(c->fd, b, 3)) goto done;
+            bool desk = false;
+            for (uint16_t i = 0, n = get16(b + 1); i < n; i++) {
+                uint8_t e[4];
+                if (!recvall(c->fd, e, 4)) goto done;
+                if ((int32_t)get32(e) == ENC_DESKTOP_SIZE) desk = true;
+            }
+            pthread_mutex_lock(&s->lock);
+            c->desktop_size = desk;
+            pthread_cond_broadcast(&s->cond);
+            pthread_mutex_unlock(&s->lock);
+            break;
+        }
+        case 3: {                                          /* FramebufferUpdateRequest */
+            uint8_t b[9];
+            if (!recvall(c->fd, b, 9)) goto done;
+            pthread_mutex_lock(&s->lock);
+            c->req = true;
+            if (!b[0]) c->req_full = true;
+            pthread_cond_broadcast(&s->cond);
+            pthread_mutex_unlock(&s->lock);
+            break;
+        }
+        case 4: {                                          /* KeyEvent */
+            uint8_t b[7];
+            if (!recvall(c->fd, b, 7)) goto done;
+            client_key(c, get32(b + 3), b[0] != 0);
+            break;
+        }
+        case 5: {                                          /* PointerEvent */
+            uint8_t b[5];
+            if (!recvall(c->fd, b, 5)) goto done;
+            client_pointer(c, b[0], get16(b + 1), get16(b + 3));
+            break;
+        }
+        case 6: {                                          /* ClientCutText */
+            uint8_t b[7];
+            if (!recvall(c->fd, b, 7)) goto done;
+            for (uint32_t len = get32(b + 3); len; ) {
+                uint8_t t[256];
+                size_t n = len < sizeof(t) ? len : sizeof(t);
+                if (!recvall(c->fd, t, n)) goto done;
+                len -= (uint32_t)n;
+            }
+            break;
+        }
+        case 150: {                                        /* EnableContinuousUpdates */
+            uint8_t b[9];
+            if (!recvall(c->fd, b, 9)) goto done;
+            break;
+        }
+        case 248: {                                        /* ClientFence */
+            uint8_t b[8];
+            if (!recvall(c->fd, b, 8)) goto done;
+            for (uint8_t n = b[7]; n; n--) {
+                uint8_t t;
+                if (!recvall(c->fd, &t, 1)) goto done;
+            }
+            break;
+        }
+        default:
+            goto done;                                     /* unknown: can't resync */
+        }
+    }
+
+done:
+    pthread_mutex_lock(&s->lock);
+    client_kill(c);
+    pthread_cond_broadcast(&s->cond);
+    pthread_mutex_unlock(&s->lock);
+    if (c->writer_started) {
+        pthread_join(c->writer, NULL);
+        fprintf(stderr, "vnc: client %s disconnected\n", c->peer);
+    }
+    client_remove(c);
+    sock_close(c->fd);
+    free(c->last);
+    free(c);
+    return NULL;
+}
+
+static void *accept_main(void *arg) {
+    GemuVncServer *s = arg;
+    while (s->running) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        sock_t maxfd = 0;
+        for (int i = 0; i < s->n_listen; i++) {
+            FD_SET(s->listen_fds[i], &fds);
+            if (s->listen_fds[i] > maxfd) maxfd = s->listen_fds[i];
+        }
+        struct timeval tv = { 0, 200000 };
+        if (select((int)maxfd + 1, &fds, NULL, NULL, &tv) <= 0) continue;
+        sock_t lfd = INVALID_SOCK;
+        for (int i = 0; i < s->n_listen && lfd == INVALID_SOCK; i++)
+            if (FD_ISSET(s->listen_fds[i], &fds)) lfd = s->listen_fds[i];
+        if (lfd == INVALID_SOCK) continue;
+        struct sockaddr_storage ss;
+        socklen_t sl = sizeof(ss);
+        sock_t fd = accept(lfd, (struct sockaddr *)&ss, &sl);
+        if (fd == INVALID_SOCK) continue;
+
+        VncClient *c = calloc(1, sizeof(*c));
+        if (!c) { sock_close(fd); continue; }
+        c->s = s;
+        c->fd = fd;
+        c->alive = true;
+        c->fmt = default_fmt();
+        snprintf(c->peer, sizeof(c->peer), "local");
+        char host[NI_MAXHOST], serv[NI_MAXSERV];
+        if (ss.ss_family != AF_UNSPEC &&
+#ifndef _WIN32
+            ss.ss_family != AF_UNIX &&
+#endif
+            getnameinfo((struct sockaddr *)&ss, sl, host, sizeof(host), serv, sizeof(serv),
+                        NI_NUMERICHOST | NI_NUMERICSERV) == 0)
+            snprintf(c->peer, sizeof(c->peer), "%s:%s", host, serv);
+
+        pthread_mutex_lock(&s->lock);
+        bool room = s->n_clients < VNC_MAX_CLIENTS;
+        if (room) s->clients[s->n_clients++] = c;
+        pthread_mutex_unlock(&s->lock);
+        pthread_t t;
+        if (!room || pthread_create(&t, NULL, reader_main, c) != 0) {
+            if (room) client_remove(c);
+            sock_close(fd);
+            free(c);
+            continue;
+        }
+        pthread_detach(t);
     }
     return NULL;
 }
 
-/* ── Address parsing ─────────────────────────────────────────────────────── */
+/* ── Listening ───────────────────────────────────────────────────────────── */
 
-static bool parse_vnc_addr(const char *s, char host[64], int *port,
-                           bool *unix_socket, char unix_path[108]) {
-    *unix_socket = false;
-    unix_path[0] = '\0';
-    if (strncmp(s, "unix:", 5) == 0) {
+static bool addr_in_use(void) {
 #ifdef _WIN32
-        (void)unix_path;
-        return false;
+    return WSAGetLastError() == WSAEADDRINUSE;
 #else
-        const char *path = s + 5;
-        if (!*path || strlen(path) >= 108) return false;
-        *unix_socket = true;
-        snprintf(unix_path, 108, "%s", path);
-        return true;
+    return errno == EADDRINUSE;
 #endif
+}
+
+/* Listen on every address host resolves to (all interfaces when host is
+ * empty), like QEMU: "localhost" gets both ::1 and 127.0.0.1.  Returns the
+ * number of sockets added to fds - 0 if the port is taken on any of them
+ * (so to= moves on), skipping addresses the host can't use at all. */
+static int listen_tcp(const char *host, int port, sock_t *fds, int max_fds,
+                      char *where, size_t where_len) {
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    if (getaddrinfo(host[0] ? host : NULL, portstr, &hints, &res) != 0) return 0;
+
+    int n = 0;
+    where[0] = '\0';
+    for (struct addrinfo *ai = res; ai && n < max_fds; ai = ai->ai_next) {
+        sock_t s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s == INVALID_SOCK) continue;
+        int one = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+        if (ai->ai_family == AF_INET6)   /* v4 gets its own socket */
+            setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&one, sizeof(one));
+        if (bind(s, ai->ai_addr, (socklen_t)ai->ai_addrlen) != 0 || listen(s, 4) != 0) {
+            bool busy = addr_in_use();
+            sock_close(s);
+            if (busy) {
+                while (n > 0) sock_close(fds[--n]);
+                break;
+            }
+            continue;
+        }
+        char h[NI_MAXHOST] = "?";
+        getnameinfo(ai->ai_addr, (socklen_t)ai->ai_addrlen, h, sizeof(h), NULL, 0, NI_NUMERICHOST);
+        size_t l = strlen(where);
+        snprintf(where + l, where_len - l, ai->ai_family == AF_INET6 ? "%s[%s]:%d" : "%s%s:%d",
+                 n ? ", " : "", h, port);
+        fds[n++] = s;
     }
-    const char *colon = strrchr(s, ':');
-    if (!colon) return false;
-    *port = 5900 + atoi(colon + 1);
-    size_t hlen = (size_t)(colon - s);
-    if      (hlen == 0)   { memcpy(host, "0.0.0.0", 8); }
-    else if (hlen < 64)   { memcpy(host, s, hlen); host[hlen] = '\0'; }
-    else                  { return false; }
-    return true;
+    freeaddrinfo(res);
+    return n;
+}
+
+static GemuVncServer *server_start(const VncConfig *cfg) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return NULL;
+#endif
+    GemuVncServer *s = calloc(1, sizeof(*s));
+    if (!s) return NULL;
+
+    if (cfg->unix_socket) {
+#ifndef _WIN32
+        sock_t fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un sa = {0};
+        sa.sun_family = AF_UNIX;
+        snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", cfg->path);
+        unlink(cfg->path);
+        if (fd != INVALID_SOCK && bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0 &&
+            listen(fd, 4) == 0) {
+            s->listen_fds[s->n_listen++] = fd;
+            snprintf(s->where, sizeof(s->where), "unix:%s", cfg->path);
+        } else if (fd != INVALID_SOCK) {
+            sock_close(fd);
+        }
+#endif
+    } else {
+        for (int d = cfg->display; d <= cfg->display_max && s->n_listen == 0; d++) {
+            s->n_listen = listen_tcp(cfg->host, VNC_PORT_BASE + d, s->listen_fds,
+                                     VNC_MAX_LISTEN, s->where, sizeof(s->where));
+            if (s->n_listen > 0) {
+                size_t l = strlen(s->where);
+                snprintf(s->where + l, sizeof(s->where) - l, " (display :%d)", d);
+            }
+        }
+    }
+    if (s->n_listen == 0) {
+        if (cfg->unix_socket)
+            fprintf(stderr, "vnc: cannot listen on unix:%s\n", cfg->path);
+        else if (cfg->display == cfg->display_max)
+            fprintf(stderr, "vnc: cannot listen on %s:%d (port %d)\n",
+                    cfg->host[0] ? cfg->host : "*", cfg->display, VNC_PORT_BASE + cfg->display);
+        else
+            fprintf(stderr, "vnc: cannot listen on %s, displays :%d-:%d\n",
+                    cfg->host[0] ? cfg->host : "*", cfg->display, cfg->display_max);
+        free(s);
+        return NULL;
+    }
+
+    pthread_mutex_init(&s->lock, NULL);
+    pthread_cond_init(&s->cond, NULL);
+    s->password_required = cfg->password;
+    s->share = cfg->share;
+    s->pointer.x = s->pointer.y = -1;
+    s->running = true;
+    if (pthread_create(&s->accept_thread, NULL, accept_main, s) != 0) {
+        for (int i = 0; i < s->n_listen; i++) sock_close(s->listen_fds[i]);
+        free(s);
+        return NULL;
+    }
+    fprintf(stderr, "vnc: listening on %s%s\n", s->where,
+            cfg->password ? " (password required)" : "");
+#ifndef HAVE_CRYPTO
+    if (cfg->password)
+        fprintf(stderr, "vnc: built without OpenSSL - VNC authentication can't succeed\n");
+#endif
+    return s;
 }
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-GemuVncServer *gemu_vnc_create(const char *addr, int fb_w, int fb_h) {
-    char host[64]; int port;
-    bool unix_socket = false;
-    char unix_path[108];
-    if (!parse_vnc_addr(addr, host, &port, &unix_socket, unix_path)) {
-        fprintf(stderr, "vnc: bad address '%s' - use host:N, :N, or unix:/path\n", addr); return NULL;
+GemuVncServer *gemu_vnc_get(void) {
+    if (!g_server && !g_server_tried && g_cfg.enabled) {
+        g_server_tried = true;
+        g_server = server_start(&g_cfg);
+        if (g_server) atexit(gemu_vnc_shutdown);   /* close sockets, remove unix: path */
     }
-#ifdef _WIN32
-    { WSADATA d; WSAStartup(MAKEWORD(2, 2), &d); }
-#endif
-    sock_t lfd;
-#ifdef _WIN32
-    lfd = socket(AF_INET, SOCK_STREAM, 0);
-#else
-    lfd = socket(unix_socket ? AF_UNIX : AF_INET, SOCK_STREAM, 0);
-#endif
-    if (lfd == INVALID_SOCK) { perror("vnc: socket"); return NULL; }
-    int opt = 1;
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, (int)sizeof(opt));
-    if (unix_socket) {
-#ifdef _WIN32
-        sock_close(lfd);
-        return NULL;
-#else
-        struct sockaddr_un sa = {0};
-        sa.sun_family = AF_UNIX;
-        snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", unix_path);
-        unlink(unix_path);
-        if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-            perror("vnc: bind"); sock_close(lfd); return NULL;
-        }
-#endif
-    } else {
-        struct sockaddr_in sa = {0};
-        sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
-        sa.sin_addr.s_addr = inet_addr(host);   /* NT5-safe (inet_pton is Vista+) */
-        if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-            perror("vnc: bind"); sock_close(lfd); return NULL;
-        }
-    }
-    listen(lfd, 1);
-    GemuVncServer *vnc = calloc(1, sizeof(*vnc));
-    vnc->listen_fd = lfd;
-    vnc->fb_w = fb_w; vnc->fb_h = fb_h;
-    vnc->pointer_x = vnc->pointer_y = -1;
-    vnc->fg_rgb = 0xFFFFFFu;
-    vnc->bg_rgb = 0x000000u;
-    vnc->unix_socket = unix_socket;
-    if (unix_socket)
-        snprintf(vnc->unix_path, sizeof(vnc->unix_path), "%s", unix_path);
-    vnc->running = true;
-    pthread_mutex_init(&vnc->lock, NULL);
-    pthread_create(&vnc->thread, NULL, vnc_thread, vnc);
-    if (unix_socket)
-        printf("vnc: listening on unix:%s\n", unix_path);
-    else
-        printf("vnc: listening on %s:%d (display :%d)\n", host, port, port - 5900);
-    return vnc;
+    return g_server;
 }
 
-void gemu_vnc_set_colors(GemuVncServer *vnc, uint32_t fg_rgb, uint32_t bg_rgb) {
-    if (!vnc) return;
-    pthread_mutex_lock(&vnc->lock);
-    vnc->fg_rgb = fg_rgb & 0xFFFFFFu;
-    vnc->bg_rgb = bg_rgb & 0xFFFFFFu;
-    vnc->n_colors = 0;
-    pthread_mutex_unlock(&vnc->lock);
-}
-
-void gemu_vnc_set_password(GemuVncServer *vnc, const char *password) {
-    if (!vnc) return;
-#ifndef HAVE_CRYPTO
-    if (password && password[0]) {
-        fprintf(stderr, "vnc: built without OpenSSL - password auth "
-                        "unavailable, refusing connections\n");
-        pthread_mutex_lock(&vnc->lock);
-        vnc->password_set = true;   /* auth required but can never succeed */
-        vnc->password[0] = '\0';
-        pthread_mutex_unlock(&vnc->lock);
-        return;
-    }
-#endif
-    pthread_mutex_lock(&vnc->lock);
-    snprintf(vnc->password, sizeof(vnc->password), "%s", password ? password : "");
-    vnc->password_set = vnc->password[0] != '\0';
-    pthread_mutex_unlock(&vnc->lock);
-}
-
-void gemu_vnc_set_palette(GemuVncServer *vnc,
-                          const uint32_t *palette, int n_colors) {
-    if (!vnc) return;
-    if (!palette || n_colors <= 0) {
-        pthread_mutex_lock(&vnc->lock);
-        vnc->n_colors = 0;
-        pthread_mutex_unlock(&vnc->lock);
-        return;
-    }
-    if (n_colors > 256) n_colors = 256;
-    pthread_mutex_lock(&vnc->lock);
-    for (int i = 0; i < n_colors; i++)
-        vnc->palette[i] = palette[i] & 0xFFFFFFu;
-    vnc->n_colors = n_colors;
-    pthread_mutex_unlock(&vnc->lock);
-}
-
-void gemu_vnc_destroy(GemuVncServer *vnc) {
-    if (!vnc) return;
-    vnc->running = false;
-    pthread_join(vnc->thread, NULL);
-    sock_close(vnc->listen_fd);
+void gemu_vnc_shutdown(void) {
+    GemuVncServer *s = g_server;
+    if (!s) return;
+    g_server = NULL;
+    pthread_mutex_lock(&s->lock);
+    s->running = false;
+    for (int i = 0; i < s->n_clients; i++) client_kill(s->clients[i]);
+    pthread_cond_broadcast(&s->cond);
+    pthread_mutex_unlock(&s->lock);
+    pthread_join(s->accept_thread, NULL);
+    for (int i = 0; i < s->n_listen; i++) sock_close(s->listen_fds[i]);
 #ifndef _WIN32
-    if (vnc->unix_socket && vnc->unix_path[0])
-        unlink(vnc->unix_path);
+    if (g_cfg.unix_socket) unlink(g_cfg.path);
 #endif
-    pthread_mutex_destroy(&vnc->lock);
-    free(vnc->fb);
-    free(vnc);
-#ifdef _WIN32
-    WSACleanup();
-#endif
+    /* Client threads are detached and exit on their own once their sockets
+     * close; the server struct is left allocated for them (process exit). */
 }
 
-void gemu_vnc_get_keys(GemuVncServer *vnc, uint8_t keys[16]) {
-    if (!vnc) { memset(keys, 0, 16); return; }
-    pthread_mutex_lock(&vnc->lock);
-    memcpy(keys, vnc->keys, 16);
-    pthread_mutex_unlock(&vnc->lock);
-}
-
-uint32_t gemu_vnc_pop_keysym(GemuVncServer *vnc) {
-    if (!vnc) return 0;
-    pthread_mutex_lock(&vnc->lock);
-    uint32_t sym = vnc->queued_keysym;
-    vnc->queued_keysym = 0;
-    pthread_mutex_unlock(&vnc->lock);
-    return sym;
-}
-
-bool gemu_vnc_pop_key_event(GemuVncServer *vnc, GemuVncKeyEvent *event) {
-    if (!vnc || !event) return false;
-    pthread_mutex_lock(&vnc->lock);
-    if (vnc->key_count == 0) {
-        pthread_mutex_unlock(&vnc->lock);
-        return false;
+void gemu_vnc_update_argb(GemuVncServer *s, const uint32_t *argb, int w, int h) {
+    if (!s || !argb || w <= 0 || h <= 0) return;
+    size_t n = (size_t)w * h;
+    pthread_mutex_lock(&s->lock);
+    if (w != s->w || h != s->h || !s->fb) {
+        uint32_t *fb = realloc(s->fb, n * sizeof(uint32_t));
+        if (!fb) { pthread_mutex_unlock(&s->lock); return; }
+        s->fb = fb;
+        s->w = w;
+        s->h = h;
+    } else if (memcmp(s->fb, argb, n * sizeof(uint32_t)) == 0) {
+        pthread_mutex_unlock(&s->lock);            /* unchanged: nothing to send */
+        return;
     }
-    *event = vnc->key_queue[vnc->key_head];
-    vnc->key_head = (vnc->key_head + 1u) % GEMU_VNC_KEY_QUEUE_CAP;
-    vnc->key_count--;
-    pthread_mutex_unlock(&vnc->lock);
-    return true;
+    memcpy(s->fb, argb, n * sizeof(uint32_t));
+    s->frame_seq++;
+    pthread_cond_broadcast(&s->cond);
+    pthread_mutex_unlock(&s->lock);
 }
 
-GemuVncPointerState gemu_vnc_get_pointer(GemuVncServer *vnc) {
-    if (!vnc) return (GemuVncPointerState){ .x = -1, .y = -1 };
-    pthread_mutex_lock(&vnc->lock);
-    GemuVncPointerState p = {
-        .x = vnc->pointer_have_pos ? vnc->pointer_x : -1,
-        .y = vnc->pointer_have_pos ? vnc->pointer_y : -1,
-        .rel_x = vnc->pointer_rel_x,
-        .rel_y = vnc->pointer_rel_y,
-        .button = vnc->pointer_button,
-        .pressed = vnc->pointer_pressed,
-        .right_button = vnc->pointer_right_button,
-        .right_pressed = vnc->pointer_right_pressed,
-    };
-    vnc->pointer_rel_x = 0;
-    vnc->pointer_rel_y = 0;
-    vnc->pointer_pressed = false;
-    vnc->pointer_right_pressed = false;
-    pthread_mutex_unlock(&vnc->lock);
+bool gemu_vnc_pop_key_event(GemuVncServer *s, GemuVncKeyEvent *ev) {
+    if (!s || !ev) return false;
+    pthread_mutex_lock(&s->lock);
+    bool have = s->key_count > 0;
+    if (have) {
+        *ev = s->keys[s->key_head];
+        s->key_head = (s->key_head + 1) % VNC_KEY_QUEUE;
+        s->key_count--;
+    }
+    pthread_mutex_unlock(&s->lock);
+    return have;
+}
+
+GemuVncPointerState gemu_vnc_get_pointer(GemuVncServer *s) {
+    if (!s) return (GemuVncPointerState){ .x = -1, .y = -1 };
+    pthread_mutex_lock(&s->lock);
+    GemuVncPointerState p = s->pointer;
+    s->pointer.rel_x = s->pointer.rel_y = 0;
+    s->pointer.pressed = s->pointer.right_pressed = false;
+    pthread_mutex_unlock(&s->lock);
     return p;
 }
 
-void gemu_vnc_update(GemuVncServer *vnc,
-                     const uint8_t *vram, int vw, int vh) {
-    if (!vnc) return;
-    pthread_mutex_lock(&vnc->lock);
-    if (vnc->vram_w != vw || vnc->vram_h != vh) {
-        free(vnc->fb);
-        vnc->fb = malloc((size_t)(vw * vh));
-        vnc->vram_w = vw; vnc->vram_h = vh;
+bool gemu_vnc_set_password(GemuVncServer *s, const char *password, char *err, size_t err_len) {
+    if (!s) { snprintf(err, err_len, "VNC is not active"); return false; }
+    if (!s->password_required) {
+        /* QEMU refuses too: authentication must be enabled at startup. */
+        snprintf(err, err_len, "password authentication is not enabled (start with -vnc ...,password=on)");
+        return false;
     }
-    if (vnc->fb) memcpy(vnc->fb, vram, (size_t)(vw * vh));
-    pthread_mutex_unlock(&vnc->lock);
+#ifndef HAVE_CRYPTO
+    snprintf(err, err_len, "built without OpenSSL - VNC authentication is unavailable");
+    return false;
+#else
+    pthread_mutex_lock(&s->lock);
+    snprintf(s->password, sizeof(s->password), "%s", password ? password : "");
+    s->password_valid = true;
+    pthread_mutex_unlock(&s->lock);
+    return true;
+#endif
+}
+
+void gemu_vnc_expire_password(GemuVncServer *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->password_valid = false;
+    pthread_mutex_unlock(&s->lock);
+}
+
+void gemu_vnc_info(GemuVncServer *s, char *buf, size_t len) {
+    if (!s) {
+        snprintf(buf, len, "Server: disabled\n");
+        return;
+    }
+    pthread_mutex_lock(&s->lock);
+    int n = snprintf(buf, len, "Server: %s\n     auth: %s\n",
+                     s->where, s->password_required ? "vnc" : "none");
+    if (s->n_clients == 0 && n >= 0 && (size_t)n < len)
+        n += snprintf(buf + n, len - (size_t)n, "Client: none\n");
+    for (int i = 0; i < s->n_clients && n >= 0 && (size_t)n < len; i++)
+        n += snprintf(buf + n, len - (size_t)n, "Client: %s\n", s->clients[i]->peer);
+    pthread_mutex_unlock(&s->lock);
 }

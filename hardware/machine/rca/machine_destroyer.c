@@ -464,17 +464,6 @@ RcaDestroyerState *rca_destroyer_create(const RcaConfig *cfg) {
         .read = destroyer_mon_read, .write = destroyer_mon_write, .ud = s,
         .addr_bits = 16, .big_endian = true });
     gemu_monitor_set_cpu_state_cb(s->monitor, destroyer_mon_cpu_state, s);
-    if (cfg->vnc_addr) {
-        int w = (cfg->vga == RCA_VGA_CDP1869) ? DESTROYER_ROTATED_W : CDP1861_DISPLAY_W;
-        int h = (cfg->vga == RCA_VGA_CDP1869) ? DESTROYER_ROTATED_H : CDP1861_DISPLAY_H;
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, w * cfg->display_scale,
-                                 h * cfg->display_scale);
-        if (cfg->vga == RCA_VGA_CDP1869)
-            gemu_vnc_set_palette(s->vnc, destroyer_palette,
-                                 (int)(sizeof(destroyer_palette) /
-                                       sizeof(destroyer_palette[0])));
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     GemuMemory tmp = {.data = s->mem, .size = DESTRYER_MEM_SIZE};
     for (int i = 0; i < cfg->n_roms; i++) {
@@ -508,7 +497,6 @@ void rca_destroyer_destroy(RcaDestroyerState *s) {
     if (!s) return;
     rca_pcspk_destroy(s->speaker);
     gemu_monitor_destroy(s->monitor);
-    gemu_vnc_destroy(s->vnc);
     free(s);
 }
 
@@ -541,34 +529,12 @@ static void destroyer_apply_held(RcaDestroyerState *s, uint32_t held) {
     }
 }
 
-static void destroyer_poll_vnc(RcaDestroyerState *s) {
-    GemuVncKeyEvent ev;
-    while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-        switch (ev.keysym) {
-        case '1': s->start1 = ev.down; break;
-        case '2': s->start2 = ev.down; break;
-        case ' ': s->fire = ev.down; break;
-        case '5':
-        case 'a':
-            if (ev.down) s->coin1_latch = 15;
-            break;
-        case '6':
-        case 'b':
-            if (ev.down) s->coin2_latch = 15;
-            break;
-        case 0xff51: s->left = ev.down; break;  /* Left */
-        case 0xff53: s->right = ev.down; break; /* Right */
-        default: break;
-        }
-    }
-}
-
 void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
     int fw = (cfg->vga == RCA_VGA_CDP1869) ? DESTROYER_ROTATED_W : CDP1861_DISPLAY_W;
     int fh = (cfg->vga == RCA_VGA_CDP1869) ? DESTROYER_ROTATED_H : CDP1861_DISPLAY_H;
 
     GemuDisplay *display = NULL;
-    if (cfg->vga != RCA_VGA_NONE) {
+    if (cfg->vga != RCA_VGA_NONE && gemu_display_wanted(cfg->display_type)) {
         display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
                 .fb_width    = fw,
@@ -604,9 +570,11 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
                 gemu_display_clear_flags(display);
                 rca_destroyer_reset(s, cfg);
             }
+            /* A/B are alternate coin keys alongside the 5/6 bindings. */
+            if (gemu_display_is_key_held(display, "a")) held |= GEMU_ACTION(6);
+            if (gemu_display_is_key_held(display, "b")) held |= GEMU_ACTION(7);
         }
         destroyer_apply_held(s, held);
-        destroyer_poll_vnc(s);
         destroyer_sync_inputs(s);
 
         GemuMonCmd cmd;
@@ -637,8 +605,6 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
                         argb[i] = destroyer_palette[s->rotated_bitmap[i]];
                     gemu_display_render(display, argb,
                                         DESTROYER_ROTATED_W, DESTROYER_ROTATED_H);
-                    gemu_vnc_update(s->vnc, s->rotated_bitmap,
-                                    DESTROYER_ROTATED_W, DESTROYER_ROTATED_H);
                 } else if (cfg->vga == RCA_VGA_CDP1861) {
                     memset(argb, 0, sizeof(uint32_t) * (size_t)(CDP1861_DISPLAY_W * CDP1861_DISPLAY_H));
                     gemu_display_render(display, argb,

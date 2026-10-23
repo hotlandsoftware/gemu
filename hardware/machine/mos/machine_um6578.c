@@ -2,7 +2,6 @@
 #  define _POSIX_C_SOURCE 199309L
 #endif
 #include "um6578.h"
-#include "rp2c02.h"  /* rp2c02_palette_rgb, reused for VNC's 64-colour table */
 #include "gemu/screendump.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,19 +46,6 @@ static GemuPointerState um6578_pointer_state(Um6578State *s) {
             .y = s->mouse_synth_y,
             .button = s->mouse_synth_left,
             .right_button = s->mouse_synth_right,
-        };
-    }
-    if (!s->display && s->vnc) {
-        GemuVncPointerState p = gemu_vnc_get_pointer(s->vnc);
-        return (GemuPointerState){
-            .x = p.x,
-            .y = p.y,
-            .rel_x = p.rel_x,
-            .rel_y = p.rel_y,
-            .button = p.button,
-            .pressed = p.pressed,
-            .right_button = p.right_button,
-            .right_pressed = p.right_pressed,
         };
     }
     if (!s->display) return (GemuPointerState){ .x = -1, .y = -1 };
@@ -270,16 +256,13 @@ static void um6578_mouse_device_command(Um6578State *s, uint8_t val) {
     }
 }
 
-/* Sample the host/VNC pointer once per frame and queue PS/2 packets when
- * Connie-chan's byte parser is ready for a new movement packet. */
+/* Sample the display pointer (local mouse or VNC) once per frame and queue
+ * PS/2 packets when Connie-chan's byte parser is ready for a new movement packet. */
 static void um6578_mouse_frame_tick(Um6578State *s) {
     if (!s->mouse_stream_enabled)
         return;
-    if (s->ram_lo[0x36] != 0 || s->ram_lo[0x37] != 1 || !mouse_queue_empty(s)) {
-        if (!s->display && s->vnc)
-            (void)gemu_vnc_get_pointer(s->vnc);
+    if (s->ram_lo[0x36] != 0 || s->ram_lo[0x37] != 1 || !mouse_queue_empty(s))
         return;
-    }
 
     GemuPointerState ptr = um6578_pointer_state(s);
 
@@ -577,41 +560,13 @@ static uint8_t um6578_apu_mem_read(uint16_t addr, void *ud) {
     return um6578_read(addr, ud);
 }
 
-/* ── Input: local display actions + VNC key -> action mapping ──────────── */
-
-#define XK_Up     0xFF52u
-#define XK_Down   0xFF54u
-#define XK_Left   0xFF51u
-#define XK_Right  0xFF53u
-#define XK_Return 0xFF0Du
-#define XK_Shift_R 0xFFE2u
+/* ── Input: local display actions (VNC input is merged in by the display) ── */
 
 static void um6578_handle_keys(Um6578State *s, uint32_t held) {
     if (s->display) {
         s->held_actions = held;
-    } else if (!s->vnc) {
+    } else {
         s->held_actions = 0;
-    }
-
-    if (s->vnc) {
-        GemuVncKeyEvent ev;
-        while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-            uint32_t bit = 0;
-            switch (ev.keysym) {
-            case 'z': case 'Z':  bit = GEMU_ACTION(UM6578_ACT_A);      break;
-            case 'x': case 'X':  bit = GEMU_ACTION(UM6578_ACT_B);      break;
-            case XK_Shift_R:     bit = GEMU_ACTION(UM6578_ACT_SELECT); break;
-            case XK_Return:      bit = GEMU_ACTION(UM6578_ACT_START);  break;
-            case XK_Up:          bit = GEMU_ACTION(UM6578_ACT_UP);     break;
-            case XK_Down:        bit = GEMU_ACTION(UM6578_ACT_DOWN);   break;
-            case XK_Left:        bit = GEMU_ACTION(UM6578_ACT_LEFT);   break;
-            case XK_Right:       bit = GEMU_ACTION(UM6578_ACT_RIGHT);  break;
-            default: break;
-            }
-            if (!bit) continue;
-            if (ev.down) s->held_actions |= bit;
-            else         s->held_actions &= ~bit;
-        }
     }
 
     if (s->input_inject_frames > 0) {
@@ -915,15 +870,6 @@ Um6578State *um6578_create(const MosConfig *cfg) {
         .addr_bits = 16, .big_endian = false });
     gemu_monitor_set_cpu_state_cb(s->monitor, um6578_mon_cpu_state, s);
 
-    if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, SH6578_WIDTH, SH6578_HEIGHT);
-        if (s->vnc)
-            gemu_vnc_set_palette(s->vnc, rp2c02_palette_rgb, 64);
-        else
-            fprintf(stderr, "um6578: failed to start VNC at %s\n", cfg->vnc_addr);
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
-
     if (cfg->sound == MOS_SOUND_2A03) {
         if (!apu2a03_init(&s->apu, (uint32_t)(UM6578_CPU_HZ + 0.5)))
             fprintf(stderr, "um6578: APU audio init failed (continuing silently)\n");
@@ -931,7 +877,7 @@ Um6578State *um6578_create(const MosConfig *cfg) {
         s->apu.mem_ud   = s;
     }
 
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
         /* Same physical device as NES's standard controller - share its
          * gemu.ini section (and the "nes-controller" heading shown at the
          * top of the Tab key-binding overlay) rather than inventing a
@@ -960,7 +906,6 @@ void um6578_destroy(Um6578State *s) {
     apu2a03_destroy(&s->apu);
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
-    gemu_vnc_destroy(s->vnc);
     free(s->rom);
     free(s);
 }
@@ -1027,8 +972,6 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
 
         if (s->display)
             gemu_display_render(s->display, s->ppu.pixels_argb, SH6578_WIDTH, SH6578_HEIGHT);
-        if (s->vnc)
-            gemu_vnc_update(s->vnc, s->ppu.pixels, SH6578_WIDTH, SH6578_HEIGHT);
 
         Uint32 dt = SDL_GetTicks() - t0;
         Uint32 frame_ms = 1000u / 60u;

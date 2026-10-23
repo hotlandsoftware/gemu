@@ -8,7 +8,6 @@
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
 #  include "apu_midi.h"
 #endif
-#include "gemu/vnc.h"
 #include "gemu/monitor.h"
 #if defined(GEMU_GTK) || defined(_WIN32)
 #  include "hex_editor.h"
@@ -168,7 +167,7 @@ typedef struct NesState {
     char           sav_path[512];     /* ~/.gemu/<game>.sav or AppData equivalent */
 
     GemuDisplay   *display;  /* display+input handle (NULL if headless) */
-    GemuVncServer *vnc;
+    void *snapshot_reserved0; /* was the VNC server; kept so saved snapshots (raw struct) still load */
     GemuMonitor   *monitor;
 
     /* Game Genie patches */

@@ -4,6 +4,7 @@
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
 #include "gemu/sha256.h"
+#include "gemu/vnc.h"
 #include "romdb.h"
 #include <SDL2/SDL.h>
 #include <ctype.h>
@@ -347,8 +348,10 @@ static void apple1_poll_curses_keyboard(Apple1State *s) {
 }
 
 static void apple1_poll_vnc_keyboard(Apple1State *s) {
+    GemuVncServer *vnc = gemu_vnc_get();
+    if (!vnc) return;
     GemuVncKeyEvent ev;
-    while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
+    while (gemu_vnc_pop_key_event(vnc, &ev)) {
         if (!ev.down || !s->display)
             continue;
         uint32_t sym = ev.keysym;
@@ -372,11 +375,15 @@ static void apple1_poll_input_devices(Apple1State *s) {
     if (ser) ser->poll(ser->ud);
 }
 
+/* Mirror the custom SDL window to VNC (no-op without -vnc). */
 static void apple1_update_vnc(Apple1State *s, bool paused) {
-    if (!s || !s->vnc || !s->display || !s->vnc_fb)
+    static uint32_t argb[A1_FB_W * A1_FB_H];
+    GemuVncServer *vnc = gemu_vnc_get();
+    if (!vnc || !s || !s->display)
         return;
 
-    memset(s->vnc_fb, 0, (size_t)A1_FB_W * A1_FB_H);
+    for (size_t i = 0; i < (size_t)A1_FB_W * A1_FB_H; i++)
+        argb[i] = 0xFF000000u;
     const uint8_t *font = apple1_display_font(s->display);
     bool cursor_phase = paused ? s->display->cursor_phase
                                : ((SDL_GetTicks() / 500u) & 1u) != 0;
@@ -394,12 +401,12 @@ static void apple1_update_vnc(Apple1State *s, bool paused) {
                 uint8_t bits = glyph[gy];
                 for (int gx = 0; gx < 5; gx++) {
                     if (bits & (uint8_t)(0x10u >> gx))
-                        s->vnc_fb[(y0 + gy) * A1_FB_W + x0 + gx] = 1;
+                        argb[(y0 + gy) * A1_FB_W + x0 + gx] = 0xFFFFFFFFu;
                 }
             }
         }
     }
-    gemu_vnc_update(s->vnc, s->vnc_fb, A1_FB_W, A1_FB_H);
+    gemu_vnc_update_argb(vnc, argb, A1_FB_W, A1_FB_H);
 }
 
 static bool apple1_screendump(void *ud, const char *path) {
@@ -991,18 +998,6 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     s->display = apple1_display_create(cfg);
     if (cfg->display_type != GEMU_DISPLAY_NONE && !s->display)
         fprintf(stderr, "apple1: display unavailable, falling back to stdio\n");
-    if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr,
-                                 A1_FB_W * cfg->display_scale,
-                                 A1_FB_H * cfg->display_scale);
-        if (s->vnc) {
-            gemu_vnc_set_colors(s->vnc, 0xFFFFFFu, 0x000000u);
-            s->vnc_fb = malloc((size_t)A1_FB_W * A1_FB_H);
-            if (!s->vnc_fb)
-                fprintf(stderr, "apple1: failed to allocate VNC framebuffer\n");
-        }
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
 
     if (!apple1_load_roms(s, cfg)) {
         apple1_destroy(s);
@@ -1067,9 +1062,7 @@ Apple1State *apple1_create(const MosConfig *cfg) {
 void apple1_destroy(Apple1State *s) {
     if (!s) return;
     gemu_monitor_destroy(s->monitor);
-    gemu_vnc_destroy(s->vnc);
     apple1_display_destroy(s->display);
-    free(s->vnc_fb);
     free(s);
 }
 

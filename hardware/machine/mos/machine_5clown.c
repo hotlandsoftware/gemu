@@ -203,63 +203,15 @@ static void pia1_write_pb(void *ud, uint8_t val) {
     s->mux_data = (uint8_t)(val ^ 0xFFu); /* inverted, per hardware */
 }
 
-/* ── Input: local display actions + VNC key -> action mapping ──────────────
- *
- * VNC clients don't go through GemuDisplay's action-bitmask polling, so
- * (like machine_nes.c) we translate RFB keysyms directly onto the same
- * action bits by hand, using the same physical keys as the default SDL
- * bindings above so both input paths feel identical. */
-
-#define XK_Left   0xFF51u
-#define XK_Up     0xFF52u
-#define XK_Right  0xFF53u
-#define XK_Down   0xFF54u
-#define XK_Return 0xFF0Du
-#define XK_F2     0xFFBFu
+/* ── Input: local display actions (VNC input is merged in by the display) ── */
 
 static void fiveclown_handle_keys(FiveClownState *s, uint32_t held) {
-    (void)XK_Up; (void)XK_Down; /* unused directions on this board */
-
     if (s->display) {
         s->held_actions = held;
         uint32_t newly = gemu_display_last_pressed(s->display);
         if (newly & GEMU_ACTION(FIVECLOWN_ACT_COIN)) s->coin_latch = 15;
-    } else if (!s->vnc) {
+    } else {
         s->held_actions = 0;
-    }
-
-    if (s->vnc) {
-        GemuVncKeyEvent ev;
-        while (gemu_vnc_pop_key_event(s->vnc, &ev)) {
-            uint32_t bit = 0;
-            switch (ev.keysym) {
-            case 'b': case 'B': bit = GEMU_ACTION(FIVECLOWN_ACT_BET);     break;
-            case 'r': case 'R': bit = GEMU_ACTION(FIVECLOWN_ACT_RECORD);  break;
-            case 'u': case 'U': bit = GEMU_ACTION(FIVECLOWN_ACT_DUP);     break;
-            case XK_Return:     bit = GEMU_ACTION(FIVECLOWN_ACT_START);   break;
-            case 'k': case 'K': bit = GEMU_ACTION(FIVECLOWN_ACT_KEYOUT);  break;
-            case 'p': case 'P': bit = GEMU_ACTION(FIVECLOWN_ACT_PAYOUT);  break;
-            case 'c': case 'C': bit = GEMU_ACTION(FIVECLOWN_ACT_COLLECT); break;
-            case XK_Right:      bit = GEMU_ACTION(FIVECLOWN_ACT_BIG);     break;
-            case XK_Left:       bit = GEMU_ACTION(FIVECLOWN_ACT_SMALL);   break;
-            case '1':           bit = GEMU_ACTION(FIVECLOWN_ACT_HOLD1);   break;
-            case '2':           bit = GEMU_ACTION(FIVECLOWN_ACT_HOLD2);   break;
-            case '3':           bit = GEMU_ACTION(FIVECLOWN_ACT_HOLD3);   break;
-            case '4':           bit = GEMU_ACTION(FIVECLOWN_ACT_HOLD4);   break;
-            case '5':           bit = GEMU_ACTION(FIVECLOWN_ACT_HOLD5);   break;
-            case XK_F2:         bit = GEMU_ACTION(FIVECLOWN_ACT_SETTING); break;
-            case '6':           bit = GEMU_ACTION(FIVECLOWN_ACT_COIN);    break;
-            case '7':           bit = GEMU_ACTION(FIVECLOWN_ACT_KEYIN);   break;
-            default: break;
-            }
-            if (!bit) continue;
-            if (ev.down) {
-                s->held_actions |= bit;
-                if (bit == GEMU_ACTION(FIVECLOWN_ACT_COIN)) s->coin_latch = 15;
-            } else {
-                s->held_actions &= ~bit;
-            }
-        }
     }
 }
 
@@ -283,12 +235,10 @@ static void fiveclown_render(FiveClownState *s) {
 
                 int py = ty * 8 + ra;
                 uint32_t *row = &s->pixels_argb[py * FIVECLOWN_FB_WIDTH + tx * 8];
-                uint8_t  *idxrow = &s->pixels_idx[py * FIVECLOWN_FB_WIDTH + tx * 8];
                 for (int n = 7; n >= 0; n--) {
                     int idx3 = (((plane2 >> n) & 1) << 2) | (((plane1 >> n) & 1) << 1) | ((plane0 >> n) & 1);
                     uint8_t pen = (uint8_t)(color * 8 + idx3);
                     *row++ = s->palette[pen];
-                    *idxrow++ = pen;
                 }
             }
         }
@@ -503,16 +453,7 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
     gemu_config_path(s->sav_path, sizeof(s->sav_path), "5clown.nvram");
     fiveclown_nvram_load(s);
 
-    if (cfg->vnc_addr) {
-        s->vnc = gemu_vnc_create(cfg->vnc_addr, FIVECLOWN_FB_WIDTH, FIVECLOWN_FB_HEIGHT);
-        if (s->vnc)
-            gemu_vnc_set_palette(s->vnc, s->palette, 256);
-        else
-            fprintf(stderr, "5clown: failed to start VNC at %s\n", cfg->vnc_addr);
-    }
-    gemu_monitor_set_vnc(s->monitor, s->vnc);
-
-    if (cfg->display_type != GEMU_DISPLAY_NONE) {
+    if (gemu_display_wanted(cfg->display_type)) {
         s->display = gemu_display_create(cfg->display_type, &(GemuDisplayConfig){
             .fb_width    = FIVECLOWN_FB_WIDTH,
             .fb_height   = FIVECLOWN_FB_HEIGHT,
@@ -536,7 +477,6 @@ void fiveclown_destroy(FiveClownState *s) {
     oki6295_destroy(&s->oki);
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
-    gemu_vnc_destroy(s->vnc);
     free(s->prg);
     free(s->audio_prg);
     free(s->gfxbanks);
@@ -612,8 +552,6 @@ void fiveclown_run(FiveClownState *s, const MosConfig *cfg) {
 
         if (s->display)
             gemu_display_render(s->display, s->pixels_argb, FIVECLOWN_FB_WIDTH, FIVECLOWN_FB_HEIGHT);
-        if (s->vnc)
-            gemu_vnc_update(s->vnc, s->pixels_idx, FIVECLOWN_FB_WIDTH, FIVECLOWN_FB_HEIGHT);
 
         Uint32 dt = SDL_GetTicks() - t0;
         Uint32 frame_ms = 1000u / 50u; /* ~50.08Hz; close enough for SDL_Delay granularity */

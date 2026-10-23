@@ -111,6 +111,12 @@ typedef struct {
  */
 GemuDisplay *gemu_display_create(GemuDisplayType type,
                                  const GemuDisplayConfig *cfg);
+
+/* Whether gemu_display_create() will return a display for `type`: true for
+ * any real backend, and for -display none when -vnc is serving the screen.
+ * Machines that skip display work when headless should test this rather
+ * than comparing against GEMU_DISPLAY_NONE. */
+bool         gemu_display_wanted(GemuDisplayType type);
 void         gemu_display_destroy(GemuDisplay *d);
 
 /* ── Per-frame I/O ───────────────────────────────────────────────────────── */
