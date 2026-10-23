@@ -48,6 +48,26 @@ static void studio2_mem_write(uint16_t addr, uint8_t val, void *ud) {
         s->ram[addr & STUDIO2_RAM_MASK] = val;
 }
 
+/* Monitor memory view: studio2_mem_read() is a plain array lookup. */
+static bool studio2_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    if (addr > 0xffffu) return false;
+    *val = studio2_mem_read((uint16_t)addr, ud);
+    return true;
+}
+
+static bool studio2_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    RcaStudio2State *s = ud;
+    if (addr > 0xffffu || addr < 0x0800) return false;              /* ROM / cart */
+    if (addr >= 0x0C00 && addr < 0x1000 && s->cart_c00) return false; /* cart bank 2 */
+    s->ram[addr & STUDIO2_RAM_MASK] = val;
+    return true;
+}
+
+static void studio2_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const RcaStudio2State *s = ud;
+    cdp1802_format_state(&s->cpu, buf, len);
+}
+
 /* ── DMA: CDP1861 → vram ─────────────────────────────────────────────────── */
 
 static void studio2_dma_out(uint8_t *data, void *ud) {
@@ -284,6 +304,10 @@ RcaStudio2State *rca_studio2_create(const RcaConfig *cfg) {
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, studio2_screendump, s);
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = studio2_mon_read, .write = studio2_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = true });
+    gemu_monitor_set_cpu_state_cb(s->monitor, studio2_mon_cpu_state, s);
     {
         GemuMediaDevice cart_dev = {
             .name   = "cartridge",
@@ -429,10 +453,24 @@ void rca_studio2_run(RcaStudio2State *s, const RcaConfig *cfg) {
         studio2_update_ef(s);
 
         /* Monitor commands */
-        GemuMonCmd cmd = gemu_monitor_poll(s->monitor);
-        if (cmd == GEMU_MON_QUIT)   { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else { quit = true; continue; } }
-        if (cmd == GEMU_MON_RESET)  reset = true;
-        if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
+        GemuMonCmd cmd;
+        while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
+            if (cmd == GEMU_MON_QUIT)  { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else quit = true; }
+            else if (cmd == GEMU_MON_RESET) reset = true;
+            else if (cmd == GEMU_MON_STEP) {
+                uint32_t n = gemu_monitor_step_count(s->monitor);
+                for (uint32_t k = 0; k < n; k++) {
+                    /* cdp1802_step advances one machine cycle; run until an
+                     * instruction completes (bounded, in case of IDL). */
+                    uint64_t start = s->cpu.insn_count;
+                    for (int i = 0; i < 1024 && s->cpu.insn_count == start; i++) {
+                        studio2_update_ef(s);
+                        cdp1802_step(&s->cpu);
+                    }
+                }
+            }
+        }
+        if (quit) continue;
 
         if (reset) { rca_studio2_reset(s, cfg); continue; }
         gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));

@@ -99,6 +99,41 @@ static uint8_t generic_mem_read(uint16_t addr, void *ud) {
     return s->mem[addr % s->mem_size];
 }
 
+/* Monitor memory view: RAM/ROM directly; in the $DFxx I/O page only the
+ * side-effect-free timer/serial status registers ($DF10 pops the RX FIFO). */
+static bool generic_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    MosGenericState *s = ud;
+    if (addr > 0xFFFF) return false;
+    if (addr >= GENERIC_IO_BASE && addr <= GENERIC_IO_END) {
+        switch (addr - GENERIC_IO_BASE) {
+        case 0x00u: *val = (uint8_t)(s->timer_reload);      return true;
+        case 0x01u: *val = (uint8_t)(s->timer_reload >> 8); return true;
+        case 0x02u: *val = s->timer_ctrl | (s->timer_pending ? 0x80u : 0u); return true;
+        case 0x11u: *val = 0x02u | (s->serial_rxq_cnt ? 0x01u : 0u); return true;
+        case 0x12u: *val = s->serial_ctrl; return true;
+        }
+        return false;
+    }
+    *val = s->mem[addr % s->mem_size];
+    return true;
+}
+
+/* Writes go to RAM only (not ROM, the I/O page or the $F001 debug port). */
+static bool generic_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    MosGenericState *s = ud;
+    if (addr > 0xFFFF || addr == 0xF001u) return false;
+    if (addr >= GENERIC_IO_BASE && addr <= GENERIC_IO_END) return false;
+    uint32_t off = (uint32_t)(addr % s->mem_size);
+    if (s->rom_map[off]) return false;
+    s->mem[off] = val;
+    return true;
+}
+
+static void generic_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const MosGenericState *s = ud;
+    mos6502_format_state(&s->cpu, buf, len);
+}
+
 static void generic_mem_write(uint16_t addr, uint8_t val, void *ud) {
     MosGenericState *s = ud;
     gemu_monitor_check_write(s->monitor, addr);
@@ -191,6 +226,10 @@ MosGenericState *mos_generic_create(const MosConfig *cfg) {
                               cfg->cpu == MOS_CPU_2A07);
 
     s->monitor = gemu_monitor_create();
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = generic_mon_read, .write = generic_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = false });
+    gemu_monitor_set_cpu_state_cb(s->monitor, generic_mon_cpu_state, s);
 
     if (cfg->vnc_addr) {
         s->vnc = gemu_vnc_create(cfg->vnc_addr, 320 * cfg->display_scale,
@@ -264,7 +303,10 @@ void mos_generic_run(MosGenericState *s, const MosConfig *cfg) {
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
             if      (cmd == GEMU_MON_QUIT)   { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else { quit = true; break; } }
             else if (cmd == GEMU_MON_RESET)  mos_generic_reset(s, cfg);
-            else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
+            else if (cmd == GEMU_MON_STEP) {
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
+                    { mos6502_step(&s->cpu); generic_timer_tick(s); }
+            }
         }
         if (quit) break;
 

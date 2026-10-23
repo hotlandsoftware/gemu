@@ -33,6 +33,42 @@ static void bus_write8(uint32_t addr, uint8_t val, void *ud) {
     /* ROM regions: writes silently ignored, matching real hardware */
 }
 
+/* Monitor memory view (20-bit physical): RAM, CGA VRAM and the ROMs are
+ * plain arrays; unmapped space returns false instead of the bus's 0xFF. */
+static bool ibm5150_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    const Ibm5150State *s = ud;
+    if (addr < s->ram_size) { *val = s->ram[addr]; return true; }
+    if (addr >= IBM5150_CGA_BASE && addr < IBM5150_CGA_END) {
+        *val = cga_mem_read(&s->cga, (uint32_t)(addr - IBM5150_CGA_BASE));
+        return true;
+    }
+    if (s->has_basic && addr >= IBM5150_BASIC_BASE &&
+        addr < IBM5150_BASIC_BASE + IBM5150_BASIC_SIZE) {
+        *val = s->basic[addr - IBM5150_BASIC_BASE];
+        return true;
+    }
+    if (addr >= IBM5150_BIOS_BASE && addr < IBM5150_BIOS_BASE + IBM5150_BIOS_SIZE) {
+        *val = s->bios[addr - IBM5150_BIOS_BASE];
+        return true;
+    }
+    return false;
+}
+
+static bool ibm5150_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    Ibm5150State *s = ud;
+    if (addr < s->ram_size) { s->ram[addr] = val; return true; }
+    if (addr >= IBM5150_CGA_BASE && addr < IBM5150_CGA_END) {
+        cga_mem_write(&s->cga, (uint32_t)(addr - IBM5150_CGA_BASE), val);
+        return true;
+    }
+    return false;   /* ROM / unmapped */
+}
+
+static void ibm5150_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const Ibm5150State *s = ud;
+    x86_format_state(&s->cpu, buf, len);
+}
+
 static void iolog(Ibm5150State *s, uint16_t port, bool is_write, uint8_t val) {
     for (int i = 0; i < s->iolog_n; i++) {
         if (s->iolog[i].port == port && s->iolog[i].is_write == is_write) {
@@ -176,6 +212,10 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     if (!s->fb) { free(s->ram); free(s); return NULL; }
 
     s->monitor = gemu_monitor_create();
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = ibm5150_mon_read, .write = ibm5150_mon_write, .ud = s,
+        .addr_bits = 20, .big_endian = false });
+    gemu_monitor_set_cpu_state_cb(s->monitor, ibm5150_mon_cpu_state, s);
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         GemuDisplayConfig dc = {

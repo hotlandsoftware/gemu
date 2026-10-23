@@ -1260,6 +1260,60 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
         s->ram[a] = val;
 }
 
+/* ── Monitor ─────────────────────────────────────────────────────────────── */
+
+/* Memory view, decoded like kim1_mem_read() but side-effect free: board RAM
+ * (and its mirrors), expansion RAM, 6530 RAM and ROM.  The 6530 RRIOT I/O
+ * and timer registers ($1700-$177F and mirrors) return false, and the
+ * monitor-ROM trap addresses read as their plain ROM bytes. */
+static bool kim1_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    Kim1State *s = ud;
+    if (addr > 0xFFFF) return false;
+    uint16_t a = (uint16_t)(addr & 0x1FFFu);
+    if (a >= KIM1_U2_BASE && a < KIM1_U2_BASE + 0x0080u) return false;
+    if (a >= 0x1780u && a < 0x1800u) { *val = s->rriot_ram[a - 0x1780u]; return true; }
+    if (a >= 0x1800u) {
+        *val = a < 0x1C00u ? s->rom_002[a - 0x1800u] : s->rom_003[a - 0x1C00u];
+        return true;
+    }
+    if (addr < 0x0400u) { *val = s->ram[addr]; return true; }
+    if (s->ext_ram && addr < s->ext_ram_top) { *val = s->ext_ram[addr - 0x0400u]; return true; }
+    if (a < 0x0400u) { *val = s->ram[a]; return true; }
+    return false;
+}
+
+/* Writes go to RAM only (board, expansion, 6530 RAM); not ROM or I/O. */
+static bool kim1_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    Kim1State *s = ud;
+    if (addr > 0xFFFF) return false;
+    uint16_t a = (uint16_t)(addr & 0x1FFFu);
+    if (a >= KIM1_U2_BASE && a < KIM1_U2_BASE + 0x0080u) return false;
+    if (a >= 0x1780u && a < 0x1800u) { s->rriot_ram[a - 0x1780u] = val; return true; }
+    if (a >= 0x1800u) return false;
+    if (addr < 0x0400u) { s->ram[addr] = val; return true; }
+    if (s->ext_ram && addr < s->ext_ram_top) { s->ext_ram[addr - 0x0400u] = val; return true; }
+    if (a < 0x0400u) { s->ram[a] = val; return true; }
+    return false;
+}
+
+static void kim1_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const Kim1State *s = ud;
+    mos6502_format_state(&s->cpu, buf, len);
+}
+
+#if defined(GEMU_GTK) || defined(_WIN32)
+static GemuMonCmd kim1_cmd_hexeditor(GemuMonitor *mon, const char *args, void *ud) {
+    Kim1State *s = ud;
+    (void)args;
+    if (!s->hex_editor) {
+        gemu_monitor_printf(mon, "hexeditor: not available with this display\n");
+        return GEMU_MON_NONE;
+    }
+    kim1_hex_toggle(s);
+    return GEMU_MON_NONE;
+}
+#endif
+
 /* ── ROM loading ─────────────────────────────────────────────────────────── */
 
 static bool load_rom_file(const char *path, uint8_t *dest, size_t expected,
@@ -1333,6 +1387,13 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     s->cfg        = cfg;
     s->has_keypad = true;  /* always show visual keypad; it's the primary UI */
     s->monitor    = gemu_monitor_create();
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = kim1_mon_read, .write = kim1_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = false });
+    gemu_monitor_set_cpu_state_cb(s->monitor, kim1_mon_cpu_state, s);
+#if defined(GEMU_GTK) || defined(_WIN32)
+    gemu_monitor_bind(s->monitor, "hexeditor", kim1_cmd_hexeditor, s);
+#endif
 
     mos6502_init(&s->cpu);
     s->cpu.mem_read  = kim1_mem_read;
@@ -1469,6 +1530,13 @@ void kim1_destroy(Kim1State *s) {
 #define KIM1_CYCLES_PER_FRAME  (KIM1_HZ / KIM1_FRAME_HZ)
 #define KIM1_FRAME_MS          (1000u / KIM1_FRAME_HZ)
 
+/* Execute one CPU instruction and advance the RRIOT timers with it. */
+static void kim1_step_insn(Kim1State *s) {
+    mos6502_step(&s->cpu);
+    rriot_timer_tick(&s->u2, s);
+    rriot_timer_tick(&s->u3, s);
+}
+
 void kim1_run(Kim1State *s, const MosConfig *cfg) {
     gemu_monitor_start(s->monitor);
 
@@ -1516,7 +1584,10 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
                 mos6502_reset(&s->cpu);
                 kim1_reset_rriots(s);
             }
-            else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
+            else if (cmd == GEMU_MON_STEP) {
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
+                    kim1_step_insn(s);
+            }
         }
         if (quit) break;
         gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
@@ -1525,9 +1596,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
             uint64_t target = s->cpu.cycle_count + KIM1_CYCLES_PER_FRAME;
             while (s->cpu.cycle_count < target) {
                 if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-                mos6502_step(&s->cpu);
-                rriot_timer_tick(&s->u2, s);
-                rriot_timer_tick(&s->u3, s);
+                kim1_step_insn(s);
                 if (gemu_monitor_is_paused(s->monitor)) break;
             }
         }

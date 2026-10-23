@@ -233,16 +233,17 @@ static const DestroyerDipOption *destroyer_current_dip_option(
 }
 
 static void destroyer_list_dips(const RcaDestroyerState *s) {
-    printf("Destroyer DIP switches:\n");
+    GemuMonitor *mon = s->monitor;
+    gemu_monitor_printf(mon, "Destroyer DIP switches:\n");
     for (size_t i = 0; i < sizeof(destroyer_dips) / sizeof(destroyer_dips[0]); i++) {
         const DestroyerDip *dip = &destroyer_dips[i];
         const DestroyerDipOption *cur = destroyer_current_dip_option(s, dip);
-        printf("  %-10s %-12s current: %s\n", dip->name, dip->desc,
+        gemu_monitor_printf(mon, "  %-10s %-12s current: %s\n", dip->name, dip->desc,
                cur ? cur->value : "unknown");
-        printf("             values:");
+        gemu_monitor_printf(mon, "             values:");
         for (size_t j = 0; j < dip->n_options; j++)
-            printf(" %s", dip->options[j].value);
-        printf("\n");
+            gemu_monitor_printf(mon, " %s", dip->options[j].value);
+        gemu_monitor_printf(mon, "\n");
     }
 }
 
@@ -262,7 +263,7 @@ static bool destroyer_set_dip(RcaDestroyerState *s, const char *name,
                               const char *value) {
     const DestroyerDip *dip = destroyer_find_dip(name);
     if (!dip) {
-        printf("unknown DIP switch '%s' (try 'dipswitch list')\n", name);
+        gemu_monitor_printf(s->monitor, "unknown DIP switch '%s' (try 'dipswitch list')\n", name);
         return true;
     }
 
@@ -278,40 +279,63 @@ static bool destroyer_set_dip(RcaDestroyerState *s, const char *name,
     if (!found)
         found = destroyer_parse_raw_dip_value(value, dip->mask, &bits);
     if (!found) {
-        printf("invalid value '%s' for DIP '%s' (try 'dipswitch list')\n",
+        gemu_monitor_printf(s->monitor, "invalid value '%s' for DIP '%s' (try 'dipswitch list')\n",
                value, name);
         return true;
     }
 
     s->in1 = (uint8_t)((s->in1 & ~dip->mask) | (bits & dip->mask));
     const DestroyerDipOption *cur = destroyer_current_dip_option(s, dip);
-    printf("DIP %s = %s\n", dip->name, cur ? cur->value : value);
+    gemu_monitor_printf(s->monitor, "DIP %s = %s\n", dip->name, cur ? cur->value : value);
     return true;
 }
 
-static bool destroyer_monitor_command(RcaDestroyerState *s, const char *line) {
+static GemuMonCmd destroyer_cmd_dipswitch(GemuMonitor *mon, const char *args,
+                                          void *ud) {
+    RcaDestroyerState *s = ud;
     char buf[256];
-    snprintf(buf, sizeof(buf), "%s", line);
+    snprintf(buf, sizeof(buf), "%s", args);
 
-    char *cmd = strtok(buf, " \t");
-    if (!cmd)
-        return true;
-    if (strcasecmp(cmd, "dipswitch") != 0 && strcasecmp(cmd, "dip") != 0)
-        return false;
-
-    char *name = strtok(NULL, " \t");
+    char *name = strtok(buf, " \t");
     char *value = strtok(NULL, " \t");
     char *extra = strtok(NULL, " \t");
 
     if (!name || strcasecmp(name, "list") == 0) {
         destroyer_list_dips(s);
-        return true;
+        return GEMU_MON_NONE;
     }
     if (!value || extra) {
-        printf("usage: dipswitch list | dipswitch <name> <value>\n");
+        gemu_monitor_printf(mon, "usage: dipswitch list | dipswitch <name> <value>\n");
+        return GEMU_MON_NONE;
+    }
+    destroyer_set_dip(s, name, value);
+    return GEMU_MON_NONE;
+}
+
+/* Monitor memory view: side-effect-free.  Character RAM reads through the
+ * CDP1869 latch the PCB bit, so that window is not inspectable. */
+static bool destroyer_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    RcaDestroyerState *s = ud;
+    if (addr > 0xffffu) return false;
+    if (addr >= 0xf400 && addr <= 0xf7ff) return false;
+    if (addr >= 0xf800) {
+        *val = cdp1869_page_read(&s->vis, (uint16_t)(addr - 0xf800));
         return true;
     }
-    return destroyer_set_dip(s, name, value);
+    *val = s->mem[addr];
+    return true;
+}
+
+static bool destroyer_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    RcaDestroyerState *s = ud;
+    if (addr > 0xffffu || addr <= 0x1fffu) return false;   /* ROM */
+    destroyer_mem_write((uint16_t)addr, val, s);
+    return true;
+}
+
+static void destroyer_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const RcaDestroyerState *s = ud;
+    cdp1802_format_state(&s->cpu, buf, len);
 }
 
 /*
@@ -435,6 +459,11 @@ RcaDestroyerState *rca_destroyer_create(const RcaConfig *cfg) {
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, destroyer_screendump, s);
+    gemu_monitor_bind(s->monitor, "dipswitch", destroyer_cmd_dipswitch, s);
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = destroyer_mon_read, .write = destroyer_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = true });
+    gemu_monitor_set_cpu_state_cb(s->monitor, destroyer_mon_cpu_state, s);
     if (cfg->vnc_addr) {
         int w = (cfg->vga == RCA_VGA_CDP1869) ? DESTROYER_ROTATED_W : CDP1861_DISPLAY_W;
         int h = (cfg->vga == RCA_VGA_CDP1869) ? DESTROYER_ROTATED_H : CDP1861_DISPLAY_H;
@@ -588,10 +617,6 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
             else if (cmd == GEMU_MON_STEP) {
                 uint32_t n = gemu_monitor_step_count(s->monitor);
                 for (uint32_t i = 0; i < n; i++) cdp1802_step(&s->cpu);
-            }
-            else if (cmd == GEMU_MON_CUSTOM) {
-                if (!destroyer_monitor_command(s, gemu_monitor_command_text(s->monitor)))
-                    gemu_monitor_unknown_command(s->monitor);
             }
         }
         if (quit) break;

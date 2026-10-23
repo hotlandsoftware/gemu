@@ -1,5 +1,6 @@
 #include "gemu/gemu.h"
 #include "gemu/args.h"
+#include "gemu/monitor.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -153,6 +154,7 @@ int main(int argc, char *argv[]) {
     if (machine_name) {
         char base_machine[128];
         machine_spec_name(machine_name, base_machine, sizeof(base_machine));
+        gemu_monitor_set_machine(base_machine);
         for (int i = 0; i < N_MACHINES; i++) {
             if (strcmp(base_machine, MACHINES[i].name) == 0)
                 return MACHINES[i].fn(argc, argv);

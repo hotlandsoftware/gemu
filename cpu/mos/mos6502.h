@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /* Status register (P) bits: NV-BDIZC */
 #define MOS6502_P_C  0x01u  /* Carry */
@@ -35,3 +36,5 @@ typedef struct Mos6502 {
 void mos6502_init (Mos6502 *cpu);
 void mos6502_reset(Mos6502 *cpu);
 void mos6502_step (Mos6502 *cpu);
+/* One-line register dump for the monitor's "info cpu". */
+void mos6502_format_state(const Mos6502 *cpu, char *buf, size_t len);

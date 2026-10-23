@@ -287,15 +287,19 @@ static void a400_render_curses_text(Atari400State *s) {
 }
 
 /* monitor: sendkey <text>  - queue each character (\n = Return) */
-static bool a400_sendkey_command(Atari400State *s, const char *text) {
-    if (!text || strncmp(text, "sendkey ", 8) != 0) return false;
+static GemuMonCmd a400_cmd_sendkey(GemuMonitor *mon, const char *args, void *ud) {
+    Atari400State *s = ud;
     if (!s->cfg->generic_keyboard) {
-        printf("sendkey: keyboard device is not attached\n");
-        return true;
+        gemu_monitor_printf(mon, "sendkey: keyboard device is not attached\n");
+        return GEMU_MON_NONE;
     }
-    for (const char *p = text + 8; *p; p++)
+    if (!*args) {
+        gemu_monitor_printf(mon, "usage: sendkey <text>\n");
+        return GEMU_MON_NONE;
+    }
+    for (const char *p = args; *p; p++)
         a400_queue_char(s, *p == '\n' ? (uint32_t)'\r' : (uint32_t)*p);
-    return true;
+    return GEMU_MON_NONE;
 }
 
 static void a400_cpu_state(void *ud, char *buf, size_t buf_len) {
@@ -318,16 +322,54 @@ static void a400_cpu_state(void *ud, char *buf, size_t buf_len) {
              s->pokey.audf[3]);
 }
 
-static bool a400_peek_command(Atari400State *s, const char *text) {
-    unsigned addr, len = 16;
-    if (!text || sscanf(text, "peek %x %x", &addr, &len) < 1) return false;
-    if (len > 128) len = 128;
-    for (unsigned i = 0; i < len; i++) {
-        if ((i & 15u) == 0) printf("%04X:", (addr + i) & 0xFFFFu);
-        printf(" %02X", a400_read((uint16_t)(addr + i), s));
-        if ((i & 15u) == 15u || i + 1 == len) printf("\n");
+/* Monitor memory view: RAM (including the selected Axlon bank), the active
+ * cartridge bank and OS ROM, decoded like a400_read() but without touching
+ * the hardware.  $D000-$D7FF (GTIA, POKEY, PIA, ANTIC and the CCTL page,
+ * whose accesses switch MaxFlash banks) and open bus return false. */
+static bool a400_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    const Atari400State *s = ud;
+    if (addr > 0xFFFF) return false;
+    if (addr >= 0xD000u && addr < 0xD800u) return false;
+    if (s->cart_enabled && s->cart_base && addr >= s->cart_base &&
+        addr < (s->cart_type ? 0xC000u : (uint32_t)s->cart_base + s->cart_size)) {
+        size_t off;
+        if (s->cart_type == 41u || s->cart_type == 42u)
+            off = (size_t)s->cart_bank * 0x2000u + (addr - 0xA000u);
+        else if (addr < (uint32_t)s->cart_base + s->cart_size)
+            off = addr - s->cart_base;
+        else
+            off = SIZE_MAX;
+        if (off != SIZE_MAX) {
+            if (!s->cart || off >= s->cart_size) return false;
+            *val = s->cart[off];
+            return true;
+        }
     }
-    return true;
+    if (s->axlon_ram && s->axlon_bank && addr >= 0x4000u && addr < 0x8000u) {
+        *val = s->axlon_ram[(size_t)(s->axlon_bank - 1u) * A400_AXLON_BANK_SIZE +
+                            (addr - 0x4000u)];
+        return true;
+    }
+    if (addr < s->ram_size) { *val = s->ram[addr]; return true; }
+    if (addr >= 0xD800u) { *val = s->os_rom[addr - 0xD800u]; return true; }
+    return false;
+}
+
+/* Writes go to RAM only; cartridge-overlaid, ROM and I/O addresses return
+ * false.  Axlon bank-select side effects are not triggered. */
+static bool a400_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    Atari400State *s = ud;
+    if (addr > 0xFFFF) return false;
+    if (s->cart_enabled && s->cart_base && addr >= s->cart_base &&
+        addr < (s->cart_type ? 0xC000u : (uint32_t)s->cart_base + s->cart_size))
+        return false;
+    if (s->axlon_ram && s->axlon_bank && addr >= 0x4000u && addr < 0x8000u) {
+        s->axlon_ram[(size_t)(s->axlon_bank - 1u) * A400_AXLON_BANK_SIZE +
+                     (addr - 0x4000u)] = val;
+        return true;
+    }
+    if (addr < s->ram_size) { s->ram[addr] = val; return true; }
+    return false;
 }
 
 /* ── VNC keyboard ───────────────────────────────────────────────────────── */
@@ -684,6 +726,10 @@ Atari400State *atari400_create(const MosConfig *cfg) {
     }
     gemu_monitor_set_cpu_state_cb(s->monitor, a400_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, a400_screendump, s);
+    gemu_monitor_bind(s->monitor, "sendkey", a400_cmd_sendkey, s);
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = a400_mon_read, .write = a400_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = false });
 
     if (cfg->atari810) {
         GemuMediaDevice floppy_dev = {
@@ -783,11 +829,13 @@ void atari400_run(Atari400State *s, const MosConfig *cfg) {
                 else { quit = true; break; }
             } else if (cmd == GEMU_MON_RESET) {
                 a400_reset(s);
-            } else if (cmd == GEMU_MON_CUSTOM) {
-                const char *text = gemu_monitor_command_text(s->monitor);
-                if (!a400_sendkey_command(s, text) &&
-                    !a400_peek_command(s, text))
-                    gemu_monitor_unknown_command(s->monitor);
+            } else if (cmd == GEMU_MON_STEP) {
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--) {
+                    if (a400_sio_trap(s)) continue;
+                    s->cpu.irq = pokey_irq_asserted(&s->pokey);
+                    mos6502_step(&s->cpu);
+                    s->wsync = false;
+                }
             }
         }
         if (quit) break;

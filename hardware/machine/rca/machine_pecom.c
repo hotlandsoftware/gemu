@@ -102,6 +102,33 @@ static void pecom_mem_write(uint16_t addr, uint8_t val, void *ud) {
     s->ram1[addr] = val;
 }
 
+/* Monitor memory view: side-effect-free.  Character RAM reads through the
+ * VIS-1870 latch the PCB bit, so that window is not inspectable; every other
+ * region of pecom_mem_read() is a plain array lookup. */
+static bool pecom_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    RcaPecom32State *s = ud;
+    if (addr > 0xffffu) return false;
+    if (addr >= PECOM32_CRAM_BASE && addr < PECOM32_PRAM_BASE) return false;
+    *val = pecom_mem_read((uint16_t)addr, s);
+    return true;
+}
+
+static bool pecom_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    RcaPecom32State *s = ud;
+    if (addr > 0xffffu) return false;
+    if (addr >= 0x8000u && addr < 0xC000u) return false;            /* ROM */
+    if (s->boot_mirror && addr < 0x4000u) return false;             /* ROM mirror */
+    if (addr >= 0xC000u && addr < PECOM32_CRAM_BASE &&
+        s->rom_size > PECOM32_ROM_SIZE) return false;               /* Pecom 64 ROM 2 */
+    pecom_mem_write((uint16_t)addr, val, s);
+    return true;
+}
+
+static void pecom_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const RcaPecom32State *s = ud;
+    cdp1802_format_state(&s->cpu, buf, len);
+}
+
 /* ── I/O ─────────────────────────────────────────────────────────────────── */
 
 /*
@@ -297,6 +324,10 @@ RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg) {
     cdp1869_set_block_cpu_access(&s->vis, true);  /* block during active display */
 
     s->monitor = gemu_monitor_create();
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = pecom_mon_read, .write = pecom_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = true });
+    gemu_monitor_set_cpu_state_cb(s->monitor, pecom_mon_cpu_state, s);
 
     if (cfg->sound_hw == RCA_SOUND_PCSPK && !cfg->vnc_addr) {
         s->speaker = rca_pcspk_create(250u);
@@ -501,7 +532,16 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
             if      (cmd == GEMU_MON_QUIT)  { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else quit = true; }
             else if (cmd == GEMU_MON_RESET) rca_pecom32_reset(s, cfg);
-            else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
+            else if (cmd == GEMU_MON_STEP) {
+                uint32_t n = gemu_monitor_step_count(s->monitor);
+                for (uint32_t k = 0; k < n; k++) {
+                    /* cdp1802_step advances one machine cycle; run until an
+                     * instruction completes (bounded, in case of IDL). */
+                    uint64_t start = s->cpu.insn_count;
+                    for (int i = 0; i < 1024 && s->cpu.insn_count == start; i++)
+                        cdp1802_step(&s->cpu);
+                }
+            }
         }
         if (quit) break;
         gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));

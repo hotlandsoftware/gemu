@@ -654,34 +654,30 @@ static bool parse_button_token(const char **p, const char *name) {
     return true;
 }
 
-static bool um6578_mouse_command(Um6578State *s, const char *text) {
-    const char *p = text;
-    while (*p == ' ' || *p == '\t') p++;
-
-    if (strncasecmp(p, "mouseclear", 10) == 0) {
-        p += 10;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p) return false;
-        s->mouse_synth_active = false;
-        s->mouse_have_pos = false;
-        s->mouse_legacy_have_pos = false;
-        printf("mouse: using host pointer\n");
-        return true;
+static GemuMonCmd um6578_cmd_mouseclear(GemuMonitor *mon, const char *args, void *ud) {
+    Um6578State *s = ud;
+    if (*args) {
+        gemu_monitor_printf(mon, "usage: mouseclear\n");
+        return GEMU_MON_NONE;
     }
+    s->mouse_synth_active = false;
+    s->mouse_have_pos = false;
+    s->mouse_legacy_have_pos = false;
+    gemu_monitor_printf(mon, "mouse: using host pointer\n");
+    return GEMU_MON_NONE;
+}
 
-    bool relative = false;
-    if (strncasecmp(p, "mousemove", 9) == 0) {
-        p += 9;
-        relative = true;
-    } else if (strncasecmp(p, "mouse", 5) == 0) {
-        p += 5;
-    } else {
-        return false;
-    }
-
+/* mouse <x> <y> [left] [right] [none]  /  mousemove <dx> <dy> [left] [right] [none] */
+static void um6578_mouse_command(GemuMonitor *mon, Um6578State *s, const char *args,
+                                 bool relative) {
+    const char *p = args;
+    const char *usage = relative ? "usage: mousemove <dx> <dy> [left] [right] [none]\n"
+                                 : "usage: mouse <x> <y> [left] [right] [none]\n";
     int x = 0, y = 0;
-    if (!parse_int_token(&p, &x) || !parse_int_token(&p, &y))
-        return false;
+    if (!parse_int_token(&p, &x) || !parse_int_token(&p, &y)) {
+        gemu_monitor_printf(mon, "%s", usage);
+        return;
+    }
 
     bool left = s->mouse_synth_left;
     bool right = s->mouse_synth_right;
@@ -697,7 +693,10 @@ static bool um6578_mouse_command(Um6578State *s, const char *text) {
         }
     }
     while (*p == ' ' || *p == '\t') p++;
-    if (*p) return false;
+    if (*p) {
+        gemu_monitor_printf(mon, "%s", usage);
+        return;
+    }
 
     bool was_synthetic = s->mouse_synth_active;
     if (relative && was_synthetic) {
@@ -717,26 +716,34 @@ static bool um6578_mouse_command(Um6578State *s, const char *text) {
     s->mouse_synth_y = y;
     s->mouse_synth_left = left;
     s->mouse_synth_right = right;
-    printf("mouse: x=%d y=%d left=%d right=%d\n", x, y, left ? 1 : 0, right ? 1 : 0);
-    return true;
+    gemu_monitor_printf(mon, "mouse: x=%d y=%d left=%d right=%d\n",
+                        x, y, left ? 1 : 0, right ? 1 : 0);
 }
 
-static bool um6578_mousestate_command(Um6578State *s, const char *text) {
-    const char *p = text;
-    while (*p == ' ' || *p == '\t') p++;
-    if (strncasecmp(p, "mousestate", 10) != 0 || (p[10] && p[10] != ' ' && p[10] != '\t'))
-        return false;
-    p += 10;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p) return false;
+static GemuMonCmd um6578_cmd_mouse(GemuMonitor *mon, const char *args, void *ud) {
+    um6578_mouse_command(mon, ud, args, false);
+    return GEMU_MON_NONE;
+}
 
-    printf("mouse-state: host=%s x=%d y=%d left=%d right=%d stream=%d q=%u/%u\n",
+static GemuMonCmd um6578_cmd_mousemove(GemuMonitor *mon, const char *args, void *ud) {
+    um6578_mouse_command(mon, ud, args, true);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd um6578_cmd_mousestate(GemuMonitor *mon, const char *args, void *ud) {
+    Um6578State *s = ud;
+    if (*args) {
+        gemu_monitor_printf(mon, "usage: mousestate\n");
+        return GEMU_MON_NONE;
+    }
+
+    gemu_monitor_printf(mon, "mouse-state: host=%s x=%d y=%d left=%d right=%d stream=%d q=%u/%u\n",
            s->mouse_synth_active ? "synthetic" : "display",
            s->mouse_synth_x, s->mouse_synth_y,
            s->mouse_synth_left ? 1 : 0, s->mouse_synth_right ? 1 : 0,
            s->mouse_stream_enabled ? 1 : 0,
            (unsigned)s->mouse_qhead, (unsigned)s->mouse_qtail);
-    printf("mouse-state: z20=%02X z21=%02X bounds x=%02X..%02X y=%02X..%02X pos=%02X,%02X parsed=%02X/%02X/%02X last=%02X/%02X changed=%02X hist=%02X idx=%02X raw=%02X stage=%02X busy=%02X flag=%02X\n",
+    gemu_monitor_printf(mon, "mouse-state: z20=%02X z21=%02X bounds x=%02X..%02X y=%02X..%02X pos=%02X,%02X parsed=%02X/%02X/%02X last=%02X/%02X changed=%02X hist=%02X idx=%02X raw=%02X stage=%02X busy=%02X flag=%02X\n",
            s->ram_lo[0x20], s->ram_lo[0x21],
            s->ram_lo[0x28], s->ram_lo[0x2a],
            s->ram_lo[0x29], s->ram_lo[0x2b],
@@ -745,16 +752,12 @@ static bool um6578_mousestate_command(Um6578State *s, const char *text) {
            s->ram_lo[0x2f], s->ram_lo[0x60],
            s->ram_lo[0x2e], s->ram_lo[0x68], s->ram_lo[0x67],
            s->ram_lo[0x35], s->ram_lo[0x37], s->ram_lo[0x36], s->ram_lo[0x30]);
-    return true;
+    return GEMU_MON_NONE;
 }
 
-static bool um6578_sendkey_command(Um6578State *s, const char *text) {
-    const char *p = text;
-    while (*p == ' ' || *p == '\t') p++;
-    if (strncasecmp(p, "sendkey", 7) != 0 || (p[7] && p[7] != ' ' && p[7] != '\t'))
-        return false;
-    p += 7;
-    while (*p == ' ' || *p == '\t') p++;
+static GemuMonCmd um6578_cmd_sendkey(GemuMonitor *mon, const char *args, void *ud) {
+    Um6578State *s = ud;
+    const char *p = args;
 
     uint32_t btn = 0;
     if      (strncasecmp(p, "a",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = GEMU_ACTION(UM6578_ACT_A);
@@ -766,8 +769,8 @@ static bool um6578_sendkey_command(Um6578State *s, const char *text) {
     else if (strncasecmp(p, "left",   4) == 0) btn = GEMU_ACTION(UM6578_ACT_LEFT);
     else if (strncasecmp(p, "right",  5) == 0) btn = GEMU_ACTION(UM6578_ACT_RIGHT);
     if (!btn) {
-        printf("sendkey: unknown button (a b start select up down left right)\n");
-        return true;
+        gemu_monitor_printf(mon, "sendkey: unknown button (a b start select up down left right)\n");
+        return GEMU_MON_NONE;
     }
 
     while (*p && *p != ' ' && *p != '\t') p++;
@@ -775,8 +778,46 @@ static bool um6578_sendkey_command(Um6578State *s, const char *text) {
     int frames = (*p >= '1' && *p <= '9') ? (int)strtol(p, NULL, 10) : 5;
     s->input_inject_mask = btn;
     s->input_inject_frames = frames;
-    printf("sendkey: holding 0x%08X for %d frame(s)\n", btn, frames);
-    return true;
+    gemu_monitor_printf(mon, "sendkey: holding 0x%08X for %d frame(s)\n", btn, frames);
+    return GEMU_MON_NONE;
+}
+
+/* Monitor memory view: work RAM, banked ROM and the bank/DMA registers.
+ * PPU, APU, controller, mouse-queue and IRQ/timer I/O return false. */
+static bool um6578_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    Um6578State *s = ud;
+    if (addr > 0xFFFF) return false;
+    if (addr < 0x2000) { *val = s->ram_lo[addr]; return true; }
+    if (addr >= 0x4040 && addr <= 0x4047) { *val = s->bankswitch[addr - 0x4040]; return true; }
+    if (addr >= 0x4048 && addr <= 0x404F) {
+        switch (addr - 0x4048) {
+        case 0: *val = s->dma_control & 0x7Fu; break;
+        case 1: *val = s->dma_bank;      break;
+        case 2: *val = s->dma_source[0]; break;
+        case 3: *val = s->dma_source[1]; break;
+        case 4: *val = s->dma_dest[0];   break;
+        case 5: *val = s->dma_dest[1];   break;
+        case 6: *val = s->dma_length[0]; break;
+        default: *val = s->dma_length[1]; break;
+        }
+        return true;
+    }
+    if (addr >= 0x5000 && addr <= 0x7FFF) { *val = s->ram_hi[addr - 0x5000]; return true; }
+    if (addr >= 0x8000) { *val = bank_read(s, (int)((addr - 0x8000) >> 12), (uint16_t)addr); return true; }
+    return false;
+}
+
+/* Writes go to work RAM only. */
+static bool um6578_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    Um6578State *s = ud;
+    if (addr < 0x2000) { s->ram_lo[addr] = val; return true; }
+    if (addr >= 0x5000 && addr <= 0x7FFF) { s->ram_hi[addr - 0x5000] = val; return true; }
+    return false;
+}
+
+static void um6578_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const Um6578State *s = ud;
+    mos6502_format_state(&s->cpu, buf, len);
 }
 
 /* ── PPU/CPU cycle sync ──────────────────────────────────────────────────── */
@@ -864,6 +905,15 @@ Um6578State *um6578_create(const MosConfig *cfg) {
     s->monitor = gemu_monitor_create();
     if (!s->monitor) { free(s->rom); free(s); return NULL; }
     gemu_monitor_set_screendump_cb(s->monitor, um6578_screendump, s);
+    gemu_monitor_bind(s->monitor, "mouse", um6578_cmd_mouse, s);
+    gemu_monitor_bind(s->monitor, "mousemove", um6578_cmd_mousemove, s);
+    gemu_monitor_bind(s->monitor, "mouseclear", um6578_cmd_mouseclear, s);
+    gemu_monitor_bind(s->monitor, "mousestate", um6578_cmd_mousestate, s);
+    gemu_monitor_bind(s->monitor, "sendkey", um6578_cmd_sendkey, s);
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = um6578_mon_read, .write = um6578_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = false });
+    gemu_monitor_set_cpu_state_cb(s->monitor, um6578_mon_cpu_state, s);
 
     if (cfg->vnc_addr) {
         s->vnc = gemu_vnc_create(cfg->vnc_addr, SH6578_WIDTH, SH6578_HEIGHT);
@@ -918,6 +968,16 @@ void um6578_destroy(Um6578State *s) {
 
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
+/* Execute one CPU instruction and bring the APU and PPU up to its cycle. */
+static void um6578_step_insn(Um6578State *s) {
+    uint64_t prev = s->cpu.cycle_count;
+    mos6502_step(&s->cpu);
+    uint64_t delta = s->cpu.cycle_count - prev;
+    for (uint64_t i = 0; i < delta; i++)
+        if (s->apu.audio_dev) apu2a03_tick(&s->apu);
+    um6578_sync_ppu(s, s->cpu.cycle_count);
+}
+
 void um6578_run(Um6578State *s, const MosConfig *cfg) {
     gemu_monitor_start(s->monitor);
 
@@ -944,12 +1004,9 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
             } else if (cmd == GEMU_MON_RESET) {
                 for (int i = 0; i < 8; i++) s->bankswitch[i] = (uint8_t)i;
                 mos6502_reset(&s->cpu);
-            } else if (cmd == GEMU_MON_CUSTOM) {
-                const char *text = gemu_monitor_command_text(s->monitor);
-                if (!um6578_mouse_command(s, text) &&
-                    !um6578_mousestate_command(s, text) &&
-                    !um6578_sendkey_command(s, text))
-                    gemu_monitor_unknown_command(s->monitor);
+            } else if (cmd == GEMU_MON_STEP) {
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
+                    um6578_step_insn(s);
             }
         }
         if (quit) break;
@@ -962,12 +1019,7 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
             s->ppu.dirty = false;
             while (!s->ppu.dirty) {
                 if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-                uint64_t prev = s->cpu.cycle_count;
-                mos6502_step(&s->cpu);
-                uint64_t delta = s->cpu.cycle_count - prev;
-                for (uint64_t i = 0; i < delta; i++)
-                    if (s->apu.audio_dev) apu2a03_tick(&s->apu);
-                um6578_sync_ppu(s, s->cpu.cycle_count);
+                um6578_step_insn(s);
                 if (gemu_monitor_is_paused(s->monitor)) break;
             }
             apu2a03_flush(&s->apu);

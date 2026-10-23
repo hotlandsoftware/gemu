@@ -179,6 +179,34 @@ static void vip_mem_write(uint16_t addr, uint8_t val, void *ud) {
     s->mem[addr] = val;
 }
 
+/* Monitor memory view: side-effect-free.  With a CDP1869, character RAM
+ * reads latch the PCB bit, so that window is not inspectable. */
+static bool vip_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    RcaVipState *s = ud;
+    if (addr > 0xffffu) return false;
+    if (s->cfg->vga == RCA_VGA_CDP1869) {
+        if (addr >= 0xf400 && addr <= 0xf7ff)
+            return false;
+        if (addr >= 0xf800) {
+            *val = cdp1869_page_read(&s->vis, (uint16_t)(addr - 0xf800));
+            return true;
+        }
+    }
+    *val = s->mem[addr];
+    return true;
+}
+
+static bool vip_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    if (addr > 0xffffu) return false;
+    vip_mem_write((uint16_t)addr, val, ud);   /* same as a CPU write */
+    return true;
+}
+
+static void vip_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const RcaVipState *s = ud;
+    cdp1802_format_state(&s->cpu, buf, len);
+}
+
 static void vip_sync(void *ud) {
     RcaVipState *s = ud;
     if (s->cfg->vga == RCA_VGA_CDP1861)
@@ -416,6 +444,10 @@ RcaVipState *rca_vip_create(const RcaConfig *cfg) {
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, vip_screendump, s);
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = vip_mon_read, .write = vip_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = true });
+    gemu_monitor_set_cpu_state_cb(s->monitor, vip_mon_cpu_state, s);
     {
         GemuMediaDevice tape_dev = {
             .name   = "tape",
@@ -583,8 +615,6 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
                 uint32_t n = gemu_monitor_step_count(s->monitor);
                 for (uint32_t i = 0; i < n; i++) vip_step_instruction(s);
             }
-            else if (cmd == GEMU_MON_CUSTOM)
-                gemu_monitor_unknown_command(s->monitor);
         }
         if (quit) break;
         gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));

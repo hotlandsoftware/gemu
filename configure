@@ -29,6 +29,8 @@ import xml.etree.ElementTree as ET
 
 CORE_SRC = [
     'core/src/memory.c', 'core/src/tcg.c', 'core/src/monitor.c',
+    'core/src/monitor_cmds.c', 'core/src/monitor_qmp.c',
+    'core/third_party/cjson/cJSON.c',
     'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/args.c',
     'core/src/sha256.c', 'core/src/screendump.c', 'core/src/util.c',
     'core/src/gemu_display_term.c', 'core/src/drive.c',
@@ -581,7 +583,7 @@ def main():
     data_xml_files = generate_data(build_dir, targets, have_alsa, have_winmidi)
 
     # All sources share a single unified include path - no per-family separation.
-    inc_dirs = ['core/include', 'cpu', 'vga', 'audio', 'crt',
+    inc_dirs = ['core/include', 'core/third_party/cjson', 'cpu', 'vga', 'audio', 'crt',
                 'hardware', 'hardware/machine', 'hardware/device',
                 'hardware/chip8', 'hardware/ia64', 'hardware/mos',
                 'hardware/other', 'hardware/rca', 'hardware/x86',

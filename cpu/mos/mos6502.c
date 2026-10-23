@@ -673,3 +673,16 @@ void mos6502_step(Mos6502 *c) {
         break;
     }
 }
+
+void mos6502_format_state(const Mos6502 *cpu, char *buf, size_t len) {
+    static const char flags[] = "NV-BDIZC";
+    char p[9];
+    for (int i = 0; i < 8; i++)
+        p[i] = (cpu->P & (0x80u >> i)) ? flags[i] : '.';
+    p[8] = '\0';
+    snprintf(buf, len,
+             "PC=%04X A=%02X X=%02X Y=%02X SP=%02X P=%02X [%s] insn=%llu cyc=%llu",
+             cpu->PC, cpu->A, cpu->X, cpu->Y, cpu->SP, cpu->P, p,
+             (unsigned long long)cpu->insn_count,
+             (unsigned long long)cpu->cycle_count);
+}

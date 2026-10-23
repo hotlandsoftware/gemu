@@ -671,8 +671,6 @@ void mitsu_tvgame6_run(MitsuTvGame6State *s, const MitsuConfig *cfg) {
                     else { running = false; break; }
                 } else if (cmd == GEMU_MON_STEP) {
                     update_game(s, 0);
-                } else if (cmd == GEMU_MON_CUSTOM) {
-                    gemu_monitor_unknown_command(s->monitor);
                 }
             }
             if (!running)
@@ -709,8 +707,6 @@ void mitsu_tvgame6_run(MitsuTvGame6State *s, const MitsuConfig *cfg) {
                 tvgame6_reset(s);
             } else if (cmd == GEMU_MON_STEP) {
                 update_game(s, 0);
-            } else if (cmd == GEMU_MON_CUSTOM) {
-                gemu_monitor_unknown_command(s->monitor);
             }
         }
         gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));

@@ -1,4 +1,5 @@
 #include "i8086.h"
+#include <stdio.h>
 #include <string.h>
 
 /* Decode-transient prefix state for the instruction currently being
@@ -706,4 +707,23 @@ unsigned x86_step(X86Cpu *c) {
     }
 
     return 4; /* placeholder average - not cycle-exact this pass */
+}
+
+void x86_format_state(const X86Cpu *cpu, char *buf, size_t len) {
+    static const struct { uint16_t bit; char c; } fl[] = {
+        { X86_FLAG_OF, 'O' }, { X86_FLAG_DF, 'D' }, { X86_FLAG_IF, 'I' },
+        { X86_FLAG_TF, 'T' }, { X86_FLAG_SF, 'S' }, { X86_FLAG_ZF, 'Z' },
+        { X86_FLAG_AF, 'A' }, { X86_FLAG_PF, 'P' }, { X86_FLAG_CF, 'C' },
+    };
+    char f[10];
+    for (int i = 0; i < 9; i++)
+        f[i] = (cpu->flags & fl[i].bit) ? fl[i].c : '-';
+    f[9] = '\0';
+    snprintf(buf, len,
+             "AX=%04X BX=%04X CX=%04X DX=%04X SP=%04X BP=%04X SI=%04X DI=%04X\n"
+             "DS=%04X ES=%04X SS=%04X CS=%04X IP=%04X FL=%04X [%s]%s insn=%llu",
+             cpu->ax.x, cpu->bx.x, cpu->cx.x, cpu->dx.x,
+             cpu->sp, cpu->bp, cpu->si, cpu->di,
+             cpu->ds, cpu->es, cpu->ss, cpu->cs, cpu->ip, cpu->flags, f,
+             cpu->halted ? " HLT" : "", (unsigned long long)cpu->insn_count);
 }

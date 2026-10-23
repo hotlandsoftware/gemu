@@ -1,4 +1,5 @@
 #include "cdp1802.h"
+#include <stdio.h>
 #include <string.h>
 
 /* ── Memory helpers ──────────────────────────────────────────────────────── */
@@ -420,4 +421,17 @@ void cdp1802_step(Cdp1802 *c) {
         cdp1802_panic(c, "invalid CPU cycle state");
         break;
     }
+}
+
+void cdp1802_format_state(const Cdp1802 *cpu, char *buf, size_t len) {
+    int n = snprintf(buf, len,
+                     "D=%02X DF=%u P=%X X=%X T=%02X IE=%u Q=%u EF=%u%u%u%u%s insn=%llu\n",
+                     cpu->D, cpu->DF & 1u, cpu->P & 0xFu, cpu->X & 0xFu, cpu->T,
+                     cpu->IE & 1u, cpu->Q & 1u,
+                     cpu->EF[0], cpu->EF[1], cpu->EF[2], cpu->EF[3],
+                     cpu->idle ? " IDLE" : "",
+                     (unsigned long long)cpu->insn_count);
+    for (int r = 0; r < 16 && n >= 0 && (size_t)n < len; r++)
+        n += snprintf(buf + n, len - (size_t)n, "R%X=%04X%s", r, cpu->R[r],
+                      r == 15 ? "" : (r % 8 == 7 ? "\n" : " "));
 }

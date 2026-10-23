@@ -213,20 +213,20 @@ static const VsDipOption *vs_current_opt(const NesState *s, const VsDip *dip) {
     return NULL;
 }
 static void vs_list_dips(const NesState *s) {
-    printf("VS. SMB DIP switches (raw=0x%02X):\n", s->vs_dip);
+    gemu_monitor_printf(s->monitor, "VS. SMB DIP switches (raw=0x%02X):\n", s->vs_dip);
     for (size_t i = 0; i < sizeof(vs_dips)/sizeof(vs_dips[0]); i++) {
         const VsDip *dip = &vs_dips[i];
         const VsDipOption *cur = vs_current_opt(s, dip);
-        printf("  %-10s  %-16s  current: %s\n",
+        gemu_monitor_printf(s->monitor, "  %-10s  %-16s  current: %s\n",
                dip->name, dip->desc, cur ? cur->value : "?");
-        printf("             values:");
-        for (size_t j = 0; j < dip->n_options; j++) printf(" %s", dip->options[j].value);
-        printf("\n");
+        gemu_monitor_printf(s->monitor, "             values:");
+        for (size_t j = 0; j < dip->n_options; j++) gemu_monitor_printf(s->monitor, " %s", dip->options[j].value);
+        gemu_monitor_printf(s->monitor, "\n");
     }
 }
 static bool vs_set_dip(NesState *s, const char *name, const char *value) {
     const VsDip *dip = vs_find_dip(name);
-    if (!dip) { printf("unknown DIP '%s' (try 'dipswitch list')\n", name); return true; }
+    if (!dip) { gemu_monitor_printf(s->monitor, "unknown DIP '%s' (try 'dipswitch list')\n", name); return true; }
     uint8_t bits = 0; bool found = false;
     for (size_t i = 0; i < dip->n_options; i++)
         if (strcasecmp(value, dip->options[i].value) == 0)
@@ -235,10 +235,10 @@ static bool vs_set_dip(NesState *s, const char *name, const char *value) {
         char *end; unsigned long v = strtoul(value, &end, 0);
         if (end && *end == '\0') { bits = (uint8_t)v & dip->mask; found = true; }
     }
-    if (!found) { printf("invalid value '%s' for DIP '%s'\n", value, name); return true; }
+    if (!found) { gemu_monitor_printf(s->monitor, "invalid value '%s' for DIP '%s'\n", value, name); return true; }
     s->vs_dip = (uint8_t)((s->vs_dip & ~dip->mask) | (bits & dip->mask));
     const VsDipOption *cur = vs_current_opt(s, dip);
-    printf("DIP %s = %s\n", dip->name, cur ? cur->value : value);
+    gemu_monitor_printf(s->monitor, "DIP %s = %s\n", dip->name, cur ? cur->value : value);
     return true;
 }
 static bool vs_dip_cmd(NesState *s, const char *args) {
@@ -246,7 +246,7 @@ static bool vs_dip_cmd(NesState *s, const char *args) {
     char buf[256]; snprintf(buf, sizeof(buf), "%s", args);
     char *name = strtok(buf, " \t"), *val = strtok(NULL, " \t");
     if (!name || strcasecmp(name, "list") == 0) { vs_list_dips(s); return true; }
-    if (!val) { printf("usage: dipswitch list | dipswitch <name> <value>\n"); return true; }
+    if (!val) { gemu_monitor_printf(s->monitor, "usage: dipswitch list | dipswitch <name> <value>\n"); return true; }
     return vs_set_dip(s, name, val);
 }
 
@@ -254,13 +254,13 @@ static bool vs_coin_cmd(NesState *s, const char *args) {
     while (*args == ' ' || *args == '\t') args++;
     int slot = (*args == '2') ? 1 : 0;
     s->vs_coin_latch[slot] = 15;
-    printf("VS coin %d\n", slot + 1);
+    gemu_monitor_printf(s->monitor, "VS coin %d\n", slot + 1);
     return true;
 }
 
 static bool vs_service_cmd(NesState *s) {
     s->vs_service = true;
-    printf("VS service\n");
+    gemu_monitor_printf(s->monitor, "VS service\n");
     return true;
 }
 
@@ -1077,6 +1077,38 @@ static uint8_t nes_prg_direct(const NesState *s, uint16_t addr) {
     return s->prg[off];
 }
 
+/* Cartridge byte the CPU sees at $8000-$FFFF under the current banking,
+ * before Game Genie patches.  No side effects; requires s->prg. */
+static uint8_t nes_prg_mapped(const NesState *s, uint16_t addr) {
+    if (s->cart.mapper == 9) {
+        uint8_t slot   = (uint8_t)((addr - 0x8000u) >> 13);  /* 0..3 */
+        uint32_t prg8k = (uint32_t)s->cart.prg_banks * 2u;
+        uint32_t bank8;
+        if      (slot == 0) bank8 = s->m9_prg_reg & 0x0Fu;
+        else if (slot == 1) bank8 = prg8k - 3u;
+        else if (slot == 2) bank8 = prg8k - 2u;
+        else                bank8 = prg8k - 1u;  /* slot 3 */
+        return s->prg[bank8 * 0x2000u + (addr & 0x1FFFu)];
+    } else if (s->cart.mapper == 5) {
+        uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
+        if (s->mmc5_prg_is_ram[slot])
+            return s->prg_ram[(s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)) & 0x1FFFu];
+        else
+            return s->prg[s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)];
+    } else if (s->cart.mapper == 4 || s->cart.mapper == 24 || s->cart.mapper == 26) {
+        uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
+        return s->prg[s->mmc3_prg_offsets[slot] + (addr & 0x1FFFu)];
+    } else if (s->cart.mapper >= 1) {
+        uint8_t slot = addr >= 0xC000 ? 1 : 0;
+        return s->prg[s->prg_offsets[slot] + (addr & 0x3FFF)];
+    } else {
+        /* NROM: 1 bank → mirrored; 2 banks → direct 32 KB */
+        uint32_t off = addr - 0x8000u;
+        if (s->cart.prg_banks == 1) off &= 0x3FFF;
+        return s->prg[off];
+    }
+}
+
 static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
     while (s->ppu_synced_cpu_cycle < cpu_cycle) {
         s->ppu_synced_cpu_cycle++;
@@ -1094,9 +1126,8 @@ static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
     }
 }
 
+/* line = arguments after "gamegenie" */
 static void nes_gamegenie_cmd(NesState *s, const char *line) {
-    /* skip "gamegenie" */
-    while (*line && !isspace((unsigned char)*line)) line++;
     while (*line && isspace((unsigned char)*line)) line++;
 
     char sub[32] = {0};
@@ -1114,17 +1145,17 @@ static void nes_gamegenie_cmd(NesState *s, const char *line) {
 
     if (strcmp(sub, "list") == 0) {
         if (!*arg) {
-            if (s->gg_count == 0) { printf("gamegenie: no patches active\n"); return; }
-            printf("Active Game Genie patches:\n");
+            if (s->gg_count == 0) { gemu_monitor_printf(s->monitor, "gamegenie: no patches active\n"); return; }
+            gemu_monitor_printf(s->monitor, "Active Game Genie patches:\n");
             for (int i = 0; i < s->gg_count; i++) {
                 NesGgPatch *g = &s->gg_patches[i];
                 uint8_t actual = nes_prg_direct(s, g->addr);
                 if (g->has_cmp) {
                     const char *status = (actual == g->cmp) ? "active" : "mismatch";
-                    printf("  %-8s  $%04X = $%02X  (if $%02X)  ROM=$%02X [%s]\n",
+                    gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  (if $%02X)  ROM=$%02X [%s]\n",
                            g->code, g->addr, g->val, g->cmp, actual, status);
                 } else {
-                    printf("  %-8s  $%04X = $%02X  ROM=$%02X [active]\n",
+                    gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  ROM=$%02X [active]\n",
                            g->code, g->addr, g->val, actual);
                 }
             }
@@ -1136,60 +1167,60 @@ static void nes_gamegenie_cmd(NesState *s, const char *line) {
                     uint8_t actual = nes_prg_direct(s, g->addr);
                     if (g->has_cmp) {
                         const char *status = (actual == g->cmp) ? "active" : "mismatch";
-                        printf("  %-8s  $%04X = $%02X  (if $%02X)  ROM=$%02X [%s]\n",
+                        gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  (if $%02X)  ROM=$%02X [%s]\n",
                                g->code, g->addr, g->val, g->cmp, actual, status);
                     } else {
-                        printf("  %-8s  $%04X = $%02X  ROM=$%02X [active]\n",
+                        gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  ROM=$%02X [active]\n",
                                g->code, g->addr, g->val, actual);
                     }
                     found = true; break;
                 }
             }
-            if (!found) printf("gamegenie: code '%s' not found\n", arg);
+            if (!found) gemu_monitor_printf(s->monitor, "gamegenie: code '%s' not found\n", arg);
         }
         return;
     }
 
     if (strcmp(sub, "add") == 0) {
-        if (!*arg) { printf("usage: gamegenie add <code>\n"); return; }
+        if (!*arg) { gemu_monitor_printf(s->monitor, "usage: gamegenie add <code>\n"); return; }
         if (s->gg_count >= NES_GG_MAX) {
-            printf("gamegenie: patch limit reached (%d max)\n", NES_GG_MAX); return;
+            gemu_monitor_printf(s->monitor, "gamegenie: patch limit reached (%d max)\n", NES_GG_MAX); return;
         }
         for (int i = 0; i < s->gg_count; i++) {
             if (strcasecmp(s->gg_patches[i].code, arg) == 0) {
-                printf("gamegenie: %s is already active\n", arg); return;
+                gemu_monitor_printf(s->monitor, "gamegenie: %s is already active\n", arg); return;
             }
         }
         uint16_t paddr; uint8_t pval, pcmp; bool has_cmp;
         if (!gg_decode(arg, &paddr, &pval, &pcmp, &has_cmp)) {
-            printf("gamegenie: invalid code '%s'\n", arg); return;
+            gemu_monitor_printf(s->monitor, "gamegenie: invalid code '%s'\n", arg); return;
         }
         NesGgPatch *g = &s->gg_patches[s->gg_count++];
         g->addr = paddr; g->val = pval; g->cmp = pcmp; g->has_cmp = has_cmp;
         snprintf(g->code, sizeof(g->code), "%s", arg);
         if (has_cmp)
-            printf("gamegenie: added %s → $%04X = $%02X (if $%02X)\n", arg, paddr, pval, pcmp);
+            gemu_monitor_printf(s->monitor, "gamegenie: added %s → $%04X = $%02X (if $%02X)\n", arg, paddr, pval, pcmp);
         else
-            printf("gamegenie: added %s → $%04X = $%02X\n", arg, paddr, pval);
+            gemu_monitor_printf(s->monitor, "gamegenie: added %s → $%04X = $%02X\n", arg, paddr, pval);
         return;
     }
 
     if (strcmp(sub, "delete") == 0 || strcmp(sub, "remove") == 0) {
-        if (!*arg) { printf("usage: gamegenie delete <code>\n"); return; }
+        if (!*arg) { gemu_monitor_printf(s->monitor, "usage: gamegenie delete <code>\n"); return; }
         for (int i = 0; i < s->gg_count; i++) {
             if (strcasecmp(s->gg_patches[i].code, arg) == 0) {
                 memmove(&s->gg_patches[i], &s->gg_patches[i + 1],
                         (size_t)(s->gg_count - i - 1) * sizeof(NesGgPatch));
                 s->gg_count--;
-                printf("gamegenie: removed %s\n", arg);
+                gemu_monitor_printf(s->monitor, "gamegenie: removed %s\n", arg);
                 return;
             }
         }
-        printf("gamegenie: code '%s' not found\n", arg);
+        gemu_monitor_printf(s->monitor, "gamegenie: code '%s' not found\n", arg);
         return;
     }
 
-    printf("gamegenie add <code> | gamegenie list [code] | gamegenie delete <code>\n");
+    gemu_monitor_printf(s->monitor, "gamegenie add <code> | gamegenie list [code] | gamegenie delete <code>\n");
 }
 
 static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
@@ -1328,34 +1359,7 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
             return s->fds.ram[addr - 0x6000u];               /* $8000–$DFFF: upper FDS RAM */
         }
         if (!s->prg) return 0;
-        uint8_t rom;
-        if (s->cart.mapper == 9) {
-            uint8_t slot   = (uint8_t)((addr - 0x8000u) >> 13);  /* 0..3 */
-            uint32_t prg8k = (uint32_t)s->cart.prg_banks * 2u;
-            uint32_t bank8;
-            if      (slot == 0) bank8 = s->m9_prg_reg & 0x0Fu;
-            else if (slot == 1) bank8 = prg8k - 3u;
-            else if (slot == 2) bank8 = prg8k - 2u;
-            else                bank8 = prg8k - 1u;  /* slot 3 */
-            rom = s->prg[bank8 * 0x2000u + (addr & 0x1FFFu)];
-        } else if (s->cart.mapper == 5) {
-            uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
-            if (s->mmc5_prg_is_ram[slot])
-                rom = s->prg_ram[(s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)) & 0x1FFFu];
-            else
-                rom = s->prg[s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)];
-        } else if (s->cart.mapper == 4 || s->cart.mapper == 24 || s->cart.mapper == 26) {
-            uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
-            rom = s->prg[s->mmc3_prg_offsets[slot] + (addr & 0x1FFFu)];
-        } else if (s->cart.mapper >= 1) {
-            uint8_t slot = addr >= 0xC000 ? 1 : 0;
-            rom = s->prg[s->prg_offsets[slot] + (addr & 0x3FFF)];
-        } else {
-            /* NROM: 1 bank → mirrored; 2 banks → direct 32 KB */
-            uint32_t off = addr - 0x8000u;
-            if (s->cart.prg_banks == 1) off &= 0x3FFF;
-            rom = s->prg[off];
-        }
+        uint8_t rom = nes_prg_mapped(s, addr);
         for (int i = 0; i < s->gg_count; i++) {
             if (s->gg_patches[i].addr == addr &&
                 (!s->gg_patches[i].has_cmp || rom == s->gg_patches[i].cmp))
@@ -2153,6 +2157,8 @@ static bool nes_arcade_assemble(NesState *s, const MosConfig *cfg) {
     return true;
 }
 
+static void nes_monitor_setup(NesState *s);
+
 NesState *nes_create(const MosConfig *cfg) {
     NesState *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -2248,6 +2254,7 @@ NesState *nes_create(const MosConfig *cfg) {
     s->apu.frame_irq_enabled = (cfg->disabled_features & MOS_FEATURE_FRAME_IRQ) == 0;
 
     s->monitor = gemu_monitor_create();
+    nes_monitor_setup(s);
     gemu_monitor_set_screendump_cb(s->monitor, nes_screendump, s);
 #if defined(GEMU_GTK)
     if (cfg->display_type == GEMU_DISPLAY_GTK) {
@@ -2639,6 +2646,262 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
     return true;
 }
 
+/* ── Monitor commands and memory view ────────────────────────────────────── */
+
+/* True when $6000-$7FFF is mapped to cartridge PRG-RAM (mirrors nes_cpu_read). */
+static bool nes_prg_ram_mapped(const NesState *s) {
+    return s->cart.mapper == 5 ||
+           (s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
+           s->cart.mapper == 4 || s->cart.mapper == 24 || s->cart.mapper == 26 ||
+           s->cart.mapper == 178 || s->cfg->is_arcade;
+}
+
+/* Side-effect-free CPU-space read for x/peek/memsave.  PPU, APU and
+ * controller registers ($2000-$401F) and FDS I/O return false because
+ * reading them on the bus clears flags or clocks shift registers. */
+static bool nes_mon_read(void *ud, uint64_t addr64, uint8_t *val) {
+    const NesState *s = ud;
+    if (addr64 > 0xFFFFu) return false;
+    uint16_t addr = (uint16_t)addr64;
+
+    if (addr < 0x2000) { *val = s->ram[addr & 0x07FF]; return true; }
+    if (addr < 0x4020) return false;
+
+    if (s->fds_enabled) {
+        if (addr < 0x6000) return false;
+        *val = addr >= 0xE000 ? s->fds.bios[addr - 0xE000u]
+                              : s->fds.ram[addr - 0x6000u];
+        return true;
+    }
+
+    if (addr < 0x6000) {
+        if (s->cfg->is_arcade) { *val = s->vs_coin_counter; return true; }
+        if (s->cart.mapper == 5 && addr >= 0x5000) {
+            if (addr == 0x5205) { *val = (uint8_t)((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]); return true; }
+            if (addr == 0x5206) { *val = (uint8_t)(((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]) >> 8); return true; }
+            if (addr >= 0x5C00 && s->mmc5_exram_mode >= 2) {
+                *val = s->mmc5_exram[addr - 0x5C00u];
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (addr < 0x8000) {
+        if (!nes_prg_ram_mapped(s)) return false;
+        *val = s->prg_ram[addr & 0x1FFFu];
+        return true;
+    }
+
+    if (!s->prg) return false;
+    uint8_t rom = nes_prg_mapped(s, addr);
+    for (int i = 0; i < s->gg_count; i++) {
+        if (s->gg_patches[i].addr == addr &&
+            (!s->gg_patches[i].has_cmp || rom == s->gg_patches[i].cmp)) {
+            rom = s->gg_patches[i].val;
+            break;
+        }
+    }
+    *val = rom;
+    return true;
+}
+
+/* Writes reach internal RAM, mapped PRG-RAM and FDS RAM only. */
+static bool nes_mon_write(void *ud, uint64_t addr64, uint8_t val) {
+    NesState *s = ud;
+    if (addr64 > 0xFFFFu) return false;
+    uint16_t addr = (uint16_t)addr64;
+
+    if (addr < 0x2000) { s->ram[addr & 0x07FF] = val; return true; }
+    if (addr < 0x6000) return false;
+    if (s->fds_enabled) {
+        if (addr >= 0xE000) return false;
+        s->fds.ram[addr - 0x6000u] = val;
+        return true;
+    }
+    if (addr < 0x8000 && nes_prg_ram_mapped(s)) {
+        s->prg_ram[addr & 0x1FFFu] = val;
+        return true;
+    }
+    return false;
+}
+
+static void nes_cpu_state(void *ud, char *buf, size_t buf_len) {
+    const NesState *s = ud;
+    mos6502_format_state(&s->cpu, buf, buf_len);
+}
+
+static GemuMonCmd nes_cmd_savevm(GemuMonitor *mon, const char *args, void *ud) {
+    NesState *s = ud;
+    char vm_path[256];
+    if (sscanf(args, "%255s", vm_path) != 1) {
+        gemu_monitor_printf(mon, "usage: savevm <file>\n");
+        return GEMU_MON_NONE;
+    }
+    if (nes_save_snapshot(s, vm_path))
+        gemu_monitor_printf(mon, "saved snapshot to %s (frame=%" PRIu64 ")\n",
+                            vm_path, s->ppu.frame);
+    else
+        gemu_monitor_printf(mon, "failed to save snapshot to %s\n", vm_path);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd nes_cmd_loadvm(GemuMonitor *mon, const char *args, void *ud) {
+    NesState *s = ud;
+    char vm_path[256];
+    if (sscanf(args, "%255s", vm_path) != 1) {
+        gemu_monitor_printf(mon, "usage: loadvm <file>\n");
+        return GEMU_MON_NONE;
+    }
+    if (nes_load_snapshot(s, vm_path))
+        gemu_monitor_printf(mon, "loaded snapshot from %s (frame=%" PRIu64 ")\n",
+                            vm_path, s->ppu.frame);
+    else
+        gemu_monitor_printf(mon, "failed to load snapshot from %s\n", vm_path);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd nes_cmd_mapperdump(GemuMonitor *mon, const char *args, void *ud) {
+    NesState *s = ud;
+    (void)args;
+    gemu_monitor_printf(mon, "mapper=%u bank_sel=%02X regs=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                        s->cart.mapper, s->mmc3_bank_sel,
+                        s->mmc3_regs[0], s->mmc3_regs[1], s->mmc3_regs[2], s->mmc3_regs[3],
+                        s->mmc3_regs[4], s->mmc3_regs[5], s->mmc3_regs[6], s->mmc3_regs[7]);
+    gemu_monitor_printf(mon, "prg_offsets($8000,$A000,$C000,$E000)=%06X %06X %06X %06X\n",
+                        s->mmc3_prg_offsets[0], s->mmc3_prg_offsets[1],
+                        s->mmc3_prg_offsets[2], s->mmc3_prg_offsets[3]);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd nes_cmd_dipswitch(GemuMonitor *mon, const char *args, void *ud) {
+    (void)mon;
+    vs_dip_cmd(ud, args);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd nes_cmd_coin(GemuMonitor *mon, const char *args, void *ud) {
+    (void)mon;
+    vs_coin_cmd(ud, args);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd nes_cmd_service(GemuMonitor *mon, const char *args, void *ud) {
+    (void)mon; (void)args;
+    vs_service_cmd(ud);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd nes_cmd_gamegenie(GemuMonitor *mon, const char *args, void *ud) {
+    (void)mon;
+    nes_gamegenie_cmd(ud, args);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd nes_cmd_sendkey(GemuMonitor *mon, const char *args, void *ud) {
+    NesState *s = ud;
+    const char *p = args;
+    uint8_t btn = 0;
+    if      (strncasecmp(p, "a",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = NES_BTN_A;
+    else if (strncasecmp(p, "b",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = NES_BTN_B;
+    else if (strncasecmp(p, "start",  5) == 0) btn = s->cfg->is_arcade ? VS_BTN_START : NES_BTN_START;
+    else if (strncasecmp(p, "select", 6) == 0) btn = NES_BTN_SELECT;
+    else if (strncasecmp(p, "up",     2) == 0) btn = NES_BTN_UP;
+    else if (strncasecmp(p, "down",   4) == 0) btn = NES_BTN_DOWN;
+    else if (strncasecmp(p, "left",   4) == 0) btn = NES_BTN_LEFT;
+    else if (strncasecmp(p, "right",  5) == 0) btn = NES_BTN_RIGHT;
+    if (btn) {
+        while (*p && *p != ' ' && *p != '\t') p++;
+        while (*p == ' ' || *p == '\t') p++;
+        int frames = (*p >= '1' && *p <= '9') ? (int)strtol(p, NULL, 10) : 5;
+        s->ctrl_inject_mask   = btn;
+        s->ctrl_inject_frames = frames;
+        gemu_monitor_printf(mon, "sendkey: holding 0x%02X for %d frame(s)\n", btn, frames);
+    } else {
+        gemu_monitor_printf(mon, "sendkey: unknown button (a b start select up down left right)\n");
+    }
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd nes_cmd_ppudump(GemuMonitor *mon, const char *args, void *ud) {
+    NesState *s = ud;
+    const Rp2c02 *ppu = &s->ppu;
+    (void)args;
+    gemu_monitor_printf(mon, "PPU: ctrl=%02X mask=%02X status=%02X v=%04X t=%04X x=%d w=%d\n",
+                        ppu->ppuctrl, ppu->ppumask, ppu->ppustatus,
+                        ppu->v, ppu->t, ppu->x, ppu->w);
+    gemu_monitor_printf(mon, "Palette BG:  ");
+    for (int i = 0; i < 16; i++) gemu_monitor_printf(mon, "%02X ", ppu->palette[i]);
+    gemu_monitor_printf(mon, "\nPalette SPR: ");
+    for (int i = 0; i < 16; i++) gemu_monitor_printf(mon, "%02X ", ppu->palette[i + 16]);
+    gemu_monitor_printf(mon, "\nSL0 pixels[0..31]: ");
+    for (int i = 0; i < 32; i++) gemu_monitor_printf(mon, "%02X ", ppu->pixels[i]);
+    gemu_monitor_printf(mon, "\nSL8 pixels[0..31]: ");
+    for (int i = 0; i < 32; i++) gemu_monitor_printf(mon, "%02X ", ppu->pixels[256*8 + i]);
+    gemu_monitor_printf(mon, "\nNT row0 tiles: ");
+    for (int i = 0; i < 32; i++) gemu_monitor_printf(mon, "%02X ", ppu->vram[i]);
+    gemu_monitor_printf(mon, "\nNT row1 tiles: ");
+    for (int i = 0; i < 32; i++) gemu_monitor_printf(mon, "%02X ", ppu->vram[32 + i]);
+    gemu_monitor_printf(mon, "\nNT attr[0..7]: ");
+    for (int i = 0; i < 8; i++) gemu_monitor_printf(mon, "%02X ", ppu->vram[0x3C0 + i]);
+    gemu_monitor_printf(mon, "\nOAM[0..3]:     ");
+    for (int i = 0; i < 16; i++) gemu_monitor_printf(mon, "%02X ", ppu->oam[i]);
+    gemu_monitor_printf(mon, "\nOAM visible:   ");
+    int shown = 0;
+    for (int i = 0; i < 64; i++) {
+        uint8_t y = ppu->oam[i * 4 + 0];
+        if (y >= 0xEF) continue;
+        gemu_monitor_printf(mon, "#%02d:%02X %02X %02X %02X ",
+                            i, y, ppu->oam[i * 4 + 1],
+                            ppu->oam[i * 4 + 2], ppu->oam[i * 4 + 3]);
+        if (++shown == 12) break;
+    }
+    if (!shown) gemu_monitor_printf(mon, "(none)");
+    gemu_monitor_printf(mon, "\n");
+    return GEMU_MON_NONE;
+}
+
+#if defined(GEMU_GTK) || defined(_WIN32)
+static GemuMonCmd nes_cmd_hexeditor(GemuMonitor *mon, const char *args, void *ud) {
+    NesState *s = ud;
+    (void)args;
+    if (!s->hex_editor) {
+        gemu_monitor_printf(mon, "hexeditor: not available (needs GTK build or -display sdl on Windows)\n");
+    } else if (hex_editor_is_visible(s->hex_editor)) {
+        hex_editor_hide(s->hex_editor);
+        gemu_monitor_printf(mon, "hexeditor: closed\n");
+    } else {
+        hex_editor_show(s->hex_editor);
+        gemu_monitor_printf(mon, "hexeditor: opened\n");
+    }
+    return GEMU_MON_NONE;
+}
+#endif
+
+static void nes_monitor_setup(NesState *s) {
+    GemuMonitor *mon = s->monitor;
+    gemu_monitor_set_memory(mon, &(GemuMonMemory){
+        .read = nes_mon_read, .write = nes_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = false });
+    gemu_monitor_set_cpu_state_cb(mon, nes_cpu_state, s);
+    gemu_monitor_bind(mon, "savevm",     nes_cmd_savevm,     s);
+    gemu_monitor_bind(mon, "loadvm",     nes_cmd_loadvm,     s);
+    gemu_monitor_bind(mon, "mapperdump", nes_cmd_mapperdump, s);
+    gemu_monitor_bind(mon, "sendkey",    nes_cmd_sendkey,    s);
+    gemu_monitor_bind(mon, "ppudump",    nes_cmd_ppudump,    s);
+    /* A Game Genie plugs into a home console's cartridge slot, not a VS. cabinet. */
+    if (!s->cfg->is_arcade)
+        gemu_monitor_bind(mon, "gamegenie", nes_cmd_gamegenie, s);
+    if (s->cfg->is_arcade) {
+        gemu_monitor_bind(mon, "dipswitch", nes_cmd_dipswitch, s);
+        gemu_monitor_bind(mon, "coin",      nes_cmd_coin,      s);
+        gemu_monitor_bind(mon, "service",   nes_cmd_service,   s);
+    }
+#if defined(GEMU_GTK) || defined(_WIN32)
+    gemu_monitor_bind(mon, "hexeditor",  nes_cmd_hexeditor,  s);
+#endif
+}
+
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
 /* Fallback frame duration when audio is off (headless / -soundhw none). */
@@ -2648,6 +2911,31 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
 /* Audio queue threshold for sync: allow up to 3 frames of latency (~50 ms).
  * ~735 samples/frame * 3 frames * 4 bytes/float = 8820 bytes */
 #define AUDIO_QUEUE_MAX  (3u * 735u * (unsigned)sizeof(float))
+
+/* Execute one CPU instruction and bring the APU, expansion audio and PPU up
+ * to the same cycle. */
+static void nes_step_insn(NesState *s) {
+#ifdef HAVE_LUA
+    if (s->lua) nes_lua_notify_exec(s->lua, s->cpu.PC);
+#endif
+    uint64_t prev = s->cpu.cycle_count;
+    mos6502_step(&s->cpu);
+    uint64_t delta = s->cpu.cycle_count - prev;
+
+    /* APU + VRC6: one tick per CPU cycle */
+    bool is_vrc6 = s->cart.mapper == 24 || s->cart.mapper == 26;
+    for (uint64_t i = 0; i < delta; i++) {
+        if (is_vrc6)
+            s->apu.fds_in = vrc6_tick(s);
+        else if (s->apu.audio_dev && s->fds_enabled)
+            s->apu.fds_in = fds_audio_tick(&s->fds);
+        if (s->apu.audio_dev) apu2a03_tick(&s->apu);
+    }
+    if (s->apu.fc_irq || s->apu.dmc.irq_flag)
+        s->cpu.irq = true;
+
+    nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+}
 
 void nes_run(NesState *s, const MosConfig *cfg) {
     gemu_monitor_start(s->monitor);
@@ -2672,137 +2960,9 @@ void nes_run(NesState *s, const MosConfig *cfg) {
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
             if      (cmd == GEMU_MON_QUIT)   { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else { quit = true; break; } }
             else if (cmd == GEMU_MON_RESET)  { nes_save_persistent(s); nes_reset(s); }
-            else if (cmd == GEMU_MON_CUSTOM) {
-                const char *text = gemu_monitor_command_text(s->monitor);
-                while (*text == ' ' || *text == '\t') text++;
-                char vm_path[256];
-                if (text && sscanf(text, "savevm %255s", vm_path) == 1) {
-                    if (nes_save_snapshot(s, vm_path))
-                        printf("saved snapshot to %s (frame=%" PRIu64 ")\n",
-                               vm_path, s->ppu.frame);
-                    else
-                        printf("failed to save snapshot to %s\n", vm_path);
-                } else if (text && sscanf(text, "loadvm %255s", vm_path) == 1) {
-                    if (nes_load_snapshot(s, vm_path))
-                        printf("loaded snapshot from %s (frame=%" PRIu64 ")\n",
-                               vm_path, s->ppu.frame);
-                    else
-                        printf("failed to load snapshot from %s\n", vm_path);
-                } else if (strncasecmp(text, "peek", 4) == 0 &&
-                           (text[4] == '\0' || text[4] == ' ' || text[4] == '\t')) {
-                    unsigned addr = 0, len = 16;
-                    int n = sscanf(text + 4, "%x %u", &addr, &len);
-                    if (n >= 1) {
-                        if (len > 256) len = 256;
-                        printf("RAM $%04X:", addr & 0x7FFu);
-                        for (unsigned i = 0; i < len; i++)
-                            printf(" %02X", s->ram[(addr + i) & 0x7FFu]);
-                        printf("\n");
-                    } else {
-                        printf("peek: usage: peek ADDR_HEX [len]\n");
-                    }
-                } else if (strncasecmp(text, "regs", 4) == 0 &&
-                           (text[4] == '\0' || text[4] == ' ' || text[4] == '\t')) {
-                    printf("CPU: PC=%04X A=%02X X=%02X Y=%02X SP=%02X P=%02X "
-                           "insn=%" PRIu64 " cyc=%" PRIu64 "\n",
-                           s->cpu.PC, s->cpu.A, s->cpu.X, s->cpu.Y, s->cpu.SP, s->cpu.P,
-                           s->cpu.insn_count, s->cpu.cycle_count);
-                } else if (strncasecmp(text, "mapperdump", 10) == 0 &&
-                           (text[10] == '\0' || text[10] == ' ' || text[10] == '\t')) {
-                    printf("mapper=%u bank_sel=%02X regs=%02X %02X %02X %02X %02X %02X %02X %02X\n",
-                           s->cart.mapper, s->mmc3_bank_sel,
-                           s->mmc3_regs[0], s->mmc3_regs[1], s->mmc3_regs[2], s->mmc3_regs[3],
-                           s->mmc3_regs[4], s->mmc3_regs[5], s->mmc3_regs[6], s->mmc3_regs[7]);
-                    printf("prg_offsets($8000,$A000,$C000,$E000)=%06X %06X %06X %06X\n",
-                           s->mmc3_prg_offsets[0], s->mmc3_prg_offsets[1],
-                           s->mmc3_prg_offsets[2], s->mmc3_prg_offsets[3]);
-                } else if (s->cfg->is_arcade &&
-                    strncasecmp(text, "dipswitch", 9) == 0 &&
-                    (text[9] == '\0' || text[9] == ' ' || text[9] == '\t'))
-                    vs_dip_cmd(s, text + 9);
-                else if (s->cfg->is_arcade &&
-                    strncasecmp(text, "coin", 4) == 0 &&
-                    (text[4] == '\0' || text[4] == ' ' || text[4] == '\t'))
-                    vs_coin_cmd(s, text + 4);
-                else if (s->cfg->is_arcade &&
-                    strncasecmp(text, "service", 7) == 0 &&
-                    (text[7] == '\0' || text[7] == ' ' || text[7] == '\t'))
-                    vs_service_cmd(s);
-                else if (strncasecmp(text, "gamegenie", 9) == 0 &&
-                    (text[9] == '\0' || text[9] == ' ' || text[9] == '\t'))
-                    nes_gamegenie_cmd(s, text);
-                else if (strncasecmp(text, "sendkey", 7) == 0 &&
-                         (text[7] == '\0' || text[7] == ' ' || text[7] == '\t')) {
-                    const char *p = text + 7;
-                    while (*p == ' ' || *p == '\t') p++;
-                    uint8_t btn = 0;
-                    if      (strncasecmp(p, "a",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = NES_BTN_A;
-                    else if (strncasecmp(p, "b",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = NES_BTN_B;
-                    else if (strncasecmp(p, "start",  5) == 0) btn = s->cfg->is_arcade ? VS_BTN_START : NES_BTN_START;
-                    else if (strncasecmp(p, "select", 6) == 0) btn = NES_BTN_SELECT;
-                    else if (strncasecmp(p, "up",     2) == 0) btn = NES_BTN_UP;
-                    else if (strncasecmp(p, "down",   4) == 0) btn = NES_BTN_DOWN;
-                    else if (strncasecmp(p, "left",   4) == 0) btn = NES_BTN_LEFT;
-                    else if (strncasecmp(p, "right",  5) == 0) btn = NES_BTN_RIGHT;
-                    if (btn) {
-                        while (*p && *p != ' ' && *p != '\t') p++;
-                        while (*p == ' ' || *p == '\t') p++;
-                        int frames = (*p >= '1' && *p <= '9') ? (int)strtol(p, NULL, 10) : 5;
-                        s->ctrl_inject_mask   = btn;
-                        s->ctrl_inject_frames = frames;
-                        printf("sendkey: holding 0x%02X for %d frame(s)\n", btn, frames);
-                    } else {
-                        printf("sendkey: unknown button (a b start select up down left right)\n");
-                    }
-                } else if (strncasecmp(text, "ppudump", 7) == 0 &&
-                           (text[7] == '\0' || text[7] == ' ' || text[7] == '\t')) {
-                    Rp2c02 *ppu = &s->ppu;
-                    printf("PPU: ctrl=%02X mask=%02X status=%02X v=%04X t=%04X x=%d w=%d\n",
-                           ppu->ppuctrl, ppu->ppumask, ppu->ppustatus,
-                           ppu->v, ppu->t, ppu->x, ppu->w);
-                    printf("Palette BG:  ");
-                    for (int i = 0; i < 16; i++) printf("%02X ", ppu->palette[i]);
-                    printf("\nPalette SPR: ");
-                    for (int i = 0; i < 16; i++) printf("%02X ", ppu->palette[i + 16]);
-                    printf("\nSL0 pixels[0..31]: ");
-                    for (int i = 0; i < 32; i++) printf("%02X ", ppu->pixels[i]);
-                    printf("\nSL8 pixels[0..31]: ");
-                    for (int i = 0; i < 32; i++) printf("%02X ", ppu->pixels[256*8 + i]);
-                    printf("\nNT row0 tiles: ");
-                    for (int i = 0; i < 32; i++) printf("%02X ", ppu->vram[i]);
-                    printf("\nNT row1 tiles: ");
-                    for (int i = 0; i < 32; i++) printf("%02X ", ppu->vram[32 + i]);
-                    printf("\nNT attr[0..7]: ");
-                    for (int i = 0; i < 8; i++) printf("%02X ", ppu->vram[0x3C0 + i]);
-                    printf("\nOAM[0..3]:     ");
-                    for (int i = 0; i < 16; i++) printf("%02X ", ppu->oam[i]);
-                    printf("\nOAM visible:   ");
-                    int shown = 0;
-                    for (int i = 0; i < 64; i++) {
-                        uint8_t y = ppu->oam[i * 4 + 0];
-                        if (y >= 0xEF) continue;
-                        printf("#%02d:%02X %02X %02X %02X ",
-                               i, y, ppu->oam[i * 4 + 1],
-                               ppu->oam[i * 4 + 2], ppu->oam[i * 4 + 3]);
-                        if (++shown == 12) break;
-                    }
-                    if (!shown) printf("(none)");
-                    printf("\n");
-#if defined(GEMU_GTK) || defined(_WIN32)
-                } else if (strncasecmp(text, "hexeditor", 9) == 0 &&
-                           (text[9] == '\0' || text[9] == ' ' || text[9] == '\t')) {
-                    if (!s->hex_editor) {
-                        printf("hexeditor: not available (needs GTK build or -display sdl on Windows)\n");
-                    } else if (hex_editor_is_visible(s->hex_editor)) {
-                        hex_editor_hide(s->hex_editor);
-                        printf("hexeditor: closed\n");
-                    } else {
-                        hex_editor_show(s->hex_editor);
-                        printf("hexeditor: opened\n");
-                    }
-#endif
-                } else
-                    gemu_monitor_unknown_command(s->monitor);
+            else if (cmd == GEMU_MON_STEP) {
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
+                    nes_step_insn(s);
             }
         }
         if (quit) break;
@@ -2824,26 +2984,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             s->ppu.dirty = false;
             while (!s->ppu.dirty) {
                 if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-#ifdef HAVE_LUA
-                if (s->lua) nes_lua_notify_exec(s->lua, s->cpu.PC);
-#endif
-                uint64_t prev = s->cpu.cycle_count;
-                mos6502_step(&s->cpu);
-                uint64_t delta = s->cpu.cycle_count - prev;
-
-                /* APU + VRC6: one tick per CPU cycle */
-                bool is_vrc6 = s->cart.mapper == 24 || s->cart.mapper == 26;
-                for (uint64_t i = 0; i < delta; i++) {
-                    if (is_vrc6)
-                        s->apu.fds_in = vrc6_tick(s);
-                    else if (s->apu.audio_dev && s->fds_enabled)
-                        s->apu.fds_in = fds_audio_tick(&s->fds);
-                    if (s->apu.audio_dev) apu2a03_tick(&s->apu);
-                }
-                if (s->apu.fc_irq || s->apu.dmc.irq_flag)
-                    s->cpu.irq = true;
-
-                nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+                nes_step_insn(s);
                 if (gemu_monitor_is_paused(s->monitor)) break;
             }
             VS_DEBUG(s, "frame=%llu pc=%04X a=%02X x=%02X y=%02X p=%02X sp=%02X "

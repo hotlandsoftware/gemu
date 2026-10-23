@@ -49,6 +49,31 @@ static bool chip8_screendump(void *ud, const char *path) {
 
 /* ── ROM loading (raw .ch8 or compiled .8o) ──────────────────────────────── */
 
+/* Monitor memory view over the 4 KB RAM array (opcodes are big-endian). */
+static bool chip8_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    const Chip8State *s = ud;
+    if (addr >= CHIP8_MEM_SIZE) return false;
+    *val = s->mem[addr];
+    return true;
+}
+
+static bool chip8_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    Chip8State *s = ud;
+    if (addr >= CHIP8_MEM_SIZE) return false;
+    s->mem[addr] = val;
+    gemu_tb_cache_flush(&s->tb_cache);   /* poked code must be re-translated */
+    return true;
+}
+
+static void chip8_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const Chip8State *s = ud;
+    int n = snprintf(buf, len, "PC=%03X I=%03X SP=%X DT=%02X ST=%02X\n",
+                     s->PC, s->I, s->SP, s->delay, s->sound);
+    for (int r = 0; r < CHIP8_NUM_REGS && n >= 0 && (size_t)n < len; r++)
+        n += snprintf(buf + n, len - (size_t)n, "V%X=%02X%s", r, s->V[r],
+                      r == CHIP8_NUM_REGS - 1 ? "" : " ");
+}
+
 static bool path_ends_8o(const char *p)
 {
     size_t n = strlen(p);
@@ -92,6 +117,10 @@ Chip8State *chip8_machine_create(const Chip8Config *cfg) {
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, chip8_screendump, s);
     gemu_tb_cache_init(&s->tb_cache, free);
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = chip8_mon_read, .write = chip8_mon_write, .ud = s,
+        .addr_bits = 12, .big_endian = true });
+    gemu_monitor_set_cpu_state_cb(s->monitor, chip8_mon_cpu_state, s);
     if (cfg->vnc_addr)
         s->vnc = gemu_vnc_create(cfg->vnc_addr,
                                  CHIP8_DISPLAY_W * cfg->display_scale,
@@ -174,7 +203,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
                 else if (cmd == GEMU_MON_STEP) {
                     uint32_t n = gemu_monitor_step_count(s->monitor);
                     for (uint32_t i = 0; i < n; i++) chip8_exec_single(s);
-                } else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
+                }
             }
             if (!running || gemu_monitor_is_paused(s->monitor)) {
                 chip8_sleep_frame();
@@ -265,7 +294,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
             else if (cmd == GEMU_MON_STEP) {
                 uint32_t n = gemu_monitor_step_count(s->monitor);
                 for (uint32_t i = 0; i < n; i++) chip8_exec_single(s);
-            } else if (cmd == GEMU_MON_CUSTOM) gemu_monitor_unknown_command(s->monitor);
+            }
         }
         if (quit) break;
         gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));

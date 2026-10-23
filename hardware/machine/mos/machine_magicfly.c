@@ -309,6 +309,61 @@ static bool magicfly_screendump(void *ud, const char *path) {
 
 /* ── NVRAM persistence ───────────────────────────────────────────────────── */
 
+/* ── Monitor ─────────────────────────────────────────────────────────────── */
+
+/* Memory view: NVRAM, video/colour RAM and program ROM.  The CRTC and the
+ * multiplexed input port are not exposed. */
+static bool magicfly_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    MagicflyState *s = ud;
+    if (addr > 0xFFFF) return false;
+    if (addr < 0x0800) { *val = s->nvram[addr]; return true; }
+    if (addr >= 0x1000 && addr <= 0x13FF) { *val = s->videoram[addr - 0x1000]; return true; }
+    if (addr >= 0x1800 && addr <= 0x1BFF) { *val = s->colorram[addr - 0x1800]; return true; }
+    if (addr >= 0xC000) { *val = s->prg[addr - 0xC000]; return true; }
+    return false;
+}
+
+static bool magicfly_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    MagicflyState *s = ud;
+    if (addr < 0x0800) { s->nvram[addr] = val; return true; }
+    if (addr >= 0x1000 && addr <= 0x13FF) { s->videoram[addr - 0x1000] = val; return true; }
+    if (addr >= 0x1800 && addr <= 0x1BFF) { s->colorram[addr - 0x1800] = val; return true; }
+    return false;
+}
+
+static void magicfly_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const MagicflyState *s = ud;
+    mos6502_format_state(&s->cpu, buf, len);
+}
+
+static GemuMonCmd magicfly_cmd_coin(GemuMonitor *mon, const char *args, void *ud) {
+    MagicflyState *s = ud;
+    (void)args;
+    s->coin_latch = 15;
+    gemu_monitor_printf(mon, "%s: coin in\n", s->cfg->is_7mezzo ? "7mezzo" : "magicfly");
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd magicfly_cmd_dipswitch(GemuMonitor *mon, const char *args, void *ud) {
+    MagicflyState *s = ud;
+    bool mf = !s->cfg->is_7mezzo;
+    const char *name = mf ? "magicfly" : "7mezzo";
+    unsigned val = 0;
+    if (sscanf(args, "%x", &val) == 1) {
+        s->dsw0 = (uint8_t)val;
+        gemu_monitor_printf(mon, "%s: DSW0 = 0x%02X\n", name, s->dsw0);
+    } else {
+        if (mf)
+            gemu_monitor_printf(mon, "%s: DSW0=%02X (bit4: 0=Maximum Bet 100, 1=Maximum Bet 20; "
+                                "bits 5-7 undocumented even in MAME)\n", name, s->dsw0);
+        else
+            gemu_monitor_printf(mon, "%s: DSW0=%02X (all 4 physical switches are undocumented "
+                                "even in MAME)\n", name, s->dsw0);
+        gemu_monitor_printf(mon, "usage: dipswitch <hex-value>\n");
+    }
+    return GEMU_MON_NONE;
+}
+
 static void magicfly_build_sav_path(char *out, size_t len, const char *name) {
     char file[64];
     snprintf(file, sizeof(file), "%s.nvram", name);
@@ -424,6 +479,12 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
     s->monitor = gemu_monitor_create();
     if (!s->monitor) { free(s->prg); free(s->gfxbnk0); free(s->gfxbnk1); free(s); return NULL; }
     gemu_monitor_set_screendump_cb(s->monitor, magicfly_screendump, s);
+    gemu_monitor_bind(s->monitor, "coin", magicfly_cmd_coin, s);
+    gemu_monitor_bind(s->monitor, "dipswitch", magicfly_cmd_dipswitch, s);
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = magicfly_mon_read, .write = magicfly_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = false });
+    gemu_monitor_set_cpu_state_cb(s->monitor, magicfly_mon_cpu_state, s);
 
     magicfly_build_sav_path(s->sav_path, sizeof(s->sav_path), name);
     magicfly_nvram_load(s);
@@ -483,6 +544,14 @@ void magicfly_destroy(MagicflyState *s) {
 
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
+/* Execute one CPU instruction and clock the DAC for its cycles. */
+static void magicfly_step_insn(MagicflyState *s) {
+    uint64_t prev = s->cpu.cycle_count;
+    mos6502_step(&s->cpu);
+    uint64_t delta = s->cpu.cycle_count - prev;
+    for (uint64_t i = 0; i < delta; i++) magicfly_dac_tick(s);
+}
+
 void magicfly_run(MagicflyState *s, const MosConfig *cfg) {
     bool mf = !cfg->is_7mezzo;
     const char *name = mf ? "magicfly" : "7mezzo";
@@ -511,32 +580,9 @@ void magicfly_run(MagicflyState *s, const MosConfig *cfg) {
             } else if (cmd == GEMU_MON_RESET) {
                 magicfly_nvram_save(s);
                 mos6502_reset(&s->cpu);
-            } else if (cmd == GEMU_MON_CUSTOM) {
-                const char *text = gemu_monitor_command_text(s->monitor);
-                while (*text == ' ' || *text == '\t') text++;
-                if (strncasecmp(text, "coin", 4) == 0 && (text[4] == '\0' || text[4] == ' ')) {
-                    s->coin_latch = 15;
-                    printf("%s: coin in\n", name);
-                } else if (strncasecmp(text, "dipswitch", 9) == 0 &&
-                           (text[9] == '\0' || text[9] == ' ' || text[9] == '\t')) {
-                    const char *p = text + 9;
-                    while (*p == ' ' || *p == '\t') p++;
-                    unsigned val = 0;
-                    if (sscanf(p, "%x", &val) == 1) {
-                        s->dsw0 = (uint8_t)val;
-                        printf("%s: DSW0 = 0x%02X\n", name, s->dsw0);
-                    } else {
-                        if (mf)
-                            printf("%s: DSW0=%02X (bit4: 0=Maximum Bet 100, 1=Maximum Bet 20; "
-                                   "bits 5-7 undocumented even in MAME)\n", name, s->dsw0);
-                        else
-                            printf("%s: DSW0=%02X (all 4 physical switches are undocumented "
-                                   "even in MAME)\n", name, s->dsw0);
-                        printf("usage: dipswitch <hex-value>\n");
-                    }
-                } else {
-                    gemu_monitor_unknown_command(s->monitor);
-                }
+            } else if (cmd == GEMU_MON_STEP) {
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
+                    magicfly_step_insn(s);
             }
         }
         if (quit) break;
@@ -551,10 +597,7 @@ void magicfly_run(MagicflyState *s, const MosConfig *cfg) {
             uint64_t target = s->cpu.cycle_count + MAGICFLY_CYCLES_PER_FRAME;
             while (s->cpu.cycle_count < target) {
                 if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-                uint64_t prev = s->cpu.cycle_count;
-                mos6502_step(&s->cpu);
-                uint64_t delta = s->cpu.cycle_count - prev;
-                for (uint64_t i = 0; i < delta; i++) magicfly_dac_tick(s);
+                magicfly_step_insn(s);
             }
             magicfly_dac_flush(s);
 

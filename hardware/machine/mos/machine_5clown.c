@@ -295,6 +295,65 @@ static void fiveclown_render(FiveClownState *s) {
     }
 }
 
+/* ── Monitor ─────────────────────────────────────────────────────────────── */
+
+/* Main-CPU memory view: NVRAM, video/colour RAM, program ROM and the DIP
+ * switch ports.  CRTC and PIA registers are not exposed. */
+static bool fiveclown_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    FiveClownState *s = ud;
+    if (addr > 0xFFFF) return false;
+    if (addr < 0x0800) { *val = s->nvram[addr]; return true; }
+    if (addr >= 0x1000 && addr <= 0x13FF) { *val = s->videoram[addr - 0x1000]; return true; }
+    if (addr >= 0x1800 && addr <= 0x1BFF) { *val = s->colorram[addr - 0x1800]; return true; }
+    if (addr >= 0x2000 && addr <= 0x7FFF) { *val = s->prg[addr - 0x2000]; return true; }
+    if (addr == 0xC400) { *val = s->dip1; return true; }
+    if (addr == 0xCC00) { *val = s->dip2; return true; }
+    if (addr == 0xD400) { *val = s->dip3; return true; }
+    if (addr >= 0xE000) { *val = s->prg[0x6000 + (addr - 0xE000)]; return true; }
+    return false;
+}
+
+static bool fiveclown_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    FiveClownState *s = ud;
+    if (addr < 0x0800) { s->nvram[addr] = val; return true; }
+    if (addr >= 0x1000 && addr <= 0x13FF) { s->videoram[addr - 0x1000] = val; return true; }
+    if (addr >= 0x1800 && addr <= 0x1BFF) { s->colorram[addr - 0x1800] = val; return true; }
+    return false;
+}
+
+static void fiveclown_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const FiveClownState *s = ud;
+    int n = snprintf(buf, len, "main:  ");
+    if (n > 0 && (size_t)n < len) mos6502_format_state(&s->cpu, buf + n, len - (size_t)n);
+    n = (int)strlen(buf);
+    if ((size_t)n < len) n += snprintf(buf + n, len - (size_t)n, "\naudio: ");
+    if (n > 0 && (size_t)n < len) mos6502_format_state(&s->audiocpu, buf + n, len - (size_t)n);
+}
+
+static GemuMonCmd fiveclown_cmd_coin(GemuMonitor *mon, const char *args, void *ud) {
+    FiveClownState *s = ud;
+    (void)args;
+    s->coin_latch = 15;
+    gemu_monitor_printf(mon, "5clown: coin in\n");
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd fiveclown_cmd_dipswitch(GemuMonitor *mon, const char *args, void *ud) {
+    FiveClownState *s = ud;
+    int bank = 0; unsigned val = 0;
+    if (sscanf(args, "%d %x", &bank, &val) == 2 && bank >= 1 && bank <= 4) {
+        uint8_t *d = bank == 1 ? &s->dip1 : bank == 2 ? &s->dip2
+                   : bank == 3 ? &s->dip3 : &s->dip4;
+        *d = (uint8_t)val;
+        gemu_monitor_printf(mon, "5clown: SW%d = 0x%02X\n", bank, *d);
+    } else {
+        gemu_monitor_printf(mon, "5clown: SW1=%02X SW2=%02X SW3=%02X SW4=%02X\n",
+                            s->dip1, s->dip2, s->dip3, s->dip4);
+        gemu_monitor_printf(mon, "usage: dipswitch <1-4> <hex-value>\n");
+    }
+    return GEMU_MON_NONE;
+}
+
 /* ── Screendump ──────────────────────────────────────────────────────────── */
 
 static bool fiveclown_screendump(void *ud, const char *path) {
@@ -434,6 +493,12 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, fiveclown_screendump, s);
+    gemu_monitor_bind(s->monitor, "coin", fiveclown_cmd_coin, s);
+    gemu_monitor_bind(s->monitor, "dipswitch", fiveclown_cmd_dipswitch, s);
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = fiveclown_mon_read, .write = fiveclown_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = false });
+    gemu_monitor_set_cpu_state_cb(s->monitor, fiveclown_mon_cpu_state, s);
 
     gemu_config_path(s->sav_path, sizeof(s->sav_path), "5clown.nvram");
     fiveclown_nvram_load(s);
@@ -510,30 +575,10 @@ void fiveclown_run(FiveClownState *s, const MosConfig *cfg) {
                 fiveclown_nvram_save(s);
                 mos6502_reset(&s->cpu);
                 mos6502_reset(&s->audiocpu);
-            } else if (cmd == GEMU_MON_CUSTOM) {
-                const char *text = gemu_monitor_command_text(s->monitor);
-                while (*text == ' ' || *text == '\t') text++;
-                if (strncasecmp(text, "coin", 4) == 0 && (text[4] == '\0' || text[4] == ' ')) {
-                    s->coin_latch = 15;
-                    printf("5clown: coin in\n");
-                } else if (strncasecmp(text, "dipswitch", 9) == 0 &&
-                           (text[9] == '\0' || text[9] == ' ' || text[9] == '\t')) {
-                    const char *p = text + 9;
-                    while (*p == ' ' || *p == '\t') p++;
-                    int bank = 0; unsigned val = 0;
-                    if (sscanf(p, "%d %x", &bank, &val) == 2 && bank >= 1 && bank <= 4) {
-                        uint8_t *d = bank == 1 ? &s->dip1 : bank == 2 ? &s->dip2
-                                   : bank == 3 ? &s->dip3 : &s->dip4;
-                        *d = (uint8_t)val;
-                        printf("5clown: SW%d = 0x%02X\n", bank, *d);
-                    } else {
-                        printf("5clown: SW1=%02X SW2=%02X SW3=%02X SW4=%02X\n",
-                               s->dip1, s->dip2, s->dip3, s->dip4);
-                        printf("usage: dipswitch <1-4> <hex-value>\n");
-                    }
-                } else {
-                    gemu_monitor_unknown_command(s->monitor);
-                }
+            } else if (cmd == GEMU_MON_STEP) {
+                /* Steps the main CPU; the sound CPU only runs whole frames. */
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
+                    mos6502_step(&s->cpu);
             }
         }
         if (quit) break;

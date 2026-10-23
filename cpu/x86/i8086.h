@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /* Intel 8086/8088 interpreter. Meant to grow in place through later
  * generations (186/286/386/486/Pentium) by feature-gating on `type`
@@ -89,3 +90,6 @@ void x86_request_irq(X86Cpu *cpu, uint8_t vector);
 /* Physical address helper, exposed so devices/monitor code can resolve a
  * segment:offset pair without duplicating the wraparound rule. */
 uint32_t x86_linear(uint16_t seg, uint16_t off);
+
+/* Register dump for the monitor's "info cpu". */
+void x86_format_state(const X86Cpu *cpu, char *buf, size_t len);

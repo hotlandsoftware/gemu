@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /* CDP1802 machine-cycle frequency */
 #define CDP1802_CLOCK_HZ          1760000u
@@ -91,6 +92,8 @@ typedef struct Cdp1802 {
 void cdp1802_init(Cdp1802 *cpu, uint8_t *mem, uint32_t mem_size);
 void cdp1802_reset(Cdp1802 *cpu);
 void cdp1802_step(Cdp1802 *cpu);   /* one machine cycle */
+/* Register dump for the monitor's "info cpu". */
+void cdp1802_format_state(const Cdp1802 *cpu, char *buf, size_t len);
 
 /* Called by peripherals to queue requests */
 void cdp1802_request_dma_out(Cdp1802 *cpu, uint16_t count,

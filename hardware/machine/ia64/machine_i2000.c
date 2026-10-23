@@ -3911,309 +3911,526 @@ static bool i2000_autosave_tick(Ia64I2000State *s) {
     return true;
 }
 
-/* monitor "x 0xADDR [count]": physical memory hexdump
- * monitor "trace N": stderr-trace the next N executed slots
- * monitor "history [N]": dump the most recently executed slots
- * monitor "panel FILE": dump the CPU/MMIO debug front panel (the live
- * display and default screendump now show real VGA output instead)
- * monitor "savevm FILE": snapshot the full machine state to FILE
- * monitor "loadvm FILE": restore full machine state from FILE (run this
+/* ── Monitor memory view ─────────────────────────────────────────────────── */
+
+/* Side-effect-free physical memory access for the monitor's x/xp/peek/poke/
+ * memsave and for "dump".  Mirrors bus_read()'s decode order (so the same
+ * address resolves to the same backing store) but only ever touches plain
+ * memory arrays: device apertures, PCI config cycles, the legacy INTA ack
+ * byte, I/O SAPIC and sparse I/O ports all return false, and the monitor's
+ * own read watchpoints are never consulted. */
+static bool i2000_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    Ia64I2000State *s = ud;
+    bool region6 = (addr >> 60) == 0xC;
+    addr = i2000_normalize_pa(s, addr);
+    uint64_t off;
+    if (i2000_high_dram_addr(addr, &off)) {
+        *val = s->high_dram[off];
+        return true;
+    }
+    if (s->rage128.enabled) {
+        uint64_t fb = rage128_bar(&s->rage128, 0x10, RAGE128_FB_BASE,
+                                 ~UINT32_C(0x03ffffff));
+        uint64_t mmio = rage128_bar(&s->rage128, 0x18, RAGE128_MMIO_BASE,
+                                   ~UINT32_C(0x3fff));
+        if (addr >= fb && addr < fb + RAGE128_FB_APER_SIZE)
+            return false;
+        if (addr >= mmio && addr < mmio + RAGE128_MMIO_SIZE)
+            return false;
+    }
+    if (s->i82559.enabled) {
+        uint64_t mmio = i82559_bar(&s->i82559, 0x10, I82559_MMIO_BASE,
+                                  ~UINT32_C(0xfff));
+        if (addr >= mmio && addr < mmio + I82559_MMIO_SIZE)
+            return false;
+        uint32_t rombar = 0;
+        memcpy(&rombar, s->i82559.cfg + 0x30, sizeof(rombar));
+        uint64_t rombase = rombar & ~UINT32_C(0x7ff);
+        if ((rombar & 1) && s->i82559.option_rom && addr >= rombase &&
+            addr < rombase + s->i82559.option_rom_size) {
+            *val = s->i82559.option_rom[addr - rombase];
+            return true;
+        }
+    }
+    if (addr < 0xD0000) {
+        uint32_t voff;
+        if (vga_mem_window(s, addr, 1, &voff))
+            return false;   /* planar reads load the VGA latches */
+        if (vga_rom_window(addr, 1, &voff)) {
+            *val = s->vga_rom_shadow[voff];
+            return true;
+        }
+    }
+    if (region6 && addr < I2000_FLASH_BASE)
+        return false;       /* PCI configuration cycle */
+    if (addr < s->ram_size) {
+        *val = s->ram[addr];
+        return true;
+    }
+    if (addr >= I2000_CHIPSET_SCRATCH_BASE && addr < I2000_RAM_MAX) {
+        *val = s->chipset_scratch[addr - I2000_CHIPSET_SCRATCH_BASE];
+        return true;
+    }
+    if (addr >= IOSAPIC_BASE && addr < IOSAPIC_BASE + IOSAPIC_SIZE)
+        return false;
+    if (addr == I2000_LEGACY_ACK_ADDR)
+        return false;       /* acknowledges the pending ExtINT */
+    if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
+        /* Same result bus_read() gives: status/ID-mode reads are pure
+         * functions of the chip state. */
+        off = addr - I2000_FLASH_BASE;
+        const I2000FlashChip *chip =
+            &s->flash_chip[(unsigned)(off / I2000_FLASH_CHIP_SIZE)];
+        if (chip->read_status) {
+            *val = (uint8_t)chip->status;
+        } else if (chip->read_id) {
+            uint32_t id_off = (uint32_t)(off % I2000_FLASH_CHIP_SIZE) & 0xFFFFu;
+            *val = id_off == 0 ? 0x89 : id_off == 1 ? 0xAC :
+                   id_off == 2 ? 0x00 : 0xFF;
+        } else {
+            *val = s->flash[off];
+        }
+        return true;
+    }
+    return false;           /* sparse I/O ports, SAC registers, unmapped */
+}
+
+/* Writes RAM (low DRAM, the high-DRAM aperture and chipset scratch) only. */
+static bool i2000_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    Ia64I2000State *s = ud;
+    bool region6 = (addr >> 60) == 0xC;
+    addr = i2000_normalize_pa(s, addr);
+    uint64_t off;
+    if (i2000_high_dram_addr(addr, &off)) {
+        s->high_dram[off] = val;
+        return true;
+    }
+    if (s->rage128.enabled) {
+        uint64_t fb = rage128_bar(&s->rage128, 0x10, RAGE128_FB_BASE,
+                                 ~UINT32_C(0x03ffffff));
+        uint64_t mmio = rage128_bar(&s->rage128, 0x18, RAGE128_MMIO_BASE,
+                                   ~UINT32_C(0x3fff));
+        if ((addr >= fb && addr < fb + RAGE128_FB_APER_SIZE) ||
+            (addr >= mmio && addr < mmio + RAGE128_MMIO_SIZE))
+            return false;
+    }
+    if (s->i82559.enabled) {
+        uint64_t mmio = i82559_bar(&s->i82559, 0x10, I82559_MMIO_BASE,
+                                  ~UINT32_C(0xfff));
+        if (addr >= mmio && addr < mmio + I82559_MMIO_SIZE)
+            return false;
+    }
+    if (addr < 0xD0000) {
+        uint32_t voff;
+        if (vga_mem_window(s, addr, 1, &voff) || vga_rom_window(addr, 1, &voff))
+            return false;
+    }
+    if (region6 && addr < I2000_FLASH_BASE)
+        return false;
+    if (addr < s->ram_size) {
+        s->ram[addr] = val;
+        return true;
+    }
+    if (addr >= I2000_CHIPSET_SCRATCH_BASE && addr < I2000_RAM_MAX) {
+        s->chipset_scratch[addr - I2000_CHIPSET_SCRATCH_BASE] = val;
+        return true;
+    }
+    return false;
+}
+
+/* ── Monitor commands ────────────────────────────────────────────────────── */
+
+/* monitor "input": keyboard controller and PIT state */
+static GemuMonCmd i2000_cmd_input(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    (void)args;
+    gemu_monitor_printf(mon, "8042: command=%02X out=%u/%u aux=%u/%u "
+           "kbd=%u/%u irq1=%u retry=%" PRIu64 " ninsts=%" PRIu64 "\n",
+           s->kbc_command_byte,
+           s->kbc_out_pos, s->kbc_out_len,
+           s->aux_out_pos, s->aux_out_len,
+           s->ps2_keyboard.queue_pos, s->ps2_keyboard.queue_len,
+           s->keyboard_irq_pending, s->keyboard_retry_ninsts,
+           s->cpu->ninsts);
+    gemu_monitor_printf(mon, "PIT0: reload=%u next=%" PRIu64 " now=%" PRIu64
+           " pending=%u mask=%02X\n",
+           s->pit0_reload ? (unsigned)s->pit0_reload : 65536u,
+           s->pit0_next_irq, merced_get_itc(s->cpu),
+           s->pit_irq_pending, s->pic_master_mask);
+    if (ps2_keyboard_has_data(&s->ps2_keyboard)) {
+        gemu_monitor_printf(mon, "keyboard bytes:");
+        for (unsigned i = s->ps2_keyboard.queue_pos;
+             i < s->ps2_keyboard.queue_len; i++)
+            gemu_monitor_printf(mon, " %02X", s->ps2_keyboard.queue[i]);
+        gemu_monitor_printf(mon, "\n");
+    }
+    return GEMU_MON_NONE;
+}
+
+/* monitor "savevm FILE": snapshot the full machine state to FILE */
+static GemuMonCmd i2000_cmd_savevm(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    char vm_path[256];
+    if (sscanf(args, "%255s", vm_path) != 1) {
+        gemu_monitor_printf(mon, "usage: savevm <file>\n");
+        return GEMU_MON_NONE;
+    }
+    if (i2000_save_snapshot(s, vm_path))
+        gemu_monitor_printf(mon, "saved snapshot to %s (ninsts=%" PRIu64 ")\n",
+                            vm_path, s->cpu->ninsts);
+    else
+        gemu_monitor_printf(mon, "failed to save snapshot to %s\n", vm_path);
+    return GEMU_MON_NONE;
+}
+
+/* monitor "loadvm FILE": restore full machine state from FILE (run this
  * right after startup to skip re-running a slow, already-verified boot
  * prefix) */
-static void i2000_custom_cmd(Ia64I2000State *s) {
-    const char *txt = gemu_monitor_command_text(s->monitor);
-    uint64_t addr;
-    int count = 64;
-    uint64_t n;
-    char panel_path[256];
+static GemuMonCmd i2000_cmd_loadvm(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
     char vm_path[256];
-    if (txt && (strcmp(txt, "input") == 0 || strcmp(txt, "input-state") == 0)) {
-        printf("8042: command=%02X out=%u/%u aux=%u/%u "
-               "kbd=%u/%u irq1=%u retry=%" PRIu64 " ninsts=%" PRIu64 "\n",
-               s->kbc_command_byte,
-               s->kbc_out_pos, s->kbc_out_len,
-               s->aux_out_pos, s->aux_out_len,
-               s->ps2_keyboard.queue_pos, s->ps2_keyboard.queue_len,
-               s->keyboard_irq_pending, s->keyboard_retry_ninsts,
-               s->cpu->ninsts);
-        printf("PIT0: reload=%u next=%" PRIu64 " now=%" PRIu64
-               " pending=%u mask=%02X\n",
-               s->pit0_reload ? (unsigned)s->pit0_reload : 65536u,
-               s->pit0_next_irq, merced_get_itc(s->cpu),
-               s->pit_irq_pending, s->pic_master_mask);
-        if (ps2_keyboard_has_data(&s->ps2_keyboard)) {
-            printf("keyboard bytes:");
-            for (unsigned i = s->ps2_keyboard.queue_pos;
-                 i < s->ps2_keyboard.queue_len; i++)
-                printf(" %02X", s->ps2_keyboard.queue[i]);
-            putchar('\n');
-        }
-        return;
+    if (sscanf(args, "%255s", vm_path) != 1) {
+        gemu_monitor_printf(mon, "usage: loadvm <file>\n");
+        return GEMU_MON_NONE;
     }
-    if (txt && sscanf(txt, "savevm %255s", vm_path) == 1) {
-        if (i2000_save_snapshot(s, vm_path))
-            printf("saved snapshot to %s (ninsts=%" PRIu64 ")\n",
-                   vm_path, s->cpu->ninsts);
-        else
-            printf("failed to save snapshot to %s\n", vm_path);
-        return;
+    if (i2000_load_snapshot(s, vm_path))
+        gemu_monitor_printf(mon, "loaded snapshot from %s (ninsts=%" PRIu64 ")\n",
+                            vm_path, s->cpu->ninsts);
+    else
+        gemu_monitor_printf(mon, "failed to load snapshot from %s\n", vm_path);
+    return GEMU_MON_NONE;
+}
+
+/* monitor "panel FILE": dump the CPU/MMIO debug front panel (the live
+ * display and default screendump now show real VGA output instead) */
+static GemuMonCmd i2000_cmd_panel(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    char panel_path[256];
+    if (sscanf(args, "%255s", panel_path) != 1) {
+        gemu_monitor_printf(mon, "usage: panel <file>\n");
+        return GEMU_MON_NONE;
     }
-    if (txt && sscanf(txt, "loadvm %255s", vm_path) == 1) {
-        if (i2000_load_snapshot(s, vm_path))
-            printf("loaded snapshot from %s (ninsts=%" PRIu64 ")\n",
-                   vm_path, s->cpu->ninsts);
-        else
-            printf("failed to load snapshot from %s\n", vm_path);
-        return;
+    panel_render(s);
+    if (gemu_screendump_argb(panel_path, s->fb, FB_W, FB_H))
+        gemu_monitor_printf(mon, "wrote debug panel to %s\n", panel_path);
+    else
+        gemu_monitor_printf(mon, "cannot write %s\n", panel_path);
+    return GEMU_MON_NONE;
+}
+
+/* monitor "trace N": stderr-trace the next N executed slots */
+static GemuMonCmd i2000_cmd_trace(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    uint64_t n;
+    if (sscanf(args, "%" SCNu64, &n) != 1) {
+        gemu_monitor_printf(mon, "usage: trace <count>\n");
+        return GEMU_MON_NONE;
     }
-    if (txt && sscanf(txt, "panel %255s", panel_path) == 1) {
-        panel_render(s);
-        if (gemu_screendump_argb(panel_path, s->fb, FB_W, FB_H))
-            printf("wrote debug panel to %s\n", panel_path);
-        else
-            printf("cannot write %s\n", panel_path);
-        return;
+    s->cpu->trace_n = n;
+    gemu_monitor_printf(mon, "tracing next %" PRIu64 " slots to stderr\n", n);
+    return GEMU_MON_NONE;
+}
+
+/* monitor "history [N]": dump the most recently executed slots to stderr */
+static GemuMonCmd i2000_cmd_history(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    (void)mon;
+    unsigned count = 128;
+    (void)sscanf(args, "%u", &count);
+    if (count > MERCED_TRACE_HISTORY) count = MERCED_TRACE_HISTORY;
+    merced_dump_trace(s->cpu, count, stderr);
+    return GEMU_MON_NONE;
+}
+
+/* monitor "calls [N]": dump the recent call history to stderr */
+static GemuMonCmd i2000_cmd_calls(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    (void)mon;
+    unsigned count = MERCED_CALL_HISTORY;
+    if (sscanf(args, "%u", &count) != 1)
+        count = MERCED_CALL_HISTORY;
+    if (count > MERCED_CALL_HISTORY) count = MERCED_CALL_HISTORY;
+    merced_dump_calls(s->cpu, count, stderr);
+    return GEMU_MON_NONE;
+}
+
+/* monitor "mousestate": deliberately dumps to stderr next to the trace */
+static GemuMonCmd i2000_cmd_mousestate(GemuMonitor *mon, const char *args,
+                                       void *ud) {
+    Ia64I2000State *s = ud;
+    (void)mon;
+    (void)args;
+    fprintf(stderr, "i2000: ninsts=%" PRIu64 " ip=%016" PRIx64
+            " psr=%016" PRIx64
+            " psr.i=%d tpr=%016" PRIx64 " tpr.mmi=%d\n",
+            s->cpu->ninsts, s->cpu->ip, s->cpu->psr,
+            !!(s->cpu->psr & (UINT64_C(1) << 14)),
+            s->cpu->cr[66] /* CR_TPR */,
+            !!(s->cpu->cr[66] & (UINT64_C(1) << 16)));
+    merced_dump_trace(s->cpu, 12, stderr);
+    fprintf(stderr, "i2000: mouse_enabled=%d mouse_streaming=%d "
+            "kbc_command_byte=%02x aux_out_len=%u aux_out_pos=%u "
+            "mouse_param_cmd=%02x mouse_prev_left=%d mouse_prev_right=%d "
+            "mouse_accum=(%d,%d) mouse_resolution=%u "
+            "mouse_sample_rate=%u kbc_out_len=%u "
+            "kbc_pending_write=%u\n",
+            s->mouse_enabled, s->mouse_streaming, s->kbc_command_byte,
+            s->aux_out_len, s->aux_out_pos, s->mouse_param_cmd,
+            s->mouse_prev_left, s->mouse_prev_right,
+            s->mouse_accum_dx, s->mouse_accum_dy, s->mouse_resolution,
+            s->mouse_sample_rate, s->kbc_out_len, s->kbc_pending_write);
+    fprintf(stderr, "i2000: iosapic_rte[12]=%016" PRIX64 " masked=%d "
+            "pic_master_mask=%02x pic_slave_mask=%02x\n",
+            s->iosapic_rte[12], !!(s->iosapic_rte[12] & IOSAPIC_RTE_MASK),
+            s->pic_master_mask, s->pic_slave_mask);
+    fflush(stderr);
+    return GEMU_MON_NONE;
+}
+
+/* monitor "mousemove DX DY [left|right]" */
+static GemuMonCmd i2000_cmd_mousemove(GemuMonitor *mon, const char *args,
+                                      void *ud) {
+    Ia64I2000State *s = ud;
+    int mdx = 0, mdy = 0;
+    char mbtn[8] = "";
+    if (sscanf(args, "%d %d %7s", &mdx, &mdy, mbtn) < 2) {
+        gemu_monitor_printf(mon, "usage: mousemove <dx> <dy> [left] [right]\n");
+        return GEMU_MON_NONE;
     }
-    if (txt && sscanf(txt, "trace %" SCNu64, &n) == 1) {
-        s->cpu->trace_n = n;
-        printf("tracing next %" PRIu64 " slots to stderr\n", n);
-        return;
+    /* Synthetic PS/2 packet injection for headless testing - see
+     * um6578's own "mousemove"/"mouse" monitor commands for the
+     * sibling feature. Goes through the exact same aux_queue_byte()/
+     * ExtINT path a real host mouse event would, so this exercises
+     * the full pipeline (packet build, IRQ delivery, ack) without
+     * needing a live display. */
+    if (!s->mouse_enabled) {
+        gemu_monitor_printf(mon, "mousemove: no mouse attached (-device mouse)\n");
+    } else if (!s->mouse_streaming) {
+        gemu_monitor_printf(mon, "mousemove: mouse attached but guest hasn't "
+                            "enabled streaming yet (mouse_streaming=0)\n");
+    } else if (s->aux_out_len != 0 ||
+               s->cpu->ninsts < s->mouse_retry_ninsts) {
+        /* Matches the real per-frame polling path's backpressure
+         * guard (ia64_i2000_run()) - real host mouse motion never
+         * queues a new packet while the previous one is still even
+         * partially undrained or its cooldown hasn't elapsed,
+         * letting the guest fully finish with one report before
+         * being offered the next. */
+        gemu_monitor_printf(mon, "mousemove: previous packet not yet "
+                            "drained/cooled down (aux_out_len=%u), dropped\n",
+                            s->aux_out_len);
+    } else {
+        bool left = strcmp(mbtn, "left") == 0;
+        bool right = strcmp(mbtn, "right") == 0;
+        int dy = -mdy;
+        bool x_overflow = mdx < -127 || mdx > 127;
+        bool y_overflow = dy < -127 || dy > 127;
+        int8_t cdx = (int8_t)(mdx < -127 ? -127 : mdx > 127 ? 127 : mdx);
+        int8_t cdy = (int8_t)(dy < -127 ? -127 : dy > 127 ? 127 : dy);
+        uint8_t flags = (uint8_t)((left ? 0x01 : 0) | (right ? 0x02 : 0) |
+                                  0x08 |
+                                  (cdx < 0 ? 0x10 : 0) | (cdy < 0 ? 0x20 : 0) |
+                                  (x_overflow ? 0x40 : 0) | (y_overflow ? 0x80 : 0));
+        aux_queue_byte(s, flags);
+        aux_queue_byte(s, (uint8_t)cdx);
+        aux_queue_byte(s, (uint8_t)cdy);
+        s->mouse_prev_left = left;
+        s->mouse_prev_right = right;
+        gemu_monitor_printf(mon, "mousemove: dx=%d dy=%d left=%d right=%d queued\n",
+                            mdx, mdy, left, right);
     }
-    if (txt && strncmp(txt, "history", 7) == 0) {
-        unsigned count = 128;
-        (void)sscanf(txt + 7, "%u", &count);
-        if (count > MERCED_TRACE_HISTORY) count = MERCED_TRACE_HISTORY;
-        merced_dump_trace(s->cpu, count, stderr);
-        return;
+    return GEMU_MON_NONE;
+}
+
+/* monitor "mousekick" */
+static GemuMonCmd i2000_cmd_mousekick(GemuMonitor *mon, const char *args,
+                                      void *ud) {
+    Ia64I2000State *s = ud;
+    (void)args;
+    /* Debug-only: unconditionally re-raise IRQ12 if aux_out has any
+     * unread bytes, regardless of the empty->nonempty transition
+     * aux_queue_byte()/the 0x60 read handler normally require. For
+     * recovering a stuck backlog from an old snapshot saved before
+     * mouse_irq_pending existed, not part of the real device model. */
+    if (s->aux_out_pos < s->aux_out_len &&
+        !(s->pic_slave_mask & 0x10) && !(s->pic_master_mask & 0x04)) {
+        s->mouse_irq_pending = true;
+        merced_raise_external(s->cpu, 0);
+        gemu_monitor_printf(mon, "mousekick: re-raised (aux_out_pos=%u "
+                            "aux_out_len=%u)\n",
+                            s->aux_out_pos, s->aux_out_len);
+    } else {
+        gemu_monitor_printf(mon, "mousekick: nothing to do (aux_out_pos=%u "
+                            "aux_out_len=%u pic_slave_mask=%02x "
+                            "pic_master_mask=%02x)\n",
+                            s->aux_out_pos, s->aux_out_len, s->pic_slave_mask,
+                            s->pic_master_mask);
     }
-    if (txt && strncmp(txt, "calls", 5) == 0) {
-        unsigned count = MERCED_CALL_HISTORY;
-        if (sscanf(txt + 5, "%u", &count) != 1)
-            count = MERCED_CALL_HISTORY;
-        if (count > MERCED_CALL_HISTORY) count = MERCED_CALL_HISTORY;
-        merced_dump_calls(s->cpu, count, stderr);
-        return;
+    return GEMU_MON_NONE;
+}
+
+/* monitor "key KEY|TEXT" */
+static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    const char *keyarg = args;
+    if (!keyarg[0]) {
+        gemu_monitor_printf(mon, "usage: key <right|left|up|down|enter|tab|esc|text>\n");
+        return GEMU_MON_NONE;
     }
-    if (txt && strncmp(txt, "mousestate", 10) == 0) {
-        fprintf(stderr, "i2000: ninsts=%" PRIu64 " ip=%016" PRIx64
-                " psr=%016" PRIx64
-                " psr.i=%d tpr=%016" PRIx64 " tpr.mmi=%d\n",
-                s->cpu->ninsts, s->cpu->ip, s->cpu->psr,
-                !!(s->cpu->psr & (UINT64_C(1) << 14)),
-                s->cpu->cr[66] /* CR_TPR */,
-                !!(s->cpu->cr[66] & (UINT64_C(1) << 16)));
-        merced_dump_trace(s->cpu, 12, stderr);
-        fprintf(stderr, "i2000: mouse_enabled=%d mouse_streaming=%d "
-                "kbc_command_byte=%02x aux_out_len=%u aux_out_pos=%u "
-                "mouse_param_cmd=%02x mouse_prev_left=%d mouse_prev_right=%d "
-                "mouse_accum=(%d,%d) mouse_resolution=%u "
-                "mouse_sample_rate=%u kbc_out_len=%u "
-                "kbc_pending_write=%u\n",
-                s->mouse_enabled, s->mouse_streaming, s->kbc_command_byte,
-                s->aux_out_len, s->aux_out_pos, s->mouse_param_cmd,
-                s->mouse_prev_left, s->mouse_prev_right,
-                s->mouse_accum_dx, s->mouse_accum_dy, s->mouse_resolution,
-                s->mouse_sample_rate, s->kbc_out_len, s->kbc_pending_write);
-        fprintf(stderr, "i2000: iosapic_rte[12]=%016" PRIX64 " masked=%d "
-                "pic_master_mask=%02x pic_slave_mask=%02x\n",
-                s->iosapic_rte[12], !!(s->iosapic_rte[12] & IOSAPIC_RTE_MASK),
-                s->pic_master_mask, s->pic_slave_mask);
-        fflush(stderr);
-        return;
-    }
-    {
-        int mdx = 0, mdy = 0;
-        char mbtn[8] = "";
-        int nmatch = txt ? sscanf(txt, "mousemove %d %d %7s", &mdx, &mdy, mbtn) : 0;
-        if (nmatch >= 2) {
-            /* Synthetic PS/2 packet injection for headless testing - see
-             * um6578's own "mousemove"/"mouse" monitor commands for the
-             * sibling feature. Goes through the exact same aux_queue_byte()/
-             * ExtINT path a real host mouse event would, so this exercises
-             * the full pipeline (packet build, IRQ delivery, ack) without
-             * needing a live display. */
-            if (!s->mouse_enabled) {
-                printf("mousemove: no mouse attached (-device mouse)\n");
-            } else if (!s->mouse_streaming) {
-                printf("mousemove: mouse attached but guest hasn't enabled "
-                       "streaming yet (mouse_streaming=0)\n");
-            } else if (s->aux_out_len != 0 ||
-                       s->cpu->ninsts < s->mouse_retry_ninsts) {
-                /* Matches the real per-frame polling path's backpressure
-                 * guard (ia64_i2000_run()) - real host mouse motion never
-                 * queues a new packet while the previous one is still even
-                 * partially undrained or its cooldown hasn't elapsed,
-                 * letting the guest fully finish with one report before
-                 * being offered the next. */
-                printf("mousemove: previous packet not yet drained/cooled "
-                       "down (aux_out_len=%u), dropped\n", s->aux_out_len);
-            } else {
-                bool left = strcmp(mbtn, "left") == 0;
-                bool right = strcmp(mbtn, "right") == 0;
-                int dy = -mdy;
-                bool x_overflow = mdx < -127 || mdx > 127;
-                bool y_overflow = dy < -127 || dy > 127;
-                int8_t cdx = (int8_t)(mdx < -127 ? -127 : mdx > 127 ? 127 : mdx);
-                int8_t cdy = (int8_t)(dy < -127 ? -127 : dy > 127 ? 127 : dy);
-                uint8_t flags = (uint8_t)((left ? 0x01 : 0) | (right ? 0x02 : 0) |
-                                          0x08 |
-                                          (cdx < 0 ? 0x10 : 0) | (cdy < 0 ? 0x20 : 0) |
-                                          (x_overflow ? 0x40 : 0) | (y_overflow ? 0x80 : 0));
-                aux_queue_byte(s, flags);
-                aux_queue_byte(s, (uint8_t)cdx);
-                aux_queue_byte(s, (uint8_t)cdy);
-                s->mouse_prev_left = left;
-                s->mouse_prev_right = right;
-                printf("mousemove: dx=%d dy=%d left=%d right=%d queued\n",
-                       mdx, mdy, left, right);
+    /* Monitor-scripted key injection for headless UI testing - the
+     * -display/-vnc input paths only ever feed kbc_queue_ascii()
+     * printable/control ASCII, so arrows (needed for the graphical
+     * setup's tab bar per its own on-screen instructions) have no
+     * other way in. A non-special argument is typed verbatim, which
+     * permits commands such as "key map -r" at the EFI shell. */
+    uint32_t special = 0;
+    if (!strcmp(keyarg, "right"))     special = 0xff53;
+    else if (!strcmp(keyarg, "left")) special = 0xff51;
+    else if (!strcmp(keyarg, "up"))   special = 0xff52;
+    else if (!strcmp(keyarg, "down")) special = 0xff54;
+    else if (!strcmp(keyarg, "enter")) special = '\r';
+    else if (!strcmp(keyarg, "tab"))   special = '\t';
+    else if (!strcmp(keyarg, "esc"))   special = 0x1b;
+    if (special) {
+        ps2_keyboard_tap(&s->ps2_keyboard, special);
+        /* EFI's built-in shell uses the polled serial console in
+         * this firmware revision (cr.iva remains zero, so it does
+         * not consume PS/2 IRQ1 scan codes).  Real SDL/VNC ASCII
+         * input is mirrored into UART RX; monitor injection must do
+         * the same or `key` appears to succeed while the shell sees
+         * nothing. */
+        if (special <= 0x7f) {
+            uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+            if (next != s->uart_rx_head) {
+                s->uart_rx[s->uart_rx_tail] = (uint8_t)special;
+                s->uart_rx_tail = next;
             }
-            return;
+            i2000_efi_bios_key(s, (uint8_t)special);
         }
-    }
-    if (txt && strncmp(txt, "mousekick", 9) == 0) {
-        /* Debug-only: unconditionally re-raise IRQ12 if aux_out has any
-         * unread bytes, regardless of the empty->nonempty transition
-         * aux_queue_byte()/the 0x60 read handler normally require. For
-         * recovering a stuck backlog from an old snapshot saved before
-         * mouse_irq_pending existed, not part of the real device model. */
-        if (s->aux_out_pos < s->aux_out_len &&
-            !(s->pic_slave_mask & 0x10) && !(s->pic_master_mask & 0x04)) {
-            s->mouse_irq_pending = true;
-            merced_raise_external(s->cpu, 0);
-            printf("mousekick: re-raised (aux_out_pos=%u aux_out_len=%u)\n",
-                   s->aux_out_pos, s->aux_out_len);
-        } else {
-            printf("mousekick: nothing to do (aux_out_pos=%u aux_out_len=%u "
-                   "pic_slave_mask=%02x pic_master_mask=%02x)\n",
-                   s->aux_out_pos, s->aux_out_len, s->pic_slave_mask,
-                   s->pic_master_mask);
-        }
-        return;
-    }
-    {
-        if (txt && strncmp(txt, "key ", 4) == 0 && txt[4]) {
-            const char *keyarg = txt + 4;
-            /* Monitor-scripted key injection for headless UI testing - the
-             * -display/-vnc input paths only ever feed kbc_queue_ascii()
-             * printable/control ASCII, so arrows (needed for the graphical
-             * setup's tab bar per its own on-screen instructions) have no
-             * other way in. A non-special argument is typed verbatim, which
-             * permits commands such as "key map -r" at the EFI shell. */
-            uint32_t special = 0;
-            if (!strcmp(keyarg, "right"))     special = 0xff53;
-            else if (!strcmp(keyarg, "left")) special = 0xff51;
-            else if (!strcmp(keyarg, "up"))   special = 0xff52;
-            else if (!strcmp(keyarg, "down")) special = 0xff54;
-            else if (!strcmp(keyarg, "enter")) special = '\r';
-            else if (!strcmp(keyarg, "tab"))   special = '\t';
-            else if (!strcmp(keyarg, "esc"))   special = 0x1b;
-            if (special) {
-                ps2_keyboard_tap(&s->ps2_keyboard, special);
-                /* EFI's built-in shell uses the polled serial console in
-                 * this firmware revision (cr.iva remains zero, so it does
-                 * not consume PS/2 IRQ1 scan codes).  Real SDL/VNC ASCII
-                 * input is mirrored into UART RX; monitor injection must do
-                 * the same or `key` appears to succeed while the shell sees
-                 * nothing. */
-                if (special <= 0x7f) {
-                    uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
-                    if (next != s->uart_rx_head) {
-                        s->uart_rx[s->uart_rx_tail] = (uint8_t)special;
-                        s->uart_rx_tail = next;
-                    }
-                    i2000_efi_bios_key(s, (uint8_t)special);
-                }
-                printf("key %s queued\n", keyarg);
-            } else {
-                size_t queued = 0;
-                for (const unsigned char *p = (const unsigned char *)keyarg;
-                     *p; p++) {
-                    if (*p < 0x20 || *p > 0x7e)
-                        continue;
-                    ps2_keyboard_tap(&s->ps2_keyboard, *p);
-                    uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
-                    if (next != s->uart_rx_head) {
-                        s->uart_rx[s->uart_rx_tail] = *p;
-                        s->uart_rx_tail = next;
-                    }
-                    i2000_efi_bios_key(s, *p);
-                    queued++;
-                }
-                printf("key: queued %zu character%s; use 'key enter' to "
-                       "submit\n", queued, queued == 1 ? "" : "s");
+        gemu_monitor_printf(mon, "key %s queued\n", keyarg);
+    } else {
+        size_t queued = 0;
+        for (const unsigned char *p = (const unsigned char *)keyarg;
+             *p; p++) {
+            if (*p < 0x20 || *p > 0x7e)
+                continue;
+            ps2_keyboard_tap(&s->ps2_keyboard, *p);
+            uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+            if (next != s->uart_rx_head) {
+                s->uart_rx[s->uart_rx_tail] = *p;
+                s->uart_rx_tail = next;
             }
-            return;
+            i2000_efi_bios_key(s, *p);
+            queued++;
         }
+        gemu_monitor_printf(mon, "key: queued %zu character%s; use 'key enter' "
+                            "to submit\n", queued, queued == 1 ? "" : "s");
     }
-    {
-        uint64_t daddr, dlen;
-        char path[256];
-        if (txt && sscanf(txt, "dump %" SCNx64 " %" SCNx64 " %255s",
-                          &daddr, &dlen, path) == 3) {
-            FILE *f = fopen(path, "wb");
-            if (!f) { printf("cannot open %s\n", path); return; }
-            for (uint64_t i = 0; i < dlen; i++) {
-                uint8_t b = (uint8_t)bus_read(s, daddr + i, 1);
-                fwrite(&b, 1, 1, f);
-            }
-            fclose(f);
-            printf("dumped 0x%" PRIX64 " bytes from 0x%" PRIX64 " to %s\n",
-                   dlen, daddr, path);
-            return;
-        }
+    return GEMU_MON_NONE;
+}
+
+/* monitor "dump ADDR LEN FILE" (both hex): physical memory to a file.
+ * Uses the side-effect-free memory view; bytes it can't read safely
+ * (MMIO, I/O ports) are written as 0xFF, like an unmapped bus read. */
+static GemuMonCmd i2000_cmd_dump(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    uint64_t daddr, dlen;
+    char path[256];
+    if (sscanf(args, "%" SCNx64 " %" SCNx64 " %255s", &daddr, &dlen, path) != 3) {
+        gemu_monitor_printf(mon, "usage: dump <addr> <len> <file>\n");
+        return GEMU_MON_NONE;
     }
-    if (txt && strncmp(txt, "vhptstats", 9) == 0) {
-        uint64_t calls, disabled, hit, unmapped, tagfail, np;
-        merced_vhpt_stats(&calls, &disabled, &hit, &unmapped, &tagfail, &np);
-        printf("vhpt: calls=%" PRIu64 " disabled=%" PRIu64 " hit=%" PRIu64
-               " unmapped=%" PRIu64 " tagfail=%" PRIu64 " np=%" PRIu64 "\n",
-               calls, disabled, hit, unmapped, tagfail, np);
-        return;
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        gemu_monitor_printf(mon, "cannot open %s\n", path);
+        return GEMU_MON_NONE;
     }
-    if (txt && strncmp(txt, "faultstats", 10) == 0) {
-        uint64_t counts[0x5B] = {0};
-        merced_fault_stats(counts, sizeof(counts) / sizeof(counts[0]));
-        static const struct { unsigned slot; const char *name; } vectors[] = {
-            { 0x00, "vhpt" }, { 0x04, "itlb" }, { 0x08, "dtlb" },
-            { 0x0c, "alt-itlb" }, { 0x10, "alt-dtlb" },
-            { 0x14, "nested-dtlb" }, { 0x20, "dirty" },
-            { 0x24, "iaccess" }, { 0x28, "daccess" },
-            { 0x2c, "break" }, { 0x30, "extint" },
-            { 0x50, "page-not-present" }, { 0x54, "general" },
-            { 0x56, "nat" }, { 0x57, "spec" }, { 0x5a, "unaligned" },
-        };
-        printf("faults:");
-        for (unsigned i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++)
-            if (counts[vectors[i].slot])
-                printf(" %s=%" PRIu64, vectors[i].name,
-                       counts[vectors[i].slot]);
-        printf("\n");
-        return;
+    for (uint64_t i = 0; i < dlen; i++) {
+        uint8_t b;
+        if (!i2000_mon_read(s, daddr + i, &b))
+            b = 0xFF;
+        fwrite(&b, 1, 1, f);
     }
-    if (txt && strncmp(txt, "atapistate", 10) == 0) {
-        printf("atapi: status=%#04x error=%#04x count=%#04x device=%#04x "
-               "irq_pending=%u irq_ready=%" PRIu64 " status_pending=%u "
-               "status_ready=%" PRIu64 " ready_status=%#04x ready_irq=%u "
-               "data=%zu/%zu phase_end=%zu ninsts=%" PRIu64 "\n",
-               s->atapi_status, s->atapi_error, s->atapi_count,
-               s->atapi_device, s->atapi_irq_pending,
-               s->atapi_irq_ready_ninsts, s->atapi_status_pending,
-               s->atapi_status_ready_ninsts, s->atapi_ready_status,
-               s->atapi_ready_irq, s->atapi_data_pos, s->atapi_data_len,
-               s->atapi_phase_end, s->cpu->ninsts);
-        return;
-    }
-    if (txt && sscanf(txt, "x %" SCNx64 " %d", &addr, &count) >= 1) {
-        if (count > 1024) count = 1024;
-        for (int i = 0; i < count; i += 16) {
-            printf("%012" PRIX64 ": ", addr + (uint64_t)i);
-            for (int j = 0; j < 16 && i + j < count; j++)
-                printf("%02X ", (unsigned)bus_read(s, addr + (uint64_t)(i + j), 1));
-            printf("\n");
-        }
-        return;
-    }
-    gemu_monitor_unknown_command(s->monitor);
+    fclose(f);
+    gemu_monitor_printf(mon, "dumped 0x%" PRIX64 " bytes from 0x%" PRIX64 " to %s\n",
+                        dlen, daddr, path);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd i2000_cmd_vhptstats(GemuMonitor *mon, const char *args,
+                                      void *ud) {
+    (void)args;
+    (void)ud;
+    uint64_t calls, disabled, hit, unmapped, tagfail, np;
+    merced_vhpt_stats(&calls, &disabled, &hit, &unmapped, &tagfail, &np);
+    gemu_monitor_printf(mon, "vhpt: calls=%" PRIu64 " disabled=%" PRIu64
+                        " hit=%" PRIu64 " unmapped=%" PRIu64 " tagfail=%" PRIu64
+                        " np=%" PRIu64 "\n",
+                        calls, disabled, hit, unmapped, tagfail, np);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd i2000_cmd_faultstats(GemuMonitor *mon, const char *args,
+                                       void *ud) {
+    (void)args;
+    (void)ud;
+    uint64_t counts[0x5B] = {0};
+    merced_fault_stats(counts, sizeof(counts) / sizeof(counts[0]));
+    static const struct { unsigned slot; const char *name; } vectors[] = {
+        { 0x00, "vhpt" }, { 0x04, "itlb" }, { 0x08, "dtlb" },
+        { 0x0c, "alt-itlb" }, { 0x10, "alt-dtlb" },
+        { 0x14, "nested-dtlb" }, { 0x20, "dirty" },
+        { 0x24, "iaccess" }, { 0x28, "daccess" },
+        { 0x2c, "break" }, { 0x30, "extint" },
+        { 0x50, "page-not-present" }, { 0x54, "general" },
+        { 0x56, "nat" }, { 0x57, "spec" }, { 0x5a, "unaligned" },
+    };
+    gemu_monitor_printf(mon, "faults:");
+    for (unsigned i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++)
+        if (counts[vectors[i].slot])
+            gemu_monitor_printf(mon, " %s=%" PRIu64, vectors[i].name,
+                                counts[vectors[i].slot]);
+    gemu_monitor_printf(mon, "\n");
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd i2000_cmd_atapistate(GemuMonitor *mon, const char *args,
+                                       void *ud) {
+    Ia64I2000State *s = ud;
+    (void)args;
+    gemu_monitor_printf(mon, "atapi: status=%#04x error=%#04x count=%#04x "
+           "device=%#04x irq_pending=%u irq_ready=%" PRIu64 " status_pending=%u "
+           "status_ready=%" PRIu64 " ready_status=%#04x ready_irq=%u "
+           "data=%zu/%zu phase_end=%zu ninsts=%" PRIu64 "\n",
+           s->atapi_status, s->atapi_error, s->atapi_count,
+           s->atapi_device, s->atapi_irq_pending,
+           s->atapi_irq_ready_ninsts, s->atapi_status_pending,
+           s->atapi_status_ready_ninsts, s->atapi_ready_status,
+           s->atapi_ready_irq, s->atapi_data_pos, s->atapi_data_len,
+           s->atapi_phase_end, s->cpu->ninsts);
+    return GEMU_MON_NONE;
+}
+
+static void i2000_monitor_setup(Ia64I2000State *s) {
+    GemuMonitor *mon = s->monitor;
+    gemu_monitor_bind(mon, "input",      i2000_cmd_input, s);
+    gemu_monitor_bind(mon, "savevm",     i2000_cmd_savevm, s);
+    gemu_monitor_bind(mon, "loadvm",     i2000_cmd_loadvm, s);
+    gemu_monitor_bind(mon, "panel",      i2000_cmd_panel, s);
+    gemu_monitor_bind(mon, "trace",      i2000_cmd_trace, s);
+    gemu_monitor_bind(mon, "history",    i2000_cmd_history, s);
+    gemu_monitor_bind(mon, "calls",      i2000_cmd_calls, s);
+    gemu_monitor_bind(mon, "mousestate", i2000_cmd_mousestate, s);
+    gemu_monitor_bind(mon, "mousemove",  i2000_cmd_mousemove, s);
+    gemu_monitor_bind(mon, "mousekick",  i2000_cmd_mousekick, s);
+    gemu_monitor_bind(mon, "key",        i2000_cmd_key, s);
+    gemu_monitor_bind(mon, "dump",       i2000_cmd_dump, s);
+    gemu_monitor_bind(mon, "vhptstats",  i2000_cmd_vhptstats, s);
+    gemu_monitor_bind(mon, "faultstats", i2000_cmd_faultstats, s);
+    gemu_monitor_bind(mon, "atapistate", i2000_cmd_atapistate, s);
+    gemu_monitor_set_memory(mon, &(GemuMonMemory){
+        .read = i2000_mon_read, .write = i2000_mon_write, .ud = s,
+        .addr_bits = 64, .big_endian = false });
 }
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
@@ -4578,6 +4795,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
         return NULL;
     }
     s->monitor = gemu_monitor_create();
+    i2000_monitor_setup(s);
     gemu_monitor_set_cpu_state_cb(s->monitor, i2000_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, i2000_screendump, s);
 
@@ -5186,6 +5404,12 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             }
         }
 
+        /* Monitor commands run inside gemu_monitor_poll(); snapshot I/O
+         * (savevm/loadvm) can block for several seconds with 2 GiB of guest
+         * RAM.  That host maintenance time is not guest time: counting it
+         * on the next loop can expire an EFI menu timer immediately after
+         * loadvm/savevm returns, so exclude it from the ITC below. */
+        uint64_t mon_start_ns = i2000_monotonic_ns();
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
             switch (cmd) {
@@ -5218,20 +5442,13 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                 fputs(buf, stdout);
                 break;
             }
-            case GEMU_MON_CUSTOM:
-                i2000_custom_cmd(s);
-                /* Snapshot I/O can block for several seconds with 2 GiB of
-                 * guest RAM.  That host maintenance time is not guest time:
-                 * counting it on the next loop can expire an EFI menu timer
-                 * immediately after loadvm/savevm returns. */
-                itc_last_ns = i2000_monotonic_ns();
-                break;
             default:
                 break;
             }
             if (!running)
                 break;
         }
+        itc_last_ns += i2000_monotonic_ns() - mon_start_ns;
         if (!running)
             break;
 

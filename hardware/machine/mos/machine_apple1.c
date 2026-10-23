@@ -697,31 +697,26 @@ static bool apple1_sendkey_token(Apple1State *s, const char *tok) {
     return false;
 }
 
-static bool apple1_sendkey(Apple1State *s, const char *text) {
-    while (*text == ' ' || *text == '\t') text++;
-    if (strncasecmp(text, "sendkey", 7) != 0 ||
-        (text[7] != '\0' && text[7] != ' ' && text[7] != '\t'))
-        return false;
-    const char *p = text + 7;
-    while (*p == ' ' || *p == '\t') p++;
-    if (!*p) {
-        printf("sendkey: usage: sendkey a-b-c-enter | reset | cls\n");
-        return true;
+static GemuMonCmd apple1_cmd_sendkey(GemuMonitor *mon, const char *args, void *ud) {
+    Apple1State *s = ud;
+    if (!*args) {
+        gemu_monitor_printf(mon, "sendkey: usage: sendkey a-b-c-enter | reset | cls\n");
+        return GEMU_MON_NONE;
     }
 
     char seq[256];
-    snprintf(seq, sizeof(seq), "%s", p);
+    snprintf(seq, sizeof(seq), "%s", args);
     char *tok = seq;
     while (tok && *tok) {
         char *next = strchr(tok, '-');
         if (next) *next++ = '\0';
         if (!apple1_sendkey_token(s, tok)) {
-            printf("sendkey: unknown key '%s'\n", tok);
-            return true;
+            gemu_monitor_printf(mon, "sendkey: unknown key '%s'\n", tok);
+            return GEMU_MON_NONE;
         }
         tok = next;
     }
-    return true;
+    return GEMU_MON_NONE;
 }
 
 static GemuMediaResult apple1_tape_change(void *ud, const char *arg,
@@ -869,6 +864,33 @@ static void apple1_write(uint16_t addr, uint8_t val, void *ud) {
         s->mem[addr] = val;
 }
 
+/* Monitor memory view: RAM and ROM as the CPU sees them.  The PIA keyboard
+ * register is reported without clearing the key-ready flag. */
+static bool apple1_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    Apple1State *s = ud;
+    if (addr > 0xFFFF) return false;
+    if (addr == APPLE1_KBD)   { *val = s->key_ready ? s->key_data : 0; return true; }
+    if (addr == APPLE1_KBDCR) { *val = s->key_ready ? 0x80u : 0x00u;   return true; }
+    if (addr == APPLE1_DSPCR) { *val = 0x80u; return true; }
+    *val = apple1_peek_mem(s, (uint16_t)addr);
+    return true;
+}
+
+/* Writes go to RAM only (not ROM or the PIA). */
+static bool apple1_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    Apple1State *s = ud;
+    if (addr > 0xFFFF) return false;
+    if (addr >= APPLE1_KBD && addr <= APPLE1_DSPCR) return false;
+    if (s->rom_map[addr] || addr >= s->ram_size) return false;
+    s->mem[addr] = val;
+    return true;
+}
+
+static void apple1_mon_cpu_state(void *ud, char *buf, size_t len) {
+    const Apple1State *s = ud;
+    mos6502_format_state(&s->cpu, buf, len);
+}
+
 static bool apple1_load_roms(Apple1State *s, const MosConfig *cfg) {
     for (int i = 0; i < cfg->n_roms; i++) {
         const char *region = cfg->roms[i].region;
@@ -955,6 +977,11 @@ Apple1State *apple1_create(const MosConfig *cfg) {
         return NULL;
     }
     gemu_monitor_set_screendump_cb(s->monitor, apple1_screendump, s);
+    gemu_monitor_bind(s->monitor, "sendkey", apple1_cmd_sendkey, s);
+    gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
+        .read = apple1_mon_read, .write = apple1_mon_write, .ud = s,
+        .addr_bits = 16, .big_endian = false });
+    gemu_monitor_set_cpu_state_cb(s->monitor, apple1_mon_cpu_state, s);
 
     s->display = apple1_display_create(cfg);
     if (cfg->display_type != GEMU_DISPLAY_NONE && !s->display)
@@ -1063,9 +1090,10 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
                 else { quit = true; break; }
             } else if (cmd == GEMU_MON_RESET) {
                 apple1_reset_machine(s);
-            } else if (cmd == GEMU_MON_CUSTOM) {
-                if (!apple1_sendkey(s, gemu_monitor_command_text(s->monitor)))
-                    gemu_monitor_unknown_command(s->monitor);
+            } else if (cmd == GEMU_MON_STEP) {
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
+                    if (!apple1_romless_woz_trap(s))
+                        mos6502_step(&s->cpu);
             }
         }
 

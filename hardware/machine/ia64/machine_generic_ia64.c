@@ -1717,150 +1717,204 @@ static bool generic_screendump(void *ud, const char *path) {
     return gemu_screendump_argb(path, s->fb, FB_W, FB_H);
 }
 
-static void generic_custom_cmd(Ia64GenericState *s) {
-    const char *txt = gemu_monitor_command_text(s->monitor);
+/* ── Monitor memory view and commands ────────────────────────────────────── */
+
+/* x/xp/peek/poke/memsave see guest RAM only; everything else reads as "--". */
+static bool generic_mon_read(void *ud, uint64_t addr, uint8_t *val) {
+    Ia64GenericState *s = ud;
+    if (addr >= s->ram_size) return false;
+    *val = s->ram[addr];
+    return true;
+}
+
+static bool generic_mon_write(void *ud, uint64_t addr, uint8_t val) {
+    Ia64GenericState *s = ud;
+    if (addr >= s->ram_size) return false;
+    s->ram[addr] = val;
+    return true;
+}
+
+/* monitor "trace N": stderr-trace the next N executed slots */
+static GemuMonCmd generic_cmd_trace(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64GenericState *s = ud;
     uint64_t n;
-    if (txt && sscanf(txt, "trace %" SCNu64, &n) == 1) {
-        s->cpu->trace_n = n;
-        printf("tracing next %" PRIu64 " slots to stderr\n", n);
-        return;
+    if (sscanf(args, "%" SCNu64, &n) != 1) {
+        gemu_monitor_printf(mon, "usage: trace <count>\n");
+        return GEMU_MON_NONE;
     }
-    if (txt && strncmp(txt, "history", 7) == 0) {
-        unsigned count = 128;
-        (void)sscanf(txt + 7, "%u", &count);
-        if (count > MERCED_TRACE_HISTORY) count = MERCED_TRACE_HISTORY;
-        merced_dump_trace(s->cpu, count, stderr);
-        return;
+    s->cpu->trace_n = n;
+    gemu_monitor_printf(mon, "tracing next %" PRIu64 " slots to stderr\n", n);
+    return GEMU_MON_NONE;
+}
+
+/* monitor "history [N]": dump the most recently executed slots to stderr */
+static GemuMonCmd generic_cmd_history(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64GenericState *s = ud;
+    (void)mon;
+    unsigned count = 128;
+    (void)sscanf(args, "%u", &count);
+    if (count > MERCED_TRACE_HISTORY) count = MERCED_TRACE_HISTORY;
+    merced_dump_trace(s->cpu, count, stderr);
+    return GEMU_MON_NONE;
+}
+
+/* monitor "calls": dump the full call history to stderr */
+static GemuMonCmd generic_cmd_calls(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64GenericState *s = ud;
+    (void)mon;
+    (void)args;
+    merced_dump_calls(s->cpu, MERCED_CALL_HISTORY, stderr);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd generic_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64GenericState *s = ud;
+    const char *arg = args;
+    if (s->qemu_firmware) {
+        if (strcmp(arg, "enter") == 0) uart_rx_push(s, '\r');
+        else if (strcmp(arg, "space") == 0) uart_rx_push(s, ' ');
+        else if (strcmp(arg, "escape") == 0) uart_rx_push(s, 0x1b);
+        else if (arg[0] != '\0' && arg[1] == '\0')
+            uart_rx_push(s, (uint8_t)arg[0]);
+        else
+            gemu_monitor_printf(mon, "usage: key <character|space|enter|escape>\n");
+    } else if (strcmp(arg, "up") == 0) {
+        kbd_push(s, GENERIC_KBD_KEY_UP);
+    } else if (strcmp(arg, "down") == 0) {
+        kbd_push(s, GENERIC_KBD_KEY_DOWN);
+    } else if (strcmp(arg, "enter") == 0) {
+        kbd_push(s, GENERIC_KBD_KEY_ENTER);
+    } else {
+        gemu_monitor_printf(mon, "usage: key <up|down|enter>\n");
     }
-    if (txt && strncmp(txt, "calls", 5) == 0) {
-        merced_dump_calls(s->cpu, MERCED_CALL_HISTORY, stderr);
-        return;
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd generic_cmd_regpoke(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64GenericState *s = ud;
+    unsigned reg;
+    uint64_t val;
+    if (sscanf(args, "%u %" SCNx64, &reg, &val) == 2 && reg < 128) {
+        merced_ia32_gr_write(s->cpu, reg, val);
+        gemu_monitor_printf(mon, "regpoke r%u = 0x%" PRIx64 "\n", reg, val);
+    } else {
+        gemu_monitor_printf(mon, "regpoke: bad args (usage: regpoke <regnum> <hexvalue>)\n");
     }
-    if (txt && strncmp(txt, "key ", 4) == 0) {
-        const char *arg = txt + 4;
-        if (s->qemu_firmware) {
-            if (strcmp(arg, "enter") == 0) uart_rx_push(s, '\r');
-            else if (strcmp(arg, "space") == 0) uart_rx_push(s, ' ');
-            else if (strcmp(arg, "escape") == 0) uart_rx_push(s, 0x1b);
-            else if (arg[0] != '\0' && arg[1] == '\0')
-                uart_rx_push(s, (uint8_t)arg[0]);
-            else
-                printf("usage: key <character|space|enter|escape>\n");
-        } else if (strcmp(arg, "up") == 0) {
-            kbd_push(s, GENERIC_KBD_KEY_UP);
-        } else if (strcmp(arg, "down") == 0) {
-            kbd_push(s, GENERIC_KBD_KEY_DOWN);
-        } else if (strcmp(arg, "enter") == 0) {
-            kbd_push(s, GENERIC_KBD_KEY_ENTER);
-        } else {
-            printf("usage: key <up|down|enter>\n");
-        }
-        return;
+    return GEMU_MON_NONE;
+}
+
+/* monitor "dump ADDR LEN FILE" (both hex): guest RAM to a file */
+static GemuMonCmd generic_cmd_dump(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64GenericState *s = ud;
+    uint64_t daddr, dlen;
+    char path[256];
+    if (sscanf(args, "%" SCNx64 " %" SCNx64 " %255s", &daddr, &dlen, path) != 3) {
+        gemu_monitor_printf(mon, "usage: dump <addr> <len> <file>\n");
+        return GEMU_MON_NONE;
     }
-    if (txt && strncmp(txt, "peek ", 5) == 0) {
-        uint64_t addr = strtoull(txt + 5, NULL, 16);
-        if (addr + 8 <= s->ram_size) {
-            uint64_t v;
-            memcpy(&v, s->ram + addr, 8);
-            printf("peek 0x%" PRIx64 " = 0x%016" PRIx64 "\n", addr, v);
-        } else {
-            printf("peek: address out of range\n");
-        }
-        return;
+    if (daddr + dlen > s->ram_size) {
+        gemu_monitor_printf(mon, "dump: range out of bounds\n");
+        return GEMU_MON_NONE;
     }
-    if (txt && strncmp(txt, "poke1 ", 6) == 0) {
-        uint64_t addr, val;
-        if (sscanf(txt + 6, "%" SCNx64 " %" SCNx64, &addr, &val) == 2 &&
-            addr < s->ram_size) {
-            s->ram[addr] = (uint8_t)val;
-            printf("poke1 0x%" PRIx64 " = 0x%02x\n", addr, (unsigned)(uint8_t)val);
-        } else {
-            printf("poke1: bad args or address out of range\n");
-        }
-        return;
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        gemu_monitor_printf(mon, "cannot open %s\n", path);
+        return GEMU_MON_NONE;
     }
-    if (txt && strncmp(txt, "regpoke ", 8) == 0) {
-        unsigned reg;
-        uint64_t val;
-        if (sscanf(txt + 8, "%u %" SCNx64, &reg, &val) == 2 && reg < 128) {
-            merced_ia32_gr_write(s->cpu, reg, val);
-            printf("regpoke r%u = 0x%" PRIx64 "\n", reg, val);
-        } else {
-            printf("regpoke: bad args (usage: regpoke <regnum> <hexvalue>)\n");
-        }
-        return;
+    fwrite(s->ram + daddr, 1, dlen, f);
+    fclose(f);
+    gemu_monitor_printf(mon, "dumped 0x%" PRIX64 " bytes from 0x%" PRIX64 " to %s\n",
+                        dlen, daddr, path);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd generic_cmd_vhptstats(GemuMonitor *mon, const char *args,
+                                        void *ud) {
+    (void)args;
+    (void)ud;
+    uint64_t calls, disabled, hit, unmapped, tagfail, np;
+    merced_vhpt_stats(&calls, &disabled, &hit, &unmapped, &tagfail, &np);
+    gemu_monitor_printf(mon, "vhpt: calls=%" PRIu64 " disabled=%" PRIu64
+                        " hit=%" PRIu64 " unmapped=%" PRIu64 " tagfail=%" PRIu64
+                        " np=%" PRIu64 "\n",
+                        calls, disabled, hit, unmapped, tagfail, np);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd generic_cmd_faultstats(GemuMonitor *mon, const char *args,
+                                         void *ud) {
+    (void)args;
+    (void)ud;
+    uint64_t counts[0x5B] = {0};
+    merced_fault_stats(counts, sizeof(counts) / sizeof(counts[0]));
+    static const struct { unsigned slot; const char *name; } vectors[] = {
+        { 0x00, "vhpt" }, { 0x04, "itlb" }, { 0x08, "dtlb" },
+        { 0x0c, "alt-itlb" }, { 0x10, "alt-dtlb" },
+        { 0x14, "nested-dtlb" }, { 0x20, "dirty" },
+        { 0x24, "iaccess" }, { 0x28, "daccess" },
+        { 0x2c, "break" }, { 0x30, "extint" },
+        { 0x50, "page-not-present" }, { 0x54, "general" },
+        { 0x56, "nat" }, { 0x57, "spec" }, { 0x5a, "unaligned" },
+    };
+    gemu_monitor_printf(mon, "faults:");
+    for (unsigned i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++)
+        if (counts[vectors[i].slot])
+            gemu_monitor_printf(mon, " %s=%" PRIu64, vectors[i].name,
+                                counts[vectors[i].slot]);
+    gemu_monitor_printf(mon, "\n");
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd generic_cmd_vgareg(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64GenericState *s = ud;
+    (void)args;
+    gemu_monitor_printf(mon, "vga: misc_output=%02x text_mode=%d mode_set=%d\n",
+                        s->vga.misc_output, vga_ibm_is_text_mode(&s->vga),
+                        vga_ibm_mode_set(&s->vga));
+    gemu_monitor_printf(mon, "seq[0-7]:");
+    for (int i = 0; i < 8; i++) gemu_monitor_printf(mon, " %02x", s->vga.seq[i]);
+    gemu_monitor_printf(mon, "\n");
+    gemu_monitor_printf(mon, "gc[0-15]:");
+    for (int i = 0; i < 16; i++) gemu_monitor_printf(mon, " %02x", s->vga.gc[i]);
+    gemu_monitor_printf(mon, "\n");
+    gemu_monitor_printf(mon, "crtc[0-31]:");
+    for (int i = 0; i < 32; i++) gemu_monitor_printf(mon, " %02x", s->vga.crtc[i]);
+    gemu_monitor_printf(mon, "\n");
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd generic_cmd_vgapeek(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64GenericState *s = ud;
+    unsigned plane;
+    unsigned off;
+    unsigned count;
+    if (sscanf(args, "%u %x %u", &plane, &off, &count) == 3 &&
+        plane < 4 && count <= 256) {
+        gemu_monitor_printf(mon, "vgapeek plane=%u off=0x%x:", plane, off);
+        for (unsigned i = 0; i < count; i++)
+            gemu_monitor_printf(mon, " %02x", s->vga.vram[plane][off + i]);
+        gemu_monitor_printf(mon, "\n");
+    } else {
+        gemu_monitor_printf(mon, "usage: vgapeek <plane 0-3> <hex offset> <count>\n");
     }
-    {
-        uint64_t daddr, dlen;
-        char path[256];
-        if (txt && sscanf(txt, "dump %" SCNx64 " %" SCNx64 " %255s",
-                          &daddr, &dlen, path) == 3) {
-            if (daddr + dlen > s->ram_size) {
-                printf("dump: range out of bounds\n");
-                return;
-            }
-            FILE *f = fopen(path, "wb");
-            if (!f) { printf("cannot open %s\n", path); return; }
-            fwrite(s->ram + daddr, 1, dlen, f);
-            fclose(f);
-            printf("dumped 0x%" PRIX64 " bytes from 0x%" PRIX64 " to %s\n",
-                   dlen, daddr, path);
-            return;
-        }
-    }
-    if (txt && strncmp(txt, "vhptstats", 9) == 0) {
-        uint64_t calls, disabled, hit, unmapped, tagfail, np;
-        merced_vhpt_stats(&calls, &disabled, &hit, &unmapped, &tagfail, &np);
-        printf("vhpt: calls=%" PRIu64 " disabled=%" PRIu64 " hit=%" PRIu64
-               " unmapped=%" PRIu64 " tagfail=%" PRIu64 " np=%" PRIu64 "\n",
-               calls, disabled, hit, unmapped, tagfail, np);
-        return;
-    }
-    if (txt && strncmp(txt, "faultstats", 10) == 0) {
-        uint64_t counts[0x5B] = {0};
-        merced_fault_stats(counts, sizeof(counts) / sizeof(counts[0]));
-        static const struct { unsigned slot; const char *name; } vectors[] = {
-            { 0x00, "vhpt" }, { 0x04, "itlb" }, { 0x08, "dtlb" },
-            { 0x0c, "alt-itlb" }, { 0x10, "alt-dtlb" },
-            { 0x14, "nested-dtlb" }, { 0x20, "dirty" },
-            { 0x24, "iaccess" }, { 0x28, "daccess" },
-            { 0x2c, "break" }, { 0x30, "extint" },
-            { 0x50, "page-not-present" }, { 0x54, "general" },
-            { 0x56, "nat" }, { 0x57, "spec" }, { 0x5a, "unaligned" },
-        };
-        printf("faults:");
-        for (unsigned i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++)
-            if (counts[vectors[i].slot])
-                printf(" %s=%" PRIu64, vectors[i].name,
-                       counts[vectors[i].slot]);
-        printf("\n");
-        return;
-    }
-    if (txt && strncmp(txt, "vgareg", 6) == 0) {
-        printf("vga: misc_output=%02x text_mode=%d mode_set=%d\n",
-               s->vga.misc_output, vga_ibm_is_text_mode(&s->vga),
-               vga_ibm_mode_set(&s->vga));
-        printf("seq[0-7]:"); for (int i=0;i<8;i++) printf(" %02x", s->vga.seq[i]); printf("\n");
-        printf("gc[0-15]:"); for (int i=0;i<16;i++) printf(" %02x", s->vga.gc[i]); printf("\n");
-        printf("crtc[0-31]:"); for (int i=0;i<32;i++) printf(" %02x", s->vga.crtc[i]); printf("\n");
-        return;
-    }
-    if (txt && strncmp(txt, "vgapeek ", 8) == 0) {
-        unsigned plane;
-        unsigned off;
-        unsigned count;
-        if (sscanf(txt + 8, "%u %x %u", &plane, &off, &count) == 3 &&
-            plane < 4 && count <= 256) {
-            printf("vgapeek plane=%u off=0x%x:", plane, off);
-            for (unsigned i = 0; i < count; i++)
-                printf(" %02x", s->vga.vram[plane][off + i]);
-            printf("\n");
-        } else {
-            printf("usage: vgapeek <plane 0-3> <hex offset> <count>\n");
-        }
-        return;
-    }
-    gemu_monitor_unknown_command(s->monitor);
+    return GEMU_MON_NONE;
+}
+
+static void generic_monitor_setup(Ia64GenericState *s) {
+    GemuMonitor *mon = s->monitor;
+    gemu_monitor_bind(mon, "trace",      generic_cmd_trace, s);
+    gemu_monitor_bind(mon, "history",    generic_cmd_history, s);
+    gemu_monitor_bind(mon, "calls",      generic_cmd_calls, s);
+    gemu_monitor_bind(mon, "key",        generic_cmd_key, s);
+    gemu_monitor_bind(mon, "regpoke",    generic_cmd_regpoke, s);
+    gemu_monitor_bind(mon, "dump",       generic_cmd_dump, s);
+    gemu_monitor_bind(mon, "vhptstats",  generic_cmd_vhptstats, s);
+    gemu_monitor_bind(mon, "faultstats", generic_cmd_faultstats, s);
+    gemu_monitor_bind(mon, "vgareg",     generic_cmd_vgareg, s);
+    gemu_monitor_bind(mon, "vgapeek",    generic_cmd_vgapeek, s);
+    gemu_monitor_set_memory(mon, &(GemuMonMemory){
+        .read = generic_mon_read, .write = generic_mon_write, .ud = s,
+        .addr_bits = 64, .big_endian = false });
 }
 
 static void generic_report_halt(Ia64GenericState *s) {
@@ -1914,6 +1968,7 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
         merced_set_cpu_model(s->cpu, 1);
 
     s->monitor = gemu_monitor_create();
+    generic_monitor_setup(s);
     gemu_monitor_set_cpu_state_cb(s->monitor, generic_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, generic_screendump, s);
 
@@ -2075,9 +2130,6 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
                 fputs(buf, stdout);
                 break;
             }
-            case GEMU_MON_CUSTOM:
-                generic_custom_cmd(s);
-                break;
             default:
                 break;
             }
