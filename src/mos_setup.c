@@ -768,10 +768,12 @@ int mos_setup(int argc, char *argv[]) {
     Vt100State *vt100 = NULL;
     GemuSerial  vt100_serial;
     if (want_vt100) {
-        const char *vt_title = cfg.machine == MOS_MACHINE_APPLE1 ? "GEMU"
-                             : cfg.want_wozmon ? "GEMU (Wozniak Monitor)"
-                             : NULL;
-        vt100 = vt100_create(cfg.display_type, vt_title);
+        /* The Apple I does all its I/O through the terminal, so it's the main
+         * window there; elsewhere it's a serial console beside the machine's. */
+        const char *vt_role = cfg.machine == MOS_MACHINE_APPLE1 ? NULL
+                            : cfg.want_wozmon ? "Wozniak Monitor"
+                            : "VT100 Terminal";
+        vt100 = vt100_create(cfg.display_type, vt_role);
         if (!vt100) { SDL_Quit(); return 1; }
         vt100_as_serial(vt100, &vt100_serial);
         cfg.serial = &vt100_serial;

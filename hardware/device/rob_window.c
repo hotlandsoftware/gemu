@@ -1,4 +1,5 @@
 #include "rob_window.h"
+#include "gemu/gemu_display.h"
 #include <epoxy/gl.h>
 #include <assimp/cimport.h>
 #include <assimp/scene.h>
@@ -455,7 +456,9 @@ RobWindow *rob_window_create(const char *model_dir, bool famicom_skin) {
 
     RobWindow *w = calloc(1, sizeof *w);
     w->famicom_skin = famicom_skin;
-    w->win = SDL_CreateWindow("GEMU (R.O.B. Display)", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+    char title[200];
+    gemu_window_title(title, sizeof(title), "R.O.B. Display", false);
+    w->win = SDL_CreateWindow(title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
                               ROB_WIN_W, ROB_WIN_H, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
     if (!w->win) {
         fprintf(stderr, "rob: SDL_CreateWindow: %s\n", SDL_GetError());

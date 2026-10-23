@@ -13,6 +13,14 @@ static uint16_t g_override_seg;
 static bool     g_rep;   /* REP/REPE/REPZ (0xF3) */
 static bool     g_repne; /* REPNE/REPNZ (0xF2) */
 
+/* Clock cycles used by the instruction being executed.  Opcode handlers add
+ * their base time from the Intel timing tables; decode_modrm() adds
+ * effective-address time and word memory accesses add the 8088 bus
+ * penalty. */
+static unsigned g_cyc;
+static unsigned g_ea_cyc;   /* EA time of the last decoded memory operand */
+static bool     g_bus8;     /* 8088: word accesses take two bus cycles */
+
 uint32_t x86_linear(uint16_t seg, uint16_t off) {
     return (((uint32_t)seg << 4) + off) & 0xFFFFFu;
 }
@@ -21,6 +29,10 @@ static void set_flag(X86Cpu *c, uint16_t bit, bool v) {
     if (v) c->flags |= bit; else c->flags = (uint16_t)(c->flags & ~bit);
 }
 static bool get_flag(const X86Cpu *c, uint16_t bit) { return (c->flags & bit) != 0; }
+
+static uint16_t fix_flags(uint16_t f) {
+    return (uint16_t)((f | X86_FLAGS_FIXED_ON) & ~X86_FLAGS_FIXED_OFF);
+}
 
 static bool parity8(uint8_t v) {
     v ^= (uint8_t)(v >> 4);
@@ -38,11 +50,13 @@ static void mwr8(X86Cpu *c, uint16_t seg, uint16_t off, uint8_t v) {
     c->mem_write8(x86_linear(seg, off), v, c->bus_ud);
 }
 static uint16_t mrd16(X86Cpu *c, uint16_t seg, uint16_t off) {
+    if (g_bus8) g_cyc += 4;
     uint8_t lo = mrd8(c, seg, off);
     uint8_t hi = mrd8(c, seg, (uint16_t)(off + 1));
     return (uint16_t)(lo | (hi << 8));
 }
 static void mwr16(X86Cpu *c, uint16_t seg, uint16_t off, uint16_t v) {
+    if (g_bus8) g_cyc += 4;
     mwr8(c, seg, off, (uint8_t)v);
     mwr8(c, seg, (uint16_t)(off + 1), (uint8_t)(v >> 8));
 }
@@ -64,6 +78,18 @@ static uint16_t pop16(X86Cpu *c) {
     uint16_t v = mrd16(c, c->ss, c->sp);
     c->sp = (uint16_t)(c->sp + 2);
     return v;
+}
+static uint8_t io_in8(X86Cpu *c, uint16_t port) { return c->io_read8(port, c->bus_ud); }
+static void    io_out8(X86Cpu *c, uint16_t port, uint8_t v) { c->io_write8(port, v, c->bus_ud); }
+static uint16_t io_in16(X86Cpu *c, uint16_t port) {
+    if (g_bus8) g_cyc += 4;
+    uint8_t lo = io_in8(c, port);
+    return (uint16_t)(lo | (io_in8(c, (uint16_t)(port + 1)) << 8));
+}
+static void io_out16(X86Cpu *c, uint16_t port, uint16_t v) {
+    if (g_bus8) g_cyc += 4;
+    io_out8(c, port, (uint8_t)v);
+    io_out8(c, (uint16_t)(port + 1), (uint8_t)(v >> 8));
 }
 
 /* ── Register file access by ModRM-style index ──────────────────────────── */
@@ -103,29 +129,44 @@ static ModRM decode_modrm(X86Cpu *c) {
     unsigned mod = byte >> 6, reg = (byte >> 3) & 7, rm = byte & 7;
     ModRM m; memset(&m, 0, sizeof m);
     m.reg = reg;
+    g_ea_cyc = 0;
     if (mod == 3) { m.rm_reg = rm; return m; }
     m.mem = true;
     uint16_t base_seg = g_seg_override ? g_override_seg : c->ds;
     uint16_t addr;
+    /* Effective-address time: base or index 5, base+index 7 (BP+DI, BX+SI)
+     * or 8 (BP+SI, BX+DI), plus 4 for a displacement; direct address 6;
+     * segment override +2. */
     switch (rm) {
-    case 0: addr = (uint16_t)(c->bx.x + c->si); break;
-    case 1: addr = (uint16_t)(c->bx.x + c->di); break;
-    case 2: addr = (uint16_t)(c->bp + c->si); if (!g_seg_override) base_seg = c->ss; break;
-    case 3: addr = (uint16_t)(c->bp + c->di); if (!g_seg_override) base_seg = c->ss; break;
-    case 4: addr = c->si; break;
-    case 5: addr = c->di; break;
+    case 0: addr = (uint16_t)(c->bx.x + c->si); g_ea_cyc = 7; break;
+    case 1: addr = (uint16_t)(c->bx.x + c->di); g_ea_cyc = 8; break;
+    case 2: addr = (uint16_t)(c->bp + c->si); g_ea_cyc = 8; if (!g_seg_override) base_seg = c->ss; break;
+    case 3: addr = (uint16_t)(c->bp + c->di); g_ea_cyc = 7; if (!g_seg_override) base_seg = c->ss; break;
+    case 4: addr = c->si; g_ea_cyc = 5; break;
+    case 5: addr = c->di; g_ea_cyc = 5; break;
     case 6:
-        if (mod == 0) { m.off = fetch16(c); m.seg = base_seg; return m; } /* direct addr */
-        addr = c->bp; if (!g_seg_override) base_seg = c->ss;
+        if (mod == 0) { /* direct address */
+            m.off = fetch16(c); m.seg = base_seg;
+            g_ea_cyc = 6 + (g_seg_override ? 2 : 0);
+            return m;
+        }
+        addr = c->bp; g_ea_cyc = 5; if (!g_seg_override) base_seg = c->ss;
         break;
-    default: addr = c->bx.x; break; /* rm==7 */
+    default: addr = c->bx.x; g_ea_cyc = 5; break; /* rm==7 */
     }
     int16_t disp = 0;
-    if (mod == 1) disp = (int8_t)fetch8(c);
-    else if (mod == 2) disp = (int16_t)fetch16(c);
+    if (mod == 1) { disp = (int8_t)fetch8(c);   g_ea_cyc += 4; }
+    else if (mod == 2) { disp = (int16_t)fetch16(c); g_ea_cyc += 4; }
+    if (g_seg_override) g_ea_cyc += 2;
     m.off = (uint16_t)(addr + disp);
     m.seg = base_seg;
     return m;
+}
+
+/* Charge an instruction's time: reg_cyc for a register operand, or mem_cyc
+ * plus effective-address time for a memory operand. */
+static void cyc_rm(const ModRM *m, unsigned reg_cyc, unsigned mem_cyc) {
+    g_cyc += m->mem ? mem_cyc + g_ea_cyc : reg_cyc;
 }
 
 static uint8_t  rm_read8(X86Cpu *c, const ModRM *m)  { return m->mem ? mrd8(c, m->seg, m->off)  : *reg8_ptr(c, m->rm_reg); }
@@ -196,9 +237,12 @@ static uint32_t do_dec(X86Cpu *c, uint32_t v, bool w) {
     return r;
 }
 
+/* ALU r/m,reg and reg,r/m: register 3; reg <- mem 9+EA; mem <- result
+ * 16+EA (CMP never writes back, so it costs the same as a read). */
 static void alu_rm_rm8(X86Cpu *c, unsigned idx, bool reg_is_dest) {
     ModRM m = decode_modrm(c);
     uint8_t *regp = reg8_ptr(c, m.reg);
+    cyc_rm(&m, 3, (reg_is_dest || idx == ALU_CMP) ? 9 : 16);
     if (reg_is_dest) {
         uint8_t r = (uint8_t)alu_op(c, idx, *regp, rm_read8(c, &m), false);
         if (idx != ALU_CMP) *regp = r;
@@ -210,6 +254,7 @@ static void alu_rm_rm8(X86Cpu *c, unsigned idx, bool reg_is_dest) {
 static void alu_rm_rm16(X86Cpu *c, unsigned idx, bool reg_is_dest) {
     ModRM m = decode_modrm(c);
     uint16_t *regp = reg16_ptr(c, m.reg);
+    cyc_rm(&m, 3, (reg_is_dest || idx == ALU_CMP) ? 9 : 16);
     if (reg_is_dest) {
         uint16_t r = (uint16_t)alu_op(c, idx, *regp, rm_read16(c, &m), true);
         if (idx != ALU_CMP) *regp = r;
@@ -220,11 +265,13 @@ static void alu_rm_rm16(X86Cpu *c, unsigned idx, bool reg_is_dest) {
 }
 static void alu_al_imm8(X86Cpu *c, unsigned idx) {
     uint8_t imm = fetch8(c);
+    g_cyc += 4;
     uint8_t r = (uint8_t)alu_op(c, idx, c->ax.b.lo, imm, false);
     if (idx != ALU_CMP) c->ax.b.lo = r;
 }
 static void alu_ax_imm16(X86Cpu *c, unsigned idx) {
     uint16_t imm = fetch16(c);
+    g_cyc += 4;
     uint16_t r = (uint16_t)alu_op(c, idx, c->ax.x, imm, true);
     if (idx != ALU_CMP) c->ax.x = r;
 }
@@ -255,7 +302,9 @@ static uint32_t shift_op(X86Cpu *c, unsigned op, uint32_t val, unsigned count, b
     switch (op & 7) {
     case 5:  of = (before & sign) != 0; break;             /* SHR: original MSB */
     case 7:  of = false; break;                             /* SAR: always 0 */
-    default: of = ((res & sign) != 0) ^ cf; break;           /* ROL/RCL/SHL/SAL/ROR/RCR approx */
+    case 1: case 3:                                         /* ROR/RCR: top two bits differ */
+        of = (((res << 1) ^ res) & sign) != 0; break;
+    default: of = ((res & sign) != 0) ^ cf; break;          /* ROL/RCL/SHL/SAL */
     }
     set_flag(c, X86_FLAG_OF, of);
     if ((op & 7) >= 4) { /* SHL/SHR/SAL/SAR update ZF/SF/PF; pure rotates don't */
@@ -266,46 +315,54 @@ static uint32_t shift_op(X86Cpu *c, unsigned op, uint32_t val, unsigned count, b
     return res;
 }
 
-/* ── String instructions ────────────────────────────────────────────────── */
+/* ── String instructions ────────────────────────────────────────────────── *
+ *
+ * A REP-prefixed string instruction runs to completion inside one
+ * x86_step(): 9 cycles of setup plus the per-element time for each
+ * repetition (single executions use the unrepeated timing). */
 
 static void do_movs(X86Cpu *c, bool w) {
     int delta = (get_flag(c, X86_FLAG_DF) ? -1 : 1) * (w ? 2 : 1);
     uint16_t srcseg = g_seg_override ? g_override_seg : c->ds;
     bool repeat = g_rep || g_repne;
+    g_cyc += repeat ? 9 : 18;
     do {
         if (repeat && c->cx.x == 0) break;
         if (w) mwr16(c, c->es, c->di, mrd16(c, srcseg, c->si));
         else   mwr8(c, c->es, c->di, mrd8(c, srcseg, c->si));
         c->si = (uint16_t)(c->si + delta);
         c->di = (uint16_t)(c->di + delta);
-        if (repeat) c->cx.x--;
+        if (repeat) { c->cx.x--; g_cyc += 17; }
     } while (repeat && c->cx.x != 0);
 }
 static void do_stos(X86Cpu *c, bool w) {
     int delta = (get_flag(c, X86_FLAG_DF) ? -1 : 1) * (w ? 2 : 1);
     bool repeat = g_rep || g_repne;
+    g_cyc += repeat ? 9 : 11;
     do {
         if (repeat && c->cx.x == 0) break;
         if (w) mwr16(c, c->es, c->di, c->ax.x); else mwr8(c, c->es, c->di, c->ax.b.lo);
         c->di = (uint16_t)(c->di + delta);
-        if (repeat) c->cx.x--;
+        if (repeat) { c->cx.x--; g_cyc += 10; }
     } while (repeat && c->cx.x != 0);
 }
 static void do_lods(X86Cpu *c, bool w) {
     int delta = (get_flag(c, X86_FLAG_DF) ? -1 : 1) * (w ? 2 : 1);
     uint16_t srcseg = g_seg_override ? g_override_seg : c->ds;
     bool repeat = g_rep || g_repne;
+    g_cyc += repeat ? 9 : 12;
     do {
         if (repeat && c->cx.x == 0) break;
         if (w) c->ax.x = mrd16(c, srcseg, c->si); else c->ax.b.lo = mrd8(c, srcseg, c->si);
         c->si = (uint16_t)(c->si + delta);
-        if (repeat) c->cx.x--;
+        if (repeat) { c->cx.x--; g_cyc += 13; }
     } while (repeat && c->cx.x != 0);
 }
 static void do_cmps(X86Cpu *c, bool w) {
     int delta = (get_flag(c, X86_FLAG_DF) ? -1 : 1) * (w ? 2 : 1);
     uint16_t srcseg = g_seg_override ? g_override_seg : c->ds;
     bool repeat = g_rep || g_repne;
+    g_cyc += repeat ? 9 : 22;
     for (;;) {
         if (repeat && c->cx.x == 0) break;
         uint32_t a = w ? mrd16(c, srcseg, c->si) : mrd8(c, srcseg, c->si);
@@ -315,6 +372,7 @@ static void do_cmps(X86Cpu *c, bool w) {
         c->di = (uint16_t)(c->di + delta);
         if (!repeat) break;
         c->cx.x--;
+        g_cyc += 22;
         bool zf = get_flag(c, X86_FLAG_ZF);
         if ((g_rep && !zf) || (g_repne && zf)) break;
     }
@@ -322,6 +380,7 @@ static void do_cmps(X86Cpu *c, bool w) {
 static void do_scas(X86Cpu *c, bool w) {
     int delta = (get_flag(c, X86_FLAG_DF) ? -1 : 1) * (w ? 2 : 1);
     bool repeat = g_rep || g_repne;
+    g_cyc += repeat ? 9 : 15;
     for (;;) {
         if (repeat && c->cx.x == 0) break;
         uint32_t a = w ? c->ax.x : c->ax.b.lo;
@@ -330,6 +389,7 @@ static void do_scas(X86Cpu *c, bool w) {
         c->di = (uint16_t)(c->di + delta);
         if (!repeat) break;
         c->cx.x--;
+        g_cyc += 15;
         bool zf = get_flag(c, X86_FLAG_ZF);
         if ((g_rep && !zf) || (g_repne && zf)) break;
     }
@@ -379,6 +439,12 @@ static bool cond_true(const X86Cpu *c, unsigned cc) {
     }
 }
 
+/* Short conditional/loop jump: taken and not-taken times differ. */
+static void jump_short(X86Cpu *c, int8_t rel, bool taken, unsigned t_cyc, unsigned nt_cyc) {
+    if (taken) { c->ip = (uint16_t)(c->ip + rel); g_cyc += t_cyc; }
+    else       g_cyc += nt_cyc;
+}
+
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
 void x86_reset(X86Cpu *c) {
@@ -390,30 +456,49 @@ void x86_reset(X86Cpu *c) {
     c->flags = X86_FLAGS_FIXED_ON;
     c->halted = false;
     c->irq_pending = false;
+    c->int_inhibit = false;
     c->insn_count = 0;
 }
 
 unsigned x86_step(X86Cpu *c) {
-    if (c->irq_pending && (c->flags & X86_FLAG_IF)) {
-        c->irq_pending = false;
-        c->halted = false;
-        deliver_interrupt(c, c->irq_vector);
-        return 61;
+    g_bus8 = (c->type == X86_CPU_8088);
+
+    /* Interrupts are recognized between instructions, unless the previous
+     * one was STI/MOV SS/POP SS. */
+    bool inhibit = c->int_inhibit;
+    c->int_inhibit = false;
+    if (!inhibit && (c->flags & X86_FLAG_IF)) {
+        if (c->irq_pending) {
+            c->irq_pending = false;
+            c->halted = false;
+            g_cyc = 0;
+            deliver_interrupt(c, c->irq_vector);
+            return 61 + g_cyc;
+        }
+        if (c->intr_pending && c->intr_pending(c->bus_ud)) {
+            uint8_t vec = c->intr_ack ? c->intr_ack(c->bus_ud) : 0;
+            c->halted = false;
+            g_cyc = 0;
+            deliver_interrupt(c, vec);
+            return 61 + g_cyc;
+        }
     }
     if (c->halted) return 2;
 
+    bool trap = (c->flags & X86_FLAG_TF) != 0;
     g_seg_override = false; g_override_seg = 0; g_rep = false; g_repne = false;
+    g_cyc = 0;
     uint8_t op;
     for (;;) {
         op = fetch8(c);
         switch (op) {
-        case 0x26: g_seg_override = true; g_override_seg = c->es; continue;
-        case 0x2E: g_seg_override = true; g_override_seg = c->cs; continue;
-        case 0x36: g_seg_override = true; g_override_seg = c->ss; continue;
-        case 0x3E: g_seg_override = true; g_override_seg = c->ds; continue;
-        case 0xF0: continue; /* LOCK - no-op, no bus arbitration to model */
-        case 0xF2: g_repne = true; continue;
-        case 0xF3: g_rep = true; continue;
+        case 0x26: g_seg_override = true; g_override_seg = c->es; g_cyc += 2; continue;
+        case 0x2E: g_seg_override = true; g_override_seg = c->cs; g_cyc += 2; continue;
+        case 0x36: g_seg_override = true; g_override_seg = c->ss; g_cyc += 2; continue;
+        case 0x3E: g_seg_override = true; g_override_seg = c->ds; g_cyc += 2; continue;
+        case 0xF0: case 0xF1: g_cyc += 2; continue; /* LOCK (0xF1 is an 8086 alias) - no bus arbitration to model */
+        case 0xF2: g_repne = true; g_cyc += 2; continue;
+        case 0xF3: g_rep = true; g_cyc += 2; continue;
         default: break;
         }
         break;
@@ -439,14 +524,14 @@ unsigned x86_step(X86Cpu *c) {
     ALU_GROUP(0x38, ALU_CMP)
 #undef ALU_GROUP
 
-    case 0x06: push16(c, c->es); break;
-    case 0x07: c->es = pop16(c); break;
-    case 0x0E: push16(c, c->cs); break;
-    case 0x0F: c->cs = pop16(c); break; /* POP CS: real but unusual 8086 opcode */
-    case 0x16: push16(c, c->ss); break;
-    case 0x17: c->ss = pop16(c); break;
-    case 0x1E: push16(c, c->ds); break;
-    case 0x1F: c->ds = pop16(c); break;
+    case 0x06: push16(c, c->es); g_cyc += 10; break;
+    case 0x07: c->es = pop16(c); g_cyc += 8; break;
+    case 0x0E: push16(c, c->cs); g_cyc += 10; break;
+    case 0x0F: c->cs = pop16(c); g_cyc += 8; break; /* POP CS: real but unusual 8086 opcode */
+    case 0x16: push16(c, c->ss); g_cyc += 10; break;
+    case 0x17: c->ss = pop16(c); g_cyc += 8; c->int_inhibit = true; break;
+    case 0x1E: push16(c, c->ds); g_cyc += 10; break;
+    case 0x1F: c->ds = pop16(c); g_cyc += 8; break;
 
     case 0x27: { /* DAA */
         uint8_t old_al = c->ax.b.lo; bool old_cf = get_flag(c, X86_FLAG_CF);
@@ -458,6 +543,7 @@ unsigned x86_step(X86Cpu *c) {
         set_flag(c, X86_FLAG_CF, cf); set_flag(c, X86_FLAG_AF, af);
         set_flag(c, X86_FLAG_ZF, al == 0); set_flag(c, X86_FLAG_SF, (al & 0x80) != 0);
         set_flag(c, X86_FLAG_PF, parity8(al));
+        g_cyc += 4;
         break;
     }
     case 0x2F: { /* DAS */
@@ -470,6 +556,7 @@ unsigned x86_step(X86Cpu *c) {
         set_flag(c, X86_FLAG_CF, cf); set_flag(c, X86_FLAG_AF, af);
         set_flag(c, X86_FLAG_ZF, al == 0); set_flag(c, X86_FLAG_SF, (al & 0x80) != 0);
         set_flag(c, X86_FLAG_PF, parity8(al));
+        g_cyc += 4;
         break;
     }
     case 0x37: { /* AAA */
@@ -478,6 +565,7 @@ unsigned x86_step(X86Cpu *c) {
         else af = false;
         c->ax.b.lo = (uint8_t)(al & 0x0F); c->ax.b.hi = ah;
         set_flag(c, X86_FLAG_AF, af); set_flag(c, X86_FLAG_CF, af);
+        g_cyc += 8;
         break;
     }
     case 0x3F: { /* AAS */
@@ -486,6 +574,7 @@ unsigned x86_step(X86Cpu *c) {
         else af = false;
         c->ax.b.lo = (uint8_t)(al & 0x0F); c->ax.b.hi = ah;
         set_flag(c, X86_FLAG_AF, af); set_flag(c, X86_FLAG_CF, af);
+        g_cyc += 8;
         break;
     }
 
@@ -493,84 +582,105 @@ unsigned x86_step(X86Cpu *c) {
     case 0x44: case 0x45: case 0x46: case 0x47: {
         uint16_t *r = reg16_ptr(c, op - 0x40);
         *r = (uint16_t)do_inc(c, *r, true);
+        g_cyc += 2;
         break;
     }
     case 0x48: case 0x49: case 0x4A: case 0x4B:
     case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
         uint16_t *r = reg16_ptr(c, op - 0x48);
         *r = (uint16_t)do_dec(c, *r, true);
+        g_cyc += 2;
         break;
     }
     case 0x50: case 0x51: case 0x52: case 0x53:
-    case 0x54: case 0x55: case 0x56: case 0x57:
+    case 0x55: case 0x56: case 0x57:
         push16(c, *reg16_ptr(c, op - 0x50));
+        g_cyc += 11;
+        break;
+    case 0x54: /* PUSH SP: the 8086 pushes the already-decremented value */
+        c->sp = (uint16_t)(c->sp - 2);
+        mwr16(c, c->ss, c->sp, c->sp);
+        g_cyc += 11;
         break;
     case 0x58: case 0x59: case 0x5A: case 0x5B:
     case 0x5C: case 0x5D: case 0x5E: case 0x5F:
         *reg16_ptr(c, op - 0x58) = pop16(c);
+        g_cyc += 8;
         break;
 
+    /* 0x60-0x6F decode as Jcc on the 8086/8088 (they're new instructions
+     * from the 186 on). */
+    case 0x60: case 0x61: case 0x62: case 0x63:
+    case 0x64: case 0x65: case 0x66: case 0x67:
+    case 0x68: case 0x69: case 0x6A: case 0x6B:
+    case 0x6C: case 0x6D: case 0x6E: case 0x6F:
     case 0x70: case 0x71: case 0x72: case 0x73:
     case 0x74: case 0x75: case 0x76: case 0x77:
     case 0x78: case 0x79: case 0x7A: case 0x7B:
     case 0x7C: case 0x7D: case 0x7E: case 0x7F: {
         int8_t rel = (int8_t)fetch8(c);
-        if (cond_true(c, (unsigned)(op - 0x70))) c->ip = (uint16_t)(c->ip + rel);
+        jump_short(c, rel, cond_true(c, (unsigned)(op & 0x0F)), 16, 4);
         break;
     }
 
     case 0x80: case 0x82: { ModRM m = decode_modrm(c); uint8_t imm = fetch8(c);
+        cyc_rm(&m, 4, m.reg == ALU_CMP ? 10 : 17);
         uint8_t r = (uint8_t)alu_op(c, m.reg, rm_read8(c, &m), imm, false);
         if (m.reg != ALU_CMP) { rm_write8(c, &m, r); }
         break; }
     case 0x81: { ModRM m = decode_modrm(c); uint16_t imm = fetch16(c);
+        cyc_rm(&m, 4, m.reg == ALU_CMP ? 10 : 17);
         uint16_t r = (uint16_t)alu_op(c, m.reg, rm_read16(c, &m), imm, true);
         if (m.reg != ALU_CMP) { rm_write16(c, &m, r); }
         break; }
     case 0x83: { ModRM m = decode_modrm(c); uint16_t imm = (uint16_t)(int16_t)(int8_t)fetch8(c);
+        cyc_rm(&m, 4, m.reg == ALU_CMP ? 10 : 17);
         uint16_t r = (uint16_t)alu_op(c, m.reg, rm_read16(c, &m), imm, true);
         if (m.reg != ALU_CMP) { rm_write16(c, &m, r); }
         break; }
 
-    case 0x84: { ModRM m = decode_modrm(c); uint8_t r = (uint8_t)(rm_read8(c,&m) & *reg8_ptr(c,m.reg)); logic_flags(c,r,false); break; }
-    case 0x85: { ModRM m = decode_modrm(c); uint16_t r = (uint16_t)(rm_read16(c,&m) & *reg16_ptr(c,m.reg)); logic_flags(c,r,true); break; }
-    case 0x86: { ModRM m = decode_modrm(c); uint8_t *r = reg8_ptr(c,m.reg); uint8_t t = rm_read8(c,&m); rm_write8(c,&m,*r); *r = t; break; }
-    case 0x87: { ModRM m = decode_modrm(c); uint16_t *r = reg16_ptr(c,m.reg); uint16_t t = rm_read16(c,&m); rm_write16(c,&m,*r); *r = t; break; }
+    case 0x84: { ModRM m = decode_modrm(c); cyc_rm(&m, 3, 9); uint8_t r = (uint8_t)(rm_read8(c,&m) & *reg8_ptr(c,m.reg)); logic_flags(c,r,false); break; }
+    case 0x85: { ModRM m = decode_modrm(c); cyc_rm(&m, 3, 9); uint16_t r = (uint16_t)(rm_read16(c,&m) & *reg16_ptr(c,m.reg)); logic_flags(c,r,true); break; }
+    case 0x86: { ModRM m = decode_modrm(c); cyc_rm(&m, 4, 17); uint8_t *r = reg8_ptr(c,m.reg); uint8_t t = rm_read8(c,&m); rm_write8(c,&m,*r); *r = t; break; }
+    case 0x87: { ModRM m = decode_modrm(c); cyc_rm(&m, 4, 17); uint16_t *r = reg16_ptr(c,m.reg); uint16_t t = rm_read16(c,&m); rm_write16(c,&m,*r); *r = t; break; }
 
-    case 0x88: { ModRM m = decode_modrm(c); rm_write8(c, &m, *reg8_ptr(c, m.reg)); break; }
-    case 0x89: { ModRM m = decode_modrm(c); rm_write16(c, &m, *reg16_ptr(c, m.reg)); break; }
-    case 0x8A: { ModRM m = decode_modrm(c); *reg8_ptr(c, m.reg) = rm_read8(c, &m); break; }
-    case 0x8B: { ModRM m = decode_modrm(c); *reg16_ptr(c, m.reg) = rm_read16(c, &m); break; }
-    case 0x8C: { ModRM m = decode_modrm(c); rm_write16(c, &m, *seg_ptr(c, m.reg)); break; }
-    case 0x8D: { ModRM m = decode_modrm(c); *reg16_ptr(c, m.reg) = m.mem ? m.off : 0; break; } /* LEA */
-    case 0x8E: { ModRM m = decode_modrm(c); *seg_ptr(c, m.reg) = rm_read16(c, &m); break; }
-    case 0x8F: { ModRM m = decode_modrm(c); rm_write16(c, &m, pop16(c)); break; }
+    case 0x88: { ModRM m = decode_modrm(c); cyc_rm(&m, 2, 9); rm_write8(c, &m, *reg8_ptr(c, m.reg)); break; }
+    case 0x89: { ModRM m = decode_modrm(c); cyc_rm(&m, 2, 9); rm_write16(c, &m, *reg16_ptr(c, m.reg)); break; }
+    case 0x8A: { ModRM m = decode_modrm(c); cyc_rm(&m, 2, 8); *reg8_ptr(c, m.reg) = rm_read8(c, &m); break; }
+    case 0x8B: { ModRM m = decode_modrm(c); cyc_rm(&m, 2, 8); *reg16_ptr(c, m.reg) = rm_read16(c, &m); break; }
+    case 0x8C: { ModRM m = decode_modrm(c); cyc_rm(&m, 2, 9); rm_write16(c, &m, *seg_ptr(c, m.reg)); break; }
+    case 0x8D: { ModRM m = decode_modrm(c); g_cyc += 2 + g_ea_cyc; *reg16_ptr(c, m.reg) = m.mem ? m.off : 0; break; } /* LEA */
+    case 0x8E: { ModRM m = decode_modrm(c); cyc_rm(&m, 2, 8); *seg_ptr(c, m.reg) = rm_read16(c, &m);
+        if ((m.reg & 3) == 2) c->int_inhibit = true; /* MOV SS */
+        break; }
+    case 0x8F: { ModRM m = decode_modrm(c); cyc_rm(&m, 8, 17); rm_write16(c, &m, pop16(c)); break; }
 
-    case 0x90: break; /* NOP */
+    case 0x90: g_cyc += 3; break; /* NOP (XCHG AX,AX) */
     case 0x91: case 0x92: case 0x93: case 0x94:
     case 0x95: case 0x96: case 0x97: {
-        uint16_t *r = reg16_ptr(c, op - 0x90); uint16_t t = c->ax.x; c->ax.x = *r; *r = t; break;
+        uint16_t *r = reg16_ptr(c, op - 0x90); uint16_t t = c->ax.x; c->ax.x = *r; *r = t;
+        g_cyc += 3; break;
     }
-    case 0x98: c->ax.b.hi = (c->ax.b.lo & 0x80) ? 0xFF : 0x00; break; /* CBW */
-    case 0x99: c->dx.x = (c->ax.x & 0x8000) ? 0xFFFF : 0x0000; break; /* CWD */
+    case 0x98: c->ax.b.hi = (c->ax.b.lo & 0x80) ? 0xFF : 0x00; g_cyc += 2; break; /* CBW */
+    case 0x99: c->dx.x = (c->ax.x & 0x8000) ? 0xFFFF : 0x0000; g_cyc += 5; break; /* CWD */
     case 0x9A: { uint16_t new_ip = fetch16(c); uint16_t new_cs = fetch16(c);
-        push16(c, c->cs); push16(c, c->ip); c->cs = new_cs; c->ip = new_ip; break; } /* CALL far */
-    case 0x9B: break; /* WAIT: no coprocessor to synchronize with */
-    case 0x9C: push16(c, c->flags); break;
-    case 0x9D: c->flags = (uint16_t)((pop16(c) | X86_FLAGS_FIXED_ON) & ~X86_FLAGS_FIXED_OFF); break;
-    case 0x9E: c->flags = (uint16_t)((c->flags & 0xFF00) | c->ax.b.hi | X86_FLAGS_FIXED_ON); break; /* SAHF */
-    case 0x9F: c->ax.b.hi = (uint8_t)(c->flags & 0xFF); break; /* LAHF */
+        push16(c, c->cs); push16(c, c->ip); c->cs = new_cs; c->ip = new_ip; g_cyc += 28; break; } /* CALL far */
+    case 0x9B: g_cyc += 3; break; /* WAIT: no coprocessor to synchronize with */
+    case 0x9C: push16(c, c->flags); g_cyc += 10; break;
+    case 0x9D: c->flags = fix_flags(pop16(c)); g_cyc += 8; break;
+    case 0x9E: c->flags = fix_flags((uint16_t)((c->flags & 0xFF00) | c->ax.b.hi)); g_cyc += 4; break; /* SAHF */
+    case 0x9F: c->ax.b.hi = (uint8_t)(c->flags & 0xFF); g_cyc += 4; break; /* LAHF */
 
-    case 0xA0: c->ax.b.lo = mrd8(c, g_seg_override ? g_override_seg : c->ds, fetch16(c)); break;
-    case 0xA1: c->ax.x = mrd16(c, g_seg_override ? g_override_seg : c->ds, fetch16(c)); break;
-    case 0xA2: mwr8(c, g_seg_override ? g_override_seg : c->ds, fetch16(c), c->ax.b.lo); break;
-    case 0xA3: mwr16(c, g_seg_override ? g_override_seg : c->ds, fetch16(c), c->ax.x); break;
+    case 0xA0: c->ax.b.lo = mrd8(c, g_seg_override ? g_override_seg : c->ds, fetch16(c)); g_cyc += 10; break;
+    case 0xA1: c->ax.x = mrd16(c, g_seg_override ? g_override_seg : c->ds, fetch16(c)); g_cyc += 10; break;
+    case 0xA2: mwr8(c, g_seg_override ? g_override_seg : c->ds, fetch16(c), c->ax.b.lo); g_cyc += 10; break;
+    case 0xA3: mwr16(c, g_seg_override ? g_override_seg : c->ds, fetch16(c), c->ax.x); g_cyc += 10; break;
     case 0xA4: do_movs(c, false); break;
     case 0xA5: do_movs(c, true); break;
     case 0xA6: do_cmps(c, false); break;
     case 0xA7: do_cmps(c, true); break;
-    case 0xA8: { uint8_t imm = fetch8(c); logic_flags(c, (uint8_t)(c->ax.b.lo & imm), false); break; }
-    case 0xA9: { uint16_t imm = fetch16(c); logic_flags(c, (uint16_t)(c->ax.x & imm), true); break; }
+    case 0xA8: { uint8_t imm = fetch8(c); logic_flags(c, (uint8_t)(c->ax.b.lo & imm), false); g_cyc += 4; break; }
+    case 0xA9: { uint16_t imm = fetch16(c); logic_flags(c, (uint16_t)(c->ax.x & imm), true); g_cyc += 4; break; }
     case 0xAA: do_stos(c, false); break;
     case 0xAB: do_stos(c, true); break;
     case 0xAC: do_lods(c, false); break;
@@ -580,123 +690,128 @@ unsigned x86_step(X86Cpu *c) {
 
     case 0xB0: case 0xB1: case 0xB2: case 0xB3:
     case 0xB4: case 0xB5: case 0xB6: case 0xB7:
-        *reg8_ptr(c, op - 0xB0) = fetch8(c); break;
+        *reg8_ptr(c, op - 0xB0) = fetch8(c); g_cyc += 4; break;
     case 0xB8: case 0xB9: case 0xBA: case 0xBB:
     case 0xBC: case 0xBD: case 0xBE: case 0xBF:
-        *reg16_ptr(c, op - 0xB8) = fetch16(c); break;
+        *reg16_ptr(c, op - 0xB8) = fetch16(c); g_cyc += 4; break;
 
-    case 0xC2: { uint16_t n = fetch16(c); c->ip = pop16(c); c->sp = (uint16_t)(c->sp + n); break; }
-    case 0xC3: c->ip = pop16(c); break;
-    case 0xC4: { ModRM m = decode_modrm(c); uint16_t off = rm_read16(c, &m); uint16_t seg = mrd16(c, m.seg, (uint16_t)(m.off + 2));
+    /* 0xC0/0xC1 and 0xC8/0xC9 are aliases of the RET/RETF forms on the 8086. */
+    case 0xC0: case 0xC2: { uint16_t n = fetch16(c); c->ip = pop16(c); c->sp = (uint16_t)(c->sp + n); g_cyc += 24; break; }
+    case 0xC1: case 0xC3: c->ip = pop16(c); g_cyc += 20; break;
+    case 0xC4: { ModRM m = decode_modrm(c); g_cyc += 16 + g_ea_cyc; uint16_t off = rm_read16(c, &m); uint16_t seg = mrd16(c, m.seg, (uint16_t)(m.off + 2));
         *reg16_ptr(c, m.reg) = off; c->es = seg; break; }
-    case 0xC5: { ModRM m = decode_modrm(c); uint16_t off = rm_read16(c, &m); uint16_t seg = mrd16(c, m.seg, (uint16_t)(m.off + 2));
+    case 0xC5: { ModRM m = decode_modrm(c); g_cyc += 16 + g_ea_cyc; uint16_t off = rm_read16(c, &m); uint16_t seg = mrd16(c, m.seg, (uint16_t)(m.off + 2));
         *reg16_ptr(c, m.reg) = off; c->ds = seg; break; }
-    case 0xC6: { ModRM m = decode_modrm(c); rm_write8(c, &m, fetch8(c)); break; }
-    case 0xC7: { ModRM m = decode_modrm(c); rm_write16(c, &m, fetch16(c)); break; }
-    case 0xCA: { uint16_t n = fetch16(c); c->ip = pop16(c); c->cs = pop16(c); c->sp = (uint16_t)(c->sp + n); break; }
-    case 0xCB: c->ip = pop16(c); c->cs = pop16(c); break;
-    case 0xCC: deliver_interrupt(c, 3); break;
-    case 0xCD: deliver_interrupt(c, fetch8(c)); break;
-    case 0xCE: if (get_flag(c, X86_FLAG_OF)) deliver_interrupt(c, 4); break;
-    case 0xCF: c->ip = pop16(c); c->cs = pop16(c);
-        c->flags = (uint16_t)((pop16(c) | X86_FLAGS_FIXED_ON) & ~X86_FLAGS_FIXED_OFF); break;
+    case 0xC6: { ModRM m = decode_modrm(c); cyc_rm(&m, 4, 10); rm_write8(c, &m, fetch8(c)); break; }
+    case 0xC7: { ModRM m = decode_modrm(c); cyc_rm(&m, 4, 10); rm_write16(c, &m, fetch16(c)); break; }
+    case 0xC8: case 0xCA: { uint16_t n = fetch16(c); c->ip = pop16(c); c->cs = pop16(c); c->sp = (uint16_t)(c->sp + n); g_cyc += 33; break; }
+    case 0xC9: case 0xCB: c->ip = pop16(c); c->cs = pop16(c); g_cyc += 34; break;
+    case 0xCC: deliver_interrupt(c, 3); g_cyc += 52; break;
+    case 0xCD: deliver_interrupt(c, fetch8(c)); g_cyc += 51; break;
+    case 0xCE: if (get_flag(c, X86_FLAG_OF)) { deliver_interrupt(c, 4); g_cyc += 53; } else g_cyc += 4; break;
+    case 0xCF: c->ip = pop16(c); c->cs = pop16(c); c->flags = fix_flags(pop16(c)); g_cyc += 24; break;
 
-    case 0xD0: { ModRM m = decode_modrm(c); rm_write8(c, &m, (uint8_t)shift_op(c, m.reg, rm_read8(c, &m), 1, false)); break; }
-    case 0xD1: { ModRM m = decode_modrm(c); rm_write16(c, &m, (uint16_t)shift_op(c, m.reg, rm_read16(c, &m), 1, true)); break; }
-    case 0xD2: { ModRM m = decode_modrm(c); rm_write8(c, &m, (uint8_t)shift_op(c, m.reg, rm_read8(c, &m), c->cx.b.lo, false)); break; }
-    case 0xD3: { ModRM m = decode_modrm(c); rm_write16(c, &m, (uint16_t)shift_op(c, m.reg, rm_read16(c, &m), c->cx.b.lo, true)); break; }
-    case 0xD4: { uint8_t base = fetch8(c); if (base == 0) { deliver_interrupt(c, 0); break; }
+    case 0xD0: { ModRM m = decode_modrm(c); cyc_rm(&m, 2, 15); rm_write8(c, &m, (uint8_t)shift_op(c, m.reg, rm_read8(c, &m), 1, false)); break; }
+    case 0xD1: { ModRM m = decode_modrm(c); cyc_rm(&m, 2, 15); rm_write16(c, &m, (uint16_t)shift_op(c, m.reg, rm_read16(c, &m), 1, true)); break; }
+    case 0xD2: { ModRM m = decode_modrm(c); cyc_rm(&m, 8, 20); g_cyc += 4u * c->cx.b.lo;
+        rm_write8(c, &m, (uint8_t)shift_op(c, m.reg, rm_read8(c, &m), c->cx.b.lo, false)); break; }
+    case 0xD3: { ModRM m = decode_modrm(c); cyc_rm(&m, 8, 20); g_cyc += 4u * c->cx.b.lo;
+        rm_write16(c, &m, (uint16_t)shift_op(c, m.reg, rm_read16(c, &m), c->cx.b.lo, true)); break; }
+    case 0xD4: { uint8_t base = fetch8(c); g_cyc += 83; if (base == 0) { deliver_interrupt(c, 0); break; }
         uint8_t al = c->ax.b.lo, ah = (uint8_t)(al / base); al = (uint8_t)(al % base);
         c->ax.b.hi = ah; c->ax.b.lo = al;
         set_flag(c, X86_FLAG_ZF, al == 0); set_flag(c, X86_FLAG_SF, (al & 0x80) != 0); set_flag(c, X86_FLAG_PF, parity8(al));
         break; }
     case 0xD5: { uint8_t base = fetch8(c); uint8_t res = (uint8_t)(c->ax.b.lo + c->ax.b.hi * base);
-        c->ax.b.lo = res; c->ax.b.hi = 0;
+        c->ax.b.lo = res; c->ax.b.hi = 0; g_cyc += 60;
         set_flag(c, X86_FLAG_ZF, res == 0); set_flag(c, X86_FLAG_SF, (res & 0x80) != 0); set_flag(c, X86_FLAG_PF, parity8(res));
         break; }
-    case 0xD7: c->ax.b.lo = mrd8(c, g_seg_override ? g_override_seg : c->ds, (uint16_t)(c->bx.x + c->ax.b.lo)); break; /* XLAT */
+    case 0xD6: c->ax.b.lo = get_flag(c, X86_FLAG_CF) ? 0xFF : 0x00; g_cyc += 4; break; /* SALC (undocumented) */
+    case 0xD7: c->ax.b.lo = mrd8(c, g_seg_override ? g_override_seg : c->ds, (uint16_t)(c->bx.x + c->ax.b.lo)); g_cyc += 11; break; /* XLAT */
     case 0xD8: case 0xD9: case 0xDA: case 0xDB:
-    case 0xDC: case 0xDD: case 0xDE: case 0xDF:
-        decode_modrm(c); /* ESC: no 8087 present; consume the ModRM/disp bytes like real unpopulated hardware */
-        break;
+    case 0xDC: case 0xDD: case 0xDE: case 0xDF: {
+        ModRM m = decode_modrm(c); /* ESC: no 8087 present; consume the ModRM/disp bytes like real unpopulated hardware */
+        cyc_rm(&m, 2, 8);
+        break; }
 
-    case 0xE0: { int8_t rel = (int8_t)fetch8(c); c->cx.x--; if (c->cx.x != 0 && !get_flag(c, X86_FLAG_ZF)) c->ip = (uint16_t)(c->ip + rel); break; }
-    case 0xE1: { int8_t rel = (int8_t)fetch8(c); c->cx.x--; if (c->cx.x != 0 && get_flag(c, X86_FLAG_ZF)) c->ip = (uint16_t)(c->ip + rel); break; }
-    case 0xE2: { int8_t rel = (int8_t)fetch8(c); c->cx.x--; if (c->cx.x != 0) c->ip = (uint16_t)(c->ip + rel); break; }
-    case 0xE3: { int8_t rel = (int8_t)fetch8(c); if (c->cx.x == 0) c->ip = (uint16_t)(c->ip + rel); break; }
-    case 0xE4: c->ax.b.lo = c->io_read8(fetch8(c), c->bus_ud); break;
-    case 0xE5: { uint8_t p = fetch8(c); c->ax.b.lo = c->io_read8(p, c->bus_ud); c->ax.b.hi = c->io_read8((uint8_t)(p + 1), c->bus_ud); break; }
-    case 0xE6: c->io_write8(fetch8(c), c->ax.b.lo, c->bus_ud); break;
-    case 0xE7: { uint8_t p = fetch8(c); c->io_write8(p, c->ax.b.lo, c->bus_ud); c->io_write8((uint8_t)(p + 1), c->ax.b.hi, c->bus_ud); break; }
-    case 0xE8: { int16_t rel = (int16_t)fetch16(c); push16(c, c->ip); c->ip = (uint16_t)(c->ip + rel); break; }
-    case 0xE9: { int16_t rel = (int16_t)fetch16(c); c->ip = (uint16_t)(c->ip + rel); break; }
-    case 0xEA: { uint16_t new_ip = fetch16(c); uint16_t new_cs = fetch16(c); c->ip = new_ip; c->cs = new_cs; break; }
-    case 0xEB: { int8_t rel = (int8_t)fetch8(c); c->ip = (uint16_t)(c->ip + rel); break; }
-    case 0xEC: c->ax.b.lo = c->io_read8(c->dx.x, c->bus_ud); break;
-    case 0xED: c->ax.b.lo = c->io_read8(c->dx.x, c->bus_ud); c->ax.b.hi = c->io_read8((uint16_t)(c->dx.x + 1), c->bus_ud); break;
-    case 0xEE: c->io_write8(c->dx.x, c->ax.b.lo, c->bus_ud); break;
-    case 0xEF: c->io_write8(c->dx.x, c->ax.b.lo, c->bus_ud); c->io_write8((uint16_t)(c->dx.x + 1), c->ax.b.hi, c->bus_ud); break;
+    case 0xE0: { int8_t rel = (int8_t)fetch8(c); c->cx.x--; jump_short(c, rel, c->cx.x != 0 && !get_flag(c, X86_FLAG_ZF), 19, 5); break; }
+    case 0xE1: { int8_t rel = (int8_t)fetch8(c); c->cx.x--; jump_short(c, rel, c->cx.x != 0 && get_flag(c, X86_FLAG_ZF), 18, 6); break; }
+    case 0xE2: { int8_t rel = (int8_t)fetch8(c); c->cx.x--; jump_short(c, rel, c->cx.x != 0, 17, 5); break; }
+    case 0xE3: { int8_t rel = (int8_t)fetch8(c); jump_short(c, rel, c->cx.x == 0, 18, 6); break; }
+    case 0xE4: c->ax.b.lo = io_in8(c, fetch8(c)); g_cyc += 10; break;
+    case 0xE5: c->ax.x = io_in16(c, fetch8(c)); g_cyc += 10; break;
+    case 0xE6: io_out8(c, fetch8(c), c->ax.b.lo); g_cyc += 10; break;
+    case 0xE7: io_out16(c, fetch8(c), c->ax.x); g_cyc += 10; break;
+    case 0xE8: { int16_t rel = (int16_t)fetch16(c); push16(c, c->ip); c->ip = (uint16_t)(c->ip + rel); g_cyc += 19; break; }
+    case 0xE9: { int16_t rel = (int16_t)fetch16(c); c->ip = (uint16_t)(c->ip + rel); g_cyc += 15; break; }
+    case 0xEA: { uint16_t new_ip = fetch16(c); uint16_t new_cs = fetch16(c); c->ip = new_ip; c->cs = new_cs; g_cyc += 15; break; }
+    case 0xEB: { int8_t rel = (int8_t)fetch8(c); c->ip = (uint16_t)(c->ip + rel); g_cyc += 15; break; }
+    case 0xEC: c->ax.b.lo = io_in8(c, c->dx.x); g_cyc += 8; break;
+    case 0xED: c->ax.x = io_in16(c, c->dx.x); g_cyc += 8; break;
+    case 0xEE: io_out8(c, c->dx.x, c->ax.b.lo); g_cyc += 8; break;
+    case 0xEF: io_out16(c, c->dx.x, c->ax.x); g_cyc += 8; break;
 
-    case 0xF4: c->halted = true; break;
-    case 0xF5: set_flag(c, X86_FLAG_CF, !get_flag(c, X86_FLAG_CF)); break;
+    case 0xF4: c->halted = true; g_cyc += 2; break;
+    case 0xF5: set_flag(c, X86_FLAG_CF, !get_flag(c, X86_FLAG_CF)); g_cyc += 2; break;
     case 0xF6: { ModRM m = decode_modrm(c); uint8_t v = rm_read8(c, &m);
         switch (m.reg) {
-        case 0: case 1: { uint8_t imm = fetch8(c); logic_flags(c, (uint8_t)(v & imm), false); break; }
-        case 2: rm_write8(c, &m, (uint8_t)~v); break;
-        case 3: rm_write8(c, &m, (uint8_t)alu_op(c, ALU_SUB, 0, v, false)); break;
-        case 4: { uint16_t r = (uint16_t)(c->ax.b.lo * (unsigned)v); c->ax.x = r;
+        case 0: case 1: { uint8_t imm = fetch8(c); cyc_rm(&m, 5, 11); logic_flags(c, (uint8_t)(v & imm), false); break; }
+        case 2: cyc_rm(&m, 3, 16); rm_write8(c, &m, (uint8_t)~v); break;
+        case 3: cyc_rm(&m, 3, 16); rm_write8(c, &m, (uint8_t)alu_op(c, ALU_SUB, 0, v, false)); break;
+        case 4: { cyc_rm(&m, 74, 80); uint16_t r = (uint16_t)(c->ax.b.lo * (unsigned)v); c->ax.x = r;
             bool cf = r > 0xFF; set_flag(c, X86_FLAG_CF, cf); set_flag(c, X86_FLAG_OF, cf); break; }
-        case 5: { int16_t r = (int16_t)((int8_t)c->ax.b.lo * (int)(int8_t)v); c->ax.x = (uint16_t)r;
+        case 5: { cyc_rm(&m, 89, 95); int16_t r = (int16_t)((int8_t)c->ax.b.lo * (int)(int8_t)v); c->ax.x = (uint16_t)r;
             bool ov = r < -128 || r > 127; set_flag(c, X86_FLAG_CF, ov); set_flag(c, X86_FLAG_OF, ov); break; }
-        case 6: { if (v == 0) { deliver_interrupt(c, 0); break; } unsigned q = c->ax.x / v, r = c->ax.x % v;
+        case 6: { cyc_rm(&m, 85, 91); if (v == 0) { deliver_interrupt(c, 0); break; } unsigned q = c->ax.x / v, r = c->ax.x % v;
             if (q > 0xFF) { deliver_interrupt(c, 0); break; } c->ax.b.lo = (uint8_t)q; c->ax.b.hi = (uint8_t)r; break; }
-        default: { if (v == 0) { deliver_interrupt(c, 0); break; } int16_t dd = (int16_t)c->ax.x;
+        default: { cyc_rm(&m, 107, 113); if (v == 0) { deliver_interrupt(c, 0); break; } int16_t dd = (int16_t)c->ax.x;
             int q = dd / (int8_t)v, r = dd % (int8_t)v;
-            if (q > 127 || q < -128) { deliver_interrupt(c, 0); break; }
+            if (q > 127 || q < -127) { deliver_interrupt(c, 0); break; } /* the 8086 also faults on -128 */
             c->ax.b.lo = (uint8_t)(int8_t)q; c->ax.b.hi = (uint8_t)(int8_t)r; break; }
         }
         break; }
     case 0xF7: { ModRM m = decode_modrm(c); uint16_t v = rm_read16(c, &m);
         switch (m.reg) {
-        case 0: case 1: { uint16_t imm = fetch16(c); logic_flags(c, (uint16_t)(v & imm), true); break; }
-        case 2: rm_write16(c, &m, (uint16_t)~v); break;
-        case 3: rm_write16(c, &m, (uint16_t)alu_op(c, ALU_SUB, 0, v, true)); break;
-        case 4: { uint32_t r = (uint32_t)c->ax.x * v; c->ax.x = (uint16_t)r; c->dx.x = (uint16_t)(r >> 16);
+        case 0: case 1: { uint16_t imm = fetch16(c); cyc_rm(&m, 5, 11); logic_flags(c, (uint16_t)(v & imm), true); break; }
+        case 2: cyc_rm(&m, 3, 16); rm_write16(c, &m, (uint16_t)~v); break;
+        case 3: cyc_rm(&m, 3, 16); rm_write16(c, &m, (uint16_t)alu_op(c, ALU_SUB, 0, v, true)); break;
+        case 4: { cyc_rm(&m, 125, 131); uint32_t r = (uint32_t)c->ax.x * v; c->ax.x = (uint16_t)r; c->dx.x = (uint16_t)(r >> 16);
             bool cf = r > 0xFFFF; set_flag(c, X86_FLAG_CF, cf); set_flag(c, X86_FLAG_OF, cf); break; }
-        case 5: { int32_t r = (int32_t)(int16_t)c->ax.x * (int32_t)(int16_t)v;
+        case 5: { cyc_rm(&m, 138, 144); int32_t r = (int32_t)(int16_t)c->ax.x * (int32_t)(int16_t)v;
             c->ax.x = (uint16_t)r; c->dx.x = (uint16_t)((uint32_t)r >> 16);
             bool ov = r < -32768 || r > 32767; set_flag(c, X86_FLAG_CF, ov); set_flag(c, X86_FLAG_OF, ov); break; }
-        case 6: { if (v == 0) { deliver_interrupt(c, 0); break; } uint32_t n = ((uint32_t)c->dx.x << 16) | c->ax.x;
+        case 6: { cyc_rm(&m, 150, 156); if (v == 0) { deliver_interrupt(c, 0); break; } uint32_t n = ((uint32_t)c->dx.x << 16) | c->ax.x;
             uint32_t q = n / v, r = n % v; if (q > 0xFFFF) { deliver_interrupt(c, 0); break; }
             c->ax.x = (uint16_t)q; c->dx.x = (uint16_t)r; break; }
-        default: { if (v == 0) { deliver_interrupt(c, 0); break; } int32_t n = (int32_t)(((uint32_t)c->dx.x << 16) | c->ax.x);
+        default: { cyc_rm(&m, 171, 177); if (v == 0) { deliver_interrupt(c, 0); break; } int32_t n = (int32_t)(((uint32_t)c->dx.x << 16) | c->ax.x);
             int32_t q = n / (int16_t)v, r = n % (int16_t)v;
-            if (q > 32767 || q < -32768) { deliver_interrupt(c, 0); break; }
+            if (q > 32767 || q < -32767) { deliver_interrupt(c, 0); break; }
             c->ax.x = (uint16_t)(int16_t)q; c->dx.x = (uint16_t)(int16_t)r; break; }
         }
         break; }
-    case 0xF8: set_flag(c, X86_FLAG_CF, false); break;
-    case 0xF9: set_flag(c, X86_FLAG_CF, true); break;
-    case 0xFA: set_flag(c, X86_FLAG_IF, false); break;
-    case 0xFB: set_flag(c, X86_FLAG_IF, true); break;
-    case 0xFC: set_flag(c, X86_FLAG_DF, false); break;
-    case 0xFD: set_flag(c, X86_FLAG_DF, true); break;
+    case 0xF8: set_flag(c, X86_FLAG_CF, false); g_cyc += 2; break;
+    case 0xF9: set_flag(c, X86_FLAG_CF, true); g_cyc += 2; break;
+    case 0xFA: set_flag(c, X86_FLAG_IF, false); g_cyc += 2; break;
+    case 0xFB: set_flag(c, X86_FLAG_IF, true); g_cyc += 2; c->int_inhibit = true; break;
+    case 0xFC: set_flag(c, X86_FLAG_DF, false); g_cyc += 2; break;
+    case 0xFD: set_flag(c, X86_FLAG_DF, true); g_cyc += 2; break;
     case 0xFE: { ModRM m = decode_modrm(c);
+        cyc_rm(&m, 3, 15);
         if (m.reg == 0) rm_write8(c, &m, (uint8_t)do_inc(c, rm_read8(c, &m), false));
         else if (m.reg == 1) rm_write8(c, &m, (uint8_t)do_dec(c, rm_read8(c, &m), false));
         else if (c->on_unknown_opcode) c->on_unknown_opcode(c, op, c->bus_ud);
         break; }
     case 0xFF: { ModRM m = decode_modrm(c);
         switch (m.reg) {
-        case 0: rm_write16(c, &m, (uint16_t)do_inc(c, rm_read16(c, &m), true)); break;
-        case 1: rm_write16(c, &m, (uint16_t)do_dec(c, rm_read16(c, &m), true)); break;
-        case 2: { uint16_t t = rm_read16(c, &m); push16(c, c->ip); c->ip = t; break; }             /* CALL near indirect */
-        case 3: { uint16_t off = rm_read16(c, &m); uint16_t seg = mrd16(c, m.seg, (uint16_t)(m.off + 2));
+        case 0: cyc_rm(&m, 3, 15); rm_write16(c, &m, (uint16_t)do_inc(c, rm_read16(c, &m), true)); break;
+        case 1: cyc_rm(&m, 3, 15); rm_write16(c, &m, (uint16_t)do_dec(c, rm_read16(c, &m), true)); break;
+        case 2: { cyc_rm(&m, 16, 21); uint16_t t = rm_read16(c, &m); push16(c, c->ip); c->ip = t; break; } /* CALL near indirect */
+        case 3: { g_cyc += 37 + g_ea_cyc; uint16_t off = rm_read16(c, &m); uint16_t seg = mrd16(c, m.seg, (uint16_t)(m.off + 2));
             push16(c, c->cs); push16(c, c->ip); c->cs = seg; c->ip = off; break; }                  /* CALL far indirect */
-        case 4: c->ip = rm_read16(c, &m); break;                                                    /* JMP near indirect */
-        case 5: { uint16_t off = rm_read16(c, &m); uint16_t seg = mrd16(c, m.seg, (uint16_t)(m.off + 2));
+        case 4: cyc_rm(&m, 11, 18); c->ip = rm_read16(c, &m); break;                              /* JMP near indirect */
+        case 5: { g_cyc += 24 + g_ea_cyc; uint16_t off = rm_read16(c, &m); uint16_t seg = mrd16(c, m.seg, (uint16_t)(m.off + 2));
             c->cs = seg; c->ip = off; break; }                                                      /* JMP far indirect */
-        case 6: push16(c, rm_read16(c, &m)); break;                                                 /* PUSH r/m16 */
+        case 6: cyc_rm(&m, 11, 16); push16(c, rm_read16(c, &m)); break;                           /* PUSH r/m16 */
         default: if (c->on_unknown_opcode) c->on_unknown_opcode(c, op, c->bus_ud); break;
         }
         break; }
@@ -706,7 +821,13 @@ unsigned x86_step(X86Cpu *c) {
         break;
     }
 
-    return 4; /* placeholder average - not cycle-exact this pass */
+    /* Single-step trap: TF set when the instruction started (and not just
+     * set by it) raises INT 1 after it completes. */
+    if (trap && !c->int_inhibit) {
+        deliver_interrupt(c, 1);
+        g_cyc += 50;
+    }
+    return g_cyc ? g_cyc : 2;
 }
 
 void x86_format_state(const X86Cpu *cpu, char *buf, size_t len) {

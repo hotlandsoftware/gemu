@@ -1,5 +1,6 @@
 #include "machine_apple1.h"
 #include "gemu/args.h"
+#include "gemu/gemu_display.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
 #include "gemu/sha256.h"
@@ -147,7 +148,9 @@ static int apple1_glyph_index(uint8_t ch) {
 
 static void apple1_display_set_paused(Apple1Display *d, bool paused) {
     if (!d || !d->window || d->title_paused == paused) return;
-    SDL_SetWindowTitle(d->window, paused ? "GEMU [Paused]" : "GEMU");
+    char title[200];
+    gemu_window_title(title, sizeof(title), NULL, paused);
+    SDL_SetWindowTitle(d->window, title);
     d->title_paused = paused;
 }
 
@@ -211,7 +214,9 @@ static Apple1Display *apple1_display_create(const MosConfig *cfg) {
         return d;
     }
 
-    d->window = SDL_CreateWindow("GEMU",
+    char title[200];
+    gemu_window_title(title, sizeof(title), NULL, false);
+    d->window = SDL_CreateWindow(title,
         SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
         A1_WIN_W, A1_WIN_H, SDL_WINDOW_SHOWN);
     if (!d->window) {

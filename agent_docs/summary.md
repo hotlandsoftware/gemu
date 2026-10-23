@@ -111,3 +111,7 @@ core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
   free reads). `gemu_monitor_poll()` runs commands on the emulator thread.
   GMP/QMP is in `core/src/monitor_qmp.c` and uses the vendored cJSON
   (`core/third_party/cjson`) - don't hand-roll JSON. User docs: `docs/monitor.md`.
+- Window titles are universal: "GEMU", "GEMU (name)" with `-name`, plus
+  " [Paused]" - formatted by `gemu_window_title()` (gemu_display.h).
+  `GemuDisplayConfig` has no title field; machines must not set titles.
+  Secondary windows pass a role ("VT100 Terminal", "Hex Editor").

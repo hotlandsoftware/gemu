@@ -1,5 +1,6 @@
 #include "gemu/args.h"
 #include "gemu/gemu.h"
+#include "gemu/gemu_display.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,7 @@ static void print_usage(const GemuArgsDef *def) {
     if (def->vnc_support)
         printf("  %-14s VNC server (use -vnc ? for address format)\n", "-vnc ADDR");
     printf("  %-14s Pause/halt instead of exiting on monitor shutdown\n", "-no-shutdown");
+    printf("  %-14s Name the VM: window title becomes \"GEMU (NAME)\"\n", "-name NAME");
     printf("  %-14s Monitor: stdio | none | telnet:HOST:PORT,server,nowait\n",
            "-monitor SPEC");
     printf("  %-14s GMP/QMP-compatible monitor over TCP or stdio (alias: -qmp)\n", "-gmp ADDR");
@@ -343,6 +345,24 @@ bool gemu_args_parse(int argc, char **argv,
 
         if (strcmp(a, "-no-shutdown") == 0) {
             out->no_shutdown = true;
+            continue;
+        }
+
+        /* ── -name NAME | -name guest=NAME[,...] (QEMU syntax) ── */
+        if (strcmp(a, "-name") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: -name requires an argument\n", def->prog);
+                return false;
+            }
+            const char *v = argv[++i];
+            const char *guest = strstr(v, "guest=");
+            if (guest && (guest == v || guest[-1] == ',')) v = guest + 6;
+            char name[128];
+            size_t n = strcspn(v, ",");
+            if (n >= sizeof(name)) n = sizeof(name) - 1;
+            memcpy(name, v, n);
+            name[n] = '\0';
+            gemu_set_vm_name(name);
             continue;
         }
 

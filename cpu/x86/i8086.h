@@ -23,9 +23,10 @@ typedef enum {
 #define X86_FLAG_IF (1u << 9)
 #define X86_FLAG_DF (1u << 10)
 #define X86_FLAG_OF (1u << 11)
-/* Bits 1,3,5,12-15 are fixed on the 8086: 1 is always set, the rest 0. */
-#define X86_FLAGS_FIXED_ON  0x0002u
-#define X86_FLAGS_FIXED_OFF 0xF02Au /* 3,5,12,13,14,15 forced clear */
+/* Fixed FLAGS bits on the 8086/8088: bit 1 and bits 12-15 always read as
+ * 1 (software tells an 8086 from a 286 this way), bits 3 and 5 as 0. */
+#define X86_FLAGS_FIXED_ON  0xF002u
+#define X86_FLAGS_FIXED_OFF 0x0028u
 
 typedef union {
     uint16_t x;
@@ -53,6 +54,17 @@ typedef struct X86Cpu {
     bool    irq_pending;
     uint8_t irq_vector;
 
+    /* Interrupts aren't recognized for one instruction after STI, MOV SS
+     * or POP SS (so SS:SP can be loaded as a pair). */
+    bool    int_inhibit;
+
+    /* Maskable interrupt line (INTR), sampled at every instruction
+     * boundary while IF is set: intr_pending reports whether the PIC has
+     * a deliverable request, and intr_ack performs the INTA cycle and
+     * returns the vector.  Both optional; also wakes the CPU from HLT. */
+    bool    (*intr_pending)(void *ud);
+    uint8_t (*intr_ack)(void *ud);
+
     uint64_t insn_count;
 
     /* 20-bit physical memory bus: phys = ((seg << 4) + off) & 0xFFFFF.
@@ -77,9 +89,10 @@ typedef struct X86Cpu {
 
 void x86_reset(X86Cpu *cpu);
 
-/* Executes one instruction (or services a pending HLT/interrupt).
- * Returns an approximate cycle count, used by the caller's frame loop to
- * pace the PIT/PIC - not cycle-exact. */
+/* Executes one instruction (or services a pending HLT/interrupt) and
+ * returns the clock cycles it took, from the 8086/8088 instruction timing
+ * tables (including effective-address time and the 8088's extra 4 cycles
+ * per word memory access, but not prefetch-queue or wait-state effects). */
 unsigned x86_step(X86Cpu *cpu);
 
 /* Raises a maskable interrupt request; delivered once IF is set, at an

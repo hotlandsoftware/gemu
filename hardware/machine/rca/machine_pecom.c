@@ -485,7 +485,6 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
-                .title     = "GEMU",
                 .fb_width  = CDP1869_VISIBLE_W,
                 .fb_height = CDP1869_VISIBLE_H,
                 .scale     = cfg->display_scale,

@@ -554,7 +554,6 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
     if (cfg->vga != RCA_VGA_NONE) {
         display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
-                .title       = "GEMU",
                 .fb_width    = fw,
                 .fb_height   = fh,
                 .scale       = cfg->display_scale,

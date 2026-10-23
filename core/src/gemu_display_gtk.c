@@ -234,6 +234,8 @@ static void gtk_do_set_title(GemuDisplay *d, const char *title) {
 /* ── Create ──────────────────────────────────────────────────────────────── */
 
 GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
+    char initial_title[200];
+    gemu_window_title(initial_title, sizeof(initial_title), NULL, false);
     GtkBackend *b = calloc(1, sizeof(*b));
     if (!b) return NULL;
 
@@ -244,7 +246,7 @@ GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
     b->fb_height   = cfg->fb_height;
 
     GemuVideoGtkSpec spec = {
-        .title    = cfg->title ? cfg->title : "GEMU",
+        .title    = initial_title,
         .width    = cfg->fb_width,
         .height   = cfg->fb_height,
         .scale    = cfg->scale ? cfg->scale : 2,
@@ -269,7 +271,7 @@ GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
     d->do_poll   = gtk_do_poll;
     d->do_set_title = gtk_do_set_title;
     d->do_destroy = gtk_do_destroy;
-    snprintf(d->title, sizeof(d->title), "%s", cfg->title ? cfg->title : "GEMU");
+    gemu_window_title(d->title, sizeof(d->title), NULL, false);
     d->pointer.x = d->pointer.y = -1;
     b->parent = d;
 

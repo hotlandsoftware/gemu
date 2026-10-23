@@ -514,7 +514,6 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
         int n_actions = mf ? (int)(sizeof(magicfly_actions_mf)/sizeof(magicfly_actions_mf[0]))
                            : (int)(sizeof(magicfly_actions_7m)/sizeof(magicfly_actions_7m[0]));
         s->display = gemu_display_create(cfg->display_type, &(GemuDisplayConfig){
-            .title       = "GEMU",
             .fb_width    = MAGICFLY_FB_WIDTH,
             .fb_height   = MAGICFLY_FB_HEIGHT,
             .scale       = cfg->display_scale,

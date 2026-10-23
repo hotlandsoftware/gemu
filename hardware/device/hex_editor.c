@@ -1,5 +1,6 @@
 #ifdef GEMU_GTK
 #include "hex_editor.h"
+#include "gemu/gemu_display.h"
 #include <gtk/gtk.h>
 #include <stdlib.h>
 #include <string.h>
@@ -740,7 +741,9 @@ HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
 
     /* ── Window ── */
     he->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(he->window), "GEMU - Hex Editor");
+    char title[200];
+    gemu_window_title(title, sizeof(title), "Hex Editor", false);
+    gtk_window_set_title(GTK_WINDOW(he->window), title);
     gtk_window_set_default_size(GTK_WINDOW(he->window), 660, 520);
     g_signal_connect(he->window, "delete-event",
                      G_CALLBACK(on_window_delete), he);

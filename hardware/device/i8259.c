@@ -6,66 +6,114 @@ void i8259_reset(I8259 *p) {
     p->imr = 0xFF; /* all lines masked until the BIOS programs it */
 }
 
+/* Highest-priority (lowest-numbered) bit set in v, or 8 if none. */
+static unsigned highest(uint8_t v) {
+    for (unsigned i = 0; i < 8; i++)
+        if (v & (1u << i)) return i;
+    return 8;
+}
+
 void i8259_io_write(I8259 *p, uint16_t port, uint8_t val) {
     if ((port & 1) == 0) {
-        if (val & 0x10) { /* ICW1: starts (re)initialization */
-            p->icw_step = 1;
+        if (val & 0x10) {                         /* ICW1 */
+            p->level_mode  = (val & 0x08) != 0;
+            p->single      = (val & 0x02) != 0;
             p->expect_icw4 = (val & 0x01) != 0;
-            p->irr = p->isr = 0;
             p->imr = 0;
+            p->isr = 0;
+            p->irr = p->level_mode ? p->lines : 0;
+            p->auto_eoi = false;
+            p->read_isr = p->poll = false;
+            p->icw_step = 2;
             return;
         }
-        if (val & 0x08) return; /* OCW3 (read register select / poll) - reads handled in io_read */
-        /* OCW2: EOI family. Only the common "non-specific EOI" (0x20) and
-         * "specific EOI" (0x60 | level) forms are implemented - the
-         * rotating-priority variants aren't something PC BIOS/DOS-era code
-         * exercises. */
-        if (val & 0x20) {
-            if (val & 0x40) { /* specific EOI: level in bits 2:0 */
-                p->isr = (uint8_t)(p->isr & ~(1u << (val & 7)));
-            } else if (p->isr) { /* non-specific: clear highest-priority in-service bit */
-                for (unsigned i = 0; i < 8; i++) {
-                    if (p->isr & (1u << i)) { p->isr = (uint8_t)(p->isr & ~(1u << i)); break; }
-                }
-            }
+        if (val & 0x08) {                         /* OCW3 */
+            if (val & 0x02) p->read_isr = (val & 0x01) != 0;
+            p->poll = (val & 0x04) != 0;
+            return;
+        }
+        /* OCW2: EOI family (rotation commands are accepted as plain EOIs) */
+        switch (val >> 5) {
+        case 1: case 5: {                         /* non-specific EOI */
+            unsigned l = highest(p->isr);
+            if (l < 8) p->isr = (uint8_t)(p->isr & ~(1u << l));
+            break;
+        }
+        case 3: case 7:                           /* specific EOI */
+            p->isr = (uint8_t)(p->isr & ~(1u << (val & 7)));
+            break;
+        default:
+            break;
         }
         return;
     }
-    /* port 0x21 */
-    if (p->icw_step == 1) { p->icw_step = 2; return; } /* ICW2 arrives as vector_base below */
-    if (p->icw_step == 2) {
+
+    switch (p->icw_step) {
+    case 2:                                       /* ICW2 */
         p->vector_base = (uint8_t)(val & 0xF8);
-        p->icw_step = p->expect_icw4 ? 3 : 0;
+        p->icw_step = !p->single ? 3 : p->expect_icw4 ? 4 : 0;
+        return;
+    case 3:                                       /* ICW3 (cascade wiring) */
+        p->icw_step = p->expect_icw4 ? 4 : 0;
+        return;
+    case 4:                                       /* ICW4 */
+        p->auto_eoi = (val & 0x02) != 0;
+        p->icw_step = 0;
+        return;
+    default:                                      /* OCW1 */
+        p->imr = val;
         return;
     }
-    if (p->icw_step == 3) { p->icw_step = 0; return; } /* ICW4 - auto_eoi bit unused by real PC BIOS; ignore */
-    p->imr = val; /* OCW1 */
+}
+
+/* The request that would be delivered next, or 8 if none can be: the
+ * highest-priority unmasked request, provided nothing of equal or higher
+ * priority is in service. */
+static unsigned deliverable(const I8259 *p) {
+    unsigned req = highest((uint8_t)(p->irr & ~p->imr));
+    if (req == 8 || highest(p->isr) <= req) return 8;
+    return req;
+}
+
+static uint8_t acknowledge(I8259 *p, unsigned line) {
+    p->irr = (uint8_t)(p->irr & ~(1u << line));
+    if (!p->auto_eoi) p->isr = (uint8_t)(p->isr | (1u << line));
+    if (p->level_mode && (p->lines & (1u << line)))
+        p->irr = (uint8_t)(p->irr | (1u << line));
+    return (uint8_t)line;
 }
 
 uint8_t i8259_io_read(I8259 *p, uint16_t port) {
-    if ((port & 1) == 0) return p->irr; /* OCW3 register-read defaults to IRR, matches typical BIOS usage */
+    if ((port & 1) == 0) {
+        if (p->poll) {                            /* poll: ack + report */
+            p->poll = false;
+            unsigned l = deliverable(p);
+            if (l == 8) return 0;
+            return (uint8_t)(0x80 | acknowledge(p, l));
+        }
+        return p->read_isr ? p->isr : p->irr;
+    }
     return p->imr;
 }
 
-void i8259_raise_irq(I8259 *p, unsigned line) {
-    if (line < 8) p->irr = (uint8_t)(p->irr | (1u << line));
-}
-void i8259_lower_irq(I8259 *p, unsigned line) {
-    if (line < 8) p->irr = (uint8_t)(p->irr & ~(1u << line));
+void i8259_set_irq(I8259 *p, unsigned line, bool level) {
+    if (line >= 8) return;
+    uint8_t bit = (uint8_t)(1u << line);
+    bool was = (p->lines & bit) != 0;
+    if (level) p->lines |= bit; else p->lines = (uint8_t)(p->lines & ~bit);
+    if (p->level_mode) {
+        if (level) p->irr |= bit; else p->irr = (uint8_t)(p->irr & ~bit);
+    } else if (level && !was) {
+        p->irr |= bit;
+    }
 }
 
-int i8259_pending_vector(I8259 *p) {
-    uint8_t requested = (uint8_t)(p->irr & ~p->imr);
-    if (!requested) return -1;
-    for (unsigned i = 0; i < 8; i++) {
-        if (!(requested & (1u << i))) continue;
-        /* A higher-or-equal priority line already in service blocks this one. */
-        uint8_t higher_mask = (uint8_t)((1u << i) - 1u);
-        if (p->isr & higher_mask) return -1;
-        if (p->isr & (1u << i)) return -1;
-        p->isr = (uint8_t)(p->isr | (1u << i));
-        p->irr = (uint8_t)(p->irr & ~(1u << i)); /* edge-style: clear request once accepted */
-        return p->vector_base + (int)i;
-    }
-    return -1;
+bool i8259_intr(const I8259 *p) {
+    return deliverable(p) < 8;
+}
+
+uint8_t i8259_ack(I8259 *p) {
+    unsigned l = deliverable(p);
+    if (l == 8) return (uint8_t)(p->vector_base + 7);   /* spurious */
+    return (uint8_t)(p->vector_base + acknowledge(p, l));
 }

@@ -4801,7 +4801,6 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         GemuDisplayConfig dc = {
-            .title = "GEMU",
             .fb_width = FB_W,
             .fb_height = FB_H,
             .scale = cfg->display_scale,

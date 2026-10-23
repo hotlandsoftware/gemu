@@ -250,6 +250,8 @@ static void caca_do_set_title(GemuDisplay *d, const char *title) {
 /* ── Create ──────────────────────────────────────────────────────────────── */
 
 GemuDisplay *gemu_display_caca_create(const GemuDisplayConfig *cfg) {
+    char initial_title[200];
+    gemu_window_title(initial_title, sizeof(initial_title), NULL, false);
     CacaBackend *b = calloc(1, sizeof(*b));
     if (!b) return NULL;
 
@@ -282,7 +284,7 @@ GemuDisplay *gemu_display_caca_create(const GemuDisplayConfig *cfg) {
         d->do_render_text = caca_do_render_text;
         d->do_poll = caca_do_poll;
         d->do_destroy = caca_do_destroy;
-        snprintf(d->title, sizeof(d->title), "%s", cfg->title ? cfg->title : "GEMU");
+        gemu_window_title(d->title, sizeof(d->title), NULL, false);
         d->pointer.x = d->pointer.y = -1;
         return d;
     }
@@ -299,7 +301,7 @@ GemuDisplay *gemu_display_caca_create(const GemuDisplayConfig *cfg) {
         }
     }
     if (!b->dp) { caca_free_canvas(b->cv); free(b); return NULL; }
-    caca_set_display_title(b->dp, cfg->title ? cfg->title : "GEMU");
+    caca_set_display_title(b->dp, initial_title);
 
     if (!b->use_halfblock) {
         b->dither = caca_create_dither(32,
@@ -320,7 +322,7 @@ GemuDisplay *gemu_display_caca_create(const GemuDisplayConfig *cfg) {
     d->do_poll   = caca_do_poll;
     d->do_set_title = caca_do_set_title;
     d->do_destroy = caca_do_destroy;
-    snprintf(d->title, sizeof(d->title), "%s", cfg->title ? cfg->title : "GEMU");
+    gemu_window_title(d->title, sizeof(d->title), NULL, false);
     d->pointer.x = d->pointer.y = -1;
     return d;
 }

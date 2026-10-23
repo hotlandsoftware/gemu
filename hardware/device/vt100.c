@@ -8,6 +8,7 @@
  */
 
 #include "vt100.h"
+#include "gemu/gemu_display.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1084,10 +1085,11 @@ void vt100_destroy(Vt100State *t) {
     free(t);
 }
 
-Vt100State *vt100_create(GemuDisplayType dtype, const char *title) {
+Vt100State *vt100_create(GemuDisplayType dtype, const char *role) {
     /* In GTK mode the frame cadence is driven by GLib; SDL VSync would
      * fight GLib's timing and break the cursor blink accumulator. */
-    if (!title) title = "GEMU (VT100 Terminal)";
+    char title[200];
+    gemu_window_title(title, sizeof(title), role, false);
     bool use_vsync = (dtype != GEMU_DISPLAY_GTK);
 
     build_graphics_map();
@@ -1223,9 +1225,11 @@ static void tty_kpush(Vt100State *t, uint8_t ch)
     if (n != t->ktail) { t->kbuf[t->khead] = ch; t->khead = n; }
 }
 
-Vt100State *vt100_create(GemuDisplayType dtype, const char *title)
+Vt100State *vt100_create(GemuDisplayType dtype, const char *role)
 {
-    (void)dtype; (void)title;
+    (void)dtype;
+    char title[200];
+    gemu_window_title(title, sizeof(title), role, false);
     Vt100State *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
 
@@ -1256,7 +1260,7 @@ Vt100State *vt100_create(GemuDisplayType dtype, const char *title)
                 snprintf(sflag, sizeof(sflag), "-S%s/%d", rel, slave);
                 // TODO: check users terminal emulator?
                 execlp("xterm", "xterm",
-                       "-title", "GEMU (VT100 Terminal)",
+                       "-title", title,
                        "-geometry", "80x24",
                        sflag, NULL);
                 /* exec failed */

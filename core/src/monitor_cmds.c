@@ -15,6 +15,7 @@
  * Keep the table sorted by name; 'help' prints it in order.
  */
 #include "monitor_priv.h"
+#include "gemu/gemu_display.h"
 
 #include <ctype.h>
 #include <inttypes.h>
@@ -462,6 +463,11 @@ static void info_machine(GemuMonitor *mon) {
     mon_printf(mon, "%s\n", machine ? machine : "(unknown)");
 }
 
+static void info_name(GemuMonitor *mon) {
+    const char *name = gemu_vm_name();
+    if (name) mon_printf(mon, "%s\n", name);
+}
+
 static void info_media_status(GemuMonitor *mon) {
     bool any = false;
     for (int i = 0; i < mon->n_media; i++) {
@@ -481,6 +487,7 @@ static const MonInfoDef info_cmds[] = {
     { "cpu",         "registers", "show CPU state",              info_cpu },
     { "machine",     NULL,        "show the emulated machine",   info_machine },
     { "media",       NULL,        "show media device status",    info_media_status },
+    { "name",        NULL,        "show the VM name given with -name", info_name },
     { "roms",        NULL,        "list loaded ROM images",      info_roms },
     { "status",      NULL,        "show whether emulation is running", info_status },
 };

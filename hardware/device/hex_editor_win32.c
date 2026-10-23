@@ -15,6 +15,7 @@
  */
 #if defined(_WIN32) && !defined(GEMU_GTK)
 #include "hex_editor.h"
+#include "gemu/gemu_display.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
@@ -625,7 +626,9 @@ HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
     if (!he) return NULL;
     he->cur_tab = -1;
 
-    he->hwnd = CreateWindowExA(0, "GemuHexEditorWindow", "GEMU \xE2\x80\x94 Hex Editor",
+    char title[200];
+    gemu_window_title(title, sizeof(title), "Hex Editor", false);
+    he->hwnd = CreateWindowExA(0, "GemuHexEditorWindow", title,
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 680, 540,
         NULL, NULL, hinst, NULL);
     if (!he->hwnd) { free(he); return NULL; }

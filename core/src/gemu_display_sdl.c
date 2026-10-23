@@ -529,6 +529,8 @@ static void menu_overlay_cb(void *ud, SDL_Renderer *r, int pixel_scale) {
 /* ── Create ──────────────────────────────────────────────────────────────── */
 
 GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
+    char initial_title[200];
+    gemu_window_title(initial_title, sizeof(initial_title), NULL, false);
     SdlBackend *b = calloc(1, sizeof(*b));
     if (!b) return NULL;
 
@@ -542,7 +544,7 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     int wh = cfg->window_height ? cfg->window_height : h * (cfg->scale ? cfg->scale : 2);
 
     b->video = gemu_video_sdl_create(&(GemuVideoSdlSpec){
-        .title         = cfg->title ? cfg->title : "GEMU",
+        .title         = initial_title,
         .width         = w,
         .height        = h,
         .window_width  = ww,
@@ -617,7 +619,7 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     d->do_reset_input_bindings = sdl_do_reset_input_bindings;
     d->do_set_title   = sdl_do_set_title;
     d->do_destroy     = sdl_do_destroy;
-    snprintf(d->title, sizeof(d->title), "%s", cfg->title ? cfg->title : "GEMU");
+    gemu_window_title(d->title, sizeof(d->title), NULL, false);
     d->pointer.x = d->pointer.y = -1;
 
 #ifdef _WIN32

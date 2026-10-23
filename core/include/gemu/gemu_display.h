@@ -78,8 +78,7 @@ typedef struct {
 
 /* ── Display config ──────────────────────────────────────────────────────── */
 typedef struct {
-    /* Window / framebuffer */
-    const char          *title;
+    /* Window / framebuffer (the title comes from gemu_window_title()) */
     int                  fb_width, fb_height; /* logical pixel dimensions */
     int                  scale;               /* ignored by terminal backends */
     int                  window_width;        /* override window width  (0 = fb_width*scale) */
@@ -125,6 +124,18 @@ void         gemu_display_destroy(GemuDisplay *d);
 void gemu_display_render(GemuDisplay *d, const uint32_t *argb, int w, int h);
 void gemu_display_render_text(GemuDisplay *d, const char *text, int rows, int cols);
 void gemu_display_set_paused(GemuDisplay *d, bool paused);
+
+/* ── Window titles ───────────────────────────────────────────────────────────
+ *
+ * Titles are the same for every machine, like QEMU's: "GEMU", or
+ * "GEMU (name)" when the user passed -name, with " [Paused]" appended while
+ * the VM is paused (gemu_display_set_paused()).  Machines can't set their
+ * own.  Secondary windows (terminals, tool windows) pass a role so they can
+ * be told apart: "GEMU (name) - Hex Editor".
+ */
+void gemu_set_vm_name(const char *name);
+const char *gemu_vm_name(void);   /* NULL when -name wasn't given */
+void gemu_window_title(char *buf, size_t len, const char *role, bool paused);
 
 /*
  * Drain the backend's event queue (non-blocking).  Must be called once per

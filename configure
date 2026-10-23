@@ -103,8 +103,9 @@ FAMILY_SRC = {
     ],
     'x86': [
         'cpu/x86/i8086.c',
-        'hardware/device/i8259.c', 'hardware/device/i8253.c', 'hardware/device/i8255.c',
-        'hardware/machine/x86/machine_ibm5150.c',
+        'hardware/device/i8237.c', 'hardware/device/i8259.c',
+        'hardware/device/i8253.c', 'hardware/device/i8255.c',
+        'hardware/machine/x86/machine_ibm5150.c', 'audio/pcspk.c',
         'vga/x86/cga.c', 'vga/x86/cgafont8x8.c', 'vga/multi/input_menu.c',
         'hardware/romdb.c',
         'src/x86_setup.c',

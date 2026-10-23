@@ -610,7 +610,7 @@ GemuDisplay *gemu_display_term_create(const GemuDisplayConfig *cfg) {
     d->do_poll      = term_do_poll;
     d->do_set_title = term_do_set_title;
     d->do_destroy   = term_do_destroy;
-    snprintf(d->title, sizeof(d->title), "%s", cfg->title ? cfg->title : "GEMU");
+    gemu_window_title(d->title, sizeof(d->title), NULL, false);
     d->pointer.x = d->pointer.y = -1;
     term_do_set_title(d, d->title);
     return d;

@@ -1430,7 +1430,6 @@ Kim1State *kim1_create(const MosConfig *cfg) {
 #endif
         s->display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
-                .title       = "GEMU",
                 .fb_width    = KIM1_FB_WIDTH,
                 .fb_height   = KIM1_FB_HEIGHT,
                 .scale       = cfg->display_scale,

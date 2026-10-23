@@ -53,11 +53,12 @@ static const GemuArgsDef def = {
         "\nx86 options:\n"
         "  -rom FILE|DIR   Load a BIOS/BASIC image, or scan a directory for\n"
         "                  known ROMs by SHA-256 (e.g. -rom roms/ibm5150)\n"
-        "  -m SIZE         RAM size, K/M suffix (default 640K, ibm5150's ceiling)\n"
-        "\nThis is an early skeleton: the 8086/8088 core covers the common\n"
-        "real-mode instruction set but not BCD adjust or cycle-exact timing,\n"
-        "and CGA only renders text mode - see cpu/x86/i8086.c and vga/x86/cga.c\n"
-        "for the exact gaps.\n"
+        "  -m SIZE         RAM size, K/M suffix (default 64K; the 19OCT81 BIOS\n"
+        "                  uses up to 544K, and POST takes ~50 s to test that)\n"
+        "\nBoots the original BIOS into Cassette BASIC (no diskette drives are\n"
+        "configured).  Not yet emulated: floppy controller, cassette, printer\n"
+        "and serial ports.  Monitor: 'sendkey' types into the keyboard, e.g.\n"
+        "sendkey PRINT spc 2+2 ret, or sendkey ctrl-alt-delete.\n"
         "\nExample:\n"
         "  ./bin/gemu -M ibm5150 -rom roms/ibm5150 -display sdl\n",
 };
@@ -93,7 +94,8 @@ int x86_setup(int argc, char *argv[]) {
         .machine = X86_MACHINE_IBM5150,
         .cpu = X86_CPU_8088,
         .vga = X86_VGA_CGA,
-        .ram_size = IBM5150_RAM_MAX,
+        .ram_size = 64u << 10,   /* Cassette BASIC uses at most 64K, and more
+                                    * RAM only lengthens POST's memory test */
         .display_type = GEMU_DISPLAY_SDL,
         .display_scale = 1,
     };

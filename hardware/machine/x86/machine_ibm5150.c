@@ -1,6 +1,9 @@
 #include "ibm5150.h"
 #include "cgafont8x8.h"
 #include "gemu/util.h"
+#include "gemu/screendump.h"
+#include <ctype.h>
+#include <SDL2/SDL.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -9,9 +12,19 @@
 #define IBM5150_CGA_BASE   0xB8000u
 #define IBM5150_CGA_END    0xBC000u /* B8000-BBFFF, 16K */
 
-#define IBM5150_INSTR_PER_FRAME  20000
-#define IBM5150_PIT_TICKS_PER_FRAME 4000 /* not wall-clock accurate this pass -
-                                           * see the run-loop comment below */
+#define PIT_HZ 1193182u
+
+/* The CGA's 640x200 picture with doubled scanlines (see cga_render()). */
+#define IBM5150_FB_W 640
+#define IBM5150_FB_H 400
+
+/* Keyboard timing, in CPU clocks: the keyboard answers a reset with 0xAA a
+ * few milliseconds after its clock line is released.  Scan codes are spaced
+ * 8 ms apart - a fast typist's pace - so the BIOS's 15-key buffer keeps up
+ * even with input injected by sendkey. */
+#define KB_RESET_HOLD   (IBM5150_CPU_HZ / 1000 * 5)   /* clock low >= 5 ms resets */
+#define KB_RESET_REPLY  (IBM5150_CPU_HZ / 1000 * 2)
+#define KB_BYTE_GAP     (IBM5150_CPU_HZ / 1000 * 8)
 
 /* ── CPU <-> memory/IO bus ───────────────────────────────────────────────── */
 
@@ -83,22 +96,142 @@ static void iolog(Ibm5150State *s, uint16_t port, bool is_write, uint8_t val) {
     }
 }
 
+/* ── Speaker ─────────────────────────────────────────────────────────────── *
+ *
+ * The speaker sounds PIT channel 2's square wave when PB0 (gate) and PB1
+ * (data) are both set; the tone generator is retuned whenever either the
+ * port or the channel changes. */
+
+static void update_speaker(Ibm5150State *s) {
+    if (!s->speaker) return;
+    const I8253Channel *c = &s->pit.ch[2];
+    bool on = (s->ppi.port_b & 0x03) == 0x03 && c->mode == 3 && c->counting;
+    if (on) {
+        unsigned div = c->reload ? c->reload : 0x10000u;
+        rca_pcspk_set_freq(s->speaker, PIT_HZ / div);
+    }
+    rca_pcspk_set_gate(s->speaker, on);
+}
+
+/* ── Keyboard ────────────────────────────────────────────────────────────── */
+
+static bool kb_enabled(const Ibm5150State *s) {
+    return !(s->ppi.port_b & 0x80) && (s->ppi.port_b & 0x40);
+}
+
+static void kb_update_irq(Ibm5150State *s) {
+    i8259_set_irq(&s->pic, 1, s->kb_full && !(s->ppi.port_b & 0x80));
+}
+
+/* Shift the next byte into the PPI if the keyboard may send one. */
+static void kb_service(Ibm5150State *s) {
+    if (s->kb_full || !kb_enabled(s) || s->cycles < s->kb_next_at) return;
+    if (s->kb_reset_at) {
+        if (s->cycles < s->kb_reset_at) return;
+        s->kb_reset_at = 0;
+        s->ppi.kb_data = 0xAA;
+    } else if (s->kbq_len > 0) {
+        s->ppi.kb_data = s->kbq[0];
+        memmove(s->kbq, s->kbq + 1, (size_t)(s->kbq_len - 1));
+        s->kbq_len--;
+    } else {
+        return;
+    }
+    s->kb_full = true;
+    s->kb_next_at = s->cycles + KB_BYTE_GAP;
+    kb_update_irq(s);
+}
+
+static void kb_port_b_changed(Ibm5150State *s, uint8_t old, uint8_t val) {
+    if ((old & 0x40) && !(val & 0x40))           /* clock pulled low */
+        s->kb_clock_low_at = s->cycles;
+    if (!(old & 0x40) && (val & 0x40) &&         /* clock released after a reset hold */
+        s->cycles - s->kb_clock_low_at >= KB_RESET_HOLD) {
+        s->kbq_len = 0;
+        s->kb_reset_at = s->cycles + KB_RESET_REPLY;
+    }
+    if (val & 0x80) {                            /* clear: empty the shift register */
+        s->kb_full = false;
+        s->ppi.kb_data = 0;
+    }
+    kb_update_irq(s);
+}
+
+/* ── I/O ports ───────────────────────────────────────────────────────────── */
+
+/* Standard adapters this machine doesn't have.  POST probes all of them,
+ * so accesses are expected and not worth logging; the bus floats high. */
+static bool empty_slot(uint16_t port) {
+    return (port >= 0x200 && port <= 0x20F) ||   /* game port */
+           (port >= 0x278 && port <= 0x27F) ||   /* LPT2 */
+           (port >= 0x2F8 && port <= 0x2FF) ||   /* COM2 */
+           (port >= 0x378 && port <= 0x37F) ||   /* LPT1 */
+           (port >= 0x3B0 && port <= 0x3BF) ||   /* MDA + its printer port */
+           (port >= 0x3F0 && port <= 0x3F7) ||   /* diskette controller */
+           (port >= 0x3F8 && port <= 0x3FF);     /* COM1 */
+}
+
 static uint8_t io_read8(uint16_t port, void *ud) {
     Ibm5150State *s = ud;
+    port &= 0x3FF;   /* the PC decodes only A0-A9 */
+    if (port <= 0x0F) return i8237_io_read(&s->dma, port);
     if (port >= 0x20 && port <= 0x21) return i8259_io_read(&s->pic, port);
     if (port >= 0x40 && port <= 0x43) return i8253_io_read(&s->pit, port);
     if (port >= 0x60 && port <= 0x63) return i8255_io_read(&s->ppi, port);
+    if (port >= 0x80 && port <= 0x83) return i8237_page_read(&s->dma, port);
     if (port >= 0x3D0 && port <= 0x3DF) return cga_io_read(&s->cga, port);
+    if (empty_slot(port)) return 0xFF;
     iolog(s, port, false, 0);
     return 0xFF;
 }
 static void io_write8(uint16_t port, uint8_t val, void *ud) {
     Ibm5150State *s = ud;
+    port &= 0x3FF;
+    if (port <= 0x0F) { i8237_io_write(&s->dma, port, val); return; }
     if (port >= 0x20 && port <= 0x21) { i8259_io_write(&s->pic, port, val); return; }
-    if (port >= 0x40 && port <= 0x43) { i8253_io_write(&s->pit, port, val); return; }
-    if (port >= 0x60 && port <= 0x63) { i8255_io_write(&s->ppi, port, val); return; }
+    if (port >= 0x40 && port <= 0x43) {
+        i8253_io_write(&s->pit, port, val);
+        update_speaker(s);
+        return;
+    }
+    if (port >= 0x60 && port <= 0x63) {
+        uint8_t old = s->ppi.port_b;
+        i8255_io_write(&s->ppi, port, val);
+        if ((port & 3) == 1) {
+            i8253_set_gate(&s->pit, 2, val & 0x01);
+            kb_port_b_changed(s, old, val);
+            update_speaker(s);
+        }
+        return;
+    }
+    if (port >= 0x80 && port <= 0x83) { i8237_page_write(&s->dma, port, val); return; }
+    if (port >= 0xA0 && port <= 0xAF) { s->nmi_mask = val; return; }
     if (port >= 0x3D0 && port <= 0x3DF) { cga_io_write(&s->cga, port, val); return; }
+    if (empty_slot(port)) return;
     iolog(s, port, true, val);
+}
+
+/* ── Interrupts and timers ───────────────────────────────────────────────── */
+
+static bool cpu_intr_pending(void *ud) {
+    Ibm5150State *s = ud;
+    return i8259_intr(&s->pic);
+}
+
+static uint8_t cpu_intr_ack(void *ud) {
+    Ibm5150State *s = ud;
+    return i8259_ack(&s->pic);
+}
+
+/* PIT outputs: channel 0 is IRQ0, channel 1 requests a DRAM refresh cycle
+ * on DMA channel 0, channel 2 feeds the speaker and PPI port C bit 5. */
+static void pit_out_changed(void *ud, unsigned ch, bool level) {
+    Ibm5150State *s = ud;
+    switch (ch) {
+    case 0: i8259_set_irq(&s->pic, 0, level); break;
+    case 1: if (level) i8237_refresh(&s->dma); break;
+    case 2: s->ppi.timer2_out = level; break;
+    }
 }
 
 static void on_unknown_opcode(X86Cpu *cpu, uint8_t opcode, void *ud) {
@@ -110,16 +243,31 @@ static void on_unknown_opcode(X86Cpu *cpu, uint8_t opcode, void *ud) {
                 opcode, cpu->cs, cpu->ip);
     }
     /* Stop cleanly rather than desync decode by guessing - keeps whatever
-     * BIOS POST progress happened so far inspectable via the monitor. */
+     * progress happened so far inspectable via the monitor. */
     s->halted_for_debug = true;
     cpu->halted = true;
 }
 
+/* Advance the rest of the machine by the clocks the CPU just used.
+ * Returns true when the CGA started a new frame. */
+static bool advance(Ibm5150State *s, unsigned clocks) {
+    s->cycles += clocks;
+    s->pit_phase += clocks;
+    if (s->pit_phase >= 4) {
+        i8253_tick(&s->pit, s->pit_phase / 4);
+        s->pit_phase %= 4;
+    }
+    kb_service(s);
+    return cga_tick(&s->cga, clocks);
+}
+
+static bool step_cpu(Ibm5150State *s) {
+    return advance(s, x86_step(&s->cpu));
+}
+
 /* ── Keyboard: XT scan code set 1, polled via gemu_display_is_key_held()
  * (the same full-keyboard pattern machine_pecom.c uses) since a PC
- * keyboard has far more keys than the 32-bit action-bitmask model fits.
- * Covers the keys BIOS/DOS-era interactive use actually needs; extending
- * this table is cheap. ────────────────────────────────────────────────── */
+ * keyboard has far more keys than the 32-bit action-bitmask model fits. ── */
 
 typedef struct { const char *name; uint8_t code; } XtKeyEnt;
 static const XtKeyEnt XT_KEYMAP[] = {
@@ -128,47 +276,169 @@ static const XtKeyEnt XT_KEYMAP[] = {
     {"Backspace",0x0E},{"Tab",0x0F},
     {"Q",0x10},{"W",0x11},{"E",0x12},{"R",0x13},{"T",0x14},{"Y",0x15},{"U",0x16},
     {"I",0x17},{"O",0x18},{"P",0x19},{"[",0x1A},{"]",0x1B},{"Return",0x1C},
-    {"Left Ctrl",0x1D},
+    {"Left Ctrl",0x1D},{"Right Ctrl",0x1D},
     {"A",0x1E},{"S",0x1F},{"D",0x20},{"F",0x21},{"G",0x22},{"H",0x23},{"J",0x24},
     {"K",0x25},{"L",0x26},{";",0x27},{"'",0x28},{"`",0x29},
     {"Left Shift",0x2A},{"\\",0x2B},
     {"Z",0x2C},{"X",0x2D},{"C",0x2E},{"V",0x2F},{"B",0x30},{"N",0x31},{"M",0x32},
-    {",",0x33},{".",0x34},{"/",0x35},{"Right Shift",0x36},
-    {"Left Alt",0x38},{"Space",0x39},
+    {",",0x33},{".",0x34},{"/",0x35},{"Right Shift",0x36},{"Keypad *",0x37},
+    {"Left Alt",0x38},{"Right Alt",0x38},{"Space",0x39},{"CapsLock",0x3A},
     {"F1",0x3B},{"F2",0x3C},{"F3",0x3D},{"F4",0x3E},{"F5",0x3F},
     {"F6",0x40},{"F7",0x41},{"F8",0x42},{"F9",0x43},{"F10",0x44},
-    {"Up",0x48},{"Left",0x4B},{"Right",0x4D},{"Down",0x50},
+    {"Numlock",0x45},{"ScrollLock",0x46},
+    {"Home",0x47},{"Up",0x48},{"PageUp",0x49},{"Keypad -",0x4A},
+    {"Left",0x4B},{"Keypad 5",0x4C},{"Right",0x4D},{"Keypad +",0x4E},
+    {"End",0x4F},{"Down",0x50},{"PageDown",0x51},{"Insert",0x52},{"Delete",0x53},
 };
 #define XT_KEYMAP_N ((int)(sizeof(XT_KEYMAP) / sizeof(XT_KEYMAP[0])))
 
 static void scan_keyboard(Ibm5150State *s) {
-    static bool prev[XT_KEYMAP_N];
-    for (int i = 0; i < XT_KEYMAP_N; i++) {
-        bool down = gemu_display_is_key_held(s->display, XT_KEYMAP[i].name);
-        if (down != prev[i]) {
-            prev[i] = down;
-            uint8_t code = XT_KEYMAP[i].code;
-            if (!down) code = (uint8_t)(code | 0x80);
-            if (s->kbq_len < (int)(sizeof(s->kbq) / sizeof(s->kbq[0])))
-                s->kbq[s->kbq_len++] = code;
-        }
-    }
-    if (!s->ppi.kb_data_ready && s->kbq_len > 0) {
-        i8255_kb_scancode(&s->ppi, s->kbq[0]);
-        memmove(s->kbq, s->kbq + 1, (size_t)(s->kbq_len - 1) * sizeof(s->kbq[0]));
-        s->kbq_len--;
-        i8259_raise_irq(&s->pic, 1);
+    bool now[128] = {0};
+    for (int i = 0; i < XT_KEYMAP_N; i++)
+        if (gemu_display_is_key_held(s->display, XT_KEYMAP[i].name))
+            now[XT_KEYMAP[i].code] = true;
+    for (int code = 1; code < 128; code++) {
+        if (now[code] == s->key_down[code]) continue;
+        s->key_down[code] = now[code];
+        if (s->kbq_len < (int)sizeof(s->kbq))
+            s->kbq[s->kbq_len++] = (uint8_t)(now[code] ? code : (code | 0x80));
     }
 }
 
+/* ── Monitor commands ────────────────────────────────────────────────────── */
+
+static bool ibm5150_screendump(void *ud, const char *path) {
+    Ibm5150State *s = ud;
+    cga_render(&s->cga, s->fb, IBM5150_FB_W, IBM5150_FB_H, cgafont8x8);
+    return gemu_screendump_argb(path, s->fb, IBM5150_FB_W, IBM5150_FB_H);
+}
+
+static void kb_queue(Ibm5150State *s, uint8_t code) {
+    if (s->kbq_len < (int)sizeof(s->kbq)) s->kbq[s->kbq_len++] = code;
+}
+
+/* Named keys for sendkey, using QEMU's names where it has them. */
+static const XtKeyEnt SENDKEY_NAMES[] = {
+    {"esc",0x01},{"backspace",0x0E},{"tab",0x0F},{"ret",0x1C},{"enter",0x1C},
+    {"ctrl",0x1D},{"shift",0x2A},{"shift_r",0x36},{"alt",0x38},{"spc",0x39},
+    {"space",0x39},{"caps_lock",0x3A},{"num_lock",0x45},{"scroll_lock",0x46},
+    {"f1",0x3B},{"f2",0x3C},{"f3",0x3D},{"f4",0x3E},{"f5",0x3F},{"f6",0x40},
+    {"f7",0x41},{"f8",0x42},{"f9",0x43},{"f10",0x44},{"home",0x47},{"up",0x48},
+    {"pgup",0x49},{"left",0x4B},{"right",0x4D},{"end",0x4F},{"down",0x50},
+    {"pgdn",0x51},{"insert",0x52},{"delete",0x53},{"minus",0x0C},{"equal",0x0D},
+};
+
+/* US layout: scan code for an ASCII character, and whether it needs shift. */
+static bool ascii_to_scan(char ch, uint8_t *code, bool *shift) {
+    static const char unshifted[] = "\0\0" "1234567890-=\0\0" "qwertyuiop[]\0\0"
+                                    "asdfghjkl;'`\0\\" "zxcvbnm,./";
+    static const char shifted[]   = "\0\0" "!@#$%^&*()_+\0\0" "QWERTYUIOP{}\0\0"
+                                    "ASDFGHJKL:\"~\0|" "ZXCVBNM<>?";
+    if (ch == ' ') { *code = 0x39; *shift = false; return true; }
+    for (unsigned i = 0; i < sizeof(unshifted) - 1; i++) {
+        if (unshifted[i] && unshifted[i] == ch) { *code = (uint8_t)i; *shift = false; return true; }
+        if (shifted[i]   && shifted[i]   == ch) { *code = (uint8_t)i; *shift = true;  return true; }
+    }
+    return false;
+}
+
+static bool sendkey_name(const char *name, uint8_t *code) {
+    for (size_t i = 0; i < sizeof(SENDKEY_NAMES) / sizeof(SENDKEY_NAMES[0]); i++)
+        if (strcasecmp(name, SENDKEY_NAMES[i].name) == 0) { *code = SENDKEY_NAMES[i].code; return true; }
+    bool shift;
+    return name[0] && !name[1] && ascii_to_scan((char)tolower((unsigned char)name[0]), code, &shift);
+}
+
+/* "ctrl-alt-delete": press each key in order, release in reverse.  Returns
+ * false (queueing nothing) unless every part is a key name. */
+static bool sendkey_combo(Ibm5150State *s, const char *tok) {
+    uint8_t codes[8];
+    int n = 0;
+    for (const char *p = tok; *p; ) {
+        const char *dash = strchr(p, '-');
+        size_t len = dash ? (size_t)(dash - p) : strlen(p);
+        char part[32];
+        if (n == 8 || len == 0 || len >= sizeof(part)) return false;
+        memcpy(part, p, len);
+        part[len] = '\0';
+        if (!sendkey_name(part, &codes[n])) return false;
+        n++;
+        p += len + (dash ? 1 : 0);
+    }
+    if (n == 0) return false;
+    for (int i = 0; i < n; i++) kb_queue(s, codes[i]);
+    for (int i = n - 1; i >= 0; i--) kb_queue(s, (uint8_t)(codes[i] | 0x80));
+    return true;
+}
+
+static GemuMonCmd ibm5150_cmd_sendkey(GemuMonitor *mon, const char *args, void *ud) {
+    Ibm5150State *s = ud;
+    if (!*args) {
+        gemu_monitor_printf(mon, "usage: sendkey <keys|text>...  e.g. sendkey ctrl-alt-delete, "
+                                 "sendkey PRINT spc 2+2 ret\n");
+        return GEMU_MON_NONE;
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", args);
+    for (char *tok = strtok(buf, " \t"); tok; tok = strtok(NULL, " \t")) {
+        if (strlen(tok) > 1 && sendkey_combo(s, tok))   /* named key or combo */
+            continue;
+        for (const char *p = tok; *p; p++) {       /* literal text */
+            uint8_t code; bool shift;
+            if (!ascii_to_scan(*p, &code, &shift)) {
+                gemu_monitor_printf(mon, "sendkey: can't type '%c'\n", *p);
+                return GEMU_MON_NONE;
+            }
+            if (shift) kb_queue(s, 0x2A);
+            kb_queue(s, code);
+            kb_queue(s, (uint8_t)(code | 0x80));
+            if (shift) kb_queue(s, 0xAA);
+        }
+    }
+    return GEMU_MON_NONE;
+}
+
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
+
+/* DIP switches for the configured RAM.  SW1 bits 2-3 give the planar
+ * (motherboard) RAM in 16K steps up to 64K; SW2 counts 32K expansion
+ * blocks above that, which the 19OCT81 BIOS reads as a 4-bit count - so
+ * 64K + 15 x 32K = 544K is the most it can use.  No diskette drives is
+ * selected (SW1 bit 0 clear) so POST boots straight into Cassette BASIC,
+ * and bits 4-5 select an 80x25 color display. */
+static uint32_t configure_switches(Ibm5150State *s, uint32_t ram) {
+    uint32_t kb = ram >> 10;
+    uint32_t planar = kb >= 64 ? 64 : (kb < 16 ? 16 : kb / 16 * 16);
+    uint32_t blocks = kb > 64 ? (kb - 64) / 32 : 0;
+    if (blocks > 15) blocks = 15;
+    s->ppi.sw1 = (uint8_t)(((planar / 16 - 1) << 2) | 0x20);
+    s->ppi.sw2 = (uint8_t)blocks;
+    return (planar + blocks * 32) << 10;
+}
+
+static void ibm5150_reset(Ibm5150State *s) {
+    x86_reset(&s->cpu);
+    i8237_reset(&s->dma);
+    i8259_reset(&s->pic);
+    i8253_reset(&s->pit);
+    i8255_reset(&s->ppi);
+    cga_reset(&s->cga);
+    s->nmi_mask = 0;
+    s->pit_phase = 0;
+    s->kbq_len = 0;
+    s->kb_full = false;
+    s->kb_reset_at = s->kb_next_at = 0;
+    s->halted_for_debug = false;
+    update_speaker(s);
+}
 
 Ibm5150State *ibm5150_create(const X86Config *cfg) {
     Ibm5150State *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
 
-    s->ram_size = cfg->ram_size ? cfg->ram_size : IBM5150_RAM_MAX;
-    if (s->ram_size > IBM5150_RAM_MAX) s->ram_size = IBM5150_RAM_MAX;
+    uint32_t ram = cfg->ram_size ? cfg->ram_size : IBM5150_RAM_MAX;
+    if (ram > IBM5150_RAM_MAX) ram = IBM5150_RAM_MAX;
+    s->ram_size = configure_switches(s, ram);
     s->ram = calloc(1, s->ram_size);
     if (!s->ram) { free(s); return NULL; }
 
@@ -195,20 +465,14 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     s->cpu.mem_write8 = bus_write8;
     s->cpu.io_read8 = io_read8;
     s->cpu.io_write8 = io_write8;
+    s->cpu.intr_pending = cpu_intr_pending;
+    s->cpu.intr_ack = cpu_intr_ack;
     s->cpu.bus_ud = s;
     s->cpu.on_unknown_opcode = on_unknown_opcode;
-    x86_reset(&s->cpu);
+    s->pit.out_changed = pit_out_changed;
+    s->pit.ud = s;
 
-    i8259_reset(&s->pic);
-    i8253_reset(&s->pit);
-    i8255_reset(&s->ppi);
-    /* SW1 DIP switches: floppy present, no 8087, 64K motherboard bank
-     * (bits 2-3, meaningless beyond the base board but BIOS still reads
-     * it), 80x25 color CGA (bits 4-5 = 10), 1 floppy drive (bits 6-7 = 00). */
-    s->ppi.sw1 = 0x2F;
-    cga_reset(&s->cga);
-
-    s->fb = calloc((size_t)640 * 200, sizeof(uint32_t));
+    s->fb = calloc((size_t)IBM5150_FB_W * IBM5150_FB_H, sizeof(uint32_t));
     if (!s->fb) { free(s->ram); free(s); return NULL; }
 
     s->monitor = gemu_monitor_create();
@@ -216,22 +480,26 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
         .read = ibm5150_mon_read, .write = ibm5150_mon_write, .ud = s,
         .addr_bits = 20, .big_endian = false });
     gemu_monitor_set_cpu_state_cb(s->monitor, ibm5150_mon_cpu_state, s);
+    gemu_monitor_set_screendump_cb(s->monitor, ibm5150_screendump, s);
+    gemu_monitor_bind(s->monitor, "sendkey", ibm5150_cmd_sendkey, s);
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         GemuDisplayConfig dc = {
-            .title = "GEMU",
-            .fb_width = 640, .fb_height = 200,
-            .scale = cfg->display_scale > 0 ? cfg->display_scale : 1,
+            .fb_width = IBM5150_FB_W, .fb_height = IBM5150_FB_H,
+            .scale = cfg->display_scale > 0 ? cfg->display_scale : 1, /* 640x400 is big enough at 1x */
             .no_menu = true, /* full keyboard machine - no gamepad-style input menu */
         };
         s->display = gemu_display_create(cfg->display_type, &dc);
+        s->speaker = rca_pcspk_create(440);
     }
 
+    ibm5150_reset(s);
     return s;
 }
 
 void ibm5150_destroy(Ibm5150State *s) {
     if (!s) return;
+    if (s->speaker) rca_pcspk_destroy(s->speaker);
     if (s->display) gemu_display_destroy(s->display);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     free(s->fb);
@@ -240,69 +508,75 @@ void ibm5150_destroy(Ibm5150State *s) {
 }
 
 void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
-    (void)cfg;
     printf("gemu-x86: IBM PC 5150\n"
            "  RAM   : %u KiB\n"
-           "  Video : CGA (text mode)\n"
+           "  Video : CGA\n"
            "  BASIC : %s\n",
            s->ram_size >> 10, s->has_basic ? "Cassette BASIC present" : "(none loaded)");
 
     gemu_monitor_start(s->monitor);
 
+    const uint64_t perf_hz = SDL_GetPerformanceFrequency();
+    uint64_t next_frame = SDL_GetPerformanceCounter();
     bool running = true;
-    bool was_halted = false;
+    bool reported_halt = false;
     while (running) {
-        if (!gemu_monitor_is_paused(s->monitor)) {
-            for (int i = 0; i < IBM5150_INSTR_PER_FRAME && !s->cpu.halted; i++)
-                x86_step(&s->cpu);
+        /* Run until the CGA starts its next frame (~1/60 s of PC time). */
+        if (!gemu_monitor_is_paused(s->monitor) && !s->halted_for_debug) {
+            bool check_bp = gemu_monitor_has_exec_breakpoints(s->monitor);
+            for (;;) {
+                if (check_bp && !s->cpu.halted &&
+                    gemu_monitor_check_exec(s->monitor, x86_linear(s->cpu.cs, s->cpu.ip)))
+                    break;
+                if (step_cpu(s)) break;
+            }
         }
-        if (s->cpu.halted && !was_halted && !s->halted_for_debug) {
-            fprintf(stderr, "ibm5150: HLT at %04x:%04x (ninsts=%llu)\n",
-                    s->cpu.cs, (uint16_t)(s->cpu.ip - 1), (unsigned long long)s->cpu.insn_count);
-        }
-        was_halted = s->cpu.halted;
 
-        /* PIT/CGA are ticked by a fixed per-loop-iteration amount rather
-         * than wall-clock time or actual cycles consumed - simplest thing
-         * that still lets a HLT-based BIOS idle loop get woken by IRQ0.
-         * Real-time pacing (see i2000's merced_set_external_itc) is a good
-         * follow-up once timing accuracy actually matters. */
-        if (i8253_tick(&s->pit, IBM5150_PIT_TICKS_PER_FRAME))
-            i8259_raise_irq(&s->pic, 0);
-        i8255_set_timer2_out(&s->ppi, i8253_ch2_out(&s->pit));
-        cga_tick(&s->cga, IBM5150_PIT_TICKS_PER_FRAME);
-
-        if (s->display) scan_keyboard(s);
-
-        int vec = i8259_pending_vector(&s->pic);
-        if (vec >= 0) x86_request_irq(&s->cpu, (uint8_t)vec);
+        /* HLT with interrupts off never resumes: POST does this on failure. */
+        bool dead = s->cpu.halted && !(s->cpu.flags & X86_FLAG_IF);
+        if (dead && !reported_halt && !s->halted_for_debug)
+            fprintf(stderr, "ibm5150: CPU halted with interrupts disabled at %04x:%04x\n",
+                    s->cpu.cs, (uint16_t)(s->cpu.ip - 1));
+        reported_halt = dead;
 
         if (s->display) {
             gemu_display_poll(s->display);
-            cga_render(&s->cga, s->fb, 640, 200, cgafont8x8);
-            gemu_display_render(s->display, s->fb, 640, 200);
-            gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor) || s->cpu.halted);
+            scan_keyboard(s);
+            cga_render(&s->cga, s->fb, IBM5150_FB_W, IBM5150_FB_H, cgafont8x8);
+            gemu_display_render(s->display, s->fb, IBM5150_FB_W, IBM5150_FB_H);
+            gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor) || dead);
             if (gemu_display_should_quit(s->display)) running = false;
             if (gemu_display_reset_requested(s->display)) {
-                x86_reset(&s->cpu);
+                ibm5150_reset(s);
                 gemu_display_clear_flags(s->display);
             }
-            gemu_sleep_ms(s->cpu.halted ? 30 : 1);
+
+            /* Pace to the CGA's 59.92 Hz frame rate. */
+            next_frame += perf_hz * CGA_CLOCKS_PER_FRAME / IBM5150_CPU_HZ;
+            uint64_t now = SDL_GetPerformanceCounter();
+            if (next_frame > now) {
+                uint64_t ms = (next_frame - now) * 1000 / perf_hz;
+                if (ms) gemu_sleep_ms((unsigned)ms);
+            } else if (now - next_frame > perf_hz / 4) {
+                next_frame = now;   /* fell far behind (e.g. paused): resync */
+            }
         }
-        /* headless (-display none): deliberately no per-frame sleep here -
-         * see machine_i2000.c's Sleep(0) history before adding one. */
+        /* headless (-display none): deliberately unthrottled while running -
+         * see machine_i2000.c's Sleep(0) history before adding a sleep. */
+        else if (gemu_monitor_is_paused(s->monitor) || s->halted_for_debug || dead)
+            gemu_sleep_ms(1);
 
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
             switch (cmd) {
-            case GEMU_MON_QUIT: running = false; break;
-            case GEMU_MON_RESET: x86_reset(&s->cpu); break;
-            case GEMU_MON_STEP: {
-                uint32_t n = gemu_monitor_step_count(s->monitor);
-                if (n == 0) n = 1;
-                for (uint32_t k = 0; k < n && !s->cpu.halted; k++) x86_step(&s->cpu);
+            case GEMU_MON_QUIT:
+                if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true);
+                else running = false;
                 break;
-            }
+            case GEMU_MON_RESET: ibm5150_reset(s); break;
+            case GEMU_MON_STEP:
+                for (uint32_t k = gemu_monitor_step_count(s->monitor); k; k--) step_cpu(s);
+                break;
             default: break;
             }
         }

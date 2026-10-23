@@ -53,6 +53,25 @@ bool gemu_ini_read(const char *section, const char *key,
     return found;
 }
 
+/* ── Window titles ───────────────────────────────────────────────────────── */
+
+static char vm_name[128];
+
+void gemu_set_vm_name(const char *name) {
+    snprintf(vm_name, sizeof(vm_name), "%s", name ? name : "");
+}
+
+const char *gemu_vm_name(void) {
+    return vm_name[0] ? vm_name : NULL;
+}
+
+void gemu_window_title(char *buf, size_t len, const char *role, bool paused) {
+    snprintf(buf, len, "GEMU%s%s%s%s%s%s",
+             vm_name[0] ? " (" : "", vm_name, vm_name[0] ? ")" : "",
+             role ? " - " : "", role ? role : "",
+             paused ? " [Paused]" : "");
+}
+
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
 GemuDisplay *gemu_display_create(GemuDisplayType type,
@@ -101,10 +120,8 @@ void gemu_display_render_text(GemuDisplay *d, const char *text, int rows, int co
 
 void gemu_display_set_paused(GemuDisplay *d, bool paused) {
     if (!d || !d->do_set_title || d->paused_title == paused) return;
-    char title[160];
-    snprintf(title, sizeof(title), "%s%s",
-             d->title[0] ? d->title : "GEMU",
-             paused ? " [Paused]" : "");
+    char title[200];
+    gemu_window_title(title, sizeof(title), NULL, paused);
     d->do_set_title(d, title);
     d->paused_title = paused;
 }

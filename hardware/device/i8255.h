@@ -2,31 +2,31 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Intel 8255 PPI as wired on the IBM 5150/5160 motherboard - ports
- * 0x60-0x63. Port A: keyboard scan code in. Port B: speaker gate/data out,
- * plus a nibble-select bit for Port C's DIP-switch readback. Port C: SW1
- * nibble (equipment config - floppy count, video mode, RAM size) selected
- * by Port B bit 3, plus timer channel 2's output on bit 7.
+/* Intel 8255 PPI as wired on the IBM 5150 motherboard - ports 0x60-0x63.
  *
- * Simplified relative to real silicon: the 8255's general-purpose mode
- * configuration (port 0x63) is accepted but not used to reprogram
- * direction/mode - the 5150's BIOS always uses the fixed A-in/B-out/C-in
- * wiring described above, so nothing on this machine needs more. */
+ * Port A (in):  keyboard scan code, or DIP switch block SW1 when PB7 is set.
+ * Port B (out): PB0 timer 2 gate, PB1 speaker data, PB2 selects what port C
+ *               bits 0-3 show, PB3 cassette motor off, PB4/PB5 disable
+ *               parity / I/O channel check, PB6 low holds the keyboard clock
+ *               low (keyboard reset), PB7 clears the keyboard and selects SW1.
+ * Port C (in):  PC0-3 SW2 switches 1-4 (PB2 set) or switch 5 on PC0 (PB2
+ *               clear); PC4 cassette data in; PC5 timer 2 output; PC6 I/O
+ *               channel check; PC7 RAM parity check.
+ *
+ * The 5150 BIOS always programs the fixed A-in/B-out/C-in configuration
+ * (0x99), so the mode register at 0x63 is accepted and ignored.  The
+ * keyboard handshake driven by PB6/PB7 is the machine's job; it reads
+ * port_b after writes. */
 
 typedef struct {
     uint8_t port_b;
-    uint8_t sw1;           /* DIP switch bank 1 - caller sets equipment bits */
-    uint8_t kb_scancode;
-    bool    kb_data_ready;
-    bool    timer2_out;    /* PIT channel 2 output, mirrored onto Port C bit 7 */
+    uint8_t sw1;           /* SW1: floppy/8087/planar RAM/video/drives */
+    uint8_t sw2;           /* SW2: expansion RAM size in 32K blocks (bits 0-4) */
+    uint8_t kb_data;       /* keyboard shift register */
+    bool    timer2_out;    /* PIT channel 2 output -> PC5 */
+    bool    cassette_in;   /* cassette data -> PC4 */
 } I8255;
 
 void    i8255_reset(I8255 *p);
 uint8_t i8255_io_read(I8255 *p, uint16_t port);
 void    i8255_io_write(I8255 *p, uint16_t port, uint8_t val);
-
-/* Machine-facing helpers */
-void i8255_kb_scancode(I8255 *p, uint8_t code); /* latch a new scan code + request IRQ1 */
-void i8255_set_timer2_out(I8255 *p, bool v);
-bool i8255_speaker_gate(const I8255 *p); /* Port B bit 0 */
-bool i8255_speaker_data(const I8255 *p); /* Port B bit 1 */

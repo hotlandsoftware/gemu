@@ -247,7 +247,6 @@ MitsuTvGame6State *mitsu_tvgame6_create(const MitsuConfig *cfg) {
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         GemuDisplayConfig dc = {
-            .title = "GEMU",
             .fb_width = FB_W,
             .fb_height = FB_H,
             .scale = cfg->display_scale,

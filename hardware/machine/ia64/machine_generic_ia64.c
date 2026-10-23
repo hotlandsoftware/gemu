@@ -2044,7 +2044,6 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
 
     if (cfg->display_type != GEMU_DISPLAY_NONE) {
         GemuDisplayConfig dc = {
-            .title = "GEMU",
             .fb_width = FB_W,
             .fb_height = FB_H,
             .scale = cfg->display_scale,
