@@ -13,6 +13,7 @@
 #include "monitor_priv.h"
 #include "cJSON.h"
 #include "gemu/vnc.h"
+#include "gemu/gemu.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -88,9 +89,10 @@ static cJSON *qmp_version(void) {
     cJSON_AddNumberToObject(qemu, "minor", 6);
     cJSON_AddNumberToObject(qemu, "micro", 0);
     cJSON *gemu = cJSON_AddObjectToObject(v, "gemu");
-    cJSON_AddNumberToObject(gemu, "major", 1);
-    cJSON_AddNumberToObject(gemu, "minor", 0);
-    cJSON_AddNumberToObject(gemu, "micro", 0);
+    cJSON_AddNumberToObject(gemu, "major", GEMU_VERSION_MAJOR);
+    cJSON_AddNumberToObject(gemu, "minor", GEMU_VERSION_MINOR);
+    cJSON_AddNumberToObject(gemu, "micro", GEMU_VERSION_PATCH);
+    cJSON_AddStringToObject(gemu, "stage", GEMU_VERSION_STAGE);
     cJSON_AddStringToObject(v, "package", "");
     return v;
 }

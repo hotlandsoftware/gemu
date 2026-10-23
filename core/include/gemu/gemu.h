@@ -1,9 +1,10 @@
 #pragma once
 
 #define GEMU_VERSION_MAJOR 0
-#define GEMU_VERSION_MINOR 1
-#define GEMU_VERSION_PATCH 0
-#define GEMU_VERSION_STR   "0.1.0"
+#define GEMU_VERSION_MINOR 0
+#define GEMU_VERSION_PATCH 1
+#define GEMU_VERSION_STAGE "A"          /* A = alpha */
+#define GEMU_VERSION_STR   "0.0.1" GEMU_VERSION_STAGE
 
 #define GEMU_UNUSED(x) ((void)(x))
 
