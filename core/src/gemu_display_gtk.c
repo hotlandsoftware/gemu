@@ -151,9 +151,10 @@ static void gtk_pointer_update(GtkBackend *b, double x, double y,
                                bool button, bool pressed,
                                bool right_button, bool right_pressed) {
     GemuDisplay *d = b->parent;
-    GtkWidget *area = gemu_video_gtk_drawing_area(b->video);
-    int aw = gtk_widget_get_allocated_width(area);
-    int ah = gtk_widget_get_allocated_height(area);
+    int px, py, aw, ah;
+    gemu_video_gtk_picture_rect(b->video, &px, &py, &aw, &ah);
+    x -= px;
+    y -= py;
     if (aw <= 0 || ah <= 0 || x < 0.0 || y < 0.0 || x >= aw || y >= ah) {
         d->pointer = (GemuPointerState){
             .x = -1, .y = -1,

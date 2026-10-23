@@ -605,13 +605,10 @@ static GemuMonCmd cmd_help(GemuMonitor *mon, const char *args) {
     for (size_t i = 0; i < N_CMDS; i++) {
         const MonCmdDef *def = &mon_cmds[i];
         if (!def->machines) continue;
-        char syn[160], machines[512];
+        char syn[160];
         format_synopsis(def, syn, sizeof(syn));
-        format_machine_list(def->machines, machines, sizeof(machines));
         bool here = machine && availability(mon, def) == AVAIL_OK;
-        char note[600];
-        snprintf(note, sizeof(note), " [%s]", machines);
-        print_help_row(mon, here ? '*' : ' ', syn, def->help, note);
+        print_help_row(mon, here ? '*' : ' ', syn, def->help, "");
     }
     return GEMU_MON_NONE;
 }

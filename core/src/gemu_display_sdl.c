@@ -56,9 +56,6 @@ typedef struct {
      * the last event so we never call SDL_SetWindowSize mid-drag (which
      * conflicts with the WM's pointer grab on X11 and causes the window to
      * move instead of resize). */
-    int    pending_snap_w;
-    int    pending_snap_h;
-    Uint32 pending_snap_t;
     bool   mouse_captured;
     bool   capture_pointer;
     bool   saw_mouse_motion;
@@ -274,15 +271,6 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
     SDL_Window *win = gemu_video_sdl_get_window(b->video);
     bool focused = win && (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0;
 
-    /* Apply debounced resize snap: fire 150ms after the last RESIZED event.
-     * We never snap mid-drag because calling SDL_SetWindowSize while the WM
-     * holds the pointer grab causes the window to move on X11. */
-    if (b->pending_snap_w > 0 &&
-        SDL_TICKS_PASSED(SDL_GetTicks(), b->pending_snap_t + 150)) {
-        gemu_video_sdl_snap_resize(b->video, b->pending_snap_w, b->pending_snap_h);
-        b->pending_snap_w = 0;
-    }
-
     /* Detect menu close → reload INI bindings */
     bool menu_open = b->menu && input_menu_is_open(b->menu);
     if (b->menu_was_open && !menu_open)
@@ -330,10 +318,6 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
                 if (!main_win ||
                     ev.window.windowID == SDL_GetWindowID(main_win))
                     d->quit = true;
-            } else if (ev.window.event == SDL_WINDOWEVENT_RESIZED) {
-                b->pending_snap_w = ev.window.data1;
-                b->pending_snap_h = ev.window.data2;
-                b->pending_snap_t = SDL_GetTicks();
             }
             break;
 

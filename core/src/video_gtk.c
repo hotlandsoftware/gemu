@@ -24,12 +24,8 @@ struct GemuVideoGtk {
     GLuint           vao;
     GLuint           vbo;
     bool             gl_ready;
-    /* Integer-scale resize (resizable windows only) */
-    bool             resizable;
-    bool             setup_done;    /* ignore size-allocate during initial layout */
-    int              pending_snap_w;
-    int              pending_snap_h;
-    guint            snap_source_id;
+    GLint            u_tex_size;    /* sharp-bilinear shader uniforms */
+    GLint            u_prescale;
 };
 
 /* ── Shaders ─────────────────────────────────────────────────────────────── */
@@ -44,13 +40,24 @@ static const char *vs_src =
     "    vUV = aUV;\n"
     "}\n";
 
+/* Sharp bilinear: behaves like nearest-neighbour scaling by the integer
+ * factor uPrescale followed by a bilinear resize to the output, so pixels
+ * stay crisp at any window size without uneven rows/columns.  Each texel's
+ * interior samples its own center; only the band at its edge (whose width
+ * shrinks as the prescale grows) blends with the neighbour. */
 static const char *fs_src =
     "#version 130\n"
     "uniform sampler2D uTex;\n"
+    "uniform vec2 uTexSize;\n"
+    "uniform vec2 uPrescale;\n"
     "in vec2 vUV;\n"
     "out vec4 fragColor;\n"
     "void main() {\n"
-    "    fragColor = texture(uTex, vUV);\n"
+    "    vec2 texel = vUV * uTexSize;\n"
+    "    vec2 center_dist = fract(texel) - 0.5;\n"
+    "    vec2 range = 0.5 - 0.5 / uPrescale;\n"
+    "    vec2 f = (center_dist - clamp(center_dist, -range, range)) * uPrescale + 0.5;\n"
+    "    fragColor = texture(uTex, (floor(texel) + f) / uTexSize);\n"
     "}\n";
 
 static GLuint gl_compile(GLenum type, const char *src) {
@@ -109,6 +116,8 @@ static void gl_setup(GemuVideoGtk *v) {
 
     glUseProgram(v->prog);
     glUniform1i(glGetUniformLocation(v->prog, "uTex"), 0);
+    v->u_tex_size = glGetUniformLocation(v->prog, "uTexSize");
+    v->u_prescale = glGetUniformLocation(v->prog, "uPrescale");
 
     /* VAO + VBO */
     glGenVertexArrays(1, &v->vao);
@@ -147,43 +156,29 @@ static void gl_teardown(GemuVideoGtk *v) {
     v->gl_ready = false;
 }
 
-/* ── Integer-scale resize ────────────────────────────────────────────────── */
+/* ── Picture placement ───────────────────────────────────────────────────── */
 
-static gboolean do_gtk_snap(gpointer data) {
-    GemuVideoGtk *v = data;
-    v->snap_source_id = 0;
-    if (!v->width || !v->height) return G_SOURCE_REMOVE;
-
-    int scale = (v->pending_snap_w + v->width / 2) / v->width;
-    if (scale < 1) scale = 1;
-    int target_w = v->width  * scale;
-    int target_h = v->height * scale;
-
-    int gl_w  = gtk_widget_get_allocated_width(v->gl_area);
-    int gl_h  = gtk_widget_get_allocated_height(v->gl_area);
-    int win_w = gtk_widget_get_allocated_width(GTK_WIDGET(v->window));
-    int win_h = gtk_widget_get_allocated_height(GTK_WIDGET(v->window));
-
-    if (target_w == gl_w && target_h == gl_h) return G_SOURCE_REMOVE;
-
-    /* Resize window by the same delta the GL area needs to change - this
-     * keeps the menu bar height out of the calculation entirely. */
-    gtk_window_resize(GTK_WINDOW(v->window),
-                      win_w + (target_w - gl_w),
-                      win_h + (target_h - gl_h));
-    return G_SOURCE_REMOVE;
+/* Largest rectangle with the framebuffer's aspect ratio that fits w x h,
+ * centered. */
+static void fit_rect(const GemuVideoGtk *v, int w, int h,
+                     int *rx, int *ry, int *rw, int *rh) {
+    if ((long)w * v->height <= (long)h * v->width) {
+        *rw = w;
+        *rh = (int)((long)w * v->height / v->width);
+    } else {
+        *rh = h;
+        *rw = (int)((long)h * v->width / v->height);
+    }
+    if (*rw < 1) *rw = 1;
+    if (*rh < 1) *rh = 1;
+    *rx = (w - *rw) / 2;
+    *ry = (h - *rh) / 2;
 }
 
-static void on_gl_size_allocate(GtkWidget *widget, GtkAllocation *alloc,
-                                gpointer data) {
-    (void)widget;
-    GemuVideoGtk *v = data;
-    if (!v->resizable || !v->setup_done) return;
-    if (v->snap_source_id)
-        g_source_remove(v->snap_source_id);
-    v->pending_snap_w = alloc->width;
-    v->pending_snap_h = alloc->height;
-    v->snap_source_id = g_timeout_add(150, do_gtk_snap, v);
+void gemu_video_gtk_picture_rect(GemuVideoGtk *v, int *x, int *y, int *w, int *h) {
+    int aw = gtk_widget_get_allocated_width(v->gl_area);
+    int ah = gtk_widget_get_allocated_height(v->gl_area);
+    fit_rect(v, aw, ah, x, y, w, h);
 }
 
 /* ── GTK callbacks ───────────────────────────────────────────────────────── */
@@ -226,15 +221,24 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *ctx, gpointer data) {
         v->frame_dirty = false;
     }
 
-    int w = gtk_widget_get_allocated_width(GTK_WIDGET(area));
-    int h = gtk_widget_get_allocated_height(GTK_WIDGET(area));
+    /* The GL framebuffer is in device pixels; allocations are in logical
+     * pixels (they differ on HiDPI). */
+    int sf = gtk_widget_get_scale_factor(GTK_WIDGET(area));
+    int w = gtk_widget_get_allocated_width(GTK_WIDGET(area)) * sf;
+    int h = gtk_widget_get_allocated_height(GTK_WIDGET(area)) * sf;
 
     glViewport(0, 0, w, h);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     if (v->active) {
+        int rx, ry, rw, rh;
+        fit_rect(v, w, h, &rx, &ry, &rw, &rh);
+        glViewport(rx, h - ry - rh, rw, rh);   /* GL's origin is bottom-left */
+        float pre_x = (float)(rw / v->width), pre_y = (float)(rh / v->height);
         glUseProgram(v->prog);
+        glUniform2f(v->u_tex_size, (float)v->width, (float)v->height);
+        glUniform2f(v->u_prescale, pre_x < 1.0f ? 1.0f : pre_x, pre_y < 1.0f ? 1.0f : pre_y);
         glBindVertexArray(v->vao);
         glBindTexture(GL_TEXTURE_2D, v->tex);
         glDrawArrays(GL_TRIANGLES, 0, 6);
@@ -268,15 +272,11 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
         return NULL;
     }
 
-    /* Scale-based windows (window_width == 0 in spec) are resizable and snap
-     * to integer multiples.  Fixed-size windows (KIM-1 keypad, etc.) are not. */
-    v->resizable = (spec->window_width == 0);
-
     /* Window */
     v->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(v->window),
                          spec->title ? spec->title : "GEMU");
-    gtk_window_set_resizable(GTK_WINDOW(v->window), v->resizable);
+    gtk_window_set_resizable(GTK_WINDOW(v->window), TRUE);   /* picture scales to fit */
     /* Best-effort: gemu.png at the repo root, same convention as every other
      * relative path in this project. gdk-pixbuf (part of GTK) handles the
      * PNG decode, so no extra dependency is needed here. Missing/unreadable
@@ -293,21 +293,12 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
      * back to the window where our on_key signal handler lives. */
     v->gl_area = gtk_gl_area_new();
     gtk_widget_set_can_focus(v->gl_area, FALSE);
-    /* For resizable windows, set minimum size to 1x; the initial scale is
-     * applied after the first show via gtk_window_resize.
-     * For fixed-size windows, the size request IS the window size. */
-    if (v->resizable)
-        gtk_widget_set_size_request(v->gl_area, v->width, v->height);
-    else
-        gtk_widget_set_size_request(v->gl_area, v->window_width, v->window_height);
+    /* The size request is the minimum size; the initial size is applied
+     * after the first show via gtk_window_resize. */
+    gtk_widget_set_size_request(v->gl_area, v->width < 160 ? v->width : 160,
+                                            v->height < 100 ? v->height : 100);
     gtk_gl_area_set_required_version(GTK_GL_AREA(v->gl_area), 3, 2);
     gtk_box_pack_start(GTK_BOX(vbox), v->gl_area, TRUE, TRUE, 0);
-
-    /* size-allocate connected before show so it fires during initial layout;
-     * setup_done is false so those early firings are ignored. */
-    if (v->resizable)
-        g_signal_connect(v->gl_area, "size-allocate",
-                         G_CALLBACK(on_gl_size_allocate), v);
 
     g_signal_connect(v->gl_area, "realize",   G_CALLBACK(on_realize),   v);
     g_signal_connect(v->gl_area, "unrealize", G_CALLBACK(on_unrealize), v);
@@ -319,27 +310,20 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     gtk_widget_show_all(v->window);
     gemu_video_gtk_poll();
 
-    if (v->resizable) {
-        /* Resize to the configured initial scale.  We can now measure the
-         * menu bar height as (window height - GL area height) and add it
-         * back when resizing to the target dimensions. */
-        int gl_h  = gtk_widget_get_allocated_height(v->gl_area);
-        int win_h = gtk_widget_get_allocated_height(GTK_WIDGET(v->window));
-        gtk_window_resize(GTK_WINDOW(v->window),
-                          v->window_width,
-                          v->window_height + (win_h - gl_h));
-        gemu_video_gtk_poll();
-        /* Initial layout complete - future size-allocates are user resizes. */
-        v->setup_done = true;
-    }
+    /* Resize to the configured initial size.  We can now measure the menu
+     * bar height as (window height - GL area height) and add it back. */
+    int gl_h  = gtk_widget_get_allocated_height(v->gl_area);
+    int win_h = gtk_widget_get_allocated_height(GTK_WIDGET(v->window));
+    gtk_window_resize(GTK_WINDOW(v->window),
+                      v->window_width,
+                      v->window_height + (win_h - gl_h));
+    gemu_video_gtk_poll();
 
     return v;
 }
 
 void gemu_video_gtk_destroy(GemuVideoGtk *v) {
     if (!v) return;
-    if (v->snap_source_id)
-        g_source_remove(v->snap_source_id);
     if (v->window) gtk_widget_destroy(v->window);
     free(v->frame_argb);
     free(v);

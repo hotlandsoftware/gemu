@@ -319,7 +319,11 @@ static void evaluate_sprites(Rp2c02 *ppu) {
     if (target >= 240) return;
 
     for (int i = 0; i < 64; i++) {
-        int y = ((int)ppu->oam[i * 4] + 1) & 0xFF;
+        /* A sprite covers lines Y+1 .. Y+height.  No 8-bit wrap: Y=$FF starts
+         * at line 256 and is never drawn (wrapping it to 0 put sprites the
+         * game had parked off-screen at the top - e.g. SMB3's Mario above
+         * the screen stuck to its top edge). */
+        int y = (int)ppu->oam[i * 4] + 1;
         if (target < y || target >= y + spr_h) continue;
 
         if (ppu->n_spr < 8) {
@@ -345,7 +349,7 @@ static void load_sprite_shifters(Rp2c02 *ppu) {
         uint8_t spr_x = ppu->oam2[i * 4 + 3];
         bool flip_v = (attr & 0x80u) != 0;
         bool flip_h = (attr & 0x40u) != 0;
-        int row = target - (((int)spr_y + 1) & 0xFF);
+        int row = target - ((int)spr_y + 1);
 
         uint16_t addr;
         if (ppu->ppuctrl & PPUCTRL_SPR_8x16) {

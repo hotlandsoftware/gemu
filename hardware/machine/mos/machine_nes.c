@@ -2797,28 +2797,43 @@ static GemuMonCmd nes_cmd_gamegenie(GemuMonitor *mon, const char *args, void *ud
     return GEMU_MON_NONE;
 }
 
+/* sendkey <button>[-<button>...] [frames]: hold the buttons (e.g. "right-b-a")
+ * on controller 1 for the given number of frames (default 5). */
 static GemuMonCmd nes_cmd_sendkey(GemuMonitor *mon, const char *args, void *ud) {
     NesState *s = ud;
+    static const struct { const char *name; uint8_t bit; } buttons[] = {
+        { "a", NES_BTN_A }, { "b", NES_BTN_B }, { "select", NES_BTN_SELECT },
+        { "start", NES_BTN_START }, { "up", NES_BTN_UP }, { "down", NES_BTN_DOWN },
+        { "left", NES_BTN_LEFT }, { "right", NES_BTN_RIGHT },
+    };
+    uint8_t mask = 0;
     const char *p = args;
-    uint8_t btn = 0;
-    if      (strncasecmp(p, "a",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = NES_BTN_A;
-    else if (strncasecmp(p, "b",      1) == 0 && (p[1] < 'a' || p[1] > 'z')) btn = NES_BTN_B;
-    else if (strncasecmp(p, "start",  5) == 0) btn = s->cfg->is_arcade ? VS_BTN_START : NES_BTN_START;
-    else if (strncasecmp(p, "select", 6) == 0) btn = NES_BTN_SELECT;
-    else if (strncasecmp(p, "up",     2) == 0) btn = NES_BTN_UP;
-    else if (strncasecmp(p, "down",   4) == 0) btn = NES_BTN_DOWN;
-    else if (strncasecmp(p, "left",   4) == 0) btn = NES_BTN_LEFT;
-    else if (strncasecmp(p, "right",  5) == 0) btn = NES_BTN_RIGHT;
-    if (btn) {
-        while (*p && *p != ' ' && *p != '\t') p++;
-        while (*p == ' ' || *p == '\t') p++;
-        int frames = (*p >= '1' && *p <= '9') ? (int)strtol(p, NULL, 10) : 5;
-        s->ctrl_inject_mask   = btn;
-        s->ctrl_inject_frames = frames;
-        gemu_monitor_printf(mon, "sendkey: holding 0x%02X for %d frame(s)\n", btn, frames);
-    } else {
-        gemu_monitor_printf(mon, "sendkey: unknown button (a b start select up down left right)\n");
+    while (*p && *p != ' ' && *p != '\t') {
+        size_t len = strcspn(p, "-+ \t");
+        uint8_t bit = 0;
+        for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+            if (strlen(buttons[i].name) == len && strncasecmp(p, buttons[i].name, len) == 0)
+                bit = buttons[i].bit;
+        if (bit == NES_BTN_START && s->cfg->is_arcade) bit = VS_BTN_START;
+        if (!bit) {
+            gemu_monitor_printf(mon, "sendkey: unknown button '%.*s' "
+                                "(a b start select up down left right, combine with -)\n",
+                                (int)len, p);
+            return GEMU_MON_NONE;
+        }
+        mask |= bit;
+        p += len;
+        if (*p == '-' || *p == '+') p++;
     }
+    if (!mask) {
+        gemu_monitor_printf(mon, "usage: sendkey <button>[-<button>...] [frames]\n");
+        return GEMU_MON_NONE;
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    int frames = (*p >= '1' && *p <= '9') ? (int)strtol(p, NULL, 10) : 5;
+    s->ctrl_inject_mask   = mask;
+    s->ctrl_inject_frames = frames;
+    gemu_monitor_printf(mon, "sendkey: holding 0x%02X for %d frame(s)\n", mask, frames);
     return GEMU_MON_NONE;
 }
 
