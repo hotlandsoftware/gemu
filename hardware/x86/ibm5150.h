@@ -6,6 +6,7 @@
 #include "i8255.h"
 #include "upd765.h"
 #include "cga.h"
+#include "mda.h"
 #include "pcspk.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
@@ -39,7 +40,10 @@ typedef struct Ibm5150State {
     I8259     pic;
     I8253     pit;
     I8255     ppi;
+    X86VgaType vga;       /* which display adapter is installed (-vga) */
     CgaDevice cga;
+    MdaDevice mda;
+    int       fb_w, fb_h; /* the adapter's framebuffer size */
     Upd765    fdc;        /* diskette adapter, present when -drive if=floppy is */
     bool      has_fdc;
     uint8_t   nmi_mask;  /* port 0xA0 */
@@ -62,7 +66,7 @@ typedef struct Ibm5150State {
     GemuMonitor  *monitor;
     GemuDisplay  *display;
     RcaPcSpeaker *speaker;
-    uint32_t     *fb; /* 640x400 ARGB, rendered from cga each frame */
+    uint32_t     *fb; /* fb_w x fb_h ARGB, rendered from the adapter each frame */
 
     bool halted_for_debug; /* set on an unimplemented/trapped opcode - keeps
                              * the machine parked so the monitor can inspect

@@ -526,6 +526,8 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     int w = cfg->fb_width,  h = cfg->fb_height;
     int ww = cfg->window_width  ? cfg->window_width  : w * (cfg->scale ? cfg->scale : 2);
     int wh = cfg->window_height ? cfg->window_height : h * (cfg->scale ? cfg->scale : 2);
+    if (!cfg->window_height && cfg->aspect_w > 0 && cfg->aspect_h > 0)
+        wh = ww * cfg->aspect_h / cfg->aspect_w;    /* e.g. 720x350 -> 720x540 at 4:3 */
 
     b->video = gemu_video_sdl_create(&(GemuVideoSdlSpec){
         .title         = initial_title,
@@ -533,6 +535,8 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
         .height        = h,
         .window_width  = ww,
         .window_height = wh,
+        .aspect_w      = cfg->aspect_w,
+        .aspect_h      = cfg->aspect_h,
         .renderer      = cfg->renderer,
         .log_prefix    = "gemu",
     });

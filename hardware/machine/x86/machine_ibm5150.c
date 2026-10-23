@@ -1,5 +1,6 @@
 #include "ibm5150.h"
 #include "cgafont8x8.h"
+#include "mdafont8x14.h"
 #include "gemu/util.h"
 #include "gemu/screendump.h"
 #include <ctype.h>
@@ -11,12 +12,55 @@
 #define IBM5150_BIOS_BASE  0xFE000u
 #define IBM5150_CGA_BASE   0xB8000u
 #define IBM5150_CGA_END    0xBC000u /* B8000-BBFFF, 16K */
+#define IBM5150_MDA_BASE   0xB0000u
+#define IBM5150_MDA_END    0xB8000u /* 4K, mirrored through B7FFF */
 
 #define PIT_HZ 1193182u
 
 /* The CGA's 640x200 picture with doubled scanlines (see cga_render()). */
-#define IBM5150_FB_W 640
-#define IBM5150_FB_H 400
+#define IBM5150_CGA_FB_W 640
+#define IBM5150_CGA_FB_H 400
+
+/* ── Display adapter (-vga cga | mda) ────────────────────────────────────── */
+
+/* The adapter's VRAM window; false if addr isn't in it. */
+static bool video_mem_read(const Ibm5150State *s, uint32_t addr, uint8_t *val) {
+    if (s->vga == X86_VGA_MDA) {
+        if (addr < IBM5150_MDA_BASE || addr >= IBM5150_MDA_END) return false;
+        *val = mda_mem_read(&s->mda, addr - IBM5150_MDA_BASE);
+        return true;
+    }
+    if (addr < IBM5150_CGA_BASE || addr >= IBM5150_CGA_END) return false;
+    *val = cga_mem_read(&s->cga, addr - IBM5150_CGA_BASE);
+    return true;
+}
+
+static bool video_mem_write(Ibm5150State *s, uint32_t addr, uint8_t val) {
+    if (s->vga == X86_VGA_MDA) {
+        if (addr < IBM5150_MDA_BASE || addr >= IBM5150_MDA_END) return false;
+        mda_mem_write(&s->mda, addr - IBM5150_MDA_BASE, val);
+        return true;
+    }
+    if (addr < IBM5150_CGA_BASE || addr >= IBM5150_CGA_END) return false;
+    cga_mem_write(&s->cga, addr - IBM5150_CGA_BASE, val);
+    return true;
+}
+
+/* The adapter's registers: MDA at 0x3B0-0x3BB (0x3BC- is its printer
+ * port), CGA at 0x3D0-0x3DF. */
+static bool video_port(const Ibm5150State *s, uint16_t port) {
+    return s->vga == X86_VGA_MDA ? (port >= 0x3B0 && port <= 0x3BB)
+                                 : (port >= 0x3D0 && port <= 0x3DF);
+}
+
+static bool video_tick(Ibm5150State *s, uint32_t clocks) {
+    return s->vga == X86_VGA_MDA ? mda_tick(&s->mda, clocks) : cga_tick(&s->cga, clocks);
+}
+
+static void video_render(Ibm5150State *s) {
+    if (s->vga == X86_VGA_MDA) mda_render(&s->mda, s->fb, mdafont8x14);
+    else cga_render(&s->cga, s->fb, s->fb_w, s->fb_h, cgafont8x8);
+}
 
 /* Keyboard timing, in CPU clocks: the keyboard answers a reset with 0xAA a
  * few milliseconds after its clock line is released.  Scan codes are spaced
@@ -31,8 +75,8 @@
 static uint8_t bus_read8(uint32_t addr, void *ud) {
     Ibm5150State *s = ud;
     if (addr < s->ram_size) return s->ram[addr];
-    if (addr >= IBM5150_CGA_BASE && addr < IBM5150_CGA_END)
-        return cga_mem_read(&s->cga, addr - IBM5150_CGA_BASE);
+    uint8_t v;
+    if (video_mem_read(s, addr, &v)) return v;
     if (s->has_basic && addr >= IBM5150_BASIC_BASE && addr < IBM5150_BASIC_BASE + IBM5150_BASIC_SIZE)
         return s->basic[addr - IBM5150_BASIC_BASE];
     if (addr >= IBM5150_BIOS_BASE && addr < IBM5150_BIOS_BASE + IBM5150_BIOS_SIZE)
@@ -42,19 +86,17 @@ static uint8_t bus_read8(uint32_t addr, void *ud) {
 static void bus_write8(uint32_t addr, uint8_t val, void *ud) {
     Ibm5150State *s = ud;
     if (addr < s->ram_size) { s->ram[addr] = val; return; }
-    if (addr >= IBM5150_CGA_BASE && addr < IBM5150_CGA_END) { cga_mem_write(&s->cga, addr - IBM5150_CGA_BASE, val); return; }
+    if (video_mem_write(s, addr, val)) return;
     /* ROM regions: writes silently ignored, matching real hardware */
 }
 
-/* Monitor memory view (20-bit physical): RAM, CGA VRAM and the ROMs are
+/* Monitor memory view (20-bit physical): RAM, video RAM and the ROMs are
  * plain arrays; unmapped space returns false instead of the bus's 0xFF. */
 static bool ibm5150_mon_read(void *ud, uint64_t addr, uint8_t *val) {
     const Ibm5150State *s = ud;
     if (addr < s->ram_size) { *val = s->ram[addr]; return true; }
-    if (addr >= IBM5150_CGA_BASE && addr < IBM5150_CGA_END) {
-        *val = cga_mem_read(&s->cga, (uint32_t)(addr - IBM5150_CGA_BASE));
+    if (addr <= 0xFFFFF && video_mem_read(s, (uint32_t)addr, val))
         return true;
-    }
     if (s->has_basic && addr >= IBM5150_BASIC_BASE &&
         addr < IBM5150_BASIC_BASE + IBM5150_BASIC_SIZE) {
         *val = s->basic[addr - IBM5150_BASIC_BASE];
@@ -70,10 +112,8 @@ static bool ibm5150_mon_read(void *ud, uint64_t addr, uint8_t *val) {
 static bool ibm5150_mon_write(void *ud, uint64_t addr, uint8_t val) {
     Ibm5150State *s = ud;
     if (addr < s->ram_size) { s->ram[addr] = val; return true; }
-    if (addr >= IBM5150_CGA_BASE && addr < IBM5150_CGA_END) {
-        cga_mem_write(&s->cga, (uint32_t)(addr - IBM5150_CGA_BASE), val);
+    if (addr <= 0xFFFFF && video_mem_write(s, (uint32_t)addr, val))
         return true;
-    }
     return false;   /* ROM / unmapped */
 }
 
@@ -166,7 +206,8 @@ static bool empty_slot(uint16_t port) {
            (port >= 0x278 && port <= 0x27F) ||   /* LPT2 */
            (port >= 0x2F8 && port <= 0x2FF) ||   /* COM2 */
            (port >= 0x378 && port <= 0x37F) ||   /* LPT1 */
-           (port >= 0x3B0 && port <= 0x3BF) ||   /* MDA + its printer port */
+           (port >= 0x3B0 && port <= 0x3BF) ||   /* MDA + its printer port (when absent) */
+           (port >= 0x3D0 && port <= 0x3DF) ||   /* CGA (when absent) */
            (port >= 0x3F0 && port <= 0x3F7) ||   /* diskette adapter (when absent) */
            (port >= 0x3F8 && port <= 0x3FF);     /* COM1 */
 }
@@ -179,7 +220,8 @@ static uint8_t io_read8(uint16_t port, void *ud) {
     if (port >= 0x40 && port <= 0x43) return i8253_io_read(&s->pit, port);
     if (port >= 0x60 && port <= 0x63) return i8255_io_read(&s->ppi, port);
     if (port >= 0x80 && port <= 0x83) return i8237_page_read(&s->dma, port);
-    if (port >= 0x3D0 && port <= 0x3DF) return cga_io_read(&s->cga, port);
+    if (video_port(s, port))
+        return s->vga == X86_VGA_MDA ? mda_io_read(&s->mda, port) : cga_io_read(&s->cga, port);
     if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) return upd765_read(&s->fdc, port);
     if (empty_slot(port)) return 0xFF;
     iolog(s, port, false, 0);
@@ -207,7 +249,11 @@ static void io_write8(uint16_t port, uint8_t val, void *ud) {
     }
     if (port >= 0x80 && port <= 0x83) { i8237_page_write(&s->dma, port, val); return; }
     if (port >= 0xA0 && port <= 0xAF) { s->nmi_mask = val; return; }
-    if (port >= 0x3D0 && port <= 0x3DF) { cga_io_write(&s->cga, port, val); return; }
+    if (video_port(s, port)) {
+        if (s->vga == X86_VGA_MDA) mda_io_write(&s->mda, port, val);
+        else cga_io_write(&s->cga, port, val);
+        return;
+    }
     if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) { upd765_write(&s->fdc, port, val); return; }
     if (empty_slot(port)) return;
     iolog(s, port, true, val);
@@ -274,7 +320,7 @@ static void on_unknown_opcode(X86Cpu *cpu, uint8_t opcode, void *ud) {
 }
 
 /* Advance the rest of the machine by the clocks the CPU just used.
- * Returns true when the CGA started a new frame. */
+ * Returns true when the display adapter started a new frame. */
 static bool advance(Ibm5150State *s, unsigned clocks) {
     s->cycles += clocks;
     s->pit_phase += clocks;
@@ -284,7 +330,7 @@ static bool advance(Ibm5150State *s, unsigned clocks) {
     }
     kb_service(s);
     if (s->has_fdc) upd765_tick(&s->fdc, clocks);
-    return cga_tick(&s->cga, clocks);
+    return video_tick(s, clocks);
 }
 
 static bool step_cpu(Ibm5150State *s) {
@@ -348,8 +394,8 @@ static void scan_keyboard(Ibm5150State *s) {
 
 static bool ibm5150_screendump(void *ud, const char *path) {
     Ibm5150State *s = ud;
-    cga_render(&s->cga, s->fb, IBM5150_FB_W, IBM5150_FB_H, cgafont8x8);
-    return gemu_screendump_argb(path, s->fb, IBM5150_FB_W, IBM5150_FB_H);
+    video_render(s);
+    return gemu_screendump_argb(path, s->fb, s->fb_w, s->fb_h);
 }
 
 static void kb_queue(Ibm5150State *s, uint8_t code) {
@@ -442,15 +488,16 @@ static GemuMonCmd ibm5150_cmd_sendkey(GemuMonitor *mon, const char *args, void *
 /* DIP switches for the configured RAM.  SW1 bits 2-3 give the planar
  * (motherboard) RAM in 16K steps up to 64K; SW2 counts 32K expansion
  * blocks above that, which the 19OCT81 BIOS reads as a 4-bit count - so
- * 64K + 15 x 32K = 544K is the most it can use.  Bits 4-5 select an
- * 80x25 color display.  Diskette drives (bit 0, count in bits 6-7) are
+ * 64K + 15 x 32K = 544K is the most it can use.  Bits 4-5 give the
+ * display: 80x25 color (CGA) or monochrome (MDA).  Diskette drives (bit 0, count in bits 6-7) are
  * added by attach_floppies(); without them POST boots Cassette BASIC. */
 static uint32_t configure_switches(Ibm5150State *s, uint32_t ram) {
     uint32_t kb = ram >> 10;
     uint32_t planar = kb >= 64 ? 64 : (kb < 16 ? 16 : kb / 16 * 16);
     uint32_t blocks = kb > 64 ? (kb - 64) / 32 : 0;
     if (blocks > 15) blocks = 15;
-    s->ppi.sw1 = (uint8_t)(((planar / 16 - 1) << 2) | 0x20);
+    s->ppi.sw1 = (uint8_t)(((planar / 16 - 1) << 2) |
+                           (s->vga == X86_VGA_MDA ? 0x30 : 0x20));   /* mono / 80x25 color */
     s->ppi.sw2 = (uint8_t)blocks;
     return (planar + blocks * 32) << 10;
 }
@@ -480,6 +527,7 @@ static void ibm5150_reset(Ibm5150State *s) {
     i8253_reset(&s->pit);
     i8255_reset(&s->ppi);
     cga_reset(&s->cga);
+    mda_reset(&s->mda);
     if (s->has_fdc) { s->fdc.dor = 0; upd765_reset(&s->fdc); }
     /* The PIT's outputs start high without a change callback; the PPI's
      * copy of timer 2 must match or POST's cassette test misses an edge. */
@@ -499,6 +547,7 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
 
     uint32_t ram = cfg->ram_size ? cfg->ram_size : IBM5150_RAM_MAX;
     if (ram > IBM5150_RAM_MAX) ram = IBM5150_RAM_MAX;
+    s->vga = cfg->vga;
     s->ram_size = configure_switches(s, ram);
     s->ram = calloc(1, s->ram_size);
     if (!s->ram) { free(s); return NULL; }
@@ -533,7 +582,9 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     s->pit.out_changed = pit_out_changed;
     s->pit.ud = s;
 
-    s->fb = calloc((size_t)IBM5150_FB_W * IBM5150_FB_H, sizeof(uint32_t));
+    s->fb_w = s->vga == X86_VGA_MDA ? MDA_WIDTH  : IBM5150_CGA_FB_W;
+    s->fb_h = s->vga == X86_VGA_MDA ? MDA_HEIGHT : IBM5150_CGA_FB_H;
+    s->fb = calloc((size_t)s->fb_w * s->fb_h, sizeof(uint32_t));
     if (!s->fb) { free(s->ram); free(s); return NULL; }
 
     s->monitor = gemu_monitor_create();
@@ -549,7 +600,11 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
 
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
-            .fb_width = IBM5150_FB_W, .fb_height = IBM5150_FB_H,
+            .fb_width = s->fb_w, .fb_height = s->fb_h,
+            /* The MDA's 720x350 filled a 4:3 monitor; CGA's 640x400 is drawn
+             * with doubled scanlines and already has its shape. */
+            .aspect_w = s->vga == X86_VGA_MDA ? 4 : 0,
+            .aspect_h = s->vga == X86_VGA_MDA ? 3 : 0,
             .scale = cfg->display_scale > 0 ? cfg->display_scale : 1, /* 640x400 is big enough at 1x */
             .no_menu = true, /* full keyboard machine - no gamepad-style input menu */
         };
@@ -574,9 +629,10 @@ void ibm5150_destroy(Ibm5150State *s) {
 void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
     printf("gemu-x86: IBM PC 5150\n"
            "  RAM   : %u KiB\n"
-           "  Video : CGA\n"
+           "  Video : %s\n"
            "  BASIC : %s\n",
-           s->ram_size >> 10, s->has_basic ? "Cassette BASIC present" : "(none loaded)");
+           s->ram_size >> 10, s->vga == X86_VGA_MDA ? "MDA (monochrome)" : "CGA",
+           s->has_basic ? "Cassette BASIC present" : "(none loaded)");
     for (int u = 0; u < 4; u++)
         if (s->fdc.drive[u])
             printf("  %s: %s\n", gemu_drive_name(s->fdc.drive[u]),
@@ -590,7 +646,8 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
     bool running = true;
     bool reported_halt = false;
     while (running) {
-        /* Run until the CGA starts its next frame (~1/60 s of PC time). */
+        /* Run until the display adapter starts its next frame (1/60 s of PC
+         * time on the CGA, 1/50 s on the MDA). */
         if (!gemu_monitor_is_paused(s->monitor) && !s->halted_for_debug) {
             bool check_bp = gemu_monitor_has_exec_breakpoints(s->monitor);
             for (;;) {
@@ -611,8 +668,8 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
         if (s->display) {
             gemu_display_poll(s->display);
             scan_keyboard(s);
-            cga_render(&s->cga, s->fb, IBM5150_FB_W, IBM5150_FB_H, cgafont8x8);
-            gemu_display_render(s->display, s->fb, IBM5150_FB_W, IBM5150_FB_H);
+            video_render(s);
+            gemu_display_render(s->display, s->fb, s->fb_w, s->fb_h);
             gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor) || dead);
             if (gemu_display_should_quit(s->display)) running = false;
             if (gemu_display_reset_requested(s->display)) {
@@ -620,8 +677,10 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
                 gemu_display_clear_flags(s->display);
             }
 
-            /* Pace to the CGA's 59.92 Hz frame rate. */
-            next_frame += perf_hz * CGA_CLOCKS_PER_FRAME / IBM5150_CPU_HZ;
+            /* Pace to the adapter's frame rate (CGA 59.92 Hz, MDA 49.8 Hz). */
+            uint32_t frame_clocks = s->vga == X86_VGA_MDA ? MDA_CLOCKS_PER_FRAME
+                                                         : CGA_CLOCKS_PER_FRAME;
+            next_frame += perf_hz * frame_clocks / IBM5150_CPU_HZ;
             uint64_t now = SDL_GetPerformanceCounter();
             if (next_frame > now) {
                 uint64_t ms = (next_frame - now) * 1000 / perf_hz;

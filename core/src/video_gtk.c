@@ -17,6 +17,7 @@ struct GemuVideoGtk {
     int              scale;
     int              window_width;
     int              window_height;
+    int              aspect_w, aspect_h;  /* display shape; 0 = width:height */
     bool             active;
     /* OpenGL */
     GLuint           tex;
@@ -162,12 +163,14 @@ static void gl_teardown(GemuVideoGtk *v) {
  * centered. */
 static void fit_rect(const GemuVideoGtk *v, int w, int h,
                      int *rx, int *ry, int *rw, int *rh) {
-    if ((long)w * v->height <= (long)h * v->width) {
+    int aw = v->aspect_w > 0 && v->aspect_h > 0 ? v->aspect_w : v->width;
+    int ah = v->aspect_w > 0 && v->aspect_h > 0 ? v->aspect_h : v->height;
+    if ((long)w * ah <= (long)h * aw) {
         *rw = w;
-        *rh = (int)((long)w * v->height / v->width);
+        *rh = (int)((long)w * ah / aw);
     } else {
         *rh = h;
-        *rw = (int)((long)h * v->width / v->height);
+        *rw = (int)((long)h * aw / ah);
     }
     if (*rw < 1) *rw = 1;
     if (*rh < 1) *rh = 1;
@@ -263,6 +266,10 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
                                                 : v->width * v->scale;
     v->window_height = spec->window_height > 0 ? spec->window_height
                                                 : v->height * v->scale;
+    v->aspect_w = spec->aspect_w;
+    v->aspect_h = spec->aspect_h;
+    if (spec->window_height <= 0 && v->aspect_w > 0 && v->aspect_h > 0)
+        v->window_height = v->window_width * v->aspect_h / v->aspect_w;
 
     /* ARGB frame buffer for indexed/mono conversions */
     v->frame_argb = malloc((size_t)v->width * (size_t)v->height *

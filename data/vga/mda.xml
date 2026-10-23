@@ -1,0 +1,3 @@
+<?xml version="1.0"?>
+<vga name="mda" description="IBM Monochrome Display Adapter (1981, 80x25 text, 720x350)"
+    requires="x86" status="working"/>

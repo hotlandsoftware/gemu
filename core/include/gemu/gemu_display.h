@@ -83,6 +83,8 @@ typedef struct {
     int                  scale;               /* ignored by terminal backends */
     int                  window_width;        /* override window width  (0 = fb_width*scale) */
     int                  window_height;       /* override window height (0 = fb_height*scale) */
+    int                  aspect_w, aspect_h;  /* shape the picture is shown at, e.g. 4:3
+                                               * for a 720x350 MDA; 0 = square pixels */
     GemuRendererType     renderer;            /* SDL hint; ignored elsewhere */
 
     /* Action table */

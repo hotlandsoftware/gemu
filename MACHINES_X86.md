@@ -11,7 +11,7 @@
 
 | Name | Full name | Status | Notes |
 |------|-----------|--------|-------|
-| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA text and graphics, keyboard, speaker, floppy drives. No cassette, printer or serial yet |
+| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA or MDA (`-vga mda`), keyboard, speaker, floppy drives. No cassette, printer, serial yet |
 
 ## IBM 5150 hardware
 
@@ -22,6 +22,7 @@
 | 8237 DMA | registers and page registers; channel 0 refresh cycles |
 | 8255 PPI | 5150 wiring: SW1/SW2 DIP switches, keyboard handshake and reset, speaker |
 | CGA | 40/80-column text, 320x200 4-color, 640x200 2-color; retrace timing |
+| MDA | 80x25 monochrome text in 9x14 cells (720x350, 4:3), green phosphor; underline/intense/reverse/blink attributes; 50 Hz timing |
 | uPD765 FDC | diskette adapter with up to 4 drives via `-drive if=floppy` / `-fda` (see docs/drive.md); DMA channel 2, IRQ6 |
 
 The DIP switches follow `-m` (64K default). The 19OCT81 BIOS can use up to

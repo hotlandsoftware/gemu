@@ -11,6 +11,7 @@ typedef enum {
 
 typedef enum {
     X86_VGA_CGA,
+    X86_VGA_MDA,
 } X86VgaType;
 
 #define X86_MAX_ROM_LOADS 4

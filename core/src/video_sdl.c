@@ -20,6 +20,7 @@ struct GemuVideoSdl {
     SDL_Rect        dst;        /* where the picture went in the last frame */
     int             width;
     int             height;
+    int             aspect_w, aspect_h;   /* shape to show the picture at */
     bool            software;
 #ifndef _WIN32
     bool            termios_active;
@@ -81,6 +82,8 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
 
     v->width    = spec->width;
     v->height   = spec->height;
+    v->aspect_w = spec->aspect_w > 0 && spec->aspect_h > 0 ? spec->aspect_w : spec->width;
+    v->aspect_h = spec->aspect_w > 0 && spec->aspect_h > 0 ? spec->aspect_h : spec->height;
 
     /* Every window can be resized freely by dragging its edges; the picture
      * is scaled to fit, keeping its aspect ratio (see present_argb()). */
@@ -164,16 +167,17 @@ void gemu_video_sdl_destroy(GemuVideoSdl *v) {
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
 }
 
-/* Largest rectangle with the framebuffer's aspect ratio that fits the
- * window's output, centered (letterboxed or pillarboxed). */
+/* Largest rectangle with the display's aspect ratio (the framebuffer's,
+ * unless the machine asked for another) that fits the window's output,
+ * centered (letterboxed or pillarboxed). */
 static SDL_Rect fit_rect(const GemuVideoSdl *v, int ow, int oh) {
     SDL_Rect r;
-    if ((long)ow * v->height <= (long)oh * v->width) {
+    if ((long)ow * v->aspect_h <= (long)oh * v->aspect_w) {
         r.w = ow;
-        r.h = (int)((long)ow * v->height / v->width);
+        r.h = (int)((long)ow * v->aspect_h / v->aspect_w);
     } else {
         r.h = oh;
-        r.w = (int)((long)oh * v->width / v->height);
+        r.w = (int)((long)oh * v->aspect_w / v->aspect_h);
     }
     if (r.w < 1) r.w = 1;
     if (r.h < 1) r.h = 1;
@@ -198,7 +202,8 @@ static void set_scale_mode(SDL_Texture *t, bool linear) {
 static void draw_scaled(GemuVideoSdl *v, const SDL_Rect *dst) {
     bool exact = dst->w % v->width == 0 && dst->h % v->height == 0 &&
                  dst->w / v->width == dst->h / v->height;
-    int k = (dst->w + v->width - 1) / v->width;
+    int kx = (dst->w + v->width - 1) / v->width, ky = (dst->h + v->height - 1) / v->height;
+    int k = kx > ky ? kx : ky;
     if (exact || !v->targets || k < 1 || k > 16) {
         set_scale_mode(v->texture, !exact);
         SDL_RenderCopy(v->renderer, v->texture, NULL, dst);

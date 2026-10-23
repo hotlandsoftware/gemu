@@ -140,7 +140,9 @@ int x86_setup(int argc, char *argv[]) {
         if (strcmp(args.cpu, "8086") == 0) cfg.cpu = X86_CPU_8086;
         else if (strcmp(args.cpu, "8088") == 0) cfg.cpu = X86_CPU_8088;
     }
-    if (args.vga && strcmp(args.vga, "cga") != 0) {
+    if (args.vga && strcmp(args.vga, "mda") == 0) {
+        cfg.vga = X86_VGA_MDA;
+    } else if (args.vga && strcmp(args.vga, "cga") != 0) {
         fprintf(stderr, "gemu: unknown x86 VGA '%s' (use -vga ? to list)\n", args.vga);
         return 1;
     }

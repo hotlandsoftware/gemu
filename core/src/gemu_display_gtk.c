@@ -253,6 +253,8 @@ GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
         .scale    = cfg->scale ? cfg->scale : 2,
         .window_width  = cfg->window_width,
         .window_height = cfg->window_height,
+        .aspect_w = cfg->aspect_w,
+        .aspect_h = cfg->aspect_h,
     };
     if (cfg->gtk) {
         spec.monitor       = cfg->gtk->monitor;

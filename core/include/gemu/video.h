@@ -13,6 +13,7 @@ typedef struct {
     int               height;
     int               window_width;
     int               window_height;
+    int               aspect_w, aspect_h;   /* display shape; 0 = width:height */
     GemuRendererType  renderer;
     const char       *log_prefix;
 } GemuVideoSdlSpec;
@@ -46,6 +47,7 @@ typedef struct {
     int             scale;
     int             window_width;
     int             window_height;
+    int             aspect_w, aspect_h;     /* display shape; 0 = width:height */
     GemuMonitor    *monitor;
     void          (*hex_toggle_cb)(void *);  /* optional: Debug > Hex Editor */
     void           *hex_toggle_ud;
