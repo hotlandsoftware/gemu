@@ -8,6 +8,7 @@
 #include "network/i82559.h"
 #include "ps2_keyboard.h"
 #include "gemu/gemu_display.h"
+#include "gemu/drive.h"
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
 #include "gemu/util.h"
@@ -302,7 +303,12 @@ struct Ia64I2000State {
     uint8_t   spd[I2000_SPD_SLOTS][256];
     uint8_t   cmd649_cfg[256];
     uint8_t   acpi_io[64];
-    FILE     *cdrom;
+    /* ide1-cd0 from the drive table (NULL = no drive configured; present
+     * but !gemu_drive_inserted() = empty tray).  A pointer replacing the
+     * old FILE *, so the raw-copied savevm layout is unchanged.  The
+     * file/size fields below are informational only (kept in sync by
+     * i2000_cdrom_changed); I/O always asks the drive. */
+    GemuDrive *cdrom;
     char      cdrom_file[512];
     uint64_t  cdrom_size;
     uint8_t   atapi_error, atapi_features, atapi_count;
@@ -315,7 +321,7 @@ struct Ia64I2000State {
      * -hda's raw 512-byte-sector image. Single device (master) only, always
      * responding regardless of the drive-select bit - same simplification
      * the ATAPI/CD-ROM secondary channel above already makes. */
-    FILE     *hda;
+    GemuDrive *hda;      /* ide0-hd0; file/size below are informational */
     char      hda_file[512];
     uint64_t  hda_size;
     uint8_t   ata_error, ata_features, ata_count;
@@ -742,7 +748,8 @@ static void atapi_no_medium(Ia64I2000State *s) {
 static void atapi_reply(Ia64I2000State *s) {
     const uint8_t *p = s->atapi_packet;
     uint8_t reply[64] = {0};
-    uint32_t blocks = (uint32_t)(s->cdrom_size / 2048);
+    uint32_t blocks = (uint32_t)(gemu_drive_size(s->cdrom) / 2048);
+    bool medium = gemu_drive_inserted(s->cdrom);
     if (atapi_debug_enabled()) {
         unsigned byte_limit = (unsigned)s->atapi_lba_mid |
                               ((unsigned)s->atapi_lba_high << 8);
@@ -755,7 +762,7 @@ static void atapi_reply(Ia64I2000State *s) {
     }
     switch (p[0]) {
     case 0x00: /* TEST UNIT READY */
-        if (!s->cdrom) {
+        if (!medium) {
             atapi_no_medium(s);
             break;
         }
@@ -767,7 +774,7 @@ static void atapi_reply(Ia64I2000State *s) {
         break;
     case 0x03: /* REQUEST SENSE */
         reply[0] = 0x70;
-        if (!s->cdrom) {
+        if (!medium) {
             reply[2] = 0x02; /* NOT READY */
             reply[12] = 0x3a; /* medium not present */
         }
@@ -785,7 +792,7 @@ static void atapi_reply(Ia64I2000State *s) {
         break;
     }
     case 0x25: /* READ CAPACITY */
-        if (!s->cdrom) {
+        if (!medium) {
             atapi_no_medium(s);
             break;
         }
@@ -796,7 +803,7 @@ static void atapi_reply(Ia64I2000State *s) {
         atapi_set_data(s, reply, 8);
         break;
     case 0x43: { /* READ TOC: one data track, lead-out */
-        if (!s->cdrom) {
+        if (!medium) {
             atapi_no_medium(s);
             break;
         }
@@ -823,8 +830,7 @@ static void atapi_reply(Ia64I2000State *s) {
                     "\n", atapi_packet_name(p[0]), lba, count, len, blocks);
         uint8_t *buf = len ? malloc(len) : NULL;
         if ((len && !buf) || lba >= blocks || count > blocks - lba ||
-            fseek(s->cdrom, (long)((uint64_t)lba * 2048), SEEK_SET) != 0 ||
-            (len && fread(buf, 1, len, s->cdrom) != len)) {
+            (len && !gemu_drive_read(s->cdrom, (uint64_t)lba * 2048, buf, len))) {
             free(buf); s->atapi_error = 0x50; s->atapi_status = 0x41;
             s->atapi_count = 0x03;
             s->atapi_irq_pending = true;
@@ -896,7 +902,7 @@ static void ata_id_string(uint8_t *id, unsigned byte_off, unsigned len,
 
 static void ata_identify(Ia64I2000State *s) {
     uint8_t id[512] = {0};
-    uint32_t sectors = s->hda ? (uint32_t)(s->hda_size / 512) : 0;
+    uint32_t sectors = (uint32_t)(gemu_drive_size(s->hda) / 512);
     const uint32_t heads = 16, spt = 63;
     uint32_t cyls = sectors / (heads * spt);
     if (cyls > 16383) cyls = 16383;
@@ -945,8 +951,7 @@ static void ata_command(Ia64I2000State *s, uint8_t cmd) {
         uint32_t count = s->ata_count ? s->ata_count : 256;
         size_t len = (size_t)count * 512;
         uint8_t *buf = malloc(len);
-        if (!buf || fseek(s->hda, (long)((uint64_t)lba * 512), SEEK_SET) != 0 ||
-            fread(buf, 1, len, s->hda) != len) {
+        if (!buf || !gemu_drive_read(s->hda, (uint64_t)lba * 512, buf, len)) {
             free(buf);
             s->ata_error = 0x40; /* UNC: uncorrectable, e.g. past end of disk */
             s->ata_status = 0x41;
@@ -2354,14 +2359,12 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                     s->ata_data[s->ata_data_pos++] = (uint8_t)(val >> (i * 8));
             }
             if (s->ata_data_is_write && s->ata_data_pos >= s->ata_data_len) {
-                if (fseek(s->hda, (long)((uint64_t)s->ata_write_lba * 512),
-                          SEEK_SET) != 0 ||
-                    fwrite(s->ata_data, 1, s->ata_data_len, s->hda) !=
-                    s->ata_data_len) {
+                if (!gemu_drive_write(s->hda,
+                                      (uint64_t)s->ata_write_lba * 512,
+                                      s->ata_data, s->ata_data_len)) {
                     s->ata_error = 0x04;
                     s->ata_status = 0x41;
                 } else {
-                    fflush(s->hda);
                     s->ata_status = 0x40;
                 }
                 s->ata_data_is_write = false;
@@ -3535,6 +3538,81 @@ static void i2000_efi_bios_key(Ia64I2000State *s, uint8_t ascii) {
     s->ram[0x41d] = (uint8_t)(next >> 8);
 }
 
+/* ── Drives ────────────────────────────────────────────────────────────────
+ *
+ * Fixed CMD-649 wiring, matching QEMU's PC naming: primary channel master
+ * = ATA hard disk (ide0-hd0, -hda, index=0), secondary channel master =
+ * ATAPI CD-ROM (ide1-cd0, -cdrom, index=2).  Slaves and any other
+ * interface stay unclaimed, so gemu_drive_check_unclaimed() rejects them. */
+
+/* Mirror the drives' current medium into the informational file/size
+ * fields (savevm still carries them, and 'atapistate'-style debugging
+ * reads them); device I/O never uses them. */
+static void i2000_drive_info_refresh(Ia64I2000State *s) {
+    snprintf(s->cdrom_file, sizeof(s->cdrom_file), "%s",
+             gemu_drive_filename(s->cdrom));
+    s->cdrom_size = gemu_drive_size(s->cdrom);
+    snprintf(s->hda_file, sizeof(s->hda_file), "%s",
+             gemu_drive_filename(s->hda));
+    s->hda_size = gemu_drive_size(s->hda);
+}
+
+/* Monitor change/eject on ide1-cd0.  The ATAPI model has no unit-attention
+ * state; it reads the medium's presence and size on every packet, so a
+ * swap is picked up by the next TEST UNIT READY / READ CAPACITY. */
+static void i2000_cdrom_changed(void *ud, bool inserted) {
+    Ia64I2000State *s = ud;
+    i2000_drive_info_refresh(s);
+    if (inserted && (s->cdrom_size == 0 || s->cdrom_size % 2048 != 0))
+        fprintf(stderr, "i2000: warning: CD-ROM image '%s' is not a "
+                "sector-aligned ISO; the partial last sector is unreadable\n",
+                s->cdrom_file);
+    if (atapi_debug_enabled())
+        fprintf(stderr, "i2000: ATAPI media %s '%s' bytes=%" PRIu64 "\n",
+                inserted ? "inserted" : "ejected", s->cdrom_file,
+                s->cdrom_size);
+}
+
+static bool i2000_claim_drives(Ia64I2000State *s) {
+    s->hda = gemu_drive_get(GEMU_DRIVE_IF_IDE, 0, 0);
+    s->cdrom = gemu_drive_get(GEMU_DRIVE_IF_IDE, 1, 0);
+    if (s->hda && gemu_drive_media(s->hda) != GEMU_DRIVE_MEDIA_DISK) {
+        fprintf(stderr, "gemu: i2000: %s: the primary IDE channel has a hard "
+                "disk, not a CD-ROM (use -cdrom or index=2)\n",
+                gemu_drive_name(s->hda));
+        return false;
+    }
+    if (s->cdrom && gemu_drive_media(s->cdrom) != GEMU_DRIVE_MEDIA_CDROM) {
+        fprintf(stderr, "gemu: i2000: %s: the secondary IDE channel has a "
+                "CD-ROM, not a hard disk (use -hda or index=0)\n",
+                gemu_drive_name(s->cdrom));
+        return false;
+    }
+    if (s->hda) {
+        uint64_t size = gemu_drive_size(s->hda);
+        if (size == 0 || size % 512 != 0) {
+            fprintf(stderr, "gemu: HDD image '%s' is not a sector-aligned "
+                    "(512-byte) raw disk image\n", gemu_drive_filename(s->hda));
+            return false;
+        }
+    }
+    if (gemu_drive_inserted(s->cdrom)) {
+        uint64_t size = gemu_drive_size(s->cdrom);
+        if (size == 0 || size % 2048 != 0) {
+            fprintf(stderr, "gemu: CD-ROM image '%s' is not a sector-aligned ISO\n",
+                    gemu_drive_filename(s->cdrom));
+            return false;
+        }
+    }
+    gemu_drive_set_change_cb(s->cdrom, i2000_cdrom_changed, s);
+    i2000_drive_info_refresh(s);
+    if (atapi_debug_enabled() && gemu_drive_inserted(s->cdrom))
+        fprintf(stderr, "i2000: ATAPI media attached '%s' bytes=%" PRIu64
+                " sectors=%" PRIu64 "\n", s->cdrom_file, s->cdrom_size,
+                s->cdrom_size / 2048);
+    return true;
+}
+
 /* Snapshot format: full-machine save/restore so a slow, deterministic boot
  * only ever has to run once. Everything in Ia64I2000State and Merced is
  * plain data (fixed-size arrays and scalars) except a handful of pointers
@@ -3659,10 +3737,10 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     bool configured_rage128 = s->rage128.enabled;
     bool configured_mouse_enabled = s->mouse_enabled;
     bool configured_i82559 = s->i82559.enabled;
-    char configured_cdrom_file[sizeof(s->cdrom_file)];
-    snprintf(configured_cdrom_file, sizeof(configured_cdrom_file), "%s",
-             s->cdrom ? s->cdrom_file : "");
-    uint64_t configured_cdrom_size = s->cdrom ? s->cdrom_size : 0;
+    /* Drives belong to this run (the drive table), not to the snapshot:
+     * a firmware checkpoint is reusable with any ISO/disk. */
+    GemuDrive *cdrom = s->cdrom;
+    GemuDrive *hda = s->hda;
     uint8_t *i82559_option_rom = s->i82559.option_rom;
     size_t i82559_option_rom_size = s->i82559.option_rom_size;
     Merced *cpu = s->cpu;
@@ -3672,8 +3750,6 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     uint8_t *high_dram = s->high_dram;
     uint8_t *atapi_data = s->atapi_data;
     uint8_t *ata_data = s->ata_data;
-    if (s->cdrom) fclose(s->cdrom);
-    if (s->hda) fclose(s->hda);
     Ia64I2000State *loaded = calloc(1, sizeof(*loaded));
     if (!loaded) { fclose(f); return false; }
     size_t state_size;
@@ -3743,15 +3819,9 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->nvram_dirty = false;
         s->atapi_data = atapi_data;
         s->ata_data = ata_data;
-        /* Explicit -cdrom media belongs to this run, not to the historical
-         * snapshot.  This makes a firmware checkpoint reusable with any ISO. */
-        if (configured_cdrom_file[0]) {
-            snprintf(s->cdrom_file, sizeof(s->cdrom_file), "%s",
-                     configured_cdrom_file);
-            s->cdrom_size = configured_cdrom_size;
-        }
-        s->cdrom = s->cdrom_file[0] ? fopen(s->cdrom_file, "rb") : NULL;
-        s->hda = s->hda_file[0] ? fopen(s->hda_file, "r+b") : NULL;
+        s->cdrom = cdrom;
+        s->hda = hda;
+        i2000_drive_info_refresh(s);
         /* Restart the autosave clock from now, not from whatever wall time
          * the snapshot itself was taken at. */
         s->last_autosave = time(NULL);
@@ -4745,43 +4815,9 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     }
     ps2_keyboard_init(&s->ps2_keyboard);
     i2000_load_vga_option_rom(s);
-    if (cfg->cdrom_path) {
-        s->cdrom = fopen(cfg->cdrom_path, "rb");
-        if (!s->cdrom || fseek(s->cdrom, 0, SEEK_END) != 0) {
-            fprintf(stderr, "gemu: cannot open CD-ROM image '%s'\n", cfg->cdrom_path);
-            ia64_i2000_destroy(s);
-            return NULL;
-        }
-        long end = ftell(s->cdrom);
-        if (end <= 0 || (end % 2048) != 0 || fseek(s->cdrom, 0, SEEK_SET) != 0) {
-            fprintf(stderr, "gemu: CD-ROM image '%s' is not a sector-aligned ISO\n",
-                    cfg->cdrom_path);
-            ia64_i2000_destroy(s);
-            return NULL;
-        }
-        s->cdrom_size = (uint64_t)end;
-        snprintf(s->cdrom_file, sizeof(s->cdrom_file), "%s", cfg->cdrom_path);
-        if (atapi_debug_enabled())
-            fprintf(stderr, "i2000: ATAPI media attached '%s' bytes=%" PRIu64
-                    " sectors=%" PRIu64 "\n", s->cdrom_file, s->cdrom_size,
-                    s->cdrom_size / 2048);
-    }
-    if (cfg->hda_path) {
-        s->hda = fopen(cfg->hda_path, "r+b");
-        if (!s->hda || fseek(s->hda, 0, SEEK_END) != 0) {
-            fprintf(stderr, "gemu: cannot open HDD image '%s'\n", cfg->hda_path);
-            ia64_i2000_destroy(s);
-            return NULL;
-        }
-        long end = ftell(s->hda);
-        if (end <= 0 || (end % 512) != 0 || fseek(s->hda, 0, SEEK_SET) != 0) {
-            fprintf(stderr, "gemu: HDD image '%s' is not a sector-aligned "
-                    "(512-byte) raw disk image\n", cfg->hda_path);
-            ia64_i2000_destroy(s);
-            return NULL;
-        }
-        s->hda_size = (uint64_t)end;
-        snprintf(s->hda_file, sizeof(s->hda_file), "%s", cfg->hda_path);
+    if (!i2000_claim_drives(s)) {
+        ia64_i2000_destroy(s);
+        return NULL;
     }
     chipset_cfg_reset(s);
 
@@ -4799,6 +4835,8 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     i2000_monitor_setup(s);
     gemu_monitor_set_cpu_state_cb(s->monitor, i2000_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, i2000_screendump, s);
+    gemu_drive_attach_monitor(s->hda, s->monitor);
+    gemu_drive_attach_monitor(s->cdrom, s->monitor);
 
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
@@ -4833,9 +4871,9 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
     merced_destroy(s->cpu);
     i82559_destroy(&s->i82559);
     free(s->atapi_data);
-    if (s->cdrom) fclose(s->cdrom);
     free(s->ata_data);
-    if (s->hda) fclose(s->hda);
+    /* The drive table owns the drives; just stop them calling back here. */
+    gemu_drive_set_change_cb(s->cdrom, NULL, NULL);
     free(s->flash);
     free(s->chipset_scratch);
     free(s->high_dram);
@@ -5246,12 +5284,18 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
            s->ram_size >> 20,
            s->flash_loaded ? s->flash_file : "(none)",
            (uint64_t)I2000_FLASH_BASE, (uint64_t)IA64_RESET_VECTOR);
-    if (s->cdrom)
-        printf("  CD-ROM: %s (%" PRIu64 " MiB)\n", s->cdrom_file,
-               s->cdrom_size >> 20);
+    if (s->cdrom) {
+        if (gemu_drive_inserted(s->cdrom))
+            printf("  CD-ROM: %s: %s (%" PRIu64 " MiB)\n",
+                   gemu_drive_name(s->cdrom), gemu_drive_filename(s->cdrom),
+                   gemu_drive_size(s->cdrom) >> 20);
+        else
+            printf("  CD-ROM: %s: (empty)\n", gemu_drive_name(s->cdrom));
+    }
     if (s->hda)
-        printf("  HDD   : %s (%" PRIu64 " MiB)\n", s->hda_file,
-               s->hda_size >> 20);
+        printf("  HDD   : %s: %s (%" PRIu64 " MiB)\n",
+               gemu_drive_name(s->hda), gemu_drive_filename(s->hda),
+               gemu_drive_size(s->hda) >> 20);
 
     gemu_monitor_start(s->monitor);
 

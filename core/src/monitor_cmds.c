@@ -411,12 +411,21 @@ static void info_block(GemuMonitor *mon) {
         mon_printf(mon, "No block devices.\n");
         return;
     }
+    /* QEMU's layout: "name: file (format...)" or "[not inserted]". */
     for (int i = 0; i < mon->n_media; i++) {
         const GemuMediaDevice *dev = &mon->media[i];
-        mon_printf(mon, "%s: type=%s removable=%d flippable=%d file=%s\n",
-                   dev->name, dev->kind ? dev->kind : dev->name,
-                   dev->eject ? 1 : 0, dev->flip ? 1 : 0,
-                   dev->file[0] ? dev->file : "(none)");
+        char status[600];
+        if (dev->status) {
+            status[0] = '\0';
+            dev->status(dev->ud, status, sizeof(status));
+        } else {
+            snprintf(status, sizeof(status), "%s", dev->file[0] ? dev->file : "[not inserted]");
+        }
+        mon_printf(mon, "%s: %s\n", dev->name, status);
+        if (dev->eject)
+            mon_printf(mon, "    Removable device: not locked, tray closed\n");
+        if (dev->flip)
+            mon_printf(mon, "    Flippable: yes ('flip %s')\n", dev->name);
     }
 }
 
@@ -758,7 +767,17 @@ static bool check_bp(GemuMonitor *mon, GemuBpType type, uint32_t addr,
 
 bool gemu_monitor_check_exec(GemuMonitor *mon, uint32_t addr) {
     if (!mon || !mon->has_exec_bp) return false;
-    return check_bp(mon, GEMU_BP_EXEC, addr, "Breakpoint", "exec");
+    /* Machines check before executing, so resuming at a breakpoint would
+     * stop on it again; let the instruction that was stopped on run. */
+    if (mon->bp_resume_skip && addr == mon->bp_resume_addr) {
+        mon->bp_resume_skip = false;
+        return false;
+    }
+    mon->bp_resume_skip = false;
+    if (!check_bp(mon, GEMU_BP_EXEC, addr, "Breakpoint", "exec")) return false;
+    mon->bp_resume_skip = true;
+    mon->bp_resume_addr = addr;
+    return true;
 }
 
 bool gemu_monitor_check_read(GemuMonitor *mon, uint32_t addr) {
@@ -786,6 +805,10 @@ static GemuMediaDevice *find_media(GemuMonitor *mon, const char *name) {
         if (strcasecmp(mon->media[i].name, name) == 0)
             return &mon->media[i];
     return NULL;
+}
+
+GemuMediaDevice *gemu_monitor_find_media(GemuMonitor *mon, const char *name) {
+    return mon && name ? find_media(mon, name) : NULL;
 }
 
 /* Common prologue for change/eject/flip: look up the device or explain. */

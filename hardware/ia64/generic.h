@@ -197,9 +197,8 @@ typedef struct {
     GemuDisplayType display_type;
     int             display_scale;
     bool            no_shutdown;
-    const char     *cdrom_path;
-    /* -hda FILE: raw read-write disk image, 512-byte sectors. NULL = none. */
-    const char     *hda_path;
+    /* Disks come from the shared drive table (gemu/drive.h): the HDD is
+     * ide0-hd0 (-hda), the CD-ROM ide1-cd0 (-cdrom). */
     const char     *cpu;        /* NULL or "merced" (default), "mckinley" */
     /* -serial SPEC: attach a 16550-style COM1 UART (port 0x3F8, inside
      * the legacy I/O window - see GENERIC_LEGACY_IO_BASE) to a host

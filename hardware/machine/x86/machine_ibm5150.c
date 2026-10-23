@@ -167,7 +167,7 @@ static bool empty_slot(uint16_t port) {
            (port >= 0x2F8 && port <= 0x2FF) ||   /* COM2 */
            (port >= 0x378 && port <= 0x37F) ||   /* LPT1 */
            (port >= 0x3B0 && port <= 0x3BF) ||   /* MDA + its printer port */
-           (port >= 0x3F0 && port <= 0x3F7) ||   /* diskette controller */
+           (port >= 0x3F0 && port <= 0x3F7) ||   /* diskette adapter (when absent) */
            (port >= 0x3F8 && port <= 0x3FF);     /* COM1 */
 }
 
@@ -180,6 +180,7 @@ static uint8_t io_read8(uint16_t port, void *ud) {
     if (port >= 0x60 && port <= 0x63) return i8255_io_read(&s->ppi, port);
     if (port >= 0x80 && port <= 0x83) return i8237_page_read(&s->dma, port);
     if (port >= 0x3D0 && port <= 0x3DF) return cga_io_read(&s->cga, port);
+    if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) return upd765_read(&s->fdc, port);
     if (empty_slot(port)) return 0xFF;
     iolog(s, port, false, 0);
     return 0xFF;
@@ -207,8 +208,32 @@ static void io_write8(uint16_t port, uint8_t val, void *ud) {
     if (port >= 0x80 && port <= 0x83) { i8237_page_write(&s->dma, port, val); return; }
     if (port >= 0xA0 && port <= 0xAF) { s->nmi_mask = val; return; }
     if (port >= 0x3D0 && port <= 0x3DF) { cga_io_write(&s->cga, port, val); return; }
+    if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) { upd765_write(&s->fdc, port, val); return; }
     if (empty_slot(port)) return;
     iolog(s, port, true, val);
+}
+
+/* ── Diskette adapter wiring: IRQ6, DMA channel 2 ────────────────────────── */
+
+static void fdc_set_irq(void *ud, bool level) {
+    Ibm5150State *s = ud;
+    i8259_set_irq(&s->pic, 6, level);
+}
+
+static bool fdc_dma_from_mem(void *ud, uint8_t *val, bool *tc) {
+    Ibm5150State *s = ud;
+    uint32_t phys;
+    if (!i8237_transfer(&s->dma, 2, &phys, tc)) return false;
+    *val = bus_read8(phys, s);
+    return true;
+}
+
+static bool fdc_dma_to_mem(void *ud, uint8_t val, bool *tc) {
+    Ibm5150State *s = ud;
+    uint32_t phys;
+    if (!i8237_transfer(&s->dma, 2, &phys, tc)) return false;
+    bus_write8(phys, val, s);
+    return true;
 }
 
 /* ── Interrupts and timers ───────────────────────────────────────────────── */
@@ -258,6 +283,7 @@ static bool advance(Ibm5150State *s, unsigned clocks) {
         s->pit_phase %= 4;
     }
     kb_service(s);
+    if (s->has_fdc) upd765_tick(&s->fdc, clocks);
     return cga_tick(&s->cga, clocks);
 }
 
@@ -416,9 +442,9 @@ static GemuMonCmd ibm5150_cmd_sendkey(GemuMonitor *mon, const char *args, void *
 /* DIP switches for the configured RAM.  SW1 bits 2-3 give the planar
  * (motherboard) RAM in 16K steps up to 64K; SW2 counts 32K expansion
  * blocks above that, which the 19OCT81 BIOS reads as a 4-bit count - so
- * 64K + 15 x 32K = 544K is the most it can use.  No diskette drives is
- * selected (SW1 bit 0 clear) so POST boots straight into Cassette BASIC,
- * and bits 4-5 select an 80x25 color display. */
+ * 64K + 15 x 32K = 544K is the most it can use.  Bits 4-5 select an
+ * 80x25 color display.  Diskette drives (bit 0, count in bits 6-7) are
+ * added by attach_floppies(); without them POST boots Cassette BASIC. */
 static uint32_t configure_switches(Ibm5150State *s, uint32_t ram) {
     uint32_t kb = ram >> 10;
     uint32_t planar = kb >= 64 ? 64 : (kb < 16 ? 16 : kb / 16 * 16);
@@ -429,6 +455,24 @@ static uint32_t configure_switches(Ibm5150State *s, uint32_t ram) {
     return (planar + blocks * 32) << 10;
 }
 
+/* Floppy drives come from -drive if=floppy / -fda / -fdb: the diskette
+ * adapter is installed when there's at least one, with as many drives as
+ * the highest unit used (the 5150 supports four). */
+static void attach_floppies(Ibm5150State *s) {
+    int count = 0;
+    for (int u = 0; u < 4; u++) {
+        s->fdc.drive[u] = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, u);
+        if (s->fdc.drive[u]) count = u + 1;
+    }
+    if (!count) return;
+    s->has_fdc = true;
+    s->fdc.set_irq = fdc_set_irq;
+    s->fdc.dma_from_mem = fdc_dma_from_mem;
+    s->fdc.dma_to_mem = fdc_dma_to_mem;
+    s->fdc.ud = s;
+    s->ppi.sw1 = (uint8_t)(s->ppi.sw1 | 0x01 | ((count - 1) << 6));
+}
+
 static void ibm5150_reset(Ibm5150State *s) {
     x86_reset(&s->cpu);
     i8237_reset(&s->dma);
@@ -436,6 +480,10 @@ static void ibm5150_reset(Ibm5150State *s) {
     i8253_reset(&s->pit);
     i8255_reset(&s->ppi);
     cga_reset(&s->cga);
+    if (s->has_fdc) { s->fdc.dor = 0; upd765_reset(&s->fdc); }
+    /* The PIT's outputs start high without a change callback; the PPI's
+     * copy of timer 2 must match or POST's cassette test misses an edge. */
+    s->ppi.timer2_out = i8253_out(&s->pit, 2);
     s->nmi_mask = 0;
     s->pit_phase = 0;
     s->kbq_len = 0;
@@ -495,6 +543,9 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     gemu_monitor_set_cpu_state_cb(s->monitor, ibm5150_mon_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, ibm5150_screendump, s);
     gemu_monitor_bind(s->monitor, "sendkey", ibm5150_cmd_sendkey, s);
+    attach_floppies(s);
+    for (int u = 0; u < 4; u++)
+        if (s->fdc.drive[u]) gemu_drive_attach_monitor(s->fdc.drive[u], s->monitor);
 
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
@@ -526,6 +577,11 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
            "  Video : CGA\n"
            "  BASIC : %s\n",
            s->ram_size >> 10, s->has_basic ? "Cassette BASIC present" : "(none loaded)");
+    for (int u = 0; u < 4; u++)
+        if (s->fdc.drive[u])
+            printf("  %s: %s\n", gemu_drive_name(s->fdc.drive[u]),
+                   gemu_drive_inserted(s->fdc.drive[u]) ? gemu_drive_filename(s->fdc.drive[u])
+                                                        : "(empty)");
 
     gemu_monitor_start(s->monitor);
 

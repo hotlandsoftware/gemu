@@ -120,3 +120,8 @@ core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
   bits / `is_key_held()` / raw keys / pointer (`core/src/gemu_display_vnc.c`).
   Machines must not contain VNC code; guard display creation with
   `gemu_display_wanted()` so `-display none -vnc` works.
+- Disks: QEMU-compatible `-drive` / `-hda` / `-cdrom` / `-fda` / `-snapshot`
+  live in `core/src/drive.c` (`gemu/drive.h`). Families opt in with
+  `GemuArgsDef.block_devices`; machines claim drives with `gemu_drive_get()`,
+  register them with `gemu_drive_attach_monitor()`, and setups call
+  `gemu_drive_check_unclaimed()`. User docs: `docs/drive.md`.

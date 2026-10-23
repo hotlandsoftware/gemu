@@ -4,6 +4,7 @@
 #include "i8259.h"
 #include "i8253.h"
 #include "i8255.h"
+#include "upd765.h"
 #include "cga.h"
 #include "pcspk.h"
 #include "gemu/monitor.h"
@@ -39,6 +40,8 @@ typedef struct Ibm5150State {
     I8253     pit;
     I8255     ppi;
     CgaDevice cga;
+    Upd765    fdc;        /* diskette adapter, present when -drive if=floppy is */
+    bool      has_fdc;
     uint8_t   nmi_mask;  /* port 0xA0 */
 
     Ibm5150IoLogEnt iolog[IBM5150_IOLOG_N];

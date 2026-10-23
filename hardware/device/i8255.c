@@ -15,7 +15,10 @@ uint8_t i8255_io_read(I8255 *p, uint16_t port) {
     case 2: {
         uint8_t c = (p->port_b & 0x04) ? (uint8_t)(p->sw2 & 0x0F)
                                        : (uint8_t)((p->sw2 >> 4) & 0x01);
-        if (p->cassette_in) c |= 0x10;
+        /* With the cassette motor relay off (PB3 set) the cassette data
+         * output - timer 2 - is wrapped back to the input; POST tests this
+         * loop (error 131 if broken). */
+        if ((p->port_b & 0x08) ? p->timer2_out : p->cassette_in) c |= 0x10;
         if (p->timer2_out)  c |= 0x20;
         return c;           /* no I/O channel or parity errors */
     }

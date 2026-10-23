@@ -3,6 +3,7 @@
 #include "vga_ibm.h"
 #include "vgafont16.h"
 #include "gemu/gemu_display.h"
+#include "gemu/drive.h"
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
 #include "gemu/util.h"
@@ -132,15 +133,20 @@ struct Ia64GenericState {
     uint32_t  atapi_byte_limit;
     size_t    atapi_block_end;
 
-    /* -hda: raw read-write disk image (see GENERIC_HDD_IO_BASE). */
-    FILE    *hdd;
+    /* ide0-hd0 (-hda) from the drive table: a raw disk image behind the
+     * custom sector window (see GENERIC_HDD_IO_BASE). */
+    GemuDrive *hdd;
     char     hdd_file[512];
     uint64_t hdd_sectors;
     uint32_t hdd_lba;
     uint8_t  hdd_result;
     uint8_t  hdd_buf[GENERIC_HDD_SECTOR_SIZE];
 
-    FILE    *cdrom;
+    /* ide1-cd0 (-cdrom) from the drive table.  NULL = no CD-ROM device
+     * (no IDE controller either); present but !gemu_drive_inserted() =
+     * empty tray.  cdrom_file/cdrom_size mirror the current medium
+     * (generic_cdrom_changed) for messages only - I/O asks the drive. */
+    GemuDrive *cdrom;
     char     cdrom_file[512];
     uint64_t cdrom_size;
     uint32_t cdrom_lba;
@@ -257,23 +263,18 @@ static void hdd_do_read(Ia64GenericState *s) {
     s->hdd_result = 1;
     memset(s->hdd_buf, 0, sizeof(s->hdd_buf));
     if (!s->hdd || s->hdd_lba >= s->hdd_sectors) return;
-    if (fseeko(s->hdd, (off_t)s->hdd_lba * GENERIC_HDD_SECTOR_SIZE,
-               SEEK_SET) != 0)
+    if (!gemu_drive_read(s->hdd, (uint64_t)s->hdd_lba * GENERIC_HDD_SECTOR_SIZE,
+                         s->hdd_buf, sizeof(s->hdd_buf)))
         return;
-    fread(s->hdd_buf, 1, sizeof(s->hdd_buf), s->hdd);
     s->hdd_result = 0;
 }
 
 static void hdd_do_write(Ia64GenericState *s) {
     s->hdd_result = 1;
     if (!s->hdd || s->hdd_lba >= s->hdd_sectors) return;
-    if (fseeko(s->hdd, (off_t)s->hdd_lba * GENERIC_HDD_SECTOR_SIZE,
-               SEEK_SET) != 0)
+    if (!gemu_drive_write(s->hdd, (uint64_t)s->hdd_lba * GENERIC_HDD_SECTOR_SIZE,
+                          s->hdd_buf, sizeof(s->hdd_buf)))
         return;
-    if (fwrite(s->hdd_buf, 1, sizeof(s->hdd_buf), s->hdd) !=
-        sizeof(s->hdd_buf))
-        return;
-    fflush(s->hdd);
     s->hdd_result = 0;
 }
 
@@ -335,13 +336,25 @@ static void atapi_set_data(Ia64GenericState *s, const void *data, size_t len) {
 static void atapi_reply(Ia64GenericState *s) {
     const uint8_t *p = s->atapi_packet;
     uint8_t reply[64] = {0};
-    uint32_t blocks = (uint32_t)(s->cdrom_size / GENERIC_CDROM_SECTOR_SIZE);
+    uint32_t blocks = (uint32_t)(gemu_drive_size(s->cdrom) / GENERIC_CDROM_SECTOR_SIZE);
+    bool medium = gemu_drive_inserted(s->cdrom);
     switch (p[0]) {
-    case 0x00: case 0x1B: case 0x1E:
+    case 0x00: /* TEST UNIT READY */
+        atapi_set_data(s, NULL, 0);
+        if (!medium) {           /* empty tray: CHECK CONDITION, NOT READY */
+            s->atapi_error = 0x20;
+            s->atapi_status = 0x41;
+        }
+        break;
+    case 0x1B: case 0x1E:
         atapi_set_data(s, NULL, 0);
         break;
     case 0x03:
         reply[0] = 0x70; reply[7] = 10;
+        if (!medium) {
+            reply[2] = 0x02;     /* NOT READY */
+            reply[12] = 0x3a;    /* medium not present */
+        }
         atapi_set_data(s, reply, p[4] < 18 ? p[4] : 18);
         break;
     case 0x12: {
@@ -376,8 +389,8 @@ static void atapi_reply(Ia64GenericState *s) {
         size_t len = (size_t)count * GENERIC_CDROM_SECTOR_SIZE;
         uint8_t *buf = len ? malloc(len) : NULL;
         if ((len && !buf) || lba >= blocks || count > blocks - lba ||
-            fseek(s->cdrom, (long)((uint64_t)lba * GENERIC_CDROM_SECTOR_SIZE), SEEK_SET) != 0 ||
-            (len && fread(buf, 1, len, s->cdrom) != len)) {
+            (len && !gemu_drive_read(s->cdrom, (uint64_t)lba * GENERIC_CDROM_SECTOR_SIZE,
+                                     buf, len))) {
             free(buf); s->atapi_error = 0x50; s->atapi_status = 0x41;
         } else {
             atapi_set_data(s, buf, len);
@@ -953,16 +966,57 @@ static void generic_serial_tx(Ia64GenericState *s, uint8_t byte) {
     }
 }
 
-static void cdrom_do_read(Ia64GenericState *s) {
-    if (!s->cdrom) {
-        s->cdrom_result = 1;
-        return;
+/* ── Drives ────────────────────────────────────────────────────────────────
+ *
+ * This machine's HDD window and CD-ROM controller aren't a real IDE pair,
+ * but they take the same drive-table slots QEMU's PC gives -hda and
+ * -cdrom: ide0-hd0 (index=0) is the HDD, ide1-cd0 (index=2) the CD-ROM.
+ * Anything else stays unclaimed and is rejected by
+ * gemu_drive_check_unclaimed(). */
+
+static void generic_cdrom_changed(void *ud, bool inserted) {
+    Ia64GenericState *s = ud;
+    snprintf(s->cdrom_file, sizeof(s->cdrom_file), "%s",
+             gemu_drive_filename(s->cdrom));
+    s->cdrom_size = gemu_drive_size(s->cdrom);
+    /* The El Torito FAT12 mount and any file opened through it describe
+     * the old disc: remount lazily from the new one on the next OPEN. */
+    s->fat12_valid = false;
+    s->file_open = false;
+    s->file_remaining = 0;
+    (void)inserted;
+}
+
+static bool generic_claim_drives(Ia64GenericState *s) {
+    s->hdd = gemu_drive_get(GEMU_DRIVE_IF_IDE, 0, 0);
+    s->cdrom = gemu_drive_get(GEMU_DRIVE_IF_IDE, 1, 0);
+    if (s->hdd && gemu_drive_media(s->hdd) != GEMU_DRIVE_MEDIA_DISK) {
+        fprintf(stderr, "gemu: generic-ia64: %s: index 0 is the hard disk, "
+                "not a CD-ROM (use -cdrom or index=2)\n", gemu_drive_name(s->hdd));
+        return false;
     }
+    if (s->cdrom && gemu_drive_media(s->cdrom) != GEMU_DRIVE_MEDIA_CDROM) {
+        fprintf(stderr, "gemu: generic-ia64: %s: index 2 is the CD-ROM, "
+                "not a hard disk (use -hda or index=0)\n", gemu_drive_name(s->cdrom));
+        return false;
+    }
+    if (s->hdd) {
+        s->hdd_sectors = gemu_drive_size(s->hdd) / GENERIC_HDD_SECTOR_SIZE;
+        snprintf(s->hdd_file, sizeof(s->hdd_file), "%s", gemu_drive_filename(s->hdd));
+        fprintf(stderr, "gemu: disk %s '%s': %" PRIu64 " sectors (%" PRIu64
+                " MiB)\n", gemu_drive_name(s->hdd), s->hdd_file, s->hdd_sectors,
+                (s->hdd_sectors * GENERIC_HDD_SECTOR_SIZE) >> 20);
+    }
+    if (s->cdrom) {
+        gemu_drive_set_change_cb(s->cdrom, generic_cdrom_changed, s);
+        generic_cdrom_changed(s, gemu_drive_inserted(s->cdrom));
+    }
+    return true;
+}
+
+static void cdrom_do_read(Ia64GenericState *s) {
     uint64_t off = (uint64_t)s->cdrom_lba * GENERIC_CDROM_SECTOR_SIZE;
-    if (off + GENERIC_CDROM_SECTOR_SIZE > s->cdrom_size ||
-        fseek(s->cdrom, (long)off, SEEK_SET) != 0 ||
-        fread(s->cdrom_buf, 1, GENERIC_CDROM_SECTOR_SIZE, s->cdrom) !=
-            GENERIC_CDROM_SECTOR_SIZE) {
+    if (!gemu_drive_read(s->cdrom, off, s->cdrom_buf, GENERIC_CDROM_SECTOR_SIZE)) {
         s->cdrom_result = 1;
         return;
     }
@@ -971,15 +1025,12 @@ static void cdrom_do_read(Ia64GenericState *s) {
 
 static void cdrom_do_read_dma(Ia64GenericState *s) {
     s->cdrom_result = 1;
-    if (!s->cdrom || s->cdrom_dma_size == 0 ||
+    if (s->cdrom_dma_size == 0 ||
         s->cdrom_dma_size % GENERIC_CDROM_SECTOR_SIZE != 0 ||
         (uint64_t)s->cdrom_dma_dst + s->cdrom_dma_size > s->ram_size)
         return;
     uint64_t off = (uint64_t)s->cdrom_lba * GENERIC_CDROM_SECTOR_SIZE;
-    if (off + s->cdrom_dma_size > s->cdrom_size ||
-        fseek(s->cdrom, (long)off, SEEK_SET) != 0 ||
-        fread(s->ram + s->cdrom_dma_dst, 1, s->cdrom_dma_size, s->cdrom) !=
-            s->cdrom_dma_size)
+    if (!gemu_drive_read(s->cdrom, off, s->ram + s->cdrom_dma_dst, s->cdrom_dma_size))
         return;
     s->cdrom_result = 0;
 }
@@ -998,17 +1049,15 @@ static void cdrom_do_read_dma(Ia64GenericState *s) {
 static bool cdrom_find_eltorito_boot_lba(Ia64GenericState *s, uint32_t *out_lba) {
     uint8_t sec[2048];
     for (uint32_t lba = 16; lba < 16 + 32; lba++) {
-        if (fseek(s->cdrom, (long)lba * 2048, SEEK_SET) != 0)
-            return false;
-        if (fread(sec, 1, 2048, s->cdrom) != 2048)
+        if (!gemu_drive_read(s->cdrom, (uint64_t)lba * 2048, sec, 2048))
             return false;
         if (sec[0] == 255)   /* volume descriptor set terminator */
             return false;
         if (sec[0] == 0 && memcmp(sec + 7, "EL TORITO SPECIFICATION", 23) == 0) {
             uint32_t catalog_lba = rd32(sec + 71);
             uint8_t cat[64];
-            if (fseek(s->cdrom, (long)catalog_lba * 2048, SEEK_SET) != 0 ||
-                fread(cat, 1, sizeof(cat), s->cdrom) != sizeof(cat))
+            if (!gemu_drive_read(s->cdrom, (uint64_t)catalog_lba * 2048,
+                                 cat, sizeof(cat)))
                 return false;
             *out_lba = rd32(cat + 40);
             return true;
@@ -1020,15 +1069,14 @@ static bool cdrom_find_eltorito_boot_lba(Ia64GenericState *s, uint32_t *out_lba)
 static bool fat12_mount(Ia64GenericState *s) {
     if (s->fat12_valid)
         return true;
-    if (!s->cdrom)
+    if (!gemu_drive_inserted(s->cdrom))
         return false;
     uint32_t boot_lba;
     if (!cdrom_find_eltorito_boot_lba(s, &boot_lba))
         return false;
     uint32_t vol_off = boot_lba * 2048u;
     uint8_t bs[512];
-    if (fseek(s->cdrom, (long)vol_off, SEEK_SET) != 0 ||
-        fread(bs, 1, sizeof(bs), s->cdrom) != sizeof(bs))
+    if (!gemu_drive_read(s->cdrom, vol_off, bs, sizeof(bs)))
         return false;
 
     uint32_t bytes_per_sector = rd16(bs + 11);
@@ -1082,8 +1130,7 @@ static void cdrom_open_file(Ia64GenericState *s, const char *path) {
     }
     bool found = false;
     uint32_t start_cluster = 0, file_size = 0;
-    if (fseek(s->cdrom, (long)s->fat12_root_dir_off, SEEK_SET) == 0 &&
-        fread(dirbuf, 1, dir_bytes, s->cdrom) == dir_bytes) {
+    if (gemu_drive_read(s->cdrom, s->fat12_root_dir_off, dirbuf, dir_bytes)) {
         for (uint32_t i = 0; i < s->fat12_root_entries; i++) {
             uint8_t *e = dirbuf + i * 32;
             if (e[0] == 0x00)
@@ -1113,8 +1160,7 @@ static void cdrom_open_file(Ia64GenericState *s, const char *path) {
 static uint32_t fat12_next_cluster(Ia64GenericState *s, uint32_t cluster) {
     uint32_t fat_byte_off = cluster + cluster / 2;   /* == cluster*3/2 */
     uint8_t buf[2];
-    if (fseek(s->cdrom, (long)(s->fat12_fat_off + fat_byte_off), SEEK_SET) != 0 ||
-        fread(buf, 1, 2, s->cdrom) != 2)
+    if (!gemu_drive_read(s->cdrom, (uint64_t)s->fat12_fat_off + fat_byte_off, buf, 2))
         return 0xFFF;
     uint16_t word = rd16(buf);
     return (cluster & 1) ? (word >> 4) : (word & 0x0FFF);
@@ -1141,8 +1187,7 @@ static void cdrom_read_next_chunk(Ia64GenericState *s) {
         uint32_t want = cluster_bytes;
         if (want > s->file_remaining)
             want = s->file_remaining;
-        if (fseek(s->cdrom, (long)cluster_off, SEEK_SET) != 0 ||
-            fread(s->cdrom_buf + produced, 1, want, s->cdrom) != want)
+        if (!gemu_drive_read(s->cdrom, cluster_off, s->cdrom_buf + produced, want))
             break;
         produced += want;
         s->file_remaining -= want;
@@ -1395,7 +1440,7 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     if (addr >= GENERIC_CDROM_IO_BASE && addr + size <= GENERIC_CDROM_IO_BASE + GENERIC_CDROM_IO_SIZE) {
         uint32_t off = (uint32_t)(addr - GENERIC_CDROM_IO_BASE);
         if (off == 0)
-            return s->cdrom != NULL;
+            return gemu_drive_inserted(s->cdrom);
         if (off == 0xC)
             return s->cdrom_result;
         if (off == 0x10)
@@ -1970,37 +2015,13 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
     gemu_monitor_set_cpu_state_cb(s->monitor, generic_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, generic_screendump, s);
 
-    if (cfg->hda_path) {
-        /* Read-write: a hard disk that silently discarded writes would be
-         * worse than no disk at all. */
-        s->hdd = fopen(cfg->hda_path, "r+b");
-        if (!s->hdd) {
-            fprintf(stderr, "gemu: cannot open disk image '%s' read-write\n",
-                    cfg->hda_path);
-        } else {
-            if (fseeko(s->hdd, 0, SEEK_END) == 0) {
-                off_t end = ftello(s->hdd);
-                if (end > 0)
-                    s->hdd_sectors = (uint64_t)end / GENERIC_HDD_SECTOR_SIZE;
-            }
-            rewind(s->hdd);
-            snprintf(s->hdd_file, sizeof(s->hdd_file), "%s", cfg->hda_path);
-            fprintf(stderr, "gemu: disk '%s': %" PRIu64 " sectors (%" PRIu64
-                    " MiB)\n", cfg->hda_path, s->hdd_sectors,
-                    (s->hdd_sectors * GENERIC_HDD_SECTOR_SIZE) >> 20);
-        }
+    if (!generic_claim_drives(s)) {
+        ia64_generic_destroy(s);
+        return NULL;
     }
-    if (cfg->cdrom_path) {
-        s->cdrom = fopen(cfg->cdrom_path, "rb");
-        if (!s->cdrom) {
-            fprintf(stderr, "gemu: cannot open CD-ROM image '%s'\n", cfg->cdrom_path);
-            ia64_generic_destroy(s);
-            return NULL;
-        }
-        fseek(s->cdrom, 0, SEEK_END);
-        s->cdrom_size = (uint64_t)ftell(s->cdrom);
-        fseek(s->cdrom, 0, SEEK_SET);
-        snprintf(s->cdrom_file, sizeof(s->cdrom_file), "%s", cfg->cdrom_path);
+    gemu_drive_attach_monitor(s->hdd, s->monitor);
+    gemu_drive_attach_monitor(s->cdrom, s->monitor);
+    if (s->cdrom) {
         /* PCI bus 0, device 4, function 0: a compatibility-mode PIIX IDE
          * controller matching the device path exported by our EFI ROM. */
         s->ide_cfg[0x00] = 0x86; s->ide_cfg[0x01] = 0x80;
@@ -2051,8 +2072,8 @@ void ia64_generic_destroy(Ia64GenericState *s) {
     if (s->display) gemu_display_destroy(s->display);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     if (s->cpu) merced_destroy(s->cpu);
-    if (s->hdd) fclose(s->hdd);
-    if (s->cdrom) fclose(s->cdrom);
+    /* The drive table owns the drives; just stop them calling back here. */
+    gemu_drive_set_change_cb(s->cdrom, NULL, NULL);
     free(s->atapi_data);
     free(s->ram);
     free(s);

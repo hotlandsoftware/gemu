@@ -114,6 +114,9 @@ void         gemu_monitor_set_memory(GemuMonitor *mon, const GemuMonMemory *mem)
 
 bool         gemu_monitor_register_media(GemuMonitor *mon,
                                          const GemuMediaDevice *dev);
+/* The monitor's own copy of a registered device (its file[] is what
+ * info block shows), or NULL. */
+GemuMediaDevice *gemu_monitor_find_media(GemuMonitor *mon, const char *name);
 void         gemu_monitor_set_input_reset_cb(GemuMonitor *mon,
                                              void (*cb)(void *ud),
                                              void *ud);

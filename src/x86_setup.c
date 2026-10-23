@@ -2,6 +2,7 @@
 #include "romdb.h"
 #include "gemu/args.h"
 #include "gemu/monitor.h"
+#include "gemu/drive.h"
 #include <SDL2/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,8 @@ static const GemuArgsDef def = {
     .n_cpus       = (int)(sizeof cpus / sizeof *cpus),
     .vgas         = vgas,
     .n_vgas       = (int)(sizeof vgas / sizeof *vgas),
+    .block_devices    = true,
+    .block_default_if = GEMU_DRIVE_IF_IDE,   /* QEMU's PC default */
     .display_mask = GEMU_DISP_F(GEMU_DISPLAY_SDL) | GEMU_DISP_F(GEMU_DISPLAY_NONE),
     .extra_help =
         "\nx86 options:\n"
@@ -54,10 +57,13 @@ static const GemuArgsDef def = {
         "                  known ROMs by SHA-256 (e.g. -rom roms/ibm5150)\n"
         "  -m SIZE         RAM size, K/M suffix (default 64K; the 19OCT81 BIOS\n"
         "                  uses up to 544K, and POST takes ~50 s to test that)\n"
-        "\nBoots the original BIOS into Cassette BASIC (no diskette drives are\n"
-        "configured).  Not yet emulated: floppy controller, cassette, printer\n"
-        "and serial ports.  Monitor: 'sendkey' types into the keyboard, e.g.\n"
-        "sendkey PRINT spc 2+2 ret, or sendkey ctrl-alt-delete.\n"
+        "\nDiskettes: -fda/-fdb FILE or -drive file=FILE,if=floppy[,index=N]\n"
+        "                  (160K/180K/320K/360K images; up to 4 drives).\n"
+        "                  With a drive in A: POST boots from it, otherwise\n"
+        "                  into Cassette BASIC.  The 5150 has no IDE.\n"
+        "Not yet emulated: cassette, printer and serial ports.  Monitor:\n"
+        "'sendkey' types into the keyboard (sendkey PRINT spc 2+2 ret,\n"
+        "sendkey ctrl-alt-delete); 'change floppy0 FILE' swaps diskettes.\n"
         "\nExample:\n"
         "  ./bin/gemu -M ibm5150 -rom roms/ibm5150 -display sdl\n",
 };
@@ -184,7 +190,8 @@ int x86_setup(int argc, char *argv[]) {
     }
 
     Ibm5150State *s = ibm5150_create(&cfg);
-    if (!s) {
+    if (!s || !gemu_drive_check_unclaimed(alias)) {
+        ibm5150_destroy(s);
         if (sdl_up) SDL_Quit();
         return 1;
     }

@@ -46,6 +46,12 @@ typedef struct {
     int                n_vgas;
     unsigned           display_mask;    /* bitfield of supported GemuDisplayType */
     const char        *extra_help;      /* optional binary-specific usage text */
+    /* QEMU-style block devices: -drive, -hda..-hdd, -cdrom, -fda/-fdb
+     * (and -floppy), -snapshot are parsed into the drive table (gemu/drive.h)
+     * with block_default_if as -drive's default if=.  Families without it
+     * keep those options for themselves (e.g. NES -fda). */
+    bool               block_devices;
+    int                block_default_if; /* GemuDriveInterface */
 } GemuArgsDef;
 
 /*

@@ -11,7 +11,8 @@
  *               low (keyboard reset), PB7 clears the keyboard and selects SW1.
  * Port C (in):  PC0-3 SW2 switches 1-4 (PB2 set) or switch 5 on PC0 (PB2
  *               clear); PC4 cassette data in; PC5 timer 2 output; PC6 I/O
- *               channel check; PC7 RAM parity check.
+ *               channel check; PC7 RAM parity check.  With the cassette
+ *               motor off, PC4 reads back timer 2 (the cassette wrap).
  *
  * The 5150 BIOS always programs the fixed A-in/B-out/C-in configuration
  * (0x99), so the mode register at 0x63 is accepted and ignored.  The

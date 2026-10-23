@@ -2,6 +2,7 @@
 #include "gemu/gemu.h"
 #include "gemu/gemu_display.h"
 #include "gemu/vnc.h"
+#include "gemu/drive.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,14 @@ static void print_usage(const GemuArgsDef *def) {
     printf("  %-14s Display backend   (use -display ? to list)\n", "-display TYPE");
     printf("  %-14s Window scale factor\n", "-scale N");
     printf("  %-14s VNC server, QEMU syntax (use -vnc ? for details)\n", "-vnc ADDR");
+    if (def->block_devices) {
+        printf("  %-14s Block device, QEMU syntax (file=,if=,bus=,unit=,index=,\n"
+               "  %-14s media=disk|cdrom,readonly=,snapshot=,format=raw,id=)\n", "-drive OPTS", "");
+        printf("  %-14s IDE disks (= -drive file=FILE,index=0..3,media=disk)\n", "-hda..-hdd FILE");
+        printf("  %-14s CD-ROM (= -drive file=FILE,index=2,media=cdrom)\n", "-cdrom FILE");
+        printf("  %-14s Floppies (= -drive file=FILE,index=0..1,if=floppy)\n", "-fda/-fdb FILE");
+        printf("  %-14s Discard all disk writes on exit (snapshot=on everywhere)\n", "-snapshot");
+    }
     printf("  %-14s Pause/halt instead of exiting on monitor shutdown\n", "-no-shutdown");
     printf("  %-14s Name the VM: window title becomes \"GEMU (NAME)\"\n", "-name NAME");
     printf("  %-14s Monitor: stdio | none | telnet:HOST:PORT,server,nowait\n",
@@ -353,6 +362,49 @@ bool gemu_args_parse(int argc, char **argv,
         if (strcmp(a, "-no-shutdown") == 0) {
             out->no_shutdown = true;
             continue;
+        }
+
+        /* ── Block devices (QEMU's -drive and its legacy shorthands) ── */
+        if (def->block_devices) {
+            static const struct {
+                const char *opt; GemuDriveInterface iface; int index; GemuDriveMedia media;
+            } legacy[] = {
+                { "-hda",    GEMU_DRIVE_IF_IDE,    0, GEMU_DRIVE_MEDIA_DISK },
+                { "-hdb",    GEMU_DRIVE_IF_IDE,    1, GEMU_DRIVE_MEDIA_DISK },
+                { "-hdc",    GEMU_DRIVE_IF_IDE,    2, GEMU_DRIVE_MEDIA_DISK },
+                { "-hdd",    GEMU_DRIVE_IF_IDE,    3, GEMU_DRIVE_MEDIA_DISK },
+                { "-cdrom",  GEMU_DRIVE_IF_IDE,    2, GEMU_DRIVE_MEDIA_CDROM },
+                { "-fda",    GEMU_DRIVE_IF_FLOPPY, 0, GEMU_DRIVE_MEDIA_DISK },
+                { "-floppy", GEMU_DRIVE_IF_FLOPPY, 0, GEMU_DRIVE_MEDIA_DISK },
+                { "-fdb",    GEMU_DRIVE_IF_FLOPPY, 1, GEMU_DRIVE_MEDIA_DISK },
+            };
+            if (strcmp(a, "-snapshot") == 0) {
+                gemu_drive_snapshot_all();
+                continue;
+            }
+            bool handled = false;
+            for (size_t k = 0; k < sizeof(legacy) / sizeof(legacy[0]); k++) {
+                if (strcmp(a, legacy[k].opt) != 0) continue;
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "%s: %s requires an argument\n", def->prog, a);
+                    return false;
+                }
+                if (!gemu_drive_add_legacy(legacy[k].iface, legacy[k].index,
+                                           legacy[k].media, argv[++i]))
+                    return false;
+                handled = true;
+                break;
+            }
+            if (handled) continue;
+            if (strcmp(a, "-drive") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "%s: -drive requires an argument\n", def->prog);
+                    return false;
+                }
+                gemu_drive_set_default_if((GemuDriveInterface)def->block_default_if);
+                if (!gemu_drive_add(argv[++i])) return false;
+                continue;
+            }
         }
 
         /* ── -name NAME | -name guest=NAME[,...] (QEMU syntax) ── */

@@ -57,9 +57,8 @@
 
 typedef struct {
     uint64_t        ram_size;
-    const char     *cdrom_path;
-    /* -hda FILE: raw read-write disk image (generic machine only for now). */
-    const char     *hda_path;
+    /* Disks come from the shared drive table (gemu/drive.h): ide0-hd0
+     * (-hda) and ide1-cd0 (-cdrom), claimed by ia64_i2000_create(). */
     GemuDisplayType display_type;
     int             display_scale;
     const char     *vga;

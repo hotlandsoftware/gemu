@@ -94,6 +94,8 @@ struct GemuMonitor {
     int             n_bps;
     int             next_bp_id;
     bool            has_exec_bp;
+    bool            bp_resume_skip;   /* step over the breakpoint just hit */
+    uint32_t        bp_resume_addr;
     bool            has_mem_bp;
     void          (*cpu_state_cb)(void *ud, char *buf, size_t buf_len);
     void           *cpu_state_ud;
