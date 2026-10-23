@@ -3626,7 +3626,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * than hand-listing every scalar field, and it stays correct automatically
  * as fields get added. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 23u /* v23 adds PIC OCW3 IRR/ISR selection */
+#define I2000_SNAPSHOT_VERSION 24u /* v24 adds the CPU's in-service vectors */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -3902,8 +3902,8 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     void *translation_cache = s->cpu->translation_cache;
     Merced loaded_cpu;
     memset(&loaded_cpu, 0, sizeof(loaded_cpu));
-    size_t cpu_state_size = version < 20u
-                          ? offsetof(Merced, translation_cache)
+    size_t cpu_state_size = version < 20u ? offsetof(Merced, translation_cache)
+                          : version < 24u ? offsetof(Merced, ext_in_service)
                           : sizeof(loaded_cpu);
     ok &= fread(&loaded_cpu, cpu_state_size, 1, f) == 1;
     if (ok) {
@@ -4134,6 +4134,56 @@ static GemuMonCmd i2000_cmd_input(GemuMonitor *mon, const char *args, void *ud) 
              i < s->ps2_keyboard.queue_len; i++)
             gemu_monitor_printf(mon, " %02X", s->ps2_keyboard.queue[i]);
         gemu_monitor_printf(mon, "\n");
+    }
+    return GEMU_MON_NONE;
+}
+
+/* One host key press: the PS/2 keyboard, plus the serial console and the
+ * EFI BIOS key buffer for ASCII (the same paths window input takes). */
+static void i2000_type_key(Ia64I2000State *s, uint32_t keysym) {
+    if (keysym <= 0x7F) {
+        uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
+        if (next != s->uart_rx_head) {
+            s->uart_rx[s->uart_rx_tail] = (uint8_t)keysym;
+            s->uart_rx_tail = next;
+        }
+        i2000_efi_bios_key(s, (uint8_t)keysym);
+    }
+    ps2_keyboard_tap(&s->ps2_keyboard, keysym);
+}
+
+/* QEMU key names (sendkey), as X11 keysyms or ASCII. */
+static const struct { const char *name; uint32_t keysym; } i2000_key_names[] = {
+    { "ret", '\r' }, { "spc", ' ' }, { "tab", '\t' }, { "esc", 0x1B },
+    { "backspace", '\b' }, { "delete", 0xffff }, { "insert", 0xff63 },
+    { "up", 0xff52 }, { "down", 0xff54 }, { "left", 0xff51 }, { "right", 0xff53 },
+    { "home", 0xff50 }, { "end", 0xff57 }, { "pgup", 0xff55 }, { "pgdn", 0xff56 },
+    { "f1", 0xffbe }, { "f2", 0xffbf }, { "f3", 0xffc0 }, { "f4", 0xffc1 },
+    { "f5", 0xffc2 }, { "f6", 0xffc3 }, { "f7", 0xffc4 }, { "f8", 0xffc5 },
+    { "f9", 0xffc6 }, { "f10", 0xffc7 }, { "f11", 0xffc8 }, { "f12", 0xffc9 },
+};
+
+/* monitor "sendkey KEY|TEXT ...": named keys (ret, spc, f8, ...) or text */
+static GemuMonCmd i2000_cmd_sendkey(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    if (!*args) {
+        gemu_monitor_printf(mon, "usage: sendkey <keys|text>...  e.g. sendkey ret, "
+                                 "sendkey fs0: ret\n");
+        return GEMU_MON_NONE;
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", args);
+    for (char *tok = strtok(buf, " \t"); tok; tok = strtok(NULL, " \t")) {
+        bool named = false;
+        for (size_t i = 0; i < sizeof(i2000_key_names) / sizeof(i2000_key_names[0]); i++)
+            if (strcmp(tok, i2000_key_names[i].name) == 0) {
+                i2000_type_key(s, i2000_key_names[i].keysym);
+                named = true;
+                break;
+            }
+        if (!named)
+            for (const char *p = tok; *p; p++)
+                i2000_type_key(s, (unsigned char)*p);
     }
     return GEMU_MON_NONE;
 }
@@ -4485,6 +4535,7 @@ static GemuMonCmd i2000_cmd_atapistate(GemuMonitor *mon, const char *args,
 static void i2000_monitor_setup(Ia64I2000State *s) {
     GemuMonitor *mon = s->monitor;
     gemu_monitor_bind(mon, "input",      i2000_cmd_input, s);
+    gemu_monitor_bind(mon, "sendkey",    i2000_cmd_sendkey, s);
     gemu_monitor_bind(mon, "savevm",     i2000_cmd_savevm, s);
     gemu_monitor_bind(mon, "loadvm",     i2000_cmd_loadvm, s);
     gemu_monitor_bind(mon, "panel",      i2000_cmd_panel, s);
@@ -4841,6 +4892,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
             .fb_width = FB_W,
+            .monitor = s->monitor,
             .fb_height = FB_H,
             .scale = cfg->display_scale,
             .actions = i2000_keyboard_actions,
@@ -5336,13 +5388,8 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             display_keys_held = keys_held;
             uint32_t cp;
             while ((cp = gemu_display_pop_raw_key(s->display)) != 0) {
-                uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
-                if (next != s->uart_rx_head && cp <= 0x7F) {
-                    s->uart_rx[s->uart_rx_tail] = (uint8_t)cp;
-                    s->uart_rx_tail = next;
-                    ps2_keyboard_tap(&s->ps2_keyboard, cp);
-                    i2000_efi_bios_key(s, (uint8_t)cp);
-                }
+                if (cp <= 0x7F)
+                    i2000_type_key(s, cp);
             }
             if (gemu_display_should_quit(s->display)) {
                 if (cfg->no_shutdown) gemu_display_clear_flags(s->display);
@@ -5461,14 +5508,21 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             i2000_bench_check(s);
         }
 
+        /* A slice is ~1-2 ms of guest time: draw at 60 Hz, not per slice,
+         * and only sleep when the CPU isn't running. */
+        bool idle = s->halted || gemu_monitor_is_paused(s->monitor);
         if (s->display) {
-            gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor) || s->halted);
-            i2000_render_frame(s);
-            gemu_display_render(s->display, s->fb, FB_W, FB_H);
-            gemu_sleep_ms(s->halted ? 30 : 1);
-        } else if (s->halted) {
-            gemu_sleep_ms(30);
+            static uint64_t last_frame_ns;
+            uint64_t frame_ns = i2000_monotonic_ns();
+            if (idle || frame_ns - last_frame_ns >= UINT64_C(16666667)) {
+                last_frame_ns = frame_ns;
+                gemu_display_set_paused(s->display, idle);
+                i2000_render_frame(s);
+                gemu_display_render(s->display, s->fb, FB_W, FB_H);
+            }
         }
+        if (idle)
+            gemu_sleep_ms(30);
     }
     gemu_monitor_stop(s->monitor);
 }

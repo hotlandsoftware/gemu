@@ -609,6 +609,7 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
             .fb_width = s->fb_w, .fb_height = s->fb_h,
+            .monitor = s->monitor,
             /* The MDA's 720x350 filled a 4:3 monitor; CGA's 640x400 is drawn
              * with doubled scanlines and already has its shape. */
             .aspect_w = s->vga == X86_VGA_MDA ? 4 : 0,

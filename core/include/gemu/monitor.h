@@ -71,6 +71,13 @@ void         gemu_monitor_set_machine(const char *name);
 /* Enqueue a reset or quit command from non-stdin sources (e.g. a GTK menu). */
 void         gemu_monitor_enqueue_reset(GemuMonitor *mon);
 void         gemu_monitor_enqueue_quit(GemuMonitor *mon);
+/* Queue any monitor command line to run at the next gemu_monitor_poll()
+ * without waiting for it - safe from the emulator thread (window menus). */
+bool         gemu_monitor_enqueue_command(GemuMonitor *mon, const char *line);
+
+/* Registered media devices, for front ends (e.g. a Blocks menu). */
+int          gemu_monitor_media_count(const GemuMonitor *mon);
+const GemuMediaDevice *gemu_monitor_media_get(const GemuMonitor *mon, int index);
 void         gemu_monitor_shutdown_or_pause(GemuMonitor *mon, bool no_shutdown);
 
 /* ── Machine-provided commands ─────────────────────────────────────────────

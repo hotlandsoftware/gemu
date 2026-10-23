@@ -102,6 +102,10 @@ typedef struct {
     bool                 capture_pointer; /* SDL: VM-style relative mouse capture */
     bool                 terminal_text;   /* curses: plain selectable ANSI text */
 
+    /* The machine's monitor: the window menus use it for Pause, Reset,
+     * Screenshot and the Blocks menu.  NULL leaves those out. */
+    GemuMonitor         *monitor;
+
     /* GTK extras - NULL for non-GTK builds / backends */
     const GemuDisplayGtkExtras *gtk;
 } GemuDisplayConfig;

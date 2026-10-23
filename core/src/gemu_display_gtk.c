@@ -1,6 +1,7 @@
 #ifdef GEMU_GTK
 #include "gemu_display_priv.h"
 #include "gemu/video.h"
+#include "gemu/gtk_menu.h"
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
 #include <stdio.h>
@@ -53,6 +54,8 @@ static guint sdl_name_to_gdk(const char *name) {
 typedef struct {
     GemuVideoGtk *video;
     GemuDisplay  *parent; /* back-pointer so signal handlers can update state */
+    GtkWidget    *menubar;
+    gint64        menubar_refreshed;
 
     struct { guint keyval; uint32_t bit; } bindings[GTK_MAX_BINDINGS];
     int n_bindings;
@@ -212,8 +215,14 @@ static void gtk_do_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
 }
 
 static uint32_t gtk_do_poll(GemuDisplay *d) {
-    (void)d;
+    GtkBackend *b = d->backend;
     gemu_video_gtk_poll();
+    /* Pick up new top-level menus (the monitor is attached after creation). */
+    gint64 now = g_get_monotonic_time();
+    if (now - b->menubar_refreshed > G_USEC_PER_SEC) {
+        gemu_gtk_menubar_refresh(b->menubar);
+        b->menubar_refreshed = now;
+    }
     /* d->held is updated by on_key signal; return current value */
     return d->held;
 }
@@ -230,6 +239,50 @@ static void gtk_do_set_title(GemuDisplay *d, const char *title) {
     GtkBackend *b = d->backend;
     GtkWidget *win = b && b->video ? gemu_video_gtk_window(b->video) : NULL;
     if (win) gtk_window_set_title(GTK_WINDOW(win), title ? title : "GEMU");
+}
+
+/* ── Window menu hooks ───────────────────────────────────────────────────── */
+
+static GemuMenu *build_menubar(void *ud) {
+    return gemu_display_build_menubar(ud);
+}
+
+static GtkWindow *gtk_parent(GemuDisplay *d) {
+    GtkBackend *b = d->backend;
+    return GTK_WINDOW(gemu_video_gtk_window(b->video));
+}
+
+static void gtk_ui_about(GemuDisplay *d) {
+    GtkWidget *dlg = gtk_message_dialog_new(gtk_parent(d), GTK_DIALOG_MODAL,
+                                            GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                                            "%s", gemu_display_about_text());
+    gtk_window_set_title(GTK_WINDOW(dlg), "About GEMU");
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+}
+
+static void gtk_ui_choose_file(GemuDisplay *d, const char *title,
+                               void (*done)(void *ud, const char *path), void *ud) {
+    GtkWidget *dlg = gtk_file_chooser_dialog_new(title, gtk_parent(d),
+                                                 GTK_FILE_CHOOSER_ACTION_OPEN,
+                                                 "_Cancel", GTK_RESPONSE_CANCEL,
+                                                 "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        char *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+        if (path) done(ud, path);
+        g_free(path);
+    }
+    gtk_widget_destroy(dlg);
+}
+
+static int gtk_ui_get_scale(GemuDisplay *d) {
+    GtkBackend *b = d->backend;
+    return gemu_video_gtk_get_scale(b->video);
+}
+
+static void gtk_ui_set_scale(GemuDisplay *d, int scale) {
+    GtkBackend *b = d->backend;
+    gemu_video_gtk_set_scale(b->video, scale);
 }
 
 /* ── Create ──────────────────────────────────────────────────────────────── */
@@ -256,12 +309,6 @@ GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
         .aspect_w = cfg->aspect_w,
         .aspect_h = cfg->aspect_h,
     };
-    if (cfg->gtk) {
-        spec.monitor       = cfg->gtk->monitor;
-        spec.hex_toggle_cb = cfg->gtk->hex_toggle_cb;
-        spec.hex_toggle_ud = cfg->gtk->hex_toggle_ud;
-    }
-
     b->video = gemu_video_gtk_create(&spec);
     if (!b->video) { free(b); return NULL; }
 
@@ -276,7 +323,14 @@ GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
     d->do_destroy = gtk_do_destroy;
     gemu_window_title(d->title, sizeof(d->title), NULL, false);
     d->pointer.x = d->pointer.y = -1;
+    d->ui_about       = gtk_ui_about;
+    d->ui_choose_file = gtk_ui_choose_file;
+    d->ui_get_scale   = gtk_ui_get_scale;
+    d->ui_set_scale   = gtk_ui_set_scale;
     b->parent = d;
+
+    b->menubar = gemu_gtk_menubar_new(build_menubar, d);
+    gemu_video_gtk_set_menubar(b->video, b->menubar);
 
     GtkWidget *win = gemu_video_gtk_window(b->video);
     GtkWidget *area = gemu_video_gtk_drawing_area(b->video);

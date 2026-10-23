@@ -68,6 +68,10 @@ media=disk`. i2000 exposes exactly one IDE drive per channel, so `-drive`
 only accepts `index=0` - there's no slave/secondary device to attach a
 second image to.
 
+The monitor's `sendkey` types into the guest: QEMU key names (`ret`, `spc`,
+`esc`, `tab`, `up`, `f8`, ...) or plain text, e.g. `sendkey ret` at the
+"Press any key to boot from CD-ROM" prompt.
+
 The monitor supports `savevm PATH` and `loadvm PATH`. Keep the same `-rom` and
 `-cdrom`/`-drive` arguments when restoring a checkpoint; explicitly configured
 CD media is retained across the restore.
@@ -79,9 +83,11 @@ corresponding `i2000-<firmware-hash>.nvram` file and cold boot.
 ## Current limitations
 
 - Windows XP IA-64 Setup boots from CD and reaches **Setup is starting
-  Windows**, but currently enters a repeated nested page-not-present/VHPT
-  translation path instead of advancing. The recurring address observed in
-  the current investigation is `0xE00001060000C000`.
+  Windows**, then bugchecks (0x8E, a breakpoint with no debugger) on the
+  first clock interrupt.  Its page-table walk reads its top-level page
+  directories at physical `0x10F000000`, above the 2 GiB of RAM, so they
+  read back as all-ones.  Where that address comes from (firmware memory
+  map or an emulation bug) is still open.
 - The Merced core and 460GX platform model remain incomplete; other operating
   systems and firmware revisions may encounter unimplemented instructions or
   devices.

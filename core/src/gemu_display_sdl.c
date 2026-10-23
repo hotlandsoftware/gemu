@@ -1,21 +1,13 @@
 #include "gemu_display_priv.h"
 #include "gemu/video.h"
 #include <SDL2/SDL.h>
-#include <SDL2/SDL_syswm.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-#  define IDM_FILE_RESET    0x0101
-#  define IDM_FILE_QUIT     0x0102
-#  define IDM_DEBUG_HEXEDIT 0x0103
-#endif
-
 /* InputMenu lives in gemu-mos/src/vga/ but is included via the build's
  * include path (same hack that lets rca share it). */
 #include "input_menu.h"
+#include "gemu_menubar_sdl.h"
 
 #define SDL_MAX_BINDINGS GEMU_DISPLAY_MAX_ACTIONS
 #define SDL_CONTROLLER_DEADZONE 16000
@@ -29,7 +21,8 @@ typedef struct {
 
 typedef struct {
     GemuVideoSdl *video;
-    InputMenu    *menu;
+    InputMenu    *menu;      /* key/controller binding screen (Input > Configure) */
+    GemuMenubar  *menubar;   /* the window's menu bar */
 
     /* key → action bit mapping, built from action table + INI overrides */
     struct { SDL_Keycode key; uint32_t bit; } bindings[SDL_MAX_BINDINGS];
@@ -41,7 +34,7 @@ typedef struct {
     /* SDL_SCANCODE_TAB is intercepted for the rebind menu when Tab is not
      * bound to any game action. */
     bool tab_is_action;
-    bool menu_plain_key;   /* the menu's own key (Tab) opens it; false on
+    bool menu_plain_key;   /* the menu key (Tab) focuses the menu bar; false on
                               keyboard machines, which use Ctrl+Shift+Tab */
 
     /* Key-hold tracking: SDL gives us down/up events, not state queries.
@@ -61,13 +54,6 @@ typedef struct {
     bool   mouse_captured;
     bool   capture_pointer;
     bool   saw_mouse_motion;
-
-#ifdef _WIN32
-    void (*hex_toggle_cb)(void *ud);
-    void  *hex_toggle_ud;
-    int    menu_client_w, menu_client_h;
-    bool   restore_menu_client_size;
-#endif
 } SdlBackend;
 
 /* ── Binding table ───────────────────────────────────────────────────────── */
@@ -279,27 +265,35 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         build_bindings(b);
     b->menu_was_open = menu_open;
 
+    int win_w = 0, win_h = 0, out_w = 0, out_h = 0;
+    if (win) SDL_GetWindowSize(win, &win_w, &win_h);
+    SDL_GetRendererOutputSize(gemu_video_sdl_get_renderer(b->video), &out_w, &out_h);
+
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        /* Ctrl+Shift+Tab opens the menu on every machine; plain Tab only
-         * where the guest has no keyboard to type it on. */
-        if (!menu_open && b->menu) {
-            bool combo = ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_TAB &&
-                         (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_SHIFT);
-            bool own_key = (b->menu_plain_key || ev.type != SDL_KEYDOWN) &&
-                           input_menu_event_opens(b->menu, &ev);
-            if (combo || own_key) {
-                input_menu_toggle(b->menu);
-                menu_open = true;
-                continue;
-            }
-        }
-
-        /* Menu swallows all events while open */
+        /* The binding screen swallows all events while open */
         if (menu_open) {
             input_menu_handle_event(b->menu, &ev);
             menu_open = input_menu_is_open(b->menu);
             continue;
+        }
+
+        if (b->menubar) {
+            /* The menu key - Ctrl+Shift+Tab on every machine, the binding
+             * screen's "Menu" key (Tab) or controller button where the guest
+             * has no keyboard to type it on - puts focus on the menu bar. */
+            bool combo = ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_TAB &&
+                         (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_SHIFT);
+            bool own_key = b->menu && (b->menu_plain_key || ev.type != SDL_KEYDOWN) &&
+                           input_menu_event_opens(b->menu, &ev);
+            if (!gemu_menubar_active(b->menubar) && (combo || own_key)) {
+                gemu_menubar_focus(b->menubar);
+                continue;
+            }
+            if (gemu_menubar_handle_event(b->menubar, &ev, win_w, win_h, out_w, out_h)) {
+                menu_open = b->menu && input_menu_is_open(b->menu);   /* Input > Configure */
+                continue;
+            }
         }
 
         switch (ev.type) {
@@ -420,20 +414,6 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             }
             break;
 
-#ifdef _WIN32
-        case SDL_SYSWMEVENT:
-            if (ev.syswm.msg->subsystem == SDL_SYSWM_WINDOWS &&
-                ev.syswm.msg->msg.win.msg == WM_COMMAND) {
-                switch (LOWORD(ev.syswm.msg->msg.win.wParam)) {
-                case IDM_FILE_RESET: d->reset = true; break;
-                case IDM_FILE_QUIT:  d->quit  = true; break;
-                case IDM_DEBUG_HEXEDIT:
-                    if (b->hex_toggle_cb) b->hex_toggle_cb(b->hex_toggle_ud);
-                    break;
-                }
-            }
-            break;
-#endif
 
         default:
             break;
@@ -464,16 +444,6 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         }
     }
 
-#ifdef _WIN32
-    /* SetMenu() changes the Win32 non-client area while SDL is still
-     * creating the window.  Restore the requested drawable size from the
-     * settled event loop so SDL itself can account for the title and menu
-     * decorations. */
-    if (b->restore_menu_client_size && win) {
-        SDL_SetWindowSize(win, b->menu_client_w, b->menu_client_h);
-        b->restore_menu_client_size = false;
-    }
-#endif
 
     return held_mask(b) | controller_mask(b);
 }
@@ -481,7 +451,7 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
 static bool sdl_do_is_key_held(GemuDisplay *d, const char *name) {
     /* Keys pressed to drive the menu aren't the guest's. */
     SdlBackend *b = d->backend;
-    if (b->menu && input_menu_is_open(b->menu)) return false;
+    if ((b->menu && input_menu_is_open(b->menu)) || gemu_menubar_active(b->menubar)) return false;
     SDL_Keycode kc = SDL_GetKeyFromName(name);
     if (kc == SDLK_UNKNOWN) return false;
     SDL_Scancode sc = SDL_GetScancodeFromKey(kc);
@@ -509,6 +479,7 @@ static void sdl_do_destroy(GemuDisplay *d) {
     SdlBackend *b = d->backend;
     if (!b) return;
     if (b->menu)  input_menu_destroy(b->menu);
+    gemu_menubar_destroy(b->menubar);
     if (b->controller) SDL_GameControllerClose(b->controller);
     if (b->video) gemu_video_sdl_destroy(b->video);
     SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
@@ -516,10 +487,48 @@ static void sdl_do_destroy(GemuDisplay *d) {
     d->backend = NULL;
 }
 
-/* ── Overlay callback for InputMenu ─────────────────────────────────────── */
+/* ── Menus: overlay drawing and the UI the menu bar can open ──────────────── */
 
 static void menu_overlay_cb(void *ud, SDL_Renderer *r, int pixel_scale) {
-    input_menu_render((InputMenu *)ud, r, pixel_scale);
+    SdlBackend *b = ud;
+    gemu_menubar_render(b->menubar, r);
+    if (b->menu) input_menu_render(b->menu, r, pixel_scale);
+}
+
+static void ui_about(GemuDisplay *d) {
+    SdlBackend *b = d->backend;
+    gemu_menubar_about(b->menubar, gemu_display_about_text());
+}
+
+static void ui_choose_file(GemuDisplay *d, const char *title,
+                           void (*done)(void *ud, const char *path), void *ud) {
+    SdlBackend *b = d->backend;
+    gemu_menubar_choose_file(b->menubar, title, done, ud);
+}
+
+static void ui_input_config(GemuDisplay *d) {
+    SdlBackend *b = d->backend;
+    input_menu_open_input(b->menu);
+}
+
+/* Window scale = window width / framebuffer width (0 if not a whole
+ * multiple, i.e. the user resized freely). */
+static int ui_get_scale(GemuDisplay *d) {
+    SdlBackend *b = d->backend;
+    SDL_Window *win = gemu_video_sdl_get_window(b->video);
+    int fw = gemu_video_sdl_width(b->video), w = 0, h = 0;
+    if (!win || fw <= 0) return 0;
+    SDL_GetWindowSize(win, &w, &h);
+    return w % fw == 0 ? w / fw : 0;
+}
+
+static void ui_set_scale(GemuDisplay *d, int scale) {
+    SdlBackend *b = d->backend;
+    SDL_Window *win = gemu_video_sdl_get_window(b->video);
+    if (!win || scale < 1) return;
+    int w = gemu_video_sdl_width(b->video) * scale;
+    int h = gemu_video_sdl_shown_height(b->video, w);
+    SDL_SetWindowSize(win, w, h + gemu_menubar_height(h));
 }
 
 /* ── Create ──────────────────────────────────────────────────────────────── */
@@ -540,6 +549,7 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     int wh = cfg->window_height ? cfg->window_height : h * (cfg->scale ? cfg->scale : 2);
     if (!cfg->window_height && cfg->aspect_w > 0 && cfg->aspect_h > 0)
         wh = ww * cfg->aspect_h / cfg->aspect_w;    /* e.g. 720x350 -> 720x540 at 4:3 */
+    wh += gemu_menubar_height(wh);                  /* the menu bar sits above the picture */
 
     b->video = gemu_video_sdl_create(&(GemuVideoSdlSpec){
         .title         = initial_title,
@@ -608,8 +618,6 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
         free(controller_defaults);
         free(names);
         free(defaults);
-        if (b->menu)
-            gemu_video_sdl_set_overlay(b->video, menu_overlay_cb, b->menu);
     }
 
     GemuDisplay *d = calloc(1, sizeof(*d));
@@ -624,43 +632,16 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     gemu_window_title(d->title, sizeof(d->title), NULL, false);
     d->pointer.x = d->pointer.y = -1;
 
-#ifdef _WIN32
-    /* Attach a native Win32 menu bar: File > Reset / Quit, and (when the
-     * machine provides one - see GemuDisplayGtkExtras) Debug > Hex Editor.
-     * The "gtk" name is historical: this struct predates the native Win32
-     * menu and was originally GTK-only, but its fields are plain callbacks
-     * that any backend can use. */
-    if (cfg->gtk) {
-        b->hex_toggle_cb = cfg->gtk->hex_toggle_cb;
-        b->hex_toggle_ud = cfg->gtk->hex_toggle_ud;
-    }
-    SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
-    {
-        SDL_SysWMinfo wm;
-        SDL_VERSION(&wm.version);
-        SDL_Window *win = gemu_video_sdl_get_window(b->video);
-        if (win && SDL_GetWindowWMInfo(win, &wm) &&
-            wm.subsystem == SDL_SYSWM_WINDOWS) {
-            HWND hwnd  = wm.info.win.window;
-            HMENU bar  = CreateMenu();
-            HMENU file = CreatePopupMenu();
-            AppendMenuA(file, MF_STRING,    IDM_FILE_RESET, "&Reset");
-            AppendMenuA(file, MF_SEPARATOR, 0,              NULL);
-            AppendMenuA(file, MF_STRING,    IDM_FILE_QUIT,  "&Quit\tEsc");
-            AppendMenuA(bar,  MF_POPUP, (UINT_PTR)file, "&File");
-            if (b->hex_toggle_cb) {
-                HMENU debug = CreatePopupMenu();
-                AppendMenuA(debug, MF_STRING, IDM_DEBUG_HEXEDIT, "&Hex Editor");
-                AppendMenuA(bar,   MF_POPUP, (UINT_PTR)debug, "&Debug");
-            }
-            SetMenu(hwnd, bar);
-            DrawMenuBar(hwnd);
-            b->menu_client_w = ww;
-            b->menu_client_h = wh;
-            b->restore_menu_client_size = true;
-        }
-    }
-#endif
+    /* Window menu bar, drawn above the picture */
+    d->ui_about       = ui_about;
+    d->ui_choose_file = ui_choose_file;
+    d->ui_get_scale   = ui_get_scale;
+    d->ui_set_scale   = ui_set_scale;
+    if (b->menu) d->ui_input_config = ui_input_config;
+    b->menubar = gemu_menubar_create(d);
+    gemu_video_sdl_set_top_margin(b->video, gemu_menubar_height);
+    gemu_video_sdl_set_overlay(b->video, menu_overlay_cb, b);
+
 
     return d;
 }

@@ -24,6 +24,12 @@ void          gemu_video_sdl_destroy(GemuVideoSdl *v);
 void gemu_video_sdl_present_argb(GemuVideoSdl *v, const uint32_t *pixels,
                                  int w, int h);
 void gemu_video_sdl_mouse_logical(GemuVideoSdl *v, int *x, int *y);
+/* Reserve fn(output height) pixels above the picture (the menu bar). */
+void gemu_video_sdl_set_top_margin(GemuVideoSdl *v, int (*fn)(int out_h));
+SDL_Renderer *gemu_video_sdl_get_renderer(const GemuVideoSdl *v);
+int  gemu_video_sdl_width(const GemuVideoSdl *v);
+int  gemu_video_sdl_height(const GemuVideoSdl *v);
+int  gemu_video_sdl_shown_height(const GemuVideoSdl *v, int w);
 
 /* Optional overlay: called after emulator frame is drawn but before
  * SDL_RenderPresent.  Use for in-emulator menus, OSD, etc. */
@@ -48,9 +54,6 @@ typedef struct {
     int             window_width;
     int             window_height;
     int             aspect_w, aspect_h;     /* display shape; 0 = width:height */
-    GemuMonitor    *monitor;
-    void          (*hex_toggle_cb)(void *);  /* optional: Debug > Hex Editor */
-    void           *hex_toggle_ud;
 } GemuVideoGtkSpec;
 
 GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec);
@@ -65,5 +68,11 @@ GtkWidget *gemu_video_gtk_drawing_area(GemuVideoGtk *v);
 /* Where the picture is drawn inside the drawing area (logical pixels): the
  * window resizes freely and the picture is fitted with its aspect ratio. */
 void gemu_video_gtk_picture_rect(GemuVideoGtk *v, int *x, int *y, int *w, int *h);
+
+/* Put the window menu bar (gemu/gtk_menu.h) above the picture. */
+void gemu_video_gtk_set_menubar(GemuVideoGtk *v, GtkWidget *bar);
+/* Window scale: picture width / framebuffer width; setting resizes. */
+int  gemu_video_gtk_get_scale(GemuVideoGtk *v);
+void gemu_video_gtk_set_scale(GemuVideoGtk *v, int scale);
 
 #endif /* GEMU_GTK */

@@ -599,6 +599,18 @@ void gemu_monitor_enqueue_quit(GemuMonitor *mon) {
     if (mon) enqueue_entry(mon, MON_ENTRY_CMD, GEMU_MON_QUIT, NULL, false);
 }
 
+bool gemu_monitor_enqueue_command(GemuMonitor *mon, const char *line) {
+    return mon && line && enqueue_entry(mon, MON_ENTRY_TEXT, GEMU_MON_NONE, line, false) != 0;
+}
+
+int gemu_monitor_media_count(const GemuMonitor *mon) {
+    return mon ? mon->n_media : 0;
+}
+
+const GemuMediaDevice *gemu_monitor_media_get(const GemuMonitor *mon, int index) {
+    return mon && index >= 0 && index < mon->n_media ? &mon->media[index] : NULL;
+}
+
 void gemu_monitor_shutdown_or_pause(GemuMonitor *mon, bool no_shutdown) {
     if (!no_shutdown) {
         gemu_monitor_enqueue_quit(mon);

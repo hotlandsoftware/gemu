@@ -200,25 +200,21 @@ bool vga_ibm_is_text_mode(const VgaIbm *v) {
 }
 
 static uint32_t dac_to_argb(const VgaIbm *v, unsigned idx) {
-    /* This firmware's palette-load routine writes DAC entries as B,G,R
-     * rather than the standard R,G,B triplet order - confirmed against raw
-     * VRAM: index 4's stored bytes (42,0,0) must display as blue (0,0,170)
-     * to match the reference, not red (170,0,0), which only happens by
-     * reading the first stored byte as Blue and the third as Red. This is
-     * purely how this firmware happens to have programmed the DAC - the
-     * write path (0x3C9) still stores exactly what's written, readback is
-     * unaffected, only the render-time interpretation swaps here. */
-    unsigned r = v->dac[idx][2] & 0x3F, g = v->dac[idx][1] & 0x3F, b = v->dac[idx][0] & 0x3F;
+    /* DAC entries are written R, G, B (port 0x3C9), as on real VGA. */
+    unsigned r = v->dac[idx][0] & 0x3F, g = v->dac[idx][1] & 0x3F, b = v->dac[idx][2] & 0x3F;
     /* 6-bit DAC channels scaled to 8-bit. */
     r = (r << 2) | (r >> 4); g = (g << 2) | (g >> 4); b = (b << 2) | (b >> 4);
     return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
+/* 4-bit pixel/attribute colour -> DAC index through the attribute
+ * controller's palette: bits 5-4 come from the colour select register
+ * (attr 0x14) when P54S (attr 0x10 bit 7) is set, bits 7-6 always do. */
 static uint32_t palette_argb(const VgaIbm *v, unsigned attr_index) {
-    uint8_t pal = v->attr[attr_index & 0xF] & 0x3F;
-    /* Attribute Controller register 0x10 bit 7 (P54S) substitutes the DAC's
-     * top two bits with attr[0x14] bits 0-1 in some legacy modes; skipped -
-     * essentially never used outside EGA-compat corner cases. */
+    unsigned pal = v->attr[attr_index & 0xF] & 0x3F;
+    if (v->attr[0x10] & 0x80)
+        pal = (pal & 0x0F) | ((v->attr[0x14] & 3u) << 4);
+    pal |= (v->attr[0x14] & 0x0Cu) << 4;
     return dac_to_argb(v, pal);
 }
 
@@ -244,7 +240,8 @@ void vga_ibm_render(const VgaIbm *v, uint32_t *argb, int fb_w, int fb_h,
                 uint8_t ch_code = off < 0x10000 ? v->vram[0][off] : 0;
                 uint8_t attr = off < 0x10000 ? v->vram[1][off] : 0x07;
                 uint32_t fg = palette_argb(v, attr & 0xF);
-                uint32_t bg = palette_argb(v, (attr >> 4) & 0x7);
+                /* attr 0x10 bit 3: bit 7 blinks; otherwise 16 backgrounds */
+                uint32_t bg = palette_argb(v, (attr >> 4) & (v->attr[0x10] & 8 ? 0x7 : 0xF));
                 const uint8_t *glyph = font8x16 + (size_t)ch_code * 16;
                 int px = ox + col * cw, py = oy + row * ch;
                 if (px + cw > fb_w || py + ch > fb_h) continue;

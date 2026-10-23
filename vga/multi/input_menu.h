@@ -38,6 +38,8 @@ void input_menu_destroy(InputMenu *menu);
 
 /* Toggle the menu open/closed.  Returns true if now open. */
 bool input_menu_toggle(InputMenu *menu);
+/* Open straight onto the key/controller binding page (Input > Configure). */
+void input_menu_open_input(InputMenu *menu);
 bool input_menu_event_opens(const InputMenu *menu, const SDL_Event *ev);
 void input_menu_reset_keys(InputMenu *menu);
 

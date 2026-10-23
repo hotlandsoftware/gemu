@@ -111,6 +111,14 @@ static GemuDisplay *create_backend(GemuDisplayType type,
 GemuDisplay *gemu_display_create(GemuDisplayType type,
                                  const GemuDisplayConfig *cfg) {
     GemuDisplay *d = type == GEMU_DISPLAY_NONE ? NULL : create_backend(type, cfg);
+    if (d) {
+        /* What the window menus act on (gemu_display_menu.c). */
+        d->monitor = cfg->monitor ? cfg->monitor : cfg->gtk ? cfg->gtk->monitor : NULL;
+        if (cfg->gtk) {
+            d->hex_toggle_cb = cfg->gtk->hex_toggle_cb;
+            d->hex_toggle_ud = cfg->gtk->hex_toggle_ud;
+        }
+    }
     GemuVncServer *vnc = gemu_vnc_get();
     if (!vnc || (cfg->terminal_text && d)) return d;   /* text-only output can't be mirrored */
     if (!d) d = gemu_display_headless_create(cfg);

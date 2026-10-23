@@ -24,6 +24,18 @@ struct GemuDisplay {
     bool paused_title;
     char title[128];
 
+    /* Window menus (gemu_display_menu.c) */
+    GemuMonitor *monitor;                   /* for Pause, Reset, Blocks... */
+    void       (*hex_toggle_cb)(void *ud);  /* Debug > Hex Editor, if any */
+    void        *hex_toggle_ud;
+    /* UI a backend can offer the menus (NULL = not available there) */
+    int  (*ui_get_scale)(struct GemuDisplay *);
+    void (*ui_set_scale)(struct GemuDisplay *, int scale);
+    void (*ui_choose_file)(struct GemuDisplay *, const char *title,
+                           void (*done)(void *ud, const char *path), void *ud);
+    void (*ui_about)(struct GemuDisplay *);
+    void (*ui_input_config)(struct GemuDisplay *);
+
     /* VNC mirroring/input (gemu_display_vnc.c); NULL without -vnc */
     struct GemuDisplayVnc *vnc;
     bool headless;          /* no local output: -display none with -vnc */
@@ -60,6 +72,13 @@ void     gemu_display_vnc_detach(GemuDisplay *d);
 void     gemu_display_vnc_frame(GemuDisplay *d, const uint32_t *argb, int w, int h);
 uint32_t gemu_display_vnc_poll(GemuDisplay *d);
 bool     gemu_display_vnc_key_held(GemuDisplay *d, const char *name);
+
+/* ── Menus (gemu_display_menu.c) ─────────────────────────────────────────── */
+typedef struct GemuMenu GemuMenu;
+/* The standard menu bar for this window; free with gemu_menu_free(). */
+GemuMenu *gemu_display_build_menubar(GemuDisplay *d);
+/* Text for the About box (multi-line). */
+const char *gemu_display_about_text(void);
 
 /* ── INI helper (implemented in gemu_display.c) ──────────────────────────── */
 

@@ -248,6 +248,7 @@ MitsuTvGame6State *mitsu_tvgame6_create(const MitsuConfig *cfg) {
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
             .fb_width = FB_W,
+            .monitor = s->monitor,
             .fb_height = FB_H,
             .scale = cfg->display_scale,
             .actions = tvgame6_actions,

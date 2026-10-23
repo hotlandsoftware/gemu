@@ -478,15 +478,9 @@ static long double fp2d(MercedFpReg f) {
         long double d = (long double)f.sig;
         return f.sign ? -d : d;
     }
-    int e = (int)f.exp - 0xFFFF;
-    long double d = (long double)f.sig * 0x1p-63L * 0.5L; /* explicit int bit */
-    d = d * 2.0;
-    /* build 2^e */
-    long double p = 1.0L;
-    int n = e < 0 ? -e : e;
-    long double b = 2.0L;
-    while (n) { if (n & 1) p *= b; b *= b; n >>= 1; }
-    d = e < 0 ? d / p : d * p;
+    /* sig has an explicit integer bit: value = sig * 2^(exp - bias - 63).
+     * long double's 64-bit significand holds sig exactly. */
+    long double d = ldexpl((long double)f.sig, (int)f.exp - 0xFFFF - 63);
     return f.sign ? -d : d;
 }
 static MercedFpReg d2fp(long double d) {
@@ -509,9 +503,9 @@ static MercedFpReg d2fp(long double d) {
         f.exp = 0x1FFFE;
         return f;
     }
-    int e = 0;
-    while (d >= 2.0L) { d *= 0.5L; e++; }
-    while (d < 1.0L) { d *= 2.0L; e--; }
+    int e;
+    d = frexpl(d, &e) * 2.0L;       /* d in [1, 2) */
+    e--;
     long double scaled = d * 0x1p63L;
     uint64_t sig = (uint64_t)scaled;
     long double fraction = scaled - (long double)sig;
@@ -642,6 +636,11 @@ static uint64_t phys_read(Merced *m, uint64_t pa, unsigned size);
 static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
                        bool instruction);
 static bool firmware_identity_pa(Merced *m, uint64_t va, uint64_t *pa);
+static void xlate_flush(Merced *m);
+static bool xlate_cacheable(const Merced *m, uint64_t va);
+static uint64_t xlate_kind(const Merced *m, bool ifetch, uint64_t isr_access);
+static bool xlate_lookup(Merced *m, uint64_t va, uint64_t kind, uint64_t *pa);
+static void xlate_store(Merced *m, uint64_t va, uint64_t kind, uint64_t pa);
 static void tlb_serialize_data(Merced *m);
 static void tlb_serialize_instruction(Merced *m);
 
@@ -742,13 +741,34 @@ void merced_set_tpr(Merced *m, uint64_t tpr) {
  * what caused the i2000 SDV BIOS to hang forever: it raises tpr to 0xC0
  * around ATA identify and never lowers it again, which permanently masks
  * any normal (>=16) vector but must NOT mask ExtINT. */
+/* Highest in-service vector (16-255), or 0 when none is in service. */
+static unsigned in_service_highest(const Merced *m) {
+    for (int i = 31; i >= 2; i--)
+        if (m->ext_in_service[i])
+            return (unsigned)(i * 8 + 31 - __builtin_clz(m->ext_in_service[i]));
+    return 0;
+}
+
 static bool interrupt_unmasked(Merced *m, uint8_t vector) {
     uint64_t tpr = m->cr[CR_TPR];
     if (vector == 2)
         return true;
+    /* ExtINT comes from the 8259 through the LINT0 pin, which the OS can
+     * mask with cr.lrr0.m.  Windows does exactly that once its I/O SAPIC
+     * driver owns interrupts; delivering the still-ticking PIT anyway
+     * storms its kernel with vector 0.  (merced_reset() leaves LRR0 clear,
+     * so firmware that never programs it keeps receiving ExtINT.) */
     if (vector == 0)
-        return !(tpr & (UINT64_C(1) << 16));
+        return !(tpr & (UINT64_C(1) << 16)) &&
+               !(m->cr[CR_LRR0] & (UINT64_C(1) << 16));
     if (tpr & (UINT64_C(1) << 16))
+        return false;
+    /* An in-service vector masks its own priority class and all lower ones
+     * until cr.eoi (SDM Vol.2 5.8.3).  Without this, a level-triggered
+     * device that's still asserted re-interrupts its own handler as soon
+     * as the OS re-enables psr.i, nesting forever (WinXP Setup). */
+    unsigned isv = in_service_highest(m);
+    if (isv && (vector & 0xF0u) <= (isv & 0xF0u))
         return false;
     return (vector & 0xF0u) > (tpr & 0xF0u);
 }
@@ -1783,6 +1803,10 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         *pa = va & MERCED_PHYS_MASK;
         return true;
     }
+    bool cacheable = xlate_cacheable(m, va);
+    uint64_t kind = xlate_kind(m, ifetch, isr_access);
+    if (cacheable && xlate_lookup(m, va, kind, pa))
+        return true;
     unsigned vrn = (unsigned)(va >> 61);
     uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
     uint64_t lookup_va = va;
@@ -1826,6 +1850,7 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         if (payload >= UINT64_C(0x80000000) &&
             payload < m->region7_directmap_limit) {
             *pa = payload - UINT64_C(0x80000000);
+            if (cacheable) xlate_store(m, va, kind, *pa);
             return true;
         }
     }
@@ -1931,6 +1956,7 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         }
     }
     *pa = (e->pfn_base + (lookup_va - e->va_start)) & MERCED_PHYS_MASK;
+    if (cacheable) xlate_store(m, va, kind, *pa);
     return true;
 }
 
@@ -2091,10 +2117,28 @@ typedef struct {
     uint8_t tmpl, valid;
 } MercedTbEntry;
 
+/* Soft TLB: recent successful data/instruction translations, one 4 KiB
+ * page per entry (IA-64's smallest page), so ordinary loads and stores skip
+ * the TR/TC scans.  Entries are keyed by page, access kind, the PSR bits the
+ * permission checks read and the region register; anything else that can
+ * change a translation (TLB inserts and purges, PKR writes) bumps
+ * xlate_generation, which invalidates every entry at once. */
+#define MERCED_XLATE_ENTRIES 4096u
+
+typedef struct {
+    uint64_t tag;        /* page VA | kind | XLATE_TAG_VALID */
+    uint64_t psr_key;
+    uint64_t rr;
+    uint64_t pa_page;
+    uint32_t generation;
+} MercedXlateEntry;
+
 typedef struct {
     MercedTbEntry entry[MERCED_TB_ENTRIES];
     uint32_t page_generation[MERCED_TB_PAGE_SLOTS];
     uint32_t translation_generation;
+    MercedXlateEntry xlate[MERCED_XLATE_ENTRIES];
+    uint32_t xlate_generation;
 } MercedTranslationCache;
 
 static inline unsigned tb_index(uint64_t va) {
@@ -2111,6 +2155,73 @@ static void tb_flush(Merced *m) {
     if (!tc) return;
     memset(tc, 0, sizeof(*tc));
     tc->translation_generation = 1;
+    tc->xlate_generation = 1;
+}
+
+/* Drop every soft-TLB entry: a TLB entry, PKR or region register changed. */
+static void xlate_flush(Merced *m) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (tc && ++tc->xlate_generation == 0) {
+        memset(tc->xlate, 0, sizeof(tc->xlate));
+        tc->xlate_generation = 1;
+    }
+}
+
+#define XLATE_TAG_VALID   UINT64_C(0x800)
+#define XLATE_PSR_KEY     (PSR_IT | PSR_DT | PSR_RT | PSR_PK | PSR_DA | PSR_IA | \
+                           (UINT64_C(3) << PSR_CPL_SHIFT))
+
+/* Firmware owns some translations while its IVT is installed, depending on
+ * IVA and on where it is executing (firmware_identity_pa() and the SAL
+ * identity fallback in va_translate_ex()).  Those addresses are never cached:
+ * all of them while a firmware IVA is installed, otherwise the ranges that
+ * firmware_identity_pa() can claim based on the IP. */
+static bool xlate_cacheable(const Merced *m, uint64_t va) {
+    uint64_t iva = m->cr[CR_IVA];
+    if (iva == 0 || iva == UINT64_C(0x00010000) || iva == UINT64_C(0xFFF80000))
+        return false;
+    if (va >= UINT64_C(0x00100000) && va < UINT64_C(0x00200000))
+        return false;
+    return !((va >> 61) == 4 && (va & ((UINT64_C(1) << 61) - 1)) <= UINT32_MAX);
+}
+
+/* The access kind, plus whether IVA is in region 0: data references then
+ * also search the instruction TLB (va_translate_ex()). */
+static uint64_t xlate_kind(const Merced *m, bool ifetch, uint64_t isr_access) {
+    return (ifetch ? 1u : 0u) | (isr_access & ISR_R ? 2u : 0u) |
+           (isr_access & ISR_W ? 4u : 0u) | (isr_access & ISR_X ? 8u : 0u) |
+           (isr_access & ISR_RS ? 16u : 0u) |
+           ((m->cr[CR_IVA] >> 61) == 0 ? 32u : 0u);
+}
+
+static MercedXlateEntry *xlate_slot(Merced *m, uint64_t va) {
+    MercedTranslationCache *tc = m->translation_cache;
+    return &tc->xlate[((va >> 12) ^ (va >> 61)) & (MERCED_XLATE_ENTRIES - 1)];
+}
+
+static bool xlate_lookup(Merced *m, uint64_t va, uint64_t kind, uint64_t *pa) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (!tc) return false;
+    const MercedXlateEntry *x = xlate_slot(m, va);
+    if (x->tag == ((va & ~UINT64_C(0xFFF)) | kind | XLATE_TAG_VALID) &&
+        x->generation == tc->xlate_generation &&
+        x->psr_key == (m->psr & XLATE_PSR_KEY) &&
+        x->rr == m->rr[va >> 61]) {
+        *pa = x->pa_page | (va & 0xFFF);
+        return true;
+    }
+    return false;
+}
+
+static void xlate_store(Merced *m, uint64_t va, uint64_t kind, uint64_t pa) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (!tc) return;
+    MercedXlateEntry *x = xlate_slot(m, va);
+    x->tag = (va & ~UINT64_C(0xFFF)) | kind | XLATE_TAG_VALID;
+    x->generation = tc->xlate_generation;
+    x->psr_key = m->psr & XLATE_PSR_KEY;
+    x->rr = m->rr[va >> 61];
+    x->pa_page = pa & ~UINT64_C(0xFFF);
 }
 
 void merced_flush_translation_cache(Merced *m) { tb_flush(m); }
@@ -3130,6 +3241,7 @@ static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
      * same region ID.  Keeping both is not harmless: lookup order would
      * keep selecting an older VHPT-backing page after NT installed its
      * corrected mapping, producing a permanent not-present fault. */
+    xlate_flush(m);
     MercedTlbEntry *tc = instruction ? m->itc : m->dtc;
     for (unsigned i = 0; i < MERCED_N_TC; i++) {
         if (&tc[i] != e && tc[i].valid && tc[i].rid == rid &&
@@ -3195,6 +3307,7 @@ static void tlb_cache_replaced_tr(Merced *m, const MercedTlbEntry *tr,
     MercedTlbEntry *tc = instruction ? m->itc : m->dtc;
     uint32_t *next = instruction ? &m->itc_next : &m->dtc_next;
     tc[(*next)++ % MERCED_N_TC] = *tr;
+    xlate_flush(m);
 }
 
 /* Reads a VHPT hash-table slot's home address. VHPT reads are always data
@@ -3571,6 +3684,7 @@ static void tlb_purge(Merced *m, MercedTlbEntry *t, int n, uint32_t rid,
                         m->ip, va, len, rid, t[i].va_start, t[i].va_end,
                         m->ninsts);
             t[i].valid = 0;
+            xlate_flush(m);
             if (merced_dbg() && tlb_debug_events < TLB_DEBUG_MAX) {
                 tlb_debug_events++;
                 fprintf(stderr, "merced: purge va=%016" PRIX64
@@ -3599,6 +3713,7 @@ static void tlb_complete_pending(Merced *m, MercedTlbEntry *t, int n) {
         t[i].pending_purge = 0;
         t[i].valid = 0;
         m->tlb_purge_pending--;
+        xlate_flush(m);
     }
 }
 
@@ -4603,12 +4718,12 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     unsigned x6 = (unsigned)bits(raw, 27, 6);
     if (!qp) return MERCED_OK;
     switch (x6) {
-    case 0x00: m->rr[gr_read(m, r3, &n3) >> 61 & 7] = gr_read(m, r2, &n2);
+    case 0x00: xlate_flush(m); m->rr[gr_read(m, r3, &n3) >> 61 & 7] = gr_read(m, r2, &n2);
                /* rr index is GR[r3] bits 63:61 */
                return MERCED_OK;
     case 0x01: m->dbr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
     case 0x02: m->ibr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
-    case 0x03: m->pkr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
+    case 0x03: xlate_flush(m); m->pkr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
     case 0x04: m->pmc[gr_read(m, r3, &n3) & 31] = gr_read(m, r2, &n2); return MERCED_OK;
     case 0x05: m->pmd[gr_read(m, r3, &n3) & 31] = gr_read(m, r2, &n2); return MERCED_OK;
     case 0x06: {
@@ -4892,12 +5007,15 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
             if (ext >= 0) {
                 v = (uint64_t)ext;
                 ext_pending_clear(m, (uint8_t)ext);
-            } else if (m->timer_pending) {
+            } else if (m->timer_pending &&
+                       interrupt_unmasked(m, (uint8_t)m->cr[CR_ITV])) {
                 v = m->cr[CR_ITV] & 0xFFull;
                 m->timer_pending = 0;
             } else {
                 v = 15;
             }
+            if (v >= 16)
+                m->ext_in_service[v >> 3] |= (uint8_t)(1u << (v & 7));
         }
         if (getenv("EXTR_DEBUG") && cr3 == CR_ISR)
             fprintf(stderr, "merced: MOVCR r1=%u isr=%016" PRIX64
@@ -4981,6 +5099,11 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x2C: case 0x3C: {                         /* mov cr3=r2 */
         unsigned cr3 = (unsigned)bits(raw, 20, 7);
         m->cr[cr3] = gr_read(m, r2, &n2);
+        if (cr3 == CR_EOI) {                        /* retire highest in-service */
+            unsigned isv = in_service_highest(m);
+            if (isv)
+                m->ext_in_service[isv >> 3] &= (uint8_t)~(1u << (isv & 7));
+        }
         if (cr3 == CR_TPR && getenv("TPR_DEBUG")) {
             fprintf(stderr, "merced: cr.tpr <- %016" PRIX64 " at ip=%016"
                     PRIX64 " ninsts=%" PRIu64 "\n", m->cr[cr3], m->ip,
@@ -5086,6 +5209,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
             return deliver_fault(m, VEC_NAT, UINT64_C(0x10), 0, false);
         memset(m->itc, 0, sizeof(m->itc));
         memset(m->dtc, 0, sizeof(m->dtc));
+        xlate_flush(m);
         return MERCED_OK;
     }
     return mhalt(m, "unimpl M-sys major 1 x6=0x%02X", x6);

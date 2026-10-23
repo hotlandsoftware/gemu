@@ -312,6 +312,11 @@ typedef struct Merced {
     /* Host-only decoded translation cache.  Kept opaque here so the cache
      * layout can evolve independently of architectural/snapshot state. */
     void *translation_cache;
+
+    /* Local SAPIC in-service vectors (vectors 16-255): set when cr.ivr
+     * delivers a vector, cleared by cr.eoi.  Keep this last - snapshots
+     * before i2000 v24 end just before it. */
+    uint8_t ext_in_service[32];
 } Merced;
 
 Merced *merced_create(const MercedBus *bus);

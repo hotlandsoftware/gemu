@@ -1,6 +1,5 @@
 #ifdef GEMU_GTK
 #include "gemu/video.h"
-#include "gemu/gtk_menu.h"
 #include <epoxy/gl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +7,8 @@
 
 struct GemuVideoGtk {
     GtkWidget       *window;
+    GtkWidget       *vbox;
+    GtkWidget       *menubar;
     GtkWidget       *gl_area;
     GtkWidget       *drawing_area;  /* kept for API compat */
     uint32_t        *frame_argb;    /* staging buffer - new pixels land here */
@@ -291,9 +292,8 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     gtk_window_set_icon_from_file(GTK_WINDOW(v->window), "gemu.png", NULL);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    v->vbox = vbox;
     gtk_container_add(GTK_CONTAINER(v->window), vbox);
-    gemu_gtk_add_action_menu(vbox, spec->monitor,
-                              spec->hex_toggle_cb, spec->hex_toggle_ud);
 
     /* GL area - must not be focusable: if it grabs focus, key events go to
      * the GL area (which has no key handler) and don't reliably propagate
@@ -317,16 +317,41 @@ GemuVideoGtk *gemu_video_gtk_create(const GemuVideoGtkSpec *spec) {
     gtk_widget_show_all(v->window);
     gemu_video_gtk_poll();
 
-    /* Resize to the configured initial size.  We can now measure the menu
-     * bar height as (window height - GL area height) and add it back. */
-    int gl_h  = gtk_widget_get_allocated_height(v->gl_area);
-    int win_h = gtk_widget_get_allocated_height(GTK_WIDGET(v->window));
-    gtk_window_resize(GTK_WINDOW(v->window),
-                      v->window_width,
-                      v->window_height + (win_h - gl_h));
+    gtk_window_resize(GTK_WINDOW(v->window), v->window_width, v->window_height);
     gemu_video_gtk_poll();
 
     return v;
+}
+
+/* Size the window so the picture area is w x h (adds the menu bar). */
+static void resize_picture(GemuVideoGtk *v, int w, int h) {
+    int bar_h = 0;
+    if (v->menubar) gtk_widget_get_preferred_height(v->menubar, NULL, &bar_h);
+    gtk_window_resize(GTK_WINDOW(v->window), w, h + bar_h);
+}
+
+void gemu_video_gtk_set_menubar(GemuVideoGtk *v, GtkWidget *bar) {
+    if (!v || !bar || v->menubar) return;
+    v->menubar = bar;
+    gtk_box_pack_start(GTK_BOX(v->vbox), bar, FALSE, FALSE, 0);
+    gtk_box_reorder_child(GTK_BOX(v->vbox), bar, 0);
+    gtk_widget_show_all(bar);
+    resize_picture(v, gtk_widget_get_allocated_width(v->gl_area),
+                      gtk_widget_get_allocated_height(v->gl_area));
+    gemu_video_gtk_poll();
+}
+
+int gemu_video_gtk_get_scale(GemuVideoGtk *v) {
+    int w = v ? gtk_widget_get_allocated_width(v->gl_area) : 0;
+    return v && v->width > 0 ? w / v->width : 0;
+}
+
+void gemu_video_gtk_set_scale(GemuVideoGtk *v, int scale) {
+    if (!v || scale < 1) return;
+    int h = v->height * scale;
+    if (v->aspect_w > 0 && v->aspect_h > 0)
+        h = v->width * scale * v->aspect_h / v->aspect_w;
+    resize_picture(v, v->width * scale, h);
 }
 
 void gemu_video_gtk_destroy(GemuVideoGtk *v) {

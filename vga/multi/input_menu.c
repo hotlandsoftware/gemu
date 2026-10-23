@@ -1,4 +1,5 @@
 #include "input_menu.h"
+#include "vgafont16.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -603,7 +604,7 @@ static void build_input_menu(InputMenu *m) {
     m->n_items = 0;
     if (m->input_page == 0) {
         m->items[m->n_items++] = (MenuItem){
-            .label = "Menu >",
+            .label = "Menu keys >",
             .action = menu_action_menu_controls,
         };
     }
@@ -618,7 +619,7 @@ static void build_input_menu(InputMenu *m) {
         };
     }
     m->items[m->n_items++] = (MenuItem){
-        .label  = "(back)",
+        .label  = "(close)",
         .action = NULL,
     };
 }
@@ -715,183 +716,135 @@ void input_menu_reset_keys(InputMenu *m) {
     if (m->n_buttons > 0)
         save_ini(m);
 
-    build_main_menu(m);
-    m->page = MENU_MAIN;
-    m->selected = 0;
-    m->input_page = 0;
-}
-
-/* ── Font rendering helpers ─────────────────────────────────────────────── */
-
-static void draw_char(SDL_Renderer *r, int x, int y, char ch,
-                      uint32_t fg, uint32_t bg, int s) {
-    if (ch < 32 || ch > 122) ch = '?';
-    const uint8_t *glyph = FONT_GLYPH(ch);
-    for (int col = 0; col < FONT_W; col++) {
-        uint8_t bits = glyph[col];
-        for (int row = 0; row < FONT_H; row++) {
-            SDL_Rect dot = { x + col * s, y + row * s, s, s };
-            if (bits & (1u << (unsigned)row)) {
-                SDL_SetRenderDrawColor(r, (fg >> 16) & 0xFF,
-                                       (fg >> 8) & 0xFF, fg & 0xFF, 255);
-            } else {
-                SDL_SetRenderDrawColor(r, (bg >> 16) & 0xFF,
-                                       (bg >> 8) & 0xFF, bg & 0xFF, 255);
-            }
-            SDL_RenderFillRect(r, &dot);
-        }
-    }
-}
-
-static int draw_text(SDL_Renderer *r, int x, int y, const char *str,
-                     uint32_t fg, uint32_t bg, int s) {
-    int start = x;
-    for (; *str; str++) {
-        draw_char(r, x, y, *str, fg, bg, s);
-        x += FONT_W * s;
-    }
-    return x - start;
+    /* Refresh the binding screen if it's showing; otherwise stay closed
+     * (this is also the menu bar's "Reset bindings to defaults"). */
+    if (m->page != MENU_CLOSED)
+        input_menu_open_input(m);
 }
 
 /* ── Rendering ──────────────────────────────────────────────────────────── */
 
-void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
-    if (!m || m->page == MENU_CLOSED) return;
-    if (pixel_scale < 1) pixel_scale = 1;
+/* Drawn as a dialog matching the window menu bar's (gemu_menubar_sdl.c):
+ * title bar, cream body, IBM 8x16 font, navy selection. */
+#define DLG_GLYPH_W 8
+#define DLG_GLYPH_H 16
+#define DLG_BG      0xFFFBF0
+#define DLG_TITLE   0xD6D8E6
+#define DLG_BORDER  0x404048
+#define DLG_TEXT    0x000000
+#define DLG_HI      0x22407A
+#define DLG_HITEXT  0xFFFFFF
+#define DLG_ACCENT  0x22407A
+#define DLG_HINT    0x8A2020
 
-    int s = pixel_scale;
-    int fw = FONT_W * s, fh = FONT_H * s;
+static void dlg_fill(SDL_Renderer *r, int x, int y, int w, int h, uint32_t rgb) {
+    SDL_SetRenderDrawColor(r, (Uint8)(rgb >> 16), (Uint8)(rgb >> 8), (Uint8)rgb, 255);
+    SDL_RenderFillRect(r, &(SDL_Rect){ x, y, w, h });
+}
+
+static int dlg_text(SDL_Renderer *r, int x, int y, const char *str, uint32_t rgb, int s) {
+    SDL_SetRenderDrawColor(r, (Uint8)(rgb >> 16), (Uint8)(rgb >> 8), (Uint8)rgb, 255);
+    int start = x;
+    for (; *str; str++, x += DLG_GLYPH_W * s) {
+        const uint8_t *g = vgafont16 + (unsigned char)*str * 16;
+        for (int row = 0; row < DLG_GLYPH_H; row++)
+            for (int col = 0; col < DLG_GLYPH_W; col++)
+                if (g[row] & (0x80 >> col))
+                    SDL_RenderFillRect(r, &(SDL_Rect){ x + col * s, y + row * s, s, s });
+    }
+    return x - start;
+}
+
+void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
+    (void)pixel_scale;
+    if (!m || m->page == MENU_CLOSED) return;
 
     int w = 256, h = 240;
     SDL_GetRendererOutputSize(r, &w, &h);
-    if (w <= 0) w = 256;
-    if (h <= 0) h = 240;
+    int s = h >= 1100 ? 2 : 1;                  /* same UI scale as the menu bar */
+    int fw = DLG_GLYPH_W * s, fh = DLG_GLYPH_H * s, lh = fh + 4 * s;
 
-    /* Semi-transparent dark background */
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(r, 0, 0, 0, 180);
-    SDL_Rect bg = { 0, 0, w, h };
-    SDL_RenderFillRect(r, &bg);
-
-    /* Menu box: centered, 75% width */
-    int mw = (w * 3) / 4;
-    int mh = (int)(m->n_items + 2) * (fh + 2 * s) + 8 * s;
-    int mx = (w - mw) / 2;
-    int my = (h - mh) / 2;
-
-    /* Box background */
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
-    SDL_SetRenderDrawColor(r, 0, 0, 80, 255);
-    SDL_RenderFillRect(r, &(SDL_Rect){ mx, my, mw, mh });
-
-    /* Border */
-    SDL_SetRenderDrawColor(r, 60, 60, 180, 255);
-    SDL_RenderDrawRect(r, &(SDL_Rect){ mx - 1, my - 1, mw + 2, mh + 2 });
-
-    int ty = my + 6 * s;
-
-    /* Title */
-    if (m->page == MENU_BINDING_OPTIONS) {
-        static const char *options[] = { "< Back", "Clear", "Set" };
-        char title[128];
-        snprintf(title, sizeof(title), "%s%s",
-                 m->items[m->selected].label,
-                 m->capture_controller ? " Controller" : "");
-        draw_text(r, mx + 6 * s, ty, "Binding: ", 0xFFFFFFFF, 0x000050FF, s);
-        draw_text(r, mx + 6 * s + 9 * fw, ty, title,
-                  0xFFFFFF00, 0x000050FF, s);
-        ty += fh + 4 * s;
-        SDL_SetRenderDrawColor(r, 60, 60, 180, 255);
-        SDL_RenderDrawLine(r, mx + 4 * s, ty, mx + mw - 4 * s, ty);
-        ty += 4 * s;
-
-        for (int i = 0; i < 3; i++) {
-            uint32_t fg = 0xFFFFFFFF;
-            uint32_t bgc = 0x000050FF;
-            if (i == m->option_selected) {
-                SDL_SetRenderDrawColor(r, 60, 60, 180, 255);
-                SDL_RenderFillRect(r, &(SDL_Rect){
-                    mx + 4 * s, ty - s, mw - 8 * s, fh + 2 * s
-                });
-                fg = 0xFF000000;
-                bgc = 0x3C3CB4FF;
-            }
-            draw_text(r, mx + 8 * s, ty, options[i], fg, bgc, s);
-            ty += fh + 2 * s;
-        }
-        return;
-    }
-
-    if (m->page == MENU_KEY_CAPTURE) {
-        char title[128];
-        snprintf(title, sizeof(title), "%s%s",
-                 m->items[m->selected].label,
-                 m->capture_controller ? " Controller" : "");
-        draw_text(r, mx + 6 * s, ty, "Press input for: ", 0xFFFFFFFF, 0x000050FF, s);
-        draw_text(r, mx + 6 * s + 17 * fw, ty, title,
-                  0xFFFFFF00, 0x000050FF, s);
-        draw_text(r, mx + 6 * s, ty + fh + 4 * s,
-                  m->capture_backspace_armed ? "(Backspace again to cancel)"
-                                             : "(Backspace to cancel)",
-                  0xFF8888FF, 0x000050FF, s);
-        return;
-    }
-
-    bool is_binding_menu = (m->list == MENU_LIST_INPUT ||
-                            m->list == MENU_LIST_CONTROLS);
-
-    if (m->list == MENU_LIST_INPUT) {
-        char title[128];
-        const char *pname = page_title(m, m->input_page);
-        if (m->input_page_count > 1)
-            snprintf(title, sizeof(title), "%s (%d/%d)", pname,
-                     m->input_page + 1, m->input_page_count);
-        else
-            snprintf(title, sizeof(title), "%s", pname);
-        draw_text(r, mx + 6 * s, ty, title, 0xFFFFFFFF, 0x000050FF, s);
-    } else if (m->list == MENU_LIST_CONTROLS) {
-        draw_text(r, mx + 6 * s, ty, "Menu", 0xFFFFFFFF, 0x000050FF, s);
+    /* What the dialog shows */
+    const char *title;
+    char title_buf[160];
+    int rows;
+    if (m->page == MENU_BINDING_OPTIONS || m->page == MENU_KEY_CAPTURE) {
+        snprintf(title_buf, sizeof(title_buf), "%s%s", m->items[m->selected].label,
+                 m->capture_controller ? " (controller)" : "");
+        title = title_buf;
+        rows = m->page == MENU_BINDING_OPTIONS ? 3 : 2;
     } else {
-        draw_text(r, mx + 6 * s, ty, "Main Menu", 0xFFFFFFFF, 0x000050FF, s);
-    }
-    ty += fh + 4 * s;
-
-    /* Separator */
-    SDL_SetRenderDrawColor(r, 60, 60, 180, 255);
-    SDL_RenderDrawLine(r, mx + 4 * s, ty, mx + mw - 4 * s, ty);
-    ty += 4 * s;
-
-    /* Items */
-    for (int i = 0; i < m->n_items; i++) {
-        uint32_t fg = 0xFFFFFFFF;
-        uint32_t bg = 0x000050FF;
-
-        if (i == m->selected) {
-            SDL_SetRenderDrawColor(r, 60, 60, 180, 255);
-            SDL_RenderFillRect(r, &(SDL_Rect){
-                mx + 4 * s, ty - s, mw - 8 * s, fh + 2 * s
-            });
-            fg = 0xFF000000;
-            bg = 0x3C3CB4FF;
+        if (m->list == MENU_LIST_INPUT) {
+            const char *pname = page_title(m, m->input_page);
+            if (m->input_page_count > 1)
+                snprintf(title_buf, sizeof(title_buf), "Input: %s (%d/%d, Left/Right for more)",
+                         pname, m->input_page + 1, m->input_page_count);
+            else
+                snprintf(title_buf, sizeof(title_buf), "Input: %s", pname);
+            title = title_buf;
+        } else {
+            title = m->list == MENU_LIST_CONTROLS ? "Menu navigation keys" : "Menu";
         }
+        rows = m->n_items;
+    }
 
-        draw_text(r, mx + 8 * s, ty, m->items[i].label, fg, bg, s);
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 96);
+    SDL_RenderFillRect(r, &(SDL_Rect){ 0, 0, w, h });
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
 
+    int th = fh + 6 * s;
+    int mw = 60 * fw;
+    if (mw > w - 16 * s) mw = w - 16 * s;
+    int mh = th + 10 * s + rows * lh + 10 * s;
+    int mx = (w - mw) / 2, my = (h - mh) / 2;
+    dlg_fill(r, mx + 4 * s, my + 4 * s, mw, mh, 0x000000);           /* shadow */
+    dlg_fill(r, mx, my, mw, mh, DLG_BG);
+    dlg_fill(r, mx, my, mw, th, DLG_TITLE);
+    dlg_fill(r, mx, my + th, mw, s, DLG_BORDER);
+    SDL_SetRenderDrawColor(r, 0x40, 0x40, 0x48, 255);
+    for (int k = 0; k < s; k++)
+        SDL_RenderDrawRect(r, &(SDL_Rect){ mx + k, my + k, mw - 2 * k, mh - 2 * k });
+    int tw = (int)strlen(title) * fw;
+    dlg_text(r, mx + (mw - tw > 0 ? (mw - tw) / 2 : 4 * s), my + 3 * s, title, DLG_TEXT, s);
+
+    int ty = my + th + 10 * s, tx = mx + 12 * s;
+
+    if (m->page == MENU_BINDING_OPTIONS) {
+        static const char *options[] = { "< Back", "Clear binding", "Set new binding..." };
+        for (int i = 0; i < 3; i++) {
+            bool hi = i == m->option_selected;
+            if (hi) dlg_fill(r, mx + 4 * s, ty - 2 * s, mw - 8 * s, lh, DLG_HI);
+            dlg_text(r, tx, ty, options[i], hi ? DLG_HITEXT : DLG_TEXT, s);
+            ty += lh;
+        }
+        return;
+    }
+    if (m->page == MENU_KEY_CAPTURE) {
+        dlg_text(r, tx, ty, m->capture_controller ? "Press a controller button or stick direction..."
+                                                  : "Press the key to use...", DLG_ACCENT, s);
+        dlg_text(r, tx, ty + lh, m->capture_backspace_armed ? "(Backspace again to cancel)"
+                                                            : "(Backspace to cancel)", DLG_HINT, s);
+        return;
+    }
+
+    bool is_binding_menu = (m->list == MENU_LIST_INPUT || m->list == MENU_LIST_CONTROLS);
+    for (int i = 0; i < m->n_items; i++) {
+        bool hi = i == m->selected;
+        uint32_t fg = hi ? DLG_HITEXT : DLG_TEXT;
+        if (hi) dlg_fill(r, mx + 4 * s, ty - 2 * s, mw - 8 * s, lh, DLG_HI);
+        dlg_text(r, tx, ty, m->items[i].label, fg, s);
         if (is_binding_menu && m->items[i].binding_ptr) {
             const char *kname = binding_display_name(m->items[i].binding_ptr);
             const char *cname = m->items[i].controller_ptr
-                              ? binding_display_name(m->items[i].controller_ptr)
-                              : "(none)";
+                              ? binding_display_name(m->items[i].controller_ptr) : "(none)";
             char pair[192];
             snprintf(pair, sizeof(pair), "%s / %s", kname, cname);
-            int kw = (int)strlen(pair) * fw;
-            int x = mx + mw - 8 * s - kw;
-            if (x < mx + 8 * s + 12 * fw)
-                x = mx + 8 * s + 12 * fw;
-            draw_text(r, x, ty, pair, fg, bg, s);
+            int x = mx + mw - 12 * s - (int)strlen(pair) * fw;
+            if (x < tx + 14 * fw) x = tx + 14 * fw;
+            dlg_text(r, x, ty, pair, hi ? DLG_HITEXT : DLG_ACCENT, s);
         }
-
-        ty += fh + 2 * s;
+        ty += lh;
     }
 }
 
@@ -1090,9 +1043,9 @@ bool input_menu_handle_event(InputMenu *m, const SDL_Event *ev) {
                 m->page = MENU_MAIN;
                 m->selected = 0;
             } else {
-                build_main_menu(m);
-                m->page = MENU_MAIN;
-                m->selected = 0;
+                /* "(close)" on the Input page: the window menu bar opened
+                 * this screen, so leaving it closes it. */
+                m->page = MENU_CLOSED;
             }
         } else if (m->items[m->selected].action) {
             m->items[m->selected].action(m);
@@ -1105,9 +1058,7 @@ bool input_menu_handle_event(InputMenu *m, const SDL_Event *ev) {
             m->page = MENU_MAIN;
             m->selected = 0;
         } else if (m->list == MENU_LIST_INPUT) {
-            build_main_menu(m);
-            m->page = MENU_MAIN;
-            m->selected = 0;
+            m->page = MENU_CLOSED;
         } else {
             m->page = MENU_CLOSED;
         }
@@ -1218,6 +1169,14 @@ void input_menu_destroy(InputMenu *m) {
     free(m->key_bindings);
     free(m->controller_bindings);
     free(m);
+}
+
+void input_menu_open_input(InputMenu *m) {
+    if (!m) return;
+    m->input_page = 0;
+    build_input_menu(m);
+    m->page = MENU_MAIN;
+    m->selected = 0;
 }
 
 bool input_menu_toggle(InputMenu *m) {

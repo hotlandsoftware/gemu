@@ -26,6 +26,7 @@ struct GemuVideoSdl {
     bool            termios_active;
     struct termios  old_termios;
 #endif
+    int           (*top_margin)(int out_h);   /* space above the picture (menu bar) */
     void          (*overlay_cb)(void *ud, SDL_Renderer *r, int pixel_scale);
     void           *overlay_ud;
 };
@@ -238,7 +239,10 @@ void gemu_video_sdl_present_argb(GemuVideoSdl *v, const uint32_t *pixels,
     SDL_RenderClear(v->renderer);
     int ow = v->width, oh = v->height;
     SDL_GetRendererOutputSize(v->renderer, &ow, &oh);
-    v->dst = fit_rect(v, ow, oh);
+    int top = v->top_margin ? v->top_margin(oh) : 0;
+    if (top > oh - 1) top = oh - 1;
+    v->dst = fit_rect(v, ow, oh - top);
+    v->dst.y += top;
     draw_scaled(v, &v->dst);
     if (v->overlay_cb) {
         /* Draw overlay at native window pixels, not logical (fb) pixels.
@@ -281,6 +285,22 @@ void gemu_video_sdl_set_overlay(GemuVideoSdl *v,
     if (!v) return;
     v->overlay_cb = cb;
     v->overlay_ud = ud;
+}
+
+void gemu_video_sdl_set_top_margin(GemuVideoSdl *v, int (*fn)(int out_h)) {
+    if (v) v->top_margin = fn;
+}
+
+SDL_Renderer *gemu_video_sdl_get_renderer(const GemuVideoSdl *v) {
+    return v ? v->renderer : NULL;
+}
+
+int gemu_video_sdl_width(const GemuVideoSdl *v)  { return v ? v->width : 0; }
+int gemu_video_sdl_height(const GemuVideoSdl *v) { return v ? v->height : 0; }
+
+/* Displayed picture height for a picture width, honouring the aspect. */
+int gemu_video_sdl_shown_height(const GemuVideoSdl *v, int w) {
+    return v ? (int)((long)w * v->aspect_h / v->aspect_w) : 0;
 }
 
 SDL_Window *gemu_video_sdl_get_window(const GemuVideoSdl *v) {

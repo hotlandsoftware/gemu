@@ -886,6 +886,7 @@ Um6578State *um6578_create(const MosConfig *cfg) {
         bool has_mouse = cfg->n_ports > 0 && cfg->ports[0] == NES_DEVICE_MOUSE;
         s->display = gemu_display_create(cfg->display_type, &(GemuDisplayConfig){
             .fb_width    = SH6578_WIDTH,
+            .monitor     = s->monitor,
             .fb_height   = SH6578_HEIGHT,
             .scale       = cfg->display_scale,
             .renderer    = cfg->display_renderer,

@@ -125,7 +125,13 @@ core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
   `GemuArgsDef.block_devices`; machines claim drives with `gemu_drive_get()`,
   register them with `gemu_drive_attach_monitor()`, and setups call
   `gemu_drive_check_unclaimed()`. User docs: `docs/drive.md`.
-- The SDL in-window menu exists for every machine: Tab opens it, except on
-  keyboard machines (`GemuDisplayConfig.no_menu`, XML `menu="disabled"`) where
-  Tab is the guest's and Ctrl+Shift+Tab (which works everywhere) is used.
+- Window menu bar (Machine/Blocks/View/Input/Debug/Help): one model,
+  `gemu_display_build_menubar()` (`core/src/gemu_display_menu.c`, types in
+  `gemu/menu.h`). SDL draws it inside the window above the picture
+  (`gemu_menubar_sdl.c`, never on VNC); GTK turns it into a GtkMenuBar
+  (`gtk_menu.c`). Actions go through the monitor, so machines get it for free
+  by passing `.monitor = s->monitor` in `GemuDisplayConfig`. Keyboard focus:
+  Ctrl+Shift+Tab everywhere, plain Tab / controller "Menu" on machines without
+  a keyboard (`no_menu`, XML `menu="disabled"`, makes Tab the guest's).
+  User docs: `docs/menu.md`.
   `-vga NAME,opts` passes card options when `GemuArgsDef.vga_options` is set.

@@ -35,7 +35,8 @@ CORE_SRC = [
     'core/src/sha256.c', 'core/src/screendump.c', 'core/src/util.c',
     'core/src/gemu_display_term.c', 'core/src/drive.c',
     'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
-    'core/src/gemu_display_vnc.c',
+    'core/src/gemu_display_vnc.c', 'core/src/gemu_display_menu.c',
+    'core/src/gemu_menubar_sdl.c', 'core/src/menu.c', 'vga/multi/vgafont16.c',
 ]
 
 CORE_SRC_CACA = ['core/src/gemu_display_caca.c']

@@ -721,6 +721,7 @@ Atari400State *atari400_create(const MosConfig *cfg) {
     if (gemu_display_wanted(cfg->display_type)) {
         s->display = gemu_display_create(cfg->display_type, &(GemuDisplayConfig){
             .fb_width    = ANTIC_FB_W,
+            .monitor     = s->monitor,
             .fb_height   = ANTIC_FB_H,
             .scale       = cfg->display_scale,
             .renderer    = cfg->display_renderer,
