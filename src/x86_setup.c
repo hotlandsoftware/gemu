@@ -48,6 +48,7 @@ static const GemuArgsDef def = {
     .n_cpus       = (int)(sizeof cpus / sizeof *cpus),
     .vgas         = vgas,
     .n_vgas       = (int)(sizeof vgas / sizeof *vgas),
+    .vga_options      = true,
     .block_devices    = true,
     .block_default_if = GEMU_DRIVE_IF_IDE,   /* QEMU's PC default */
     .display_mask = GEMU_DISP_F(GEMU_DISPLAY_SDL) | GEMU_DISP_F(GEMU_DISPLAY_NONE),
@@ -61,6 +62,8 @@ static const GemuArgsDef def = {
         "                  (160K/180K/320K/360K images; up to 4 drives).\n"
         "                  With a drive in A: POST boots from it, otherwise\n"
         "                  into Cassette BASIC.  The 5150 has no IDE.\n"
+        "\nVideo: -vga cga (default) or -vga mda[,phosphor=green|amber|white]\n"
+        "                  (the MDA's monitor: IBM 5151 green, amber or white).\n"
         "Not yet emulated: cassette, printer and serial ports.  Monitor:\n"
         "'sendkey' types into the keyboard (sendkey PRINT spc 2+2 ret,\n"
         "sendkey ctrl-alt-delete); 'change floppy0 FILE' swaps diskettes.\n"
@@ -142,6 +145,10 @@ int x86_setup(int argc, char *argv[]) {
     }
     if (args.vga && strcmp(args.vga, "mda") == 0) {
         cfg.vga = X86_VGA_MDA;
+        cfg.vga_opts = args.vga_opts;
+    } else if (args.vga_opts) {
+        fprintf(stderr, "gemu: -vga %s takes no options\n", args.vga);
+        return 1;
     } else if (args.vga && strcmp(args.vga, "cga") != 0) {
         fprintf(stderr, "gemu: unknown x86 VGA '%s' (use -vga ? to list)\n", args.vga);
         return 1;

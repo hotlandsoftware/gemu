@@ -50,6 +50,7 @@ typedef struct {
      * (and -floppy), -snapshot are parsed into the drive table (gemu/drive.h)
      * with block_default_if as -drive's default if=.  Families without it
      * keep those options for themselves (e.g. NES -fda). */
+    bool               vga_options;     /* -vga NAME,opts accepted (else an error) */
     bool               block_devices;
     int                block_default_if; /* GemuDriveInterface */
 } GemuArgsDef;
@@ -64,7 +65,8 @@ typedef struct {
     const char     *machine;       /* NULL until -M given */
     const char     *machine_opts;  /* comma tail from -M machine,opt,... */
     const char     *cpu;           /* NULL until -cpu given */
-    const char     *vga;           /* NULL until -vga given */
+    const char     *vga;           /* NULL until -vga given (name only) */
+    const char     *vga_opts;      /* comma tail from -vga name,opt=val,... */
     GemuDisplayType display_type;
     int             display_scale;
     const char     *vnc_addr;      /* -vnc spec (NULL = none); the display layer

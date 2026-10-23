@@ -125,3 +125,7 @@ core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
   `GemuArgsDef.block_devices`; machines claim drives with `gemu_drive_get()`,
   register them with `gemu_drive_attach_monitor()`, and setups call
   `gemu_drive_check_unclaimed()`. User docs: `docs/drive.md`.
+- The SDL in-window menu exists for every machine: Tab opens it, except on
+  keyboard machines (`GemuDisplayConfig.no_menu`, XML `menu="disabled"`) where
+  Tab is the guest's and Ctrl+Shift+Tab (which works everywhere) is used.
+  `-vga NAME,opts` passes card options when `GemuArgsDef.vga_options` is set.

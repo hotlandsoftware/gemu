@@ -548,6 +548,14 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     uint32_t ram = cfg->ram_size ? cfg->ram_size : IBM5150_RAM_MAX;
     if (ram > IBM5150_RAM_MAX) ram = IBM5150_RAM_MAX;
     s->vga = cfg->vga;
+    if (s->vga == X86_VGA_MDA) {
+        char err[160];
+        if (!mda_set_options(&s->mda, cfg->vga_opts, err, sizeof(err))) {
+            fprintf(stderr, "gemu: -vga mda: %s\n", err);
+            free(s);
+            return NULL;
+        }
+    }
     s->ram_size = configure_switches(s, ram);
     s->ram = calloc(1, s->ram_size);
     if (!s->ram) { free(s); return NULL; }

@@ -1,4 +1,5 @@
 #include "mda.h"
+#include <stdio.h>
 #include <string.h>
 
 /* Beam position is kept in 1/16 CPU clocks so the line length (258.9
@@ -10,13 +11,43 @@
 #define VISIBLE_BEAM     3383u    /* 720 of 882 dots */
 #define BEAM_PER_FRAME   (BEAM_PER_LINE * LINES_PER_FRAME)
 
-/* IBM 5151 green phosphor */
 #define MDA_BLACK   0xFF000000u
-#define MDA_NORMAL  0xFF18B030u
-#define MDA_BRIGHT  0xFF70FF80u
+
+/* Normal and intense colours per monitor phosphor. */
+static const struct { const char *name; uint32_t normal, bright; } phosphors[] = {
+    [MDA_PHOSPHOR_GREEN] = { "green", 0xFF18B030u, 0xFF70FF80u },
+    [MDA_PHOSPHOR_AMBER] = { "amber", 0xFFC07800u, 0xFFFFB000u },
+    [MDA_PHOSPHOR_WHITE] = { "white", 0xFFA8A8B4u, 0xFFF4F4FFu },
+};
 
 void mda_reset(MdaDevice *m) {
+    MdaPhosphor phosphor = m->phosphor;
     memset(m, 0, sizeof *m);
+    m->phosphor = phosphor;
+}
+
+bool mda_set_options(MdaDevice *m, const char *opts, char *err, size_t err_len) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s", opts ? opts : "");
+    for (char *o = buf; o && *o; ) {
+        char *next = strchr(o, ',');
+        if (next) *next++ = '\0';
+        char *val = strchr(o, '=');
+        if (val) *val++ = '\0';
+        if (strcmp(o, "phosphor") != 0 || !val) {
+            snprintf(err, err_len, "unknown mda option '%s' (try phosphor=green|amber|white)", o);
+            return false;
+        }
+        size_t i;
+        for (i = 0; i < sizeof(phosphors) / sizeof(phosphors[0]) && strcmp(val, phosphors[i].name); i++) {}
+        if (i == sizeof(phosphors) / sizeof(phosphors[0])) {
+            snprintf(err, err_len, "unknown phosphor '%s' (green, amber or white)", val);
+            return false;
+        }
+        m->phosphor = (MdaPhosphor)i;
+        o = next;
+    }
+    return true;
 }
 
 uint8_t mda_io_read(MdaDevice *m, uint16_t port) {
@@ -70,6 +101,8 @@ bool mda_tick(MdaDevice *m, uint32_t clocks) {
 void mda_render(const MdaDevice *m, uint32_t *argb, const uint8_t *font8x14) {
     for (int i = 0; i < MDA_WIDTH * MDA_HEIGHT; i++) argb[i] = MDA_BLACK;
     if (!(m->mode_ctrl & 0x08)) return;                 /* video disabled */
+    const uint32_t normal = phosphors[m->phosphor].normal;
+    const uint32_t bright = phosphors[m->phosphor].bright;
 
     bool blink_enable = (m->mode_ctrl & 0x20) != 0;
     bool char_blink_on = (m->frame & 16) != 0;          /* 32-frame cycle */
@@ -94,9 +127,9 @@ void mda_render(const MdaDevice *m, uint32_t *argb, const uint8_t *font8x14) {
                 fg = MDA_BLACK;
             } else if ((attr & 0x77) == 0x70) {          /* reverse video */
                 fg = MDA_BLACK;
-                bg = (!blink_enable && (attr & 0x80)) ? MDA_BRIGHT : MDA_NORMAL;
+                bg = (!blink_enable && (attr & 0x80)) ? bright : normal;
             } else {
-                fg = (attr & 0x08) ? MDA_BRIGHT : MDA_NORMAL;
+                fg = (attr & 0x08) ? bright : normal;
                 underline = (attr & 0x07) == 0x01;
             }
             bool show_fg = !(blink && !char_blink_on);
@@ -105,7 +138,7 @@ void mda_render(const MdaDevice *m, uint32_t *argb, const uint8_t *font8x14) {
 
             /* The cursor is drawn in the text colour (normal green over
              * black-on-green and invisible cells, so it stays visible). */
-            uint32_t cursor_col = fg == MDA_BLACK ? MDA_NORMAL : fg;
+            uint32_t cursor_col = fg == MDA_BLACK ? normal : fg;
             const uint8_t *glyph = font8x14 + (unsigned)ch * 14;
             for (int y = 0; y < 14; y++) {
                 uint8_t bits = glyph[y];

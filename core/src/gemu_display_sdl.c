@@ -41,6 +41,8 @@ typedef struct {
     /* SDL_SCANCODE_TAB is intercepted for the rebind menu when Tab is not
      * bound to any game action. */
     bool tab_is_action;
+    bool menu_plain_key;   /* the menu's own key (Tab) opens it; false on
+                              keyboard machines, which use Ctrl+Shift+Tab */
 
     /* Key-hold tracking: SDL gives us down/up events, not state queries.
      * We keep a compact list of currently-held SDL_Keycodes and their bits. */
@@ -279,10 +281,18 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
 
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (!menu_open && b->menu && input_menu_event_opens(b->menu, &ev)) {
-            input_menu_toggle(b->menu);
-            menu_open = true;
-            continue;
+        /* Ctrl+Shift+Tab opens the menu on every machine; plain Tab only
+         * where the guest has no keyboard to type it on. */
+        if (!menu_open && b->menu) {
+            bool combo = ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_TAB &&
+                         (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_SHIFT);
+            bool own_key = (b->menu_plain_key || ev.type != SDL_KEYDOWN) &&
+                           input_menu_event_opens(b->menu, &ev);
+            if (combo || own_key) {
+                input_menu_toggle(b->menu);
+                menu_open = true;
+                continue;
+            }
         }
 
         /* Menu swallows all events while open */
@@ -469,7 +479,9 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
 }
 
 static bool sdl_do_is_key_held(GemuDisplay *d, const char *name) {
-    (void)d;
+    /* Keys pressed to drive the menu aren't the guest's. */
+    SdlBackend *b = d->backend;
+    if (b->menu && input_menu_is_open(b->menu)) return false;
     SDL_Keycode kc = SDL_GetKeyFromName(name);
     if (kc == SDLK_UNKNOWN) return false;
     SDL_Scancode sc = SDL_GetScancodeFromKey(kc);
@@ -556,12 +568,14 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     /* Build action→key binding table */
     build_bindings(b);
 
-    /* InputMenu: create whenever ini_section is set so Tab always opens a menu
-     * (at minimum: Reset / Close Menu / Quit).  When no_rebind is set or there
-     * are no rebindable actions, pass 0 buttons so the Input page is hidden.
-     * no_menu suppresses this entirely - Tab does nothing. */
-    if (cfg->ini_section && !cfg->no_menu) {
-        int nb = (cfg->no_rebind || !cfg->actions || cfg->n_actions <= 0)
+    /* InputMenu: every window has one (at minimum: Reset / Close Menu /
+     * Quit), opened with Tab, or Ctrl+Shift+Tab on keyboard machines
+     * (no_menu) where Tab is the guest's.  Without an ini_section, with
+     * no_rebind, or with no rebindable actions, pass 0 buttons so the Input
+     * page is hidden. */
+    b->menu_plain_key = !cfg->no_menu;
+    {
+        int nb = (!cfg->ini_section || cfg->no_rebind || !cfg->actions || cfg->n_actions <= 0)
                  ? 0 : cfg->n_actions;
         SDL_Keycode *defaults = nb ? calloc((size_t)nb, sizeof(SDL_Keycode)) : NULL;
         const char **names    = nb ? calloc((size_t)nb, sizeof(char *))      : NULL;

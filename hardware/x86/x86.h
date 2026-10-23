@@ -27,6 +27,7 @@ typedef struct X86Config {
     X86MachineType  machine;
     X86CpuType      cpu;
     X86VgaType      vga;
+    const char     *vga_opts;   /* -vga NAME,opts: card options (e.g. phosphor=amber) */
     uint32_t        ram_size; /* bytes */
     GemuDisplayType display_type;
     int             display_scale;

@@ -486,9 +486,21 @@ bool gemu_args_parse(int argc, char **argv,
                 fprintf(stderr, "%s: -vga not supported\n", def->prog);
                 return false;
             }
-            if (!dev_validate(def->prog, "-vga", def->vgas, def->n_vgas, v))
+            /* -vga NAME[,OPTION=VALUE...]: options belong to the card */
+            static char vga_name[64];
+            const char *comma = strchr(v, ',');
+            size_t len = comma ? (size_t)(comma - v) : strlen(v);
+            if (len >= sizeof(vga_name)) len = sizeof(vga_name) - 1;
+            memcpy(vga_name, v, len);
+            vga_name[len] = '\0';
+            if (!dev_validate(def->prog, "-vga", def->vgas, def->n_vgas, vga_name))
                 return false;
-            out->vga = v;
+            if (comma && !def->vga_options) {
+                fprintf(stderr, "%s: -vga %s takes no options\n", def->prog, vga_name);
+                return false;
+            }
+            out->vga = vga_name;
+            out->vga_opts = comma ? comma + 1 : NULL;
             continue;
         }
 

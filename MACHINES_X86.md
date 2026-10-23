@@ -22,7 +22,7 @@
 | 8237 DMA | registers and page registers; channel 0 refresh cycles |
 | 8255 PPI | 5150 wiring: SW1/SW2 DIP switches, keyboard handshake and reset, speaker |
 | CGA | 40/80-column text, 320x200 4-color, 640x200 2-color; retrace timing |
-| MDA | 80x25 monochrome text in 9x14 cells (720x350, 4:3), green phosphor; underline/intense/reverse/blink attributes; 50 Hz timing |
+| MDA | 80x25 monochrome text in 9x14 cells (720x350, 4:3); monitor phosphor `-vga mda,phosphor=green|amber|white` (default green, the IBM 5151); underline/intense/reverse/blink attributes; 50 Hz timing |
 | uPD765 FDC | diskette adapter with up to 4 drives via `-drive if=floppy` / `-fda` (see docs/drive.md); DMA channel 2, IRQ6 |
 
 The DIP switches follow `-m` (64K default). The 19OCT81 BIOS can use up to
