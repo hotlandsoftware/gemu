@@ -13,6 +13,7 @@ struct GemuVideoGtk {
     GtkWidget       *drawing_area;  /* kept for API compat */
     uint32_t        *frame_argb;    /* staging buffer - new pixels land here */
     bool             frame_dirty;   /* frame_argb has a frame not yet uploaded */
+    bool             tex_resize;    /* width/height changed: reallocate the texture */
     int              width;
     int              height;
     int              scale;
@@ -214,6 +215,12 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *ctx, gpointer data) {
      * GTK3 can leave GL_UNPACK_SKIP_ROWS non-zero after compositing widgets
      * in this same context; reset all unpack state so Mesa reads exactly the
      * right number of rows and doesn't overrun v->frame_argb. */
+    if (v->tex_resize) {
+        glBindTexture(GL_TEXTURE_2D, v->tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, v->width, v->height,
+                     0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+        v->tex_resize = false;
+    }
     if (v->frame_dirty) {
         glPixelStorei(GL_UNPACK_ALIGNMENT,   4);
         glPixelStorei(GL_UNPACK_ROW_LENGTH,  0);
@@ -339,6 +346,22 @@ void gemu_video_gtk_set_menubar(GemuVideoGtk *v, GtkWidget *bar) {
     resize_picture(v, gtk_widget_get_allocated_width(v->gl_area),
                       gtk_widget_get_allocated_height(v->gl_area));
     gemu_video_gtk_poll();
+}
+
+void gemu_video_gtk_set_geometry(GemuVideoGtk *v, int w, int h, int aspect_w, int aspect_h) {
+    if (!v || w <= 0 || h <= 0) return;
+    if (w != v->width || h != v->height) {
+        uint32_t *fb = realloc(v->frame_argb, (size_t)w * (size_t)h * sizeof(*fb));
+        if (!fb) return;
+        v->frame_argb = fb;
+        v->width = w;
+        v->height = h;
+        v->frame_dirty = false;
+        v->tex_resize = true;
+    }
+    v->aspect_w = aspect_w;
+    v->aspect_h = aspect_h;
+    gtk_gl_area_queue_render(GTK_GL_AREA(v->gl_area));
 }
 
 int gemu_video_gtk_get_scale(GemuVideoGtk *v) {

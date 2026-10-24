@@ -51,11 +51,20 @@ static guint sdl_name_to_gdk(const char *name) {
     return (kv != GDK_KEY_VoidSymbol) ? kv : GDK_KEY_VoidSymbol;
 }
 
-typedef struct {
+typedef struct GtkBackendS {
     GemuVideoGtk *video;
     GemuDisplay  *parent; /* back-pointer so signal handlers can update state */
     GtkWidget    *menubar;
     gint64        menubar_refreshed;
+
+    /* Monitors detached into windows of their own (View > Detach) */
+    struct GtkHeadWin {
+        struct GtkBackendS *b;
+        int        head;
+        GtkWidget *window, *area;
+        uint32_t  *fb;
+        int        w, h, aspect_w, aspect_h;
+    } heads[GEMU_DISPLAY_MAX_HEADS];
 
     struct { guint keyval; uint32_t bit; } bindings[GTK_MAX_BINDINGS];
     int n_bindings;
@@ -99,6 +108,14 @@ static gboolean on_key(GtkWidget *w, GdkEventKey *ev, gpointer ud) {
     GtkBackend  *b    = ud;
     GemuDisplay *d    = b->parent;
     bool         down = (ev->type == GDK_KEY_PRESS);
+
+    /* Ctrl+Alt+1..9 switches monitors, as in QEMU */
+    if (down && d->n_heads > 1 &&
+        (ev->state & GDK_CONTROL_MASK) && (ev->state & GDK_MOD1_MASK) &&
+        ev->keyval >= GDK_KEY_1 && ev->keyval <= GDK_KEY_9) {
+        gemu_display_select_head(d, (int)(ev->keyval - GDK_KEY_1));
+        return TRUE;
+    }
 
     if (down && ev->keyval == GDK_KEY_Escape) {
         d->quit = true;
@@ -230,6 +247,10 @@ static uint32_t gtk_do_poll(GemuDisplay *d) {
 static void gtk_do_destroy(GemuDisplay *d) {
     GtkBackend *b = d->backend;
     if (!b) return;
+    for (int i = 0; i < GEMU_DISPLAY_MAX_HEADS; i++) {
+        if (b->heads[i].window) gtk_widget_destroy(b->heads[i].window);
+        free(b->heads[i].fb);
+    }
     gemu_video_gtk_destroy(b->video);
     free(b);
     d->backend = NULL;
@@ -239,6 +260,92 @@ static void gtk_do_set_title(GemuDisplay *d, const char *title) {
     GtkBackend *b = d->backend;
     GtkWidget *win = b && b->video ? gemu_video_gtk_window(b->video) : NULL;
     if (win) gtk_window_set_title(GTK_WINDOW(win), title ? title : "GEMU");
+}
+
+/* ── Detached monitor windows ────────────────────────────────────────────── */
+
+static gboolean head_draw(GtkWidget *w, cairo_t *cr, gpointer ud) {
+    struct GtkHeadWin *hw = ud;
+    int aw = gtk_widget_get_allocated_width(w), ah = gtk_widget_get_allocated_height(w);
+    cairo_set_source_rgb(cr, 0, 0, 0);
+    cairo_paint(cr);
+    if (!hw->fb || hw->w <= 0) return TRUE;
+    /* fit the picture at its shape, centred */
+    double shape = hw->aspect_w > 0 && hw->aspect_h > 0 ? (double)hw->aspect_w / hw->aspect_h
+                                                        : (double)hw->w / hw->h;
+    double pw = aw, ph = aw / shape;
+    if (ph > ah) { ph = ah; pw = ah * shape; }
+    cairo_surface_t *img = cairo_image_surface_create_for_data(
+        (unsigned char *)hw->fb, CAIRO_FORMAT_RGB24, hw->w, hw->h, hw->w * 4);
+    cairo_translate(cr, (aw - pw) / 2, (ah - ph) / 2);
+    cairo_scale(cr, pw / hw->w, ph / hw->h);
+    cairo_set_source_surface(cr, img, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_NEAREST);
+    cairo_paint(cr);
+    cairo_surface_destroy(img);
+    return TRUE;
+}
+
+static void gtk_do_close_head(GemuDisplay *d, int head) {
+    GtkBackend *b = d->backend;
+    struct GtkHeadWin *hw = &b->heads[head];
+    if (hw->window) gtk_widget_destroy(hw->window);
+    free(hw->fb);
+    *hw = (struct GtkHeadWin){ 0 };
+    gemu_display_head_closed(d, head);
+}
+
+static gboolean head_delete(GtkWidget *w, GdkEvent *ev, gpointer ud) {
+    (void)w; (void)ev;
+    struct GtkHeadWin *hw = ud;
+    gtk_do_close_head(hw->b->parent, hw->head);
+    return TRUE;
+}
+
+static bool gtk_do_detach_head(GemuDisplay *d, int head) {
+    GtkBackend *b = d->backend;
+    const GemuDisplayHead *h = &d->heads[head];
+    struct GtkHeadWin *hw = &b->heads[head];
+    int scale = gemu_video_gtk_get_scale(b->video);
+    if (scale < 1) scale = 1;
+    char title[200];
+    gemu_window_title(title, sizeof(title), h->name, false);
+    *hw = (struct GtkHeadWin){ .b = b, .head = head, .aspect_w = h->aspect_w, .aspect_h = h->aspect_h };
+    hw->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(hw->window), title);
+    hw->area = gtk_drawing_area_new();
+    gtk_container_add(GTK_CONTAINER(hw->window), hw->area);
+    int ww = h->width * scale;
+    int wh = h->aspect_w > 0 && h->aspect_h > 0 ? ww * h->aspect_h / h->aspect_w : h->height * scale;
+    gtk_window_set_default_size(GTK_WINDOW(hw->window), ww, wh);
+    g_signal_connect(hw->area, "draw", G_CALLBACK(head_draw), hw);
+    g_signal_connect(hw->window, "delete-event", G_CALLBACK(head_delete), hw);
+    /* keys typed into it go to the guest, like the main window's */
+    gtk_widget_add_events(hw->window, GDK_KEY_PRESS_MASK | GDK_KEY_RELEASE_MASK);
+    g_signal_connect(hw->window, "key-press-event",   G_CALLBACK(on_key), b);
+    g_signal_connect(hw->window, "key-release-event", G_CALLBACK(on_key), b);
+    gtk_widget_show_all(hw->window);
+    return true;
+}
+
+static void gtk_do_present_head(GemuDisplay *d, int head, const uint32_t *argb, int w, int h) {
+    GtkBackend *b = d->backend;
+    struct GtkHeadWin *hw = &b->heads[head];
+    if (!hw->window) return;
+    if (w != hw->w || h != hw->h) {
+        uint32_t *fb = realloc(hw->fb, (size_t)w * h * sizeof(*fb));
+        if (!fb) return;
+        hw->fb = fb;
+        hw->w = w;
+        hw->h = h;
+    }
+    memcpy(hw->fb, argb, (size_t)w * h * sizeof(*argb));
+    gtk_widget_queue_draw(hw->area);
+}
+
+static void gtk_do_raise_head(GemuDisplay *d, int head) {
+    GtkBackend *b = d->backend;
+    if (b->heads[head].window) gtk_window_present(GTK_WINDOW(b->heads[head].window));
 }
 
 /* ── Window menu hooks ───────────────────────────────────────────────────── */
@@ -285,6 +392,13 @@ static void gtk_ui_set_scale(GemuDisplay *d, int scale) {
     gemu_video_gtk_set_scale(b->video, scale);
 }
 
+static void gtk_do_set_geometry(GemuDisplay *d, int w, int h, int aspect_w, int aspect_h) {
+    GtkBackend *b = d->backend;
+    b->fb_width = w;
+    b->fb_height = h;
+    gemu_video_gtk_set_geometry(b->video, w, h, aspect_w, aspect_h);
+}
+
 /* ── Create ──────────────────────────────────────────────────────────────── */
 
 GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
@@ -327,6 +441,11 @@ GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
     d->ui_choose_file = gtk_ui_choose_file;
     d->ui_get_scale   = gtk_ui_get_scale;
     d->ui_set_scale   = gtk_ui_set_scale;
+    d->do_set_geometry = gtk_do_set_geometry;
+    d->do_detach_head  = gtk_do_detach_head;
+    d->do_present_head = gtk_do_present_head;
+    d->do_raise_head   = gtk_do_raise_head;
+    d->do_close_head   = gtk_do_close_head;
     b->parent = d;
 
     b->menubar = gemu_gtk_menubar_new(build_menubar, d);

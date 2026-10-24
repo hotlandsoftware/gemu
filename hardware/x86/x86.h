@@ -28,6 +28,9 @@ typedef struct X86Config {
     X86CpuType      cpu;
     X86VgaType      vga;
     const char     *vga_opts;   /* -vga NAME,opts: card options (e.g. phosphor=amber) */
+    bool            has_vga2;   /* a second card from -device (the other of CGA/MDA) */
+    X86VgaType      vga2;
+    const char     *vga2_opts;
     uint32_t        ram_size; /* bytes */
     GemuDisplayType display_type;
     int             display_scale;

@@ -30,6 +30,8 @@ SDL_Renderer *gemu_video_sdl_get_renderer(const GemuVideoSdl *v);
 int  gemu_video_sdl_width(const GemuVideoSdl *v);
 int  gemu_video_sdl_height(const GemuVideoSdl *v);
 int  gemu_video_sdl_shown_height(const GemuVideoSdl *v, int w);
+/* Change the framebuffer size and shape (aspect 0 = square pixels). */
+bool gemu_video_sdl_set_geometry(GemuVideoSdl *v, int w, int h, int aspect_w, int aspect_h);
 
 /* Optional overlay: called after emulator frame is drawn but before
  * SDL_RenderPresent.  Use for in-emulator menus, OSD, etc. */
@@ -74,5 +76,7 @@ void gemu_video_gtk_set_menubar(GemuVideoGtk *v, GtkWidget *bar);
 /* Window scale: picture width / framebuffer width; setting resizes. */
 int  gemu_video_gtk_get_scale(GemuVideoGtk *v);
 void gemu_video_gtk_set_scale(GemuVideoGtk *v, int scale);
+/* Change the framebuffer size and shape (switching monitors). */
+void gemu_video_gtk_set_geometry(GemuVideoGtk *v, int w, int h, int aspect_w, int aspect_h);
 
 #endif /* GEMU_GTK */

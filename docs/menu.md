@@ -12,6 +12,7 @@ VNC clients (`-vnc`) and `screendump` see just the emulated screen.
 | Scale   | window scale 1x-4x (you can also drag the window edges); starts at 1x unless `-scale N` |
 | Input   | one entry per input device (`nes-controller`, `nes-controller (2)`, ...) to remap its keys and controller; Reset bindings to defaults. Hidden when the machine has no remappable input (SDL) |
 | Debug   | Hex Editor (machines that have one) |
+| View    | which monitor the window shows, on machines with several (e.g. an IBM 5150 with CGA + MDA); Ctrl+Alt+1..9. Detach ... to new window gives the current monitor its own window (closing it brings the monitor back) |
 | Help    | About GEMU |
 
 The menus run the matching monitor commands (`stop`/`cont`, `system_reset`,

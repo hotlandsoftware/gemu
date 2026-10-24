@@ -64,6 +64,9 @@ static const GemuArgsDef def = {
         "                  into Cassette BASIC.  The 5150 has no IDE.\n"
         "\nVideo: -vga cga (default) or -vga mda[,phosphor=green|amber|white]\n"
         "                  (the MDA's monitor: IBM 5151 green, amber or white).\n"
+        "                  Add the other card with -device mda[,phosphor=...] or\n"
+        "                  -device cga for a second monitor; the View menu (or\n"
+        "                  Ctrl+Alt+1/2) switches between them.\n"
         "Not yet emulated: cassette, printer and serial ports.  Monitor:\n"
         "'sendkey' types into the keyboard (sendkey PRINT spc 2+2 ret,\n"
         "sendkey ctrl-alt-delete); 'change floppy0 FILE' swaps diskettes.\n"
@@ -162,6 +165,28 @@ int x86_setup(int argc, char *argv[]) {
             uint32_t sz = parse_size(rem[++i]);
             if (!sz) return 1;
             cfg.ram_size = sz;
+        } else if (strcmp(rem[i], "-device") == 0) {
+            /* A second display adapter on its own monitor: -device mda[,opts]
+             * or -device cga, the one -vga didn't pick. */
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -device requires an argument\n"); return 1; }
+            const char *dev = rem[++i];
+            const char *comma = strchr(dev, ',');
+            size_t len = comma ? (size_t)(comma - dev) : strlen(dev);
+            X86VgaType type;
+            if (len == 3 && strncmp(dev, "mda", 3) == 0)      type = X86_VGA_MDA;
+            else if (len == 3 && strncmp(dev, "cga", 3) == 0) type = X86_VGA_CGA;
+            else {
+                fprintf(stderr, "gemu: unknown x86 device '%.*s' (ibm5150: -device mda or -device cga)\n",
+                        (int)len, dev);
+                return 1;
+            }
+            if (comma && type != X86_VGA_MDA) {
+                fprintf(stderr, "gemu: -device cga takes no options\n");
+                return 1;
+            }
+            cfg.has_vga2 = true;
+            cfg.vga2 = type;
+            cfg.vga2_opts = comma ? comma + 1 : NULL;
         } else if (strcmp(rem[i], "-rom") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -rom requires an argument\n"); return 1; }
             rom_arg = rem[++i];
@@ -185,6 +210,13 @@ int x86_setup(int argc, char *argv[]) {
     if (ctx.loaded == 0) {
         fprintf(stderr, "gemu: %s needs a BIOS ROM (-rom FILE, or -rom DIR to scan)\n", alias);
         romdb_print_needed(alias);
+        return 1;
+    }
+
+    if (cfg.has_vga2 && cfg.vga2 == cfg.vga) {
+        fprintf(stderr, "gemu: -device %s: that card is already the -vga adapter "
+                        "(the second card must be the other of cga/mda)\n",
+                cfg.vga2 == X86_VGA_MDA ? "mda" : "cga");
         return 1;
     }
 

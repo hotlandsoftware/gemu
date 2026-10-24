@@ -11,7 +11,7 @@
 
 | Name | Full name | Status | Notes |
 |------|-----------|--------|-------|
-| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA or MDA (`-vga mda`), keyboard, speaker, floppy drives. No cassette, printer, serial yet |
+| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA or MDA (`-vga mda`), or both on two monitors (`-device`), keyboard, speaker, floppy drives. No cassette, printer, serial yet |
 
 ## IBM 5150 hardware
 
@@ -32,3 +32,18 @@ only uses 64K either way.
 ```
 ./bin/gemu -M ibm5150 -rom roms/
 ```
+
+Two monitors: like the real machine, the 5150 can have a CGA and an MDA at
+once - they use different memory (B8000 vs B0000) and ports (3Dx vs 3Bx).
+`-vga` picks the primary card (the DIP switches, so POST starts on it) and
+`-device` adds the other:
+
+```
+./bin/gemu -M ibm5150 -rom roms/ -vga cga -device mda,phosphor=amber
+```
+
+The window shows one monitor at a time: **View → Monitor 1 / Monitor 2**, or
+Ctrl+Alt+1 / Ctrl+Alt+2 as in QEMU.  **View → Detach ... to new window** puts
+the current monitor in a window of its own, so both are on screen at once;
+close that window (or View → Close ... window) to bring it back.  DOS's `MODE MONO` / `MODE CO80` move the
+console between them.

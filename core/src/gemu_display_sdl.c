@@ -61,6 +61,9 @@ typedef struct {
      * SDL_SetWindowSize uses the same units as the Scale menu. */
     int    want_w, want_h;
     int    size_fixups;
+
+    /* Monitors detached into windows of their own (View > Detach) */
+    GemuVideoSdl *head_video[GEMU_DISPLAY_MAX_HEADS];
 } SdlBackend;
 
 /* ── Binding table ───────────────────────────────────────────────────────── */
@@ -227,6 +230,70 @@ static uint32_t sdl_to_raw(SDL_Keycode kc) {
 
 static void sdl_do_set_title(GemuDisplay *d, const char *title);
 
+static void sdl_do_set_geometry(GemuDisplay *d, int w, int h, int aspect_w, int aspect_h) {
+    SdlBackend *b = d->backend;
+    gemu_video_sdl_set_geometry(b->video, w, h, aspect_w, aspect_h);
+}
+
+/* ── Detached monitor windows ────────────────────────────────────────────── */
+
+static int ui_get_scale(GemuDisplay *d);
+
+static bool sdl_do_detach_head(GemuDisplay *d, int head) {
+    SdlBackend *b = d->backend;
+    const GemuDisplayHead *h = &d->heads[head];
+    int scale = ui_get_scale(d);
+    if (scale < 1) scale = 1;
+    int ww = h->width * scale;
+    int wh = h->aspect_w > 0 && h->aspect_h > 0 ? ww * h->aspect_h / h->aspect_w
+                                                : h->height * scale;
+    char title[200];
+    gemu_window_title(title, sizeof(title), h->name, false);
+    b->head_video[head] = gemu_video_sdl_create(&(GemuVideoSdlSpec){
+        .title = title, .width = h->width, .height = h->height,
+        .window_width = ww, .window_height = wh,
+        .aspect_w = h->aspect_w, .aspect_h = h->aspect_h,
+        .log_prefix = "gemu",
+    });
+    return b->head_video[head] != NULL;
+}
+
+static void sdl_do_present_head(GemuDisplay *d, int head, const uint32_t *argb, int w, int h) {
+    SdlBackend *b = d->backend;
+    gemu_video_sdl_present_argb(b->head_video[head], argb, w, h);
+}
+
+static void sdl_do_raise_head(GemuDisplay *d, int head) {
+    SdlBackend *b = d->backend;
+    SDL_Window *win = gemu_video_sdl_get_window(b->head_video[head]);
+    if (win) SDL_RaiseWindow(win);
+}
+
+static void sdl_do_close_head(GemuDisplay *d, int head) {
+    SdlBackend *b = d->backend;
+    gemu_video_sdl_destroy(b->head_video[head]);
+    b->head_video[head] = NULL;
+    gemu_display_head_closed(d, head);
+}
+
+/* The detached monitor whose window an event is for, or -1. */
+static int event_head(const SdlBackend *b, const SDL_Event *ev) {
+    Uint32 id;
+    switch (ev->type) {
+    case SDL_WINDOWEVENT:     id = ev->window.windowID; break;
+    case SDL_MOUSEMOTION:     id = ev->motion.windowID; break;
+    case SDL_MOUSEBUTTONDOWN:
+    case SDL_MOUSEBUTTONUP:   id = ev->button.windowID; break;
+    case SDL_MOUSEWHEEL:      id = ev->wheel.windowID;  break;
+    default:                  return -1;
+    }
+    for (int i = 0; i < GEMU_DISPLAY_MAX_HEADS; i++) {
+        SDL_Window *w = gemu_video_sdl_get_window(b->head_video[i]);
+        if (w && SDL_GetWindowID(w) == id) return i;
+    }
+    return -1;
+}
+
 /* Reflect mouse-capture state in the window title - capturing hides the OS
  * cursor and grabs it, which is confusing without a visible hint for how to
  * get it back. */
@@ -278,10 +345,28 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
 
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
+        /* A detached monitor's window: closing it brings the monitor back;
+         * its mouse events aren't the main window's.  (Keys typed into it
+         * go to the guest as usual.) */
+        int dh = event_head(b, &ev);
+        if (dh >= 0) {
+            if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_CLOSE)
+                sdl_do_close_head(d, dh);
+            continue;
+        }
+
         /* The binding screen swallows all events while open */
         if (menu_open) {
             input_menu_handle_event(b->menu, &ev);
             menu_open = input_menu_is_open(b->menu);
+            continue;
+        }
+
+        /* Ctrl+Alt+1..9 switches monitors, as in QEMU */
+        if (ev.type == SDL_KEYDOWN && d->n_heads > 1 &&
+            (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_ALT) &&
+            ev.key.keysym.sym >= SDLK_1 && ev.key.keysym.sym <= SDLK_9) {
+            gemu_display_select_head(d, ev.key.keysym.sym - SDLK_1);
             continue;
         }
 
@@ -499,6 +584,8 @@ static void sdl_do_destroy(GemuDisplay *d) {
     if (b->menu)  input_menu_destroy(b->menu);
     gemu_menubar_destroy(b->menubar);
     if (b->controller) SDL_GameControllerClose(b->controller);
+    for (int i = 0; i < GEMU_DISPLAY_MAX_HEADS; i++)
+        if (b->head_video[i]) gemu_video_sdl_destroy(b->head_video[i]);
     if (b->video) gemu_video_sdl_destroy(b->video);
     SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
     free(b);
@@ -659,6 +746,11 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     d->do_is_key_held = sdl_do_is_key_held;
     d->do_reset_input_bindings = sdl_do_reset_input_bindings;
     d->do_set_title   = sdl_do_set_title;
+    d->do_set_geometry = sdl_do_set_geometry;
+    d->do_detach_head  = sdl_do_detach_head;
+    d->do_present_head = sdl_do_present_head;
+    d->do_raise_head   = sdl_do_raise_head;
+    d->do_close_head   = sdl_do_close_head;
     d->do_destroy     = sdl_do_destroy;
     gemu_window_title(d->title, sizeof(d->title), NULL, false);
     d->pointer.x = d->pointer.y = -1;

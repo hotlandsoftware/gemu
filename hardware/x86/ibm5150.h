@@ -40,10 +40,14 @@ typedef struct Ibm5150State {
     I8259     pic;
     I8253     pit;
     I8255     ppi;
-    X86VgaType vga;       /* which display adapter is installed (-vga) */
+    X86VgaType vga;       /* the primary display adapter (-vga): POST uses it */
+    bool      has_cga, has_mda; /* installed cards: -vga plus an optional
+                                 * second one (-device), each on its own monitor */
     CgaDevice cga;
     MdaDevice mda;
-    int       fb_w, fb_h; /* the adapter's framebuffer size */
+    int       n_heads;    /* monitors: 1, or 2 with both cards */
+    X86VgaType head_card[2]; /* card shown on each monitor, primary first */
+    int       fb_w, fb_h; /* the shown card's framebuffer size */
     Upd765    fdc;        /* diskette adapter, present when -drive if=floppy is */
     bool      has_fdc;
     uint8_t   nmi_mask;  /* port 0xA0 */

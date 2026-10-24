@@ -22,6 +22,12 @@ struct GemuDisplay {
     bool quit;
     bool reset;
     bool paused_title;
+
+    /* Monitors (gemu_display_set_heads); n_heads 0 = just the one */
+    GemuDisplayHead heads[GEMU_DISPLAY_MAX_HEADS];
+    char            head_names[GEMU_DISPLAY_MAX_HEADS][48];
+    bool            head_detached[GEMU_DISPLAY_MAX_HEADS];  /* in a window of its own */
+    int             n_heads, head;
     char title[128];
 
     /* Window menus (gemu_display_menu.c) */
@@ -50,6 +56,15 @@ struct GemuDisplay {
     bool     (*do_is_key_held)(struct GemuDisplay *, const char *);
     void     (*do_reset_input_bindings)(struct GemuDisplay *);
     void     (*do_set_title)   (struct GemuDisplay *, const char *);
+    /* New framebuffer size/shape (switching monitors); NULL = takes any size */
+    void     (*do_set_geometry)(struct GemuDisplay *, int w, int h, int aspect_w, int aspect_h);
+    /* Detached monitor windows (NULL = backend can't): open one for a head,
+     * draw a frame into it, bring it to the front.  When the user closes it
+     * the backend calls gemu_display_head_closed(). */
+    bool     (*do_detach_head) (struct GemuDisplay *, int head);
+    void     (*do_present_head)(struct GemuDisplay *, int head, const uint32_t *argb, int w, int h);
+    void     (*do_raise_head)  (struct GemuDisplay *, int head);
+    void     (*do_close_head)  (struct GemuDisplay *, int head);  /* then head_closed */
     void     (*do_destroy)    (struct GemuDisplay *);
     void      *backend;
 };
@@ -80,6 +95,8 @@ bool     gemu_display_vnc_key_held(GemuDisplay *d, const char *name);
 typedef struct GemuMenu GemuMenu;
 /* The standard menu bar for this window; free with gemu_menu_free(). */
 GemuMenu *gemu_display_build_menubar(GemuDisplay *d);
+/* A detached monitor's window was closed: the head is back in View. */
+void      gemu_display_head_closed(GemuDisplay *d, int head);
 /* Text for the About box (multi-line). */
 const char *gemu_display_about_text(void);
 

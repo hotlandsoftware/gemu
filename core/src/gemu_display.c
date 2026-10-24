@@ -155,6 +155,76 @@ void gemu_display_set_paused(GemuDisplay *d, bool paused) {
     d->paused_title = paused;
 }
 
+/* ── Monitors ────────────────────────────────────────────────────────────── */
+
+void gemu_display_set_heads(GemuDisplay *d, const GemuDisplayHead *heads, int n) {
+    if (!d) return;
+    if (n > GEMU_DISPLAY_MAX_HEADS) n = GEMU_DISPLAY_MAX_HEADS;
+    for (int i = 0; i < n; i++) {
+        d->heads[i] = heads[i];
+        snprintf(d->head_names[i], sizeof(d->head_names[i]), "%s",
+                 heads[i].name ? heads[i].name : "Monitor");
+        d->heads[i].name = d->head_names[i];
+    }
+    d->n_heads = n;
+    d->head = 0;
+}
+
+int gemu_display_head(const GemuDisplay *d) {
+    return d ? d->head : 0;
+}
+
+bool gemu_display_head_detached(const GemuDisplay *d, int head) {
+    return d && head >= 0 && head < d->n_heads && d->head_detached[head];
+}
+
+bool gemu_display_head_shown(const GemuDisplay *d, int head) {
+    return d && (head == d->head || gemu_display_head_detached(d, head));
+}
+
+void gemu_display_render_head(GemuDisplay *d, int head, const uint32_t *argb, int w, int h) {
+    if (!d || !argb) return;
+    if (head == d->head)
+        gemu_display_render(d, argb, w, h);
+    else if (gemu_display_head_detached(d, head) && d->do_present_head)
+        d->do_present_head(d, head, argb, w, h);
+}
+
+/* Give a monitor its own window; the main window moves on to another
+ * monitor (there must be one left to show). */
+bool gemu_display_detach_head(GemuDisplay *d, int head) {
+    if (!d || !d->do_detach_head || head < 0 || head >= d->n_heads || d->head_detached[head])
+        return false;
+    int other = -1;
+    for (int i = 0; i < d->n_heads && other < 0; i++)
+        if (i != head && !d->head_detached[i]) other = i;
+    if (other < 0 || !d->do_detach_head(d, head)) return false;
+    d->head_detached[head] = true;
+    if (head == d->head) gemu_display_select_head(d, other);
+    return true;
+}
+
+void gemu_display_head_closed(GemuDisplay *d, int head) {
+    if (d && head >= 0 && head < d->n_heads) d->head_detached[head] = false;
+}
+
+/* Switch the window to another monitor, keeping its whole-number scale.
+ * A monitor already in a window of its own is brought to the front. */
+void gemu_display_select_head(GemuDisplay *d, int head) {
+    if (!d || head < 0 || head >= d->n_heads || head == d->head) return;
+    if (d->head_detached[head]) {
+        if (d->do_raise_head) d->do_raise_head(d, head);
+        return;
+    }
+    int scale = d->ui_get_scale ? d->ui_get_scale(d) : 0;
+    const GemuDisplayHead *h = &d->heads[head];
+    d->head = head;
+    if (d->do_set_geometry)
+        d->do_set_geometry(d, h->width, h->height, h->aspect_w, h->aspect_h);
+    if (scale > 0 && d->ui_set_scale)
+        d->ui_set_scale(d, scale);
+}
+
 uint32_t gemu_display_poll(GemuDisplay *d) {
     if (!d) return 0;
     d->held_prev   = d->held;

@@ -303,6 +303,27 @@ int gemu_video_sdl_shown_height(const GemuVideoSdl *v, int w) {
     return v ? (int)((long)w * v->aspect_h / v->aspect_w) : 0;
 }
 
+bool gemu_video_sdl_set_geometry(GemuVideoSdl *v, int w, int h, int aspect_w, int aspect_h) {
+    if (!v || w <= 0 || h <= 0) return false;
+    int aw = aspect_w > 0 && aspect_h > 0 ? aspect_w : w;
+    int ah = aspect_w > 0 && aspect_h > 0 ? aspect_h : h;
+    if (w == v->width && h == v->height && aw == v->aspect_w && ah == v->aspect_h)
+        return true;
+    SDL_Texture *t = SDL_CreateTexture(v->renderer, SDL_PIXELFORMAT_ARGB8888,
+                                       SDL_TEXTUREACCESS_STREAMING, w, h);
+    if (!t) return false;
+    SDL_DestroyTexture(v->texture);
+    v->texture = t;
+    if (v->scaled) { SDL_DestroyTexture(v->scaled); v->scaled = NULL; }
+    v->scaled_k = 0;
+    v->width = w;
+    v->height = h;
+    v->aspect_w = aw;
+    v->aspect_h = ah;
+    SDL_SetWindowMinimumSize(v->window, w < 160 ? w : 160, h < 100 ? h : 100);
+    return true;
+}
+
 SDL_Window *gemu_video_sdl_get_window(const GemuVideoSdl *v) {
     return v ? v->window : NULL;
 }

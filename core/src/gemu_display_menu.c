@@ -6,6 +6,7 @@
  *   Scale    window scale 1x-4x
  *   Input    one entry per input device (its bindings), reset bindings
  *   Debug    Hex Editor (machines that have one)
+ *   View     which monitor to show (machines with several)
  *   Help     About GEMU
  *
  * Actions go through the machine's monitor where possible, so the menus do
@@ -147,6 +148,31 @@ static void reset_bindings(void *ud, int arg) {
     gemu_display_reset_input_bindings(ud);
 }
 
+static bool head_is(void *ud, int head) {
+    return gemu_display_head(ud) == head;
+}
+
+static void select_head(void *ud, int head) {
+    gemu_display_select_head(ud, head);
+}
+
+static void detach_head(void *ud, int head) {
+    gemu_display_detach_head(ud, head);
+}
+
+static bool can_detach(void *ud, int head) {
+    GemuDisplay *d = ud;
+    if (!d->do_detach_head) return false;
+    for (int i = 0; i < d->n_heads; i++)
+        if (i != head && !d->head_detached[i]) return true;   /* one left for the main window */
+    return false;
+}
+
+static void close_head(void *ud, int head) {
+    GemuDisplay *d = ud;
+    if (d->do_close_head) d->do_close_head(d, head);
+}
+
 static void hex_editor(void *ud, int arg) {
     (void)arg;
     GemuDisplay *d = ud;
@@ -242,6 +268,30 @@ GemuMenu *gemu_display_build_menubar(GemuDisplay *d) {
     if (d->hex_toggle_cb) {
         GemuMenu *debug = gemu_menu_add_submenu(bar, "Debug");
         gemu_menu_add(debug, GEMU_MENU_ACTION, "Hex Editor", hex_editor, d, 0);
+    }
+
+    /* View: which monitor the window shows, on machines with several */
+    if (d->n_heads > 1) {
+        GemuMenu *view = gemu_menu_add_submenu(bar, "View");
+        char label[96];
+        for (int i = 0; i < d->n_heads; i++) {
+            snprintf(label, sizeof(label), "%s%s", d->heads[i].name,
+                     d->head_detached[i] ? " (own window)" : "");
+            it = gemu_menu_add(view, GEMU_MENU_RADIO, label, select_head, d, i);
+            it->checked = head_is;
+            if (i < 9) snprintf(it->shortcut, sizeof(it->shortcut), "Ctrl+Alt+%d", i + 1);
+        }
+        if (d->do_detach_head) {
+            gemu_menu_add_separator(view);
+            snprintf(label, sizeof(label), "Detach %s to new window", d->heads[d->head].name);
+            it = gemu_menu_add(view, GEMU_MENU_ACTION, label, detach_head, d, d->head);
+            it->enabled = can_detach;
+            for (int i = 0; i < d->n_heads; i++)
+                if (d->head_detached[i]) {
+                    snprintf(label, sizeof(label), "Close %s window", d->heads[i].name);
+                    gemu_menu_add(view, GEMU_MENU_ACTION, label, close_head, d, i);
+                }
+        }
     }
 
     if (d->ui_about) {

@@ -138,6 +138,31 @@ void gemu_display_render(GemuDisplay *d, const uint32_t *argb, int w, int h);
 void gemu_display_render_text(GemuDisplay *d, const char *text, int rows, int cols);
 void gemu_display_set_paused(GemuDisplay *d, bool paused);
 
+/* ── Monitors ────────────────────────────────────────────────────────────────
+ * A machine with several display adapters (e.g. an IBM PC with both an MDA
+ * and a CGA) registers one head per monitor, head 0 being the one the
+ * display was created with.  The window shows one head at a time, chosen
+ * from the View menu (or Ctrl+Alt+1..9, as in QEMU); the machine renders
+ * gemu_display_head() at that head's size. */
+#define GEMU_DISPLAY_MAX_HEADS 8
+typedef struct {
+    const char *name;                 /* e.g. "Monitor 2 (MDA)" */
+    int         width, height;        /* framebuffer size */
+    int         aspect_w, aspect_h;   /* shown shape; 0 = square pixels */
+} GemuDisplayHead;
+
+void gemu_display_set_heads(GemuDisplay *d, const GemuDisplayHead *heads, int n);
+int  gemu_display_head(const GemuDisplay *d);
+void gemu_display_select_head(GemuDisplay *d, int head);
+
+/* View > Detach: a monitor can also get a window of its own (closing it
+ * brings the monitor back).  Machines with several heads render every head
+ * gemu_display_head_shown() reports, each with gemu_display_render_head(). */
+bool gemu_display_head_shown(const GemuDisplay *d, int head);
+bool gemu_display_head_detached(const GemuDisplay *d, int head);
+void gemu_display_render_head(GemuDisplay *d, int head, const uint32_t *argb, int w, int h);
+bool gemu_display_detach_head(GemuDisplay *d, int head);
+
 /* ── Window titles ───────────────────────────────────────────────────────────
  *
  * Titles are the same for every machine, like QEMU's: "GEMU", or
