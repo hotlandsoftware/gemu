@@ -725,16 +725,18 @@ void input_menu_reset_keys(InputMenu *m) {
 /* ── Rendering ──────────────────────────────────────────────────────────── */
 
 /* Drawn as a dialog matching the window menu bar's (gemu_menubar_sdl.c):
- * title bar, cream body, IBM 8x16 font, navy selection. */
+ * Windows 3.1 frame and navy title bar, white body, IBM 8x16 font. */
 #define DLG_GLYPH_W 8
 #define DLG_GLYPH_H 16
-#define DLG_BG      0xFFFBF0
-#define DLG_TITLE   0xD6D8E6
-#define DLG_BORDER  0x404048
+#define DLG_BG      0xFFFFFF
+#define DLG_TITLE   0x000080
+#define DLG_TITLEFG 0xFFFFFF
+#define DLG_FRAME   0xC0C0C0
+#define DLG_BORDER  0x000000
 #define DLG_TEXT    0x000000
-#define DLG_HI      0x22407A
+#define DLG_HI      0x000080
 #define DLG_HITEXT  0xFFFFFF
-#define DLG_ACCENT  0x22407A
+#define DLG_ACCENT  0x000080
 #define DLG_HINT    0x8A2020
 
 static void dlg_fill(SDL_Renderer *r, int x, int y, int w, int h, uint32_t rgb) {
@@ -798,15 +800,15 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
     if (mw > w - 16 * s) mw = w - 16 * s;
     int mh = th + 10 * s + rows * lh + 10 * s;
     int mx = (w - mw) / 2, my = (h - mh) / 2;
-    dlg_fill(r, mx + 4 * s, my + 4 * s, mw, mh, 0x000000);           /* shadow */
+    int fb = 5 * s;                                                   /* 3.1 frame */
+    dlg_fill(r, mx - fb, my - fb, mw + 2 * fb, mh + 2 * fb, DLG_BORDER);
+    dlg_fill(r, mx - fb + s, my - fb + s, mw + 2 * fb - 2 * s, mh + 2 * fb - 2 * s, DLG_FRAME);
+    dlg_fill(r, mx - s, my - s, mw + 2 * s, mh + 2 * s, DLG_BORDER);
     dlg_fill(r, mx, my, mw, mh, DLG_BG);
     dlg_fill(r, mx, my, mw, th, DLG_TITLE);
     dlg_fill(r, mx, my + th, mw, s, DLG_BORDER);
-    SDL_SetRenderDrawColor(r, 0x40, 0x40, 0x48, 255);
-    for (int k = 0; k < s; k++)
-        SDL_RenderDrawRect(r, &(SDL_Rect){ mx + k, my + k, mw - 2 * k, mh - 2 * k });
     int tw = (int)strlen(title) * fw;
-    dlg_text(r, mx + (mw - tw > 0 ? (mw - tw) / 2 : 4 * s), my + 3 * s, title, DLG_TEXT, s);
+    dlg_text(r, mx + (mw - tw > 0 ? (mw - tw) / 2 : 4 * s), my + 3 * s, title, DLG_TITLEFG, s);
 
     int ty = my + th + 10 * s, tx = mx + 12 * s;
 

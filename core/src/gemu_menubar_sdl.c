@@ -34,15 +34,18 @@
 #define C_MENU_BG   0xF4F4EE
 #define C_MENU_FG   0x000000
 #define C_MENU_DIS  0x9A9A9A
-#define C_MENU_HI   0x22407A
+#define C_MENU_HI   0x000080
 #define C_MENU_HIFG 0xFFFFFF
 #define C_BORDER    0x404048
 #define C_SHADOW    0x000000
-#define C_DLG_TITLE 0xD6D8E6
-#define C_DLG_BG    0xFFFBF0
-#define C_BTN_FACE  0xCACACA
-#define C_BTN_LIGHT 0xF4F4F4
-#define C_BTN_DARK  0x707070
+/* Dialogs: the Windows 3.1 default colour scheme */
+#define C_DLG_TITLE 0x000080        /* active title bar */
+#define C_DLG_TITLEFG 0xFFFFFF
+#define C_DLG_BG    0xFFFFFF        /* window background */
+#define C_DLG_FRAME 0xC0C0C0        /* active border */
+#define C_BTN_FACE  0xC0C0C0
+#define C_BTN_LIGHT 0xFFFFFF
+#define C_BTN_DARK  0x808080
 
 typedef struct {
     GemuMenu *menu;
@@ -143,18 +146,38 @@ static void text(GemuMenubar *mb, SDL_Renderer *r, int x, int y, const char *s, 
     }
 }
 
-/* 3D button in the Windows 3.x style. */
+/* Dotted rectangle (the Windows focus indicator). */
+static void dotted_frame(SDL_Renderer *r, SDL_Rect rc, uint32_t rgb, int t) {
+    for (int x = rc.x; x < rc.x + rc.w; x += 2 * t) {
+        fill(r, x, rc.y, t, t, rgb);
+        fill(r, x, rc.y + rc.h - t, t, t, rgb);
+    }
+    for (int y = rc.y; y < rc.y + rc.h; y += 2 * t) {
+        fill(r, rc.x, y, t, t, rgb);
+        fill(r, rc.x + rc.w - t, y, t, t, rgb);
+    }
+}
+
+/* Windows 3.1 push button: black outline with the corners cut, a two-pixel
+ * white/grey bevel, a thicker outline on the default button and a dotted
+ * focus rectangle around the label. */
 static void button(GemuMenubar *mb, SDL_Renderer *r, SDL_Rect rc, const char *label, bool focus) {
-    int t = mb->scale;
-    fill(r, rc.x, rc.y, rc.w, rc.h, C_BTN_FACE);
-    fill(r, rc.x, rc.y, rc.w, t, C_BTN_LIGHT);
-    fill(r, rc.x, rc.y, t, rc.h, C_BTN_LIGHT);
-    fill(r, rc.x, rc.y + rc.h - t, rc.w, t, C_BTN_DARK);
-    fill(r, rc.x + rc.w - t, rc.y, t, rc.h, C_BTN_DARK);
-    frame(r, (SDL_Rect){ rc.x - t, rc.y - t, rc.w + 2 * t, rc.h + 2 * t }, C_BORDER, t);
-    if (focus) frame(r, (SDL_Rect){ rc.x + 3 * t, rc.y + 3 * t, rc.w - 6 * t, rc.h - 6 * t }, C_BTN_DARK, 1);
-    text(mb, r, rc.x + (rc.w - text_w(mb, label)) / 2, rc.y + (rc.h - GLYPH_H * mb->scale) / 2,
-         label, C_MENU_FG);
+    int t = mb->scale, b = focus ? 2 * t : t;
+    fill(r, rc.x + t, rc.y, rc.w - 2 * t, b, 0x000000);              /* outline */
+    fill(r, rc.x + t, rc.y + rc.h - b, rc.w - 2 * t, b, 0x000000);
+    fill(r, rc.x, rc.y + t, b, rc.h - 2 * t, 0x000000);
+    fill(r, rc.x + rc.w - b, rc.y + t, b, rc.h - 2 * t, 0x000000);
+    SDL_Rect in = { rc.x + b, rc.y + b, rc.w - 2 * b, rc.h - 2 * b };
+    fill(r, in.x, in.y, in.w, in.h, C_BTN_FACE);
+    fill(r, in.x, in.y, in.w - t, 2 * t, C_BTN_LIGHT);               /* bevel */
+    fill(r, in.x, in.y, 2 * t, in.h - t, C_BTN_LIGHT);
+    fill(r, in.x + t, in.y + in.h - 2 * t, in.w - t, 2 * t, C_BTN_DARK);
+    fill(r, in.x + in.w - 2 * t, in.y + t, 2 * t, in.h - t, C_BTN_DARK);
+    int tw = text_w(mb, label), tx = rc.x + (rc.w - tw) / 2;
+    int ty = rc.y + (rc.h - GLYPH_H * t) / 2;
+    text(mb, r, tx, ty, label, C_MENU_FG);
+    if (focus)
+        dotted_frame(r, (SDL_Rect){ tx - 2 * t, ty, tw + 4 * t, GLYPH_H * t }, 0x000000, t);
 }
 
 /* ── Model / state ───────────────────────────────────────────────────────── */
@@ -280,15 +303,25 @@ static void draw_dialog_frame(GemuMenubar *mb, SDL_Renderer *r, int w, int h) {
     int x = (mb->out_w - w) / 2, y = (mb->out_h - h) / 2;
     if (y < gemu_menubar_height(mb->out_h)) y = gemu_menubar_height(mb->out_h);
     mb->dlg_rect = (SDL_Rect){ x, y, w, h };
-    fill(r, x + 4 * sc, y + 4 * sc, w, h, C_SHADOW);
+    /* Windows 3.1 dialog frame, drawn outside dlg_rect: black outline, a
+     * grey border band, then a black line around the title and client. */
+    int fw = 5 * sc;
+    fill(r, x - fw, y - fw, w + 2 * fw, h + 2 * fw, 0x000000);
+    fill(r, x - fw + sc, y - fw + sc, w + 2 * fw - 2 * sc, h + 2 * fw - 2 * sc, C_DLG_FRAME);
+    frame(r, (SDL_Rect){ x - sc, y - sc, w + 2 * sc, h + 2 * sc }, 0x000000, sc);
     fill(r, x, y, w, h, C_DLG_BG);
     int th = (GLYPH_H + 6) * sc;
     fill(r, x, y, w, th, C_DLG_TITLE);
-    fill(r, x, y + th, w, sc, C_BORDER);
-    frame(r, mb->dlg_rect, C_BORDER, sc);
-    /* the little close box, as in the screenshots this is modelled on */
-    frame(r, (SDL_Rect){ x + 4 * sc, y + 4 * sc, th - 8 * sc, th - 8 * sc }, C_BORDER, sc);
-    text(mb, r, x + (w - text_w(mb, mb->dlg_title)) / 2, y + 3 * sc, mb->dlg_title, C_MENU_FG);
+    fill(r, x, y + th, w, sc, 0x000000);
+    /* system-menu box: grey square with the "spacebar" dash */
+    fill(r, x, y, th, th, C_DLG_FRAME);
+    fill(r, x + th, y, sc, th, 0x000000);
+    int dw = th / 2, dx = x + (th - dw) / 2, dy = y + th / 2 - sc;
+    fill(r, dx + sc, dy + sc, dw, 3 * sc, C_BTN_DARK);
+    fill(r, dx, dy, dw, 3 * sc, C_BTN_LIGHT);
+    frame(r, (SDL_Rect){ dx, dy, dw, 3 * sc }, 0x000000, sc);
+    text(mb, r, x + th + (w - th - text_w(mb, mb->dlg_title)) / 2, y + 3 * sc,
+         mb->dlg_title, C_DLG_TITLEFG);
 }
 
 static void draw_about(GemuMenubar *mb, SDL_Renderer *r) {
@@ -336,7 +369,7 @@ static void draw_file(GemuMenubar *mb, SDL_Renderer *r) {
 
     mb->list_rect = (SDL_Rect){ x, y, cw, rows * lh };
     fill(r, x, y, cw, rows * lh, 0xFFFFFF);
-    frame(r, (SDL_Rect){ x - sc, y - sc, cw + 2 * sc, rows * lh + 2 * sc }, C_BTN_DARK, sc);
+    frame(r, (SDL_Rect){ x - sc, y - sc, cw + 2 * sc, rows * lh + 2 * sc }, 0x000000, sc);
     if (mb->file_sel < mb->file_top) mb->file_top = mb->file_sel;
     if (mb->file_sel >= mb->file_top + rows) mb->file_top = mb->file_sel - rows + 1;
     for (int i = 0; i < rows && mb->file_top + i < mb->n_files; i++) {
