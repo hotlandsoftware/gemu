@@ -130,7 +130,7 @@ int ia64_setup(int argc, char *argv[]) {
     Ia64Config cfg = {
         .ram_size = 512ull << 20,
         .display_type = GEMU_DISPLAY_SDL,
-        .display_scale = 1,
+        .display_scale = 0,          /* 0 = 1x unless -scale */
     };
     GemuArgs args = {
         .display_type = cfg.display_type,

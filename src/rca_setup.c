@@ -167,7 +167,7 @@ int rca_setup(int argc, char *argv[]) {
         .keyboard      = RCA_KEYBOARD_VP601,
         .sound_hw      = RCA_SOUND_NONE,
         .display_type  = GEMU_DISPLAY_SDL,
-        .display_scale = 4,
+        .display_scale = 0,          /* 0 = 1x unless -scale */
     };
 
     GemuArgs args = {

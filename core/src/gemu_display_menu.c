@@ -3,7 +3,7 @@
  *
  *   Machine  Pause, Reset, Screenshot, Quit
  *   Blocks   one submenu per monitor media device: Change..., Eject, Flip
- *   View     window scale
+ *   Scale    window scale 1x-4x
  *   Input    one entry per input device (its bindings), reset bindings
  *   Debug    Hex Editor (machines that have one)
  *   Help     About GEMU
@@ -125,7 +125,7 @@ static const char *base_name(const char *path) {
     return b;
 }
 
-/* ── View / Input / Help ─────────────────────────────────────────────────── */
+/* ── Scale / Input / Help ────────────────────────────────────────────────── */
 
 static bool scale_is(void *ud, int scale) {
     GemuDisplay *d = ud;
@@ -214,7 +214,7 @@ GemuMenu *gemu_display_build_menubar(GemuDisplay *d) {
     }
 
     if (d->ui_set_scale) {
-        GemuMenu *view = gemu_menu_add_submenu(bar, "View");
+        GemuMenu *view = gemu_menu_add_submenu(bar, "Scale");
         for (int s = 1; s <= 4; s++) {
             char label[16];
             snprintf(label, sizeof(label), "%dx", s);

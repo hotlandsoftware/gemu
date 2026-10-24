@@ -303,7 +303,7 @@ GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
         .title    = initial_title,
         .width    = cfg->fb_width,
         .height   = cfg->fb_height,
-        .scale    = cfg->scale ? cfg->scale : 2,
+        .scale    = cfg->scale ? cfg->scale : 1,
         .window_width  = cfg->window_width,
         .window_height = cfg->window_height,
         .aspect_w = cfg->aspect_w,

@@ -454,7 +454,7 @@ int mos_setup(int argc, char *argv[]) {
         .vga          = MOS_VGA_NONE,
         .display_type = GEMU_DISPLAY_NONE,
         .display_renderer = GEMU_RENDERER_AUTO,
-        .display_scale = 1,
+        .display_scale = 0,          /* 0 = 1x unless -scale */
     };
 
     GemuArgs args = {

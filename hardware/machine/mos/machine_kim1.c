@@ -1378,8 +1378,9 @@ Kim1State *kim1_create(const MosConfig *cfg) {
                 .fb_width    = KIM1_FB_WIDTH,
                 .fb_height   = KIM1_FB_HEIGHT,
                 .scale       = cfg->display_scale,
-                .window_width  = KIM1_PRESENT_WIDTH,
-                .window_height = KIM1_PRESENT_HEIGHT,
+                /* the panel's natural size, unless -scale was given */
+                .window_width  = cfg->display_scale ? 0 : KIM1_PRESENT_WIDTH,
+                .window_height = cfg->display_scale ? 0 : KIM1_PRESENT_HEIGHT,
                 .renderer    = cfg->display_renderer,
                 .actions     = kim1_actions,
                 .n_actions   = KIM1_NUM_ACTIONS,

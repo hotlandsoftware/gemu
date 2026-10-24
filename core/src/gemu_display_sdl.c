@@ -54,6 +54,13 @@ typedef struct {
     bool   mouse_captured;
     bool   capture_pointer;
     bool   saw_mouse_motion;
+
+    /* Window size asked for at creation.  Some setups (sdl2-compat on
+     * Wayland with fractional scaling) apply the create-time size in device
+     * pixels, so it's re-applied once the window is shown - by then
+     * SDL_SetWindowSize uses the same units as the Scale menu. */
+    int    want_w, want_h;
+    int    size_fixups;
 } SdlBackend;
 
 /* ── Binding table ───────────────────────────────────────────────────────── */
@@ -314,6 +321,17 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             break;
 
         case SDL_WINDOWEVENT:
+            if ((ev.window.event == SDL_WINDOWEVENT_SHOWN ||
+                 ev.window.event == SDL_WINDOWEVENT_EXPOSED) && b->size_fixups < 2) {
+                SDL_Window *win = gemu_video_sdl_get_window(b->video);
+                int cw = 0, ch = 0;
+                b->size_fixups++;
+                if (win && ev.window.windowID == SDL_GetWindowID(win)) {
+                    SDL_GetWindowSize(win, &cw, &ch);
+                    if (cw != b->want_w || ch != b->want_h)
+                        SDL_SetWindowSize(win, b->want_w, b->want_h);
+                }
+            }
             if (ev.window.event == SDL_WINDOWEVENT_CLOSE) {
                 /* Only quit if it's the main (NES) window being closed.
                  * Closing a secondary window (e.g. ROB display) must not
@@ -555,11 +573,14 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     b->capture_pointer = cfg->capture_pointer;
 
     int w = cfg->fb_width,  h = cfg->fb_height;
-    int ww = cfg->window_width  ? cfg->window_width  : w * (cfg->scale ? cfg->scale : 2);
-    int wh = cfg->window_height ? cfg->window_height : h * (cfg->scale ? cfg->scale : 2);
+    /* 1x unless -scale (or the machine) asks for more */
+    int ww = cfg->window_width  ? cfg->window_width  : w * (cfg->scale ? cfg->scale : 1);
+    int wh = cfg->window_height ? cfg->window_height : h * (cfg->scale ? cfg->scale : 1);
     if (!cfg->window_height && cfg->aspect_w > 0 && cfg->aspect_h > 0)
         wh = ww * cfg->aspect_h / cfg->aspect_w;    /* e.g. 720x350 -> 720x540 at 4:3 */
     wh += gemu_menubar_height(wh);                  /* the menu bar sits above the picture */
+    b->want_w = ww;
+    b->want_h = wh;
 
     b->video = gemu_video_sdl_create(&(GemuVideoSdlSpec){
         .title         = initial_title,

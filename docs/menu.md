@@ -9,8 +9,8 @@ VNC clients (`-vnc`) and `screendump` see just the emulated screen.
 |---------|-------|
 | Machine | Pause, Reset, Screenshot (`gemu-YYYYMMDD-HHMMSS.png`), Quit |
 | Blocks  | one submenu per drive (`floppy0: disk.img`): Change..., Eject, Flip disk |
-| View    | window scale 1x-4x (you can also drag the window edges) |
-| Input   | Configure keys and controller..., Reset bindings to defaults (SDL) |
+| Scale   | window scale 1x-4x (you can also drag the window edges); starts at 1x unless `-scale N` |
+| Input   | one entry per input device (`nes-controller`, `nes-controller (2)`, ...) to remap its keys and controller; Reset bindings to defaults. Hidden when the machine has no remappable input (SDL) |
 | Debug   | Hex Editor (machines that have one) |
 | Help    | About GEMU |
 

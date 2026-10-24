@@ -125,7 +125,7 @@ core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
   `GemuArgsDef.block_devices`; machines claim drives with `gemu_drive_get()`,
   register them with `gemu_drive_attach_monitor()`, and setups call
   `gemu_drive_check_unclaimed()`. User docs: `docs/drive.md`.
-- Window menu bar (Machine/Blocks/View/Input/Debug/Help): one model,
+- Window menu bar (Machine/Blocks/Scale/Input/Debug/Help): one model,
   `gemu_display_build_menubar()` (`core/src/gemu_display_menu.c`, types in
   `gemu/menu.h`). SDL draws it inside the window above the picture
   (`gemu_menubar_sdl.c`, never on VNC); GTK turns it into a GtkMenuBar

@@ -53,7 +53,7 @@ int chip8_setup(int argc, char *argv[]) {
         .mem_size      = CHIP8_MEM_SIZE,
         .cpu_hz        = 0,
         .display_type  = GEMU_DISPLAY_SDL,
-        .display_scale = 10,
+        .display_scale = 0,          /* 0 = 1x unless -scale */
         .quirk_shift   = false,
         .quirk_jump    = false,
         .fg_argb       = 0,
