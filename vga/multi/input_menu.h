@@ -40,6 +40,12 @@ void input_menu_destroy(InputMenu *menu);
 bool input_menu_toggle(InputMenu *menu);
 /* Open straight onto the key/controller binding page (Input > Configure). */
 void input_menu_open_input(InputMenu *menu);
+/* The binding pages (one per input device) and opening one directly, for
+ * the window menu's Input submenu.  Labels number repeated device names:
+ * "nes-controller", "nes-controller (2)". */
+int  input_menu_page_count(const InputMenu *menu);
+void input_menu_page_label(const InputMenu *menu, int page, char *buf, size_t len);
+void input_menu_open_page(InputMenu *menu, int page);
 bool input_menu_event_opens(const InputMenu *menu, const SDL_Event *ev);
 void input_menu_reset_keys(InputMenu *menu);
 

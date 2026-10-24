@@ -506,9 +506,19 @@ static void ui_choose_file(GemuDisplay *d, const char *title,
     gemu_menubar_choose_file(b->menubar, title, done, ud);
 }
 
-static void ui_input_config(GemuDisplay *d) {
+static int ui_input_pages(GemuDisplay *d) {
     SdlBackend *b = d->backend;
-    input_menu_open_input(b->menu);
+    return input_menu_page_count(b->menu);
+}
+
+static void ui_input_page_label(GemuDisplay *d, int page, char *buf, size_t len) {
+    SdlBackend *b = d->backend;
+    input_menu_page_label(b->menu, page, buf, len);
+}
+
+static void ui_input_config(GemuDisplay *d, int page) {
+    SdlBackend *b = d->backend;
+    input_menu_open_page(b->menu, page);
 }
 
 /* Window scale = window width / framebuffer width (0 if not a whole
@@ -637,7 +647,11 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     d->ui_choose_file = ui_choose_file;
     d->ui_get_scale   = ui_get_scale;
     d->ui_set_scale   = ui_set_scale;
-    if (b->menu) d->ui_input_config = ui_input_config;
+    if (b->menu) {
+        d->ui_input_pages      = ui_input_pages;
+        d->ui_input_page_label = ui_input_page_label;
+        d->ui_input_config     = ui_input_config;
+    }
     b->menubar = gemu_menubar_create(d);
     gemu_video_sdl_set_top_margin(b->video, gemu_menubar_height);
     gemu_video_sdl_set_overlay(b->video, menu_overlay_cb, b);

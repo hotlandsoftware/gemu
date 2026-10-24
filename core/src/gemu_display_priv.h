@@ -34,7 +34,10 @@ struct GemuDisplay {
     void (*ui_choose_file)(struct GemuDisplay *, const char *title,
                            void (*done)(void *ud, const char *path), void *ud);
     void (*ui_about)(struct GemuDisplay *);
-    void (*ui_input_config)(struct GemuDisplay *);
+    /* Input devices (binding pages): count, menu label, open one */
+    int  (*ui_input_pages)(struct GemuDisplay *);
+    void (*ui_input_page_label)(struct GemuDisplay *, int page, char *buf, size_t len);
+    void (*ui_input_config)(struct GemuDisplay *, int page);
 
     /* VNC mirroring/input (gemu_display_vnc.c); NULL without -vnc */
     struct GemuDisplayVnc *vnc;

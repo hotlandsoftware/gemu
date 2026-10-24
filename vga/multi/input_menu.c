@@ -777,10 +777,11 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
         rows = m->page == MENU_BINDING_OPTIONS ? 3 : 2;
     } else {
         if (m->list == MENU_LIST_INPUT) {
-            const char *pname = page_title(m, m->input_page);
+            char pname[96];
+            input_menu_page_label(m, m->input_page, pname, sizeof(pname));
             if (m->input_page_count > 1)
-                snprintf(title_buf, sizeof(title_buf), "Input: %s (%d/%d, Left/Right for more)",
-                         pname, m->input_page + 1, m->input_page_count);
+                snprintf(title_buf, sizeof(title_buf), "Input: %s  (Left/Right: other devices)",
+                         pname);
             else
                 snprintf(title_buf, sizeof(title_buf), "Input: %s", pname);
             title = title_buf;
@@ -1174,8 +1175,26 @@ void input_menu_destroy(InputMenu *m) {
 }
 
 void input_menu_open_input(InputMenu *m) {
+    input_menu_open_page(m, 0);
+}
+
+int input_menu_page_count(const InputMenu *m) {
+    if (!m || m->n_buttons == 0) return 0;
+    return m->n_pages > 0 ? m->n_pages : 1;
+}
+
+void input_menu_page_label(const InputMenu *m, int page, char *buf, size_t len) {
+    const char *name = page_title(m, page);
+    int nth = 1;                    /* which occurrence of this name it is */
+    for (int p = 0; p < page; p++)
+        if (strcmp(page_title(m, p), name) == 0) nth++;
+    if (nth > 1) snprintf(buf, len, "%s (%d)", name, nth);
+    else         snprintf(buf, len, "%s", name);
+}
+
+void input_menu_open_page(InputMenu *m, int page) {
     if (!m) return;
-    m->input_page = 0;
+    m->input_page = page;
     build_input_menu(m);
     m->page = MENU_MAIN;
     m->selected = 0;

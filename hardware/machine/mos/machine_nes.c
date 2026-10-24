@@ -107,6 +107,11 @@ static const GemuInputPage nes_fc2mic_pages[] = {
     { "famicom-mic",    7 },   /* P2: A, B, Up, Down, Left, Right, Send Mic */
 };
 
+static const GemuInputPage nes_2p_pages[] = {
+    { "nes-controller", 8 },   /* P1 */
+    { "nes-controller", 8 },   /* P2 */
+};
+
 static const GemuActionDef nes_2p_actions[NES_2P_N_ACTIONS] = {
     { "A",        GEMU_ACTION(0),  "z"           },
     { "B",        GEMU_ACTION(1),  "x"           },
@@ -2245,8 +2250,8 @@ NesState *nes_create(const MosConfig *cfg) {
             n_acts  = VS_NES_N_ACTIONS;
             ini_sec = "vssmb";
         } else if (two_controllers) {
-            acts   = nes_2p_actions;
-            n_acts = NES_2P_N_ACTIONS;
+            acts      = nes_2p_actions; n_acts  = NES_2P_N_ACTIONS;
+            act_pages = nes_2p_pages;   n_pages = 2;
         } else if (has_fc2_mic) {
             acts      = nes_fc2mic_actions; n_acts  = NES_FC2MIC_N_ACTIONS;
             act_pages = nes_fc2mic_pages;   n_pages = 2;

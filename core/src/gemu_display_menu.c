@@ -4,7 +4,7 @@
  *   Machine  Pause, Reset, Screenshot, Quit
  *   Blocks   one submenu per monitor media device: Change..., Eject, Flip
  *   View     window scale
- *   Input    configure keys/controller, reset bindings
+ *   Input    one entry per input device (its bindings), reset bindings
  *   Debug    Hex Editor (machines that have one)
  *   Help     About GEMU
  *
@@ -137,10 +137,9 @@ static void set_scale(void *ud, int scale) {
     if (d->ui_set_scale) d->ui_set_scale(d, scale);
 }
 
-static void input_config(void *ud, int arg) {
-    (void)arg;
+static void input_config(void *ud, int page) {
     GemuDisplay *d = ud;
-    if (d->ui_input_config) d->ui_input_config(d);
+    if (d->ui_input_config) d->ui_input_config(d, page);
 }
 
 static void reset_bindings(void *ud, int arg) {
@@ -163,11 +162,10 @@ static void about(void *ud, int arg) {
 const char *gemu_display_about_text(void) {
     return "GEMU " GEMU_VERSION_STR " - Generic EMUlator\n"
            "\n"
-           "A multi-machine emulator with QEMU's command line,\n"
-           "monitor and QMP.\n"
+           "Emulating everything in existence!\n"
            "\n"
            "Build date: " __DATE__ "\n"
-           "Monitor: 'help' lists every command.";
+           "Type 'help' in monitor for commands.";
 }
 
 /* ── The bar ─────────────────────────────────────────────────────────────── */
@@ -225,10 +223,18 @@ GemuMenu *gemu_display_build_menubar(GemuDisplay *d) {
         }
     }
 
-    if (d->ui_input_config || d->do_reset_input_bindings) {
+    /* Input: one entry per input device (its key/controller bindings);
+     * no tab at all when the machine has no remappable input. */
+    int n_inputs = d->ui_input_pages ? d->ui_input_pages(d) : 0;
+    if (n_inputs > 0) {
         GemuMenu *input = gemu_menu_add_submenu(bar, "Input");
-        if (d->ui_input_config)
-            gemu_menu_add(input, GEMU_MENU_ACTION, "Configure keys and controller...", input_config, d, 0);
+        for (int i = 0; i < n_inputs; i++) {
+            char label[96];
+            d->ui_input_page_label(d, i, label, sizeof(label));
+            gemu_menu_add(input, GEMU_MENU_ACTION, label, input_config, d, i);
+        }
+        if (d->do_reset_input_bindings)
+            gemu_menu_add_separator(input);
         if (d->do_reset_input_bindings)
             gemu_menu_add(input, GEMU_MENU_ACTION, "Reset bindings to defaults", reset_bindings, d, 0);
     }
