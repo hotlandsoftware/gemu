@@ -276,6 +276,30 @@ static void sdl_do_close_head(GemuDisplay *d, int head) {
     gemu_display_head_closed(d, head);
 }
 
+/* The window an event is for (0 = none, e.g. controller events). */
+static Uint32 event_window(const SDL_Event *ev) {
+    switch (ev->type) {
+    case SDL_WINDOWEVENT:     return ev->window.windowID;
+    case SDL_KEYDOWN:
+    case SDL_KEYUP:           return ev->key.windowID;
+    case SDL_TEXTINPUT:       return ev->text.windowID;
+    case SDL_MOUSEMOTION:     return ev->motion.windowID;
+    case SDL_MOUSEBUTTONDOWN:
+    case SDL_MOUSEBUTTONUP:   return ev->button.windowID;
+    case SDL_MOUSEWHEEL:      return ev->wheel.windowID;
+    default:                  return 0;
+    }
+}
+
+/* A detached monitor's window (keys typed there go to the guest). */
+static bool own_window(const SdlBackend *b, Uint32 id) {
+    for (int i = 0; i < GEMU_DISPLAY_MAX_HEADS; i++) {
+        SDL_Window *w = gemu_video_sdl_get_window(b->head_video[i]);
+        if (w && SDL_GetWindowID(w) == id) return true;
+    }
+    return false;
+}
+
 /* The detached monitor whose window an event is for, or -1. */
 static int event_head(const SdlBackend *b, const SDL_Event *ev) {
     Uint32 id;
@@ -354,6 +378,11 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
                 sdl_do_close_head(d, dh);
             continue;
         }
+        /* Some other window of ours (e.g. the hex editor, which reads its
+         * own events with an SDL event watch): not for the guest. */
+        Uint32 ev_win = event_window(&ev);
+        if (ev_win && win && ev_win != SDL_GetWindowID(win) && !own_window(b, ev_win))
+            continue;
 
         /* The binding screen swallows all events while open */
         if (menu_open) {

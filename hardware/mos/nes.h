@@ -9,9 +9,7 @@
 #  include "apu_midi.h"
 #endif
 #include "gemu/monitor.h"
-#if defined(GEMU_GTK) || defined(_WIN32)
-#  include "hex_editor.h"
-#endif
+#include "hex_editor.h"
 #ifdef HAVE_ROB
 #  include "rob.h"
 #  include "rob_window.h"
@@ -194,10 +192,8 @@ typedef struct NesState {
     bool     fds_enabled;
     FdsState fds;
 
-    /* Hex editor (GTK only) */
-#if defined(GEMU_GTK) || defined(_WIN32)
+    /* Debug > Hex Editor */
     HexEditor *hex_editor;
-#endif
 
     /* -device crt: NTSC composite encode+decode (see crt/nes_ntsc_encode.h,
      * crt/ntsc_decode.h). crt_signal is the oversampled composite scratch

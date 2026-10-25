@@ -1,8 +1,8 @@
 #pragma once
-/* Two independent implementations share this API: hardware/device/hex_editor.c (GTK,
- * used when GEMU_GTK) and hardware/device/hex_editor_win32.c (plain Win32, used when
- * _WIN32 && !GEMU_GTK). Exactly one is compiled into any given build. */
-#if defined(GEMU_GTK) || defined(_WIN32)
+/* Three implementations share this API: hardware/device/hex_editor.c (GTK,
+ * used when GEMU_GTK), hardware/device/hex_editor_win32.c (plain Win32, used
+ * when _WIN32 && !GEMU_GTK) and hardware/device/hex_editor_sdl.c (an SDL
+ * window, everywhere else). Exactly one is compiled into any given build. */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -39,4 +39,4 @@ bool hex_editor_is_visible(const HexEditor *he);
  * loop every frame - it will only redraw when the window is visible. */
 void hex_editor_refresh(HexEditor *he);
 
-#endif /* GEMU_GTK || _WIN32 */
+

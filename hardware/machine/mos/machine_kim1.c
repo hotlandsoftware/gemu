@@ -4,9 +4,7 @@
 #include "kim1.h"
 #include "gemu/util.h"
 #include "wozmon_rom.h"
-#if defined(GEMU_GTK) || defined(_WIN32)
 #  include "hex_editor.h"
-#endif
 #include <SDL2/SDL.h>
 #include <errno.h>
 #include <stdio.h>
@@ -26,7 +24,6 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud);
 static void kim1_update_monitor_display(Kim1State *s);
 static void kim1_panel_command(Kim1State *s, uint8_t key);
 
-#if defined(GEMU_GTK) || defined(_WIN32)
 static void kim1_hex_toggle(void *ud) {
     Kim1State *s = ud;
     if (!s->hex_editor) return;
@@ -35,7 +32,6 @@ static void kim1_hex_toggle(void *ud) {
     else
         hex_editor_show(s->hex_editor);
 }
-#endif
 
 /* ── KIM-1 keypad action table ──────────────────────────────────────────── */
 
@@ -1246,7 +1242,6 @@ static void kim1_mon_cpu_state(void *ud, char *buf, size_t len) {
     mos6502_format_state(&s->cpu, buf, len);
 }
 
-#if defined(GEMU_GTK) || defined(_WIN32)
 static GemuMonCmd kim1_cmd_hexeditor(GemuMonitor *mon, const char *args, void *ud) {
     Kim1State *s = ud;
     (void)args;
@@ -1257,7 +1252,6 @@ static GemuMonCmd kim1_cmd_hexeditor(GemuMonitor *mon, const char *args, void *u
     kim1_hex_toggle(s);
     return GEMU_MON_NONE;
 }
-#endif
 
 /* ── ROM loading ─────────────────────────────────────────────────────────── */
 
@@ -1336,9 +1330,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         .read = kim1_mon_read, .write = kim1_mon_write, .ud = s,
         .addr_bits = 16, .big_endian = false });
     gemu_monitor_set_cpu_state_cb(s->monitor, kim1_mon_cpu_state, s);
-#if defined(GEMU_GTK) || defined(_WIN32)
     gemu_monitor_bind(s->monitor, "hexeditor", kim1_cmd_hexeditor, s);
-#endif
 
     mos6502_init(&s->cpu);
     s->cpu.mem_read  = kim1_mem_read;
@@ -1366,13 +1358,11 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     }
 
     if (gemu_display_wanted(cfg->display_type)) {
-#if defined(GEMU_GTK) || defined(_WIN32)
         GemuDisplayGtkExtras gtk_extras = {
             .monitor       = s->monitor,
             .hex_toggle_cb = kim1_hex_toggle,
             .hex_toggle_ud = s,
         };
-#endif
         s->display = gemu_display_create(cfg->display_type,
             &(GemuDisplayConfig){
                 .fb_width    = KIM1_FB_WIDTH,
@@ -1386,9 +1376,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
                 .n_actions   = KIM1_NUM_ACTIONS,
                 .ini_section = "kim-keypad",
                 .no_rebind   = true,
-#if defined(GEMU_GTK) || defined(_WIN32)
                 .gtk         = &gtk_extras,
-#endif
             });
         if (!s->display)
             fprintf(stderr, "gemu-kim1: failed to create display window\n");
@@ -1411,10 +1399,9 @@ Kim1State *kim1_create(const MosConfig *cfg) {
 
 #if defined(GEMU_GTK)
     if (cfg->display_type == GEMU_DISPLAY_GTK) {
-#elif defined(_WIN32)
-    if (cfg->display_type == GEMU_DISPLAY_SDL) {
+#else
+    if (cfg->display_type == GEMU_DISPLAY_SDL) {     /* Win32 or SDL hex editor */
 #endif
-#if defined(GEMU_GTK) || defined(_WIN32)
         HexRegion kim1_regions[5] = {
             { "RAM ($0000-$03FF)",      s->ram,      sizeof(s->ram),      false, 0x0000u },
             { "RRIOT RAM ($1780-$17FF)",s->rriot_ram,sizeof(s->rriot_ram),false, 0x1780u },
@@ -1433,7 +1420,6 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         }
         s->hex_editor = hex_editor_create(kim1_regions, n_regions);
     }
-#endif /* GEMU_GTK || _WIN32 */
 
     kim1_reset_rriots(s);
     s->serial = cfg->serial;
@@ -1446,9 +1432,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
 }
 
 void kim1_destroy(Kim1State *s) {
-#if defined(GEMU_GTK) || defined(_WIN32)
     hex_editor_destroy(s->hex_editor);
-#endif
     gemu_display_destroy(s->display);
     gemu_monitor_destroy(s->monitor);
     free(s->ext_ram);
@@ -1540,9 +1524,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
                                 KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
         }
 
-#if defined(GEMU_GTK) || defined(_WIN32)
         hex_editor_refresh(s->hex_editor);
-#endif
 
         gemu_sleep_ms(KIM1_FRAME_MS);
     }

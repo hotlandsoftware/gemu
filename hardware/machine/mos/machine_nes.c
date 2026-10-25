@@ -273,18 +273,14 @@ static bool nes_device_is_rob(NesDeviceType dev) {
     return dev == NES_DEVICE_ROB || dev == NES_DEVICE_ROB_FAMICOM;
 }
 
-/* Debug > Hex Editor menu callback (GTK or native Win32; no-op otherwise). */
+/* Debug > Hex Editor menu callback. */
 static void nes_hex_toggle(void *ud) {
-#if defined(GEMU_GTK) || defined(_WIN32)
     NesState *s = ud;
     if (!s->hex_editor) return;
     if (hex_editor_is_visible(s->hex_editor))
         hex_editor_hide(s->hex_editor);
     else
         hex_editor_show(s->hex_editor);
-#else
-    (void)ud;
-#endif
 }
 
 /* ── Battery-backed SRAM persistence ────────────────────────────────────── */
@@ -2192,10 +2188,9 @@ NesState *nes_create(const MosConfig *cfg) {
     gemu_monitor_set_screendump_cb(s->monitor, nes_screendump, s);
 #if defined(GEMU_GTK)
     if (cfg->display_type == GEMU_DISPLAY_GTK) {
-#elif defined(_WIN32)
-    if (cfg->display_type == GEMU_DISPLAY_SDL) {
+#else
+    if (cfg->display_type == GEMU_DISPLAY_SDL) {     /* Win32 or SDL hex editor */
 #endif
-#if defined(GEMU_GTK) || defined(_WIN32)
         HexRegion nes_regions[] = {
             { "CPU RAM ($0000-$07FF)", s->ram,
               sizeof(s->ram), false, 0x0000 },
@@ -2208,7 +2203,6 @@ NesState *nes_create(const MosConfig *cfg) {
         };
         s->hex_editor = hex_editor_create(nes_regions, 3);
     }
-#endif /* GEMU_GTK || _WIN32 */
     if (s->fds_enabled) {
         GemuMediaDevice floppy_dev = {
             .name   = "floppy",
@@ -2357,9 +2351,7 @@ void nes_destroy(NesState *s) {
     nes_lua_destroy(s->lua);
 #endif
     if (s->fds_enabled) { free(s->fds.raw_disk); }
-#if defined(GEMU_GTK) || defined(_WIN32)
     hex_editor_destroy(s->hex_editor);
-#endif
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     apu_midi_close(&s->apu_midi);
 #endif
@@ -2432,9 +2424,7 @@ static bool nes_save_snapshot(NesState *s, const char *path) {
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     snap->apu_midi.out = NULL;
 #endif
-#if defined(GEMU_GTK) || defined(_WIN32)
     snap->hex_editor = NULL;
-#endif
 #ifdef HAVE_ROB
     snap->rob_window = NULL;
 #endif
@@ -2514,9 +2504,7 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     MidiOut *apu_midi_out = s->apu_midi.out;
 #endif
-#if defined(GEMU_GTK) || defined(_WIN32)
     HexEditor *hex_editor = s->hex_editor;
-#endif
 #ifdef HAVE_ROB
     RobWindow *rob_window = s->rob_window;
 #endif
@@ -2547,9 +2535,7 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     s->apu_midi.out = apu_midi_out;
 #endif
-#if defined(GEMU_GTK) || defined(_WIN32)
     s->hex_editor = hex_editor;
-#endif
 #ifdef HAVE_ROB
     s->rob_window = rob_window;
 #endif
@@ -2791,12 +2777,11 @@ static GemuMonCmd nes_cmd_ppudump(GemuMonitor *mon, const char *args, void *ud) 
     return GEMU_MON_NONE;
 }
 
-#if defined(GEMU_GTK) || defined(_WIN32)
 static GemuMonCmd nes_cmd_hexeditor(GemuMonitor *mon, const char *args, void *ud) {
     NesState *s = ud;
     (void)args;
     if (!s->hex_editor) {
-        gemu_monitor_printf(mon, "hexeditor: not available (needs GTK build or -display sdl on Windows)\n");
+        gemu_monitor_printf(mon, "hexeditor: not available with this display\n");
     } else if (hex_editor_is_visible(s->hex_editor)) {
         hex_editor_hide(s->hex_editor);
         gemu_monitor_printf(mon, "hexeditor: closed\n");
@@ -2806,7 +2791,6 @@ static GemuMonCmd nes_cmd_hexeditor(GemuMonitor *mon, const char *args, void *ud
     }
     return GEMU_MON_NONE;
 }
-#endif
 
 static void nes_monitor_setup(NesState *s) {
     GemuMonitor *mon = s->monitor;
@@ -2827,9 +2811,7 @@ static void nes_monitor_setup(NesState *s) {
         gemu_monitor_bind(mon, "coin",      nes_cmd_coin,      s);
         gemu_monitor_bind(mon, "service",   nes_cmd_service,   s);
     }
-#if defined(GEMU_GTK) || defined(_WIN32)
     gemu_monitor_bind(mon, "hexeditor",  nes_cmd_hexeditor,  s);
-#endif
 }
 
 /* ── Run loop ────────────────────────────────────────────────────────────── */
@@ -3006,10 +2988,8 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                 SDL_Delay(frame_ms - elapsed);
         }
 
-#if defined(GEMU_GTK) || defined(_WIN32)
         hex_editor_refresh(s->hex_editor);
         /* GTK event pump is done inside gemu_display_poll() via the backend */
-#endif
     }
 
     printf("nes: %llu frames, %llu cpu cycles\n",

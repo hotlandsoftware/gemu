@@ -92,6 +92,8 @@ FAMILY_SRC = {
         # empty translation unit everywhere else (Linux, or --enable-gtk
         # on Windows, which still uses the GTK implementation instead).
         'hardware/device/hex_editor_win32.c',
+        # SDL hex editor for every other build (empty with GTK or on Win32)
+        'hardware/device/hex_editor_sdl.c',
         'src/mos_setup.c',
     ],
     'rca': [
