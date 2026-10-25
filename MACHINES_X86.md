@@ -47,3 +47,21 @@ Ctrl+Alt+1 / Ctrl+Alt+2 as in QEMU.  **View → Detach ... to new window** puts
 the current monitor in a window of its own, so both are on screen at once;
 close that window (or View → Close ... window) to bring it back.  DOS's `MODE MONO` / `MODE CO80` move the
 console between them.
+
+## CPU test suite
+
+The 8088 core is checked against the [SingleStepTests 8088 V2](https://github.com/SingleStepTests/8088)
+suite: about 3 million single-instruction tests captured from a real AMD
+D8088, with register, flag and memory results.  Put the suite's `v2/*.json.gz`
+and `metadata.json` in `roms/tests/8088/`, then:
+
+```
+ninja x86-sst
+./bin/x86-sst roms/tests/8088            # all opcodes
+./bin/x86-sst roms/tests/8088 F6.7 27    # just these (-v: every failure)
+```
+
+Every documented opcode passes.  Flags the 8088 leaves undefined are masked
+using `metadata.json`, and opcodes it marks undefined are skipped; `-undef`
+checks those too.  Bus cycles and the prefetch queue aren't compared - the
+core isn't cycle-exact.

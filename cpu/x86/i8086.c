@@ -282,8 +282,20 @@ static uint32_t shift_op(X86Cpu *c, unsigned op, uint32_t val, unsigned count, b
     uint32_t mask = w ? 0xFFFFu : 0xFFu, sign = w ? 0x8000u : 0x80u;
     if (count == 0) return val & mask; /* count=0: flags untouched (real 8086 behavior) */
     bool cf = get_flag(c, X86_FLAG_CF);
-    uint32_t res = val & mask, before = res;
+    uint32_t res = val & mask, last = res;    /* last: value before the final step */
+    if ((op & 7) == 6) {
+        /* SETMO / SETMOC (undocumented /6): the operand becomes all ones
+         * (SETMOC only with CL != 0 - the count==0 return above). */
+        set_flag(c, X86_FLAG_CF, false);
+        set_flag(c, X86_FLAG_OF, false);
+        set_flag(c, X86_FLAG_AF, false);
+        set_flag(c, X86_FLAG_ZF, false);
+        set_flag(c, X86_FLAG_SF, true);
+        set_flag(c, X86_FLAG_PF, true);
+        return mask;
+    }
     for (unsigned i = 0; i < count; i++) {
+        last = res;
         switch (op & 7) {
         case 0: cf = (res & sign) != 0; res = ((res << 1) | (cf ? 1u : 0u)) & mask; break;                 /* ROL */
         case 1: cf = (res & 1) != 0;    res = ((res >> 1) | (cf ? sign : 0u)) & mask; break;               /* ROR */
@@ -291,16 +303,16 @@ static uint32_t shift_op(X86Cpu *c, unsigned op, uint32_t val, unsigned count, b
         case 3: { bool n = (res & 1) != 0; res = ((res >> 1) | (cf ? sign : 0u)) & mask; cf = n; } break;  /* RCR */
         case 5: cf = (res & 1) != 0; res = (res >> 1) & mask; break;                                       /* SHR */
         case 7: { bool msb = (res & sign) != 0; cf = (res & 1) != 0; res = ((res >> 1) | (msb ? sign : 0u)) & mask; } break; /* SAR */
-        default: cf = (res & sign) != 0; res = (res << 1) & mask; break;                                   /* SHL/SAL (4,6) */
+        default: cf = (res & sign) != 0; res = (res << 1) & mask; break;                                   /* SHL/SAL */
         }
     }
     set_flag(c, X86_FLAG_CF, cf);
-    /* OF is architecturally defined only for count==1; we compute a
-     * reasonable value for larger counts too but don't promise spec
-     * compliance there - matches common simple-interpreter practice. */
+    /* OF is architecturally defined only for count==1, but the 8088
+     * computes it the same way from the final single-bit step for any
+     * count (SingleStepTests). */
     bool of;
     switch (op & 7) {
-    case 5:  of = (before & sign) != 0; break;             /* SHR: original MSB */
+    case 5:  of = (last & sign) != 0; break;               /* SHR: MSB before the last step */
     case 7:  of = false; break;                             /* SAR: always 0 */
     case 1: case 3:                                         /* ROR/RCR: top two bits differ */
         of = (((res << 1) ^ res) & sign) != 0; break;
@@ -538,7 +550,9 @@ unsigned x86_step(X86Cpu *c) {
         bool af = get_flag(c, X86_FLAG_AF), cf;
         uint8_t al = old_al;
         if (((al & 0x0F) > 9) || af) { al = (uint8_t)(al + 6); af = true; } else af = false;
-        if ((old_al > 0x99) || old_cf) { al = (uint8_t)(al + 0x60); cf = true; } else cf = false;
+        /* The 8088 compares against 0x9F, not 0x99, when AF was set: AL
+         * 9A-9F with AF and no CF gets no high adjustment (SingleStepTests). */
+        if ((old_al > (get_flag(c, X86_FLAG_AF) ? 0x9F : 0x99)) || old_cf) { al = (uint8_t)(al + 0x60); cf = true; } else cf = false;
         c->ax.b.lo = al;
         set_flag(c, X86_FLAG_CF, cf); set_flag(c, X86_FLAG_AF, af);
         set_flag(c, X86_FLAG_ZF, al == 0); set_flag(c, X86_FLAG_SF, (al & 0x80) != 0);
@@ -551,7 +565,9 @@ unsigned x86_step(X86Cpu *c) {
         bool af = get_flag(c, X86_FLAG_AF), cf;
         uint8_t al = old_al;
         if (((al & 0x0F) > 9) || af) { al = (uint8_t)(al - 6); af = true; } else af = false;
-        if ((old_al > 0x99) || old_cf) { al = (uint8_t)(al - 0x60); cf = true; } else cf = false;
+        /* The 8088 compares against 0x9F, not 0x99, when AF was set: AL
+         * 9A-9F with AF and no CF gets no high adjustment (SingleStepTests). */
+        if ((old_al > (get_flag(c, X86_FLAG_AF) ? 0x9F : 0x99)) || old_cf) { al = (uint8_t)(al - 0x60); cf = true; } else cf = false;
         c->ax.b.lo = al;
         set_flag(c, X86_FLAG_CF, cf); set_flag(c, X86_FLAG_AF, af);
         set_flag(c, X86_FLAG_ZF, al == 0); set_flag(c, X86_FLAG_SF, (al & 0x80) != 0);
@@ -717,7 +733,15 @@ unsigned x86_step(X86Cpu *c) {
         rm_write8(c, &m, (uint8_t)shift_op(c, m.reg, rm_read8(c, &m), c->cx.b.lo, false)); break; }
     case 0xD3: { ModRM m = decode_modrm(c); cyc_rm(&m, 8, 20); g_cyc += 4u * c->cx.b.lo;
         rm_write16(c, &m, (uint16_t)shift_op(c, m.reg, rm_read16(c, &m), c->cx.b.lo, true)); break; }
-    case 0xD4: { uint8_t base = fetch8(c); g_cyc += 83; if (base == 0) { deliver_interrupt(c, 0); break; }
+    case 0xD4: { uint8_t base = fetch8(c); g_cyc += 83;
+        if (base == 0) {
+            /* Divide error, with the flags as if the result were 0: ZF and
+             * PF set, SF/OF/AF/CF clear (they're pushed - SingleStepTests). */
+            c->flags = (uint16_t)((c->flags & ~(X86_FLAG_OF | X86_FLAG_SF | X86_FLAG_AF | X86_FLAG_CF))
+                                  | X86_FLAG_ZF | X86_FLAG_PF);
+            deliver_interrupt(c, 0);
+            break;
+        }
         uint8_t al = c->ax.b.lo, ah = (uint8_t)(al / base); al = (uint8_t)(al % base);
         c->ax.b.hi = ah; c->ax.b.lo = al;
         set_flag(c, X86_FLAG_ZF, al == 0); set_flag(c, X86_FLAG_SF, (al & 0x80) != 0); set_flag(c, X86_FLAG_PF, parity8(al));
@@ -767,6 +791,7 @@ unsigned x86_step(X86Cpu *c) {
         default: { cyc_rm(&m, 107, 113); if (v == 0) { deliver_interrupt(c, 0); break; } int16_t dd = (int16_t)c->ax.x;
             int q = dd / (int8_t)v, r = dd % (int8_t)v;
             if (q > 127 || q < -127) { deliver_interrupt(c, 0); break; } /* the 8086 also faults on -128 */
+            if (g_rep || g_repne) q = -q;    /* 8088 quirk: a REP prefix negates the quotient */
             c->ax.b.lo = (uint8_t)(int8_t)q; c->ax.b.hi = (uint8_t)(int8_t)r; break; }
         }
         break; }
@@ -786,6 +811,7 @@ unsigned x86_step(X86Cpu *c) {
         default: { cyc_rm(&m, 171, 177); if (v == 0) { deliver_interrupt(c, 0); break; } int32_t n = (int32_t)(((uint32_t)c->dx.x << 16) | c->ax.x);
             int32_t q = n / (int16_t)v, r = n % (int16_t)v;
             if (q > 32767 || q < -32767) { deliver_interrupt(c, 0); break; }
+            if (g_rep || g_repne) q = -q;    /* 8088 quirk: a REP prefix negates the quotient */
             c->ax.x = (uint16_t)(int16_t)q; c->dx.x = (uint16_t)(int16_t)r; break; }
         }
         break; }
@@ -811,8 +837,12 @@ unsigned x86_step(X86Cpu *c) {
         case 4: cyc_rm(&m, 11, 18); c->ip = rm_read16(c, &m); break;                              /* JMP near indirect */
         case 5: { g_cyc += 24 + g_ea_cyc; uint16_t off = rm_read16(c, &m); uint16_t seg = mrd16(c, m.seg, (uint16_t)(m.off + 2));
             c->cs = seg; c->ip = off; break; }                                                      /* JMP far indirect */
-        case 6: cyc_rm(&m, 11, 16); push16(c, rm_read16(c, &m)); break;                           /* PUSH r/m16 */
-        default: if (c->on_unknown_opcode) c->on_unknown_opcode(c, op, c->bus_ud); break;
+        case 6: case 7: {                                                    /* PUSH r/m16 (/7 is an alias) */
+            cyc_rm(&m, 11, 16);
+            /* PUSH SP pushes the decremented SP, as opcode 54 does */
+            uint16_t v = (!m.mem && m.rm_reg == 4) ? (uint16_t)(c->sp - 2) : rm_read16(c, &m);
+            push16(c, v);
+            break; }
         }
         break; }
 

@@ -738,6 +738,15 @@ def main():
     lines.append(f'build gemu: phony {binary}')
     for tname in targets:
         lines.append(f'build gemu-{tname}: phony {binary}')
+    # SingleStepTests 8088 harness (not built by default): ninja x86-sst
+    if 'cpu/x86/i8086.c' in srcs:
+        sst_obj = f'{build_dir}/tests/x86_sst.o'
+        lines.append(f'build {sst_obj}: cc tests/x86_sst.c')
+        lines.append(f'  CFLAGS = {unified_cflags} -Icpu/x86 -Icore/third_party/cjson')
+        lines.append(f'build {bin_dir}/x86-sst: link {sst_obj} '
+                     f'{build_dir}/cpu/x86/i8086.o {build_dir}/core/third_party/cjson/cJSON.o')
+        lines.append(f'  LDFLAGS = -lz')
+        lines.append(f'build x86-sst: phony {bin_dir}/x86-sst')
     lines.append('')
     lines.append(f'default {binary}')
     lines.append('')
