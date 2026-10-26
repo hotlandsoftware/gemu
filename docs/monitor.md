@@ -31,6 +31,13 @@ every reply echoes the request's `id`. Requests may span lines or share one.
 | `set_password`, `expire_password` | VNC password, as in QEMU (`"protocol": "vnc"`) |
 | `human-monitor-command` | run any monitor command below (`"arguments": {"command-line": "..."}`) and return its output as a string |
 | `stop`, `cont`, `system_reset`, `quit` | same as the monitor commands; the reply is sent once the command has taken effect |
+| `blockdev-open-tray` | open a removable drive's tray (`"id"` or `"device"`: the name from `info block`); the medium stays in the tray but the machine sees an empty drive |
+| `blockdev-close-tray` | close the tray, loading whatever medium is in it |
+| `blockdev-remove-medium` | take the medium out of an open tray |
+| `blockdev-add` | create a named node for an image: `{"driver": "file", "node-name": N, "filename": F}` or `{"driver": "raw", "node-name": N, "file": {"driver": "file", "filename": F}}` |
+| `blockdev-insert-medium` | put a node (`"node-name"`) into an open, empty tray |
+| `blockdev-del` | delete a node that isn't in a drive |
+| `blockdev-change-medium` | swap the medium for `"filename"` in one step (`format`, `read-only-mode` and `force` are accepted and ignored) |
 
 ```
 -> {"execute": "qmp_capabilities"}
@@ -38,6 +45,18 @@ every reply echoes the request's `id`. Requests may span lines or share one.
 -> {"execute": "human-monitor-command", "arguments": {"command-line": "info cpu"}, "id": 1}
 <- {"return": "PC=C000 A=00 X=16 Y=00 SP=FA P=24 [..-..I..] insn=44 cyc=117\n", "id": 1}
 ```
+
+Swapping a floppy the long way, as libvirt does:
+
+```
+-> {"execute": "blockdev-add", "arguments": {"driver": "raw", "node-name": "disk2", "file": {"driver": "file", "filename": "disk2.img"}}}
+-> {"execute": "blockdev-open-tray", "arguments": {"id": "floppy0"}}
+-> {"execute": "blockdev-remove-medium", "arguments": {"id": "floppy0"}}
+-> {"execute": "blockdev-insert-medium", "arguments": {"id": "floppy0", "node-name": "disk2"}}
+-> {"execute": "blockdev-close-tray", "arguments": {"id": "floppy0"}}
+```
+
+The `eject` monitor command leaves the tray open and `change` closes it, as in QEMU.
 
 > ``-monitor none``
 
@@ -196,6 +215,6 @@ Run `help` on any machine for the authoritative list; the machines each command 
 | `regpoke`, `vgareg`, `vgapeek` | generic-ia64 | generic IA-64 debugging |
 
 # Adding commands (for developers)
-GMP lives in `core/src/monitor_qmp.c` and uses the bundled [cJSON](https://github.com/DaveGamble/cJSON) (`core/third_party/cjson`, MIT) for all JSON parsing and generation; add QMP commands to its `qmp_cmds[]` table.
+GMP lives in `core/src/monitor_qmp.c` (the tray and node model behind `blockdev-*` is in `core/src/monitor_block.c`) and uses the bundled [cJSON](https://github.com/DaveGamble/cJSON) (`core/third_party/cjson`, MIT) for all JSON parsing and generation; add QMP commands to its `qmp_cmds[]` table.
 
 All commands are declared in the `mon_cmds[]` table in `core/src/monitor_cmds.c`; `help` is generated from it. Machines implement the ones the core can't with `gemu_monitor_bind()`, and provide a memory view with `gemu_monitor_set_memory()`. See the comment at the top of `monitor_cmds.c` and `core/include/gemu/monitor.h`.

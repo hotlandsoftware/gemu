@@ -414,8 +414,11 @@ static void info_block(GemuMonitor *mon) {
     /* QEMU's layout: "name: file (format...)" or "[not inserted]". */
     for (int i = 0; i < mon->n_media; i++) {
         const GemuMediaDevice *dev = &mon->media[i];
+        const MonTray *tray = &mon->tray[i];
         char status[600];
-        if (dev->status) {
+        if (tray->open) {   /* the device itself is empty */
+            snprintf(status, sizeof(status), "%s", tray->file[0] ? tray->file : "[not inserted]");
+        } else if (dev->status) {
             status[0] = '\0';
             dev->status(dev->ud, status, sizeof(status));
         } else {
@@ -423,7 +426,8 @@ static void info_block(GemuMonitor *mon) {
         }
         mon_printf(mon, "%s: %s\n", dev->name, status);
         if (dev->eject)
-            mon_printf(mon, "    Removable device: not locked, tray closed\n");
+            mon_printf(mon, "    Removable device: not locked, tray %s\n",
+                       tray->open ? "open" : "closed");
         if (dev->flip)
             mon_printf(mon, "    Flippable: yes ('flip %s')\n", dev->name);
     }
@@ -849,7 +853,10 @@ static GemuMonCmd do_eject(GemuMonitor *mon, const char *verb, GemuMediaDevice *
     }
     char err[256] = "";
     GemuMediaResult r = dev->eject(dev->ud, err, sizeof(err));
-    if (r != GEMU_MEDIA_ERR) dev->file[0] = '\0';
+    if (r != GEMU_MEDIA_ERR) {
+        dev->file[0] = '\0';
+        mon_block_media_changed(mon, dev, true);
+    }
     return media_result(mon, verb, dev, r, err);
 }
 
@@ -879,8 +886,10 @@ static GemuMonCmd cmd_change(GemuMonitor *mon, const char *args) {
     }
     char err[256] = "";
     GemuMediaResult r = dev->change(dev->ud, file, err, sizeof(err));
-    if (r != GEMU_MEDIA_ERR)
+    if (r != GEMU_MEDIA_ERR) {
         snprintf(dev->file, sizeof(dev->file), "%s", file);
+        mon_block_media_changed(mon, dev, false);
+    }
     return media_result(mon, "change", dev, r, err);
 }
 

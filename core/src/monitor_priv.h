@@ -18,6 +18,7 @@ typedef int sock_t;
 #define ROM_ENTRY_MAX    16
 #define BP_MAX           32
 #define MON_BIND_MAX     64
+#define BLOCK_NODE_MAX   16
 
 typedef struct {
     uint32_t addr;
@@ -31,14 +32,38 @@ typedef struct {
     uint32_t   addr;
 } MonBpEntry;
 
+/* A block node from QMP blockdev-add: an image file that can be inserted
+ * into a drive's open tray with blockdev-insert-medium. */
+typedef struct {
+    bool used;
+    char name[64];
+    char file[512];
+    bool read_only;
+    int  attached;     /* media index + 1 of the drive holding it; 0 = none */
+} MonBlockNode;
+
+/* QEMU's tray model, kept per media device.  Devices only know "loaded" or
+ * "empty", so opening the tray unloads the medium from the device but keeps
+ * it in the tray; closing the tray loads whatever is in it. */
+typedef struct {
+    bool open;
+    char file[512];    /* medium sitting in the open tray; "" = none */
+    int  node;         /* node index + 1 backing the drive's medium; 0 = none */
+} MonTray;
+
 typedef enum {
     MON_ENTRY_CMD,   /* control command from a non-console source (GTK menu) */
     MON_ENTRY_TEXT,  /* a command line to parse and run */
+    MON_ENTRY_FN,    /* a function to call on the emulator thread (QMP) */
 } MonEntryType;
+
+typedef GemuMonCmd (*MonEntryFn)(GemuMonitor *mon, void *ud);
 
 typedef struct {
     MonEntryType type;
     GemuMonCmd   cmd;
+    MonEntryFn   fn;
+    void        *fn_ud;
     bool         capture;  /* collect output for a QMP human-monitor-command */
     uint64_t     seq;
     char         text[MON_LINE_MAX];
@@ -85,7 +110,9 @@ struct GemuMonitor {
     size_t          capture_len, capture_size;
 
     GemuMediaDevice media[MEDIA_DEVICE_MAX];
+    MonTray         tray[MEDIA_DEVICE_MAX];
     int             n_media;
+    MonBlockNode    nodes[BLOCK_NODE_MAX];
     void          (*input_reset_cb)(void *ud);
     void           *input_reset_ud;
     MonRomEntry     rom_entries[ROM_ENTRY_MAX];
@@ -125,6 +152,10 @@ typedef enum {
  * (malloc'd; NULL if it printed nothing). */
 MonRunResult mon_run_line(GemuMonitor *mon, const char *line, bool capture,
                           unsigned timeout_ms, char **out);
+/* Queue fn(mon, ud) and wait up to timeout_ms for the emulator thread to run
+ * it.  On MON_RUN_TIMEOUT it may still run later, so ud must stay valid. */
+MonRunResult mon_run_fn(GemuMonitor *mon, MonEntryFn fn, void *ud,
+                        unsigned timeout_ms);
 /* Listening-socket helpers shared by the telnet and GMP transports.
  * mon_accept_client waits up to a second and sets mon->client_fd. */
 bool mon_accept_client(GemuMonitor *mon);
@@ -150,3 +181,31 @@ bool       mon_line_is_quit(const char *line);
 /* Called by the reader thread for lines it must handle itself because they
  * read further input from the transport (e.g. "change vnc password"). */
 bool       mon_line_is_vnc_password(const char *line);
+
+/* monitor_block.c - the QMP blockdev-* operations.  Fill a MonBlockReq on
+ * any thread, then run mon_block_run on the emulator thread (mon_run_fn). */
+typedef enum {
+    MON_BLOCK_ADD,             /* node, file, read_only */
+    MON_BLOCK_DEL,             /* node */
+    MON_BLOCK_OPEN_TRAY,       /* device */
+    MON_BLOCK_CLOSE_TRAY,      /* device */
+    MON_BLOCK_REMOVE_MEDIUM,   /* device */
+    MON_BLOCK_INSERT_MEDIUM,   /* device, node */
+    MON_BLOCK_CHANGE_MEDIUM,   /* device, file */
+} MonBlockOp;
+
+typedef struct {
+    MonBlockOp  op;
+    char        device[64];
+    char        node[64];
+    char        file[512];
+    bool        read_only;
+    /* Result: klass is NULL on success, else a QMP error class and desc. */
+    const char *klass;
+    char        desc[256];
+} MonBlockReq;
+
+GemuMonCmd mon_block_run(GemuMonitor *mon, void *req);
+/* The text monitor's change/eject went through: keep the tray in step
+ * (QEMU's eject leaves the tray open; change closes it). */
+void       mon_block_media_changed(GemuMonitor *mon, GemuMediaDevice *dev, bool ejected);

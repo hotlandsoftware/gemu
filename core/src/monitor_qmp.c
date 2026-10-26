@@ -253,10 +253,199 @@ static cJSON *qmp_query_vnc(QmpConn *c, const cJSON *args, QmpError *err) {
     return r;
 }
 
+/* ── Block devices ───────────────────────────────────────────────────────── */
+
+/* A string argument: true and copied if present, else sets err when
+ * required.  Absent optional arguments leave out untouched. */
+static bool str_arg(const cJSON *args, const char *name, bool required,
+                    char *out, size_t out_len, QmpError *err) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(args, name);
+    if (!v) {
+        if (required) set_error(err, "GenericError", "Parameter '%s' is missing", name);
+        return false;
+    }
+    if (!cJSON_IsString(v)) {
+        set_error(err, "GenericError", "Invalid parameter type for '%s', expected: string", name);
+        return false;
+    }
+    if (strlen(v->valuestring) >= out_len) {
+        set_error(err, "GenericError", "Parameter '%s' is too long", name);
+        return false;
+    }
+    snprintf(out, out_len, "%s", v->valuestring);
+    return true;
+}
+
+static bool bool_arg(const cJSON *args, const char *name, bool *out, QmpError *err) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(args, name);
+    if (!v) return true;
+    if (!cJSON_IsBool(v)) {
+        set_error(err, "GenericError", "Invalid parameter type for '%s', expected: boolean", name);
+        return false;
+    }
+    *out = cJSON_IsTrue(v);
+    return true;
+}
+
+/* The drive: "id" (qdev id) or "device" (block backend name).  GEMU's
+ * media devices have one name that serves as both. */
+static bool device_arg(const cJSON *args, MonBlockReq *r, QmpError *err) {
+    bool have_dev = str_arg(args, "device", false, r->device, sizeof(r->device), err);
+    if (err->klass) return false;
+    char id[64];
+    bool have_id = str_arg(args, "id", false, id, sizeof(id), err);
+    if (err->klass) return false;
+    if (have_dev && have_id) {
+        set_error(err, "GenericError", "%s", "Need exactly one of 'device' and 'id'");
+        return false;
+    }
+    if (!have_dev && !have_id) {
+        set_error(err, "GenericError", "Parameter '%s' is missing", "id");
+        return false;
+    }
+    if (have_id) snprintf(r->device, sizeof(r->device), "%s", id);
+    return true;
+}
+
+/* Run a filled-in request on the emulator thread.  The request is on the
+ * heap: if the wait times out the emulator thread may still write to it,
+ * so it is leaked rather than freed. */
+static cJSON *run_block(QmpConn *c, MonBlockReq *r, QmpError *err) {
+    if (err->klass) {
+        free(r);
+        return NULL;
+    }
+    switch (mon_run_fn(c->mon, mon_block_run, r, QMP_WAIT_MS)) {
+    case MON_RUN_OK:
+        if (r->klass) {
+            err->klass = r->klass;
+            snprintf(err->desc, sizeof(err->desc), "%s", r->desc);
+        }
+        free(r);
+        break;
+    case MON_RUN_QUEUE_FULL:
+        set_error(err, "GenericError", "%s", "monitor command queue is full");
+        free(r);
+        break;
+    case MON_RUN_TIMEOUT:
+        set_error(err, "GenericError", "%s",
+                  "timed out waiting for the machine to run the command");
+        break;
+    }
+    return NULL;
+}
+
+static MonBlockReq *new_block_req(MonBlockOp op, QmpError *err) {
+    MonBlockReq *r = calloc(1, sizeof(*r));
+    if (!r) set_error(err, "GenericError", "%s", "out of memory");
+    else    r->op = op;
+    return r;
+}
+
+/* blockdev-add: {"driver": "file", "node-name": N, "filename": F} or a
+ * format driver over a file child, {"driver": "raw", "node-name": N,
+ * "file": {"driver": "file", "filename": F}}.  GEMU's devices detect image
+ * formats themselves, so the format driver only has to be one we know. */
+static cJSON *qmp_blockdev_add(QmpConn *c, const cJSON *args, QmpError *err) {
+    static const char *const drivers[] = {
+        "file", "host_cdrom", "host_device", "raw", "qcow2", "vpc", "vmdk", "vdi", "dmg",
+    };
+    MonBlockReq *r = new_block_req(MON_BLOCK_ADD, err);
+    if (!r) return NULL;
+    char driver[32];
+    if (!str_arg(args, "driver", true, driver, sizeof(driver), err))
+        return run_block(c, r, err);
+    bool known = false;
+    for (size_t i = 0; i < sizeof(drivers) / sizeof(drivers[0]); i++)
+        known |= strcmp(driver, drivers[i]) == 0;
+    if (!known) {
+        set_error(err, "GenericError", "Unsupported driver '%s'", driver);
+        return run_block(c, r, err);
+    }
+    if (!str_arg(args, "node-name", true, r->node, sizeof(r->node), err) ||
+        !bool_arg(args, "read-only", &r->read_only, err))
+        return run_block(c, r, err);
+
+    const cJSON *file = cJSON_GetObjectItemCaseSensitive(args, "file");
+    if (strcmp(driver, "file") == 0 || strncmp(driver, "host_", 5) == 0)
+        str_arg(args, "filename", true, r->file, sizeof(r->file), err);
+    else if (cJSON_IsObject(file))
+        str_arg(file, "filename", true, r->file, sizeof(r->file), err);
+    else if (cJSON_IsString(file))
+        set_error(err, "GenericError", "%s",
+                  "'file' must be an inline {\"driver\": \"file\", \"filename\": ...} object");
+    else
+        set_error(err, "GenericError", "Parameter '%s' is missing", "file");
+    return run_block(c, r, err);
+}
+
+static cJSON *qmp_blockdev_del(QmpConn *c, const cJSON *args, QmpError *err) {
+    MonBlockReq *r = new_block_req(MON_BLOCK_DEL, err);
+    if (!r) return NULL;
+    str_arg(args, "node-name", true, r->node, sizeof(r->node), err);
+    return run_block(c, r, err);
+}
+
+static cJSON *qmp_blockdev_open_tray(QmpConn *c, const cJSON *args, QmpError *err) {
+    MonBlockReq *r = new_block_req(MON_BLOCK_OPEN_TRAY, err);
+    if (!r) return NULL;
+    bool force = false;   /* trays are never locked, so force changes nothing */
+    if (device_arg(args, r, err)) bool_arg(args, "force", &force, err);
+    return run_block(c, r, err);
+}
+
+static cJSON *qmp_blockdev_close_tray(QmpConn *c, const cJSON *args, QmpError *err) {
+    MonBlockReq *r = new_block_req(MON_BLOCK_CLOSE_TRAY, err);
+    if (!r) return NULL;
+    device_arg(args, r, err);
+    return run_block(c, r, err);
+}
+
+static cJSON *qmp_blockdev_remove_medium(QmpConn *c, const cJSON *args, QmpError *err) {
+    MonBlockReq *r = new_block_req(MON_BLOCK_REMOVE_MEDIUM, err);
+    if (!r) return NULL;
+    device_arg(args, r, err);
+    return run_block(c, r, err);
+}
+
+static cJSON *qmp_blockdev_insert_medium(QmpConn *c, const cJSON *args, QmpError *err) {
+    MonBlockReq *r = new_block_req(MON_BLOCK_INSERT_MEDIUM, err);
+    if (!r) return NULL;
+    if (device_arg(args, r, err))
+        str_arg(args, "node-name", true, r->node, sizeof(r->node), err);
+    return run_block(c, r, err);
+}
+
+/* blockdev-change-medium: format and read-only-mode are accepted for
+ * compatibility; devices detect formats and open media as they need. */
+static cJSON *qmp_blockdev_change_medium(QmpConn *c, const cJSON *args, QmpError *err) {
+    MonBlockReq *r = new_block_req(MON_BLOCK_CHANGE_MEDIUM, err);
+    if (!r) return NULL;
+    char format[32], mode[32];
+    bool force = false;
+    if (device_arg(args, r, err) &&
+        str_arg(args, "filename", true, r->file, sizeof(r->file), err) &&
+        bool_arg(args, "force", &force, err)) {
+        str_arg(args, "format", false, format, sizeof(format), err);
+        if (!err->klass && str_arg(args, "read-only-mode", false, mode, sizeof(mode), err) &&
+            strcmp(mode, "retain") && strcmp(mode, "read-only") && strcmp(mode, "read-write"))
+            set_error(err, "GenericError",
+                      "Parameter 'read-only-mode' does not accept value '%s'", mode);
+    }
+    return run_block(c, r, err);
+}
+
 static const struct {
     const char *name;
     QmpFn       fn;
 } qmp_cmds[] = {
+    { "blockdev-add",            qmp_blockdev_add },
+    { "blockdev-change-medium",  qmp_blockdev_change_medium },
+    { "blockdev-close-tray",     qmp_blockdev_close_tray },
+    { "blockdev-del",            qmp_blockdev_del },
+    { "blockdev-insert-medium",  qmp_blockdev_insert_medium },
+    { "blockdev-open-tray",      qmp_blockdev_open_tray },
+    { "blockdev-remove-medium",  qmp_blockdev_remove_medium },
     { "cont",                  qmp_cont },
     { "expire_password",       qmp_expire_password },
     { "human-monitor-command", qmp_human_monitor_command },

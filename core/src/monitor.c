@@ -296,6 +296,8 @@ static uint64_t enqueue_entry(GemuMonitor *mon, MonEntryType type,
         e->cmd = cmd;
         e->capture = capture;
         e->seq = seq = ++mon->next_seq;
+        e->fn = NULL;
+        e->fn_ud = NULL;
         snprintf(e->text, sizeof(e->text), "%s", text ? text : "");
         mon->tail = next;
     }
@@ -339,6 +341,32 @@ MonRunResult mon_run_line(GemuMonitor *mon, const char *line, bool capture,
         }
         mon->capture_len = mon->capture_size = 0;
     }
+    pthread_mutex_unlock(&mon->lock);
+    pthread_setcancelstate(oldstate, NULL);
+    return done ? MON_RUN_OK : MON_RUN_TIMEOUT;
+}
+
+MonRunResult mon_run_fn(GemuMonitor *mon, MonEntryFn fn, void *ud,
+                        unsigned timeout_ms) {
+    uint64_t seq = 0;
+    pthread_mutex_lock(&mon->lock);
+    int next = (mon->tail + 1) % MON_QUEUE_SIZE;
+    if (next != mon->head) {
+        MonEntry *e = &mon->queue[mon->tail];
+        memset(e, 0, sizeof(*e));
+        e->type = MON_ENTRY_FN;
+        e->fn = fn;
+        e->fn_ud = ud;
+        e->seq = seq = ++mon->next_seq;
+        mon->tail = next;
+    }
+    if (!seq) {
+        pthread_mutex_unlock(&mon->lock);
+        return MON_RUN_QUEUE_FULL;
+    }
+    int oldstate;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldstate);
+    bool done = wait_done_locked(mon, seq, timeout_ms);
     pthread_mutex_unlock(&mon->lock);
     pthread_setcancelstate(oldstate, NULL);
     return done ? MON_RUN_OK : MON_RUN_TIMEOUT;
@@ -800,8 +828,8 @@ GemuMonCmd gemu_monitor_poll(GemuMonitor *mon) {
 
         /* Run the command without the lock: handlers may take a while and
          * the reader must stay free to queue the next line. */
-        GemuMonCmd cmd = (entry.type == MON_ENTRY_TEXT)
-                       ? mon_dispatch(mon, entry.text)
+        GemuMonCmd cmd = entry.type == MON_ENTRY_TEXT ? mon_dispatch(mon, entry.text)
+                       : entry.type == MON_ENTRY_FN   ? entry.fn(mon, entry.fn_ud)
                        : entry.cmd;
 
         pthread_mutex_lock(&mon->lock);

@@ -109,7 +109,7 @@ core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
   table names, print with `gemu_monitor_printf()`, and expose memory to
   `x`/`peek`/`poke`/`memsave` with `gemu_monitor_set_memory()` (side-effect
   free reads). `gemu_monitor_poll()` runs commands on the emulator thread.
-  GMP/QMP is in `core/src/monitor_qmp.c` and uses the vendored cJSON
+  GMP/QMP is in `core/src/monitor_qmp.c` (blockdev tray/node model in `core/src/monitor_block.c`) and uses the vendored cJSON
   (`core/third_party/cjson`) - don't hand-roll JSON. User docs: `docs/monitor.md`.
 - Window titles are universal: "GEMU", "GEMU (name)" with `-name`, plus
   " [Paused]" - formatted by `gemu_window_title()` (gemu_display.h).
