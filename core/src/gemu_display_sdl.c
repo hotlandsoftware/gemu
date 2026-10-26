@@ -64,6 +64,10 @@ typedef struct {
 
     /* Monitors detached into windows of their own (View > Detach) */
     GemuVideoSdl *head_video[GEMU_DISPLAY_MAX_HEADS];
+
+    /* When the machine last sent a frame: while it isn't (paused, halted)
+     * poll redraws the last one so menus and resizing keep working. */
+    Uint32 last_frame, last_redraw;
 } SdlBackend;
 
 /* ── Binding table ───────────────────────────────────────────────────────── */
@@ -350,6 +354,19 @@ static void sdl_set_mouse_captured(GemuDisplay *d, SdlBackend *b, bool captured)
 static void sdl_do_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
     SdlBackend *b = d->backend;
     gemu_video_sdl_present_argb(b->video, argb, w, h);
+    b->last_frame = SDL_GetTicks();
+}
+
+/* No frame from the machine for a while (it's paused or halted, and most
+ * machines skip drawing then): redraw the last one ~30 times a second, so
+ * the menu bar, its dialogs and window resizes still show. */
+static void redraw_if_idle(SdlBackend *b) {
+    Uint32 now = SDL_GetTicks();
+    if (now - b->last_frame < 100 || now - b->last_redraw < 33) return;
+    b->last_redraw = now;
+    gemu_video_sdl_redraw(b->video);
+    for (int i = 0; i < GEMU_DISPLAY_MAX_HEADS; i++)
+        if (b->head_video[i]) gemu_video_sdl_redraw(b->head_video[i]);
 }
 
 static uint32_t sdl_do_poll(GemuDisplay *d) {
@@ -576,7 +593,7 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         }
     }
 
-
+    redraw_if_idle(b);
     return held_mask(b) | controller_mask(b);
 }
 
@@ -687,6 +704,14 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     b->n_actions   = cfg->n_actions;
     b->ini_section = cfg->ini_section;
     b->capture_pointer = cfg->capture_pointer;
+
+    /* Closing the main window quits (the SDL_WINDOWEVENT_CLOSE handling in
+     * sdl_do_poll); closing any other window of ours (a detached monitor,
+     * the hex editor, the Game Genie) must not, even if it leaves only one
+     * window showing. */
+#ifdef SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE
+    SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+#endif
 
     int w = cfg->fb_width,  h = cfg->fb_height;
     /* 1x unless -scale (or the machine) asks for more */

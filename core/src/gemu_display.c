@@ -155,6 +155,15 @@ void gemu_display_set_paused(GemuDisplay *d, bool paused) {
     d->paused_title = paused;
 }
 
+void gemu_display_add_debug_item(GemuDisplay *d, const char *label,
+                                 void (*activate)(void *ud), void *ud) {
+    if (!d || !activate || d->n_debug_items >= GEMU_DISPLAY_MAX_DEBUG_ITEMS) return;
+    int i = d->n_debug_items++;
+    snprintf(d->debug_items[i].label, sizeof(d->debug_items[i].label), "%s", label);
+    d->debug_items[i].activate = activate;
+    d->debug_items[i].ud = ud;
+}
+
 /* ── Monitors ────────────────────────────────────────────────────────────── */
 
 void gemu_display_set_heads(GemuDisplay *d, const GemuDisplayHead *heads, int n) {

@@ -138,6 +138,13 @@ void gemu_display_render(GemuDisplay *d, const uint32_t *argb, int w, int h);
 void gemu_display_render_text(GemuDisplay *d, const char *text, int rows, int cols);
 void gemu_display_set_paused(GemuDisplay *d, bool paused);
 
+/* ── Debug menu ──────────────────────────────────────────────────────────────
+ * Machine tools listed under the window's Debug menu (after Hex Editor),
+ * e.g. the NES Game Genie manager. */
+#define GEMU_DISPLAY_MAX_DEBUG_ITEMS 8
+void gemu_display_add_debug_item(GemuDisplay *d, const char *label,
+                                 void (*activate)(void *ud), void *ud);
+
 /* ── Monitors ────────────────────────────────────────────────────────────────
  * A machine with several display adapters (e.g. an IBM PC with both an MDA
  * and a CGA) registers one head per monitor, head 0 being the one the

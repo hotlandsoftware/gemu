@@ -235,6 +235,12 @@ void gemu_video_sdl_present_argb(GemuVideoSdl *v, const uint32_t *pixels,
                                  int w, int h) {
     if (!v || !pixels || w != v->width || h != v->height) return;
     SDL_UpdateTexture(v->texture, NULL, pixels, w * (int)sizeof(uint32_t));
+    gemu_video_sdl_redraw(v);
+}
+
+/* Draw the last frame again (window resized, menus changed, VM paused). */
+void gemu_video_sdl_redraw(GemuVideoSdl *v) {
+    if (!v) return;
     SDL_SetRenderDrawColor(v->renderer, 0, 0, 0, 255);
     SDL_RenderClear(v->renderer);
     int ow = v->width, oh = v->height;

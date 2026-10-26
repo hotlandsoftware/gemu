@@ -178,14 +178,14 @@ Presses keys or buttons on the machine's input device. The key names depend on t
 
 > ``hexeditor``
 
-Toggles the hex editor window (GTK builds, or SDL on Windows).
+Toggles the hex editor window (the same as Debug > Hex Editor).
 
 # Machine-specific commands
 Run `help` on any machine for the authoritative list; the machines each command supports are shown in brackets.
 
 | Command | Machines | Description |
 |---------|----------|-------------|
-| `gamegenie add <code>` / `list` / `delete <code>` | nes, nespal, famicom, dendy | manage Game Genie codes |
+| `gamegenie add <code> [name]` / `list` / `on <code>` / `off <code>` / `delete <code>` | nes, nespal, famicom, dendy | manage Game Genie codes (the same list as Debug > Game Genie, saved per game in `<config>/<game>.cht`) |
 | `ppudump`, `mapperdump` | NES family, VS. System | show PPU state / mapper registers |
 | `dipswitch [list \| <switch> <value>]` / `dip` | vssmb, vsskatekids, 5clown, magicfly, 7mezzo, destroyer, altair2 | list or set DIP switches |
 | `coin [slot]` | vssmb, vsskatekids, 5clown, magicfly, 7mezzo | insert a coin |

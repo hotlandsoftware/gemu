@@ -30,6 +30,9 @@ SDL_Renderer *gemu_video_sdl_get_renderer(const GemuVideoSdl *v);
 int  gemu_video_sdl_width(const GemuVideoSdl *v);
 int  gemu_video_sdl_height(const GemuVideoSdl *v);
 int  gemu_video_sdl_shown_height(const GemuVideoSdl *v, int w);
+/* Draw the last frame again, with the overlay (menus), at the window's
+ * current size - for when the machine isn't producing frames. */
+void gemu_video_sdl_redraw(GemuVideoSdl *v);
 /* Change the framebuffer size and shape (aspect 0 = square pixels). */
 bool gemu_video_sdl_set_geometry(GemuVideoSdl *v, int w, int h, int aspect_w, int aspect_h);
 

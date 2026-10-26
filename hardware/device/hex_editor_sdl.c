@@ -54,7 +54,8 @@ struct HexEditor {
     SDL_Window   *win;
     SDL_Renderer *ren;
     SDL_Texture  *font;
-    bool          visible;
+    bool          visible, sized;
+    bool          close_requested;  /* hide at the next refresh (see hex_event_watch) */
     Uint32        last_draw;
     bool          dirty;
 
@@ -337,7 +338,10 @@ static int SDLCALL hex_event_watch(void *ud, SDL_Event *ev) {
     }
     if (!id || ev_id != id) return 1;
     if (ev->type == SDL_WINDOWEVENT) {
-        if (ev->window.event == SDL_WINDOWEVENT_CLOSE) hex_editor_hide(he);
+        /* Not hidden here: SDL counts visible windows right after
+         * delivering this, and with this one hidden it would think the
+         * last window closed and quit the emulator. */
+        if (ev->window.event == SDL_WINDOWEVENT_CLOSE) he->close_requested = true;
     } else if (ev->type == SDL_KEYDOWN) {
         on_key(he, &ev->key);
     } else if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
@@ -401,6 +405,11 @@ void hex_editor_destroy(HexEditor *he) {
 void hex_editor_show(HexEditor *he) {
     if (!he) return;
     SDL_ShowWindow(he->win);
+    if (!he->sized) {   /* create-time sizes can come out shrunk (Wayland scaling) */
+        SDL_SetWindowSize(he->win, COLS * GLYPH_W + 2 * PAD,
+                          TAB_H + ROWS_DEFAULT * GLYPH_H + STATUS_H + 2 * PAD);
+        he->sized = true;
+    }
     SDL_RaiseWindow(he->win);
     he->visible = true;
     he->dirty = true;
@@ -420,6 +429,10 @@ bool hex_editor_is_visible(const HexEditor *he) {
 /* Called every emulated frame: memory changes under us, so redraw ~30 times
  * a second while shown (and at once after input). */
 void hex_editor_refresh(HexEditor *he) {
+    if (he && he->close_requested) {
+        he->close_requested = false;
+        hex_editor_hide(he);
+    }
     if (!he || !he->visible) return;
     Uint32 now = SDL_GetTicks();
     if (!he->dirty && now - he->last_draw < 33) return;

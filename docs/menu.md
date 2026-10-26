@@ -11,7 +11,7 @@ VNC clients (`-vnc`) and `screendump` see just the emulated screen.
 | Blocks  | one submenu per drive (`floppy0: disk.img`): Change..., Eject, Flip disk |
 | Scale   | window scale 1x-4x (you can also drag the window edges); starts at 1x unless `-scale N` |
 | Input   | one entry per input device (`nes-controller`, `nes-controller (2)`, ...) to remap its keys and controller; Reset bindings to defaults. Hidden when the machine has no remappable input (SDL) |
-| Debug   | Hex Editor (machines that have one) |
+| Debug   | Hex Editor (machines that have one); Game Genie... on the NES/Famicom: a code manager like FCE Ultra's - codes with on/off checkboxes, Name/Code/Address/Value/Compare fields that encode and decode as you type, Add/Update/Delete; codes are saved per game |
 | View    | which monitor the window shows, on machines with several (e.g. an IBM 5150 with CGA + MDA); Ctrl+Alt+1..9. Detach ... to new window gives the current monitor its own window (closing it brings the monitor back) |
 | Help    | About GEMU |
 

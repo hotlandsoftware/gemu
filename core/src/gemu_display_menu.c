@@ -179,6 +179,11 @@ static void hex_editor(void *ud, int arg) {
     if (d->hex_toggle_cb) d->hex_toggle_cb(d->hex_toggle_ud);
 }
 
+static void debug_item(void *ud, int i) {
+    GemuDisplay *d = ud;
+    d->debug_items[i].activate(d->debug_items[i].ud);
+}
+
 static void about(void *ud, int arg) {
     (void)arg;
     GemuDisplay *d = ud;
@@ -265,9 +270,12 @@ GemuMenu *gemu_display_build_menubar(GemuDisplay *d) {
             gemu_menu_add(input, GEMU_MENU_ACTION, "Reset bindings to defaults", reset_bindings, d, 0);
     }
 
-    if (d->hex_toggle_cb) {
+    if (d->hex_toggle_cb || d->n_debug_items) {
         GemuMenu *debug = gemu_menu_add_submenu(bar, "Debug");
-        gemu_menu_add(debug, GEMU_MENU_ACTION, "Hex Editor", hex_editor, d, 0);
+        if (d->hex_toggle_cb)
+            gemu_menu_add(debug, GEMU_MENU_ACTION, "Hex Editor", hex_editor, d, 0);
+        for (int i = 0; i < d->n_debug_items; i++)
+            gemu_menu_add(debug, GEMU_MENU_ACTION, d->debug_items[i].label, debug_item, d, i);
     }
 
     /* View: which monitor the window shows, on machines with several */

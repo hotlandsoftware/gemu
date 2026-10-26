@@ -31,6 +31,8 @@
 #  include <gtk/gtk.h>
 #endif
 #include "hex_editor.h"
+#include "cheat_dialog.h"
+#include "nes_cheats.h"
 
 #define VS_DEBUG(s, ...) do { \
     if ((s)->cfg->is_arcade && nes_vs_debug_enabled()) { \
@@ -1015,42 +1017,47 @@ static void nes_chr_write(uint16_t addr, uint8_t val, void *ud) {
 
 /* ── CPU memory map ──────────────────────────────────────────────────────── */
 
-/* ── Game Genie ──────────────────────────────────────────────────────────── */
+/* ── Game Genie ──────────────────────────────────────────────────────────── *
+ *
+ * The cheat list (Debug > Game Genie and the monitor's "gamegenie") lives
+ * outside NesState - snapshots store NesState raw, and cheats are the
+ * player's settings rather than machine state, as in FCE Ultra.  The ROM
+ * patches the CPU applies (gg_patches) are rebuilt from its enabled codes.
+ * One NES per process, so file-scope state is fine. */
 
-static const char gg_alpha[] = "APZLGITYEOXUKSVN";
+static NesCheats    g_cheats;
+static CheatDialog *g_cheat_dialog;
 
-static bool gg_decode(const char *code, uint16_t *addr, uint8_t *val,
-                      uint8_t *cmp, bool *has_cmp) {
-    int len = (int)strlen(code);
-    if (len != 6 && len != 8) return false;
-    uint8_t n[8] = {0};
-    for (int i = 0; i < len; i++) {
-        const char *p = strchr(gg_alpha, toupper((unsigned char)code[i]));
-        if (!p) return false;
-        n[i] = (uint8_t)(p - gg_alpha);
+static void nes_cheats_apply(void *ud) {
+    NesState *s = ud;
+    s->gg_count = 0;
+    for (int i = 0; i < g_cheats.n && s->gg_count < NES_GG_MAX; i++) {
+        if (!g_cheats.list[i].enabled) continue;
+        NesGgPatch *g = &s->gg_patches[s->gg_count];
+        if (!nes_gg_decode(g_cheats.list[i].code, &g->addr, &g->val, &g->cmp, &g->has_cmp)) continue;
+        snprintf(g->code, sizeof(g->code), "%s", g_cheats.list[i].code);
+        s->gg_count++;
     }
-    /* NES Game Genie bit layout per nesgg.txt:
-     *   val[7]=n0[3]  val[6:4]=n1[2:0]  val[3]=n5[3](6ch)/n7[3](8ch)  val[2:0]=n0[2:0]
-     *   addr[14:12]=n3[2:0]  addr[11]=n4[3]   addr[10:8]=n5[2:0]
-     *   addr[7]=n1[3]  addr[6:4]=n2[2:0]  addr[3]=n3[3]  addr[2:0]=n4[2:0]
-     *   cmp[7]=n6[3]  cmp[6:4]=n7[2:0]  cmp[3]=n5[3]  cmp[2:0]=n6[2:0]  (8-char) */
-    *addr = 0x8000u
-        | ((uint16_t)(n[3] & 7u) << 12)
-        | ((uint16_t)(n[4] & 8u) <<  8)
-        | ((uint16_t)(n[5] & 7u) <<  8)
-        | ((uint16_t)(n[1] & 8u) <<  4)
-        | ((uint16_t)(n[2] & 7u) <<  4)
-        | ((uint16_t)(n[3] & 8u))
-        | ((uint16_t)(n[4] & 7u));
-    *has_cmp = (len == 8);
-    if (*has_cmp) {
-        *val = (uint8_t)(((n[0] & 8u) << 4) | ((n[1] & 7u) << 4) | (n[7] & 8u) | (n[0] & 7u));
-        *cmp = (uint8_t)(((n[6] & 8u) << 4) | ((n[7] & 7u) << 4) | (n[5] & 8u) | (n[6] & 7u));
-    } else {
-        *val = (uint8_t)(((n[0] & 8u) << 4) | ((n[1] & 7u) << 4) | (n[5] & 8u) | (n[0] & 7u));
-        *cmp = 0;
+}
+
+/* This cartridge's codes, from <config>/<game>.cht. */
+static void nes_cheats_load(NesState *s) {
+    char path[512] = "";
+    if (s->cart_path_buf[0] && !s->cfg->is_arcade) {
+        char game[256], file[300];
+        nes_game_basename(s->cart_path_buf, game, sizeof(game));
+        snprintf(file, sizeof(file), "%s.cht", game);
+        gemu_config_path(path, sizeof(path), file);
     }
-    return true;
+    nes_cheats_init(&g_cheats, path, nes_cheats_apply, s);
+    nes_cheats_apply(s);
+    if (g_cheats.n)
+        printf("nes: %d Game Genie code%s from %s\n", g_cheats.n, g_cheats.n == 1 ? "" : "s", path);
+}
+
+static void nes_cheat_dialog_toggle(void *ud) {
+    (void)ud;
+    cheat_dialog_toggle(g_cheat_dialog);
 }
 
 static uint8_t nes_prg_direct(const NesState *s, uint16_t addr) {
@@ -1127,101 +1134,77 @@ static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
     }
 }
 
-/* line = arguments after "gamegenie" */
+static void gg_print(NesState *s, const NesCheat *e) {
+    uint16_t a; uint8_t v, k; bool h;
+    if (!nes_gg_decode(e->code, &a, &v, &k, &h)) return;
+    uint8_t rom = s->prg ? nes_prg_direct(s, a) : 0;
+    const char *state = !e->enabled ? "off" : (h && rom != k) ? "on, compare mismatch" : "on";
+    if (h)
+        gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  (if $%02X)  ROM=$%02X [%s]  %s\n",
+                            e->code, a, v, k, rom, state, e->name);
+    else
+        gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  ROM=$%02X [%s]  %s\n",
+                            e->code, a, v, rom, state, e->name);
+}
+
+/* line = arguments after "gamegenie":
+ *   list [code] | add <code> [name] | delete <code> | on <code> | off <code> */
 static void nes_gamegenie_cmd(NesState *s, const char *line) {
     while (*line && isspace((unsigned char)*line)) line++;
-
-    char sub[32] = {0};
-    int  si = 0;
+    char sub[32] = {0}, code[32] = {0};
+    int si = 0;
     while (*line && !isspace((unsigned char)*line) && si < 31)
         sub[si++] = (char)tolower((unsigned char)*line++);
     while (*line && isspace((unsigned char)*line)) line++;
-    const char *arg = line;
-    /* trim trailing whitespace from arg */
-    char argbuf[32] = {0};
-    snprintf(argbuf, sizeof(argbuf), "%s", arg);
-    for (int i = (int)strlen(argbuf) - 1; i >= 0 && isspace((unsigned char)argbuf[i]); i--)
-        argbuf[i] = '\0';
-    arg = argbuf;
+    si = 0;
+    while (*line && !isspace((unsigned char)*line) && si < 31) code[si++] = *line++;
+    while (*line && isspace((unsigned char)*line)) line++;
+    char name[64];
+    snprintf(name, sizeof(name), "%s", line);
+    for (int i = (int)strlen(name) - 1; i >= 0 && isspace((unsigned char)name[i]); i--) name[i] = '\0';
+    char err[160];
 
     if (strcmp(sub, "list") == 0) {
-        if (!*arg) {
-            if (s->gg_count == 0) { gemu_monitor_printf(s->monitor, "gamegenie: no patches active\n"); return; }
-            gemu_monitor_printf(s->monitor, "Active Game Genie patches:\n");
-            for (int i = 0; i < s->gg_count; i++) {
-                NesGgPatch *g = &s->gg_patches[i];
-                uint8_t actual = nes_prg_direct(s, g->addr);
-                if (g->has_cmp) {
-                    const char *status = (actual == g->cmp) ? "active" : "mismatch";
-                    gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  (if $%02X)  ROM=$%02X [%s]\n",
-                           g->code, g->addr, g->val, g->cmp, actual, status);
-                } else {
-                    gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  ROM=$%02X [active]\n",
-                           g->code, g->addr, g->val, actual);
-                }
-            }
-        } else {
-            bool found = false;
-            for (int i = 0; i < s->gg_count; i++) {
-                if (strcasecmp(s->gg_patches[i].code, arg) == 0) {
-                    NesGgPatch *g = &s->gg_patches[i];
-                    uint8_t actual = nes_prg_direct(s, g->addr);
-                    if (g->has_cmp) {
-                        const char *status = (actual == g->cmp) ? "active" : "mismatch";
-                        gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  (if $%02X)  ROM=$%02X [%s]\n",
-                               g->code, g->addr, g->val, g->cmp, actual, status);
-                    } else {
-                        gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  ROM=$%02X [active]\n",
-                               g->code, g->addr, g->val, actual);
-                    }
-                    found = true; break;
-                }
-            }
-            if (!found) gemu_monitor_printf(s->monitor, "gamegenie: code '%s' not found\n", arg);
+        if (code[0]) {
+            int i = nes_cheats_find(&g_cheats, code);
+            if (i < 0) gemu_monitor_printf(s->monitor, "gamegenie: code '%s' not found\n", code);
+            else gg_print(s, &g_cheats.list[i]);
+            return;
         }
+        if (g_cheats.n == 0) { gemu_monitor_printf(s->monitor, "gamegenie: no codes\n"); return; }
+        gemu_monitor_printf(s->monitor, "Game Genie codes:\n");
+        for (int i = 0; i < g_cheats.n; i++) gg_print(s, &g_cheats.list[i]);
         return;
     }
-
     if (strcmp(sub, "add") == 0) {
-        if (!*arg) { gemu_monitor_printf(s->monitor, "usage: gamegenie add <code>\n"); return; }
-        if (s->gg_count >= NES_GG_MAX) {
-            gemu_monitor_printf(s->monitor, "gamegenie: patch limit reached (%d max)\n", NES_GG_MAX); return;
+        if (!code[0]) { gemu_monitor_printf(s->monitor, "usage: gamegenie add <code> [name]\n"); return; }
+        if (!nes_cheats_add(&g_cheats, code, name, true, err, sizeof(err))) {
+            gemu_monitor_printf(s->monitor, "gamegenie: %s\n", err);
+            return;
         }
-        for (int i = 0; i < s->gg_count; i++) {
-            if (strcasecmp(s->gg_patches[i].code, arg) == 0) {
-                gemu_monitor_printf(s->monitor, "gamegenie: %s is already active\n", arg); return;
-            }
-        }
-        uint16_t paddr; uint8_t pval, pcmp; bool has_cmp;
-        if (!gg_decode(arg, &paddr, &pval, &pcmp, &has_cmp)) {
-            gemu_monitor_printf(s->monitor, "gamegenie: invalid code '%s'\n", arg); return;
-        }
-        NesGgPatch *g = &s->gg_patches[s->gg_count++];
-        g->addr = paddr; g->val = pval; g->cmp = pcmp; g->has_cmp = has_cmp;
-        snprintf(g->code, sizeof(g->code), "%s", arg);
-        if (has_cmp)
-            gemu_monitor_printf(s->monitor, "gamegenie: added %s → $%04X = $%02X (if $%02X)\n", arg, paddr, pval, pcmp);
-        else
-            gemu_monitor_printf(s->monitor, "gamegenie: added %s → $%04X = $%02X\n", arg, paddr, pval);
+        gemu_monitor_printf(s->monitor, "gamegenie: added\n");
+        gg_print(s, &g_cheats.list[g_cheats.n - 1]);
         return;
     }
-
-    if (strcmp(sub, "delete") == 0 || strcmp(sub, "remove") == 0) {
-        if (!*arg) { gemu_monitor_printf(s->monitor, "usage: gamegenie delete <code>\n"); return; }
-        for (int i = 0; i < s->gg_count; i++) {
-            if (strcasecmp(s->gg_patches[i].code, arg) == 0) {
-                memmove(&s->gg_patches[i], &s->gg_patches[i + 1],
-                        (size_t)(s->gg_count - i - 1) * sizeof(NesGgPatch));
-                s->gg_count--;
-                gemu_monitor_printf(s->monitor, "gamegenie: removed %s\n", arg);
-                return;
-            }
+    int i = code[0] ? nes_cheats_find(&g_cheats, code) : -1;
+    if (strcmp(sub, "delete") == 0 || strcmp(sub, "remove") == 0 ||
+        strcmp(sub, "on") == 0 || strcmp(sub, "off") == 0) {
+        if (i < 0) {
+            gemu_monitor_printf(s->monitor, code[0] ? "gamegenie: code '%s' not found\n"
+                                                    : "usage: gamegenie %s <code>\n", code[0] ? code : sub);
+            return;
         }
-        gemu_monitor_printf(s->monitor, "gamegenie: code '%s' not found\n", arg);
+        if (sub[0] == 'o') {
+            nes_cheats_set_enabled(&g_cheats, i, sub[1] == 'n');
+            gemu_monitor_printf(s->monitor, "gamegenie: %s %s\n", g_cheats.list[i].code, sub[1] == 'n' ? "on" : "off");
+        } else {
+            gemu_monitor_printf(s->monitor, "gamegenie: removed %s\n", g_cheats.list[i].code);
+            nes_cheats_remove(&g_cheats, i);
+        }
         return;
     }
-
-    gemu_monitor_printf(s->monitor, "gamegenie add <code> | gamegenie list [code] | gamegenie delete <code>\n");
+    gemu_monitor_printf(s->monitor, "gamegenie list [code] | add <code> [name] | delete <code> | on <code> | off <code>\n"
+                                    "(Debug > Game Genie in the window does the same)\n");
 }
 
 static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
@@ -1723,6 +1706,7 @@ static GemuMediaResult nes_media_change(void *ud, const char *arg,
         return GEMU_MEDIA_ERR;
     }
     nes_battery_setup(s);
+    nes_cheats_load(s);         /* this cartridge's Game Genie codes */
     return GEMU_MEDIA_OK_RESET;
 }
 
@@ -2269,6 +2253,17 @@ NesState *nes_create(const MosConfig *cfg) {
             });
         if (!s->display)
             fprintf(stderr, "nes: failed to create display window\n");
+        /* Debug > Game Genie (a Game Genie plugs into a home console only) */
+        if (s->display && !cfg->is_arcade) {
+#ifdef GEMU_GTK
+            if (cfg->display_type == GEMU_DISPLAY_GTK)
+                g_cheat_dialog = cheat_dialog_gtk_create(&g_cheats);
+#endif
+            if (cfg->display_type == GEMU_DISPLAY_SDL)
+                g_cheat_dialog = cheat_dialog_sdl_create(&g_cheats);
+            if (g_cheat_dialog)
+                gemu_display_add_debug_item(s->display, "Game Genie...", nes_cheat_dialog_toggle, s);
+        }
         else
             gemu_monitor_set_input_reset_cb(s->monitor,
                                             gemu_display_reset_input_bindings_ud,
@@ -2295,6 +2290,7 @@ NesState *nes_create(const MosConfig *cfg) {
 
     if (!s->fds_enabled)
         nes_battery_setup(s);
+    nes_cheats_load(s);
 
     if (s->cart.mapper == 4) {
         s->ppu.irq_scanline = mmc3_irq_scanline;
@@ -2352,6 +2348,7 @@ void nes_destroy(NesState *s) {
 #endif
     if (s->fds_enabled) { free(s->fds.raw_disk); }
     hex_editor_destroy(s->hex_editor);
+    if (g_cheat_dialog) { g_cheat_dialog->destroy(g_cheat_dialog); g_cheat_dialog = NULL; }
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     apu_midi_close(&s->apu_midi);
 #endif
@@ -2542,6 +2539,7 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
 #ifdef HAVE_LUA
     s->lua = lua;
 #endif
+    nes_cheats_apply(s);    /* the codes that are on now, not the snapshot's */
 
     fclose(f);
     return true;
@@ -2989,6 +2987,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
         }
 
         hex_editor_refresh(s->hex_editor);
+        if (g_cheat_dialog) g_cheat_dialog->refresh(g_cheat_dialog);
         /* GTK event pump is done inside gemu_display_poll() via the backend */
     }
 

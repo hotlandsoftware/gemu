@@ -34,6 +34,9 @@ struct GemuDisplay {
     GemuMonitor *monitor;                   /* for Pause, Reset, Blocks... */
     void       (*hex_toggle_cb)(void *ud);  /* Debug > Hex Editor, if any */
     void        *hex_toggle_ud;
+    struct { char label[48]; void (*activate)(void *ud); void *ud; }
+                 debug_items[GEMU_DISPLAY_MAX_DEBUG_ITEMS];
+    int          n_debug_items;
     /* UI a backend can offer the menus (NULL = not available there) */
     int  (*ui_get_scale)(struct GemuDisplay *);
     void (*ui_set_scale)(struct GemuDisplay *, int scale);
