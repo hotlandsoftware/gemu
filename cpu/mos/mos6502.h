@@ -43,5 +43,14 @@ typedef struct Mos6502 {
 void mos6502_init (Mos6502 *cpu);
 void mos6502_reset(Mos6502 *cpu);
 void mos6502_step (Mos6502 *cpu);
+/* Disassembly (mos6502_dis.c).  The symbol callback may name an operand
+ * address; access says how the instruction uses it.  Returns the
+ * instruction's length in bytes. */
+enum { MOS6502_SYM_CODE, MOS6502_SYM_READ, MOS6502_SYM_WRITE };
+typedef uint8_t     (*Mos6502PeekFn)(void *ud, uint16_t addr);
+typedef const char *(*Mos6502SymFn)(void *ud, uint16_t addr, int access);
+int  mos6502_disasm(Mos6502PeekFn peek, void *ud, uint16_t pc, char *buf, size_t len,
+                    Mos6502SymFn sym, void *sym_ud);
+int  mos6502_insn_len(uint8_t opcode);
 /* One-line register dump for the monitor's "info cpu". */
 void mos6502_format_state(const Mos6502 *cpu, char *buf, size_t len);

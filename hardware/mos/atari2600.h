@@ -9,6 +9,7 @@
 #include "gemu/gemu_display.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 /*
  * Atari 2600 (Video Computer System) - 6507 @ 1.19 MHz, TIA video/sound/
@@ -43,6 +44,32 @@ enum {
     A26_NUM_ACTIONS
 };
 
+/* Debugger state (a2600_debug.c). */
+#define A26_FULL_W (TIA_LINE_CLOCKS * 2)   /* full-frame view: every color clock */
+#define A26_FULL_H TIA_MAX_LINES
+#define A26_HISTORY 16
+
+typedef struct {
+    int      lines, vsync_end, first_lit, last_lit;
+    uint64_t cycles;
+} A26FrameStats;
+
+typedef struct {
+    int       break_line;      /* stop when the beam reaches it; -1 = off */
+    uint32_t  stop_lines;      /* "scanline N": lines left before stopping */
+    uint32_t  stop_frames;     /* "frame N": frames left before stopping */
+    int       last_line;
+    FILE     *trace;
+    char      trace_path[256];
+    bool      frame_watch;     /* report scanline-count changes */
+    A26FrameStats hist[A26_HISTORY];
+    int       hist_n, hist_pos;
+    bool      autoreload;
+    int64_t   cart_mtime;
+    uint32_t  last_check_ms;
+    uint32_t *full_fb;         /* A26_FULL_W x A26_FULL_H */
+} A26Debug;
+
 typedef struct Atari2600State {
     Mos6502   cpu;
     Tia       tia;
@@ -71,11 +98,31 @@ typedef struct Atari2600State {
 
     char      cart_path[512];
     uint32_t  fb[A2600_FB_W * A2600_FB_H];
+    uint32_t  lut[128];      /* palette in use, ARGB */
+
+    A26Debug     dbg;
 
     GemuDisplay *display;
     GemuMonitor *monitor;
     HexEditor   *hex_editor;
 } Atari2600State;
+
+/* machine_atari2600.c, for the debugger */
+bool a26_reload_cart(Atari2600State *s, char *err, size_t err_len);
+uint8_t a26_peek(const Atari2600State *s, uint16_t addr);
+const uint32_t *a26_palette(const Atari2600State *s);   /* 128 ARGB entries */
+
+/* a2600_debug.c */
+void a26_debug_init(Atari2600State *s);
+void a26_debug_destroy(Atari2600State *s);
+void a26_debug_bind(Atari2600State *s);
+bool a26_debug_before_step(Atari2600State *s);   /* true = stop here */
+bool a26_debug_after_step(Atari2600State *s);
+bool a26_debug_frame_done(Atari2600State *s, uint64_t cycles);
+void a26_debug_poll(Atari2600State *s);           /* once per host frame */
+void a26_debug_present(Atari2600State *s);
+void a26_debug_toggle_colors(void *ud);
+void a26_debug_reload(void *ud);
 
 Atari2600State *atari2600_create (const MosConfig *cfg);
 void            atari2600_run    (Atari2600State *s, const MosConfig *cfg);

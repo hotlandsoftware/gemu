@@ -38,6 +38,7 @@ enum {
     NEED_MEM       = 1 << 0,
     NEED_MEM_WRITE = 1 << 1,
     NEED_SCREEN    = 1 << 2,
+    NEED_FLIP      = 1 << 3,   /* some media device can flip sides */
 };
 
 typedef struct {
@@ -88,8 +89,12 @@ static const MonCmdDef mon_cmds[] = {
     /* name          aliases         params                        help */
     { "atapistate",  NULL,           "",
       "show ATAPI controller state", "i2000", NULL, 0 },
+    { "autoreload",  NULL,           "[on | off]",
+      "reload the cartridge (and symbols) whenever the file changes", M_A2600, NULL, 0 },
     { "break",       "b",            "<addr>",
       "set exec breakpoint", NULL, cmd_break, 0 },
+    { "breakline",   NULL,           "[<line> | off]",
+      "stop when the beam reaches a scanline", M_A2600, NULL, 0 },
     { "calls",       NULL,           "[count]",
       "dump the recent call history to stderr", M_IA64, NULL, 0 },
     { "change",      NULL,           "<device> <file> | vnc password",
@@ -100,10 +105,14 @@ static const MonCmdDef mon_cmds[] = {
       "resume emulation", NULL, cmd_cont, 0 },
     { "cpu",         NULL,           "",
       "show CPU state (same as 'info cpu')", NULL, cmd_cpu, 0 },
+    { "debugcolors", NULL,           "[on | off]",
+      "draw each TIA object in a fixed colour; show blanking", M_A2600, NULL, 0 },
     { "delete",      "del",          "[N]",
       "delete breakpoint N (or all if N omitted)", NULL, cmd_delete, 0 },
     { "dipswitch",   "dip",          "[list | <switch> <value>]",
       "list or set DIP switches", M_VS " 5clown " M_MAGICFLY " " M_DESTROYER " " M_A2600, NULL, 0 },
+    { "disas",       "u",            "[addr] [count]",
+      "disassemble (default: from the PC)", M_A2600, NULL, 0 },
     { "dump",        NULL,           "<addr> <len> <file>",
       "write len bytes (both hex) of the system bus to file", M_IA64, NULL, 0 },
     { "eject",       NULL,           "<device>",
@@ -113,13 +122,19 @@ static const MonCmdDef mon_cmds[] = {
     { "faultstats",  NULL,           "",
       "show CPU fault counters", M_IA64, NULL, 0 },
     { "flip",        NULL,           "<device>",
-      "flip disk media to the next side", NULL, cmd_flip, 0 },
+      "flip disk media to the next side", NULL, cmd_flip, NEED_FLIP },
+    { "frame",       NULL,           "[count]",
+      "run count frames (default 1), then stop", M_A2600, NULL, 0 },
+    { "frameinfo",   NULL,           "[watch on | off]",
+      "scanline counts and VSYNC/VBLANK of recent frames", M_A2600, NULL, 0 },
     { "gamegenie",   NULL,           "add <code> | list | delete <code>",
       "manage Game Genie codes", M_NES, NULL, 0 },
-    { "help",        "?",            "[command]",
+    { "help",        "?",            "[command | all]",
       "list commands, or describe one", NULL, cmd_help, 0 },
     { "hexeditor",   NULL,           "",
       "toggle the hex editor window", NULL, NULL, 0 },
+    { "hide",        NULL,           "[p0 p1 m0 m1 bl pf | none]",
+      "hide TIA objects from the picture (collisions still happen)", M_A2600, NULL, 0 },
     { "history",     NULL,           "[count]",
       "dump the most recently executed slots to stderr", M_IA64, NULL, 0 },
     { "info",        NULL,           "<subcommand>",
@@ -156,13 +171,19 @@ static const MonCmdDef mon_cmds[] = {
       "quit the emulator", NULL, cmd_quit, 0 },
     { "regpoke",     NULL,           "<reg> <value>",
       "set general register r<reg> to a hex value", "generic-ia64", NULL, 0 },
+    { "reload",      NULL,           "",
+      "reload the cartridge file and power-cycle", M_A2600, NULL, 0 },
     { "reset",       "system_reset", "[keys]",
       "reset the machine ('reset keys' restores default input bindings)",
       NULL, cmd_reset, 0 },
+    { "riot",        NULL,           "",
+      "show the 6532 RIOT timer and ports", M_A2600, NULL, 0 },
     { "rwatch",      NULL,           "<addr>",
       "set read watchpoint", NULL, cmd_rwatch, 0 },
     { "savevm",      NULL,           "<file>",
       "save machine state to file", NULL, NULL, 0 },
+    { "scanline",    NULL,           "[count]",
+      "run count scanlines (default 1), then stop", M_A2600, NULL, 0 },
     { "screendump",  NULL,           "<file>[.png]",
       "save screenshot (PPM or PNG)", NULL, cmd_screendump, NEED_SCREEN },
     { "sendkey",     NULL,           "<keys>",
@@ -175,8 +196,15 @@ static const MonCmdDef mon_cmds[] = {
       "execute count instructions (default 1), then stop", NULL, cmd_step, 0 },
     { "stop",        "halt",         "",
       "halt emulation", NULL, cmd_stop, 0 },
-    { "trace",       NULL,           "<count>",
-      "trace the next count executed slots to stderr", M_IA64, NULL, 0 },
+    { "symbols",     "sym",          "[load <file> | reload | list [text] | clear]",
+      "load assembler labels; addresses then accept names", NULL, mon_cmd_symbols, 0 },
+    { "tia",         NULL,           "",
+      "show TIA registers, object positions and collisions", M_A2600, NULL, 0 },
+    { "trace",       NULL,           "<count> | <file> | off",
+      "trace execution (ia64: next count slots to stderr; atari2600: every instruction to file)",
+      M_IA64 " " M_A2600, NULL, 0 },
+    { "view",        NULL,           "[tv | full]",
+      "show the TV picture or the full-frame debug view", M_A2600, NULL, 0 },
     { "vgapeek",     NULL,           "<plane> <offset> <count>",
       "dump VGA plane memory", "generic-ia64", NULL, 0 },
     { "vgareg",      NULL,           "",
@@ -229,13 +257,13 @@ static void unquote(const char *in, char *out, size_t out_len) {
     }
 }
 
-/* Addresses and bytes are hex by default ("1234", "0x1234", "$1234"). */
+/* The monitor running the current command, for symbol lookups. */
+static const GemuMonitor *cur_mon;
+
+/* Addresses and bytes are hex by default ("1234", "0x1234", "$1234"), or
+ * a loaded symbol ("Kernel", "Score+2"). */
 static bool parse_hex(const char *s, uint64_t *out) {
-    if (*s == '$') s++;
-    if (!*s) return false;
-    char *end;
-    *out = strtoull(s, &end, 16);
-    return *end == '\0';
+    return gemu_monitor_parse_addr(cur_mon, s, out);
 }
 
 /* Counts and sizes are decimal unless prefixed ("16", "0x10"). */
@@ -303,6 +331,11 @@ static MonAvail availability(const GemuMonitor *mon, const MonCmdDef *def) {
         return AVAIL_UNSUPPORTED;
     if ((def->needs & NEED_SCREEN) && !mon->screendump_cb)
         return AVAIL_UNSUPPORTED;
+    if (def->needs & NEED_FLIP) {
+        bool any = false;
+        for (int i = 0; i < mon->n_media; i++) any |= mon->media[i].flip != NULL;
+        if (!any) return AVAIL_UNSUPPORTED;
+    }
     return AVAIL_OK;
 }
 
@@ -356,6 +389,7 @@ GemuMonCmd mon_dispatch(GemuMonitor *mon, const char *line) {
     size_t len = strlen(argbuf);
     while (len && isspace((unsigned char)argbuf[len - 1])) argbuf[--len] = '\0';
 
+    cur_mon = mon;
     const MonCmdDef *def = find_def(verb);
     if (!def) {
         mon_printf(mon, "unknown command '%s' (try 'help')\n", verb);
@@ -615,29 +649,45 @@ static void help_command(GemuMonitor *mon, const MonCmdDef *def) {
 
 static GemuMonCmd cmd_help(GemuMonitor *mon, const char *args) {
     char word[64];
+    bool all = false;
     if (take_token(args, word, sizeof(word))) {
-        const MonCmdDef *def = find_def(word);
-        if (def) help_command(mon, def);
-        else     mon_printf(mon, "help: unknown command '%s'\n", word);
-        return GEMU_MON_NONE;
+        if (strcasecmp(word, "all") != 0) {
+            const MonCmdDef *def = find_def(word);
+            if (def) help_command(mon, def);
+            else     mon_printf(mon, "help: unknown command '%s'\n", word);
+            return GEMU_MON_NONE;
+        }
+        all = true;
     }
 
+    /* Only what this machine can run, unless "help all". */
     for (size_t i = 0; i < N_CMDS; i++)
-        if (!mon_cmds[i].machines)
+        if (!mon_cmds[i].machines && (all || availability(mon, &mon_cmds[i]) == AVAIL_OK))
             print_help_line(mon, &mon_cmds[i]);
 
     const char *machine = mon_machine_name();
-    mon_printf(mon, "\nMachine-specific commands%s%s%s:\n",
-               machine ? " (* = available on " : "",
-               machine ? machine : "", machine ? ")" : "");
+    bool header = false;
     for (size_t i = 0; i < N_CMDS; i++) {
         const MonCmdDef *def = &mon_cmds[i];
         if (!def->machines) continue;
+        bool here = machine && availability(mon, def) == AVAIL_OK;
+        if (!here && !all) continue;
+        if (!header) {
+            if (all)
+                mon_printf(mon, "\nMachine-specific commands%s%s%s:\n",
+                           machine ? " (* = available on " : "",
+                           machine ? machine : "", machine ? ")" : "");
+            else
+                mon_printf(mon, "\n%s%s commands:\n", machine ? machine : "Machine",
+                           machine ? "" : "-specific");
+            header = true;
+        }
         char syn[160];
         format_synopsis(def, syn, sizeof(syn));
-        bool here = machine && availability(mon, def) == AVAIL_OK;
-        print_help_row(mon, here ? '*' : ' ', syn, def->help, "");
+        print_help_row(mon, all && here ? '*' : ' ', syn, def->help, "");
     }
+    if (!all)
+        mon_printf(mon, "\n'help <command>' describes one; 'help all' lists every machine's.\n");
     return GEMU_MON_NONE;
 }
 
@@ -759,10 +809,13 @@ static GemuMonCmd cmd_delete(GemuMonitor *mon, const char *args) {
 
 static bool check_bp(GemuMonitor *mon, GemuBpType type, uint32_t addr,
                      const char *what, const char *kind) {
+    uint32_t m = mon->addr_mask ? mon->addr_mask : 0xFFFFFFFFu;
     for (int i = 0; i < mon->n_bps; i++) {
-        if ((mon->bp_entries[i].type & type) && mon->bp_entries[i].addr == addr) {
-            mon_printf(mon, "%s %d hit: %s at 0x%04x\n",
-                       what, mon->bp_entries[i].id, kind, addr);
+        if ((mon->bp_entries[i].type & type) && ((mon->bp_entries[i].addr ^ addr) & m) == 0) {
+            const char *sym = gemu_monitor_symbol_name(mon, addr);
+            mon_printf(mon, "%s %d hit: %s at 0x%04x%s%s\n",
+                       what, mon->bp_entries[i].id, kind, addr,
+                       sym ? " " : "", sym ? sym : "");
             mon->paused = true;
             return true;
         }

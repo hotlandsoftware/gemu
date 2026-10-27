@@ -32,6 +32,11 @@ typedef struct {
     uint32_t   addr;
 } MonBpEntry;
 
+typedef struct {
+    char     name[48];
+    uint32_t value;
+} MonSymbol;
+
 /* A block node from QMP blockdev-add: an image file that can be inserted
  * into a drive's open tray with blockdev-insert-medium. */
 typedef struct {
@@ -133,6 +138,12 @@ struct GemuMonitor {
     MonBinding      bindings[MON_BIND_MAX];
     int             n_bindings;
 
+    MonSymbol      *syms;            /* symbols loaded from an assembler's output */
+    int             n_syms, cap_syms;
+    char            sym_path[512];
+    int64_t         sym_mtime;
+    uint32_t        addr_mask;       /* address lines decoded (mirrors); 0 = all */
+
     MonBackend      backend;
     char            telnet_host[64];
     int             telnet_port;
@@ -181,6 +192,9 @@ bool       mon_line_is_quit(const char *line);
 /* Called by the reader thread for lines it must handle itself because they
  * read further input from the transport (e.g. "change vnc password"). */
 bool       mon_line_is_vnc_password(const char *line);
+
+/* monitor_symbols.c */
+GemuMonCmd mon_cmd_symbols(GemuMonitor *mon, const char *args);
 
 /* monitor_block.c - the QMP blockdev-* operations.  Fill a MonBlockReq on
  * any thread, then run mon_block_run on the emulator thread (mon_run_fn). */

@@ -293,9 +293,15 @@ static void start_hmove(Tia *t) {
 /* ── Register writes ─────────────────────────────────────────────────────── */
 
 static void end_frame(Tia *t) {
+    if (t->debug_view)   /* clear what the new frame doesn't reach */
+        for (int y = t->scanline; y < TIA_MAX_LINES; y++) {
+            memset(t->dbg[t->draw][y], 0x01, TIA_LINE_CLOCKS);
+            t->dbg_vsync[t->draw][y] = 0;
+        }
     t->frame_lines    = t->scanline;
     t->done_first_lit = t->first_lit;
     t->done_last_lit  = t->last_lit;
+    t->done_vsync_end = t->vsync_end_line;
     t->draw ^= 1;
     memset(t->fb[t->draw], 0, sizeof(t->fb[t->draw]));
     t->frame_ready = true;
@@ -427,12 +433,46 @@ static bool pf_bit_at(const Tia *t, int x) {
     return (t->pf[2] >> (col - 12)) & 1u;
 }
 
+/* Fixed colours for debugcolors (NTSC values). */
+#define DBG_P0 0x46u
+#define DBG_M0 0x42u
+#define DBG_P1 0x1Eu
+#define DBG_M1 0x18u
+#define DBG_BL 0x9Eu
+#define DBG_PF 0xC6u
+#define DBG_BK 0x00u
+
+static uint8_t pixel_color(const Tia *t, int x, bool p0, bool p1, bool m0, bool m1,
+                           bool bl, bool pf) {
+    uint8_t c0 = t->colup[0], c1 = t->colup[1], cpf = t->colupf, cbl = t->colupf, cbk = t->colubk;
+    uint8_t cm0 = c0, cm1 = c1, cpfs = (t->ctrlpf & 0x02u) ? t->colup[x >= 80] : cpf;
+    if (t->debug_colors) {
+        c0 = DBG_P0; cm0 = DBG_M0; c1 = DBG_P1; cm1 = DBG_M1;
+        cpf = cpfs = DBG_PF; cbl = DBG_BL; cbk = DBG_BK;
+    }
+    if (t->ctrlpf & 0x04u)          /* playfield priority: PF/BL, P0/M0, P1/M1 */
+        return pf ? cpf : bl ? cbl : p0 ? c0 : m0 ? cm0 : p1 ? c1 : m1 ? cm1 : cbk;
+    if (t->ctrlpf & 0x02u)          /* score mode: PF in the players' colours */
+        return p0 ? c0 : m0 ? cm0 : pf ? cpfs : p1 ? c1 : m1 ? cm1 : bl ? cbl : cbk;
+    return p0 ? c0 : m0 ? cm0 : p1 ? c1 : m1 ? cm1 : pf ? cpf : bl ? cbl : cbk;
+}
+
 static void draw_pixel(Tia *t, int x) {
     bool p0 = t->p[0].on, p1 = t->p[1].on, m0 = t->m[0].on, m1 = t->m[1].on;
     bool bl = t->bl.on, pf = t->pf_bit;
+    bool blank = t->vblank & 0x02u;
 
-    if (t->vblank & 0x02u) {   /* VBLANK blanks the picture and the collision latches */
-        if (t->scanline < TIA_MAX_LINES) t->fb[t->draw][t->scanline][x] = 0;
+    if (t->debug_view && t->scanline < TIA_MAX_LINES) {
+        uint8_t h = t->hide;
+        uint8_t c = pixel_color(t, x, p0 && !(h & TIA_HIDE_P0), p1 && !(h & TIA_HIDE_P1),
+                                m0 && !(h & TIA_HIDE_M0), m1 && !(h & TIA_HIDE_M1),
+                                bl && !(h & TIA_HIDE_BL), pf && !(h & TIA_HIDE_PF));
+        t->dbg[t->draw][t->scanline][TIA_HBLANK + x] = (uint8_t)(c | (blank ? 1u : 0u));
+    }
+
+    if (blank) {   /* VBLANK blanks the picture and the collision latches */
+        if (t->scanline < TIA_MAX_LINES)
+            t->fb[t->draw][t->scanline][x] = t->debug_colors ? 0x04u : 0;
         return;
     }
 
@@ -461,16 +501,10 @@ static void draw_pixel(Tia *t, int x) {
     if (bl && pf) t->cx[6] |= 0x80u;
 
     t->line_lit = true;
-    uint8_t color;
-    if (t->ctrlpf & 0x04u)          /* playfield priority: PF/BL, P0/M0, P1/M1 */
-        color = (pf || bl) ? t->colupf : (p0 || m0) ? t->colup[0] :
-                (p1 || m1) ? t->colup[1] : t->colubk;
-    else if (t->ctrlpf & 0x02u)     /* score mode: PF in the players' colours */
-        color = (p0 || m0) ? t->colup[0] : pf ? t->colup[x >= 80] :
-                (p1 || m1) ? t->colup[1] : bl ? t->colupf : t->colubk;
-    else
-        color = (p0 || m0) ? t->colup[0] : (p1 || m1) ? t->colup[1] :
-                (pf || bl) ? t->colupf : t->colubk;
+    uint8_t h = t->hide;
+    uint8_t color = pixel_color(t, x, p0 && !(h & TIA_HIDE_P0), p1 && !(h & TIA_HIDE_P1),
+                                m0 && !(h & TIA_HIDE_M0), m1 && !(h & TIA_HIDE_M1),
+                                bl && !(h & TIA_HIDE_BL), pf && !(h & TIA_HIDE_PF));
     if (t->scanline < TIA_MAX_LINES) t->fb[t->draw][t->scanline][x] = color;
 }
 
@@ -507,6 +541,11 @@ static void tick(Tia *t) {
         int x = t->hctr - TIA_HBLANK;
         if (x >= 0 && t->scanline < TIA_MAX_LINES)
             t->fb[t->draw][t->scanline][x] = 0;   /* the HMOVE comb */
+        if (t->debug_view && t->scanline < TIA_MAX_LINES) {
+            t->dbg[t->draw][t->scanline][t->hctr] = 0x01u;
+            if (t->hctr == 0) t->dbg_vsync[t->draw][t->scanline] = 0;
+            if (t->vsync & 0x02u) t->dbg_vsync[t->draw][t->scanline] = 1;
+        }
     } else {
         int x = t->hctr - TIA_HBLANK;
         if (x == 0 || x == 79) t->pf_reflect = t->ctrlpf & 0x01u;
@@ -525,6 +564,15 @@ static void tick(Tia *t) {
 
     t->clock++;
     if (++t->hctr >= TIA_LINE_CLOCKS) new_line(t);
+}
+
+int tia_object_x(const Tia *t, const TiaObject *o, int start_delay) {
+    /* Counter ticks happen on visible clocks; the main copy's decode is at
+     * 156 and its first pixel start_delay ticks later. */
+    int x0 = t->hctr - TIA_HBLANK;
+    if (x0 < 0 || t->hblank) x0 = t->ext_hblank ? 8 : 0;
+    int ticks = (156 - o->counter + TIA_WIDTH) % TIA_WIDTH;
+    return (x0 + ticks + start_delay) % TIA_WIDTH;
 }
 
 void tia_run(Tia *t, uint64_t target) {

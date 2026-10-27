@@ -166,4 +166,5 @@ typedef struct MosConfig {
     GemuSerial     *serial;      /* serial terminal attached to this machine (NULL = none) */
     uint32_t        mem_size;  /* generic machine RAM in bytes (0 = default 64KB) */
     const char     *lua_path;  /* -lua FILE: run an FCEUX-Lua-subset script (NES only) */
+    const char     *symbols_path; /* -symbols FILE: assembler labels for the monitor */
 } MosConfig;

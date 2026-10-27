@@ -30,7 +30,7 @@ import xml.etree.ElementTree as ET
 CORE_SRC = [
     'core/src/memory.c', 'core/src/tcg.c', 'core/src/monitor.c',
     'core/src/monitor_cmds.c', 'core/src/monitor_qmp.c',
-    'core/src/monitor_block.c',
+    'core/src/monitor_block.c', 'core/src/monitor_symbols.c',
     'core/third_party/cjson/cJSON.c',
     'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/args.c',
     'core/src/sha256.c', 'core/src/screendump.c', 'core/src/util.c',
@@ -75,7 +75,7 @@ FAMILY_SRC = {
         'src/mitsu_setup.c',
     ],
     'mos': [
-        'cpu/mos/mos6502.c',
+        'cpu/mos/mos6502.c', 'cpu/mos/mos6502_dis.c',
         'vga/mos/rp2c02.c', 'vga/mos/ppu_sh6578.c', 'vga/multi/input_menu.c',
         'audio/apu2a03.c', 'audio/okim6295.c',
         'hardware/machine/mos/machine_mos.c', 'hardware/machine/mos/machine_apple1.c',
@@ -86,6 +86,7 @@ FAMILY_SRC = {
         'hardware/machine/mos/machine_um6578.c',
         'hardware/machine/mos/machine_atari400.c',
         'hardware/machine/mos/machine_atari2600.c', 'hardware/machine/mos/a2600_cart.c',
+        'hardware/machine/mos/a2600_debug.c',
         'vga/mos/tia.c', 'audio/tia_sound.c', 'hardware/device/m6532.c',
         'vga/mos/antic.c', 'audio/pokey.c',
         'crt/ntsc_decode.c', 'crt/nes_ntsc_encode.c', 'crt/crt_tube.c',

@@ -64,6 +64,7 @@ Disables the interactive monitor.
 
 # Syntax
 - Addresses and byte values are hexadecimal, with or without a `0x` or `$` prefix (`break c000`, `poke 0x200 a9 01`).
+- Once symbols are loaded (`symbols load`, or `-symbols FILE` on MOS machines), any address can also be a label, optionally with an offset (`break Kernel`, `x Score+2`).
 - Counts and sizes are decimal unless prefixed with `0x` (`peek 200 32`, `memsave 0 0x800 ram.bin`).
 - File names can be quoted if they contain spaces.
 - `help <command>` describes a single command, including which machines support it.
@@ -71,9 +72,9 @@ Disables the interactive monitor.
 # Commands available on every machine
 
 ## General
-> ``help`` / ``?`` ``[command]``
+> ``help`` / ``?`` ``[command | all]``
 
-Lists all commands, or describes one.
+Lists the commands the running machine supports (general ones first, then its own). `help <command>` describes any command, including which machines have it; `help all` lists every command, marking with `*` those available here.
 
 > ``info <subcommand>``
 
@@ -125,6 +126,10 @@ Sets a read+write, read or write watchpoint.
 > ``delete [N]`` / ``del``
 
 Deletes breakpoint N, or all breakpoints if N is omitted.
+
+> ``symbols [load <file> | reload | list [text] | clear]`` / ``sym``
+
+Loads the labels an assembler wrote: DASM `-s` symbol files, VICE/ca65 label files (`al C:F000 .name`) and plain `NAME = $addr` lists. Labels are then accepted wherever an address is, and shown in breakpoint hits and disassembly. `symbols reload` re-reads the same file after a rebuild.
 
 ## Memory
 These use the machine's memory view, which reads RAM and ROM directly and never disturbs hardware registers. Bytes that can't be read safely (I/O registers whose reads have side effects) show as `--`.
@@ -213,6 +218,14 @@ Run `help` on any machine for the authoritative list; the machines each command 
 | `key`, `trace`, `history`, `calls`, `dump`, `vhptstats`, `faultstats` | i2000, generic-ia64 | IA-64 debugging |
 | `input`, `panel`, `mousekick`, `atapistate` | i2000 | i2000 debugging |
 | `regpoke`, `vgareg`, `vgapeek` | generic-ia64 | generic IA-64 debugging |
+| `disas [addr] [count]` / `u` | atari2600 | disassemble, with TIA/RIOT register names and symbols |
+| `tia`, `riot` | atari2600 | chip state: registers, object positions, collisions; timer and ports |
+| `frame [n]`, `scanline [n]`, `breakline <n> \| off` | atari2600 | run n frames / scanlines then stop; stop when the beam reaches a scanline |
+| `trace <file> \| off` | atari2600 | log every instruction with frame, scanline and cycle |
+| `frameinfo [watch on \| off]` | atari2600 | scanline counts, VSYNC and picture lines of recent frames; report changes |
+| `debugcolors [on \| off]`, `hide <p0 p1 m0 m1 bl pf \| none>` | atari2600 | fixed object colours; leave objects out of the picture |
+| `view [tv \| full]` | atari2600 | the TV picture or the full-frame debug view (also View menu) |
+| `reload`, `autoreload [on \| off]` | atari2600 | reload the cartridge (and symbols) now / whenever the file changes |
 
 # Adding commands (for developers)
 GMP lives in `core/src/monitor_qmp.c` (the tray and node model behind `blockdev-*` is in `core/src/monitor_block.c`) and uses the bundled [cJSON](https://github.com/DaveGamble/cJSON) (`core/third_party/cjson`, MIT) for all JSON parsing and generation; add QMP commands to its `qmp_cmds[]` table.

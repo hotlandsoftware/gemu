@@ -250,18 +250,24 @@ static void update_window(Atari2600State *s) {
 
 static void build_frame(Atari2600State *s) {
     const uint8_t (*frame)[TIA_WIDTH] = tia_frame(&s->tia);
-    uint32_t lut[128];
-    for (int i = 0; i < 128; i++) lut[i] = palette_color(s, (uint8_t)(i << 1));
+    for (int i = 0; i < 128; i++) s->lut[i] = palette_color(s, (uint8_t)(i << 1));
     for (int y = 0; y < A2600_FB_H; y++) {
         const uint8_t *src = frame[s->window_start + y];
         uint32_t *dst = s->fb + y * A2600_FB_W;
         for (int x = 0; x < TIA_WIDTH; x++)
-            dst[2 * x] = dst[2 * x + 1] = lut[src[x] >> 1];
+            dst[2 * x] = dst[2 * x + 1] = s->lut[src[x] >> 1];
     }
 }
 
+const uint32_t *a26_palette(const Atari2600State *s) {
+    return s->lut;
+}
+
+/* Saves what the window shows: the picture, or the full-frame view. */
 static bool a26_screendump(void *ud, const char *path) {
     Atari2600State *s = ud;
+    if (s->display && gemu_display_head(s->display) == 1 && s->dbg.full_fb)
+        return gemu_screendump_argb(path, s->dbg.full_fb, A26_FULL_W, A26_FULL_H);
     return gemu_screendump_argb(path, s->fb, A2600_FB_W, A2600_FB_H);
 }
 
@@ -285,6 +291,13 @@ static bool a26_mon_read(void *ud, uint64_t addr64, uint8_t *val) {
     else if (!(addr & 0x200u)) *val = s->riot.ram[addr & 0x7Fu];
     else                       *val = m6532_peek(&s->riot, addr, s->cpu.cycle_count);
     return true;
+}
+
+/* Side-effect-free bus read (debugger, disassembler). */
+uint8_t a26_peek(const Atari2600State *s, uint16_t addr) {
+    uint8_t v = 0;
+    a26_mon_read((void *)s, addr, &v);
+    return v;
 }
 
 static bool a26_mon_write(void *ud, uint64_t addr64, uint8_t val) {
@@ -415,6 +428,8 @@ static bool a26_save_snapshot(Atari2600State *s, const char *path) {
     snap->riot.read_pa = NULL; snap->riot.read_pb = NULL; snap->riot.ud = NULL;
     snap->cart.rom = NULL;
     snap->tia.sound.dev = 0;
+    snap->dbg.trace = NULL;
+    snap->dbg.full_fb = NULL;
     uint64_t magic = A26_SNAPSHOT_MAGIC;
     uint32_t version = A26_SNAPSHOT_VERSION, rom_size = s->cart.rom_size;
     bool ok = fwrite(&magic, sizeof(magic), 1, f) == 1 &&
@@ -450,8 +465,10 @@ static bool a26_load_snapshot(Atari2600State *s, const char *path) {
     uint8_t *rom = s->cart.rom;
     SDL_AudioDeviceID dev = s->tia.sound.dev;
     void *ud = s->cpu.mem_ud;
+    A26Debug dbg = s->dbg;   /* the debugger's settings aren't machine state */
     *s = *snap;
     free(snap);
+    s->dbg = dbg;
     s->cfg = cfg; s->display = display; s->monitor = monitor; s->hex_editor = hex;
     s->cart.rom = rom;
     s->tia.sound.dev = dev;
@@ -516,6 +533,17 @@ static GemuMediaResult a26_cart_eject(void *ud, char *err, size_t err_len) {
     return GEMU_MEDIA_OK;
 }
 
+bool a26_reload_cart(Atari2600State *s, char *err, size_t err_len) {
+    if (!s->cart_path[0]) { snprintf(err, err_len, "no cartridge inserted"); return false; }
+    if (!a26_cart_load(&s->cart, s->cart_path)) {
+        snprintf(err, err_len, "failed to load '%s'", s->cart_path);
+        return false;
+    }
+    make_hex_editor(s);
+    a26_power_on(s);
+    return true;
+}
+
 static void a26_cart_status(void *ud, char *buf, size_t len) {
     const Atari2600State *s = ud;
     if (!s->cart.rom) { snprintf(buf, len, "[not inserted]"); return; }
@@ -574,10 +602,19 @@ Atari2600State *atari2600_create(const MosConfig *cfg) {
     s->cpu.mem_ud    = s;
     mos_cpu_apply(&s->cpu, cfg->cpu);
     s->cpu.dummy_cycles = true;   /* hotspots see every bus cycle */
+    for (int i = 0; i < 128; i++) s->lut[i] = palette_color(s, (uint8_t)(i << 1));
 
     s->monitor = gemu_monitor_create();
     if (!s->monitor) { tia_sound_destroy(&s->tia.sound); a26_cart_free(&s->cart); free(s); return NULL; }
     GemuMonitor *mon = s->monitor;
+    gemu_monitor_set_addr_mask(mon, 0x1FFF);   /* 13 address lines: "break F000" = $1000 */
+    a26_debug_init(s);
+    a26_debug_bind(s);
+    if (cfg->symbols_path) {
+        int n = gemu_monitor_load_symbols(mon, cfg->symbols_path);
+        if (n < 0) fprintf(stderr, "atari2600: cannot read symbols '%s'\n", cfg->symbols_path);
+        else       printf("atari2600: %d symbols from %s\n", n, cfg->symbols_path);
+    }
     gemu_monitor_set_cpu_state_cb(mon, a26_cpu_state, s);
     gemu_monitor_set_screendump_cb(mon, a26_screendump, s);
     gemu_monitor_set_memory(mon, &(GemuMonMemory){
@@ -624,8 +661,16 @@ Atari2600State *atari2600_create(const MosConfig *cfg) {
                 .hex_toggle_ud = s,
             },
         });
-        if (s->display)
+        if (s->display) {
             gemu_monitor_set_input_reset_cb(mon, gemu_display_reset_input_bindings_ud, s->display);
+            /* View menu: the picture, or every color clock of every line. */
+            gemu_display_set_heads(s->display, (GemuDisplayHead[]){
+                { "TV picture", A2600_FB_W, A2600_FB_H, 4, 3 },
+                { "Full frame (debug)", A26_FULL_W, A26_FULL_H, 0, 0 },
+            }, 2);
+            gemu_display_add_debug_item(s->display, "Reload Cartridge", a26_debug_reload, s);
+            gemu_display_add_debug_item(s->display, "Debug Colors", a26_debug_toggle_colors, s);
+        }
     }
 
     a26_power_on(s);
@@ -637,6 +682,7 @@ void atari2600_destroy(Atari2600State *s) {
     hex_editor_destroy(s->hex_editor);
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
+    a26_debug_destroy(s);
     tia_sound_destroy(&s->tia.sound);
     a26_cart_free(&s->cart);
     free(s);
@@ -709,22 +755,34 @@ void atari2600_run(Atari2600State *s, const MosConfig *cfg) {
 
         handle_input(s);
 
+        a26_debug_poll(s);
+
         uint64_t frame_cycles = 0;
         if (!paused) {
             uint64_t start = s->cpu.cycle_count;
             while (!s->tia.frame_ready) {
                 if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
+                if (a26_debug_before_step(s)) break;
                 a26_step(s);
+                if (a26_debug_after_step(s)) break;
                 if (gemu_monitor_is_paused(s->monitor)) break;
             }
-            s->tia.frame_ready = false;
             frame_cycles = s->cpu.cycle_count - start;
+            if (s->tia.frame_ready) {
+                s->tia.frame_ready = false;
+                a26_debug_frame_done(s, s->cpu.cycle_count - s->frame_start_cycle);
+                s->frame_start_cycle = s->cpu.cycle_count;
+            }
             tia_sound_flush(&s->tia.sound);
             update_window(s);
             build_frame(s);
         }
 
-        if (s->display) gemu_display_render(s->display, s->fb, A2600_FB_W, A2600_FB_H);
+        if (s->display) {
+            if (gemu_display_head_shown(s->display, 0))
+                gemu_display_render_head(s->display, 0, s->fb, A2600_FB_W, A2600_FB_H);
+            a26_debug_present(s);
+        }
 
         /* Pace to the audio clock, or to the frame's real duration. */
         if (s->tia.sound.dev && !paused) {

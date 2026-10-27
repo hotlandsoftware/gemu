@@ -158,6 +158,22 @@ bool gemu_monitor_check_exec (GemuMonitor *mon, uint32_t addr);
 bool gemu_monitor_check_read (GemuMonitor *mon, uint32_t addr);
 bool gemu_monitor_check_write(GemuMonitor *mon, uint32_t addr);
 bool gemu_monitor_has_exec_breakpoints(const GemuMonitor *mon);
+/* Stop emulation as if by "stop" (e.g. a machine's own raster breakpoint). */
+void gemu_monitor_pause(GemuMonitor *mon);
+/* Address lines the machine decodes: breakpoints and symbols then match
+ * through mirrors (an Atari 2600 passes 0x1FFF, so "break F000" also stops
+ * at $1000).  0 = compare every bit. */
+void gemu_monitor_set_addr_mask(GemuMonitor *mon, uint32_t mask);
+
+/* ── Symbols (monitor_symbols.c) ───────────────────────────────────────────
+ * Labels from an assembler (DASM -s, VICE/ca65 label files, NAME = $addr).
+ * Every command that takes an address accepts them, with +/- offsets. */
+int         gemu_monitor_load_symbols(GemuMonitor *mon, const char *path);   /* count, -1 = error */
+void        gemu_monitor_clear_symbols(GemuMonitor *mon);
+bool        gemu_monitor_reload_symbols_if_changed(GemuMonitor *mon);
+const char *gemu_monitor_symbol_name(const GemuMonitor *mon, uint32_t addr);
+bool        gemu_monitor_symbol_value(const GemuMonitor *mon, const char *name, uint32_t *value);
+bool        gemu_monitor_parse_addr(const GemuMonitor *mon, const char *text, uint64_t *out);
 bool gemu_monitor_has_mem_breakpoints (const GemuMonitor *mon);
 
 /* Start the reader thread (no-op for stdio when stdin is not a TTY). */

@@ -134,6 +134,7 @@ static const GemuArgsDef def = {
 #endif
         "  -start ADDR        Override reset vector and start execution at ADDR\n"
         "  -cartridge FILE    Insert a cartridge\n"
+        "  -symbols FILE      Load assembler labels for the monitor (DASM -s, VICE)\n"
         "  -floppy FILE       Insert a floppy disk image (-fda is an alias)\n"
         "  -tape [ADDR:]FILE  Insert a cassette tape\n"
 #ifdef HAVE_LUA
@@ -601,6 +602,9 @@ int mos_setup(int argc, char *argv[]) {
         } else if (strcmp(rem[i], "-cartridge") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -cartridge requires an argument\n"); return 1; }
             cfg.cart_path = rem[++i];
+        } else if (strcmp(rem[i], "-symbols") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -symbols requires an argument\n"); return 1; }
+            cfg.symbols_path = rem[++i];
         } else if (strcmp(rem[i], "-lua") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -lua requires an argument\n"); return 1; }
             cfg.lua_path = rem[++i];

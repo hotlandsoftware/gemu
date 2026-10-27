@@ -100,10 +100,31 @@ typedef struct Tia {
     int      vsync_end_line;  /* line VSYNC ended on, current frame */
     int      first_lit, last_lit;            /* lines with VBLANK off, current frame */
     int      done_first_lit, done_last_lit;  /* same, last finished frame */
+    int      done_vsync_end;
     bool     line_lit;
+
+    /* Debugging */
+    bool     debug_colors;   /* fixed colour per object, blanking shown grey */
+    uint8_t  hide;           /* TIA_HIDE_* objects left out of the picture */
+    bool     debug_view;     /* fill dbg[] below */
+    /* Every color clock of every line (HBLANK included), for the debugger's
+     * full-frame view: the colour, with bit 0 set where the TV is blanked
+     * (HBLANK, VBLANK) and the picture would be black. */
+    uint8_t  dbg[2][TIA_MAX_LINES][TIA_LINE_CLOCKS];
+    uint8_t  dbg_vsync[2][TIA_MAX_LINES];   /* VSYNC was on during the line */
 
     TiaSound sound;
 } Tia;
+
+#define TIA_HIDE_P0 0x01u
+#define TIA_HIDE_P1 0x02u
+#define TIA_HIDE_M0 0x04u
+#define TIA_HIDE_M1 0x08u
+#define TIA_HIDE_BL 0x10u
+#define TIA_HIDE_PF 0x20u
+
+/* Horizontal position (0-159) where an object's main copy next starts. */
+int     tia_object_x(const Tia *t, const TiaObject *o, int start_delay);
 
 void    tia_init(Tia *t);
 void    tia_reset(Tia *t);    /* registers and counters; keeps the sound device */
@@ -118,4 +139,8 @@ uint8_t tia_peek(const Tia *t, uint16_t addr);
 /* The last finished frame. */
 static inline const uint8_t (*tia_frame(const Tia *t))[TIA_WIDTH] {
     return (const uint8_t (*)[TIA_WIDTH])t->fb[t->draw ^ 1];
+}
+/* The frame in progress, every color clock (debug view). */
+static inline const uint8_t (*tia_dbg_frame(const Tia *t, bool current))[TIA_LINE_CLOCKS] {
+    return (const uint8_t (*)[TIA_LINE_CLOCKS])t->dbg[current ? t->draw : t->draw ^ 1];
 }

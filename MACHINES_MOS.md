@@ -99,6 +99,33 @@ library relies on), with two-channel TIA sound.
 - The machine menu's Reset power-cycles the console; the Game Reset switch
   is the F2 key / `sendkey reset`.
 
+#### Debugging homebrew
+
+```sh
+dasm game.asm -f3 -ogame.bin -sgame.sym
+./bin/gemu -M atari2600 -cartridge game.bin -symbols game.sym -monitor stdio
+(gemu) autoreload on        # rebuild in another terminal: the game restarts with it
+(gemu) break Kernel         # labels work anywhere an address does
+(gemu) disas                # STA WSYNC, LDA INTIM... register names by direction
+(gemu) tia                  # object x positions, NUSIZ, HMxx, PF bits, collisions
+(gemu) scanline 10          # step the beam; breakline 100 stops when it gets there
+(gemu) frameinfo watch on   # complain when a frame isn't 262 lines
+```
+
+- **Full-frame view** (View > "Full frame (debug)", or `view full`): every
+  color clock of every line - HBLANK, VBLANK (dimmed, objects still drawn),
+  VSYNC (magenta), the HMOVE comb, the TV window's edges - and, while
+  stopped, the beam's position. It can also be detached into its own window.
+- **Debug > Debug Colors** / `debugcolors on`: each object in a fixed colour
+  (P0 red, M0 dark red, P1 yellow, M1 orange, BL blue, PF green);
+  `hide p0 pf` takes objects out of the picture (they still collide).
+- **Raster control**: `frame [n]`, `scanline [n]`, `breakline <n>`, plus
+  `break`/`watch`, which match through the 6507's address mirrors (`break F000`
+  also stops at `$1000`; with `vcs.h` labels in the symbol file, `wwatch WSYNC`
+  works as written).
+- `trace FILE` logs each instruction with frame, scanline and cycle-in-line;
+  `riot` shows the timer and when it expires; `mapperdump` the bank state.
+
 ## Planned, not implemented yet
 | Name   | Full Name     | Year |
 |--------|---------------|---------------|

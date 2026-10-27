@@ -616,7 +616,15 @@ void gemu_monitor_destroy(GemuMonitor *mon) {
     pthread_cond_destroy(&mon->done_cond);
     pthread_mutex_destroy(&mon->lock);
     free(mon->capture_buf);
+    free(mon->syms);
     free(mon);
+}
+
+void gemu_monitor_pause(GemuMonitor *mon) {
+    if (!mon) return;
+    pthread_mutex_lock(&mon->lock);
+    mon->paused = true;
+    pthread_mutex_unlock(&mon->lock);
 }
 
 void gemu_monitor_enqueue_reset(GemuMonitor *mon) {
