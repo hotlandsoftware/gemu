@@ -23,13 +23,13 @@ jobs:
             libsdl2-dev libsdl2-ttf-dev libncurses-dev
 
       - name: Configure
-        run: ./configure --target-list="chip8,mos,rca,ia64"
+        run: ./configure --target-list="chip8,mos,rca,ia64,x86,mitsu,z80"
 
       - name: Build
         run: ninja
 
       - name: Package
-        run: tar czf gemu-linux-x86_64.tar.gz -C bin gemu gemu-chip8 gemu-mos gemu-rca gemu-ia64
+        run: tar czf gemu-linux-x86_64.tar.gz -C bin gemu gemu-chip8 gemu-mos gemu-rca gemu-ia64 gemu-x86 gemu-mitsu gemu-z80
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -58,7 +58,7 @@ jobs:
             mingw-w64-x86_64-python
 
       - name: Configure
-        run: python3 configure --target-list="chip8,mos,rca,ia64"
+        run: python3 configure --target-list="chip8,mos,rca,ia64,x86,mitsu,z80"
 
       - name: Build
         run: ninja
@@ -106,7 +106,7 @@ jobs:
       # fail at compile time, PE subsystem version set to 5.1.
       - name: Configure
         run: >-
-          python3 configure --target-list="chip8,mos,rca,ia64" --disable-crypto
+          python3 configure --target-list="chip8,mos,rca,ia64,x86,mitsu,z80" --disable-crypto
           --extra-cflags="-D_WIN32_WINNT=0x0502 -DWINVER=0x0502"
           --extra-ldflags="-Wl,--major-subsystem-version=5 -Wl,--minor-subsystem-version=1"
 
