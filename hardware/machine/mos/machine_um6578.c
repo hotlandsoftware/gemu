@@ -854,6 +854,7 @@ Um6578State *um6578_create(const MosConfig *cfg) {
     s->cpu.mem_read  = um6578_read;
     s->cpu.mem_write = um6578_write;
     s->cpu.mem_ud    = s;
+    mos_cpu_apply(&s->cpu, cfg->cpu);
     /* real M6502 core on this hardware - decimal mode stays enabled
      * (decimal_disable defaults false), unlike the NES's 2A03. */
 

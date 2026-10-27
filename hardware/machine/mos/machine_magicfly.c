@@ -425,6 +425,7 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
     s->cpu.mem_read  = magicfly_read;
     s->cpu.mem_write = magicfly_write;
     s->cpu.mem_ud    = s;
+    mos_cpu_apply(&s->cpu, cfg->cpu);
 
     s->monitor = gemu_monitor_create();
     if (!s->monitor) { free(s->prg); free(s->gfxbnk0); free(s->gfxbnk1); free(s); return NULL; }

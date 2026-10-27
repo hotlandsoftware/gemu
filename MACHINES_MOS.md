@@ -7,6 +7,7 @@
 | 2a07 | `Ricoh 2A07` | working |  |
 | 6501 | `MOS Technology 6501` | working | Extremely rare early version of 6502,  pin-compatible with Motorola 6800 |
 | 6502 | `MOS Technology 6502` | working | |
+| 6507 | `MOS Technology 6507` | working | 28-pin 6502: 13 address pins (8 KB, mirrored), no IRQ/NMI pins; usable on any MOS machine |
 
 ## VGA
 | Name   | Full Name     | Status | Notes |
@@ -23,11 +24,15 @@
 | msm6295 | `OKI MSM6295 ADPCM` | working |  |
 | none | `None (disable all sound output)` | working |  |
 | pcspk | `PC Speaker` | working |  |
+| tia | `Atari TIA two-channel sound` | working | Atari 2600 |
 
 ## Devices
 | Name   | Full Name     | Status | Notes |
 |--------|---------------|---------|---------|
 | a1ci | `Apple I Cassette Interface` | working |  |
+| cx10 | `Atari CX10 joystick` | working | the 1977 joystick; electrically identical to the CX40 |
+| cx30 | `Atari CX30 paddle controllers` | working | a pair per jack; the mouse turns player 1's paddle, Left/Right turn either |
+| cx40 | `Atari CX40 joystick` | working | default Atari 2600 controller |
 | fds | `Famicom Disk System` | working |  |
 | famicom-keyboard | `Famicom 72-key Keyboard` | working |  |
 | famicom-mic | `Famicom Microphone Controller` | working | no proper mic detection yet, can send mic sound by pressing M (default) |
@@ -50,6 +55,9 @@ Simulated machines include:
 | Name   | Full Name     | Year | Graphics  | Input | Sound | Status |
 |--------|---------------|---------|---------|-------|-------|-------|
 | apple1 | `Apple I` | 1976 | 🟢 | 🟢 | 🔴 | working | 
+| atari2600 | `Atari 2600 Video Computer System (NTSC)` | 1977 | 🟢 | 🟢 | 🟢 | working | 
+| atari2600pal | `Atari 2600 Video Computer System (PAL)` | 1978 | 🟢 | 🟢 | 🟢 | working | 
+| atari2600secam | `Atari 2600 Video Computer System (SECAM)` | 1983 | 🟢 | 🟢 | 🟢 | working | 
 | atari400 | `Atari 400` | 1979 | 🟢 | 🟢 | 🟢 | imperfect | 
 | dendy | `Dendy Famiclone` | 1992 | 🟢 | 🟢 | 🟢 | imperfect | 
 | famicom | `Nintendo Family Computer` | 1983  | 🟢 | 🟢 | 🟢 | imperfect | 
@@ -60,6 +68,37 @@ Simulated machines include:
 | um6578 | `UM6578 Enhanced Famiclone` | 199? | 🟢 | 🟢 | 🟢 | imperfect | 
 | vssmb | `VS. Super Mario Bros.` | 1986 | 🟢 | 🟢 | 🟢 | working | 
 
+### Atari 2600
+
+```sh
+./bin/gemu -M atari2600 -cartridge game.bin                      # CX40 joystick
+./bin/gemu -M atari2600 -cartridge game.bin -device cx40 -device cx40   # two players
+./bin/gemu -M atari2600 -cartridge breakout.bin -device cx30     # paddles
+```
+
+No BIOS is needed. The TIA is emulated one color clock at a time, synced to
+the exact CPU cycle of every bus access (WSYNC, HMOVE and its HBLANK "comb",
+per-register write delays, NUSIZ changes mid-draw and the other quirks the
+library relies on), with two-channel TIA sound.
+
+- **Cartridges**: 2K, 4K, F8/F6/F4 (+Superchip), EF/DF/BF (+SC), FE (Activision),
+  E0 (Parker Bros), 3F/3E (Tigervision), E7 (M Network), FA (CBS RAM Plus),
+  F0 (Megaboy), UA, CV (CommaVid), 0840, SB, DPC (Pitfall II) and AR
+  (Starpath Supercharger tape images, with a built-in BIOS). The scheme is
+  detected automatically; a file extension such as `.f8` or `.e0` forces one.
+- **TV standard**: `atari2600` switches to the PAL palette by itself when a
+  program draws PAL-length (312-line) frames; `atari2600pal` and
+  `atari2600secam` force PAL timing/palette or the SECAM palette.
+- **Keys** (Input menu to change): joystick on the arrows + Space, a second
+  CX40 on W/A/S/D + Left Shift. Console: F1 Game Select, F2 Game Reset,
+  F3 Color/B&W, F5/F6 left/right difficulty (toggles).
+- **Monitor**: `sendkey up-fire`, `sendkey reset`, `sendkey p2left` (buttons:
+  up down left right fire reset select, p2up... p2fire);
+  `dipswitch color bw`, `dipswitch left a`, `dipswitch list` for the toggle
+  switches; `mapperdump` shows the bank-switching state; `savevm`/`loadvm`.
+- The machine menu's Reset power-cycles the console; the Game Reset switch
+  is the F2 key / `sendkey reset`.
+
 ## Planned, not implemented yet
 | Name   | Full Name     | Year |
 |--------|---------------|---------------|
@@ -69,7 +108,6 @@ Simulated machines include:
 | atari65xe | `Atari 65XE` | 1983 |
 | atari800 | `Atari 800` | 1979 |
 | atari800xl | `Atari 800XL` | 1983 |
-| atari2600 | `Atari 2600/VCS` | 1977 |
 | atari5200 | `Atari 5200` | 1982 |
 | atari5200 | `Atari 7800` | 1986 |
 | atarilynx | `Atari Lynx` | 1989 |

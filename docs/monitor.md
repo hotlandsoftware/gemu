@@ -193,7 +193,7 @@ Saves or restores the full machine state.
 
 > ``sendkey <keys>``
 
-Presses keys or buttons on the machine's input device. The key names depend on the machine (e.g. `sendkey start` on the NES, `sendkey HELLO enter` on the Apple I).
+Presses keys or buttons on the machine's input device. The key names depend on the machine (e.g. `sendkey start` on the NES, `sendkey up-fire` or `sendkey reset` on the Atari 2600, `sendkey HELLO enter` on the Apple I).
 
 > ``hexeditor``
 
@@ -205,8 +205,8 @@ Run `help` on any machine for the authoritative list; the machines each command 
 | Command | Machines | Description |
 |---------|----------|-------------|
 | `gamegenie add <code> [name]` / `list` / `on <code>` / `off <code>` / `delete <code>` | nes, nespal, famicom, dendy | manage Game Genie codes (the same list as Debug > Game Genie, saved per game in `<config>/<game>.cht`) |
-| `ppudump`, `mapperdump` | NES family, VS. System | show PPU state / mapper registers |
-| `dipswitch [list \| <switch> <value>]` / `dip` | vssmb, vsskatekids, 5clown, magicfly, 7mezzo, destroyer, altair2 | list or set DIP switches |
+| `ppudump`, `mapperdump` | NES family, VS. System (`mapperdump` also Atari 2600) | show PPU state / mapper registers |
+| `dipswitch [list \| <switch> <value>]` / `dip` | vssmb, vsskatekids, 5clown, magicfly, 7mezzo, destroyer, altair2, atari2600 | list or set DIP switches (Atari 2600: the console's Color/B&W and difficulty switches) |
 | `coin [slot]` | vssmb, vsskatekids, 5clown, magicfly, 7mezzo | insert a coin |
 | `service` | vssmb, vsskatekids | press the service button |
 | `mouse`, `mousemove`, `mouseclear`, `mousestate` | um6578, asobou, czdf1 (`mousemove`, `mousestate` also i2000) | drive a synthetic mouse |

@@ -58,6 +58,7 @@ typedef struct {
 #define M_DESTROYER "destroyer altair2"
 #define M_UM6578    "um6578 asobou czdf1"
 #define M_IA64      "i2000 generic-ia64"
+#define M_A2600     "atari2600 atari2600pal atari2600secam"
 
 static GemuMonCmd cmd_help(GemuMonitor *, const char *);
 static GemuMonCmd cmd_info(GemuMonitor *, const char *);
@@ -102,7 +103,7 @@ static const MonCmdDef mon_cmds[] = {
     { "delete",      "del",          "[N]",
       "delete breakpoint N (or all if N omitted)", NULL, cmd_delete, 0 },
     { "dipswitch",   "dip",          "[list | <switch> <value>]",
-      "list or set DIP switches", M_VS " 5clown " M_MAGICFLY " " M_DESTROYER, NULL, 0 },
+      "list or set DIP switches", M_VS " 5clown " M_MAGICFLY " " M_DESTROYER " " M_A2600, NULL, 0 },
     { "dump",        NULL,           "<addr> <len> <file>",
       "write len bytes (both hex) of the system bus to file", M_IA64, NULL, 0 },
     { "eject",       NULL,           "<device>",
@@ -130,7 +131,7 @@ static const MonCmdDef mon_cmds[] = {
     { "loadvm",      NULL,           "<file>",
       "restore machine state from file", NULL, NULL, 0 },
     { "mapperdump",  NULL,           "",
-      "show cartridge mapper registers", M_NES_ALL, NULL, 0 },
+      "show cartridge mapper registers", M_NES_ALL " " M_A2600, NULL, 0 },
     { "memsave",     "pmemsave",     "<addr> <size> <file>",
       "save size bytes of memory at addr to file", NULL, cmd_memsave, NEED_MEM },
     { "mouse",       NULL,           "<x> <y> [left] [right] [none]",

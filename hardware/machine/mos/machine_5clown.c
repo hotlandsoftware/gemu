@@ -422,6 +422,7 @@ FiveClownState *fiveclown_create(const MosConfig *cfg) {
     s->cpu.mem_read  = main_read;
     s->cpu.mem_write = main_write;
     s->cpu.mem_ud    = s;
+    mos_cpu_apply(&s->cpu, cfg->cpu);
 
     mos6502_init(&s->audiocpu);
     s->audiocpu.mem_read  = audio_read;

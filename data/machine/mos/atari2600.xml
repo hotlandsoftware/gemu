@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<machine name="atari2600" family="mos" description="Atari 2600 Video Computer System (1977) (NTSC)"
+         cpu="6507" soundhw="tia" tv="ntsc" status="working">
+    <device name="cx40"/>
+</machine>

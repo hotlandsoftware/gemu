@@ -85,6 +85,8 @@ FAMILY_SRC = {
         'hardware/machine/mos/machine_magicfly.c',
         'hardware/machine/mos/machine_um6578.c',
         'hardware/machine/mos/machine_atari400.c',
+        'hardware/machine/mos/machine_atari2600.c', 'hardware/machine/mos/a2600_cart.c',
+        'vga/mos/tia.c', 'audio/tia_sound.c', 'hardware/device/m6532.c',
         'vga/mos/antic.c', 'audio/pokey.c',
         'crt/ntsc_decode.c', 'crt/nes_ntsc_encode.c', 'crt/crt_tube.c',
         'hardware/device/fds.c', 'hardware/device/fds_hle.c',

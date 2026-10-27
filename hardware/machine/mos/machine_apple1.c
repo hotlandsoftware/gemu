@@ -1047,7 +1047,7 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     s->cpu.mem_read = apple1_read;
     s->cpu.mem_write = apple1_write;
     s->cpu.mem_ud = s;
-    s->cpu.decimal_disable = false;
+    mos_cpu_apply(&s->cpu, cfg->cpu);
     mos6502_reset(&s->cpu);
     if (cfg->has_start_addr)
         s->cpu.PC = cfg->start_addr;

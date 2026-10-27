@@ -6,11 +6,17 @@
 
 static inline uint8_t rd(Mos6502 *c, uint16_t a) {
     c->cycle_count++;
-    return c->mem_read(a, c->mem_ud);
+    return c->mem_read(a & c->addr_mask, c->mem_ud);
 }
 static inline void wr(Mos6502 *c, uint16_t a, uint8_t v) {
     c->cycle_count++;
-    c->mem_write(a, v, c->mem_ud);
+    c->mem_write(a & c->addr_mask, v, c->mem_ud);
+}
+/* A cycle the CPU spends fixing up an address: a read of the
+ * not-yet-corrected address on real hardware. */
+static inline void idle(Mos6502 *c, uint16_t a) {
+    if (c->dummy_cycles) (void)rd(c, a);
+    else                 c->cycle_count++;
 }
 /* Zero-page 16-bit read (wraps within page - critical for JMP ind bug etc.) */
 static inline uint16_t rd16zp(Mos6502 *c, uint8_t a) {
@@ -63,6 +69,7 @@ static inline uint16_t am_abx(Mos6502 *c, int *cross) {
     uint16_t base = (uint16_t)(lo | ((uint16_t)hi << 8));
     uint16_t ea   = base + c->X;
     if (cross) *cross = ((ea ^ base) >> 8) & 1;
+    c->dummy_addr = (uint16_t)((base & 0xFF00u) | (ea & 0x00FFu));
     return ea;
 }
 static inline uint16_t am_aby(Mos6502 *c, int *cross) {
@@ -70,6 +77,7 @@ static inline uint16_t am_aby(Mos6502 *c, int *cross) {
     uint16_t base = (uint16_t)(lo | ((uint16_t)hi << 8));
     uint16_t ea   = base + c->Y;
     if (cross) *cross = ((ea ^ base) >> 8) & 1;
+    c->dummy_addr = (uint16_t)((base & 0xFF00u) | (ea & 0x00FFu));
     return ea;
 }
 static inline uint16_t am_izx(Mos6502 *c) {
@@ -82,6 +90,7 @@ static inline uint16_t am_izy(Mos6502 *c, int *cross) {
     uint16_t base = rd16zp(c, z);
     uint16_t ea   = base + c->Y;
     if (cross) *cross = ((ea ^ base) >> 8) & 1;
+    c->dummy_addr = (uint16_t)((base & 0xFF00u) | (ea & 0x00FFu));
     return ea;
 }
 
@@ -172,11 +181,11 @@ static uint8_t do_ror(Mos6502 *c, uint8_t v) {
 static void do_branch(Mos6502 *c, bool cond) {
     int8_t  off = (int8_t)fetch(c);   /* always fetch offset (1 cycle) */
     if (!cond) return;
-    c->cycle_count++;                  /* +1: branch taken */
     uint16_t old = c->PC;
+    idle(c, old);                      /* +1: branch taken */
     c->PC = (uint16_t)(c->PC + off);
-    if ((c->PC ^ old) & 0xFF00u)
-        c->cycle_count++;              /* +1: page crossed */
+    if ((c->PC ^ old) & 0xFF00u)       /* +1: page crossed */
+        idle(c, (uint16_t)((old & 0xFF00u) | (c->PC & 0x00FFu)));
 }
 
 /* ── Interrupt dispatch ───────────────────────────────────────────────────── */
@@ -199,6 +208,7 @@ void mos6502_init(Mos6502 *cpu) {
     memset(cpu, 0, sizeof(*cpu));
     cpu->P = MOS6502_P_U | MOS6502_P_I;
     cpu->SP = 0xFDu;
+    cpu->addr_mask = 0xFFFFu;
 }
 
 void mos6502_reset(Mos6502 *cpu) {
@@ -214,6 +224,7 @@ void mos6502_reset(Mos6502 *cpu) {
 
 void mos6502_step(Mos6502 *c) {
     /* NMI takes priority over IRQ */
+    if (c->no_int_pins) c->nmi = c->irq = false;
     if (c->nmi) {
         c->nmi = false;
         service_irq(c, 0xFFFAu, false);
@@ -242,12 +253,12 @@ void mos6502_step(Mos6502 *c) {
     case 0x05: c->A |= rd(c, am_zp(c));   set_nz(c, c->A); break; /* ORA zp  */
     case 0x15: c->A |= rd(c, am_zpx(c));  set_nz(c, c->A); break; /* ORA zpx */
     case 0x0D: c->A |= rd(c, am_abs(c));  set_nz(c, c->A); break; /* ORA abs */
-    case 0x1D: { int x; uint16_t ea = am_abx(c, &x); if (x) c->cycle_count++;
+    case 0x1D: { int x; uint16_t ea = am_abx(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A |= rd(c, ea); set_nz(c, c->A); break; }      /* ORA abx */
-    case 0x19: { int x; uint16_t ea = am_aby(c, &x); if (x) c->cycle_count++;
+    case 0x19: { int x; uint16_t ea = am_aby(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A |= rd(c, ea); set_nz(c, c->A); break; }      /* ORA aby */
     case 0x01: c->A |= rd(c, am_izx(c));  set_nz(c, c->A); break; /* ORA izx */
-    case 0x11: { int x; uint16_t ea = am_izy(c, &x); if (x) c->cycle_count++;
+    case 0x11: { int x; uint16_t ea = am_izy(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A |= rd(c, ea); set_nz(c, c->A); break; }      /* ORA izy */
 
     /* ── AND ──────────────────────────────────────────────────────────── */
@@ -255,12 +266,12 @@ void mos6502_step(Mos6502 *c) {
     case 0x25: c->A &= rd(c, am_zp(c));   set_nz(c, c->A); break;
     case 0x35: c->A &= rd(c, am_zpx(c));  set_nz(c, c->A); break;
     case 0x2D: c->A &= rd(c, am_abs(c));  set_nz(c, c->A); break;
-    case 0x3D: { int x; uint16_t ea = am_abx(c, &x); if (x) c->cycle_count++;
+    case 0x3D: { int x; uint16_t ea = am_abx(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A &= rd(c, ea); set_nz(c, c->A); break; }
-    case 0x39: { int x; uint16_t ea = am_aby(c, &x); if (x) c->cycle_count++;
+    case 0x39: { int x; uint16_t ea = am_aby(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A &= rd(c, ea); set_nz(c, c->A); break; }
     case 0x21: c->A &= rd(c, am_izx(c));  set_nz(c, c->A); break;
-    case 0x31: { int x; uint16_t ea = am_izy(c, &x); if (x) c->cycle_count++;
+    case 0x31: { int x; uint16_t ea = am_izy(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A &= rd(c, ea); set_nz(c, c->A); break; }
 
     /* ── EOR ──────────────────────────────────────────────────────────── */
@@ -268,12 +279,12 @@ void mos6502_step(Mos6502 *c) {
     case 0x45: c->A ^= rd(c, am_zp(c));   set_nz(c, c->A); break;
     case 0x55: c->A ^= rd(c, am_zpx(c));  set_nz(c, c->A); break;
     case 0x4D: c->A ^= rd(c, am_abs(c));  set_nz(c, c->A); break;
-    case 0x5D: { int x; uint16_t ea = am_abx(c, &x); if (x) c->cycle_count++;
+    case 0x5D: { int x; uint16_t ea = am_abx(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A ^= rd(c, ea); set_nz(c, c->A); break; }
-    case 0x59: { int x; uint16_t ea = am_aby(c, &x); if (x) c->cycle_count++;
+    case 0x59: { int x; uint16_t ea = am_aby(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A ^= rd(c, ea); set_nz(c, c->A); break; }
     case 0x41: c->A ^= rd(c, am_izx(c));  set_nz(c, c->A); break;
-    case 0x51: { int x; uint16_t ea = am_izy(c, &x); if (x) c->cycle_count++;
+    case 0x51: { int x; uint16_t ea = am_izy(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A ^= rd(c, ea); set_nz(c, c->A); break; }
 
     /* ── ADC ──────────────────────────────────────────────────────────── */
@@ -281,12 +292,12 @@ void mos6502_step(Mos6502 *c) {
     case 0x65: do_adc(c, rd(c, am_zp(c)));   break;
     case 0x75: do_adc(c, rd(c, am_zpx(c)));  break;
     case 0x6D: do_adc(c, rd(c, am_abs(c)));  break;
-    case 0x7D: { int x; uint16_t ea = am_abx(c, &x); if (x) c->cycle_count++;
+    case 0x7D: { int x; uint16_t ea = am_abx(c, &x); if (x) idle(c, c->dummy_addr);
                  do_adc(c, rd(c, ea)); break; }
-    case 0x79: { int x; uint16_t ea = am_aby(c, &x); if (x) c->cycle_count++;
+    case 0x79: { int x; uint16_t ea = am_aby(c, &x); if (x) idle(c, c->dummy_addr);
                  do_adc(c, rd(c, ea)); break; }
     case 0x61: do_adc(c, rd(c, am_izx(c)));  break;
-    case 0x71: { int x; uint16_t ea = am_izy(c, &x); if (x) c->cycle_count++;
+    case 0x71: { int x; uint16_t ea = am_izy(c, &x); if (x) idle(c, c->dummy_addr);
                  do_adc(c, rd(c, ea)); break; }
 
     /* ── SBC ──────────────────────────────────────────────────────────── */
@@ -294,12 +305,12 @@ void mos6502_step(Mos6502 *c) {
     case 0xE5: do_sbc(c, rd(c, am_zp(c)));   break;
     case 0xF5: do_sbc(c, rd(c, am_zpx(c)));  break;
     case 0xED: do_sbc(c, rd(c, am_abs(c)));  break;
-    case 0xFD: { int x; uint16_t ea = am_abx(c, &x); if (x) c->cycle_count++;
+    case 0xFD: { int x; uint16_t ea = am_abx(c, &x); if (x) idle(c, c->dummy_addr);
                  do_sbc(c, rd(c, ea)); break; }
-    case 0xF9: { int x; uint16_t ea = am_aby(c, &x); if (x) c->cycle_count++;
+    case 0xF9: { int x; uint16_t ea = am_aby(c, &x); if (x) idle(c, c->dummy_addr);
                  do_sbc(c, rd(c, ea)); break; }
     case 0xE1: do_sbc(c, rd(c, am_izx(c)));  break;
-    case 0xF1: { int x; uint16_t ea = am_izy(c, &x); if (x) c->cycle_count++;
+    case 0xF1: { int x; uint16_t ea = am_izy(c, &x); if (x) idle(c, c->dummy_addr);
                  do_sbc(c, rd(c, ea)); break; }
 
     /* ── CMP ──────────────────────────────────────────────────────────── */
@@ -307,12 +318,12 @@ void mos6502_step(Mos6502 *c) {
     case 0xC5: do_cmp(c, c->A, rd(c, am_zp(c)));   break;
     case 0xD5: do_cmp(c, c->A, rd(c, am_zpx(c)));  break;
     case 0xCD: do_cmp(c, c->A, rd(c, am_abs(c)));  break;
-    case 0xDD: { int x; uint16_t ea = am_abx(c, &x); if (x) c->cycle_count++;
+    case 0xDD: { int x; uint16_t ea = am_abx(c, &x); if (x) idle(c, c->dummy_addr);
                  do_cmp(c, c->A, rd(c, ea)); break; }
-    case 0xD9: { int x; uint16_t ea = am_aby(c, &x); if (x) c->cycle_count++;
+    case 0xD9: { int x; uint16_t ea = am_aby(c, &x); if (x) idle(c, c->dummy_addr);
                  do_cmp(c, c->A, rd(c, ea)); break; }
     case 0xC1: do_cmp(c, c->A, rd(c, am_izx(c)));  break;
-    case 0xD1: { int x; uint16_t ea = am_izy(c, &x); if (x) c->cycle_count++;
+    case 0xD1: { int x; uint16_t ea = am_izy(c, &x); if (x) idle(c, c->dummy_addr);
                  do_cmp(c, c->A, rd(c, ea)); break; }
 
     /* ── CPX / CPY ────────────────────────────────────────────────────── */
@@ -332,7 +343,7 @@ void mos6502_step(Mos6502 *c) {
     case 0x06: { uint16_t ea = am_zp(c);  uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_asl(c, v)); break; }
     case 0x16: { uint16_t ea = am_zpx(c); uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_asl(c, v)); break; }
     case 0x0E: { uint16_t ea = am_abs(c); uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_asl(c, v)); break; }
-    case 0x1E: { int x; uint16_t ea = am_abx(c, &x); c->cycle_count++;
+    case 0x1E: { int x; uint16_t ea = am_abx(c, &x); idle(c, c->dummy_addr);
                  uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_asl(c, v)); break; }
 
     /* ── LSR ──────────────────────────────────────────────────────────── */
@@ -340,7 +351,7 @@ void mos6502_step(Mos6502 *c) {
     case 0x46: { uint16_t ea = am_zp(c);  uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_lsr(c, v)); break; }
     case 0x56: { uint16_t ea = am_zpx(c); uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_lsr(c, v)); break; }
     case 0x4E: { uint16_t ea = am_abs(c); uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_lsr(c, v)); break; }
-    case 0x5E: { int x; uint16_t ea = am_abx(c, &x); c->cycle_count++;
+    case 0x5E: { int x; uint16_t ea = am_abx(c, &x); idle(c, c->dummy_addr);
                  uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_lsr(c, v)); break; }
 
     /* ── ROL ──────────────────────────────────────────────────────────── */
@@ -348,7 +359,7 @@ void mos6502_step(Mos6502 *c) {
     case 0x26: { uint16_t ea = am_zp(c);  uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_rol(c, v)); break; }
     case 0x36: { uint16_t ea = am_zpx(c); uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_rol(c, v)); break; }
     case 0x2E: { uint16_t ea = am_abs(c); uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_rol(c, v)); break; }
-    case 0x3E: { int x; uint16_t ea = am_abx(c, &x); c->cycle_count++;
+    case 0x3E: { int x; uint16_t ea = am_abx(c, &x); idle(c, c->dummy_addr);
                  uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_rol(c, v)); break; }
 
     /* ── ROR ──────────────────────────────────────────────────────────── */
@@ -356,19 +367,19 @@ void mos6502_step(Mos6502 *c) {
     case 0x66: { uint16_t ea = am_zp(c);  uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_ror(c, v)); break; }
     case 0x76: { uint16_t ea = am_zpx(c); uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_ror(c, v)); break; }
     case 0x6E: { uint16_t ea = am_abs(c); uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_ror(c, v)); break; }
-    case 0x7E: { int x; uint16_t ea = am_abx(c, &x); c->cycle_count++;
+    case 0x7E: { int x; uint16_t ea = am_abx(c, &x); idle(c, c->dummy_addr);
                  uint8_t v = rd(c, ea); wr(c, ea, v); wr(c, ea, do_ror(c, v)); break; }
 
     /* ── INC / DEC memory ────────────────────────────────────────────── */
     case 0xE6: { uint16_t ea = am_zp(c);  uint8_t v = (uint8_t)(rd(c, ea) + 1); wr(c, ea, v-1); wr(c, ea, v); set_nz(c, v); break; }
     case 0xF6: { uint16_t ea = am_zpx(c); uint8_t v = (uint8_t)(rd(c, ea) + 1); wr(c, ea, v-1); wr(c, ea, v); set_nz(c, v); break; }
     case 0xEE: { uint16_t ea = am_abs(c); uint8_t v = (uint8_t)(rd(c, ea) + 1); wr(c, ea, v-1); wr(c, ea, v); set_nz(c, v); break; }
-    case 0xFE: { int x; uint16_t ea = am_abx(c, &x); c->cycle_count++;
+    case 0xFE: { int x; uint16_t ea = am_abx(c, &x); idle(c, c->dummy_addr);
                  uint8_t v = (uint8_t)(rd(c, ea) + 1); wr(c, ea, v-1); wr(c, ea, v); set_nz(c, v); break; }
     case 0xC6: { uint16_t ea = am_zp(c);  uint8_t v = (uint8_t)(rd(c, ea) - 1); wr(c, ea, v+1); wr(c, ea, v); set_nz(c, v); break; }
     case 0xD6: { uint16_t ea = am_zpx(c); uint8_t v = (uint8_t)(rd(c, ea) - 1); wr(c, ea, v+1); wr(c, ea, v); set_nz(c, v); break; }
     case 0xCE: { uint16_t ea = am_abs(c); uint8_t v = (uint8_t)(rd(c, ea) - 1); wr(c, ea, v+1); wr(c, ea, v); set_nz(c, v); break; }
-    case 0xDE: { int x; uint16_t ea = am_abx(c, &x); c->cycle_count++;
+    case 0xDE: { int x; uint16_t ea = am_abx(c, &x); idle(c, c->dummy_addr);
                  uint8_t v = (uint8_t)(rd(c, ea) - 1); wr(c, ea, v+1); wr(c, ea, v); set_nz(c, v); break; }
 
     /* ── INX / DEX / INY / DEY ───────────────────────────────────────── */
@@ -382,12 +393,12 @@ void mos6502_step(Mos6502 *c) {
     case 0xA5: c->A = rd(c, am_zp(c));   set_nz(c, c->A); break;
     case 0xB5: c->A = rd(c, am_zpx(c));  set_nz(c, c->A); break;
     case 0xAD: c->A = rd(c, am_abs(c));  set_nz(c, c->A); break;
-    case 0xBD: { int x; uint16_t ea = am_abx(c, &x); if (x) c->cycle_count++;
+    case 0xBD: { int x; uint16_t ea = am_abx(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A = rd(c, ea); set_nz(c, c->A); break; }
-    case 0xB9: { int x; uint16_t ea = am_aby(c, &x); if (x) c->cycle_count++;
+    case 0xB9: { int x; uint16_t ea = am_aby(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A = rd(c, ea); set_nz(c, c->A); break; }
     case 0xA1: c->A = rd(c, am_izx(c));  set_nz(c, c->A); break;
-    case 0xB1: { int x; uint16_t ea = am_izy(c, &x); if (x) c->cycle_count++;
+    case 0xB1: { int x; uint16_t ea = am_izy(c, &x); if (x) idle(c, c->dummy_addr);
                  c->A = rd(c, ea); set_nz(c, c->A); break; }
 
     /* ── LDX ──────────────────────────────────────────────────────────── */
@@ -395,7 +406,7 @@ void mos6502_step(Mos6502 *c) {
     case 0xA6: c->X = rd(c, am_zp(c));   set_nz(c, c->X); break;
     case 0xB6: c->X = rd(c, am_zpy(c));  set_nz(c, c->X); break;
     case 0xAE: c->X = rd(c, am_abs(c));  set_nz(c, c->X); break;
-    case 0xBE: { int x; uint16_t ea = am_aby(c, &x); if (x) c->cycle_count++;
+    case 0xBE: { int x; uint16_t ea = am_aby(c, &x); if (x) idle(c, c->dummy_addr);
                  c->X = rd(c, ea); set_nz(c, c->X); break; }
 
     /* ── LDY ──────────────────────────────────────────────────────────── */
@@ -403,17 +414,17 @@ void mos6502_step(Mos6502 *c) {
     case 0xA4: c->Y = rd(c, am_zp(c));   set_nz(c, c->Y); break;
     case 0xB4: c->Y = rd(c, am_zpx(c));  set_nz(c, c->Y); break;
     case 0xAC: c->Y = rd(c, am_abs(c));  set_nz(c, c->Y); break;
-    case 0xBC: { int x; uint16_t ea = am_abx(c, &x); if (x) c->cycle_count++;
+    case 0xBC: { int x; uint16_t ea = am_abx(c, &x); if (x) idle(c, c->dummy_addr);
                  c->Y = rd(c, ea); set_nz(c, c->Y); break; }
 
     /* ── STA ──────────────────────────────────────────────────────────── */
     case 0x85: wr(c, am_zp(c),  c->A); break;
     case 0x95: wr(c, am_zpx(c), c->A); break;
     case 0x8D: wr(c, am_abs(c), c->A); break;
-    case 0x9D: { int x; uint16_t ea = am_abx(c, &x); c->cycle_count++; wr(c, ea, c->A); break; }
-    case 0x99: { int x; uint16_t ea = am_aby(c, &x); c->cycle_count++; wr(c, ea, c->A); break; }
+    case 0x9D: { int x; uint16_t ea = am_abx(c, &x); idle(c, c->dummy_addr); wr(c, ea, c->A); break; }
+    case 0x99: { int x; uint16_t ea = am_aby(c, &x); idle(c, c->dummy_addr); wr(c, ea, c->A); break; }
     case 0x81: wr(c, am_izx(c), c->A); break;
-    case 0x91: { int x; uint16_t ea = am_izy(c, &x); c->cycle_count++; wr(c, ea, c->A); break; }
+    case 0x91: { int x; uint16_t ea = am_izy(c, &x); idle(c, c->dummy_addr); wr(c, ea, c->A); break; }
 
     /* ── STX / STY ────────────────────────────────────────────────────── */
     case 0x86: wr(c, am_zp(c),  c->X); break; /* STX zp  */
@@ -511,88 +522,88 @@ void mos6502_step(Mos6502 *c) {
     case 0x0C:
         rd(c, am_abs(c)); break;
     case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC:
-        { int x; uint16_t ea = am_abx(c, &x); if (x) c->cycle_count++; rd(c, ea); break; }
+        { int x; uint16_t ea = am_abx(c, &x); if (x) idle(c, c->dummy_addr); rd(c, ea); break; }
 
     /* SLO: ASL mem, then ORA A - C from ASL, N/Z from ORA result */
     case 0x07: { uint16_t ea=am_zp(c);  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_asl(c,v); wr(c,ea,v); c->A|=v; set_nz(c,c->A); break; }
     case 0x17: { uint16_t ea=am_zpx(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_asl(c,v); wr(c,ea,v); c->A|=v; set_nz(c,c->A); break; }
     case 0x03: { uint16_t ea=am_izx(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_asl(c,v); wr(c,ea,v); c->A|=v; set_nz(c,c->A); break; }
-    case 0x13: { int x; uint16_t ea=am_izy(c,&x); c->cycle_count++;
+    case 0x13: { int x; uint16_t ea=am_izy(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_asl(c,v); wr(c,ea,v); c->A|=v; set_nz(c,c->A); break; }
     case 0x0F: { uint16_t ea=am_abs(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_asl(c,v); wr(c,ea,v); c->A|=v; set_nz(c,c->A); break; }
-    case 0x1F: { int x; uint16_t ea=am_abx(c,&x); c->cycle_count++;
+    case 0x1F: { int x; uint16_t ea=am_abx(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_asl(c,v); wr(c,ea,v); c->A|=v; set_nz(c,c->A); break; }
-    case 0x1B: { int x; uint16_t ea=am_aby(c,&x); c->cycle_count++;
+    case 0x1B: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_asl(c,v); wr(c,ea,v); c->A|=v; set_nz(c,c->A); break; }
 
     /* SRE: LSR mem, then EOR A */
     case 0x47: { uint16_t ea=am_zp(c);  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_lsr(c,v); wr(c,ea,v); c->A^=v; set_nz(c,c->A); break; }
     case 0x57: { uint16_t ea=am_zpx(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_lsr(c,v); wr(c,ea,v); c->A^=v; set_nz(c,c->A); break; }
     case 0x43: { uint16_t ea=am_izx(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_lsr(c,v); wr(c,ea,v); c->A^=v; set_nz(c,c->A); break; }
-    case 0x53: { int x; uint16_t ea=am_izy(c,&x); c->cycle_count++;
+    case 0x53: { int x; uint16_t ea=am_izy(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_lsr(c,v); wr(c,ea,v); c->A^=v; set_nz(c,c->A); break; }
     case 0x4F: { uint16_t ea=am_abs(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_lsr(c,v); wr(c,ea,v); c->A^=v; set_nz(c,c->A); break; }
-    case 0x5F: { int x; uint16_t ea=am_abx(c,&x); c->cycle_count++;
+    case 0x5F: { int x; uint16_t ea=am_abx(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_lsr(c,v); wr(c,ea,v); c->A^=v; set_nz(c,c->A); break; }
-    case 0x5B: { int x; uint16_t ea=am_aby(c,&x); c->cycle_count++;
+    case 0x5B: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_lsr(c,v); wr(c,ea,v); c->A^=v; set_nz(c,c->A); break; }
 
     /* RLA: ROL mem, then AND A */
     case 0x27: { uint16_t ea=am_zp(c);  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_rol(c,v); wr(c,ea,v); c->A&=v; set_nz(c,c->A); break; }
     case 0x37: { uint16_t ea=am_zpx(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_rol(c,v); wr(c,ea,v); c->A&=v; set_nz(c,c->A); break; }
     case 0x23: { uint16_t ea=am_izx(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_rol(c,v); wr(c,ea,v); c->A&=v; set_nz(c,c->A); break; }
-    case 0x33: { int x; uint16_t ea=am_izy(c,&x); c->cycle_count++;
+    case 0x33: { int x; uint16_t ea=am_izy(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_rol(c,v); wr(c,ea,v); c->A&=v; set_nz(c,c->A); break; }
     case 0x2F: { uint16_t ea=am_abs(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_rol(c,v); wr(c,ea,v); c->A&=v; set_nz(c,c->A); break; }
-    case 0x3F: { int x; uint16_t ea=am_abx(c,&x); c->cycle_count++;
+    case 0x3F: { int x; uint16_t ea=am_abx(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_rol(c,v); wr(c,ea,v); c->A&=v; set_nz(c,c->A); break; }
-    case 0x3B: { int x; uint16_t ea=am_aby(c,&x); c->cycle_count++;
+    case 0x3B: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_rol(c,v); wr(c,ea,v); c->A&=v; set_nz(c,c->A); break; }
 
     /* RRA: ROR mem, then ADC A (carry-in = bit shifted out of mem) */
     case 0x67: { uint16_t ea=am_zp(c);  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_ror(c,v); wr(c,ea,v); do_adc(c,v); break; }
     case 0x77: { uint16_t ea=am_zpx(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_ror(c,v); wr(c,ea,v); do_adc(c,v); break; }
     case 0x63: { uint16_t ea=am_izx(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_ror(c,v); wr(c,ea,v); do_adc(c,v); break; }
-    case 0x73: { int x; uint16_t ea=am_izy(c,&x); c->cycle_count++;
+    case 0x73: { int x; uint16_t ea=am_izy(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_ror(c,v); wr(c,ea,v); do_adc(c,v); break; }
     case 0x6F: { uint16_t ea=am_abs(c); uint8_t v=rd(c,ea); wr(c,ea,v); v=do_ror(c,v); wr(c,ea,v); do_adc(c,v); break; }
-    case 0x7F: { int x; uint16_t ea=am_abx(c,&x); c->cycle_count++;
+    case 0x7F: { int x; uint16_t ea=am_abx(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_ror(c,v); wr(c,ea,v); do_adc(c,v); break; }
-    case 0x7B: { int x; uint16_t ea=am_aby(c,&x); c->cycle_count++;
+    case 0x7B: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); wr(c,ea,v); v=do_ror(c,v); wr(c,ea,v); do_adc(c,v); break; }
 
     /* DCP: DEC mem, then CMP A */
     case 0xC7: { uint16_t ea=am_zp(c);  uint8_t v=(uint8_t)(rd(c,ea)-1); wr(c,ea,v+1); wr(c,ea,v); do_cmp(c,c->A,v); break; }
     case 0xD7: { uint16_t ea=am_zpx(c); uint8_t v=(uint8_t)(rd(c,ea)-1); wr(c,ea,v+1); wr(c,ea,v); do_cmp(c,c->A,v); break; }
     case 0xC3: { uint16_t ea=am_izx(c); uint8_t v=(uint8_t)(rd(c,ea)-1); wr(c,ea,v+1); wr(c,ea,v); do_cmp(c,c->A,v); break; }
-    case 0xD3: { int x; uint16_t ea=am_izy(c,&x); c->cycle_count++;
+    case 0xD3: { int x; uint16_t ea=am_izy(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=(uint8_t)(rd(c,ea)-1); wr(c,ea,v+1); wr(c,ea,v); do_cmp(c,c->A,v); break; }
     case 0xCF: { uint16_t ea=am_abs(c); uint8_t v=(uint8_t)(rd(c,ea)-1); wr(c,ea,v+1); wr(c,ea,v); do_cmp(c,c->A,v); break; }
-    case 0xDF: { int x; uint16_t ea=am_abx(c,&x); c->cycle_count++;
+    case 0xDF: { int x; uint16_t ea=am_abx(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=(uint8_t)(rd(c,ea)-1); wr(c,ea,v+1); wr(c,ea,v); do_cmp(c,c->A,v); break; }
-    case 0xDB: { int x; uint16_t ea=am_aby(c,&x); c->cycle_count++;
+    case 0xDB: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=(uint8_t)(rd(c,ea)-1); wr(c,ea,v+1); wr(c,ea,v); do_cmp(c,c->A,v); break; }
 
     /* ISC: INC mem, then SBC A */
     case 0xE7: { uint16_t ea=am_zp(c);  uint8_t v=(uint8_t)(rd(c,ea)+1); wr(c,ea,v-1); wr(c,ea,v); do_sbc(c,v); break; }
     case 0xF7: { uint16_t ea=am_zpx(c); uint8_t v=(uint8_t)(rd(c,ea)+1); wr(c,ea,v-1); wr(c,ea,v); do_sbc(c,v); break; }
     case 0xE3: { uint16_t ea=am_izx(c); uint8_t v=(uint8_t)(rd(c,ea)+1); wr(c,ea,v-1); wr(c,ea,v); do_sbc(c,v); break; }
-    case 0xF3: { int x; uint16_t ea=am_izy(c,&x); c->cycle_count++;
+    case 0xF3: { int x; uint16_t ea=am_izy(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=(uint8_t)(rd(c,ea)+1); wr(c,ea,v-1); wr(c,ea,v); do_sbc(c,v); break; }
     case 0xEF: { uint16_t ea=am_abs(c); uint8_t v=(uint8_t)(rd(c,ea)+1); wr(c,ea,v-1); wr(c,ea,v); do_sbc(c,v); break; }
-    case 0xFF: { int x; uint16_t ea=am_abx(c,&x); c->cycle_count++;
+    case 0xFF: { int x; uint16_t ea=am_abx(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=(uint8_t)(rd(c,ea)+1); wr(c,ea,v-1); wr(c,ea,v); do_sbc(c,v); break; }
-    case 0xFB: { int x; uint16_t ea=am_aby(c,&x); c->cycle_count++;
+    case 0xFB: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
                  uint8_t v=(uint8_t)(rd(c,ea)+1); wr(c,ea,v-1); wr(c,ea,v); do_sbc(c,v); break; }
 
     /* LAX: LDA + LDX same value */
     case 0xA7: { uint8_t v=rd(c,am_zp(c));  c->A=c->X=v; set_nz(c,v); break; }
     case 0xB7: { uint8_t v=rd(c,am_zpy(c)); c->A=c->X=v; set_nz(c,v); break; }
     case 0xA3: { uint8_t v=rd(c,am_izx(c)); c->A=c->X=v; set_nz(c,v); break; }
-    case 0xB3: { int x; uint16_t ea=am_izy(c,&x); if(x) c->cycle_count++;
+    case 0xB3: { int x; uint16_t ea=am_izy(c,&x); if(x) idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); c->A=c->X=v; set_nz(c,v); break; }
     case 0xAF: { uint8_t v=rd(c,am_abs(c)); c->A=c->X=v; set_nz(c,v); break; }
-    case 0xBF: { int x; uint16_t ea=am_aby(c,&x); if(x) c->cycle_count++;
+    case 0xBF: { int x; uint16_t ea=am_aby(c,&x); if(x) idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea); c->A=c->X=v; set_nz(c,v); break; }
 
     /* SAX: store A & X (no flag changes) */
@@ -638,25 +649,25 @@ void mos6502_step(Mos6502 *c) {
     case 0x8B: c->A = c->X & fetch(c); set_nz(c, c->A); break;
 
     /* LAS: mem & SP → A, X, SP */
-    case 0xBB: { int x; uint16_t ea=am_aby(c,&x); if(x) c->cycle_count++;
+    case 0xBB: { int x; uint16_t ea=am_aby(c,&x); if(x) idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea) & c->SP; c->A=c->X=c->SP=v; set_nz(c,v); break; }
 
     /* SHA: A & X & (addr_hi+1) → mem (unstable) */
-    case 0x9F: { int x; uint16_t ea=am_aby(c,&x); c->cycle_count++;
+    case 0x9F: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
                  wr(c, ea, c->A & c->X & (uint8_t)((ea >> 8) + 1u)); break; }
-    case 0x93: { int x; uint16_t ea=am_izy(c,&x); c->cycle_count++;
+    case 0x93: { int x; uint16_t ea=am_izy(c,&x); idle(c, c->dummy_addr);
                  wr(c, ea, c->A & c->X & (uint8_t)((ea >> 8) + 1u)); break; }
 
     /* SHX: X & (addr_hi+1) → mem */
-    case 0x9E: { int x; uint16_t ea=am_aby(c,&x); c->cycle_count++;
+    case 0x9E: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
                  wr(c, ea, c->X & (uint8_t)((ea >> 8) + 1u)); break; }
 
     /* SHY: Y & (addr_hi+1) → mem */
-    case 0x9C: { int x; uint16_t ea=am_abx(c,&x); c->cycle_count++;
+    case 0x9C: { int x; uint16_t ea=am_abx(c,&x); idle(c, c->dummy_addr);
                  wr(c, ea, c->Y & (uint8_t)((ea >> 8) + 1u)); break; }
 
     /* TAS: SP = A & X; A & X & (addr_hi+1) → mem */
-    case 0x9B: { int x; uint16_t ea=am_aby(c,&x); c->cycle_count++;
+    case 0x9B: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
                  c->SP = c->A & c->X; wr(c, ea, c->SP & (uint8_t)((ea >> 8) + 1u)); break; }
 
     /* KIL: CPU halt - jams real hardware; treat as no-op so emulator stays alive */

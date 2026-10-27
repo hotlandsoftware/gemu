@@ -686,6 +686,7 @@ Atari400State *atari400_create(const MosConfig *cfg) {
     s->cpu.mem_read  = a400_read;
     s->cpu.mem_write = a400_write;
     s->cpu.mem_ud    = s;
+    mos_cpu_apply(&s->cpu, cfg->cpu);
 
     s->monitor = gemu_monitor_create();
     if (!s->monitor) {

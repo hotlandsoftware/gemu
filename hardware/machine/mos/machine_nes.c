@@ -2221,8 +2221,7 @@ NesState *nes_create(const MosConfig *cfg) {
     s->cpu.mem_read        = nes_cpu_read;
     s->cpu.mem_write       = nes_cpu_write;
     s->cpu.mem_ud          = s;
-    s->cpu.decimal_disable = (cfg->cpu == MOS_CPU_2A03 ||
-                              cfg->cpu == MOS_CPU_2A07);
+    mos_cpu_apply(&s->cpu, cfg->cpu);
 
     s->apu.sweep_enabled = true;
     s->apu.dmc_enabled = true;

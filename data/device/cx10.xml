@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<device name="cx10" description="Atari CX10 joystick (1977; same wiring as the CX40)" status="working">
+    <machine name="atari2600"/>
+    <machine name="atari2600pal"/>
+    <machine name="atari2600secam"/>
+</device>

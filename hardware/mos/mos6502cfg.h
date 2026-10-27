@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "gemu/display.h"
 #include "gemu/serial.h"
+#include "mos6502.h"
 
 typedef enum {
     MOS_MACHINE_GENERIC,
@@ -13,6 +14,7 @@ typedef enum {
     MOS_MACHINE_MAGICFLY, /* misc/magicfly.cpp hardware: Magic Fly, 7 e Mezzo */
     MOS_MACHINE_UM6578,  /* UM6578/SH6578/NT6578 NES-clone-on-a-chip (plug & play TV games) */
     MOS_MACHINE_ATARI400, /* Atari 400 (6502 + ANTIC/GTIA/POKEY) */
+    MOS_MACHINE_ATARI2600, /* Atari 2600 VCS (6507 + TIA + 6532 RIOT) */
 } MosMachineType;
 
 /* -device crt / -device cheap-crt (NES only, see crt/ntsc_decode.h). A
@@ -40,7 +42,15 @@ typedef enum {
     MOS_CPU_2A03,   /* Ricoh 2A03: 6502 without decimal mode, built into NES */
     MOS_CPU_2A07,   /* Ricoh 2A07: PAL NES CPU/APU, no decimal mode */
     MOS_CPU_6501,   /* 6800-pinout predecessor; same ISA as 6502 */
+    MOS_CPU_6507,   /* 28-pin 6502: 13 address pins (8 KB), no IRQ/NMI pins */
 } MosCpuType;
+
+/* Give a CPU core the pin and ALU differences of a -cpu choice. */
+static inline void mos_cpu_apply(Mos6502 *cpu, MosCpuType type) {
+    cpu->decimal_disable = type == MOS_CPU_2A03 || type == MOS_CPU_2A07;
+    cpu->addr_mask       = type == MOS_CPU_6507 ? 0x1FFFu : 0xFFFFu;
+    cpu->no_int_pins     = type == MOS_CPU_6507;
+}
 
 typedef enum {
     MOS_VGA_NONE,
@@ -56,6 +66,7 @@ typedef enum {
     MOS_SOUND_2A03_MIDI,        /* Ricoh 2A03 built-in APU → MIDI output */
 #endif
     MOS_SOUND_PCSPK,            /* magicfly/7mezzo: 1-bit delta-sigma bitstream DAC */
+    MOS_SOUND_TIA,              /* Atari 2600 TIA audio → SDL */
 } MosSoundType;
 
 /* Composable arcade sound cards (QEMU -soundhw-style: a comma-separated set
@@ -83,6 +94,16 @@ typedef enum {
     NES_DEVICE_FC2_MIC,     /* Famicom Controller 2 with built-in microphone */
     NES_DEVICE_MOUSE,       /* UM6578/PS/2-compatible mouse (24-bit reply via standard $4016 shift register) */
 } NesDeviceType;
+
+/* Atari 2600 controller ports (-device cx40 / cx10 / cx30). */
+typedef enum {
+    A2600_CTRL_NONE = 0,
+    A2600_CTRL_CX40,     /* CX40 joystick (1978) */
+    A2600_CTRL_CX10,     /* CX10 joystick (1977) - electrically the same as a CX40 */
+    A2600_CTRL_CX30,     /* CX30 paddle pair */
+} A2600Controller;
+
+#define A2600_PORTS 2
 
 typedef enum {
     MOS_CG_AUTO,
@@ -125,6 +146,9 @@ typedef struct MosConfig {
     bool            char_gen_explicit;
     NesDeviceType   ports[NES_PORTS]; /* devices on controller ports 1–2 */
     int             n_ports;          /* how many ports were explicitly assigned */
+    A2600Controller a2600_ports[A2600_PORTS]; /* Atari 2600 left/right controller jacks */
+    int             n_a2600_ports;
+    bool            is_secam;    /* SECAM TV (Atari 2600: 8-colour palette) */
     bool            ppu_debug;
     bool            is_pal;      /* PAL/Dendy: 312 lines, ~50 Hz frame rate */
     bool            is_dendy;   /* Dendy Famiclone: NTSC-compatible PPU/APU within PAL 50 Hz */

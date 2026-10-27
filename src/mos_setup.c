@@ -7,6 +7,7 @@
 #include "magicfly.h"
 #include "um6578.h"
 #include "atari400.h"
+#include "atari2600.h"
 #include "vt100.h"
 #include "romdb.h"
 #include "gemu/gemu.h"
@@ -97,6 +98,7 @@ static const GemuDevDesc machines[] = {
 static const GemuDevDesc cpus[] = {
     {"6501", "MOS Technology 6501"},
     {"6502", "MOS Technology 6502"},
+    {"6507", "MOS Technology 6507 (6502 with 13 address pins, no IRQ/NMI)"},
     {"2a03", "Ricoh 2A03 (6502-like, no decimal mode)"},
     {"2a07", "Ricoh 2A07 (PAL NES CPU/APU, no decimal mode)"},
 };
@@ -140,7 +142,7 @@ static const GemuArgsDef def = {
         "  -cg NAME           Character generator\n"
         "  -vga NAME          Graphics card\n"
         "  -renderer MODE     Set SDL renderer: auto | software | accelerated (default: auto)\n"
-        "  -soundhw CHIP      Insert a sound card"
+        "  -soundhw CHIP      Insert a sound card (tia: Atari 2600)"
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
         " | 2a03,output=midi"
 #endif
@@ -153,6 +155,7 @@ static const GemuArgsDef def = {
         "  ./bin/gemu -M mos -rom 0x0000:6502_functional_test.bin -start 0x0400\n"
         "  ./bin/gemu -M nes -cartridge game.nes -vnc :1\n"
         "  ./bin/gemu -M nes -device fds -fda game.fds -device nes-controller\n"
+        "  ./bin/gemu -M atari2600 -cartridge game.bin -device cx40 -device cx30\n"
 #ifdef HAVE_LUA
         "  ./bin/gemu -M nes -cartridge game.nes -lua script.lua\n"
 #endif
@@ -188,6 +191,10 @@ static bool parse_soundhw(const char *hw, MosSoundType *out, uint32_t *mask) {
         *out = MOS_SOUND_PCSPK;
         return true;
     }
+    if (strcmp(hw, "tia") == 0) {
+        *out = MOS_SOUND_TIA;
+        return true;
+    }
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     if (strcmp(hw, "2a03,output=midi") == 0) {
         *out = MOS_SOUND_2A03_MIDI;
@@ -221,6 +228,10 @@ static bool parse_cpu(const char *name, MosCpuType *out) {
     }
     if (strcmp(name, "6502") == 0) {
         *out = MOS_CPU_6502;
+        return true;
+    }
+    if (strcmp(name, "6507") == 0) {
+        *out = MOS_CPU_6507;
         return true;
     }
     if (strcmp(name, "2a03") == 0) {
@@ -264,6 +275,26 @@ static bool attach_device(MosConfig *cfg, bool *want_vt100, const char *name,
         cfg->want_wozmon = false;
         cfg->a1ci = false;
         cfg->n_ports = 0;
+        cfg->n_a2600_ports = 0;
+        cfg->a2600_ports[0] = cfg->a2600_ports[1] = A2600_CTRL_NONE;
+        return true;
+    }
+    /* Atari 2600 controllers: one per jack, left first. */
+    static const struct { const char *name; A2600Controller type; } a2600_devs[] = {
+        {"cx40", A2600_CTRL_CX40}, {"cx10", A2600_CTRL_CX10}, {"cx30", A2600_CTRL_CX30},
+    };
+    for (int d = 0; d < (int)(sizeof(a2600_devs) / sizeof(a2600_devs[0])); d++) {
+        if (strcmp(name, a2600_devs[d].name) != 0) continue;
+        if (cfg->machine != MOS_MACHINE_ATARI2600) {
+            if (!quiet) fprintf(stderr, "gemu: -device %s is supported by atari2600 only\n", name);
+            return false;
+        }
+        if (cfg->n_a2600_ports >= A2600_PORTS) {
+            if (!quiet) fprintf(stderr, "gemu: both controller jacks are already occupied\n");
+            return false;
+        }
+        cfg->devices_none = false;
+        cfg->a2600_ports[cfg->n_a2600_ports++] = a2600_devs[d].type;
         return true;
     }
     if (strcmp(name, "fds") == 0) {
@@ -490,9 +521,11 @@ int mos_setup(int argc, char *argv[]) {
             else if (strcmp(canon, "magicfly") == 0) cfg.machine = MOS_MACHINE_MAGICFLY;
             else if (strcmp(canon, "um6578") == 0) cfg.machine = MOS_MACHINE_UM6578;
             else if (strcmp(canon, "atari400") == 0) cfg.machine = MOS_MACHINE_ATARI400;
+            else if (strcmp(canon, "atari2600") == 0) cfg.machine = MOS_MACHINE_ATARI2600;
             cfg.is_dendy = md->tv && strcmp(md->tv, "dendy") == 0;
             cfg.is_arcade = md->tv && strcmp(md->tv, "vs") == 0;
             cfg.is_pal   = cfg.is_dendy || (md->tv && strcmp(md->tv, "pal") == 0);
+            cfg.is_secam = md->tv && strcmp(md->tv, "secam") == 0;
             cfg.is_7mezzo = strcmp(md->name, "7mezzo") == 0;
             if (!args.cpu && md->cpu) {
                 if (!parse_cpu(md->cpu, &cfg.cpu)) {
@@ -521,7 +554,15 @@ int mos_setup(int argc, char *argv[]) {
                 if (!sz) return 1;
                 cfg.mem_size = sz;
             }
-            if (!attach_default_devices(&cfg, &want_vt100, md->devices))
+            /* Atari 2600: a -device controller replaces the default joystick */
+            bool a2600_user_ctrl = false;
+            for (int r = 0; r + 1 < nrem; r++)
+                if (strcmp(rem[r], "-device") == 0 &&
+                    (!strcmp(rem[r + 1], "cx40") || !strcmp(rem[r + 1], "cx10") ||
+                     !strcmp(rem[r + 1], "cx30")))
+                    a2600_user_ctrl = true;
+            if (!(cfg.machine == MOS_MACHINE_ATARI2600 && a2600_user_ctrl) &&
+                !attach_default_devices(&cfg, &want_vt100, md->devices))
                 return 1;
             break;
         }
@@ -643,6 +684,7 @@ int mos_setup(int argc, char *argv[]) {
                 printf("  msm6295            OKI MSM6295 ADPCM (5clown)\n");
                 printf("                     ay8910/msm6295 are composable: -soundhw ay8910,msm6295\n");
                 printf("  pcspk              Primitive 1-bit speaker (magicfly, 7mezzo)\n");
+                printf("  tia                Atari TIA two-channel sound (atari2600)\n");
                 SDL_Quit(); return 0;
             }
             if (!parse_soundhw(hw, &cfg.sound, &cfg.sound_hw_mask)) {
@@ -672,7 +714,8 @@ int mos_setup(int argc, char *argv[]) {
          cfg.machine == MOS_MACHINE_5CLOWN ||
          cfg.machine == MOS_MACHINE_MAGICFLY ||
          cfg.machine == MOS_MACHINE_UM6578 ||
-         cfg.machine == MOS_MACHINE_ATARI400)
+         cfg.machine == MOS_MACHINE_ATARI400 ||
+         cfg.machine == MOS_MACHINE_ATARI2600)
         && !args.vnc_addr && !args.display_explicit) {
 #ifdef GEMU_GTK
         bool um6578_mouse = cfg.machine == MOS_MACHINE_UM6578 &&
@@ -703,8 +746,8 @@ int mos_setup(int argc, char *argv[]) {
             cfg.ports[cfg.n_ports++] = NES_DEVICE_CONTROLLER;
     }
 
-    if (cfg.machine == MOS_MACHINE_NES && !cfg.sound_explicit &&
-        cfg.sound != MOS_SOUND_NONE) {
+    if ((cfg.machine == MOS_MACHINE_NES || cfg.machine == MOS_MACHINE_ATARI2600) &&
+        !cfg.sound_explicit && cfg.sound != MOS_SOUND_NONE) {
         bool has_output = (cfg.display_type == GEMU_DISPLAY_SDL ||
                            cfg.display_type == GEMU_DISPLAY_GTK);
         if (!has_output)
@@ -724,6 +767,11 @@ int mos_setup(int argc, char *argv[]) {
         }
         if (cfg.fda_path && !cfg.fds_enabled && cfg.machine != MOS_MACHINE_ATARI400) {
             fprintf(stderr, "gemu: -fda requires -device fds\n");
+            return 1;
+        }
+    } else if (cfg.machine == MOS_MACHINE_ATARI2600) {
+        if (!cfg.cart_path) {
+            fprintf(stderr, "gemu: atari2600 requires -cartridge FILE (a .bin/.a26 ROM image)\n");
             return 1;
         }
     } else if (cfg.machine == MOS_MACHINE_ATARI400 &&
@@ -812,6 +860,11 @@ int mos_setup(int argc, char *argv[]) {
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
         um6578_run(s, &cfg);
         um6578_destroy(s);
+    } else if (cfg.machine == MOS_MACHINE_ATARI2600) {
+        Atari2600State *s = atari2600_create(&cfg);
+        if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }
+        atari2600_run(s, &cfg);
+        atari2600_destroy(s);
     } else if (cfg.machine == MOS_MACHINE_ATARI400) {
         Atari400State *s = atari400_create(&cfg);
         if (!s) { vt100_destroy(vt100); SDL_Quit(); return 1; }

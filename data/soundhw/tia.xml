@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<soundhw name="tia" description="Atari TIA two-channel sound" status="working">
+    <machine name="atari2600"/>
+    <machine name="atari2600pal"/>
+    <machine name="atari2600secam"/>
+</soundhw>

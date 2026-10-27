@@ -31,6 +31,13 @@ typedef struct Mos6502 {
     bool irq;             /* level-sensitive: true = IRQ line asserted */
     bool nmi;             /* edge-triggered: set to true to request NMI */
     bool decimal_disable; /* true = ignore D flag in ADC/SBC (Ricoh 2A03 behaviour) */
+
+    uint16_t addr_mask;   /* address pins present: 0xFFFF, or 0x1FFF on a 6507 */
+    bool no_int_pins;     /* 6507: no IRQ/NMI pins, so irq/nmi are ignored */
+    bool dummy_cycles;    /* perform the dummy bus reads of page-crossing and
+                             taken-branch cycles instead of only counting them
+                             (bank-switching hotspots can see them) */
+    uint16_t dummy_addr;  /* internal: address of the next dummy read */
 } Mos6502;
 
 void mos6502_init (Mos6502 *cpu);

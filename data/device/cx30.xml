@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<device name="cx30" description="Atari CX30 paddle controllers (pair; mouse or left/right keys)" status="working">
+    <machine name="atari2600"/>
+    <machine name="atari2600pal"/>
+    <machine name="atari2600secam"/>
+</device>
