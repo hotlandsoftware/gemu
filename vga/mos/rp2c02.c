@@ -96,6 +96,30 @@ static void increment_vram_addr(Rp2c02 *ppu) {
     ppu->v = (uint16_t)((ppu->v + ((ppu->ppuctrl & PPUCTRL_VRAM_INC) ? 32 : 1)) & 0x7FFFu);
 }
 
+static bool rendering_enabled(const Rp2c02 *ppu);
+static uint8_t oam_store(uint8_t addr, uint8_t val);
+
+/* Rendering is on and this is a visible or pre-render line. */
+static bool ppu_rendering_line(const Rp2c02 *ppu) {
+    return rendering_enabled(ppu) &&
+           (ppu->scanline < 240 || ppu->scanline == ppu->lines_total - 1);
+}
+
+/* What OAMDATA reads: OAM at OAMADDR, or during rendering whatever is on
+ * the secondary OAM bus ($FF while it's being cleared, the byte being
+ * evaluated, then the entries being fetched). */
+static uint8_t oam_bus(const Rp2c02 *ppu) {
+    if (!ppu_rendering_line(ppu)) return ppu->oam[ppu->oamaddr];
+    int dot = ppu->dot;
+    if (dot >= 1 && dot <= 64)   return 0xFF;
+    if (dot >= 65 && dot <= 256) return ppu->oam[ppu->oamaddr];
+    if (dot >= 257 && dot <= 320) {
+        int i = (dot - 257) >> 3, b = (dot - 257) & 7;
+        return ppu->oam2[i * 4 + (b > 3 ? 3 : b)];
+    }
+    return ppu->oam2[0];
+}
+
 uint8_t rp2c02_read(Rp2c02 *ppu, uint8_t reg) {
     uint8_t val = ppu->open_bus;
 
@@ -107,7 +131,7 @@ uint8_t rp2c02_read(Rp2c02 *ppu, uint8_t reg) {
         ppu->w = false;
         break;
     case 4:
-        val = ppu->oam[ppu->oamaddr];
+        val = oam_bus(ppu);
         break;
     case 7: {
         uint16_t addr = ppu->v & 0x3FFFu;
@@ -161,7 +185,13 @@ void rp2c02_write(Rp2c02 *ppu, uint8_t reg, uint8_t val) {
         ppu->oamaddr = val;
         break;
     case 4:
-        ppu->oam[ppu->oamaddr++] = val;
+        if (ppu_rendering_line(ppu)) {
+            /* No write during rendering; OAMADDR's top 6 bits are bumped. */
+            ppu->oamaddr = (uint8_t)(ppu->oamaddr + 4);
+        } else {
+            ppu->oam[ppu->oamaddr] = oam_store(ppu->oamaddr, val);
+            ppu->oamaddr++;
+        }
         break;
     case 5:
         if (!ppu->w) {
@@ -203,8 +233,17 @@ void rp2c02_write(Rp2c02 *ppu, uint8_t reg, uint8_t val) {
     }
 }
 
+/* OAM byte 2 (attributes) has no bits 2-4. */
+static uint8_t oam_store(uint8_t addr, uint8_t val) {
+    return (addr & 3u) == 2u ? (uint8_t)(val & 0xE3u) : val;
+}
+
+/* The DMA writes through OAMDATA: 256 bytes starting at OAMADDR. */
 void rp2c02_oam_dma(Rp2c02 *ppu, const uint8_t *page) {
-    memcpy(ppu->oam, page, 256);
+    for (int i = 0; i < 256; i++) {
+        uint8_t a = (uint8_t)(ppu->oamaddr + i);
+        ppu->oam[a] = oam_store(a, page[i]);
+    }
 }
 
 static bool rendering_enabled(const Rp2c02 *ppu) {
@@ -306,41 +345,88 @@ static uint8_t bit_reverse(uint8_t b) {
     return b;
 }
 
-static void evaluate_sprites(Rp2c02 *ppu) {
-    int target = ppu->scanline + 1;
-    if (target >= ppu->lines_total) target = 0;
-
+/* Is OAM value v (a Y, or misread X) within sprite height of this line? */
+static bool spr_in_range(const Rp2c02 *ppu, uint8_t v) {
     int spr_h = (ppu->ppuctrl & PPUCTRL_SPR_8x16) ? 16 : 8;
-    ppu->n_spr = 0;
-    ppu->spr0_next = false;
-    memset(ppu->oam2, 0xFF, sizeof(ppu->oam2));
-    memset(ppu->spr_is_zero, 0, sizeof(ppu->spr_is_zero));
+    int d = ppu->scanline - (int)v;
+    return d >= 0 && d < spr_h;
+}
 
-    if (target >= 240) return;
-
-    for (int i = 0; i < 64; i++) {
-        /* A sprite covers lines Y+1 .. Y+height.  No 8-bit wrap: Y=$FF starts
-         * at line 256 and is never drawn (wrapping it to 0 put sprites the
-         * game had parked off-screen at the top - e.g. SMB3's Mario above
-         * the screen stuck to its top edge). */
-        int y = (int)ppu->oam[i * 4] + 1;
-        if (target < y || target >= y + spr_h) continue;
-
-        if (ppu->n_spr < 8) {
-            memcpy(&ppu->oam2[ppu->n_spr * 4], &ppu->oam[i * 4], 4);
-            ppu->spr_is_zero[ppu->n_spr] = (i == 0);
-            if (i == 0) ppu->spr0_next = true;
-        } else {
-            ppu->ppustatus |= PPUSTAT_SPR_OVF;
-            break;
-        }
-        ppu->n_spr++;
+/* Sprite evaluation for the next line, one dot at a time (visible lines,
+ * rendering on).  Dots 1-64 clear secondary OAM; dots 65-256 read OAM at
+ * OAMADDR on odd dots and act on the byte on even dots:
+ *   Y in range       copy the entry, OAMADDR +1 per byte; the X byte gets the
+ *                    same range check, and failing it ANDs OAMADDR with $FC
+ *   Y out of range   OAMADDR += 4, AND $FC
+ *   secondary full   in range: set overflow, read 3 more bytes; out of range:
+ *                    OAMADDR += 5 (the hardware's n+m increment bug)
+ * Whatever is in range on dot 66 is "sprite zero" for the next line, so
+ * starting from a nonzero OAMADDR makes another object sprite zero.  Once
+ * OAMADDR wraps every entry has been seen and evaluation idles. */
+static void sprite_eval_dot(Rp2c02 *ppu, int dot) {
+    if (dot >= 1 && dot <= 64) {
+        if (!(dot & 1)) ppu->oam2[(dot - 1) >> 1] = 0xFF;
+        return;
     }
+    if (dot == 65) {
+        ppu->eval_slot = 0;
+        ppu->eval_byte = 0;
+        ppu->eval_ovf_copy = 0;
+        ppu->eval_done = false;
+        ppu->spr0_next = false;
+    }
+    if (dot & 1) {   /* read */
+        ppu->eval_s = ppu->oam[ppu->oamaddr];
+        return;
+    }
+
+    unsigned a = ppu->oamaddr, next;
+    uint8_t v = ppu->eval_s;
+    if (ppu->eval_done) {
+        next = a + 4;
+    } else if (ppu->eval_slot < 8) {
+        uint8_t *slot = &ppu->oam2[ppu->eval_slot * 4];
+        if (ppu->eval_byte == 0) {
+            slot[0] = v;
+            if (spr_in_range(ppu, v)) {
+                if (dot == 66) ppu->spr0_next = true;
+                ppu->eval_byte = 1;
+                next = a + 1;
+            } else {
+                next = (a + 4) & 0x1FCu;
+            }
+        } else {
+            slot[ppu->eval_byte] = v;
+            next = a + 1;
+            if (ppu->eval_byte == 3) {
+                if (!spr_in_range(ppu, v)) next &= 0x1FCu;
+                ppu->eval_byte = 0;
+                ppu->eval_slot++;
+            } else {
+                ppu->eval_byte++;
+            }
+        }
+    } else if (ppu->eval_ovf_copy) {
+        next = a + 1;
+        if (--ppu->eval_ovf_copy == 0) ppu->eval_done = true;
+    } else if (spr_in_range(ppu, v)) {
+        ppu->ppustatus |= PPUSTAT_SPR_OVF;
+        ppu->eval_ovf_copy = 3;
+        next = a + 1;
+    } else {
+        next = a + 5;
+    }
+    if (next > 0xFFu) ppu->eval_done = true;
+    ppu->oamaddr = (uint8_t)next;
 }
 
 static void load_sprite_shifters(Rp2c02 *ppu) {
     int target = ppu->scanline + 1;
     if (target >= ppu->lines_total) target = 0;
+    bool visible = ppu->scanline >= 0 && ppu->scanline < 240;
+    ppu->n_spr = visible ? ppu->eval_slot : 0;
+    memset(ppu->spr_is_zero, 0, sizeof(ppu->spr_is_zero));
+    ppu->spr_is_zero[0] = visible && ppu->spr0_next;
 
     for (int i = 0; i < (int)ppu->n_spr; i++) {
         uint8_t spr_y = ppu->oam2[i * 4 + 0];
@@ -482,12 +568,13 @@ void rp2c02_tick(Rp2c02 *ppu) {
             bg_shift_tick(ppu);
             bg_fetch(ppu, dot);
         }
+        if (visible && dot >= 1 && dot <= 256) sprite_eval_dot(ppu, dot);
         if (dot == 256) incr_y(ppu);
         if (dot == 257) {
             copy_x_from_t(ppu);
-            evaluate_sprites(ppu);
             load_sprite_shifters(ppu);
         }
+        if (dot >= 257 && dot <= 320) ppu->oamaddr = 0;
         if (prerender && dot >= 280 && dot <= 304)
             copy_y_from_t(ppu);
     }

@@ -1160,8 +1160,6 @@ static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
                 s->cpu.nmi = true;
                 s->ppu.nmi_pending = false;
             }
-            if (s->ppu.dirty)
-                return;
         }
     }
 }
@@ -2454,7 +2452,7 @@ void nes_destroy(NesState *s) {
  * pattern machine_i2000.c uses for its savevm/loadvm. */
 
 #define NES_SNAPSHOT_MAGIC    0x314D5645534d454eULL /* "NEMSVE1" */
-#define NES_SNAPSHOT_VERSION  2u   /* 2: board state for nes_boards.c */
+#define NES_SNAPSHOT_VERSION  3u   /* 2: board state; 3: dot-by-dot sprite evaluation */
 
 /* The CHR RAM a snapshot carries: all of CHR on CHR-RAM carts, the 8 KB
  * beside the ROM on TQROM. */

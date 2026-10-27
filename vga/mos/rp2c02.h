@@ -75,6 +75,12 @@ typedef struct Rp2c02 {
     uint8_t  at_latch_hi;
 
     uint8_t  oam2[32];
+    /* Sprite evaluation, run dot by dot (65-256) from OAMADDR. */
+    uint8_t  eval_s;        /* byte read from OAM on the last odd dot */
+    uint8_t  eval_slot;     /* secondary OAM entries filled (0-8) */
+    uint8_t  eval_byte;     /* 0 = next byte is a Y, 1-3 = copying an entry */
+    uint8_t  eval_ovf_copy; /* bytes still to read after an overflow hit */
+    bool     eval_done;     /* every entry of OAM has been looked at */
     uint8_t  n_spr;
     bool     spr0_next;
     bool     spr0_active;
