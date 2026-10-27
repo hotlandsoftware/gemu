@@ -124,6 +124,9 @@ FAMILY_SRC = {
     'z80': [
         'cpu/z80/z80.c', 'cpu/z80/z80_dis.c',
         'hardware/machine/z80/machine_z80.c',
+        'hardware/machine/z80/machine_lagonda.c',
+        'vga/multi/tms9918.c', 'audio/msm5205.c',
+        'hardware/device/mm58167.c', 'hardware/device/adc0809.c', 'hardware/device/ppi8255.c',
         'hardware/romdb.c',
         'src/z80_setup.c',
     ],

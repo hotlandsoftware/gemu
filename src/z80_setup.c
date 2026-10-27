@@ -1,4 +1,5 @@
 #include "machine_z80.h"
+#include "lagonda.h"
 #include "romdb.h"
 #include "gemu/args.h"
 #include "gemu/monitor.h"
@@ -53,6 +54,9 @@ static const GemuArgsDef def = {
         "\nThe generic machine (-M z80) has 64 KB of RAM, a timer at ports\n"
         "00h-02h and a serial console (stdin/stdout) at ports 10h-12h; see\n"
         "hardware/machine/z80/machine_z80.h.  Monitor: 'disas [addr] [n]'.\n"
+        "\nLagonda (-M lagonda -rom roms/lagonda): the car's sensors and switches\n"
+        "are keys (arrows: speed/rpm, [ ]: gear, F1-F9: warnings ...) and the\n"
+        "monitor's 'sensor' command; see MACHINES_Z80.md.\n"
         "\nExamples:\n"
         "  ./bin/gemu -M z80 -rom 0:prog.bin -display none\n"
         "  ./bin/gemu -M z80 -cpm zexdoc.com -display none\n",
@@ -158,12 +162,16 @@ int z80_setup(int argc, char *argv[]) {
         }
     }
 
-    if (cfg.machine == Z80_MACHINE_LAGONDA) {
-        fprintf(stderr, "gemu: lagonda is not emulated yet (the Z80 core is in place; "
-                        "the machine is next)\n");
+    if (cfg.machine == Z80_MACHINE_LAGONDA && (cfg.cpm_path || cfg.has_start_addr)) {
+        fprintf(stderr, "gemu: -cpm and -start are for the generic z80 machine\n");
         return 1;
     }
-    if (cfg.n_roms == 0 && !cfg.cpm_path) {
+    if (cfg.machine == Z80_MACHINE_LAGONDA && cfg.n_roms == 0) {
+        fprintf(stderr, "gemu: lagonda needs its EPROMs: -rom DIR (or a .zip)\n");
+        romdb_print_needed("lagonda");
+        return 1;
+    }
+    if (cfg.machine == Z80_MACHINE_GENERIC && cfg.n_roms == 0 && !cfg.cpm_path) {
         fprintf(stderr, "gemu: -M z80 needs a program: -rom ADDR:FILE or -cpm FILE\n");
         return 1;
     }
@@ -177,11 +185,20 @@ int z80_setup(int argc, char *argv[]) {
         return 1;
     }
     int rc = 1;
-    Z80GenericState *s = z80_generic_create(&cfg);
-    if (s) {
-        z80_generic_run(s, &cfg);
-        z80_generic_destroy(s);
-        rc = 0;
+    if (cfg.machine == Z80_MACHINE_LAGONDA) {
+        LagondaState *s = lagonda_create(&cfg);
+        if (s) {
+            lagonda_run(s, &cfg);
+            lagonda_destroy(s);
+            rc = 0;
+        }
+    } else {
+        Z80GenericState *s = z80_generic_create(&cfg);
+        if (s) {
+            z80_generic_run(s, &cfg);
+            z80_generic_destroy(s);
+            rc = 0;
+        }
     }
     SDL_Quit();
     return rc;

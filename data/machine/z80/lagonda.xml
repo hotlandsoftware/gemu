@@ -1,12 +1,11 @@
 <?xml version="1.0"?>
-<machine name="lagonda" family="z80" description="Javelina AUtomotive Data Information Terminal (1976)"
-        cpu="z80" status="skeleton">
-    <!-- AUDIT CPU card: the 2732 near the centre is the Z80 program, the one
-         near the edge the display graphics.  Addresses are placeholders
-         until the memory map is worked out. -->
+<machine name="lagonda" family="z80" description="Javelina AUtomotive Data Information Terminal (1985)"
+        cpu="z80" status="imperfect">
+    <!-- AUDIT CPU card: the 2732 near the centre is the Z80 program (0000h),
+         the one near the edge the display graphics (1000h). -->
     <rom name="lagonda_code_2_center_of_board.bin" region="code"     addr="0x0000"
          sha256="cc5eca4ba8c07bbb4121e5141b9b7b7accd5f1cfa7f2644fddcaea45e3f53d6a"/>
-    <rom name="lagonda_code_1_edge_of_board.bin"   region="graphics" addr="0x0000"
+    <rom name="lagonda_code_1_edge_of_board.bin"   region="graphics" addr="0x1000"
          sha256="f1637d8e64e1648ede55339efb25b6ce44f167a945dacff2fb6066674aba7474"/>
     <!-- ASP32K speech card: MSM5205 ADPCM (4 kHz, 4-bit), two phrases per EPROM -->
     <rom name="lagonda_sound_1.bin" region="speech1" addr="0x0000"

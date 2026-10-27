@@ -209,6 +209,9 @@ struct InputMenu {
     MenuList       list;
     int            input_page;
     int            input_page_count;
+    int            input_chunk;        /* part of the page shown, when it doesn't fit */
+    int            input_chunks;
+    int            rows_fit;           /* list rows the window has room for; 0 = unknown */
     int            selected;
     int            option_selected;
     int            capture_index;
@@ -594,6 +597,8 @@ static void build_main_menu(InputMenu *m) {
     };
 }
 
+/* A device page with more buttons than the window has rows for is shown
+ * in parts; Left/Right step through them before moving to the next page. */
 static void build_input_menu(InputMenu *m) {
     m->list = MENU_LIST_INPUT;
     m->input_page_count = m->n_pages > 0 ? m->n_pages : 1;
@@ -601,15 +606,34 @@ static void build_input_menu(InputMenu *m) {
     if (m->input_page >= m->input_page_count)
         m->input_page = m->input_page_count - 1;
 
+    int n_page = 0;
+    for (int i = 0; i < m->n_buttons; i++)
+        if (page_for_button(m, i) == m->input_page) n_page++;
+
+    /* Each part ends with "(close)"; the first page starts with "Menu keys >". */
+    bool menu_keys = m->input_page == 0;
+    int fit = m->rows_fit >= 3 ? m->rows_fit : MENU_ITEM_MAX;
+    if (fit > MENU_ITEM_MAX) fit = MENU_ITEM_MAX;
+    int first_cap = fit - 1 - (menu_keys ? 1 : 0), cap = fit - 1;
+    if (first_cap < 1) first_cap = 1;
+    m->input_chunks = 1;
+    for (int left = n_page - first_cap; left > 0; left -= cap) m->input_chunks++;
+    if (m->input_chunk < 0) m->input_chunk = 0;
+    if (m->input_chunk >= m->input_chunks) m->input_chunk = m->input_chunks - 1;
+    int from = m->input_chunk ? first_cap + (m->input_chunk - 1) * cap : 0;
+    int to = from + (m->input_chunk ? cap : first_cap);
+
     m->n_items = 0;
-    if (m->input_page == 0) {
+    if (menu_keys && m->input_chunk == 0) {
         m->items[m->n_items++] = (MenuItem){
             .label = "Menu keys >",
             .action = menu_action_menu_controls,
         };
     }
-    for (int i = 0; i < m->n_buttons; i++) {
+    for (int i = 0, k = 0; i < m->n_buttons; i++) {
         if (page_for_button(m, i) != m->input_page)
+            continue;
+        if (k++ < from || k > to)
             continue;
         m->items[m->n_items++] = (MenuItem){
             .label = display_button_name(m->button_names[i]),
@@ -622,6 +646,21 @@ static void build_input_menu(InputMenu *m) {
         .label  = "(close)",
         .action = NULL,
     };
+}
+
+/* Left/Right on the Input list: the next part of this page, then the
+ * next page (entering the previous one at its last part). */
+static void input_menu_step(InputMenu *m, int dir) {
+    if (m->input_chunks <= 1 && m->input_page_count <= 1) return;
+    int chunk = m->input_chunk + dir;
+    if (chunk >= 0 && chunk < m->input_chunks) {
+        m->input_chunk = chunk;
+    } else {
+        m->input_page = (m->input_page + dir + m->input_page_count) % m->input_page_count;
+        m->input_chunk = dir > 0 ? 0 : MENU_ITEM_MAX;   /* clamped to the last part */
+    }
+    build_input_menu(m);
+    m->selected = 0;
 }
 
 static void build_menu_controls_menu(InputMenu *m) {
@@ -660,6 +699,7 @@ static void menu_action_close(InputMenu *m) {
 static void menu_action_input(InputMenu *m) {
     m->page = MENU_MAIN;
     m->input_page = 0;
+    m->input_chunk = 0;
     build_input_menu(m);
     m->selected = 0;
 }
@@ -766,6 +806,18 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
     int s = h >= 1100 ? 2 : 1;                  /* same UI scale as the menu bar */
     int fw = DLG_GLYPH_W * s, fh = DLG_GLYPH_H * s, lh = fh + 4 * s;
 
+    /* How many list rows fit: the window less the frame, title and padding.
+     * The Input list is split into parts of that size. */
+    int fit = (h - 2 * 5 * s - 8 * s - (fh + 6 * s) - 20 * s) / lh;
+    if (fit != m->rows_fit) {
+        m->rows_fit = fit;
+        if (m->page == MENU_MAIN && m->list == MENU_LIST_INPUT) {
+            int sel = m->selected;
+            build_input_menu(m);
+            m->selected = sel < m->n_items ? sel : m->n_items - 1;
+        }
+    }
+
     /* What the dialog shows */
     const char *title;
     char title_buf[160];
@@ -779,9 +831,12 @@ void input_menu_render(InputMenu *m, SDL_Renderer *r, int pixel_scale) {
         if (m->list == MENU_LIST_INPUT) {
             char pname[96];
             input_menu_page_label(m, m->input_page, pname, sizeof(pname));
-            if (m->input_page_count > 1)
-                snprintf(title_buf, sizeof(title_buf), "Input: %s  (Left/Right: other devices)",
-                         pname);
+            char part[32] = "";
+            if (m->input_chunks > 1)
+                snprintf(part, sizeof(part), " %d/%d", m->input_chunk + 1, m->input_chunks);
+            if (m->input_page_count > 1 || m->input_chunks > 1)
+                snprintf(title_buf, sizeof(title_buf), "Input: %s%s  (Left/Right: %s)", pname, part,
+                         m->input_page_count > 1 ? "other devices" : "more");
             else
                 snprintf(title_buf, sizeof(title_buf), "Input: %s", pname);
             title = title_buf;
@@ -1013,25 +1068,11 @@ bool input_menu_handle_event(InputMenu *m, const SDL_Event *ev) {
         return true;
     }
     if (go_left) {
-        if (m->list == MENU_LIST_INPUT && m->input_page_count > 1) {
-            if (m->input_page > 0)
-                m->input_page--;
-            else
-                m->input_page = m->input_page_count - 1;
-            build_input_menu(m);
-            m->selected = 0;
-        }
+        if (m->list == MENU_LIST_INPUT) input_menu_step(m, -1);
         return true;
     }
     if (go_right) {
-        if (m->list == MENU_LIST_INPUT && m->input_page_count > 1) {
-            if (m->input_page < m->input_page_count - 1)
-                m->input_page++;
-            else
-                m->input_page = 0;
-            build_input_menu(m);
-            m->selected = 0;
-        }
+        if (m->list == MENU_LIST_INPUT) input_menu_step(m, 1);
         return true;
     }
     if (accept) {
@@ -1195,6 +1236,7 @@ void input_menu_page_label(const InputMenu *m, int page, char *buf, size_t len) 
 void input_menu_open_page(InputMenu *m, int page) {
     if (!m) return;
     m->input_page = page;
+    m->input_chunk = 0;
     build_input_menu(m);
     m->page = MENU_MAIN;
     m->selected = 0;
