@@ -4,6 +4,7 @@
 #include "gemu/gtk_menu.h"
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
+#include <SDL2/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -234,6 +235,14 @@ static void gtk_do_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
 static uint32_t gtk_do_poll(GemuDisplay *d) {
     GtkBackend *b = d->backend;
     gemu_video_gtk_poll();
+    /* SDL windows opened alongside GTK (the R.O.B. view) handle their events
+     * in event watches, which run during the pump; nothing else reads SDL's
+     * queue here.  Without pumping, the compositor's pings go unanswered
+     * and the window is marked "Not Responding". */
+    if (SDL_GetCurrentVideoDriver()) {   /* SDL video is up (implicitly, too) */
+        SDL_PumpEvents();
+        SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+    }
     /* Pick up new top-level menus (the monitor is attached after creation). */
     gint64 now = g_get_monotonic_time();
     if (now - b->menubar_refreshed > G_USEC_PER_SEC) {

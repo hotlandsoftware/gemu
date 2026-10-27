@@ -687,8 +687,11 @@ int mos_setup(int argc, char *argv[]) {
     if (cfg.machine == MOS_MACHINE_NES) {
         if (!cfg.devices_none && cfg.n_ports == 0) {
             cfg.ports[cfg.n_ports++] = NES_DEVICE_CONTROLLER;
-        } else if (!cfg.devices_none && cfg.n_ports == 1 && cfg.ports[0] == NES_DEVICE_ZAPPER) {
-            cfg.ports[1] = NES_DEVICE_ZAPPER;
+        } else if (!cfg.devices_none && cfg.n_ports == 1 &&
+                   (cfg.ports[0] == NES_DEVICE_ZAPPER || cfg.ports[0] == NES_DEVICE_ROB ||
+                    cfg.ports[0] == NES_DEVICE_ROB_FAMICOM)) {
+            /* Zapper and R.O.B. go in port 2, with a controller to play */
+            cfg.ports[1] = cfg.ports[0];
             cfg.ports[0] = NES_DEVICE_CONTROLLER;
             cfg.n_ports  = 2;
         }

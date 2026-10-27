@@ -10,6 +10,7 @@
 #endif
 #include "gemu/monitor.h"
 #include "hex_editor.h"
+#include "nes_boards.h"
 #ifdef HAVE_ROB
 #  include "rob.h"
 #  include "rob_window.h"
@@ -143,6 +144,13 @@ typedef struct NesState {
     uint8_t  m178_mode;    /* $4800: bits[2:1]=PRG mode, bit[0]=mirror */
     uint8_t  m178_prg_lo;  /* $4801: PRG A16..A14 (inner 16KB bank) */
     uint8_t  m178_prg_hi;  /* $4802: PRG A24..A17 (outer 128KB block) */
+
+    /* PRG/CHR go through the mmc3_*_offsets fine windows: MMC3 (4, 119),
+     * VRC6 (24, 26) and every board in nes_boards.c (has_board). */
+    bool     fine_banks;
+    bool     has_board;
+    NesBoard board;
+    uint8_t  tqrom_ram_windows;  /* mapper 119: CHR windows mapped to its 8 KB CHR RAM */
 
     Apu2a03  apu;
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
