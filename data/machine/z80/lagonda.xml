@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<machine name="lagonda" family="z80" description="Javelina AUtomotive Data Information Terminal (1976)"
+        cpu="z80" status="skeleton">
+    <!-- AUDIT CPU card: the 2732 near the centre is the Z80 program, the one
+         near the edge the display graphics.  Addresses are placeholders
+         until the memory map is worked out. -->
+    <rom name="lagonda_code_2_center_of_board.bin" region="code"     addr="0x0000"
+         sha256="cc5eca4ba8c07bbb4121e5141b9b7b7accd5f1cfa7f2644fddcaea45e3f53d6a"/>
+    <rom name="lagonda_code_1_edge_of_board.bin"   region="graphics" addr="0x0000"
+         sha256="f1637d8e64e1648ede55339efb25b6ce44f167a945dacff2fb6066674aba7474"/>
+    <!-- ASP32K speech card: MSM5205 ADPCM (4 kHz, 4-bit), two phrases per EPROM -->
+    <rom name="lagonda_sound_1.bin" region="speech1" addr="0x0000"
+         sha256="d7f3d08adc2fa6c40ec8704560febbe8b0b1551774d08ae496271e685f25c26e"/>
+    <rom name="lagonda_sound_2.bin" region="speech2" addr="0x0000"
+         sha256="36d0beb4c82b694156a7ab9c8c98abb7d7920c9e5a20e83169e681f38a28db51"/>
+    <rom name="lagonda_sound_3.bin" region="speech3" addr="0x0000"
+         sha256="739999efae4e5b305afbecc7c64a01c2af654aaf45380fa19256665f1f53906c"/>
+    <rom name="lagonda_sound_4.bin" region="speech4" addr="0x0000"
+         sha256="0a040afbc8f4f7f2f1100de514d1ff39ce4519813231bda64c6fd9030f6010e5"/>
+    <rom name="lagonda_sound_5.bin" region="speech5" addr="0x0000"
+         sha256="04fbffe4b3cfdccfd8496dc19075746a4e52c877c8c9e80ed88656163a3bee80"/>
+</machine>

@@ -60,6 +60,7 @@ typedef struct {
 #define M_UM6578    "um6578 asobou czdf1"
 #define M_IA64      "i2000 generic-ia64"
 #define M_A2600     "atari2600 atari2600pal atari2600secam"
+#define M_Z80       "z80"
 
 static GemuMonCmd cmd_help(GemuMonitor *, const char *);
 static GemuMonCmd cmd_info(GemuMonitor *, const char *);
@@ -112,7 +113,7 @@ static const MonCmdDef mon_cmds[] = {
     { "dipswitch",   "dip",          "[list | <switch> <value>]",
       "list or set DIP switches", M_VS " 5clown " M_MAGICFLY " " M_DESTROYER " " M_A2600, NULL, 0 },
     { "disas",       "u",            "[addr] [count]",
-      "disassemble (default: from the PC)", M_A2600, NULL, 0 },
+      "disassemble (default: from the PC)", M_A2600 " " M_Z80, NULL, 0 },
     { "dump",        NULL,           "<addr> <len> <file>",
       "write len bytes (both hex) of the system bus to file", M_IA64, NULL, 0 },
     { "eject",       NULL,           "<device>",

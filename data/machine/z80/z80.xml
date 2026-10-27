@@ -1,0 +1,3 @@
+<?xml version="1.0"?>
+<machine name="z80" family="z80" description="Generic Zilog Z80 machine (flat 64 KB)"
+         cpu="z80" ram="64K" status="preliminary"/>

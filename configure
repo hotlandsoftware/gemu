@@ -121,6 +121,12 @@ FAMILY_SRC = {
         'hardware/romdb.c',
         'src/x86_setup.c',
     ],
+    'z80': [
+        'cpu/z80/z80.c', 'cpu/z80/z80_dis.c',
+        'hardware/machine/z80/machine_z80.c',
+        'hardware/romdb.c',
+        'src/z80_setup.c',
+    ],
 }
 
 FAMILY_SRC_GTK = {
@@ -165,8 +171,8 @@ def die(msg):
 
 # ── Data-file generation ───────────────────────────────────────────────────────
 
-FAMILY_SETUP  = {'mos': 'mos_setup', 'rca': 'rca_setup', 'chip8': 'chip8_setup', 'mitsu': 'mitsu_setup', 'ia64': 'ia64_setup', 'x86': 'x86_setup'}
-FAMILY_DEFINE = {'mos': 'HAVE_MOS',  'rca': 'HAVE_RCA',  'chip8': 'HAVE_CHIP8', 'mitsu': 'HAVE_MITSU',  'ia64': 'HAVE_IA64',  'x86': 'HAVE_X86'}
+FAMILY_SETUP  = {'mos': 'mos_setup', 'rca': 'rca_setup', 'chip8': 'chip8_setup', 'mitsu': 'mitsu_setup', 'ia64': 'ia64_setup', 'x86': 'x86_setup', 'z80': 'z80_setup'}
+FAMILY_DEFINE = {'mos': 'HAVE_MOS',  'rca': 'HAVE_RCA',  'chip8': 'HAVE_CHIP8', 'mitsu': 'HAVE_MITSU',  'ia64': 'HAVE_IA64',  'x86': 'HAVE_X86', 'z80': 'HAVE_Z80'}
 
 def _xml_files(*patterns):
     paths = []
@@ -598,12 +604,12 @@ def main():
     inc_dirs = ['core/include', 'core/third_party/cjson', 'cpu', 'vga', 'audio', 'crt',
                 'hardware', 'hardware/machine', 'hardware/device',
                 'hardware/chip8', 'hardware/ia64', 'hardware/mos',
-                'hardware/other', 'hardware/rca', 'hardware/x86',
+                'hardware/other', 'hardware/rca', 'hardware/x86', 'hardware/z80',
                 'hardware/machine/chip8', 'hardware/machine/ia64',
                 'hardware/machine/mos', 'hardware/machine/other',
-                'hardware/machine/rca', 'hardware/machine/x86',
+                'hardware/machine/rca', 'hardware/machine/x86', 'hardware/machine/z80',
                 'vga/ia64', 'vga/mos', 'vga/rca', 'vga/multi', 'vga/x86',
-                'cpu/chip8', 'cpu/ia64', 'cpu/mos', 'cpu/rca', 'cpu/x86',
+                'cpu/chip8', 'cpu/ia64', 'cpu/mos', 'cpu/rca', 'cpu/x86', 'cpu/z80',
                 'src', build_dir]
     inc_flags = ' '.join(f'-I{d}' for d in inc_dirs)
 
@@ -755,6 +761,15 @@ def main():
                      f'{build_dir}/cpu/x86/i8086.o {build_dir}/core/third_party/cjson/cJSON.o')
         lines.append(f'  LDFLAGS = -lz')
         lines.append(f'build x86-sst: phony {bin_dir}/x86-sst')
+    # SingleStepTests Z80 harness (not built by default): ninja z80-sst
+    if 'cpu/z80/z80.c' in srcs:
+        sst_obj = f'{build_dir}/tests/z80_sst.o'
+        lines.append(f'build {sst_obj}: cc tests/z80_sst.c')
+        lines.append(f'  CFLAGS = {unified_cflags} -Icpu/z80 -Icore/third_party/cjson')
+        lines.append(f'build {bin_dir}/z80-sst: link {sst_obj} '
+                     f'{build_dir}/cpu/z80/z80.o {build_dir}/core/third_party/cjson/cJSON.o')
+        lines.append(f'  LDFLAGS = -lz')
+        lines.append(f'build z80-sst: phony {bin_dir}/z80-sst')
     lines.append('')
     lines.append(f'default {binary}')
     lines.append('')
