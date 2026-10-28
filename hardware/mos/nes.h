@@ -11,6 +11,7 @@
 #include "gemu/monitor.h"
 #include "hex_editor.h"
 #include "nes_boards.h"
+#include "nes_pins.h"
 #ifdef HAVE_ROB
 #  include "rob.h"
 #  include "rob_window.h"
@@ -200,6 +201,13 @@ typedef struct NesState {
     bool     fds_enabled;
     FdsState fds;
 
+    /* Debug > Cartridge Pins (nes_pins.h) */
+    NesPins  pins;
+    unsigned pins_seen;      /* pins.version last applied to the PPU and APU */
+    uint32_t clock_seen;     /* pins.clock_hz last applied */
+    bool     cart_irq;       /* the cartridge (mapper, FDS) pulling /IRQ low */
+    uint8_t  cpu_bus;        /* last value on the CPU data bus */
+
     /* Debug > Hex Editor */
     HexEditor *hex_editor;
 
@@ -225,6 +233,10 @@ typedef struct NesState {
     NesLua *lua;   /* -lua FILE: FCEUX-Lua-subset script, NULL if none loaded */
 #endif
 } NesState;
+
+/* The CPU's /IRQ: the APU's frame and DMC flags, and the cartridge's
+ * line through connector pin 15.  Call after changing either. */
+void      nes_update_irq(NesState *s);
 
 NesState *nes_create (const MosConfig *cfg);
 void      nes_run    (NesState *s, const MosConfig *cfg);

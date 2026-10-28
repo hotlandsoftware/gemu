@@ -99,6 +99,8 @@ static const MonCmdDef mon_cmds[] = {
       "stop when the beam reaches a scanline", M_A2600, NULL, 0 },
     { "calls",       NULL,           "[count]",
       "dump the recent call history to stderr", M_IA64, NULL, 0 },
+    { "cartpin",     NULL,           "[list | <pin> good|open|flaky | tilt <deg> | reinsert | clock <Hz>|default]",
+      "fault the cartridge connector's contacts, tilt the cartridge, set the CPU clock (M2)", M_NES, NULL, 0 },
     { "change",      NULL,           "<device> <file> | vnc password",
       "insert/change media, or set the VNC password", NULL, cmd_change, 0 },
     { "coin",        NULL,           "[slot]",

@@ -111,6 +111,12 @@ typedef struct Rp2c02 {
     void (*irq_scanline)(void *ud);
     void *irq_ud;
 
+    /* Cartridge connector faults (nes_pins.h): when set, called for each
+     * access that goes through the connector; returns the contacts open
+     * for it.  NULL = a good connection (and no cost). */
+    uint64_t (*cart_open)(void *ud);
+    void     *cart_open_ud;
+
     bool debug;
 } Rp2c02;
 

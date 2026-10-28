@@ -68,6 +68,57 @@ Simulated machines include:
 | um6578 | `UM6578 Enhanced Famiclone` | 199? | 🟢 | 🟢 | 🟢 | imperfect | 
 | vssmb | `VS. Super Mario Bros.` | 1986 | 🟢 | 🟢 | 🟢 | working | 
 
+### NES: Debug > Cartridge Pins
+
+This window shows the Famicom's 60-pin cartridge connector (the NES's 72-pin
+slot carries the same signals). You can fault any contact:
+
+- **Left-click** a contact to open it. It turns black and stays open.
+- **Right-click** a contact to make it flaky. It blinks and opens on a random
+  quarter of the accesses through it.
+- **Hover** over a contact to see what the pin carries and what losing it
+  does.
+- **Tilt** (the arrow buttons, or the wheel over them) tips the cartridge
+  in 0.5° steps, up to 5° either way. It pivots on the end that stays seated,
+  so each contact rises by its distance from that end times sin(angle), on
+  the connector's 2.54 mm pitch. Past 0.75 mm of lift a contact goes flaky,
+  and past 1.5 mm it opens. The window draws each column raised by its lift.
+  Tilting adds to the faults you set by hand rather than replacing them.
+  Under about 0.6° nothing happens; at 1.5° the lifted third of the
+  connector is open. The two +5V pins (30 and 31) and the two grounds (1 and
+  16) sit at opposite ends, so a tilt either way leaves the cartridge
+  powered.
+- **Reinsert** seats the cartridge straight and makes every contact good
+  again. The game keeps running, so press Reset if it crashed.
+
+Below the connector, the slider sets M2, the CPU clock, from 0.1 to 4 MHz.
+The PPU and APU follow it, so the game and its sound slow down or speed up
+together. The test points light when /NMI, the APU's /IRQ or the mapper's
+/IRQ is asserted. The monitor's `cartpin` command does the same as the
+window.
+
+Each fault acts where the signal does on the real board:
+
+| Fault | Effect |
+|-------|--------|
+| Address pins (CPU or PPU) | The cartridge sees the bit stuck high, because a floating TTL input reads 1. |
+| CPU data pins | Reads get open bus in that bit; writes to the mapper see a 1. |
+| PPU data pins | CHR reads get the bit of the address low byte that the multiplexed AD bus still holds. |
+| /ROMSEL | $8000-$FFFF reads open bus. |
+| M2 | $4020-$7FFF goes dead, and mapper timers and expansion audio stop. |
+| R/W | Every write to the cartridge is lost. |
+| /IRQ | Mapper IRQs never reach the CPU. |
+| PPU /RD, /WR, A13 | CHR stops answering or stops being written. |
+| CIRAM A10 | Floats high, so one nametable shows everywhere. |
+| CIRAM /CE or PPU /A13 | Nametables are switched off. |
+| PPU A12 | MMC3-style scanline IRQs stop. |
+| SOUND IN (45) | Only expansion audio is heard. |
+| SOUND OUT (46) | Silence. |
+| Power | The ground and +5V pins come in pairs. The cartridge only loses power when both pins of a pair are open. Its nametable wiring is passive, so that keeps working. |
+
+VS. System machines have no cartridge connector, so neither the window nor
+`cartpin` is offered there.
+
 ### Atari 2600
 
 ```sh

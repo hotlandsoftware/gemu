@@ -100,6 +100,8 @@ FAMILY_SRC = {
         # SDL hex editor for every other build (empty with GTK or on Win32)
         'hardware/device/hex_editor_sdl.c',
         'hardware/device/nes_cheats.c', 'hardware/device/cheat_dialog_sdl.c',
+        'hardware/machine/mos/nes_pins.c', 'hardware/device/nes_pin_panel.c',
+        'hardware/device/nes_pin_window_sdl.c',
         'src/mos_setup.c',
     ],
     'rca': [
@@ -133,7 +135,8 @@ FAMILY_SRC = {
 }
 
 FAMILY_SRC_GTK = {
-    'mos': ['hardware/device/hex_editor.c', 'hardware/device/cheat_dialog_gtk.c'],
+    'mos': ['hardware/device/hex_editor.c', 'hardware/device/cheat_dialog_gtk.c',
+            'hardware/device/nes_pin_window_gtk.c'],
 }
 
 FAMILY_SRC_ALSA = {

@@ -71,8 +71,8 @@ static void set_nt(NesState *s, uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     s->board.nt[0] = a; s->board.nt[1] = b; s->board.nt[2] = c; s->board.nt[3] = d;
 }
 
-static void irq_raise(NesState *s) { s->cpu.irq = true; }
-static void irq_ack(NesState *s)   { s->cpu.irq = false; }
+static void irq_raise(NesState *s) { s->cart_irq = true;  nes_update_irq(s); }
+static void irq_ack(NesState *s)   { s->cart_irq = false; nes_update_irq(s); }
 
 /* ── Konami VRC IRQ (VRC4; same counter as VRC6) ─────────────────────────── */
 

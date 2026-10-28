@@ -1,4 +1,5 @@
 #include "rp2c02.h"
+#include "nes_pins.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -57,8 +58,13 @@ static void palette_wr(Rp2c02 *ppu, uint8_t addr, uint8_t val) {
     ppu->palette[palette_index(addr)] = val & 0x3Fu;
 }
 
+static uint8_t cart_bus_rd(Rp2c02 *ppu, uint16_t addr);
+static void    cart_bus_wr(Rp2c02 *ppu, uint16_t addr, uint8_t val);
+
 static uint8_t ppu_bus_rd(Rp2c02 *ppu, uint16_t addr) {
     addr &= 0x3FFFu;
+    if (ppu->cart_open && addr < 0x3F00u)
+        return cart_bus_rd(ppu, addr);
     if (addr < 0x2000u)
         return ppu->chr_read ? ppu->chr_read(addr, ppu->chr_ud) : 0;
     if (addr < 0x3F00u) {
@@ -71,7 +77,9 @@ static uint8_t ppu_bus_rd(Rp2c02 *ppu, uint16_t addr) {
 
 static void ppu_bus_wr(Rp2c02 *ppu, uint16_t addr, uint8_t val) {
     addr &= 0x3FFFu;
-    if (addr < 0x2000u) {
+    if (ppu->cart_open && addr < 0x3F00u) {
+        cart_bus_wr(ppu, addr, val);
+    } else if (addr < 0x2000u) {
         if (ppu->chr_write) ppu->chr_write(addr, val, ppu->chr_ud);
     } else if (addr < 0x3F00u) {
         if (ppu->nt_write)
@@ -80,6 +88,68 @@ static void ppu_bus_wr(Rp2c02 *ppu, uint16_t addr, uint8_t val) {
             ppu->vram[nt_mirror(ppu, addr & 0x2FFFu)] = val;
     } else {
         palette_wr(ppu, (uint8_t)addr, val);
+    }
+}
+
+/* ── Accesses through a faulty cartridge connector ──────────────────────────
+ * The cartridge sees the address with its open address pins high, enables
+ * CHR when that has A13 low and /RD (or /WR) is connected, and drives
+ * CIRAM's /CE and A10: /CE from /A13 (a wire on nearly every board), A10
+ * from its mirroring of the address it sees.  CIRAM's A0-A9 and data come
+ * straight from the PPU.  Whatever no chip drives reads as the address low
+ * byte the multiplexed AD bus still holds; CHR and CIRAM both answering
+ * fight (0 wins). */
+
+static bool ciram_select(uint64_t open, uint16_t addr) {
+    return (addr & 0x2000u) &&
+           !(open & (NES_PIN_BIT(NP_CIRAM_CE) | NES_PIN_BIT(NP_PPU_A13N)));
+}
+
+/* The nametable address CIRAM gets: page bits from the cartridge. */
+static uint16_t ciram_addr(uint16_t addr, uint16_t cart_addr) {
+    return (uint16_t)(0x2000u | (cart_addr & 0x0C00u) | (addr & 0x03FFu));
+}
+
+static uint8_t ciram_rd(Rp2c02 *ppu, uint64_t open, uint16_t addr, uint16_t cart_addr) {
+    uint16_t a = ciram_addr(addr, cart_addr);
+    if (ppu->nt_read) return ppu->nt_read(a, ppu->nt_ud);
+    if (open & NES_PIN_BIT(NP_CIRAM_A10)) return ppu->vram[0x400u | (addr & 0x3FFu)];   /* floats high */
+    return ppu->vram[nt_mirror(ppu, a)];
+}
+
+static uint8_t cart_bus_rd(Rp2c02 *ppu, uint16_t addr) {
+    uint64_t open = ppu->cart_open(ppu->cart_open_ud);
+    if (!open) {
+        if (addr < 0x2000u) return ppu->chr_read ? ppu->chr_read(addr, ppu->chr_ud) : 0;
+        if (ppu->nt_read) return ppu->nt_read(addr & 0x2FFFu, ppu->nt_ud);
+        return ppu->vram[nt_mirror(ppu, addr & 0x2FFFu)];
+    }
+    uint8_t floating = (uint8_t)addr, v = floating;
+    uint16_t ca = (uint16_t)(addr | nes_pins_ppu_addr_open(open));
+    bool chr = !nes_pins_dead(open) && !(ca & 0x2000u) &&
+               !(open & NES_PIN_BIT(NP_PPU_RD)) && ppu->chr_read;
+    if (chr) {
+        uint8_t d = ppu->chr_read(ca & 0x1FFFu, ppu->chr_ud);
+        uint8_t dopen = nes_pins_ppu_data_open(open);
+        v = (uint8_t)((d & ~dopen) | (floating & dopen));
+    }
+    if (ciram_select(open, addr)) {
+        uint8_t c = ciram_rd(ppu, open, addr, ca);
+        v = chr ? (uint8_t)(v & c) : c;
+    }
+    return v;
+}
+
+static void cart_bus_wr(Rp2c02 *ppu, uint16_t addr, uint8_t val) {
+    uint64_t open = ppu->cart_open(ppu->cart_open_ud);
+    uint16_t ca = (uint16_t)(addr | nes_pins_ppu_addr_open(open));
+    if (!nes_pins_dead(open) && !(ca & 0x2000u) && !(open & NES_PIN_BIT(NP_PPU_WR)) && ppu->chr_write)
+        ppu->chr_write(ca & 0x1FFFu, (uint8_t)(val | nes_pins_ppu_data_open(open)), ppu->chr_ud);
+    if (ciram_select(open, addr)) {
+        uint16_t a = ciram_addr(addr, ca);
+        if (ppu->nt_write) ppu->nt_write(a, val, ppu->nt_ud);
+        else if (open & NES_PIN_BIT(NP_CIRAM_A10)) ppu->vram[0x400u | (addr & 0x3FFu)] = val;
+        else ppu->vram[nt_mirror(ppu, a)] = val;
     }
 }
 
@@ -453,8 +523,8 @@ static void load_sprite_shifters(Rp2c02 *ppu) {
             addr = (uint16_t)(base + ((uint16_t)tile << 4) + (uint8_t)row);
         }
 
-        uint8_t lo = ppu->chr_read ? ppu->chr_read(addr, ppu->chr_ud) : 0;
-        uint8_t hi = ppu->chr_read ? ppu->chr_read((uint16_t)(addr + 8), ppu->chr_ud) : 0;
+        uint8_t lo = ppu_bus_rd(ppu, addr);
+        uint8_t hi = ppu_bus_rd(ppu, (uint16_t)(addr + 8));
         if (flip_h) {
             lo = bit_reverse(lo);
             hi = bit_reverse(hi);
@@ -598,7 +668,8 @@ void rp2c02_tick(Rp2c02 *ppu) {
         }
     }
 
-    if (dot == 260 && active && rendering && ppu->irq_scanline)
+    if (dot == 260 && active && rendering && ppu->irq_scanline &&
+        !(ppu->cart_open && (ppu->cart_open(ppu->cart_open_ud) & NES_PIN_BIT(NP_PPU_A12))))
         ppu->irq_scanline(ppu->irq_ud);
 
     ppu->dot++;

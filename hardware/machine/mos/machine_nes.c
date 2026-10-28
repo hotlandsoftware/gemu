@@ -14,6 +14,7 @@
 #include "gemu/screendump.h"
 #include "gemu/gemu_display.h"
 #include <SDL2/SDL.h>  /* needed for APU audio queue sync */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,7 @@
 #endif
 #include "hex_editor.h"
 #include "cheat_dialog.h"
+#include "nes_pin_window.h"
 #include "nes_cheats.h"
 
 #define VS_DEBUG(s, ...) do { \
@@ -629,7 +631,7 @@ static void mmc3_cpu_write(NesState *s, uint16_t addr, uint8_t val) {
         if (!odd) { s->mmc3_irq_latch = val; }
         else      { s->mmc3_irq_reload = true; s->mmc3_irq_counter = 0; }
     } else {
-        if (!odd) { s->mmc3_irq_enabled = false; s->cpu.irq = false; }
+        if (!odd) { s->mmc3_irq_enabled = false; s->cart_irq = false; nes_update_irq(s); }
         else      { s->mmc3_irq_enabled = true; }
     }
 }
@@ -642,8 +644,10 @@ static void mmc3_irq_scanline(void *ud) {
     } else {
         s->mmc3_irq_counter--;
     }
-    if (s->mmc3_irq_counter == 0 && s->mmc3_irq_enabled)
-        s->cpu.irq = true;
+    if (s->mmc3_irq_counter == 0 && s->mmc3_irq_enabled) {
+        s->cart_irq = true;
+        nes_update_irq(s);
+    }
 }
 
 /* ── Mapper 178 (WaixingFS) ──────────────────────────────────────────────── */
@@ -832,8 +836,10 @@ static void mmc5_irq_scanline(void *ud) {
     }
     if (s->mmc5_irq_target > 0 && s->mmc5_irq_counter == s->mmc5_irq_target) {
         s->mmc5_irq_pending = true;
-        if (s->mmc5_irq_enabled)
-            s->cpu.irq = true;
+        if (s->mmc5_irq_enabled) {
+            s->cart_irq = true;
+            nes_update_irq(s);
+        }
     }
 }
 
@@ -851,7 +857,8 @@ static float vrc6_tick(NesState *s) {
         if (fire) {
             if (s->vrc6_irq_counter == 0xFF) {
                 s->vrc6_irq_counter = s->vrc6_irq_latch;
-                s->cpu.irq = true;
+                s->cart_irq = true;
+                nes_update_irq(s);
             } else { s->vrc6_irq_counter++; }
         }
     }
@@ -975,10 +982,11 @@ static void vrc6_cpu_write(NesState *s, uint16_t addr, uint8_t val) {
             if (s->vrc6_irq_enabled) {
                 s->vrc6_irq_counter = s->vrc6_irq_latch;
                 s->vrc6_prescaler   = 0;
-            } else { s->cpu.irq = false; }
+            } else { s->cart_irq = false; nes_update_irq(s); }
             break;
         case 2:
-            s->cpu.irq          = false;
+            s->cart_irq = false;
+            nes_update_irq(s);
             s->vrc6_irq_counter = s->vrc6_irq_latch;
             s->vrc6_irq_enabled = s->vrc6_irq_after;
             s->vrc6_prescaler   = 0;
@@ -1087,6 +1095,13 @@ static void nes_cheats_load(NesState *s) {
         printf("nes: %d Game Genie code%s from %s\n", g_cheats.n, g_cheats.n == 1 ? "" : "s", path);
 }
 
+static NesPinWindow *g_pin_window;   /* Debug > Cartridge Pins */
+
+static void nes_pin_window_toggle_cb(void *ud) {
+    (void)ud;
+    nes_pin_window_toggle(g_pin_window);
+}
+
 static void nes_cheat_dialog_toggle(void *ud) {
     (void)ud;
     cheat_dialog_toggle(g_cheat_dialog);
@@ -1149,15 +1164,98 @@ static uint8_t nes_prg_mapped(const NesState *s, uint16_t addr) {
     }
 }
 
+static uint8_t nes_cpu_read(uint16_t addr, void *ud);
+static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud);
+static void    nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud);
+
+/* ── Cartridge connector (Debug > Cartridge Pins, nes_pins.h) ─────────────── */
+
+void nes_update_irq(NesState *s) {
+    bool apu = s->apu.fc_irq || s->apu.dmc.irq_flag;
+    bool cart = s->cart_irq && !(nes_pins_sample(&s->pins) & NES_PIN_BIT(NP_IRQ));
+    s->cpu.irq = apu || cart;
+    if (apu) s->pins.tp_apu_irq = true;
+    if (s->cart_irq) s->pins.tp_map_irq = true;   /* the test point is on the cartridge side */
+}
+
+static uint64_t nes_ppu_cart_open(void *ud) {
+    return nes_pins_sample(&((NesState *)ud)->pins);
+}
+
+/* Bring the PPU hook, the sound loop and the clock in line with the pins. */
+static void nes_pins_apply(NesState *s) {
+    NesPins *p = &s->pins;
+    if (s->pins_seen != p->version) {
+        s->pins_seen = p->version;
+        bool any = nes_pins_any(p) && !s->cfg->is_arcade;
+        s->ppu.cart_open = any ? nes_ppu_cart_open : NULL;
+        s->ppu.cart_open_ud = s;
+        uint64_t open = nes_pins_open_mask(p);
+        s->apu.no_sound_in  = any && (open & NES_PIN_BIT(NP_SOUND_IN)) != 0;
+        s->apu.no_sound_out = any && ((open & NES_PIN_BIT(NP_SOUND_OUT)) || nes_pins_dead(open));
+        nes_update_irq(s);
+    }
+    if (s->clock_seen != p->clock_hz) {
+        s->clock_seen = p->clock_hz;
+        /* The APU resamples from the CPU clock: a slower clock makes more
+         * output samples per cycle, so pacing to the audio slows everything
+         * (and lowers the pitch) as on a real underclocked console. */
+        s->apu.clock_pps = (double)p->clock_hz / (double)APU2A03_SAMPLE_RATE;
+    }
+}
+
+/* CPU access to cartridge space ($4020-$FFFF) through faulty contacts. */
+static uint8_t nes_cart_read_faulty(NesState *s, uint16_t addr) {
+    uint64_t open = nes_pins_sample(&s->pins);
+    if (!open) return nes_cpu_read_bus(addr, s);
+    uint8_t bus = s->cpu_bus;
+    if (nes_pins_dead(open)) return bus;
+    /* /ROMSEL (A15 and M2, made in the console) selects $8000-$FFFF; the
+     * cartridge decodes $4020-$7FFF from A13, A14 and its M2 input. */
+    if (open & NES_PIN_BIT(addr >= 0x8000u ? NP_ROMSEL : NP_M2)) return bus;
+    uint16_t a = (uint16_t)((addr & 0x8000u) | ((addr | nes_pins_cpu_addr_open(open)) & 0x7FFFu));
+    uint8_t d = nes_cpu_read_bus(a, s);
+    uint8_t dopen = nes_pins_cpu_data_open(open);
+    return (uint8_t)((d & ~dopen) | (bus & dopen));
+}
+
+static void nes_cart_write_faulty(NesState *s, uint16_t addr, uint8_t val) {
+    uint64_t open = nes_pins_sample(&s->pins);
+    if (!open) { nes_cpu_write_bus(addr, val, s); return; }
+    if (nes_pins_dead(open) || (open & NES_PIN_BIT(NP_CPU_RW))) return;
+    if (open & NES_PIN_BIT(addr >= 0x8000u ? NP_ROMSEL : NP_M2)) return;
+    uint16_t a = (uint16_t)((addr & 0x8000u) | ((addr | nes_pins_cpu_addr_open(open)) & 0x7FFFu));
+    nes_cpu_write_bus(a, (uint8_t)(val | nes_pins_cpu_data_open(open)), s);
+}
+
+static bool nes_cart_faulty(const NesState *s, uint16_t addr) {
+    return addr >= 0x4020u && nes_pins_any(&s->pins) && !s->cfg->is_arcade;
+}
+
+static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
+    NesState *s = ud;
+    uint8_t v = nes_cart_faulty(s, addr) ? nes_cart_read_faulty(s, addr) : nes_cpu_read_bus(addr, ud);
+    s->cpu_bus = v;
+    return v;
+}
+
+static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
+    NesState *s = ud;
+    s->cpu_bus = val;
+    if (nes_cart_faulty(s, addr)) nes_cart_write_faulty(s, addr, val);
+    else nes_cpu_write_bus(addr, val, ud);
+}
+
 static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
     while (s->ppu_synced_cpu_cycle < cpu_cycle) {
         s->ppu_synced_cpu_cycle++;
         if (s->fds_enabled)
-            s->cpu.irq = fds_tick(&s->fds);
+            { s->cart_irq = fds_tick(&s->fds); nes_update_irq(s); }
         for (int i = 0; i < 3; i++) {
             rp2c02_tick(&s->ppu);
             if (s->ppu.nmi_pending) {
                 s->cpu.nmi = true;
+                s->pins.tp_nmi = true;
                 s->ppu.nmi_pending = false;
             }
         }
@@ -1237,7 +1335,7 @@ static void nes_gamegenie_cmd(NesState *s, const char *line) {
                                     "(Debug > Game Genie in the window does the same)\n");
 }
 
-static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
+static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
     NesState *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
 
@@ -1251,14 +1349,14 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
     /* FDS I/O registers ($4020-$408F covers disk regs + wavetable + sound) */
     if (s->fds_enabled && addr >= 0x4020 && addr <= 0x408Fu) {
         uint8_t v = fds_reg_read(&s->fds, addr);
-        s->cpu.irq = fds_tick(&s->fds);  /* recalculate IRQ after flag clear */
+        s->cart_irq = fds_tick(&s->fds);  /* recalculate IRQ after flag clear */
+        nes_update_irq(s);
         return v;
     }
 
     if (addr == 0x4015) {
         uint8_t v = apu2a03_read(&s->apu, 0x4015);
-        if (!s->apu.fc_irq && !s->apu.dmc.irq_flag)
-            s->cpu.irq = false;
+        nes_update_irq(s);
         return v;
     }
 
@@ -1350,7 +1448,8 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
             uint8_t v = (s->mmc5_irq_pending ? 0x80u : 0u) |
                         (s->mmc5_in_frame    ? 0x40u : 0u);
             s->mmc5_irq_pending = false;
-            s->cpu.irq = false;
+            s->cart_irq = false;
+            nes_update_irq(s);
             return v;
         }
         if (addr == 0x5205) return (uint8_t)((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]);
@@ -1391,7 +1490,7 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
     return 0;  /* open bus */
 }
 
-static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
+static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
     NesState *s = ud;
     gemu_monitor_check_write(s->monitor, addr);
 
@@ -1417,7 +1516,8 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
         /* $4025 bit 3 controls mirroring (0=vertical, 1=horizontal) */
         if (addr == 0x4025)
             s->ppu.mirror = (val & 0x08) ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
-        s->cpu.irq = fds_tick(&s->fds);
+        s->cart_irq = fds_tick(&s->fds);
+        nes_update_irq(s);
         return;
     }
 
@@ -1471,9 +1571,8 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
     /* APU registers */
     if ((addr >= 0x4000 && addr <= 0x4013) || addr == 0x4015 || addr == 0x4017) {
         apu2a03_write(&s->apu, addr, val);
-        /* $4010/$4017 can clear APU IRQ flags; drop cpu.irq if both are now clear */
-        if (!s->apu.fc_irq && !s->apu.dmc.irq_flag)
-            s->cpu.irq = false;
+        /* $4010/$4017 can clear APU IRQ flags */
+        nes_update_irq(s);
         return;
     }
 
@@ -1519,7 +1618,7 @@ static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
         if (addr == 0x5203) { s->mmc5_irq_target = val; return; }
         if (addr == 0x5204) {
             s->mmc5_irq_enabled = (val & 0x80u) != 0;
-            if (!s->mmc5_irq_enabled) { s->mmc5_irq_pending = false; s->cpu.irq = false; }
+            if (!s->mmc5_irq_enabled) { s->mmc5_irq_pending = false; s->cart_irq = false; nes_update_irq(s); }
             return;
         }
         if (addr == 0x5205) { s->mmc5_mul[0] = val; return; }
@@ -1975,7 +2074,7 @@ static void nes_reset(NesState *s) {
         s->mmc3_irq_counter = 0;
         s->mmc3_irq_reload  = false;
         s->mmc3_irq_enabled = false;
-        s->cpu.irq          = false;
+        s->cart_irq         = false;
         mmc3_update_banks(s);
     } else if (s->cart.mapper == 24 || s->cart.mapper == 26) {
         uint32_t n8k = (uint32_t)s->cart.prg_banks * 2u;
@@ -1997,13 +2096,14 @@ static void nes_reset(NesState *s) {
         s->vrc6_saw_rate = 0; s->vrc6_saw_period = 0; s->vrc6_saw_en = false;
         s->vrc6_saw_timer = 0; s->vrc6_saw_accum = 0; s->vrc6_saw_step = 0;
         s->vrc6_halt    = false;
-        s->cpu.irq      = false;
+        s->cart_irq     = false;
     }
     memset(&s->board, 0, sizeof(s->board));
     if (s->has_board) {
         nes_board_reset(s);
-        s->cpu.irq = false;
+        s->cart_irq = false;
     }
+    nes_update_irq(s);
 
     mos6502_reset(&s->cpu);
     VS_DEBUG(s, "reset pc=%04X nmi=%04X reset=%04X irq=%04X prgfffc=%02X%02X dip=%02X\n",
@@ -2201,6 +2301,9 @@ NesState *nes_create(const MosConfig *cfg) {
         }
     }
 
+    nes_pins_init(&s->pins, cfg->cpu == MOS_CPU_2A07 ? 1662607u : 1789773u);
+    s->clock_seen = s->pins.clock_hz;
+
     /* Wire up PPU CHR bus */
     rp2c02_init(&s->ppu, cfg->is_pal);
     if (cfg->is_dendy) s->ppu.vblank_line = 291;  /* Dendy: 50 extra post-render lines */
@@ -2341,6 +2444,15 @@ NesState *nes_create(const MosConfig *cfg) {
                 g_cheat_dialog = cheat_dialog_sdl_create(&g_cheats);
             if (g_cheat_dialog)
                 gemu_display_add_debug_item(s->display, "Game Genie...", nes_cheat_dialog_toggle, s);
+            /* Debug > Cartridge Pins (a VS. board has no cartridge connector) */
+#ifdef GEMU_GTK
+            if (cfg->display_type == GEMU_DISPLAY_GTK)
+                g_pin_window = nes_pin_window_gtk_create(&s->pins);
+#endif
+            if (cfg->display_type == GEMU_DISPLAY_SDL)
+                g_pin_window = nes_pin_window_sdl_create(&s->pins);
+            if (g_pin_window)
+                gemu_display_add_debug_item(s->display, "Cartridge Pins...", nes_pin_window_toggle_cb, s);
         }
         else
             gemu_monitor_set_input_reset_cb(s->monitor,
@@ -2424,6 +2536,7 @@ void nes_destroy(NesState *s) {
     if (s->fds_enabled) { free(s->fds.raw_disk); }
     hex_editor_destroy(s->hex_editor);
     if (g_cheat_dialog) { g_cheat_dialog->destroy(g_cheat_dialog); g_cheat_dialog = NULL; }
+    if (g_pin_window) { g_pin_window->destroy(g_pin_window); g_pin_window = NULL; }
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     apu_midi_close(&s->apu_midi);
 #endif
@@ -2598,8 +2711,12 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
     NesLua *lua = s->lua;
 #endif
 
+    NesPins pins = s->pins;       /* a debugging setting, not machine state */
     *s = *loaded;
     free(loaded);
+    s->pins = pins;
+    s->pins_seen = pins.version - 1u;   /* reapply: the hook pointers came from the file */
+    s->clock_seen = 0;
 
     s->cfg     = cfg;
     s->prg     = prg;
@@ -2894,6 +3011,62 @@ static GemuMonCmd nes_cmd_hexeditor(GemuMonitor *mon, const char *args, void *ud
     return GEMU_MON_NONE;
 }
 
+/* cartpin [list | <pin> good|open|flaky | tilt <deg> | reinsert | clock <Hz>|default] */
+static GemuMonCmd nes_cmd_cartpin(GemuMonitor *mon, const char *args, void *ud) {
+    NesState *s = ud;
+    NesPins *p = &s->pins;
+    char a[32] = "", b[32] = "";
+    int n = sscanf(args, "%31s %31s", a, b);
+    if (n <= 0 || !strcmp(a, "list")) {
+        static const char *const st[3] = { "good", "OPEN", "flaky" };
+        gemu_monitor_printf(mon, "M2 clock %u Hz (console: %u), tilt %+.1f deg%s\n", p->clock_hz,
+                            p->clock_default, p->tilt_deg,
+                            nes_pins_dead(nes_pins_open_mask(p)) ? "   cartridge has no power" : "");
+        for (int i = 1; i <= NES_PINS_N; i++) {
+            NesPinState ps = nes_pins_get(p, i);
+            if (n > 0 || ps != NES_PIN_GOOD)
+                gemu_monitor_printf(mon, "  %2d %-10s %-6s%s %s\n", i, nes_pin_info[i].label, st[ps],
+                                    ps != nes_pins_get_user(p, i) ? "(tilt)" : "      ",
+                                    nes_pin_info[i].what);
+        }
+        if (n <= 0 && !nes_pins_any(p))
+            gemu_monitor_printf(mon, "  every contact good ('cartpin list' shows all 60)\n");
+    } else if (!strcmp(a, "reinsert")) {
+        nes_pins_reinsert(p);
+    } else if (!strcmp(a, "tilt")) {
+        char *end;
+        double d = strtod(b, &end);
+        if (!b[0] || *end || fabs(d) > NES_PIN_TILT_MAX) {
+            gemu_monitor_printf(mon, "cartpin: tilt -%.0f..%.0f degrees (+ lifts the pin 30 end)\n",
+                                NES_PIN_TILT_MAX, NES_PIN_TILT_MAX);
+            return GEMU_MON_NONE;
+        }
+        nes_pins_set_tilt(p, d);
+    } else if (!strcmp(a, "clock")) {
+        if (!strcmp(b, "default")) p->clock_hz = p->clock_default;
+        else {
+            unsigned long hz = strtoul(b, NULL, 0);
+            if (hz < NES_PIN_CLOCK_MIN || hz > NES_PIN_CLOCK_MAX) {
+                gemu_monitor_printf(mon, "cartpin: clock %u-%u Hz, or default\n",
+                                    NES_PIN_CLOCK_MIN, NES_PIN_CLOCK_MAX);
+                return GEMU_MON_NONE;
+            }
+            p->clock_hz = (uint32_t)hz;
+        }
+    } else {
+        int pin = nes_pins_find(a);
+        NesPinState ps;
+        if (!pin) { gemu_monitor_printf(mon, "cartpin: no pin '%s' (1-60 or a label, e.g. m2, cpu_a3)\n", a); return GEMU_MON_NONE; }
+        if (!strcmp(b, "good")) ps = NES_PIN_GOOD;
+        else if (!strcmp(b, "open") || !strcmp(b, "bad")) ps = NES_PIN_BROKEN;
+        else if (!strcmp(b, "flaky")) ps = NES_PIN_FLAKY;
+        else { gemu_monitor_printf(mon, "usage: cartpin <pin> good|open|flaky\n"); return GEMU_MON_NONE; }
+        nes_pins_set(p, pin, ps);
+    }
+    nes_pins_apply(s);
+    return GEMU_MON_NONE;
+}
+
 static void nes_monitor_setup(NesState *s) {
     GemuMonitor *mon = s->monitor;
     gemu_monitor_set_memory(mon, &(GemuMonMemory){
@@ -2906,8 +3079,10 @@ static void nes_monitor_setup(NesState *s) {
     gemu_monitor_bind(mon, "sendkey",    nes_cmd_sendkey,    s);
     gemu_monitor_bind(mon, "ppudump",    nes_cmd_ppudump,    s);
     /* A Game Genie plugs into a home console's cartridge slot, not a VS. cabinet. */
-    if (!s->cfg->is_arcade)
+    if (!s->cfg->is_arcade) {
         gemu_monitor_bind(mon, "gamegenie", nes_cmd_gamegenie, s);
+        gemu_monitor_bind(mon, "cartpin",   nes_cmd_cartpin,   s);
+    }
     if (s->cfg->is_arcade) {
         gemu_monitor_bind(mon, "dipswitch", nes_cmd_dipswitch, s);
         gemu_monitor_bind(mon, "coin",      nes_cmd_coin,      s);
@@ -2936,19 +3111,29 @@ static void nes_step_insn(NesState *s) {
     mos6502_step(&s->cpu);
     uint64_t delta = s->cpu.cycle_count - prev;
 
-    /* APU + VRC6: one tick per CPU cycle */
+    /* APU + VRC6: one tick per CPU cycle.  The cartridge's chips count
+     * M2, so with that contact open (or no power) they stop. */
     bool is_vrc6 = s->cart.mapper == 24 || s->cart.mapper == 26;
+    bool m2 = true;
+    if (nes_pins_any(&s->pins) && !s->cfg->is_arcade) {
+        uint64_t open = nes_pins_sample(&s->pins);
+        m2 = !(open & NES_PIN_BIT(NP_M2)) && !nes_pins_dead(open);
+    }
     for (uint64_t i = 0; i < delta; i++) {
-        if (is_vrc6)
+        if (!m2)
+            s->apu.fds_in = 0.0f;
+        else if (is_vrc6)
             s->apu.fds_in = vrc6_tick(s);
         else if (s->apu.audio_dev && s->fds_enabled)
             s->apu.fds_in = fds_audio_tick(&s->fds);
         if (s->apu.audio_dev) apu2a03_tick(&s->apu);
     }
-    if (s->board.ticks)
+    if (s->board.ticks && m2)
         nes_board_tick(s, (unsigned)delta);
-    if (s->apu.fc_irq || s->apu.dmc.irq_flag)
-        s->cpu.irq = true;
+    nes_update_irq(s);
+    /* A slow clock makes a frame's audio outgrow the buffer: send it on. */
+    if (s->apu.audio_dev && s->apu.frame_n > 900)
+        apu2a03_flush(&s->apu);
 
     nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
 }
@@ -2959,6 +3144,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
     bool quit = false;
     while (!quit) {
         Uint32 t0 = SDL_GetTicks();  /* used for non-audio frame sync below */
+        nes_pins_apply(s);
 
         /* Poll display: pump events, update held bitmask, check quit/reset */
         uint32_t held = 0;
@@ -3088,12 +3274,15 @@ void nes_run(NesState *s, const MosConfig *cfg) {
         } else {
             Uint32 elapsed = SDL_GetTicks() - t0;
             Uint32 frame_ms = cfg->is_pal ? NES_FRAME_PAL_MS : NES_FRAME_MS;
+            /* a changed M2 (Debug > Cartridge Pins) lengthens or shortens it */
+            frame_ms = (Uint32)((uint64_t)frame_ms * s->pins.clock_default / s->pins.clock_hz);
             if (elapsed < frame_ms)
                 SDL_Delay(frame_ms - elapsed);
         }
 
         hex_editor_refresh(s->hex_editor);
         if (g_cheat_dialog) g_cheat_dialog->refresh(g_cheat_dialog);
+        if (g_pin_window) g_pin_window->refresh(g_pin_window);
         /* GTK event pump is done inside gemu_display_poll() via the backend */
     }
 

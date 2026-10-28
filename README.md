@@ -1,20 +1,40 @@
-# GEMU (Generic EMUlator)
+# GEMU (Generic EMUlator) README
 
 > [!WARNING]
 > GEMU is currently unstable and should not be used in production environments.
 
-<img align="left" src="gemu.png" alt="GEMU Icon" /> GEMU is a multi-machine emulator which seeks to emulate every device and machine in existence (yes, really) while having an extremely wide variety of features and the versatile command set of QEMU. 
+<img align="left" src="gemu.png" alt="GEMU Icon" /> GEMU is designed to be a fast, accurate multi-machine emulator for a variety of different systems. The overall goal is to emulate every device and machine in existence along with their peripherals, while maintaining as much backwards compatibility with QEMU as possible.
 
-The emulator seeks to offer:
-- full, accurate, and fast low-level emulation of a wide variety of computers, machines and devices
-- a simple, easy to use UI to easily set up any machine
-- full, backwards compatibility with QEMU, including console commands, command line options, even featuring full QMP support.
-- a wide variety of helpful debug features
+GEMU seeks to offer:
+- full, accurate, low-level emulation of a wide variety of computers, machines, and devices
+- a simple and easy to use UI to easily setup a machine
+- full, backwards compatibility with QEMU, including monitor commands, command line options, and QMP support.
+- a wide variety of debugging features for homebrew and other uses
 
-GEMU currently emulates around 35 machines, and is currently in an **alpha** state.
+GEMU offers emulation for over 40 different machines, and is currently in an **alpha** state.
+
+# Supported Architectures
+GEMU currently emulates the following architectures:
+
+- [X] IA64 / Itanium
+- [X] MOS
+- [X] RCA
+- [X] X86
+- [X] Z80
 
 # Targets & Documentation
-See https://gemu.miraheze.org/
+see https://gemu.miraheze.org/
+
+# Screenshots
+
+| ![](imgs/nes.webp)   | ![](imgs/atari400.webp)  | ![](imgs/2600.webp)      |
+|:--------------------:|:------------------------:|:------------------------:|
+| NES/Famicom          | Atari 400                | Atari VCS/2600           |
+| ![](imgs/chip8.webp) | ![](imgs/i2000.webp)     | ![](imgs/ibm5150.webp)   |
+| CHIP-8               | HP i2000                 | IBM 5150                 |
+| ![](imgs/lagonda.webp)| ![](imgs/pecom64.webp)  | ![](imgs/apple1.webp)    |
+| Lagonda Car Dashboard | Pecom 64                | Apple I                  |
+
 
 # Building
 ## Linux
@@ -61,5 +81,5 @@ TODO
 **Visual Studio**
 TODO
 
-# Transparency
-This entire program is vibe coded, though I have some experience with programming which helps make it not completely horrible. I mainly started this as a way to see how far AI agents have come - and now I'm curious to see how many different machines and devices I can make AI emulate with little reference (simply feeding it datasheets, manuals, expected behavior etc)
+# Disclosure
+This program is made pretty much entirely with AI (though I have enough programming experience to make it not completely unusable/horrible.) The emulator is mainly an experiment to see how many different machines AI agents can make an emulator with little reference (simply feeding it datasheets, manuals, expected behavior, etc.) If you are against AI developed software, you'll want to close the page now!

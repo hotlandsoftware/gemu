@@ -81,6 +81,11 @@ typedef struct Apu2a03 {
     /* Expansion audio: written before each tick by the host machine */
     float    fds_in;
 
+    /* The Famicom's audio loops through the cartridge (pin 45 out to its
+     * mixer, pin 46 back): either can be cut (nes_pins.h). */
+    bool     no_sound_in;      /* the console's channels don't reach the mix */
+    bool     no_sound_out;     /* nothing reaches the output */
+
     /* Compatibility switches */
     bool     sweep_enabled;
     bool     dmc_enabled;

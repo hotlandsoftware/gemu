@@ -210,6 +210,7 @@ Run `help` on any machine for the authoritative list; the machines each command 
 | Command | Machines | Description |
 |---------|----------|-------------|
 | `gamegenie add <code> [name]` / `list` / `on <code>` / `off <code>` / `delete <code>` | nes, nespal, famicom, dendy | manage Game Genie codes (the same list as Debug > Game Genie, saved per game in `<config>/<game>.cht`) |
+| `cartpin [list]` / `cartpin <pin> good\|open\|flaky` / `cartpin tilt <deg>` / `cartpin reinsert` / `cartpin clock <Hz>\|default` | nes, nespal, famicom, dendy | tilt the cartridge (-5 to 5 degrees; + lifts the pin 30 end), fault cartridge connector contacts (by number or label, e.g. `cartpin m2 open`, `cartpin ppu_d3 flaky`) and set the CPU clock; the same as Debug > Cartridge Pins (see MACHINES_MOS.md) |
 | `ppudump`, `mapperdump` | NES family, VS. System (`mapperdump` also Atari 2600) | show PPU state / mapper registers |
 | `dipswitch [list \| <switch> <value>]` / `dip` | vssmb, vsskatekids, 5clown, magicfly, 7mezzo, destroyer, altair2, atari2600 | list or set DIP switches (Atari 2600: the console's Color/B&W and difficulty switches) |
 | `coin [slot]` | vssmb, vsskatekids, 5clown, magicfly, 7mezzo | insert a coin |
