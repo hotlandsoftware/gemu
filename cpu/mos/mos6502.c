@@ -4,19 +4,31 @@
 
 /* ── Memory access helpers ───────────────────────────────────────────────── */
 
+/* End of a cycle: what the interrupt logic samples (see cycle_polling). */
+static inline void poll(Mos6502 *c) {
+    if (!c->cycle_polling) return;
+    c->poll_nmi[1] = c->poll_nmi[0];
+    c->poll_irq[1] = c->poll_irq[0];
+    c->poll_nmi[0] = c->nmi;
+    c->poll_irq[0] = c->irq && !(c->P & MOS6502_P_I);
+}
+
 static inline uint8_t rd(Mos6502 *c, uint16_t a) {
     c->cycle_count++;
-    return c->mem_read(a & c->addr_mask, c->mem_ud);
+    uint8_t v = c->mem_read(a & c->addr_mask, c->mem_ud);
+    poll(c);
+    return v;
 }
 static inline void wr(Mos6502 *c, uint16_t a, uint8_t v) {
     c->cycle_count++;
     c->mem_write(a & c->addr_mask, v, c->mem_ud);
+    poll(c);
 }
 /* A cycle the CPU spends fixing up an address: a read of the
  * not-yet-corrected address on real hardware. */
 static inline void idle(Mos6502 *c, uint16_t a) {
     if (c->dummy_cycles) (void)rd(c, a);
-    else                 c->cycle_count++;
+    else                 { c->cycle_count++; poll(c); }
 }
 /* Zero-page 16-bit read (wraps within page - critical for JMP ind bug etc.) */
 static inline uint16_t rd16zp(Mos6502 *c, uint8_t a) {
@@ -179,6 +191,9 @@ static uint8_t do_ror(Mos6502 *c, uint8_t v) {
 }
 
 static void do_branch(Mos6502 *c, bool cond) {
+    /* polled before cycle 2, and (taken) again before cycle 4 only: a taken
+     * branch that stays on its page keeps the opcode fetch's sample */
+    bool nmi1 = c->poll_nmi[0], irq1 = c->poll_irq[0];
     int8_t  off = (int8_t)fetch(c);   /* always fetch offset (1 cycle) */
     if (!cond) return;
     uint16_t old = c->PC;
@@ -186,6 +201,21 @@ static void do_branch(Mos6502 *c, bool cond) {
     c->PC = (uint16_t)(c->PC + off);
     if ((c->PC ^ old) & 0xFF00u)       /* +1: page crossed */
         idle(c, (uint16_t)((old & 0xFF00u) | (c->PC & 0x00FFu)));
+    else if (c->cycle_polling) {
+        c->poll_nmi[1] = nmi1;
+        c->poll_irq[1] = irq1;
+    }
+}
+
+static void sh_store(Mos6502 *c, uint16_t ea, int crossed, uint8_t reg) {
+    if (c->rdy_halted) {   /* a DMA on the cycle before: the AND is lost (SHY = STY) */
+        wr(c, ea, reg);
+        return;
+    }
+    uint8_t base_hi = (uint8_t)(c->dummy_addr >> 8);   /* the uncorrected address */
+    uint8_t v = (uint8_t)(reg & (uint8_t)(base_hi + 1u));
+    if (crossed) ea = (uint16_t)((v << 8) | (ea & 0x00FFu));
+    wr(c, ea, v);
 }
 
 /* ── Interrupt dispatch ───────────────────────────────────────────────────── */
@@ -197,9 +227,18 @@ static void service_irq(Mos6502 *c, uint16_t vector, bool brk) {
     push(c, (uint8_t)(c->PC & 0xFFu));
     push(c, (c->P & ~MOS6502_P_B) | (brk ? MOS6502_P_B : 0u) | MOS6502_P_U);
     c->P |= MOS6502_P_I;
+    /* An NMI that arrived by now takes the vector (BRK's B flag is already
+     * on the stack, so the handler sees a BRK that went to the NMI). */
+    if (c->cycle_polling && vector != 0xFFFAu && c->poll_nmi[1]) {
+        vector = 0xFFFAu;
+        c->nmi = false;
+    }
     uint8_t lo = rd(c, vector);
     uint8_t hi = rd(c, (uint16_t)(vector + 1));
     c->PC = (uint16_t)(lo | ((uint16_t)hi << 8));
+    /* the sequence doesn't poll: the handler's first instruction always runs */
+    if (c->cycle_polling)
+        c->poll_nmi[0] = c->poll_nmi[1] = c->poll_irq[0] = c->poll_irq[1] = false;
 }
 
 /* ── Init / Reset ────────────────────────────────────────────────────────── */
@@ -225,13 +264,26 @@ void mos6502_reset(Mos6502 *cpu) {
 void mos6502_step(Mos6502 *c) {
     /* NMI takes priority over IRQ */
     if (c->no_int_pins) c->nmi = c->irq = false;
-    if (c->nmi) {
+    if (c->cycle_polling) {
+        /* what the previous instruction's penultimate cycle saw */
+        if (c->poll_nmi[1] && c->nmi) {
+            c->nmi = false;
+            service_irq(c, 0xFFFAu, false);
+            c->insn_count++;
+            return;
+        }
+        if (c->poll_irq[1]) {
+            service_irq(c, 0xFFFEu, false);
+            c->insn_count++;
+            return;
+        }
+    } else if (c->nmi) {
         c->nmi = false;
         service_irq(c, 0xFFFAu, false);
         c->insn_count++;
         return;
     }
-    if (c->irq && !(c->P & MOS6502_P_I)) {
+    if (!c->cycle_polling && c->irq && !(c->P & MOS6502_P_I)) {
         service_irq(c, 0xFFFEu, false);
         c->insn_count++;
         return;
@@ -645,6 +697,10 @@ void mos6502_step(Mos6502 *c) {
     /* Illegal SBC imm - identical to official $E9 */
     case 0xEB: do_sbc(c, fetch(c)); break;
 
+    /* LXA: A = X = (A | magic) & #imm.  The magic constant varies between
+     * chips (and with temperature); $FF makes it LAX #imm. */
+    case 0xAB: c->A = c->X = fetch(c); set_nz(c, c->A); break;
+
     /* XAA: A = X & #imm (unstable on hardware; common approximation) */
     case 0x8B: c->A = c->X & fetch(c); set_nz(c, c->A); break;
 
@@ -652,23 +708,20 @@ void mos6502_step(Mos6502 *c) {
     case 0xBB: { int x; uint16_t ea=am_aby(c,&x); if(x) idle(c, c->dummy_addr);
                  uint8_t v=rd(c,ea) & c->SP; c->A=c->X=c->SP=v; set_nz(c,v); break; }
 
-    /* SHA: A & X & (addr_hi+1) → mem (unstable) */
-    case 0x9F: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
-                 wr(c, ea, c->A & c->X & (uint8_t)((ea >> 8) + 1u)); break; }
-    case 0x93: { int x; uint16_t ea=am_izy(c,&x); idle(c, c->dummy_addr);
-                 wr(c, ea, c->A & c->X & (uint8_t)((ea >> 8) + 1u)); break; }
-
-    /* SHX: X & (addr_hi+1) → mem */
-    case 0x9E: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
-                 wr(c, ea, c->X & (uint8_t)((ea >> 8) + 1u)); break; }
-
-    /* SHY: Y & (addr_hi+1) → mem */
-    case 0x9C: { int x; uint16_t ea=am_abx(c,&x); idle(c, c->dummy_addr);
-                 wr(c, ea, c->Y & (uint8_t)((ea >> 8) + 1u)); break; }
-
-    /* TAS: SP = A & X; A & X & (addr_hi+1) → mem */
-    case 0x9B: { int x; uint16_t ea=am_aby(c,&x); idle(c, c->dummy_addr);
-                 c->SP = c->A & c->X; wr(c, ea, c->SP & (uint8_t)((ea >> 8) + 1u)); break; }
+    /* SHA / SHX / SHY / TAS (SHS): store reg & (H+1), where H is the high
+     * byte of the base address - the bus still carries it while the index is
+     * added.  Crossing a page, the corrected high byte comes from that same
+     * AND, so the value stored also becomes the address's high byte. */
+    case 0x9F: { int x; uint16_t ea=am_aby(c,&x); c->rdy_halted = false; idle(c, c->dummy_addr);
+                 sh_store(c, ea, x, (uint8_t)(c->A & c->X)); break; }
+    case 0x93: { int x; uint16_t ea=am_izy(c,&x); c->rdy_halted = false; idle(c, c->dummy_addr);
+                 sh_store(c, ea, x, (uint8_t)(c->A & c->X)); break; }
+    case 0x9E: { int x; uint16_t ea=am_aby(c,&x); c->rdy_halted = false; idle(c, c->dummy_addr);
+                 sh_store(c, ea, x, c->X); break; }
+    case 0x9C: { int x; uint16_t ea=am_abx(c,&x); c->rdy_halted = false; idle(c, c->dummy_addr);
+                 sh_store(c, ea, x, c->Y); break; }
+    case 0x9B: { int x; uint16_t ea=am_aby(c,&x); c->rdy_halted = false; idle(c, c->dummy_addr);
+                 c->SP = c->A & c->X; sh_store(c, ea, x, c->SP); break; }
 
     /* KIL: CPU halt - jams real hardware; treat as no-op so emulator stays alive */
     case 0x02: case 0x12: case 0x22: case 0x32: case 0x42: case 0x52:

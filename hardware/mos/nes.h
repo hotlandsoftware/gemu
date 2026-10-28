@@ -170,6 +170,17 @@ typedef struct NesState {
 
     char           cart_path_buf[512]; /* path of currently loaded cartridge */
     uint64_t       ppu_synced_cpu_cycle;
+    uint64_t       apu_synced_cpu_cycle;   /* the APU, expansion audio and mapper counters */
+    bool           apu_syncing;
+    uint64_t       apu_deadline;           /* the APU may lag until this cycle (apu2a03_until_event) */
+    uint64_t       ppu_deadline;           /* likewise the PPU (rp2c02_dots_until_event) */
+
+    /* The 2A03's DMA unit: OAM and DMC DMA halt the CPU on its next read */
+    bool           dma_halt;               /* a DMA is waiting for a read cycle */
+    bool           dmc_dma, dmc_dummy, dmc_abort;
+    bool           oam_dma;
+    uint8_t        oam_page;
+    bool           in_dma;
     bool           battery_autosave;  /* user opted in to save SRAM on exit */
     char           sav_path[512];     /* ~/.gemu/<game>.sav or AppData equivalent */
 

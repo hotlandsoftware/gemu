@@ -38,6 +38,14 @@ typedef struct Mos6502 {
                              taken-branch cycles instead of only counting them
                              (bank-switching hotspots can see them) */
     uint16_t dummy_addr;  /* internal: address of the next dummy read */
+    bool cycle_polling;   /* sample the NMI latch and /IRQ at the end of every
+                             cycle and act on the penultimate cycle's sample, as
+                             the 6502 does: CLI/SEI/PLP take effect one
+                             instruction late, an NMI late in an instruction
+                             waits for the next, and an NMI during a BRK or IRQ
+                             sequence takes over its vector (the NES) */
+    bool poll_nmi[2], poll_irq[2];   /* internal: [0] last cycle, [1] the one before */
+    bool rdy_halted;      /* set by the machine when RDY held the CPU (a DMA) during a read */
 } Mos6502;
 
 void mos6502_init (Mos6502 *cpu);

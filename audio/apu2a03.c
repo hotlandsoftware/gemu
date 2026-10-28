@@ -164,7 +164,7 @@ static void clock_frame(Apu2a03 *a, bool half) {
 
 /* ── APU tick (one CPU cycle) ────────────────────────────────────────────── */
 
-void apu2a03_tick(Apu2a03 *a) {
+static inline void tick_one(Apu2a03 *a) {
     a->cycle++;
     a->apu_clk = !a->apu_clk;
 
@@ -202,20 +202,25 @@ void apu2a03_tick(Apu2a03 *a) {
 
     }
 
-    /* DMC: clocked every CPU cycle (rate table values are in CPU cycles) */
-    if (a->dmc_enabled && a->ch_en[4]) {
-        if (a->dmc.timer > 0) {
+    /* DMC: its timer is clocked by the APU, on get (even) cycles, so the
+     * rate table's CPU-cycle periods are halved and a DMA it asks for always
+     * halts the CPU on a put cycle.  The output unit runs whether or not the
+     * channel is enabled; $4015 only starts and stops the memory reader. */
+    if (a->dmc_enabled) {
+        if ((a->cycle & 1u) != 0) {
+            /* put cycle: the timer holds */
+        } else if (a->dmc.timer > 0) {
             a->dmc.timer--;
         } else {
-            a->dmc.timer = a->dmc.period;
+            a->dmc.timer = (uint16_t)(a->dmc.period / 2u - 1u);
             if (!a->dmc.silence) {
                 if (a->dmc.shift & 1) {
                     if (a->dmc.level <= 125) a->dmc.level += 2;
                 } else {
                     if (a->dmc.level >= 2)   a->dmc.level -= 2;
                 }
-                a->dmc.shift >>= 1;
             }
+            a->dmc.shift >>= 1;
             if (--a->dmc.bits_rem == 0) {
                 a->dmc.bits_rem = 8;
                 if (a->dmc.buf_empty) {
@@ -226,42 +231,49 @@ void apu2a03_tick(Apu2a03 *a) {
                     a->dmc.buf_empty = true;
                 }
             }
-            /* Refill DMC sample buffer from memory */
-            if (a->dmc.buf_empty && a->dmc.bytes_rem > 0 && a->mem_read) {
-                a->dmc.sample_buf = a->mem_read(a->dmc.cur_addr, a->mem_ud);
-                a->dmc.buf_empty  = false;
-                a->dmc.cur_addr   = (a->dmc.cur_addr == 0xFFFF)
-                                    ? 0x8000 : a->dmc.cur_addr + 1;
-                if (--a->dmc.bytes_rem == 0) {
-                    if (a->dmc.loop) {
-                        a->dmc.cur_addr  = a->dmc.start_addr;
-                        a->dmc.bytes_rem = a->dmc.start_len;
-                    } else if (a->dmc.irq_en) {
-                        a->dmc.irq_flag = true;
-                    }
-                }
+        }
+        /* The memory reader refills an empty buffer ("reload" DMA); after a
+         * $4015 enable the first fetch waits out start_delay. */
+        if (a->dmc.start_delay && --a->dmc.start_delay) {
+            /* waiting */
+        } else if (a->dmc.buf_empty && a->dmc.bytes_rem > 0) {
+            if (a->dma_external) {
+                a->dmc.dma_pending = true;
+            } else if (a->mem_read) {
+                apu2a03_dmc_fill(a, a->mem_read(a->dmc.cur_addr, a->mem_ud));
             }
         }
     }
 
-    /* Frame counter */
+    /* Frame counter.  CPU cycles from the (delayed) $4017 write:
+     *   4-step: 7457 Q, 14913 H, 22371 Q, 29829 H; IRQ flag on 29828-29830
+     *   5-step: 7457 Q, 14913 H, 22371 Q, 37281 H
+     * "get" cycles are the even ones (see apu2a03.h). */
     {
-        uint32_t steps = a->fc_mode ? 5 : 4;
-        const uint32_t *pts = a->fc_mode ? fc5 : fc4;
-        uint32_t pos = a->fc_div % (a->fc_mode ? 37282u : 29830u);
-        a->fc_div++;
-
-        for (uint32_t i = 0; i < steps; i++) {
-            if (pos == pts[i]) {
-                /* 5-step mode step 3 (cycle 29829) is a no-op on hardware */
-                if (a->fc_mode && i == 3) break;
-                bool half = (i == 1) || (i == 3) || (a->fc_mode && i == 4);
-                clock_frame(a, half);
-                if (a->frame_irq_enabled && !a->fc_mode && i == 3 && !a->fc_irq_inhibit)
-                    a->fc_irq = true;
-                break;
-            }
+        bool get = (a->cycle & 1u) == 0;
+        if (a->fc_clear_pending && !get) {   /* cleared going from put into get */
+            a->fc_irq = false;
+            a->fc_clear_pending = false;
         }
+        if (a->fc_write_delay && --a->fc_write_delay == 0) {
+            a->fc_mode = (a->fc_new >> 7) & 1;
+            a->fc_div = 0;
+            if (a->fc_mode) clock_frame(a, true);   /* 5-step: clocks at once */
+        }
+        uint32_t t = ++a->fc_div;
+        bool irq_cycle = false;
+        if (t == 7457 || t == 22371) clock_frame(a, false);
+        else if (t == 14913) clock_frame(a, true);
+        if (!a->fc_mode) {
+            if (t == 29829) clock_frame(a, true);
+            if (t >= 29828 && t <= 29830) irq_cycle = true;
+            if (t == 29830) a->fc_div = 0;
+        } else {
+            if (t == 37281) clock_frame(a, true);
+            if (t == 37282) a->fc_div = 0;
+        }
+        if (irq_cycle && a->frame_irq_enabled && !a->fc_irq_inhibit)
+            a->fc_irq = true;
     }
 
     /* Sample generation */
@@ -284,8 +296,36 @@ void apu2a03_tick(Apu2a03 *a) {
     }
 }
 
+void apu2a03_tick(Apu2a03 *a) { tick_one(a); }
+
+void apu2a03_run(Apu2a03 *a, uint64_t to) {
+    while (a->cycle < to) tick_one(a);
+}
+
+uint64_t apu2a03_until_event(const Apu2a03 *a) {
+    if (a->fc_write_delay || a->fc_clear_pending) return 0;
+    uint64_t best = 1u << 30;   /* nothing pending: "a long way off" */
+    if (!a->fc_mode && a->frame_irq_enabled && !a->fc_irq_inhibit)
+        best = a->fc_div < 29828u ? 29828u - a->fc_div : 1;
+    if (a->dmc_enabled) {
+        if (a->dmc.start_delay) return 0;
+        if (a->dmc.buf_empty) {
+            if (a->dmc.bytes_rem > 0 && !a->dmc.dma_pending) return 0;
+        } else if (a->dmc.bytes_rem > 0) {
+            /* the buffer empties (and the reader asks for a DMA) on the
+             * bits_rem-th timer expiry; the timer counts on even cycles */
+            uint64_t k = (uint64_t)a->dmc.timer + 1u + (uint64_t)(a->dmc.bits_rem - 1u) * (a->dmc.period / 2u);
+            uint64_t ticks = 2u * k - (a->cycle & 1u);
+            if (ticks - 1u < best) best = ticks - 1u;
+        }
+    }
+    return best;
+}
+
 /* ── Register writes ─────────────────────────────────────────────────────── */
 
+/* Register writes land on CPU cycle a->cycle + 1: the machine has brought
+ * the APU up to the cycle before (apu2a03.h). */
 void apu2a03_write(Apu2a03 *a, uint16_t addr, uint8_t v) {
     switch (addr) {
     /* ── Pulse 1 ─────── */
@@ -393,23 +433,28 @@ void apu2a03_write(Apu2a03 *a, uint16_t addr, uint8_t v) {
                 if (i < 2) a->pulse[i].len = 0;
                 else if (i == 2) a->tri.len = 0;
                 else if (i == 3) a->noise.len = 0;
-                else { a->dmc.bytes_rem = 0; a->dmc.buf_empty = true; }
+                else { a->dmc.bytes_rem = 0; a->dmc.start_delay = 0; }
             } else if (i == 4 && a->dmc.bytes_rem == 0) {
                 a->dmc.cur_addr  = a->dmc.start_addr;
                 a->dmc.bytes_rem = a->dmc.start_len;
+                /* the first fetch comes 2 or 3 cycles later (get/put) */
+                if (a->dmc.buf_empty) a->dmc.start_delay = ((a->cycle + 1u) & 1u) ? 3 : 2;
             }
+        }
+        if (!a->ch_en[4] && a->dmc.dma_pending) {
+            a->dmc.dma_pending = false;
+            a->dmc.dma_abort = true;
         }
         a->dmc.irq_flag = false;
         break;
     /* ── Frame counter ─ */
     case 0x4017:
-        a->fc_mode        = (v >> 7) & 1;
+        /* the inhibit flag acts at once; the sequence restarts 3 or 4
+         * cycles later, depending on whether this is a get or put cycle */
         a->fc_irq_inhibit = ((v >> 6) & 1) || !a->frame_irq_enabled;
-        a->fc_div         = 0;
-        a->fc_step        = 0;
-        if (a->fc_irq_inhibit) a->fc_irq = false;
-        /* 5-step: immediately clock all units */
-        if (a->fc_mode) clock_frame(a, true);
+        if (a->fc_irq_inhibit) { a->fc_irq = false; a->fc_clear_pending = false; }
+        a->fc_new = v;
+        a->fc_write_delay = ((a->cycle + 1u) & 1u) ? 4 : 3;
         break;
     }
     if (a->write_tap) a->write_tap(addr, v, a->write_tap_ud);
@@ -425,9 +470,26 @@ uint8_t apu2a03_read(Apu2a03 *a, uint16_t addr) {
     if (a->dmc_enabled && a->dmc.bytes_rem > 0) s |= 0x10;
     if (a->frame_irq_enabled && a->fc_irq)      s |= 0x40;
     if (a->dmc_enabled && a->dmc.irq_flag)      s |= 0x80;
-    a->fc_irq       = false;
-    a->dmc.irq_flag = false;
+    /* clears the frame flag at the next get cycle; the DMC's flag is
+     * cleared by writing $4015 or $4010 */
+    if (a->fc_irq) a->fc_clear_pending = true;
     return s;
+}
+
+void apu2a03_dmc_fill(Apu2a03 *a, uint8_t byte) {
+    a->dmc.dma_pending = false;
+    if (a->dmc.bytes_rem == 0) return;   /* disabled while the DMA ran */
+    a->dmc.sample_buf = byte;
+    a->dmc.buf_empty  = false;
+    a->dmc.cur_addr   = (a->dmc.cur_addr == 0xFFFF) ? 0x8000 : (uint16_t)(a->dmc.cur_addr + 1);
+    if (--a->dmc.bytes_rem == 0) {
+        if (a->dmc.loop) {
+            a->dmc.cur_addr  = a->dmc.start_addr;
+            a->dmc.bytes_rem = a->dmc.start_len;
+        } else if (a->dmc.irq_en) {
+            a->dmc.irq_flag = true;
+        }
+    }
 }
 
 /* ── SDL audio output ────────────────────────────────────────────────────── */
@@ -455,7 +517,9 @@ void apu2a03_reset(Apu2a03 *a) {
     bool sweep_enabled = a->sweep_enabled;
     bool dmc_enabled = a->dmc_enabled;
     bool frame_irq_enabled = a->frame_irq_enabled;
+    bool dma_external = a->dma_external;
     memset(a, 0, sizeof(*a));
+    a->dma_external = dma_external;
     a->audio_dev    = dev;
     a->clock_pps    = pps;
     a->mem_read     = mr;

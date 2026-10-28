@@ -1232,18 +1232,213 @@ static bool nes_cart_faulty(const NesState *s, uint16_t addr) {
     return addr >= 0x4020u && nes_pins_any(&s->pins) && !s->cfg->is_arcade;
 }
 
+static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle);
+
+/* The DMC asking for a byte, or its channel disabled while it waited. */
+static void nes_dmc_dma_check(NesState *s) {
+    if (s->apu.dmc.dma_pending && !s->dmc_dma) {
+        s->dmc_dma = s->dmc_dummy = s->dma_halt = true;
+    }
+    if (s->apu.dmc.dma_abort) {
+        s->apu.dmc.dma_abort = false;
+        if (s->dmc_dma) {
+            if (s->dma_halt && !s->in_dma) s->dmc_dma = s->dmc_dummy = s->dma_halt = false;
+            else s->dmc_abort = true;   /* already under way: dropped at the next cycle */
+        }
+    }
+}
+
+/* The APU, the cartridge's expansion audio and its mapper's cycle counters,
+ * one tick per CPU cycle up to `cpu_cycle`.  The cartridge's chips count
+ * M2, so with that contact open (or no power) they stop. */
+/* Whether the cartridge side must tick with every CPU cycle: chips that
+ * count M2 (VRC IRQs and audio, FME-7 and friends, the FDS), or connector
+ * faults that can stop M2.  Otherwise the APU alone runs in batches. */
+static bool nes_apu_eager(const NesState *s) {
+    return s->board.ticks || s->cart.mapper == 24 || s->cart.mapper == 26 || s->fds_enabled ||
+           (nes_pins_any(&s->pins) && !s->cfg->is_arcade);
+}
+
+static void nes_sync_apu_to_cpu(NesState *s, uint64_t cpu_cycle) {
+    if (s->apu_synced_cpu_cycle >= cpu_cycle || s->apu_syncing) return;
+    s->apu_syncing = true;   /* the DMC fetches through nes_cpu_read */
+    if (!nes_apu_eager(s)) {
+        while (s->apu_synced_cpu_cycle < cpu_cycle) {
+            uint64_t to = cpu_cycle - s->apu_synced_cpu_cycle > 256u ? s->apu_synced_cpu_cycle + 256u
+                                                                     : cpu_cycle;
+            s->apu.cycle = s->apu_synced_cpu_cycle;
+            apu2a03_run(&s->apu, to);
+            s->apu_synced_cpu_cycle = to;
+            /* a slow clock makes a frame's audio outgrow the buffer */
+            if (s->apu.audio_dev && s->apu.frame_n > 900) apu2a03_flush(&s->apu);
+        }
+        nes_dmc_dma_check(s);
+        s->apu_deadline = s->apu_synced_cpu_cycle + apu2a03_until_event(&s->apu);
+        s->apu_syncing = false;
+        nes_update_irq(s);
+        return;
+    }
+    bool is_vrc6 = s->cart.mapper == 24 || s->cart.mapper == 26;
+    bool m2 = true;
+    if (nes_pins_any(&s->pins) && !s->cfg->is_arcade) {
+        uint64_t open = nes_pins_sample(&s->pins);
+        m2 = !(open & NES_PIN_BIT(NP_M2)) && !nes_pins_dead(open);
+    }
+    while (s->apu_synced_cpu_cycle < cpu_cycle) {
+        s->apu_synced_cpu_cycle++;
+        if (!m2)
+            s->apu.fds_in = 0.0f;
+        else if (is_vrc6)
+            s->apu.fds_in = vrc6_tick(s);
+        else if (s->apu.audio_dev && s->fds_enabled)
+            s->apu.fds_in = fds_audio_tick(&s->fds);
+        s->apu.cycle = s->apu_synced_cpu_cycle - 1u;   /* tick numbers the cycle */
+        apu2a03_tick(&s->apu);
+        if (s->board.ticks && m2)
+            nes_board_tick(s, 1);
+        nes_dmc_dma_check(s);
+    }
+    if (s->apu.audio_dev && s->apu.frame_n > 900) apu2a03_flush(&s->apu);
+    s->apu_syncing = false;
+    nes_update_irq(s);
+}
+
+/* Before each bus access the rest of the console catches up with the CPU,
+ * so registers, IRQ and NMI are exact to the cycle: the PPU through this
+ * cycle (as before), the APU side up to its start. */
+/* The FDS's disk logic ticks with the PPU, and a Lua script may look at the
+ * PPU from any instruction: those keep it in step every cycle. */
+static bool nes_ppu_eager(const NesState *s) {
+#ifdef HAVE_LUA
+    if (s->lua) return true;
+#endif
+    return s->fds_enabled;
+}
+
+static void nes_sync_all(NesState *s) {
+    uint64_t c = s->cpu.cycle_count - 1;
+    if (c >= s->apu_deadline || nes_apu_eager(s)) nes_sync_apu_to_cpu(s, c);
+    if (s->cpu.cycle_count >= s->ppu_deadline || nes_ppu_eager(s))
+        nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+}
+
+/* ── DMA ─────────────────────────────────────────────────────────────────────
+ * A DMA halts the CPU (RDY) on its next read cycle - a write can't be
+ * halted - and the halted CPU keeps repeating that read.  The DMC's fetch
+ * needs a halt and a dummy cycle, then a get (even) cycle; OAM DMA reads on
+ * get cycles and writes $2004 on put cycles, 256 times.  Running together,
+ * any DMA cycle counts as the DMC's halt or dummy cycle.
+ *
+ * The 2A03 reads its own registers ($4015-$4017, mirrored every $20) only
+ * while the 6502's address bus is in $4000-$401F: a DMA read there sees
+ * open bus unless the CPU was halted on such an address, and then reads the
+ * registers too, whatever the DMA's own address (bus conflicts). */
+
+static uint8_t dma_bus_read(NesState *s, uint16_t a) {
+    uint8_t v = nes_cart_faulty(s, a) ? nes_cart_read_faulty(s, a) : nes_cpu_read_bus(a, s);
+    if (a != 0x4015) s->cpu_bus = v;
+    return v;
+}
+
+static uint8_t dma_read(NesState *s, uint16_t a, bool regs, uint16_t *prev) {
+    uint8_t v;
+    if (!regs) {
+        v = (a & 0xFFE0u) == 0x4000u ? s->cpu_bus : dma_bus_read(s, a);
+        *prev = a;
+        return v;
+    }
+    uint16_t reg = (uint16_t)(0x4000u | (a & 0x1Fu));
+    if (reg == 0x4015) {
+        v = dma_bus_read(s, 0x4015);
+        if (a != reg) (void)dma_bus_read(s, a);
+    } else if (reg == 0x4016 || reg == 0x4017) {
+        /* the controller sees back-to-back reads as one */
+        v = *prev == reg ? s->cpu_bus : dma_bus_read(s, reg);
+        if (a != reg) {
+            uint8_t ext = dma_bus_read(s, a);
+            v = (uint8_t)((ext & 0xE0u) | (v & ext & 0x1Fu));
+        }
+    } else {
+        v = dma_bus_read(s, a);
+    }
+    *prev = reg;
+    return v;
+}
+
+static void dma_cycle(NesState *s) {
+    s->cpu.cycle_count++;
+    nes_sync_all(s);
+}
+
+static void nes_run_dma(NesState *s, uint16_t cpu_addr) {
+    s->in_dma = true;
+    s->cpu.cycle_count--;          /* the DMA's cycles come before this read */
+    bool regs = (cpu_addr & 0xFFE0u) == 0x4000u;
+    bool skip_dummy = cpu_addr == 0x4016 || cpu_addr == 0x4017;
+    uint16_t prev = cpu_addr;
+    uint8_t oam_val = 0;
+    unsigned oam_n = 0;
+
+    /* halt: the CPU's read happens and is repeated later */
+    dma_cycle(s);
+    if (s->dmc_abort) s->dmc_dma = s->dmc_dummy = s->dmc_abort = false;
+    else (void)dma_bus_read(s, cpu_addr);
+    s->dma_halt = false;
+
+    while (s->dmc_dma || s->oam_dma) {
+        if (s->dmc_abort) s->dmc_dma = s->dmc_dummy = s->dmc_abort = s->dma_halt = false;
+        bool get = ((s->cpu.cycle_count + 1u) & 1u) == 0;
+        bool dmc_ready = s->dmc_dma && !s->dma_halt && !s->dmc_dummy;
+        if (s->dma_halt) s->dma_halt = false;
+        else if (s->dmc_dummy) s->dmc_dummy = false;
+        dma_cycle(s);
+        if (get && dmc_ready) {
+            uint8_t v = dma_read(s, s->apu.dmc.cur_addr, regs, &prev);
+            s->dmc_dma = false;
+            apu2a03_dmc_fill(&s->apu, v);
+            s->apu_deadline = 0;   /* its state moved on: look again */
+        } else if (get && s->oam_dma && !(oam_n & 1u)) {
+            oam_val = dma_read(s, (uint16_t)(s->oam_page << 8 | oam_n >> 1), regs, &prev);
+            oam_n++;
+        } else if (!get && s->oam_dma && (oam_n & 1u)) {
+            nes_cpu_write_bus(0x2004, oam_val, s);
+            s->cpu_bus = oam_val;
+            if (++oam_n == 512) s->oam_dma = false;
+        } else if (!skip_dummy) {
+            (void)dma_bus_read(s, cpu_addr);   /* halted: the read repeats */
+        }
+    }
+    s->cpu.cycle_count++;          /* back to the CPU's own read */
+    s->cpu.rdy_halted = true;
+    s->in_dma = false;
+}
+
 static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
     NesState *s = ud;
+    nes_sync_all(s);
+    /* the PPU's state shows through cartridge registers (MMC5's in-frame
+     * flag...) and the Zapper's light sensor */
+    if ((addr >= 0x4020 && addr < 0x6000) || addr == 0x4016 || addr == 0x4017)
+        nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+    if (s->dma_halt && !s->in_dma) {
+        nes_run_dma(s, addr);
+        nes_sync_all(s);
+    }
     uint8_t v = nes_cart_faulty(s, addr) ? nes_cart_read_faulty(s, addr) : nes_cpu_read_bus(addr, ud);
-    s->cpu_bus = v;
+    if (addr != 0x4015) s->cpu_bus = v;   /* $4015 is read over the internal bus only */
     return v;
 }
 
 static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
     NesState *s = ud;
+    nes_sync_all(s);
+    /* a mapper write can switch what the PPU draws (CHR banks, mirroring) */
+    bool cart = addr >= 0x4020;
+    if (cart) nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
     s->cpu_bus = val;
     if (nes_cart_faulty(s, addr)) nes_cart_write_faulty(s, addr, val);
     else nes_cpu_write_bus(addr, val, ud);
+    if (cart) s->ppu_deadline = 0;
 }
 
 static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
@@ -1260,6 +1455,8 @@ static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
             }
         }
     }
+    /* it may now lag until it next does something the CPU can see */
+    s->ppu_deadline = s->ppu_synced_cpu_cycle + rp2c02_dots_until_event(&s->ppu) / 3u;
 }
 
 static void gg_print(NesState *s, const NesCheat *e) {
@@ -1343,6 +1540,7 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
 
     if (addr < 0x4000) {
         nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+        s->ppu_deadline = 0;
         return rp2c02_read(&s->ppu, (uint8_t)(addr & 7));
     }
 
@@ -1355,7 +1553,11 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
     }
 
     if (addr == 0x4015) {
-        uint8_t v = apu2a03_read(&s->apu, 0x4015);
+        nes_sync_apu_to_cpu(s, s->cpu.cycle_count - 1);
+        s->apu_deadline = 0;
+        /* bit 5 isn't driven: it reads the CPU's internal bus (and, unlike
+         * every other read, this one doesn't reach the external bus) */
+        uint8_t v = (uint8_t)((apu2a03_read(&s->apu, 0x4015) & ~0x20u) | (s->cpu_bus & 0x20u));
         nes_update_irq(s);
         return v;
     }
@@ -1400,14 +1602,17 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
         return s->vs_coin_counter;
     }
 
+    /* The controller ports drive D0-D4 (whatever is plugged in uses D0, the
+     * Famicom's microphone D2, the Zapper D3-D4); D5-D7 are open bus. */
+    uint8_t ctrl_open = s->cpu_bus & 0xE0u;
     if (addr == 0x4016) {
-        if (s->cfg->ports[0] != NES_DEVICE_CONTROLLER) return 0;
-        if (s->ctrl_strobe) return (s->ctrl_state[0] & NES_BTN_A) ? 1u : 0u;
+        if (s->cfg->ports[0] != NES_DEVICE_CONTROLLER) return ctrl_open;
+        if (s->ctrl_strobe) return ctrl_open | ((s->ctrl_state[0] & NES_BTN_A) ? 1u : 0u);
         uint8_t bit = s->ctrl_shift[0] & 1;
         s->ctrl_shift[0] = (s->ctrl_shift[0] >> 1) | 0x80u;
         /* D2: Famicom hardwired controller 2 microphone */
         uint8_t mic = (s->cfg->ports[1] == NES_DEVICE_FC2_MIC && s->mic_noise) ? 0x04u : 0u;
-        return bit | mic;
+        return ctrl_open | bit | mic;
     }
     if (addr == 0x4017) {
         if (s->cfg->ports[1] == NES_DEVICE_ZAPPER) {
@@ -1426,15 +1631,15 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
                 uint8_t luma = (uint8_t)((r * 77u + g * 150u + b * 29u) >> 8);
                 if (luma >= 85) light = 0; /* bright pixel → light detected */
             }
-            return trigger | light;
+            return ctrl_open | trigger | light;
         }
         if (s->cfg->ports[1] != NES_DEVICE_CONTROLLER &&
             s->cfg->ports[1] != NES_DEVICE_FC2_MIC &&
-            !nes_device_is_rob(s->cfg->ports[1])) return 0;
-        if (s->ctrl_strobe) return (s->ctrl_state[1] & NES_BTN_A) ? 1u : 0u;
+            !nes_device_is_rob(s->cfg->ports[1])) return ctrl_open;
+        if (s->ctrl_strobe) return ctrl_open | ((s->ctrl_state[1] & NES_BTN_A) ? 1u : 0u);
         uint8_t bit = s->ctrl_shift[1] & 1;
         s->ctrl_shift[1] = (s->ctrl_shift[1] >> 1) | 0x80u;
-        return bit;
+        return ctrl_open | bit;
     }
 
     if (s->has_board && addr >= 0x4020 && addr < 0x8000) {
@@ -1455,8 +1660,8 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
         if (addr == 0x5205) return (uint8_t)((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]);
         if (addr == 0x5206) return (uint8_t)(((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]) >> 8);
         if (addr >= 0x5C00)
-            return (s->mmc5_exram_mode >= 2) ? s->mmc5_exram[addr - 0x5C00u] : 0;
-        return 0;
+            return (s->mmc5_exram_mode >= 2) ? s->mmc5_exram[addr - 0x5C00u] : s->cpu_bus;
+        return s->cpu_bus;
     }
 
     if (addr >= 0x6000 && addr < 0x8000) {
@@ -1468,7 +1673,7 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
             s->cart.mapper == 178 || s->cfg->is_arcade ||
             (s->has_board && nes_board_has_prg_ram(s)))
             return s->prg_ram[addr & 0x1FFF];
-        return 0;
+        return s->cpu_bus;   /* no PRG-RAM: open bus */
     }
 
     if (addr >= 0x8000) {
@@ -1477,7 +1682,7 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
                 return s->fds.bios[addr - 0xE000u];          /* BIOS ROM */
             return s->fds.ram[addr - 0x6000u];               /* $8000–$DFFF: upper FDS RAM */
         }
-        if (!s->prg) return 0;
+        if (!s->prg) return s->cpu_bus;
         uint8_t rom = nes_prg_mapped(s, addr);
         for (int i = 0; i < s->gg_count; i++) {
             if (s->gg_patches[i].addr == addr &&
@@ -1487,7 +1692,7 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
         return rom;
     }
 
-    return 0;  /* open bus */
+    return s->cpu_bus;  /* open bus: the last value on the data bus */
 }
 
 static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
@@ -1507,6 +1712,7 @@ static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
         }
         nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
         rp2c02_write(&s->ppu, (uint8_t)(addr & 7), val);
+        s->ppu_deadline = 0;   /* NMI enable, rendering... may have changed */
         return;
     }
 
@@ -1523,15 +1729,9 @@ static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
 
     if (addr == 0x4014) {
         VS_DEBUG(s, "write 4014 <- %02X pc=%04X dma\n", val, s->cpu.PC);
-        /* OAM DMA: stall CPU 513 cycles, copy 256 bytes to OAM */
-        nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
-        uint8_t page[256];
-        uint16_t base = (uint16_t)val << 8;
-        for (int i = 0; i < 256; i++)
-            page[i] = nes_cpu_read((uint16_t)(base + i), s);
-        rp2c02_oam_dma(&s->ppu, page);
-        s->cpu.cycle_count += 513;
-        nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+        /* OAM DMA: starts on the CPU's next read (nes_run_dma) */
+        s->oam_page = val;
+        s->oam_dma = s->dma_halt = true;
         return;
     }
 
@@ -1570,7 +1770,10 @@ static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
 
     /* APU registers */
     if ((addr >= 0x4000 && addr <= 0x4013) || addr == 0x4015 || addr == 0x4017) {
+        nes_sync_apu_to_cpu(s, s->cpu.cycle_count - 1);
         apu2a03_write(&s->apu, addr, val);
+        nes_dmc_dma_check(s);
+        s->apu_deadline = 0;   /* the write may bring the next event closer */
         /* $4010/$4017 can clear APU IRQ flags */
         nes_update_irq(s);
         return;
@@ -1990,13 +2193,15 @@ static void nes_reset(NesState *s) {
     if (s->fds_enabled) {
         /* FDS: horizontal mirroring until $4025 says otherwise */
         s->ppu.mirror = RP2C02_MIRROR_HORIZONTAL;
-        s->ppu_synced_cpu_cycle = s->cpu.cycle_count;
+        s->ppu_synced_cpu_cycle = s->apu_synced_cpu_cycle = s->cpu.cycle_count;
+        s->apu_deadline = s->ppu_deadline = 0;
         mos6502_reset(&s->cpu);
         apu2a03_reset(&s->apu);
         return;
     }
     s->ppu.mirror = s->cart.mirror;
-    s->ppu_synced_cpu_cycle = s->cpu.cycle_count;
+    s->ppu_synced_cpu_cycle = s->apu_synced_cpu_cycle = s->cpu.cycle_count;
+    s->apu_deadline = s->ppu_deadline = 0;
 
     /* Mapper bank state must be set before mos6502_reset reads the reset
        vector, otherwise prg_offsets[1] is 0 and the vector is fetched from
@@ -2323,6 +2528,8 @@ NesState *nes_create(const MosConfig *cfg) {
     s->cpu.mem_write       = nes_cpu_write;
     s->cpu.mem_ud          = s;
     mos_cpu_apply(&s->cpu, cfg->cpu);
+    s->cpu.dummy_cycles = true;   /* page-crossing and branch dummy reads hit registers */
+    s->cpu.cycle_polling = true;  /* interrupts polled on each instruction's penultimate cycle */
 
     s->apu.sweep_enabled = true;
     s->apu.dmc_enabled = true;
@@ -2346,6 +2553,7 @@ NesState *nes_create(const MosConfig *cfg) {
     }
     s->apu.sweep_enabled = (cfg->disabled_features & MOS_FEATURE_SWEEP_REGISTERS) == 0;
     s->apu.dmc_enabled = (cfg->disabled_features & MOS_FEATURE_DMC_CHANNEL) == 0;
+    s->apu.dma_external = true;   /* the DMC's fetches are DMAs that halt the CPU */
     s->apu.frame_irq_enabled = (cfg->disabled_features & MOS_FEATURE_FRAME_IRQ) == 0;
 
     s->monitor = gemu_monitor_create();
@@ -2716,6 +2924,7 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
     free(loaded);
     s->pins = pins;
     s->pins_seen = pins.version - 1u;   /* reapply: the hook pointers came from the file */
+    s->apu_deadline = s->ppu_deadline = 0;
     s->clock_seen = 0;
 
     s->cfg     = cfg;
@@ -3107,35 +3316,9 @@ static void nes_step_insn(NesState *s) {
 #ifdef HAVE_LUA
     if (s->lua) nes_lua_notify_exec(s->lua, s->cpu.PC);
 #endif
-    uint64_t prev = s->cpu.cycle_count;
     mos6502_step(&s->cpu);
-    uint64_t delta = s->cpu.cycle_count - prev;
-
-    /* APU + VRC6: one tick per CPU cycle.  The cartridge's chips count
-     * M2, so with that contact open (or no power) they stop. */
-    bool is_vrc6 = s->cart.mapper == 24 || s->cart.mapper == 26;
-    bool m2 = true;
-    if (nes_pins_any(&s->pins) && !s->cfg->is_arcade) {
-        uint64_t open = nes_pins_sample(&s->pins);
-        m2 = !(open & NES_PIN_BIT(NP_M2)) && !nes_pins_dead(open);
-    }
-    for (uint64_t i = 0; i < delta; i++) {
-        if (!m2)
-            s->apu.fds_in = 0.0f;
-        else if (is_vrc6)
-            s->apu.fds_in = vrc6_tick(s);
-        else if (s->apu.audio_dev && s->fds_enabled)
-            s->apu.fds_in = fds_audio_tick(&s->fds);
-        if (s->apu.audio_dev) apu2a03_tick(&s->apu);
-    }
-    if (s->board.ticks && m2)
-        nes_board_tick(s, (unsigned)delta);
-    nes_update_irq(s);
-    /* A slow clock makes a frame's audio outgrow the buffer: send it on. */
-    if (s->apu.audio_dev && s->apu.frame_n > 900)
-        apu2a03_flush(&s->apu);
-
-    nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+    if (s->cpu.cycle_count >= s->ppu_deadline || nes_ppu_eager(s))
+        nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
 }
 
 void nes_run(NesState *s, const MosConfig *cfg) {
@@ -3165,6 +3348,8 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             else if (cmd == GEMU_MON_STEP) {
                 for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
                     nes_step_insn(s);
+                nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);   /* show the monitor the whole state */
+                nes_sync_apu_to_cpu(s, s->cpu.cycle_count);
             }
         }
         if (quit) break;
@@ -3198,6 +3383,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                      s->cpu.nmi ? 1 : 0, s->cpu.irq ? 1 : 0);
 
             /* Flush APU samples to SDL audio */
+            nes_sync_apu_to_cpu(s, s->cpu.cycle_count);
             apu2a03_flush(&s->apu);
 
 #ifdef HAVE_LUA

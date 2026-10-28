@@ -49,6 +49,11 @@ typedef struct {
     bool     silence;
     uint16_t period, timer;
     bool     irq_flag;
+    /* With dma_external, the reader asks the machine for each byte (a DMA
+     * that halts the CPU) instead of reading it itself: */
+    bool     dma_pending;         /* wants a byte: apu2a03_dmc_fill() answers */
+    bool     dma_abort;           /* $4015 disabled the channel: drop a pending DMA */
+    uint8_t  start_delay;         /* $4015 enable: cycles until the first fetch */
 } ApuDmc;
 
 typedef struct Apu2a03 {
@@ -62,11 +67,16 @@ typedef struct Apu2a03 {
     /* Frame counter */
     uint8_t  fc_mode;             /* 0=4-step, 1=5-step */
     bool     fc_irq_inhibit, fc_irq;
-    uint32_t fc_div;
+    uint32_t fc_div;              /* CPU cycles since the sequence began */
     uint8_t  fc_step;
+    uint8_t  fc_write_delay;      /* a $4017 write takes effect 3 or 4 cycles later */
+    uint8_t  fc_new;
+    bool     fc_clear_pending;    /* a $4015 read clears the flag at the next get cycle */
+    bool     dma_external;        /* the machine runs the DMC's DMA (see ApuDmc) */
 
     /* Timing */
-    uint64_t cycle;               /* total CPU cycles elapsed */
+    uint64_t cycle;               /* the CPU cycle last ticked; even = "get", odd = "put".
+                                   * A machine syncing per access sets it (NES) */
     double   clock_pps;            /* cycles per output sample (CPU_HZ / SAMPLE_RATE) */
     bool     apu_clk;             /* toggles each CPU cycle */
 
@@ -101,6 +111,8 @@ typedef struct Apu2a03 {
 } Apu2a03;
 
 bool    apu2a03_init   (Apu2a03 *a, uint32_t cpu_clock_hz);   /* opens SDL audio; returns false on failure */
+/* The DMA the DMC asked for (dmc.dma_pending) delivers its byte. */
+void    apu2a03_dmc_fill(Apu2a03 *a, uint8_t byte);
 void    apu2a03_reset  (Apu2a03 *a);
 void    apu2a03_destroy(Apu2a03 *a);
 
@@ -108,4 +120,10 @@ void    apu2a03_write  (Apu2a03 *a, uint16_t addr, uint8_t val);
 uint8_t apu2a03_read   (Apu2a03 *a, uint16_t addr);
 
 void    apu2a03_tick   (Apu2a03 *a);   /* call once per CPU cycle */
+/* Tick up to and including CPU cycle `to` (a->cycle numbers the last one). */
+void    apu2a03_run    (Apu2a03 *a, uint64_t to);
+/* Cycles until the APU could next change something the CPU sees without
+ * touching a register - the frame IRQ, or the DMC asking for a DMA - so a
+ * machine may leave it unsynced until then.  0 = keep it in step. */
+uint64_t apu2a03_until_event(const Apu2a03 *a);
 void    apu2a03_flush  (Apu2a03 *a);   /* queue frame samples to SDL; call once per frame */
