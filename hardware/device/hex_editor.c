@@ -26,7 +26,7 @@ typedef struct {
     int            hl_byte;      /* currently highlighted byte index */
 } HexEditorTab;
 
-struct HexEditor {
+struct HexEditorGtk {
     GtkWidget     *window;
     GtkWidget     *notebook;
     GtkWidget     *addr_entry;
@@ -343,7 +343,7 @@ static bool hex_tab_byte_at_pos(HexEditorTab *tab, int offset,
     return false;
 }
 
-static HexEditorTab *hex_tab_for_text_view(HexEditor *he, GtkWidget *text_view) {
+static HexEditorTab *hex_tab_for_text_view(HexEditorGtk *he, GtkWidget *text_view) {
     for (int i = 0; i < he->n_tabs; i++) {
         if (he->tabs[i].text_view == text_view)
             return &he->tabs[i];
@@ -351,14 +351,14 @@ static HexEditorTab *hex_tab_for_text_view(HexEditor *he, GtkWidget *text_view) 
     return NULL;
 }
 
-static void hex_sync_cur_tab(HexEditor *he) {
+static void hex_sync_cur_tab(HexEditorGtk *he) {
     int page = gtk_notebook_get_current_page(GTK_NOTEBOOK(he->notebook));
     if (page >= 0 && page < he->n_tabs)
         he->cur_tab = &he->tabs[page];
 }
 
 /* Update the address/value entries to reflect the selected byte. */
-static void hex_update_entries(HexEditor *he, uint32_t addr, uint8_t val) {
+static void hex_update_entries(HexEditorGtk *he, uint32_t addr, uint8_t val) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%04X", addr);
     gtk_entry_set_text(GTK_ENTRY(he->addr_entry), buf);
@@ -367,7 +367,7 @@ static void hex_update_entries(HexEditor *he, uint32_t addr, uint8_t val) {
 }
 
 /* Read current byte value from the active tab's data at the selected address. */
-static uint8_t hex_read_byte(const HexEditor *he) {
+static uint8_t hex_read_byte(const HexEditorGtk *he) {
     if (!he->cur_tab || !he->cur_tab->data) return 0;
     uint32_t off = he->selected_addr - he->cur_tab->base_addr;
     if (off >= he->cur_tab->size) return 0;
@@ -375,7 +375,7 @@ static uint8_t hex_read_byte(const HexEditor *he) {
 }
 
 /* Write a byte to the active tab's data (only if not read-only). */
-static bool hex_write_byte(HexEditor *he, uint32_t addr, uint8_t val) {
+static bool hex_write_byte(HexEditorGtk *he, uint32_t addr, uint8_t val) {
     if (!he->cur_tab || he->cur_tab->read_only || !he->cur_tab->data)
         return false;
     uint32_t off = addr - he->cur_tab->base_addr;
@@ -386,7 +386,7 @@ static bool hex_write_byte(HexEditor *he, uint32_t addr, uint8_t val) {
 }
 
 /* Select a byte: highlight it, update entries. */
-static void hex_select_byte(HexEditor *he, int line, int byte_idx, uint32_t addr) {
+static void hex_select_byte(HexEditorGtk *he, int line, int byte_idx, uint32_t addr) {
     he->selected_addr = addr;
     he->has_selection = true;
     if (he->cur_tab) {
@@ -405,7 +405,7 @@ static void hex_select_byte(HexEditor *he, int line, int byte_idx, uint32_t addr
 
 /* ── Tab switching ───────────────────────────────────────────────────────── */
 
-static void hex_update_cur_tab(HexEditor *he) {
+static void hex_update_cur_tab(HexEditorGtk *he) {
     int page = gtk_notebook_get_current_page(GTK_NOTEBOOK(he->notebook));
     if (page < 0 || page >= he->n_tabs) {
         he->cur_tab = NULL;
@@ -422,7 +422,7 @@ static void hex_update_cur_tab(HexEditor *he) {
 /* ── Callbacks ───────────────────────────────────────────────────────────── */
 
 static gboolean on_text_click(GtkWidget *w, GdkEventButton *ev, gpointer ud) {
-    HexEditor *he = ud;
+    HexEditorGtk *he = ud;
     HexEditorTab *tab = hex_tab_for_text_view(he, w);
     if (!tab || !tab->buf) return FALSE;
     he->cur_tab = tab;
@@ -453,13 +453,13 @@ static gboolean on_text_click(GtkWidget *w, GdkEventButton *ev, gpointer ud) {
 static void on_page_switched(GtkNotebook *nb, GtkWidget *page, guint page_num,
                               gpointer ud) {
     (void)nb; (void)page; (void)page_num;
-    HexEditor *he = ud;
+    HexEditorGtk *he = ud;
     hex_update_cur_tab(he);
 }
 
 static void on_write_clicked(GtkButton *btn, gpointer ud) {
     (void)btn;
-    HexEditor *he = ud;
+    HexEditorGtk *he = ud;
     hex_sync_cur_tab(he);
     if (!he->has_selection || !he->cur_tab || he->cur_tab->read_only) return;
 
@@ -494,7 +494,7 @@ static void on_value_activate(GtkEntry *entry, gpointer ud) {
 }
 
 static void on_goto_activate(GtkEntry *entry, gpointer ud) {
-    HexEditor *he = ud;
+    HexEditorGtk *he = ud;
     hex_sync_cur_tab(he);
     const char *text = gtk_entry_get_text(entry);
     uint32_t addr = (uint32_t)strtoul(text, NULL, 16);
@@ -530,7 +530,7 @@ static void on_goto_activate(GtkEntry *entry, gpointer ud) {
 }
 
 /* Move the selection by `delta` bytes if the result stays in range. */
-static void hex_move_selection(HexEditor *he, int32_t delta, bool scroll) {
+static void hex_move_selection(HexEditorGtk *he, int32_t delta, bool scroll) {
     uint32_t base = he->cur_tab->base_addr;
     uint32_t size = (uint32_t)he->cur_tab->size;
 
@@ -551,7 +551,7 @@ static void hex_move_selection(HexEditor *he, int32_t delta, bool scroll) {
     }
 }
 
-static void hex_move_cursor_digit(HexEditor *he, int32_t delta) {
+static void hex_move_cursor_digit(HexEditorGtk *he, int32_t delta) {
     uint32_t base = he->cur_tab->base_addr;
     int32_t digit = (int32_t)((he->selected_addr - base) * 2u)
                     + he->edit_nibble + delta;
@@ -566,7 +566,7 @@ static void hex_move_cursor_digit(HexEditor *he, int32_t delta) {
     hex_move_selection(he, byte_delta, false);
 }
 
-static void hex_edit_selected_nibble(HexEditor *he, int nibble_val) {
+static void hex_edit_selected_nibble(HexEditorGtk *he, int nibble_val) {
     if (!he->cur_tab || !he->cur_tab->data)
         return;
     if (he->cur_tab->read_only) {
@@ -604,7 +604,7 @@ static void hex_edit_selected_nibble(HexEditor *he, int nibble_val) {
     gtk_label_set_text(GTK_LABEL(he->status_label), status);
 }
 
-static bool hex_key_should_edit(HexEditor *he) {
+static bool hex_key_should_edit(HexEditorGtk *he) {
     if (!he || !he->window || !he->cur_tab || !he->cur_tab->text_view)
         return false;
 
@@ -616,7 +616,7 @@ static bool hex_key_should_edit(HexEditor *he) {
 }
 
 static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer ud) {
-    HexEditor *he = ud;
+    HexEditorGtk *he = ud;
     (void)w;
 
     if (!hex_key_should_edit(he))
@@ -667,14 +667,14 @@ static gboolean on_value_key_press(GtkWidget *w, GdkEventKey *ev, gpointer ud) {
 
 static gboolean on_window_delete(GtkWidget *w, GdkEvent *ev, gpointer ud) {
     (void)w; (void)ev;
-    HexEditor *he = ud;
-    hex_editor_hide(he);
+    HexEditorGtk *he = ud;
+    hex_editor_gtk_hide(he);
     return TRUE;
 }
 
 /* ── Tab setup ───────────────────────────────────────────────────────────── */
 
-static GtkWidget *hex_create_tab_view(HexEditor *he, HexEditorTab *tab) {
+static GtkWidget *hex_create_tab_view(HexEditorGtk *he, HexEditorTab *tab) {
     tab->scrolled = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(tab->scrolled),
         GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
@@ -709,7 +709,7 @@ static GtkWidget *hex_create_tab_view(HexEditor *he, HexEditorTab *tab) {
 
 /* Initialize one tab's data source, build its view, rebuild its contents,
  * and append it to the notebook. */
-static void hex_editor_add_tab(HexEditor *he, const char *label,
+static void hex_editor_add_tab(HexEditorGtk *he, const char *label,
                                 const uint8_t *data, size_t size,
                                 bool read_only, uint32_t base_addr) {
     if (he->n_tabs >= HEX_MAX_TABS) return;
@@ -722,7 +722,7 @@ static void hex_editor_add_tab(HexEditor *he, const char *label,
         .base_addr = base_addr,
     };
     hex_create_tab_view(he, tab);
-    /* Don't populate the buffer here - hex_editor_show() rebuilds all tabs
+    /* Don't populate the buffer here - hex_editor_gtk_show() rebuilds all tabs
      * on first display; building large regions now would queue thousands of
      * GTK repaint events that starve the GL renderer before it's ready. */
     gtk_notebook_append_page(GTK_NOTEBOOK(he->notebook), tab->scrolled,
@@ -731,12 +731,12 @@ static void hex_editor_add_tab(HexEditor *he, const char *label,
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
+HexEditorGtk *hex_editor_gtk_create(const HexRegion *regions, int n_regions) {
     if (!regions || n_regions <= 0 || n_regions > HEX_MAX_TABS) return NULL;
 
     if (!gtk_init_check(NULL, NULL)) return NULL;
 
-    HexEditor *he = calloc(1, sizeof(*he));
+    HexEditorGtk *he = calloc(1, sizeof(*he));
     if (!he) return NULL;
 
     /* ── Window ── */
@@ -823,14 +823,14 @@ HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
     return he;
 }
 
-void hex_editor_destroy(HexEditor *he) {
+void hex_editor_gtk_destroy(HexEditorGtk *he) {
     if (!he) return;
     if (he->window)
         gtk_widget_destroy(he->window);
     free(he);
 }
 
-void hex_editor_show(HexEditor *he) {
+void hex_editor_gtk_show(HexEditorGtk *he) {
     if (!he || he->visible) return;
     he->visible = true;
 
@@ -848,17 +848,17 @@ void hex_editor_show(HexEditor *he) {
     gtk_window_present(GTK_WINDOW(he->window));
 }
 
-void hex_editor_hide(HexEditor *he) {
+void hex_editor_gtk_hide(HexEditorGtk *he) {
     if (!he || !he->visible) return;
     he->visible = false;
     gtk_widget_hide(he->window);
 }
 
-bool hex_editor_is_visible(const HexEditor *he) {
+bool hex_editor_gtk_is_visible(const HexEditorGtk *he) {
     return he && he->visible;
 }
 
-void hex_editor_refresh(HexEditor *he) {
+void hex_editor_gtk_refresh(HexEditorGtk *he) {
     if (!he || !he->visible) return;
 
     /* Throttle: rebuild only every 4th frame (~15 Hz) to keep overhead low

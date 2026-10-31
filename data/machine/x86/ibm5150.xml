@@ -1,8 +1,14 @@
 <?xml version="1.0"?>
 <machine name="ibm5150" family="x86" description="IBM PC 5150 (1981)"
         cpu="8088" vga="cga" ram="64K" status="imperfect">
-    <rom name="BIOS_5150_19OCT81_U33.BIN" region="bios"  addr="0x0000"
+    <rom name="BIOS_IBM5150_16AUG82_5000024_U33.bin" region="bios"  addr="0x0000"
+         sha256="8aa2c24a4d342b77624cba34f4881ffee125e941900c45a186cf1c8af249cd1a"/>
+    <rom name="BIOS_IBM5150_19OCT81_5700671_U33.bin" region="bios"  addr="0x0000"
          sha256="0932d30f91df12761e05bb0229508b4255329990e76264fdc8f1cdc3bf07c0e4"/>
+    <rom name="BIOS_IBM5150_24APR81_5700051_U33.bin" region="bios"  addr="0x0000"
+         sha256="a259306c47b43e14ef6378d7bdeff67331a2519d363bc36b3f354bc91a6874c8"/>
+    <rom name="BIOS_IBM5150_27OCT82_1501476_U33.bin" region="bios"  addr="0x0000"
+         sha256="3700c345f3dcb76039986429ade9ff0cffbc2f0cae535b987b95a5de8aa0094f"/>
     <rom name="ibm-basic-1.00.rom"        region="basic" addr="0x0000"
          sha256="2452b03b4b724b5b81e8cc367809c521144f5fe4e0425caee42ac71240b9b102"/>
 </machine>

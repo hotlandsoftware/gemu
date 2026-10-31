@@ -96,12 +96,11 @@ FAMILY_SRC = {
         'crt/ntsc_decode.c', 'crt/nes_ntsc_encode.c', 'crt/crt_tube.c',
         'hardware/device/fds.c', 'hardware/device/fds_hle.c',
         'hardware/device/vt100.c', 'hardware/romdb.c',
-        # Native Win32 hex editor: the whole file is wrapped in
-        # #if defined(_WIN32) && !defined(GEMU_GTK), so it compiles to an
-        # empty translation unit everywhere else (Linux, or --enable-gtk
-        # on Windows, which still uses the GTK implementation instead).
+        # Hex editors, chosen by display at run time (hex_editor_select.c):
+        # the native Win32 one is empty off Windows, the SDL one on it; the
+        # GTK one is FAMILY_SRC_GTK's.
+        'hardware/device/hex_editor_select.c',
         'hardware/device/hex_editor_win32.c',
-        # SDL hex editor for every other build (empty with GTK or on Win32)
         'hardware/device/hex_editor_sdl.c',
         'hardware/device/nes_cheats.c', 'hardware/device/cheat_dialog_sdl.c',
         'hardware/machine/mos/nes_pins.c', 'hardware/device/nes_pin_panel.c',
@@ -685,7 +684,7 @@ def main():
         ld_parts += ['-lws2_32', '-mconsole']
         if have_winmidi:
             ld_parts += ['-lwinmm']
-        if 'mos' in targets and not want_gtk:
+        if 'mos' in targets:
             # Native Win32 hex editor (hardware/device/hex_editor_win32.c): tab control
             # + SetWindowSubclass need comctl32, and the GDI text/bitmap
             # calls need gdi32 - neither is in MinGW's default link set

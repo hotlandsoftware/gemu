@@ -1396,11 +1396,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         }
     }
 
-#if defined(GEMU_GTK)
-    if (cfg->display_type == GEMU_DISPLAY_GTK) {
-#else
-    if (cfg->display_type == GEMU_DISPLAY_SDL) {     /* Win32 or SDL hex editor */
-#endif
+    {   /* for the display in use (none with -display none or curses) */
         HexRegion kim1_regions[5] = {
             { "RAM ($0000-$03FF)",      s->ram,      sizeof(s->ram),      false, 0x0000u },
             { "RRIOT RAM ($1780-$17FF)",s->rriot_ram,sizeof(s->rriot_ram),false, 0x1780u },
@@ -1417,7 +1413,7 @@ Kim1State *kim1_create(const MosConfig *cfg) {
                 "Expansion RAM ($0400+)", s->ext_ram, hex_sz, false, 0x0400u
             };
         }
-        s->hex_editor = hex_editor_create(kim1_regions, n_regions);
+        s->hex_editor = hex_editor_create(cfg->display_type, kim1_regions, n_regions);
     }
 
     kim1_reset_rriots(s);

@@ -552,18 +552,13 @@ static void a26_cart_status(void *ud, char *buf, size_t len) {
 }
 
 static void make_hex_editor(Atari2600State *s) {
-#if defined(GEMU_GTK)
-    if (s->cfg->display_type != GEMU_DISPLAY_GTK) return;
-#else
-    if (s->cfg->display_type != GEMU_DISPLAY_SDL) return;
-#endif
     if (s->hex_editor) { hex_editor_destroy(s->hex_editor); s->hex_editor = NULL; }
     HexRegion regions[3] = {
         { "RIOT RAM ($80-$FF)", s->riot.ram, sizeof(s->riot.ram), false, 0x80 },
         { "Cartridge ROM", s->cart.rom, s->cart.rom_size, true, 0 },
         { "Cartridge RAM", s->cart.ram, s->cart.ram_size, false, 0 },
     };
-    s->hex_editor = hex_editor_create(regions, s->cart.ram_size ? 3 : 2);
+    s->hex_editor = hex_editor_create(s->cfg->display_type, regions, s->cart.ram_size ? 3 : 2);
 }
 
 /* ── Create / destroy ────────────────────────────────────────────────────── */

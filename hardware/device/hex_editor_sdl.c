@@ -1,6 +1,6 @@
 /*
- * Hex editor drawn with SDL, for builds with neither GTK nor Win32 (the
- * plain Linux SDL build) - see hex_editor.h.  Its own window, in the same
+ * Hex editor drawn with SDL, used with -display sdl everywhere but Windows
+ * (which has a native one) - see hex_editor.h.  Its own window, in the same
  * Windows 3.1 look and IBM 8x16 font as the window menus:
  *
  *   tabs        one per memory region (click, or Tab / Shift+Tab)
@@ -14,7 +14,7 @@
  * Its events are picked out of SDL's queue with an event watch; the display
  * backend leaves events for windows other than its own alone.
  */
-#if !defined(GEMU_GTK) && !defined(_WIN32)
+#if !defined(_WIN32)
 #include "hex_editor.h"
 #include "vgafont16.h"
 #include <SDL2/SDL.h>
@@ -43,7 +43,7 @@
 #define C_HITEXT   0xFFFFFF
 #define C_RO       0x606060
 
-struct HexEditor {
+struct HexEditorSdl {
     HexRegion   tabs[HEX_MAX_TABS];
     char        labels[HEX_MAX_TABS][64];
     int         n_tabs, cur;
@@ -73,7 +73,7 @@ static void fill(SDL_Renderer *r, int x, int y, int w, int h, uint32_t rgb) {
     SDL_RenderFillRect(r, &(SDL_Rect){ x, y, w, h });
 }
 
-static void text(HexEditor *he, int x, int y, const char *s, uint32_t rgb) {
+static void text(HexEditorSdl *he, int x, int y, const char *s, uint32_t rgb) {
     SDL_SetTextureColorMod(he->font, (Uint8)(rgb >> 16), (Uint8)(rgb >> 8), (Uint8)rgb);
     for (; *s; s++, x += GLYPH_W) {
         unsigned ch = (unsigned char)*s;
@@ -82,7 +82,7 @@ static void text(HexEditor *he, int x, int y, const char *s, uint32_t rgb) {
     }
 }
 
-static bool make_font(HexEditor *he) {
+static bool make_font(HexEditorSdl *he) {
     SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, 16 * GLYPH_W, 16 * GLYPH_H, 32,
                                                     SDL_PIXELFORMAT_ARGB8888);
     if (!s) return false;
@@ -100,7 +100,7 @@ static bool make_font(HexEditor *he) {
 }
 
 /* Hex lines that fit between the tabs and the status line. */
-static int view_rows(const HexEditor *he) {
+static int view_rows(const HexEditorSdl *he) {
     int w = 0, h = 0;
     SDL_GetRendererOutputSize(he->ren, &w, &h);
     int rows = (h - TAB_H - STATUS_H - 2 * PAD) / GLYPH_H;
@@ -112,7 +112,7 @@ static size_t region_lines(const HexRegion *r) {
 }
 
 /* Keep the selection on screen. */
-static void scroll_to_sel(HexEditor *he) {
+static void scroll_to_sel(HexEditorSdl *he) {
     const HexRegion *r = &he->tabs[he->cur];
     size_t line = he->sel[he->cur] / LINE_BYTES, rows = (size_t)view_rows(he);
     if (line < he->top[he->cur]) he->top[he->cur] = line;
@@ -121,7 +121,7 @@ static void scroll_to_sel(HexEditor *he) {
     if (he->top[he->cur] + rows > lines) he->top[he->cur] = lines > rows ? lines - rows : 0;
 }
 
-static void draw(HexEditor *he) {
+static void draw(HexEditorSdl *he) {
     SDL_Renderer *r = he->ren;
     int ow = 0, oh = 0;
     SDL_GetRendererOutputSize(r, &ow, &oh);
@@ -201,7 +201,7 @@ static void draw(HexEditor *he) {
 
 /* ── Editing ─────────────────────────────────────────────────────────────── */
 
-static void move_sel(HexEditor *he, long delta) {
+static void move_sel(HexEditorSdl *he, long delta) {
     const HexRegion *reg = &he->tabs[he->cur];
     if (!reg->size) return;
     long s = (long)he->sel[he->cur] + delta;
@@ -212,7 +212,7 @@ static void move_sel(HexEditor *he, long delta) {
     he->message[0] = '\0';
 }
 
-static void type_nibble(HexEditor *he, int v) {
+static void type_nibble(HexEditorSdl *he, int v) {
     HexRegion *reg = &he->tabs[he->cur];
     if (!reg->data || !reg->size) return;
     if (reg->read_only) {
@@ -229,7 +229,7 @@ static void type_nibble(HexEditor *he, int v) {
     }
 }
 
-static void do_goto(HexEditor *he) {
+static void do_goto(HexEditorSdl *he) {
     HexRegion *reg = &he->tabs[he->cur];
     he->goto_open = false;
     if (!he->goto_buf[0]) return;
@@ -251,7 +251,7 @@ static int hex_value(SDL_Keycode k) {
     return -1;
 }
 
-static void on_key(HexEditor *he, const SDL_KeyboardEvent *k) {
+static void on_key(HexEditorSdl *he, const SDL_KeyboardEvent *k) {
     SDL_Keycode key = k->keysym.sym;
     bool ctrl = (k->keysym.mod & KMOD_CTRL) != 0, shift = (k->keysym.mod & KMOD_SHIFT) != 0;
     long rows = view_rows(he);
@@ -268,7 +268,7 @@ static void on_key(HexEditor *he, const SDL_KeyboardEvent *k) {
         return;
     }
     switch (key) {
-    case SDLK_ESCAPE:   hex_editor_hide(he); return;
+    case SDLK_ESCAPE:   hex_editor_sdl_hide(he); return;
     case SDLK_LEFT:     move_sel(he, -1); break;
     case SDLK_RIGHT:    move_sel(he, 1); break;
     case SDLK_UP:       move_sel(he, -LINE_BYTES); break;
@@ -296,7 +296,7 @@ static void on_key(HexEditor *he, const SDL_KeyboardEvent *k) {
     }
 }
 
-static void on_click(HexEditor *he, int x, int y) {
+static void on_click(HexEditorSdl *he, int x, int y) {
     for (int i = 0; i < he->n_tabs; i++) {
         SDL_Rect t = he->tab_rect[i];
         if (x >= t.x && x < t.x + t.w && y >= t.y && y < t.y + t.h) {
@@ -327,7 +327,7 @@ static void on_click(HexEditor *he, int x, int y) {
 
 /* Event watch: this window's events, as SDL queues them. */
 static int SDLCALL hex_event_watch(void *ud, SDL_Event *ev) {
-    HexEditor *he = ud;
+    HexEditorSdl *he = ud;
     Uint32 id = he->win ? SDL_GetWindowID(he->win) : 0, ev_id;
     switch (ev->type) {
     case SDL_WINDOWEVENT:     ev_id = ev->window.windowID; break;
@@ -366,11 +366,11 @@ static int SDLCALL hex_event_watch(void *ud, SDL_Event *ev) {
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
 
-HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
+HexEditorSdl *hex_editor_sdl_create(const HexRegion *regions, int n_regions) {
     if (!regions || n_regions <= 0) return NULL;
     if (n_regions > HEX_MAX_TABS) n_regions = HEX_MAX_TABS;
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) return NULL;
-    HexEditor *he = calloc(1, sizeof(*he));
+    HexEditorSdl *he = calloc(1, sizeof(*he));
     if (!he) { SDL_QuitSubSystem(SDL_INIT_VIDEO); return NULL; }
     for (int i = 0; i < n_regions; i++) {
         he->tabs[i] = regions[i];
@@ -384,7 +384,7 @@ HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
                                SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE);
     he->ren = he->win ? SDL_CreateRenderer(he->win, -1, 0) : NULL;
     if (!he->ren || !make_font(he)) {
-        hex_editor_destroy(he);
+        hex_editor_sdl_destroy(he);
         return NULL;
     }
     SDL_SetWindowMinimumSize(he->win, 40 * GLYPH_W, TAB_H + 4 * GLYPH_H + STATUS_H + 2 * PAD);
@@ -392,7 +392,7 @@ HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
     return he;
 }
 
-void hex_editor_destroy(HexEditor *he) {
+void hex_editor_sdl_destroy(HexEditorSdl *he) {
     if (!he) return;
     SDL_DelEventWatch(hex_event_watch, he);
     if (he->font) SDL_DestroyTexture(he->font);
@@ -402,7 +402,7 @@ void hex_editor_destroy(HexEditor *he) {
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
 }
 
-void hex_editor_show(HexEditor *he) {
+void hex_editor_sdl_show(HexEditorSdl *he) {
     if (!he) return;
     SDL_ShowWindow(he->win);
     if (!he->sized) {   /* create-time sizes can come out shrunk (Wayland scaling) */
@@ -415,23 +415,23 @@ void hex_editor_show(HexEditor *he) {
     he->dirty = true;
 }
 
-void hex_editor_hide(HexEditor *he) {
+void hex_editor_sdl_hide(HexEditorSdl *he) {
     if (!he) return;
     SDL_HideWindow(he->win);
     he->visible = false;
     he->goto_open = false;
 }
 
-bool hex_editor_is_visible(const HexEditor *he) {
+bool hex_editor_sdl_is_visible(const HexEditorSdl *he) {
     return he && he->visible;
 }
 
 /* Called every emulated frame: memory changes under us, so redraw ~30 times
  * a second while shown (and at once after input). */
-void hex_editor_refresh(HexEditor *he) {
+void hex_editor_sdl_refresh(HexEditorSdl *he) {
     if (he && he->close_requested) {
         he->close_requested = false;
-        hex_editor_hide(he);
+        hex_editor_sdl_hide(he);
     }
     if (!he || !he->visible) return;
     Uint32 now = SDL_GetTicks();
@@ -440,4 +440,4 @@ void hex_editor_refresh(HexEditor *he) {
     draw(he);
 }
 
-#endif /* !GEMU_GTK && !_WIN32 */
+#endif /* !_WIN32 */

@@ -13,7 +13,7 @@
  * (Goto / Addr / Value / Write / status) docked to the bottom, hex view
  * fills the remainder.
  */
-#if defined(_WIN32) && !defined(GEMU_GTK)
+#if defined(_WIN32)
 #include "hex_editor.h"
 #include "gemu/gemu_display.h"
 #define WIN32_LEAN_AND_MEAN
@@ -49,7 +49,7 @@ typedef struct {
     int      scroll_line;   /* preserved across tab switches */
 } HexEditorTab;
 
-struct HexEditor {
+struct HexEditorWin32 {
     HWND hwnd, tab_ctrl, view, goto_edit, addr_edit, value_edit, write_btn, status;
     HFONT font;
     int   char_w, char_h;
@@ -99,7 +99,7 @@ static int format_hex_line(char *out, size_t out_sz,
 
 /* ── Small helpers ───────────────────────────────────────────────────────── */
 
-static HexEditorTab *cur_tab(HexEditor *he) {
+static HexEditorTab *cur_tab(HexEditorWin32 *he) {
     return (he->cur_tab >= 0 && he->cur_tab < he->n_tabs)
          ? &he->tabs[he->cur_tab] : NULL;
 }
@@ -109,7 +109,7 @@ static int tab_line_count(const HexEditorTab *tab) {
     return (int)((tab->size + HEX_LINE_BYTES - 1) / HEX_LINE_BYTES);
 }
 
-static void set_status(HexEditor *he, const char *text) {
+static void set_status(HexEditorWin32 *he, const char *text) {
     SetWindowTextA(he->status, text);
 }
 
@@ -127,7 +127,7 @@ static bool write_byte(HexEditorTab *tab, uint32_t addr, uint8_t val) {
     return true;
 }
 
-static void update_entries(HexEditor *he, uint32_t addr, uint8_t val) {
+static void update_entries(HexEditorWin32 *he, uint32_t addr, uint8_t val) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%04X", addr);
     SetWindowTextA(he->addr_edit, buf);
@@ -135,7 +135,7 @@ static void update_entries(HexEditor *he, uint32_t addr, uint8_t val) {
     SetWindowTextA(he->value_edit, buf);
 }
 
-static void scroll_to_line(HexEditor *he, HexEditorTab *tab, int line) {
+static void scroll_to_line(HexEditorWin32 *he, HexEditorTab *tab, int line) {
     RECT rc; GetClientRect(he->view, &rc);
     int visible = he->char_h > 0 ? (rc.bottom / he->char_h) : 1;
     int n_lines = tab_line_count(tab);
@@ -152,7 +152,7 @@ static void scroll_to_line(HexEditor *he, HexEditorTab *tab, int line) {
 }
 
 /* Select a byte: update state, entries, status, enable/disable Write. */
-static void select_byte(HexEditor *he, int line, int byte_idx, uint32_t addr) {
+static void select_byte(HexEditorWin32 *he, int line, int byte_idx, uint32_t addr) {
     he->selected_addr = addr;
     he->has_selection  = true;
     he->sel_line = line;
@@ -169,7 +169,7 @@ static void select_byte(HexEditor *he, int line, int byte_idx, uint32_t addr) {
 }
 
 /* Move selection by delta bytes if the result stays in range. */
-static void move_selection(HexEditor *he, int32_t delta, bool scroll) {
+static void move_selection(HexEditorWin32 *he, int32_t delta, bool scroll) {
     HexEditorTab *tab = cur_tab(he);
     if (!tab) return;
     uint32_t base = tab->base_addr, size = (uint32_t)tab->size;
@@ -184,7 +184,7 @@ static void move_selection(HexEditor *he, int32_t delta, bool scroll) {
     select_byte(he, line, bi, new_addr);
 }
 
-static void move_cursor_digit(HexEditor *he, int32_t delta) {
+static void move_cursor_digit(HexEditorWin32 *he, int32_t delta) {
     HexEditorTab *tab = cur_tab(he);
     if (!tab) return;
     uint32_t base = tab->base_addr;
@@ -198,7 +198,7 @@ static void move_cursor_digit(HexEditor *he, int32_t delta) {
     move_selection(he, byte_delta, false);
 }
 
-static void edit_selected_nibble(HexEditor *he, int nibble_val) {
+static void edit_selected_nibble(HexEditorWin32 *he, int nibble_val) {
     HexEditorTab *tab = cur_tab(he);
     if (!tab || !tab->data) return;
     if (tab->read_only) { set_status(he, "Read-only memory"); return; }
@@ -267,7 +267,7 @@ static void hex_text_out(HDC hdc, int x, int y, const char *s, int n, int char_w
     ExtTextOutA(hdc, x, y, ETO_OPAQUE, NULL, s, (UINT)n, dx);
 }
 
-static void view_paint(HexEditor *he, HDC hdc, RECT client) {
+static void view_paint(HexEditorWin32 *he, HDC hdc, RECT client) {
     HexEditorTab *tab = cur_tab(he);
     HFONT old_font = (HFONT)SelectObject(hdc, he->font);
     SetBkMode(hdc, OPAQUE);
@@ -329,7 +329,7 @@ static void view_paint(HexEditor *he, HDC hdc, RECT client) {
 }
 
 static LRESULT CALLBACK view_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    HexEditor *he = (HexEditor *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    HexEditorWin32 *he = (HexEditorWin32 *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_CREATE:
@@ -449,7 +449,7 @@ static LRESULT CALLBACK view_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
 /* ── Bottom-bar edit subclassing (Enter key + hex-digit filtering) ───────── */
 
-static void on_goto(HexEditor *he) {
+static void on_goto(HexEditorWin32 *he) {
     HexEditorTab *tab = cur_tab(he);
     char text[32];
     GetWindowTextA(he->goto_edit, text, sizeof(text));
@@ -474,7 +474,7 @@ static void on_goto(HexEditor *he) {
     select_byte(he, line, bi, addr);
 }
 
-static void on_write(HexEditor *he) {
+static void on_write(HexEditorWin32 *he) {
     HexEditorTab *tab = cur_tab(he);
     if (!he->has_selection || !tab || tab->read_only) return;
 
@@ -496,7 +496,7 @@ static void on_write(HexEditor *he) {
 static LRESULT CALLBACK goto_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                       UINT_PTR id, DWORD_PTR ref) {
     (void)id;
-    HexEditor *he = (HexEditor *)ref;
+    HexEditorWin32 *he = (HexEditorWin32 *)ref;
     if (msg == WM_CHAR && wp == VK_RETURN) { on_goto(he); return 0; }
     if (msg == WM_GETDLGCODE) return DLGC_WANTALLKEYS;
     return DefSubclassProc(hwnd, msg, wp, lp);
@@ -505,7 +505,7 @@ static LRESULT CALLBACK goto_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
 static LRESULT CALLBACK value_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                        UINT_PTR id, DWORD_PTR ref) {
     (void)id;
-    HexEditor *he = (HexEditor *)ref;
+    HexEditorWin32 *he = (HexEditorWin32 *)ref;
     if (msg == WM_CHAR) {
         if (wp == VK_RETURN) { on_write(he); return 0; }
         int c = (int)wp;
@@ -522,7 +522,7 @@ static LRESULT CALLBACK value_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 
 #define BAR_HEIGHT 28
 
-static void relayout(HexEditor *he) {
+static void relayout(HexEditorWin32 *he) {
     RECT rc; GetClientRect(he->hwnd, &rc);
     int w = rc.right, h = rc.bottom;
     MoveWindow(he->tab_ctrl, 0, 0, w, h - BAR_HEIGHT, TRUE);
@@ -543,7 +543,7 @@ static void relayout(HexEditor *he) {
     MoveWindow(he->status, x, y + 2, (w - x - 4) > 0 ? w - x - 4 : 0, 18, TRUE);
 }
 
-static void switch_to_tab(HexEditor *he, int index) {
+static void switch_to_tab(HexEditorWin32 *he, int index) {
     if (index < 0 || index >= he->n_tabs) return;
     he->cur_tab = index;
     he->has_selection = false;
@@ -564,13 +564,13 @@ static void switch_to_tab(HexEditor *he, int index) {
 }
 
 static LRESULT CALLBACK win_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    HexEditor *he = (HexEditor *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    HexEditorWin32 *he = (HexEditorWin32 *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
     switch (msg) {
     case WM_SIZE:
         if (he) relayout(he);
         return 0;
     case WM_CLOSE:
-        if (he) hex_editor_hide(he);
+        if (he) hex_editor_win32_hide(he);
         return 0;
     case WM_COMMAND:
         if (he && LOWORD(wp) == IDC_WRITE && HIWORD(wp) == BN_CLICKED) {
@@ -594,7 +594,7 @@ static LRESULT CALLBACK win_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
+HexEditorWin32 *hex_editor_win32_create(const HexRegion *regions, int n_regions) {
     if (!regions || n_regions <= 0 || n_regions > HEX_MAX_TABS) return NULL;
 
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_TAB_CLASSES };
@@ -622,7 +622,7 @@ HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
         g_win_class = RegisterClassA(&wc);
     }
 
-    HexEditor *he = calloc(1, sizeof(*he));
+    HexEditorWin32 *he = calloc(1, sizeof(*he));
     if (!he) return NULL;
     he->cur_tab = -1;
 
@@ -714,7 +714,7 @@ HexEditor *hex_editor_create(const HexRegion *regions, int n_regions) {
     return he;
 }
 
-void hex_editor_destroy(HexEditor *he) {
+void hex_editor_win32_destroy(HexEditorWin32 *he) {
     if (!he) return;
     if (he->hwnd) DestroyWindow(he->hwnd);
     if (he->font && he->font != (HFONT)GetStockObject(SYSTEM_FIXED_FONT))
@@ -722,24 +722,24 @@ void hex_editor_destroy(HexEditor *he) {
     free(he);
 }
 
-void hex_editor_show(HexEditor *he) {
+void hex_editor_win32_show(HexEditorWin32 *he) {
     if (!he || he->visible) return;
     he->visible = true;
     ShowWindow(he->hwnd, SW_SHOW);
     SetForegroundWindow(he->hwnd);
 }
 
-void hex_editor_hide(HexEditor *he) {
+void hex_editor_win32_hide(HexEditorWin32 *he) {
     if (!he || !he->visible) return;
     he->visible = false;
     ShowWindow(he->hwnd, SW_HIDE);
 }
 
-bool hex_editor_is_visible(const HexEditor *he) {
+bool hex_editor_win32_is_visible(const HexEditorWin32 *he) {
     return he && he->visible;
 }
 
-void hex_editor_refresh(HexEditor *he) {
+void hex_editor_win32_refresh(HexEditorWin32 *he) {
     if (!he || !he->visible) return;
 
     /* Throttle to ~15 Hz, matching the GTK implementation. */
@@ -748,7 +748,7 @@ void hex_editor_refresh(HexEditor *he) {
 
     InvalidateRect(he->view, NULL, FALSE);
 
-    /* Pump this window's message queue here: hex_editor_refresh() is called
+    /* Pump this window's message queue here: hex_editor_win32_refresh() is called
      * from each machine's own run loop, which never dispatches messages for
      * any window besides the main display. */
     MSG msg;
@@ -758,4 +758,4 @@ void hex_editor_refresh(HexEditor *he) {
     }
 }
 
-#endif /* _WIN32 && !GEMU_GTK */
+#endif /* _WIN32 */
