@@ -5,6 +5,7 @@
 #include "i8253.h"
 #include "i8255.h"
 #include "upd765.h"
+#include "ibm_hdc.h"
 #include "cga.h"
 #include "mda.h"
 #include "pcspk.h"
@@ -17,6 +18,8 @@
 #define IBM5150_RAM_MAX   0xA0000u /* 640K conventional RAM ceiling */
 #define IBM5150_BIOS_SIZE 0x2000u  /* 8K, mapped at 0xFE000-0xFFFFF */
 #define IBM5150_BASIC_SIZE 0x8000u /* 32K Cassette BASIC, 0xF6000-0xFDFFF */
+#define IBM5150_HDC_ROM_BASE 0xC8000u /* fixed disk adapter BIOS */
+#define IBM5150_HDC_ROM_MAX  0x2000u
 #define IBM5150_CPU_HZ    4772727u /* 14.31818 MHz / 3 */
 
 /* Distinct "first unhandled access to this port" log entries, mirroring
@@ -50,6 +53,10 @@ typedef struct Ibm5150State {
     int       fb_w, fb_h; /* the shown card's framebuffer size */
     Upd765    fdc;        /* diskette adapter, present when -drive if=floppy is */
     bool      has_fdc;
+    IbmHdc    hdc;        /* fixed disk adapter, -device ibm-fixed-disk */
+    bool      has_hdc;
+    uint8_t   hdc_rom[IBM5150_HDC_ROM_MAX];
+    uint32_t  hdc_rom_size;
     uint8_t   nmi_mask;  /* port 0xA0 */
 
     Ibm5150IoLogEnt iolog[IBM5150_IOLOG_N];

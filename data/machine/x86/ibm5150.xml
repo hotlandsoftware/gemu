@@ -11,4 +11,9 @@
          sha256="3700c345f3dcb76039986429ade9ff0cffbc2f0cae535b987b95a5de8aa0094f"/>
     <rom name="ibm-basic-1.00.rom"        region="basic" addr="0x0000"
          sha256="2452b03b4b724b5b81e8cc367809c521144f5fe4e0425caee42ac71240b9b102"/>
+    <!-- IBM Fixed Disk Adapter BIOS (-device ibm-fixed-disk), at C8000h -->
+    <rom name="5000059_reduced_for_2732_or_27C32.bin" region="fixed-disk-5000059" addr="0x0000"
+         sha256="309c51a1bc41348bebc581e209d6e28a0b3327f6ad2cef6b5ba7cfd21e39fbc3"/>
+    <rom name="59X7291_reduced_for_2732_or_27C32.bin" region="fixed-disk-59x7291" addr="0x0000"
+         sha256="067a7fd9315aed963bb6b5641c2530fb651bd25c3bbe14762295dd1795c5dfd8"/>
 </machine>

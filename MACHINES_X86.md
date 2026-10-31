@@ -11,7 +11,7 @@
 
 | Name | Full name | Status | Notes |
 |------|-----------|--------|-------|
-| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA or MDA (`-vga mda`), or both on two monitors (`-device`), keyboard, speaker, floppy drives. No cassette, printer, serial yet |
+| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA or MDA (`-vga mda`), or both on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`). No cassette, printer, serial yet |
 
 ## IBM 5150 hardware
 
@@ -19,11 +19,12 @@
 |------|--------|
 | 8253 PIT | all six modes, gates, latching; IRQ0, DRAM refresh and speaker wired up |
 | 8259 PIC | edge/level triggering, masking, EOI, auto-EOI, IRR/ISR/poll reads |
-| 8237 DMA | registers and page registers; channel 0 refresh cycles |
+| 8237 DMA | registers and page registers; channel 0 refresh cycles; channels 2 (diskette) and 3 (fixed disk) |
 | 8255 PPI | 5150 wiring: SW1/SW2 DIP switches, keyboard handshake and reset, speaker |
 | CGA | 40/80-column text, 320x200 4-color, 640x200 2-color; retrace timing |
 | MDA | 80x25 monochrome text in 9x14 cells (720x350, 4:3); monitor phosphor `-vga mda,phosphor=green|amber|white` (default green, the IBM 5151); underline/intense/reverse/blink attributes; 50 Hz timing |
 | uPD765 FDC | diskette adapter with up to 4 drives via `-drive if=floppy` / `-fda` (see docs/drive.md); DMA channel 2, IRQ6 |
+| Fixed disk adapter | IBM's Xebec card: two drives via `-hda` / `-hdb`, ports 320h-323h, ROM at C8000h, DMA channel 3, IRQ5; the adapter's command set, drive timing (below) |
 
 The DIP switches follow `-m` (64K default). The 19OCT81 BIOS can use up to
 544K, but POST's memory test then takes about 50 seconds; Cassette BASIC
@@ -47,6 +48,42 @@ Ctrl+Alt+1 / Ctrl+Alt+2 as in QEMU.  **View → Detach ... to new window** puts
 the current monitor in a window of its own, so both are on screen at once;
 close that window (or View → Close ... window) to bring it back.  DOS's `MODE MONO` / `MODE CO80` move the
 console between them.
+
+## Hard disks
+
+The 5150's own BIOS has no hard disk support: from the 10/27/82 revision it
+runs adapter ROMs, and the IBM Fixed Disk Adapter's ROM adds the disk to
+INT 13h and boots from it.  `-device ibm-fixed-disk` fits the card, `-hda`
+and `-hdb` are its two drives, and `-rom roms/ibm5150` finds its ROM:
+5000059 (the original, preferred) or 59X7291 (1985); `romfile=FILE` picks
+one.  The older BIOSes never run the ROM, and GEMU warns about them.
+
+The card's jumpers choose each drive's type from a table of four in the
+ROM, and GEMU sets them from the image's size (17 sectors of 512 bytes per
+track):
+
+| ROM | Type 0 | Type 1 | Type 2 | Type 3 |
+|-----|--------|--------|--------|--------|
+| 5000059 | 153x4, 5,326,848 bytes | 375x8, 26,112,000 | 306x6, 15,980,544 | 306x4, 10,653,696 |
+| 59X7291 | 306x4, 10,653,696 | 612x4, 21,307,392 | 615x4, 21,411,840 | 306x8, 21,307,392 |
+
+`type0=N` / `type1=N` pick between two types of the same size.  To set up
+a new disk, make an empty image of one of these sizes, then boot DOS from a
+diskette and run FDISK and `FORMAT C: /S`:
+
+```
+truncate -s 10653696 hd.img
+./bin/gemu -M ibm5150 -rom roms/ibm5150 -m 640K -device ibm-fixed-disk \
+    -hda hd.img -fda dos330/DISK01.IMG
+```
+
+Once it's formatted, leave out `-fda` and the PC boots from the hard disk.
+The drives run at real speed: 3600 rpm, with sectors where the interleave put
+them (`interleave=N`, default 6 as IBM formatted these drives; a low-level
+format sets it), and seeks of 3 ms plus 0.66 ms a cylinder, as the ST-412's
+are.  FORMAT's surface check of a 10 MB disk takes about three minutes, as
+it did on an XT.  On a cold boot the ROM sets the BIOS clock ahead by about
+23 s while it waits for a second drive, so DOS's time starts there.
 
 ## CPU test suite
 

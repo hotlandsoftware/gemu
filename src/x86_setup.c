@@ -61,7 +61,14 @@ static const GemuArgsDef def = {
         "\nDiskettes: -fda/-fdb FILE or -drive file=FILE,if=floppy[,index=N]\n"
         "                  (160K/180K/320K/360K images; up to 4 drives).\n"
         "                  With a drive in A: POST boots from it, otherwise\n"
-        "                  into Cassette BASIC.  The 5150 has no IDE.\n"
+        "                  into Cassette BASIC.\n"
+        "\nHard disks: -device ibm-fixed-disk -hda FILE [-hdb FILE]\n"
+        "                  The IBM Fixed Disk Adapter (needs the 10/27/82 BIOS and\n"
+        "                  the adapter ROM, found by -rom roms/ibm5150).  Each\n"
+        "                  image's size picks its drive type from the ROM's table\n"
+        "                  (5000059: 5, 10, 15 or 26 MB); type0=/type1=N choose\n"
+        "                  one, romfile=FILE another ROM, interleave=N (default 6)\n"
+        "                  how unformatted images are laid out.\n"
         "\nVideo: -vga cga (default) or -vga mda[,phosphor=green|amber|white]\n"
         "                  (the MDA's monitor: IBM 5151 green, amber or white).\n"
         "                  Add the other card with -device mda[,phosphor=...] or\n"
@@ -172,11 +179,20 @@ int x86_setup(int argc, char *argv[]) {
             const char *dev = rem[++i];
             const char *comma = strchr(dev, ',');
             size_t len = comma ? (size_t)(comma - dev) : strlen(dev);
+            if (len == 14 && strncmp(dev, "ibm-fixed-disk", 14) == 0) {
+                if (cfg.hdc != X86_HDC_NONE) {
+                    fprintf(stderr, "gemu: -device ibm-fixed-disk: only one hard disk controller fits\n");
+                    return 1;
+                }
+                cfg.hdc = X86_HDC_IBM;
+                cfg.hdc_opts = comma ? comma + 1 : NULL;
+                continue;
+            }
             X86VgaType type;
             if (len == 3 && strncmp(dev, "mda", 3) == 0)      type = X86_VGA_MDA;
             else if (len == 3 && strncmp(dev, "cga", 3) == 0) type = X86_VGA_CGA;
             else {
-                fprintf(stderr, "gemu: unknown x86 device '%.*s' (ibm5150: -device mda or -device cga)\n",
+                fprintf(stderr, "gemu: unknown x86 device '%.*s' (use -device ? to list)\n",
                         (int)len, dev);
                 return 1;
             }

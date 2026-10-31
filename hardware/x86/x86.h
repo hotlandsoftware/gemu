@@ -14,7 +14,12 @@ typedef enum {
     X86_VGA_MDA,
 } X86VgaType;
 
-#define X86_MAX_ROM_LOADS 4
+#define X86_MAX_ROM_LOADS 8
+
+typedef enum {
+    X86_HDC_NONE,
+    X86_HDC_IBM,        /* -device ibm-fixed-disk: IBM Fixed Disk Adapter */
+} X86HdcType;
 
 typedef struct {
     const char *path;
@@ -31,6 +36,8 @@ typedef struct X86Config {
     bool            has_vga2;   /* a second card from -device (the other of CGA/MDA) */
     X86VgaType      vga2;
     const char     *vga2_opts;
+    X86HdcType      hdc;        /* hard disk controller (-device) */
+    const char     *hdc_opts;   /* its options (romfile=, interleave=) */
     uint32_t        ram_size; /* bytes */
     GemuDisplayType display_type;
     int             display_scale;

@@ -3,6 +3,7 @@
 #include "mdafont8x14.h"
 #include "gemu/util.h"
 #include "gemu/screendump.h"
+#include "gemu/sha256.h"
 #include <ctype.h>
 #include <SDL2/SDL.h>
 #include <stdio.h>
@@ -121,6 +122,8 @@ static uint8_t bus_read8(uint32_t addr, void *ud) {
         return s->basic[addr - IBM5150_BASIC_BASE];
     if (addr >= IBM5150_BIOS_BASE && addr < IBM5150_BIOS_BASE + IBM5150_BIOS_SIZE)
         return s->bios[addr - IBM5150_BIOS_BASE];
+    if (s->has_hdc && addr >= IBM5150_HDC_ROM_BASE && addr < IBM5150_HDC_ROM_BASE + s->hdc_rom_size)
+        return s->hdc_rom[addr - IBM5150_HDC_ROM_BASE];
     return 0xFF;
 }
 static void bus_write8(uint32_t addr, uint8_t val, void *ud) {
@@ -144,6 +147,10 @@ static bool ibm5150_mon_read(void *ud, uint64_t addr, uint8_t *val) {
     }
     if (addr >= IBM5150_BIOS_BASE && addr < IBM5150_BIOS_BASE + IBM5150_BIOS_SIZE) {
         *val = s->bios[addr - IBM5150_BIOS_BASE];
+        return true;
+    }
+    if (s->has_hdc && addr >= IBM5150_HDC_ROM_BASE && addr < IBM5150_HDC_ROM_BASE + s->hdc_rom_size) {
+        *val = s->hdc_rom[addr - IBM5150_HDC_ROM_BASE];
         return true;
     }
     return false;
@@ -243,6 +250,8 @@ static void kb_port_b_changed(Ibm5150State *s, uint8_t old, uint8_t val) {
  * so accesses are expected and not worth logging; the bus floats high. */
 static bool empty_slot(uint16_t port) {
     return (port >= 0x200 && port <= 0x20F) ||   /* game port */
+           (port >= 0x210 && port <= 0x217) ||   /* 5161 expansion unit */
+           (port >= 0x320 && port <= 0x32F) ||   /* fixed disk adapters (when absent) */
            (port >= 0x278 && port <= 0x27F) ||   /* LPT2 */
            (port >= 0x2F8 && port <= 0x2FF) ||   /* COM2 */
            (port >= 0x378 && port <= 0x37F) ||   /* LPT1 */
@@ -263,6 +272,7 @@ static uint8_t io_read8(uint16_t port, void *ud) {
     if (mda_port(s, port)) return mda_io_read(&s->mda, port);
     if (cga_port(s, port)) return cga_io_read(&s->cga, port);
     if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) return upd765_read(&s->fdc, port);
+    if (s->has_hdc && port >= 0x320 && port <= 0x323) return ibm_hdc_read(&s->hdc, port - 0x320);
     if (empty_slot(port)) return 0xFF;
     iolog(s, port, false, 0);
     return 0xFF;
@@ -292,6 +302,7 @@ static void io_write8(uint16_t port, uint8_t val, void *ud) {
     if (mda_port(s, port)) { mda_io_write(&s->mda, port, val); return; }
     if (cga_port(s, port)) { cga_io_write(&s->cga, port, val); return; }
     if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) { upd765_write(&s->fdc, port, val); return; }
+    if (s->has_hdc && port >= 0x320 && port <= 0x323) { ibm_hdc_write(&s->hdc, port - 0x320, val); return; }
     if (empty_slot(port)) return;
     iolog(s, port, true, val);
 }
@@ -315,6 +326,29 @@ static bool fdc_dma_to_mem(void *ud, uint8_t val, bool *tc) {
     Ibm5150State *s = ud;
     uint32_t phys;
     if (!i8237_transfer(&s->dma, 2, &phys, tc)) return false;
+    bus_write8(phys, val, s);
+    return true;
+}
+
+/* ── Fixed disk adapter wiring: IRQ5, DMA channel 3 ──────────────────────── */
+
+static void hdc_set_irq(void *ud, bool level) {
+    Ibm5150State *s = ud;
+    i8259_set_irq(&s->pic, 5, level);
+}
+
+static bool hdc_dma_from_mem(void *ud, uint8_t *val, bool *tc) {
+    Ibm5150State *s = ud;
+    uint32_t phys;
+    if (!i8237_transfer(&s->dma, 3, &phys, tc)) return false;
+    *val = bus_read8(phys, s);
+    return true;
+}
+
+static bool hdc_dma_to_mem(void *ud, uint8_t val, bool *tc) {
+    Ibm5150State *s = ud;
+    uint32_t phys;
+    if (!i8237_transfer(&s->dma, 3, &phys, tc)) return false;
     bus_write8(phys, val, s);
     return true;
 }
@@ -367,6 +401,7 @@ static bool advance(Ibm5150State *s, unsigned clocks) {
     }
     kb_service(s);
     if (s->has_fdc) upd765_tick(&s->fdc, clocks);
+    if (s->has_hdc) ibm_hdc_tick(&s->hdc, clocks);
     return video_tick(s, clocks);
 }
 
@@ -557,6 +592,133 @@ static void attach_floppies(Ibm5150State *s) {
     s->ppi.sw1 = (uint8_t)(s->ppi.sw1 | 0x01 | ((count - 1) << 6));
 }
 
+/* BIOSes from before 10/27/82 don't look for adapter ROMs, so the fixed
+ * disk adapter's never runs under them. */
+static void warn_old_bios(const Ibm5150State *s) {
+    static const char *const no_rom_scan[] = {
+        "a259306c47b43e14ef6378d7bdeff67331a2519d363bc36b3f354bc91a6874c8",  /* 24APR81 */
+        "0932d30f91df12761e05bb0229508b4255329990e76264fdc8f1cdc3bf07c0e4",  /* 19OCT81 */
+        "8aa2c24a4d342b77624cba34f4881ffee125e941900c45a186cf1c8af249cd1a",  /* 16AUG82 */
+    };
+    GemuSha256Ctx ctx;
+    uint8_t digest[GEMU_SHA256_DIGEST_LEN];
+    char hex[65];
+    gemu_sha256_init(&ctx);
+    gemu_sha256_update(&ctx, s->bios, IBM5150_BIOS_SIZE);
+    gemu_sha256_final(&ctx, digest);
+    gemu_sha256_hex(digest, hex);
+    for (size_t i = 0; i < sizeof(no_rom_scan) / sizeof(no_rom_scan[0]); i++)
+        if (strcmp(hex, no_rom_scan[i]) == 0)
+            fprintf(stderr, "gemu: warning: this BIOS predates adapter ROM support, so the fixed "
+                            "disk adapter's ROM won't run (it needs the 10/27/82 BIOS)\n");
+}
+
+/* The adapter's ROM holds the drive types its jumpers choose between: a
+ * table of 16-byte entries (cylinders, heads, ...) that it points INT 41h
+ * at with MOV WORD [0104h], table.  Returns the table's offset, or -1. */
+static int hdc_drive_table(const Ibm5150State *s) {
+    for (uint32_t i = 0; i + 6 <= s->hdc_rom_size; i++) {
+        const uint8_t *p = &s->hdc_rom[i];
+        if (p[0] == 0xC7 && p[1] == 0x06 && p[2] == 0x04 && p[3] == 0x01) {
+            uint32_t t = p[4] | (uint32_t)p[5] << 8;
+            if (t + 4 * 16 <= s->hdc_rom_size) return (int)t;
+        }
+    }
+    return -1;
+}
+
+static uint64_t hdc_type_bytes(const uint8_t *e) {
+    return (uint64_t)(e[0] | e[1] << 8) * e[2] * IBM_HDC_SPT * IBM_HDC_SECTOR;
+}
+
+/* -device ibm-fixed-disk[,romfile=FILE][,interleave=N]: the card, its ROM
+ * (romfile=, or the one the ROM scan found: 5000059 before 59X7291) and
+ * the drives from -hda/-hdb, each one's type jumpered to the table entry
+ * its image is the size of. */
+static bool attach_fixed_disk(Ibm5150State *s, const X86Config *cfg, const char *scanned_rom) {
+    const char *romfile = scanned_rom;
+    unsigned interleave = 6;   /* how IBM formatted these drives */
+    int want_type[2] = { -1, -1 };
+    char opts[512];
+    snprintf(opts, sizeof(opts), "%s", cfg->hdc_opts ? cfg->hdc_opts : "");
+    for (char *o = strtok(opts, ","); o; o = strtok(NULL, ",")) {
+        if (strncmp(o, "romfile=", 8) == 0) romfile = o + 8;
+        else if ((strncmp(o, "type0=", 6) == 0 || strncmp(o, "type1=", 6) == 0) &&
+                 o[6] >= '0' && o[6] <= '3' && !o[7]) {
+            want_type[o[4] - '0'] = o[6] - '0';
+        } else if (strncmp(o, "interleave=", 11) == 0) {
+            interleave = (unsigned)atoi(o + 11);
+            if (interleave < 1 || interleave >= IBM_HDC_SPT) {
+                fprintf(stderr, "gemu: ibm-fixed-disk: interleave must be 1-16\n");
+                return false;
+            }
+        } else {
+            fprintf(stderr, "gemu: ibm-fixed-disk: unknown option '%s' "
+                            "(romfile=, type0=0-3, type1=0-3, interleave=)\n", o);
+            return false;
+        }
+    }
+    if (!romfile) {
+        fprintf(stderr, "gemu: ibm-fixed-disk needs its BIOS ROM (5000059 or 59X7291): "
+                        "-rom roms/ibm5150 to scan, or romfile=FILE\n");
+        return false;
+    }
+    FILE *f = fopen(romfile, "rb");
+    if (!f) { fprintf(stderr, "gemu: ibm-fixed-disk: cannot open '%s'\n", romfile); return false; }
+    s->hdc_rom_size = (uint32_t)fread(s->hdc_rom, 1, IBM5150_HDC_ROM_MAX, f);
+    fclose(f);
+    int table = hdc_drive_table(s);
+    if (s->hdc_rom_size < 3 || s->hdc_rom[0] != 0x55 || s->hdc_rom[1] != 0xAA || table < 0) {
+        fprintf(stderr, "gemu: ibm-fixed-disk: '%s' isn't a fixed disk adapter ROM\n", romfile);
+        return false;
+    }
+
+    IbmHdc *h = &s->hdc;
+    for (int u = 0; u < 2; u++) {
+        GemuDrive *d = gemu_drive_get(GEMU_DRIVE_IF_IDE, 0, u);
+        if (!d) continue;
+        if (gemu_drive_media(d) != GEMU_DRIVE_MEDIA_DISK) {
+            fprintf(stderr, "gemu: ibm-fixed-disk: %s is a CD-ROM; the adapter takes hard disks\n",
+                    gemu_drive_name(d));
+            return false;
+        }
+        uint64_t size = gemu_drive_size(d);
+        /* the first type the size fits, unless typeN= picked one (59X7291's
+         * 612x4 and 306x8 drives are the same size) */
+        int type = -1;
+        for (int t = 0; t < 4 && type < 0; t++)
+            if (hdc_type_bytes(&s->hdc_rom[table + 16 * t]) == size &&
+                (want_type[u] < 0 || want_type[u] == t)) type = t;
+        if (type < 0) {
+            fprintf(stderr, "gemu: ibm-fixed-disk: %s is %llu bytes, which isn't %s.  "
+                            "The ROM's drive types (17 sectors of 512 bytes per track):\n",
+                    gemu_drive_name(d), (unsigned long long)size,
+                    want_type[u] < 0 ? "a drive this ROM knows" : "the drive type chosen");
+            for (int t = 0; t < 4; t++) {
+                const uint8_t *e = &s->hdc_rom[table + 16 * t];
+                fprintf(stderr, "  type %d: %4u cylinders, %u heads: %llu bytes\n", t,
+                        (unsigned)(e[0] | e[1] << 8), e[2], (unsigned long long)hdc_type_bytes(e));
+            }
+            fprintf(stderr, "Create an empty one with e.g. truncate -s %llu hd.img\n",
+                    (unsigned long long)hdc_type_bytes(&s->hdc_rom[table + 16 * 0]));
+            return false;
+        }
+        const uint8_t *e = &s->hdc_rom[table + 16 * type];
+        h->drive[u] = d;
+        h->geom[u] = (IbmHdcGeometry){ (uint16_t)(e[0] | e[1] << 8), e[2] };
+        h->interleave[u] = (uint8_t)interleave;
+        h->jumpers |= (uint8_t)(type << (u == 0 ? 2 : 0));
+    }
+    h->clock_hz = IBM5150_CPU_HZ;
+    h->set_irq = hdc_set_irq;
+    h->dma_to_mem = hdc_dma_to_mem;
+    h->dma_from_mem = hdc_dma_from_mem;
+    h->ud = s;
+    s->has_hdc = true;
+    warn_old_bios(s);
+    return true;
+}
+
 static void ibm5150_reset(Ibm5150State *s) {
     x86_reset(&s->cpu);
     i8237_reset(&s->dma);
@@ -566,6 +728,7 @@ static void ibm5150_reset(Ibm5150State *s) {
     cga_reset(&s->cga);
     mda_reset(&s->mda);
     if (s->has_fdc) { s->fdc.dor = 0; upd765_reset(&s->fdc); }
+    if (s->has_hdc) ibm_hdc_reset(&s->hdc);
     /* The PIT's outputs start high without a change callback; the PPI's
      * copy of timer 2 must match or POST's cassette test misses an edge. */
     s->ppi.timer2_out = i8253_out(&s->pit, 2);
@@ -607,8 +770,14 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     if (!s->ram) { free(s); return NULL; }
 
     bool have_bios = false;
+    const char *hdc_rom = NULL;
     for (int i = 0; i < cfg->n_roms; i++) {
         const X86RomLoad *r = &cfg->roms[i];
+        if (r->region && strncmp(r->region, "fixed-disk-", 11) == 0) {
+            /* the first adapter (5000059) wins over its successor */
+            if (!hdc_rom || strcmp(r->region, "fixed-disk-5000059") == 0) hdc_rom = r->path;
+            continue;
+        }
         FILE *f = fopen(r->path, "rb");
         if (!f) { fprintf(stderr, "gemu: cannot open '%s'\n", r->path); continue; }
         if (r->region && strcmp(r->region, "basic") == 0) {
@@ -652,6 +821,21 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     attach_floppies(s);
     for (int u = 0; u < 4; u++)
         if (s->fdc.drive[u]) gemu_drive_attach_monitor(s->fdc.drive[u], s->monitor);
+    if (cfg->hdc == X86_HDC_NONE &&
+        (gemu_drive_get(GEMU_DRIVE_IF_IDE, 0, 0) || gemu_drive_get(GEMU_DRIVE_IF_IDE, 0, 1))) {
+        fprintf(stderr, "gemu: the 5150 needs a hard disk adapter for -hda/-hdb: "
+                        "add -device ibm-fixed-disk\n");
+        gemu_monitor_destroy(s->monitor);
+        free(s->fb); free(s->ram); free(s);
+        return NULL;
+    }
+    if (cfg->hdc == X86_HDC_IBM && !attach_fixed_disk(s, cfg, hdc_rom)) {
+        gemu_monitor_destroy(s->monitor);
+        free(s->fb); free(s->ram); free(s);
+        return NULL;
+    }
+    for (int u = 0; u < 2; u++)
+        if (s->hdc.drive[u]) gemu_drive_attach_monitor(s->hdc.drive[u], s->monitor);
 
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
@@ -712,6 +896,15 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
             printf("  %s: %s\n", gemu_drive_name(s->fdc.drive[u]),
                    gemu_drive_inserted(s->fdc.drive[u]) ? gemu_drive_filename(s->fdc.drive[u])
                                                         : "(empty)");
+    if (s->has_hdc) {
+        printf("  Fixed disk adapter: IBM, ROM at C8000h, IRQ 5, DMA 3\n");
+        for (int u = 0; u < 2; u++)
+            if (s->hdc.drive[u])
+                printf("  %s: %s (%u cylinders, %u heads, drive type %u)\n",
+                       gemu_drive_name(s->hdc.drive[u]), gemu_drive_filename(s->hdc.drive[u]),
+                       s->hdc.geom[u].cyls, s->hdc.geom[u].heads,
+                       (s->hdc.jumpers >> (u == 0 ? 2 : 0)) & 3u);
+    }
 
     gemu_monitor_start(s->monitor);
 
