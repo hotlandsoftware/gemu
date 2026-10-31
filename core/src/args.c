@@ -41,6 +41,7 @@ static void print_usage(const GemuArgsDef *def) {
     if (def->n_vgas > 0)
         printf("  %-14s Video chip        (use -vga ? to list)\n", "-vga TYPE");
     printf("  %-14s Display backend   (use -display ? to list)\n", "-display TYPE");
+    printf("  %-14s   sdl and gtk: show-menubar=on|off (default on)\n", "  [,OPTION...]");
     printf("  %-14s Window scale factor\n", "-scale N");
     printf("  %-14s VNC server, QEMU syntax (use -vnc ? for details)\n", "-vnc ADDR");
     if (def->block_devices) {
@@ -515,9 +516,13 @@ bool gemu_args_parse(int argc, char **argv,
                 list_displays(def->display_mask);
                 exit(0);
             }
+            /* TYPE[,OPTION...], as QEMU's -display */
+            const char *opts = strchr(v, ',');
+            size_t name_len = opts ? (size_t)(opts - v) : strlen(v);
             bool found = false;
             for (int d = 0; d < N_DISPLAYS; d++) {
-                if (strcmp(display_table[d].name, v) == 0) {
+                if (strlen(display_table[d].name) == name_len &&
+                    strncmp(display_table[d].name, v, name_len) == 0) {
                     out->display_type     = display_table[d].type;
                     out->display_explicit = true;
                     found = true;
@@ -525,9 +530,26 @@ bool gemu_args_parse(int argc, char **argv,
                 }
             }
             if (!found) {
-                fprintf(stderr, "%s: unknown display '%s' (try -display ?)\n",
-                        def->prog, v);
+                fprintf(stderr, "%s: unknown display '%.*s' (try -display ?)\n",
+                        def->prog, (int)name_len, v);
                 return false;
+            }
+            while (opts) {
+                const char *opt = opts + 1;
+                opts = strchr(opt, ',');
+                size_t len = opts ? (size_t)(opts - opt) : strlen(opt);
+                bool menubar_display = out->display_type == GEMU_DISPLAY_SDL ||
+                                       out->display_type == GEMU_DISPLAY_GTK;
+                if (menubar_display && len == 16 && strncmp(opt, "show-menubar=off", 16) == 0) {
+                    gemu_display_set_show_menubar(false);
+                } else if (menubar_display && len == 15 && strncmp(opt, "show-menubar=on", 15) == 0) {
+                    gemu_display_set_show_menubar(true);
+                } else {
+                    fprintf(stderr, "%s: -display %.*s: unknown option '%.*s'%s\n", def->prog,
+                            (int)name_len, v, (int)len, opt,
+                            menubar_display ? " (supported: show-menubar=on|off)" : "");
+                    return false;
+                }
             }
             continue;
         }

@@ -180,6 +180,12 @@ bool gemu_display_detach_head(GemuDisplay *d, int head);
  */
 void gemu_set_vm_name(const char *name);
 const char *gemu_vm_name(void);   /* NULL when -name wasn't given */
+
+/* -display sdl|gtk,show-menubar=off (as QEMU's GTK display): the window has
+ * no menu bar.  Its functions stay reachable through the monitor and the
+ * keyboard shortcuts. */
+void gemu_display_set_show_menubar(bool show);
+bool gemu_display_show_menubar(void);
 void gemu_window_title(char *buf, size_t len, const char *role, bool paused);
 
 /*

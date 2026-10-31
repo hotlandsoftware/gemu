@@ -1,0 +1,50 @@
+# Maintainer: Hotland Software <rightowner@gmail.com>
+pkgname=gemu-git
+pkgver=r368.9652c36
+pkgrel=1
+pkgdesc="Accurate multi-machine emulator (NES, Atari 2600/400, IBM 5150, Itanium, Z80, CHIP-8 and more) with QEMU-compatible options and monitor"
+arch=('x86_64')
+url="https://github.com/hotlandsoftware/gemu"
+license=('GPL-3.0-only')
+# configure enables optional features by what it finds, so every one is
+# listed here: a clean chroot build then has the same features as yours.
+depends=(
+    'sdl2'          # display, input, audio (sdl2-compat provides it)
+    'sdl2_ttf'      # VT100 terminal window
+    'sdl2_image'    # window icon
+    'openssl'       # VNC authentication
+    'libzip'        # -rom FILE.zip
+    'gtk3' 'libepoxy'   # -display gtk
+    'alsa-lib'      # NES -soundhw midi
+    'assimp' 'libglvnd' # NES R.O.B. 3D window
+    'lua51'         # NES -lua scripting
+    'libcaca'       # -display curses
+)
+makedepends=('git' 'python' 'ninja' 'pkgconf')
+provides=('gemu')
+conflicts=('gemu')
+source=("gemu::git+https://github.com/hotlandsoftware/gemu.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd gemu
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+    cd gemu
+    python configure --enable-gtk --prefix=/usr \
+        --extra-cflags="$CFLAGS $CPPFLAGS" --extra-ldflags="$LDFLAGS"
+    ninja
+}
+
+package() {
+    cd gemu
+    install -Dm755 bin/gemu "$pkgdir/usr/bin/gemu"
+    # the per-family names (gemu-mos, gemu-x86...) are symlinks to gemu
+    for link in bin/gemu-*; do
+        [ -L "$link" ] && ln -s gemu "$pkgdir/usr/bin/${link#bin/}"
+    done
+    install -Dm644 gemu.png "$pkgdir/usr/share/pixmaps/gemu.png"
+    install -Dm644 -t "$pkgdir/usr/share/doc/gemu" README.md MACHINES_*.md docs/*.md
+}

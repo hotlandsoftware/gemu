@@ -369,6 +369,24 @@ static void redraw_if_idle(SdlBackend *b) {
         if (b->head_video[i]) gemu_video_sdl_redraw(b->head_video[i]);
 }
 
+/* Keep the window wide enough for every menu title: a narrow machine (the
+ * NES's 256 pixels at 1x) would otherwise cut the bar off.  The bar's
+ * titles can change (Blocks appears once drives exist), and a resolution
+ * change resets the minimum size, so this is checked every frame.  The
+ * picture keeps its shape, centred between bars. */
+static void fit_menubar(SdlBackend *b, SDL_Window *win, int win_w, int win_h, int out_w, int out_h) {
+    if (!win || !b->menubar || out_w <= 0 || win_w <= 0) return;
+    int need = gemu_menubar_width(b->menubar, out_h);
+    if (need <= 0) return;
+    need = (need * win_w + out_w - 1) / out_w;          /* output pixels -> window units (HiDPI) */
+    int min_w = 0, min_h = 0;
+    SDL_GetWindowMinimumSize(win, &min_w, &min_h);
+    if (min_w < need) SDL_SetWindowMinimumSize(win, need, min_h);
+    Uint32 flags = SDL_GetWindowFlags(win);
+    if (win_w < need && !(flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED)))
+        SDL_SetWindowSize(win, need, win_h);
+}
+
 static uint32_t sdl_do_poll(GemuDisplay *d) {
     SdlBackend *b = d->backend;
     SDL_Window *win = gemu_video_sdl_get_window(b->video);
@@ -383,6 +401,7 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
     int win_w = 0, win_h = 0, out_w = 0, out_h = 0;
     if (win) SDL_GetWindowSize(win, &win_w, &win_h);
     SDL_GetRendererOutputSize(gemu_video_sdl_get_renderer(b->video), &out_w, &out_h);
+    fit_menubar(b, win, win_w, win_h, out_w, out_h);
 
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
@@ -640,6 +659,13 @@ static void sdl_do_destroy(GemuDisplay *d) {
 
 /* ── Menus: overlay drawing and the UI the menu bar can open ──────────────── */
 
+/* The menu bar's height above the picture: none with show-menubar=off. */
+static int no_menubar_height(int out_h) { (void)out_h; return 0; }
+
+static int menubar_height(int out_h) {
+    return gemu_display_show_menubar() ? gemu_menubar_height(out_h) : 0;
+}
+
 static void menu_overlay_cb(void *ud, SDL_Renderer *r, int pixel_scale) {
     SdlBackend *b = ud;
     gemu_menubar_render(b->menubar, r);
@@ -689,7 +715,7 @@ static void ui_set_scale(GemuDisplay *d, int scale) {
     if (!win || scale < 1) return;
     int w = gemu_video_sdl_width(b->video) * scale;
     int h = gemu_video_sdl_shown_height(b->video, w);
-    SDL_SetWindowSize(win, w, h + gemu_menubar_height(h));
+    SDL_SetWindowSize(win, w, h + menubar_height(h));
 }
 
 /* ── Create ──────────────────────────────────────────────────────────────── */
@@ -719,7 +745,7 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
     int wh = cfg->window_height ? cfg->window_height : h * (cfg->scale ? cfg->scale : 1);
     if (!cfg->window_height && cfg->aspect_w > 0 && cfg->aspect_h > 0)
         wh = ww * cfg->aspect_h / cfg->aspect_w;    /* e.g. 720x350 -> 720x540 at 4:3 */
-    wh += gemu_menubar_height(wh);                  /* the menu bar sits above the picture */
+    wh += menubar_height(wh);                       /* the menu bar sits above the picture */
     b->want_w = ww;
     b->want_h = wh;
 
@@ -819,8 +845,12 @@ GemuDisplay *gemu_display_sdl_create(const GemuDisplayConfig *cfg) {
         d->ui_input_page_label = ui_input_page_label;
         d->ui_input_config     = ui_input_config;
     }
-    b->menubar = gemu_menubar_create(d);
-    gemu_video_sdl_set_top_margin(b->video, gemu_menubar_height);
+    if (gemu_display_show_menubar()) {
+        b->menubar = gemu_menubar_create(d);
+        gemu_video_sdl_set_top_margin(b->video, gemu_menubar_height);
+    } else {
+        gemu_video_sdl_set_top_margin(b->video, no_menubar_height);
+    }
     gemu_video_sdl_set_overlay(b->video, menu_overlay_cb, b);
 
 

@@ -129,8 +129,4 @@ uint8_t rp2c02_read(Rp2c02 *ppu, uint8_t reg);
 void    rp2c02_write(Rp2c02 *ppu, uint8_t reg, uint8_t val);
 
 void    rp2c02_tick(Rp2c02 *ppu);
-/* Dots until the PPU next does something the CPU can see without touching
- * a register: the frame ending, NMI, or (with an irq_scanline hook) the
- * dot-260 scanline clock.  A machine may let it lag behind until then. */
-uint32_t rp2c02_dots_until_event(const Rp2c02 *ppu);
 void    rp2c02_oam_dma(Rp2c02 *ppu, const uint8_t *page);

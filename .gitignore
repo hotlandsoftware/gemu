@@ -13,3 +13,5 @@ tools/*.pyc
 *.bin
 *.dis
 *.log
+build-win/
+bin-win/

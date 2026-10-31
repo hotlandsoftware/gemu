@@ -234,6 +234,14 @@ int gemu_menubar_height(int out_h) {
     return (GLYPH_H + 4) * ui_scale(out_h);
 }
 
+int gemu_menubar_width(const GemuMenubar *mb, int out_h) {
+    if (!mb || !mb->bar) return 0;
+    int sc = ui_scale(out_h), w = 8 * sc;   /* the 4-pixel margins either side */
+    for (int i = 0; i < mb->bar->n && i < 16; i++)   /* as gemu_menubar_render lays them out */
+        w += (int)strlen(mb->bar->items[i].label) * GLYPH_W * sc + 12 * sc;
+    return w;
+}
+
 bool gemu_menubar_active(const GemuMenubar *mb) {
     return mb && (mb->open >= 0 || mb->dialog != DLG_NONE);
 }

@@ -20,6 +20,10 @@ Options:
   --build-dir=DIR      object directory (default: build)
   --bindir=DIR         binary output directory (default: bin)
   --prefix=DIR         install prefix (default: /usr/local)
+  --cross=PREFIX       cross-compile with PREFIX-gcc, e.g. x86_64-w64-mingw32
+                       for Windows (tools/build-windows.sh sets it all up);
+                       libraries come from PREFIX-pkg-config, or pkg-config
+                       with PKG_CONFIG_LIBDIR pointing at the target's .pc files
 """
 
 import sys, os, argparse, subprocess, shutil, glob
@@ -163,8 +167,10 @@ def run(cmd):
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
+PKG_CONFIG = 'pkg-config'   # --cross may point it at the target's libraries
+
 def pkg(package, *flags):
-    r = run(['pkg-config'] + list(flags) + [package])
+    r = run([PKG_CONFIG] + list(flags) + [package])
     return r.split() if r is not None else None
 
 def check(label, result):
@@ -425,6 +431,7 @@ def main():
     p.add_argument('--build-dir',     default='build')
     p.add_argument('--bindir',        default='bin')
     p.add_argument('--prefix',        default='/usr/local')
+    p.add_argument('--cross',         default='')
     args = p.parse_args()
 
     if args.help:
@@ -437,6 +444,21 @@ def main():
             die(f'unknown family {t!r}. Valid: {", ".join(FAMILY_SRC)}')
 
     on_windows = sys.platform == 'win32'
+    cross_windows = False
+    if args.cross:
+        global PKG_CONFIG
+        if args.cc == 'gcc':
+            args.cc = f'{args.cross}-gcc'
+        if not shutil.which(args.cc):
+            die(f'{args.cc} not found (cross compiler for --cross={args.cross})')
+        if shutil.which(f'{args.cross}-pkg-config'):
+            PKG_CONFIG = f'{args.cross}-pkg-config'
+        elif not os.environ.get('PKG_CONFIG_LIBDIR'):
+            # plain pkg-config would hand back the host's libraries
+            die(f'--cross: no {args.cross}-pkg-config; set PKG_CONFIG_LIBDIR to the '
+                'directory holding the target\'s .pc files')
+        cross_windows = 'mingw' in args.cross
+        on_windows = on_windows or cross_windows
     build_dir  = args.build_dir
     bin_dir    = args.bindir
 
@@ -752,7 +774,9 @@ def main():
         all_objs.append(obj)
 
     lines.append('')
-    binary = f'{bin_dir}/gemu'
+    # a Windows linker writes gemu.exe whatever it is told; name it so, or
+    # ninja would relink every time (native MSYS2 builds keep the old name)
+    binary = f'{bin_dir}/gemu.exe' if cross_windows else f'{bin_dir}/gemu'
     lines.append(f'build {binary}: link {" ".join(all_objs)}')
     lines.append(f'  LDFLAGS = {ldflags}')
     lines.append(f'build gemu: phony {binary}')

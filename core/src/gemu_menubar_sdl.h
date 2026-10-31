@@ -14,6 +14,9 @@ void         gemu_menubar_destroy(GemuMenubar *mb);
 
 /* Height of the bar in output pixels for a window of out_h output pixels. */
 int          gemu_menubar_height(int out_h);
+/* Width the bar needs to show every menu title (output pixels; 0 before
+ * its first build). */
+int          gemu_menubar_width(const GemuMenubar *mb, int out_h);
 
 /* Draw the bar, any open menus and dialogs (output pixel coordinates). */
 void         gemu_menubar_render(GemuMenubar *mb, SDL_Renderer *r);

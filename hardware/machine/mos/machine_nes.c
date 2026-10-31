@@ -1306,20 +1306,10 @@ static void nes_sync_apu_to_cpu(NesState *s, uint64_t cpu_cycle) {
 /* Before each bus access the rest of the console catches up with the CPU,
  * so registers, IRQ and NMI are exact to the cycle: the PPU through this
  * cycle (as before), the APU side up to its start. */
-/* The FDS's disk logic ticks with the PPU, and a Lua script may look at the
- * PPU from any instruction: those keep it in step every cycle. */
-static bool nes_ppu_eager(const NesState *s) {
-#ifdef HAVE_LUA
-    if (s->lua) return true;
-#endif
-    return s->fds_enabled;
-}
-
 static void nes_sync_all(NesState *s) {
     uint64_t c = s->cpu.cycle_count - 1;
     if (c >= s->apu_deadline || nes_apu_eager(s)) nes_sync_apu_to_cpu(s, c);
-    if (s->cpu.cycle_count >= s->ppu_deadline || nes_ppu_eager(s))
-        nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+    nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
 }
 
 /* ── DMA ─────────────────────────────────────────────────────────────────────
@@ -1416,10 +1406,6 @@ static void nes_run_dma(NesState *s, uint16_t cpu_addr) {
 static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
     NesState *s = ud;
     nes_sync_all(s);
-    /* the PPU's state shows through cartridge registers (MMC5's in-frame
-     * flag...) and the Zapper's light sensor */
-    if ((addr >= 0x4020 && addr < 0x6000) || addr == 0x4016 || addr == 0x4017)
-        nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
     if (s->dma_halt && !s->in_dma) {
         nes_run_dma(s, addr);
         nes_sync_all(s);
@@ -1432,13 +1418,9 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
 static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
     NesState *s = ud;
     nes_sync_all(s);
-    /* a mapper write can switch what the PPU draws (CHR banks, mirroring) */
-    bool cart = addr >= 0x4020;
-    if (cart) nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
     s->cpu_bus = val;
     if (nes_cart_faulty(s, addr)) nes_cart_write_faulty(s, addr, val);
     else nes_cpu_write_bus(addr, val, ud);
-    if (cart) s->ppu_deadline = 0;
 }
 
 static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
@@ -1455,8 +1437,6 @@ static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
             }
         }
     }
-    /* it may now lag until it next does something the CPU can see */
-    s->ppu_deadline = s->ppu_synced_cpu_cycle + rp2c02_dots_until_event(&s->ppu) / 3u;
 }
 
 static void gg_print(NesState *s, const NesCheat *e) {
@@ -1540,7 +1520,6 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
 
     if (addr < 0x4000) {
         nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
-        s->ppu_deadline = 0;
         return rp2c02_read(&s->ppu, (uint8_t)(addr & 7));
     }
 
@@ -1712,7 +1691,6 @@ static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
         }
         nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
         rp2c02_write(&s->ppu, (uint8_t)(addr & 7), val);
-        s->ppu_deadline = 0;   /* NMI enable, rendering... may have changed */
         return;
     }
 
@@ -2194,14 +2172,14 @@ static void nes_reset(NesState *s) {
         /* FDS: horizontal mirroring until $4025 says otherwise */
         s->ppu.mirror = RP2C02_MIRROR_HORIZONTAL;
         s->ppu_synced_cpu_cycle = s->apu_synced_cpu_cycle = s->cpu.cycle_count;
-        s->apu_deadline = s->ppu_deadline = 0;
+        s->apu_deadline = 0;
         mos6502_reset(&s->cpu);
         apu2a03_reset(&s->apu);
         return;
     }
     s->ppu.mirror = s->cart.mirror;
     s->ppu_synced_cpu_cycle = s->apu_synced_cpu_cycle = s->cpu.cycle_count;
-    s->apu_deadline = s->ppu_deadline = 0;
+    s->apu_deadline = 0;
 
     /* Mapper bank state must be set before mos6502_reset reads the reset
        vector, otherwise prg_offsets[1] is 0 and the vector is fetched from
@@ -2924,7 +2902,7 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
     free(loaded);
     s->pins = pins;
     s->pins_seen = pins.version - 1u;   /* reapply: the hook pointers came from the file */
-    s->apu_deadline = s->ppu_deadline = 0;
+    s->apu_deadline = 0;
     s->clock_seen = 0;
 
     s->cfg     = cfg;
@@ -3317,8 +3295,7 @@ static void nes_step_insn(NesState *s) {
     if (s->lua) nes_lua_notify_exec(s->lua, s->cpu.PC);
 #endif
     mos6502_step(&s->cpu);
-    if (s->cpu.cycle_count >= s->ppu_deadline || nes_ppu_eager(s))
-        nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+    nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
 }
 
 void nes_run(NesState *s, const MosConfig *cfg) {

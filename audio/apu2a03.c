@@ -34,8 +34,6 @@ static const uint8_t tri_seq[32] = {
 };
 
 /* Frame counter step points (CPU cycles, NTSC) */
-static const uint32_t fc4[4] = {7457, 14913, 22371, 29829};
-static const uint32_t fc5[5] = {7457, 14913, 22371, 29829, 37281};
 
 /* ── Envelope helpers ────────────────────────────────────────────────────── */
 

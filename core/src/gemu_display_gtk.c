@@ -457,8 +457,10 @@ GemuDisplay *gemu_display_gtk_create(const GemuDisplayConfig *cfg) {
     d->do_close_head   = gtk_do_close_head;
     b->parent = d;
 
-    b->menubar = gemu_gtk_menubar_new(build_menubar, d);
-    gemu_video_gtk_set_menubar(b->video, b->menubar);
+    if (gemu_display_show_menubar()) {   /* -display gtk,show-menubar=off */
+        b->menubar = gemu_gtk_menubar_new(build_menubar, d);
+        gemu_video_gtk_set_menubar(b->video, b->menubar);
+    }
 
     GtkWidget *win = gemu_video_gtk_window(b->video);
     GtkWidget *area = gemu_video_gtk_drawing_area(b->video);

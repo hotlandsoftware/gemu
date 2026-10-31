@@ -56,6 +56,11 @@ bool gemu_ini_read(const char *section, const char *key,
 
 /* ── Window titles ───────────────────────────────────────────────────────── */
 
+static bool show_menubar = true;
+
+void gemu_display_set_show_menubar(bool show) { show_menubar = show; }
+bool gemu_display_show_menubar(void) { return show_menubar; }
+
 static char vm_name[128];
 
 void gemu_set_vm_name(const char *name) {

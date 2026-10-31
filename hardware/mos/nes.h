@@ -173,7 +173,6 @@ typedef struct NesState {
     uint64_t       apu_synced_cpu_cycle;   /* the APU, expansion audio and mapper counters */
     bool           apu_syncing;
     uint64_t       apu_deadline;           /* the APU may lag until this cycle (apu2a03_until_event) */
-    uint64_t       ppu_deadline;           /* likewise the PPU (rp2c02_dots_until_event) */
 
     /* The 2A03's DMA unit: OAM and DMC DMA halt the CPU on its next read */
     bool           dma_halt;               /* a DMA is waiting for a read cycle */

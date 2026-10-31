@@ -701,24 +701,6 @@ void rp2c02_tick(Rp2c02 *ppu) {
     }
 }
 
-uint32_t rp2c02_dots_until_event(const Rp2c02 *ppu) {
-    int sl = ppu->scanline, dot = ppu->dot;
-    if (ppu->nmi_pending) return 0;   /* raised by a $2000 write: due on the next tick */
-    /* the frame ends on the tick that finishes the pre-render line (one
-     * sooner on a skipped odd frame); the event is on tick best + 1 */
-    int end = (ppu->lines_total - 1 - sl) * 341 + (341 - dot) - 2;
-    uint32_t best = end > 0 ? (uint32_t)end : 0;
-    if (ppu->ppuctrl & PPUCTRL_NMI_EN) {
-        int to = (ppu->vblank_line - sl) * 341 + (1 - dot);
-        if (to >= 0 && (uint32_t)to < best) best = (uint32_t)to;
-    }
-    if (ppu->irq_scanline && rendering_enabled(ppu)) {
-        uint32_t to = dot <= 260 ? (uint32_t)(260 - dot) : (uint32_t)(341 - dot + 260);
-        if (to < best) best = to;
-    }
-    return best;
-}
-
 void rp2c02_reset(Rp2c02 *ppu) {
     ppu->ppuctrl = 0;
     ppu->ppumask = 0;

@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 #define NES_PIN_PANEL_W 640
-#define NES_PIN_PANEL_H 384
+#define NES_PIN_PANEL_H 400
 #define NES_PIN_CLOCK_MIN 100000u
 #define NES_PIN_CLOCK_MAX 4000000u
 
@@ -25,6 +25,7 @@ typedef struct {
     NesPins *pins;
     int      hover_pin;         /* 0 = none */
     int      hover_ctl;         /* a control under the mouse, or -1 */
+    int      pressed_ctl;       /* the button held down, or -1 */
     bool     dragging;          /* the clock slider */
     uint32_t tp_lit_until[3];   /* /NMI, APU /IRQ, MAP /IRQ */
     uint32_t now;               /* ms, as of the last draw */

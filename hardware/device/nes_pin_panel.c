@@ -1,16 +1,20 @@
 /*
  * Debug > Cartridge Pins, drawn and driven the same for every backend
- * (see nes_pin_window.h):
+ * (see nes_pin_window.h), in the Windows 3.1 look of GEMU's other tool
+ * windows (cheat_dialog_sdl.c):
  *
- *     labels 31-60 (rotated)
- *   [31][32][33] ... [60]      gold = contact, black = open, blinking = flaky
- *   ===================== PCB edge
- *   [ 1][ 2][ 3] ... [30]
- *     labels 1-30
- *   what the pin under the mouse carries
- *   CLOCK 1.79 MHz  [======o-----]  1789773 Hz
- *   TILT            [<] +1.5 deg [>]  right end up
- *   TP (o)/NMI (o)APU /IRQ (o)MAP /IRQ          [Reinsert] [Clock reset]
+ *   +---------------------------------+
+ *   |   labels 31-60 (rotated)        |
+ *   | [31][32][33] ... [60]           |  gold = contact, black = open,
+ *   | ===================== PCB edge  |  blinking = flaky
+ *   | [ 1][ 2][ 3] ... [30]           |
+ *   |   labels 1-30                   |
+ *   +---------------------------------+
+ *   Clock:        [-------[]-------]  [ 1789773] Hz
+ *   Tilt:         [<] [ +1.5 deg] [>]  right end up 1.96 mm
+ *   Test points:  (o) /NMI  (o) APU /IRQ  (o) MAP /IRQ   [Reinsert] [Clock reset]
+ *   ----------------------------------------------------------------
+ *   status: what the pin or control under the mouse does
  *
  * Left click opens or closes a contact, right click makes it flaky; the
  * slider (or the wheel over it) sets M2, the tilt buttons (or the wheel
@@ -28,7 +32,7 @@
 #define COLS     30
 #define X0       ((W - COLS * PITCH) / 2)
 #define LABEL_H  80
-#define TOP_LBL  8
+#define TOP_LBL  10
 #define TOP_PIN  (TOP_LBL + LABEL_H + 4)
 #define PIN_W    16
 #define PIN_H    30
@@ -36,20 +40,34 @@
 #define BAND_H   12
 #define BOT_PIN  (BAND_Y + BAND_H + 2)
 #define BOT_LBL  (BOT_PIN + PIN_H + 4)
-#define STATUS_Y (BOT_LBL + LABEL_H + 6)
-#define CLOCK_Y  (STATUS_Y + 40)
-#define TILT_Y   (CLOCK_Y + 28)
-#define TP_Y     (TILT_Y + 28)
+#define BOX_X    (X0 - 12)
+#define BOX_Y    4
+#define BOX_W    (COLS * PITCH + 24)
+#define BOX_H    (BOT_LBL + LABEL_H + 4 - BOX_Y)
+#define LABEL_X  BOX_X
+#define CLOCK_Y  (BOX_Y + BOX_H + 12)
+#define TILT_Y   (CLOCK_Y + 30)
+#define TP_Y     (TILT_Y + 30)
+#define STATUS_Y (TP_Y + 34)
 #define TILT_STEP 0.5
 #define LIFT_PX_PER_MM 4.0
 #define LIFT_PX_MAX    10
-#define SLIDER_X 176
-#define SLIDER_W 300
-#define READOUT_X (SLIDER_X + SLIDER_W + 16)
+#define CTL_X    120                    /* the controls' column, after the labels */
+#define SLIDER_X (CTL_X + 6)
+#define SLIDER_W 348
+#define READOUT_X (SLIDER_X + SLIDER_W + 14)
 
-#define C_BG      0xFF1C1F24u
-#define C_TEXT    0xFFD8D8D8u
-#define C_DIM     0xFF8890A0u
+/* the 3.1 palette of cheat_dialog_sdl.c */
+#define C_FACE    0xFFC0C0C0u
+#define C_BG      0xFFFFFFFFu
+#define C_TEXT    0xFF000000u
+#define C_DIM     0xFF808080u
+#define C_LIGHT   0xFFFFFFFFu
+#define C_DARK    0xFF808080u
+#define C_HI      0xFF000080u
+#define C_ERR     0xFF800000u
+#define C_FLAKY_TX 0xFFA05000u
+/* the connector picture */
 #define C_GOLD    0xFFE0B040u
 #define C_GOLD_HI 0xFFF6D782u
 #define C_GOLD_LO 0xFFA07818u
@@ -58,11 +76,9 @@
 #define C_FLAKY   0xFFFF8C1Au
 #define C_PCB     0xFF2050B0u
 #define C_PCB_LO  0xFF163A80u
-#define C_GREEN   0xFF40C060u
-#define C_LED_ON  0xFF70FF70u
-#define C_LED_OFF 0xFF24402Au
-#define C_BTN     0xFF3A414Au
-#define C_BTN_HI  0xFF4E5764u
+#define C_BOARD   0xFF2A3A2Eu
+#define C_LED_ON  0xFF00FF00u
+#define C_LED_OFF 0xFF005000u
 
 enum { CTL_SLIDER, CTL_TILT_LEFT, CTL_TILT_RIGHT, CTL_REINSERT, CTL_CLOCK_RESET, N_CTL };
 
@@ -70,10 +86,10 @@ typedef struct { int x, y, w, h; } Rect;
 
 static const Rect ctl_rect[N_CTL] = {
     [CTL_SLIDER]      = { SLIDER_X, CLOCK_Y - 2, SLIDER_W, 20 },
-    [CTL_TILT_LEFT]   = { SLIDER_X, TILT_Y - 3, 28, 22 },
-    [CTL_TILT_RIGHT]  = { SLIDER_X + 112, TILT_Y - 3, 28, 22 },
-    [CTL_REINSERT]    = { 420, TP_Y - 3, 92, 22 },
-    [CTL_CLOCK_RESET] = { 520, TP_Y - 3, 100, 22 },
+    [CTL_TILT_LEFT]   = { CTL_X, TILT_Y - 3, 24, 22 },
+    [CTL_TILT_RIGHT]  = { CTL_X + 108, TILT_Y - 3, 24, 22 },
+    [CTL_REINSERT]    = { W - 8 - 104 - 8 - 88, TP_Y - 4, 88, 24 },
+    [CTL_CLOCK_RESET] = { W - 8 - 104, TP_Y - 4, 104, 24 },
 };
 
 static bool in_rect(Rect r, int x, int y) {
@@ -104,6 +120,28 @@ static void circle(uint32_t *fb, int cx, int cy, int r, uint32_t c) {
         for (int i = -r; i <= r; i++)
             if (i * i + j * j <= r * r + r && cx + i >= 0 && cx + i < W && cy + j >= 0 && cy + j < H)
                 fb[(cy + j) * W + cx + i] = c;
+}
+
+static void frame(uint32_t *fb, int x, int y, int w, int h, uint32_t c) {
+    fill(fb, x, y, w, 1, c);
+    fill(fb, x, y + h - 1, w, 1, c);
+    fill(fb, x, y, 1, h, c);
+    fill(fb, x + w - 1, y, 1, h, c);
+}
+
+/* A white box with a black frame: the list and text fields of the 3.1 look. */
+static void field(uint32_t *fb, int x, int y, int w, int h) {
+    fill(fb, x, y, w, h, C_BG);
+    frame(fb, x, y, w, h, C_TEXT);
+}
+
+/* The raised 3.1 face of a push button or slider thumb (no border). */
+static void bevel(uint32_t *fb, int x, int y, int w, int h) {
+    fill(fb, x, y, w, h, C_FACE);
+    fill(fb, x, y, w - 1, 2, C_LIGHT);
+    fill(fb, x, y, 2, h - 1, C_LIGHT);
+    fill(fb, x + 1, y + h - 2, w - 1, 2, C_DARK);
+    fill(fb, x + w - 2, y + 1, 2, h - 1, C_DARK);
 }
 
 static void text(uint32_t *fb, int x, int y, const char *s, uint32_t c) {
@@ -181,15 +219,10 @@ static void draw_pin(NesPinPanel *p, uint32_t *fb, int pin) {
     snprintf(num, sizeof(num), "%d", pin);
     int tw = (int)strlen(num) * 8;
     text(fb, r.x + (r.w - tw) / 2, r.y + (r.h - 16) / 2, num, gold ? 0xFF3A2A08u : C_DIM);
-    if (pin == p->hover_pin) {
-        fill(fb, r.x - 2, r.y - 2, r.w + 4, 1, 0xFFFFFFFFu);
-        fill(fb, r.x - 2, r.y + r.h + 1, r.w + 4, 1, 0xFFFFFFFFu);
-        fill(fb, r.x - 2, r.y - 2, 1, r.h + 4, 0xFFFFFFFFu);
-        fill(fb, r.x + r.w + 1, r.y - 2, 1, r.h + 4, 0xFFFFFFFFu);
-    }
+    if (pin == p->hover_pin) frame(fb, r.x - 2, r.y - 2, r.w + 4, r.h + 4, C_LIGHT);
     const char *label = nes_pin_info[pin].label;
-    uint32_t lc = st == NES_PIN_GOOD ? C_DIM : st == NES_PIN_BROKEN ? 0xFFFF6060u : C_FLAKY;
-    if (pin == p->hover_pin) lc = 0xFFFFFFFFu;
+    uint32_t lc = st == NES_PIN_GOOD ? C_TEXT : st == NES_PIN_BROKEN ? C_ERR : C_FLAKY_TX;
+    if (pin == p->hover_pin) lc = C_HI;
     int lx = X0 + pin_col(pin) * PITCH + (PITCH - 16) / 2, dy = col_dy(p, pin_col(pin));
     if (pin > 30) text_up(fb, lx, TOP_LBL + LABEL_H - 1 + dy, label, lc);                  /* ends at the contact */
     else          text_up(fb, lx, BOT_LBL + (int)strlen(label) * 8 - 1 + dy, label, lc);   /* starts at it */
@@ -218,18 +251,26 @@ static void slider_to(NesPinPanel *p, int x) {
     set_clock(p, NES_PIN_CLOCK_MIN + (uint32_t)(f * (NES_PIN_CLOCK_MAX - NES_PIN_CLOCK_MIN)));
 }
 
+/* A 3.1 push button (as cheat_dialog_sdl.c's), pressed while clicked. */
 static void button(NesPinPanel *p, uint32_t *fb, int ctl, const char *label) {
     Rect r = ctl_rect[ctl];
-    fill_round(fb, r.x, r.y, r.w, r.h, 4, p->hover_ctl == ctl ? C_BTN_HI : C_BTN);
-    text(fb, r.x + (r.w - (int)strlen(label) * 8) / 2, r.y + (r.h - 16) / 2, label, C_TEXT);
+    fill(fb, r.x + 1, r.y, r.w - 2, 1, C_TEXT);
+    fill(fb, r.x + 1, r.y + r.h - 1, r.w - 2, 1, C_TEXT);
+    fill(fb, r.x, r.y + 1, 1, r.h - 2, C_TEXT);
+    fill(fb, r.x + r.w - 1, r.y + 1, 1, r.h - 2, C_TEXT);
+    bool down = p->pressed_ctl == ctl && p->hover_ctl == ctl;
+    if (down) fill(fb, r.x + 1, r.y + 1, r.w - 2, r.h - 2, C_FACE);
+    else      bevel(fb, r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+    int o = down ? 1 : 0;
+    text(fb, r.x + (r.w - (int)strlen(label) * 8) / 2 + o, r.y + (r.h - 16) / 2 + o, label, C_TEXT);
 }
 
-static void led(uint32_t *fb, int x, const char *label, bool on) {
-    int w = 24 + (int)strlen(label) * 8;
-    fill_round(fb, x, TP_Y - 3, w, 22, 10, 0xFF1F3324u);
-    fill_round(fb, x + 1, TP_Y - 2, w - 2, 20, 9, 0xFF16261Au);
-    circle(fb, x + 11, TP_Y + 8, 4, on ? C_LED_ON : C_LED_OFF);
-    text(fb, x + 20, TP_Y, label, on ? C_TEXT : C_DIM);
+/* returns the x after it */
+static int led(uint32_t *fb, int x, const char *label, bool on) {
+    circle(fb, x + 6, TP_Y + 8, 6, C_TEXT);
+    circle(fb, x + 6, TP_Y + 8, 5, on ? C_LED_ON : C_LED_OFF);
+    text(fb, x + 18, TP_Y, label, C_TEXT);
+    return x + 18 + (int)strlen(label) * 8 + 18;
 }
 
 static void status_lines(NesPinPanel *p, char *l1, char *l2, size_t len) {
@@ -268,6 +309,7 @@ void nes_pin_panel_init(NesPinPanel *p, NesPins *pins) {
     memset(p, 0, sizeof(*p));
     p->pins = pins;
     p->hover_ctl = -1;
+    p->pressed_ctl = -1;
 }
 
 void nes_pin_panel_draw(NesPinPanel *p, uint32_t *fb, uint32_t now_ms) {
@@ -279,14 +321,15 @@ void nes_pin_panel_draw(NesPinPanel *p, uint32_t *fb, uint32_t now_ms) {
         *tp[i] = false;
     }
 
-    fill(fb, 0, 0, W, H, C_BG);
-    /* the cartridge's edge, column by column so a tilt can raise it:
-     * board, then the two rows of contacts */
+    fill(fb, 0, 0, W, H, C_FACE);
+    /* the connector, in a box like the Game Genie's list; the cartridge's
+     * edge column by column so a tilt can raise it: board, then contacts */
+    field(fb, BOX_X, BOX_Y, BOX_W, BOX_H);
     for (int col = -1; col <= COLS; col++) {
         int c = col < 0 ? 0 : col >= COLS ? COLS - 1 : col, dy = col_dy(p, c);
         int x = col < 0 ? X0 - 8 : col >= COLS ? X0 + COLS * PITCH : X0 + col * PITCH;
         int w = col < 0 || col >= COLS ? 8 : PITCH;
-        fill(fb, x, TOP_PIN + 6 + dy, w, BOT_PIN + PIN_H - 6 - (TOP_PIN + 6), 0xFF2A3A2Eu);
+        fill(fb, x, TOP_PIN + 6 + dy, w, BOT_PIN + PIN_H - 6 - (TOP_PIN + 6), C_BOARD);
         fill(fb, x, BAND_Y + dy, w, BAND_H, C_PCB);
         fill(fb, x, BAND_Y + BAND_H - 2 + dy, w, 2, C_PCB_LO);
     }
@@ -295,46 +338,48 @@ void nes_pin_panel_draw(NesPinPanel *p, uint32_t *fb, uint32_t now_ms) {
     for (int pin = 1; pin <= NES_PINS_N; pin++) draw_pin(p, fb, pin);
 
     char buf[160], buf2[160];
-    status_lines(p, buf, buf2, sizeof(buf));
-    buf[(W - 2 * X0) / 8] = buf2[(W - 2 * X0) / 8] = '\0';
-    text(fb, X0, STATUS_Y, buf, p->hover_pin ? C_TEXT : C_DIM);
-    text(fb, X0, STATUS_Y + 16, buf2, C_DIM);
 
-    /* clock */
+    /* clock: a 3.1 trackbar and the value in a field */
     uint32_t hz = p->pins->clock_hz;
-    snprintf(buf, sizeof(buf), "CLOCK %.2f MHz", hz / 1e6);
-    text(fb, X0, CLOCK_Y, buf, C_TEXT);
-    int ty = CLOCK_Y + 6, kx = slider_x_for(hz);
-    fill_round(fb, SLIDER_X, ty, SLIDER_W, 5, 2, 0xFF404850u);
-    fill_round(fb, SLIDER_X, ty, kx - SLIDER_X + 1, 5, 2, C_GREEN);
+    text(fb, LABEL_X, CLOCK_Y, "Clock:", C_TEXT);
+    int ty = CLOCK_Y + 5, kx = slider_x_for(hz);
+    field(fb, SLIDER_X - 4, ty, SLIDER_W + 8, 6);
     int home = slider_x_for(p->pins->clock_default);
-    fill(fb, home, ty - 4, 1, 3, C_DIM);
-    circle(fb, kx, ty + 2, 8, p->dragging || p->hover_ctl == CTL_SLIDER ? 0xFFFFFFFFu : 0xFFD0D4DAu);
-    fill_round(fb, READOUT_X, CLOCK_Y - 3, 96, 22, 3, 0xFF101214u);
+    fill(fb, home, ty + 9, 1, 5, C_TEXT);                 /* the console's own clock */
+    frame(fb, kx - 6, CLOCK_Y - 3, 12, 22, C_TEXT);
+    bevel(fb, kx - 5, CLOCK_Y - 2, 10, 20);
+    field(fb, READOUT_X, CLOCK_Y - 3, 96, 22);
     snprintf(buf, sizeof(buf), "%u", hz);
-    text(fb, READOUT_X + 88 - (int)strlen(buf) * 8, CLOCK_Y, buf, hz == p->pins->clock_default ? C_TEXT : C_FLAKY);
-    text(fb, READOUT_X + 102, CLOCK_Y, "Hz", C_DIM);
+    text(fb, READOUT_X + 90 - (int)strlen(buf) * 8, CLOCK_Y, buf, hz == p->pins->clock_default ? C_TEXT : C_ERR);
+    text(fb, READOUT_X + 102, CLOCK_Y, "Hz", C_TEXT);
 
     /* tilt */
     double t = p->pins->tilt_deg;
-    text(fb, X0, TILT_Y, "TILT", C_TEXT);
+    text(fb, LABEL_X, TILT_Y, "Tilt:", C_TEXT);
     button(p, fb, CTL_TILT_LEFT, "\x11");
-    fill_round(fb, SLIDER_X + 34, TILT_Y - 3, 72, 22, 3, 0xFF101214u);
+    field(fb, CTL_X + 30, TILT_Y - 3, 72, 22);
     snprintf(buf, sizeof(buf), "%+.1f\xF8", t);
-    text(fb, SLIDER_X + 34 + 36 - (int)strlen(buf) * 4, TILT_Y, buf, t == 0.0 ? C_TEXT : C_FLAKY);
+    text(fb, CTL_X + 30 + 36 - (int)strlen(buf) * 4, TILT_Y, buf, t == 0.0 ? C_TEXT : C_ERR);
     button(p, fb, CTL_TILT_RIGHT, "\x10");
     if (t == 0.0) snprintf(buf, sizeof(buf), "seated straight");
     else snprintf(buf, sizeof(buf), "%s end up %.2f mm", t > 0 ? "right" : "left",
                   nes_pins_lift_mm(p->pins, t > 0 ? 30 : 1));
-    text(fb, SLIDER_X + 150, TILT_Y, buf, C_DIM);
+    text(fb, CTL_X + 144, TILT_Y, buf, C_TEXT);
 
-    /* test points */
-    text(fb, X0, TP_Y, "TP", C_DIM);
-    led(fb, X0 + 24, "/NMI", now_ms < p->tp_lit_until[0]);
-    led(fb, X0 + 88, "APU /IRQ", now_ms < p->tp_lit_until[1]);
-    led(fb, X0 + 184, "MAP /IRQ", now_ms < p->tp_lit_until[2]);
+    /* test points and the buttons */
+    text(fb, LABEL_X, TP_Y, "Test points:", C_TEXT);
+    int lx = led(fb, CTL_X, "/NMI", now_ms < p->tp_lit_until[0]);
+    lx = led(fb, lx, "APU /IRQ", now_ms < p->tp_lit_until[1]);
+    led(fb, lx, "MAP /IRQ", now_ms < p->tp_lit_until[2]);
     button(p, fb, CTL_REINSERT, "Reinsert");
     button(p, fb, CTL_CLOCK_RESET, "Clock reset");
+
+    /* status line, as the Game Genie's */
+    fill(fb, 0, STATUS_Y - 6, W, 1, C_DARK);
+    status_lines(p, buf, buf2, sizeof(buf));
+    buf[(W - 2 * LABEL_X) / 8] = buf2[(W - 2 * LABEL_X) / 8] = '\0';
+    text(fb, LABEL_X, STATUS_Y, buf, C_TEXT);
+    text(fb, LABEL_X, STATUS_Y + 16, buf2, C_TEXT);
 }
 
 void nes_pin_panel_mouse(NesPinPanel *p, int x, int y, NesPinMouse ev) {
@@ -342,7 +387,7 @@ void nes_pin_panel_mouse(NesPinPanel *p, int x, int y, NesPinMouse ev) {
         if (!p->dragging) { p->hover_pin = 0; p->hover_ctl = -1; }
         return;
     }
-    if (ev == NES_PIN_MOUSE_UP) { p->dragging = false; return; }
+    if (ev == NES_PIN_MOUSE_UP) { p->dragging = false; p->pressed_ctl = -1; return; }
     if (p->dragging) { slider_to(p, x); return; }
 
     p->hover_pin = pin_at(p, x, y);
@@ -360,6 +405,7 @@ void nes_pin_panel_mouse(NesPinPanel *p, int x, int y, NesPinMouse ev) {
                                                     : (st == NES_PIN_FLAKY ? NES_PIN_GOOD : NES_PIN_FLAKY);
         nes_pins_set(p->pins, p->hover_pin, want);
     } else if (ev == NES_PIN_MOUSE_LEFT) {
+        p->pressed_ctl = p->hover_ctl;
         switch (p->hover_ctl) {
         case CTL_SLIDER:      p->dragging = true; slider_to(p, x); break;
         case CTL_TILT_LEFT:   nes_pins_set_tilt(p->pins, p->pins->tilt_deg - TILT_STEP); break;
