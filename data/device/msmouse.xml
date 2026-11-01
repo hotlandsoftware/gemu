@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<device name="msmouse" description="Microsoft Mouse (serial, on COM1 or COM2)" status="working">
+    <machine name="ibm5150"/>
+</device>

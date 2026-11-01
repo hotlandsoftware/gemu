@@ -38,6 +38,7 @@ typedef struct X86Config {
     const char     *vga2_opts;
     X86HdcType      hdc;        /* hard disk controller (-device) */
     const char     *hdc_opts;   /* its options (romfile=, interleave=) */
+    int             mouse_com;  /* -device msmouse: on COM1 or COM2 (0 = none) */
     uint32_t        ram_size; /* bytes */
     GemuDisplayType display_type;
     int             display_scale;

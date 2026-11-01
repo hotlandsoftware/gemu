@@ -273,6 +273,8 @@ static uint8_t io_read8(uint16_t port, void *ud) {
     if (cga_port(s, port)) return cga_io_read(&s->cga, port);
     if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) return upd765_read(&s->fdc, port);
     if (s->has_hdc && port >= 0x320 && port <= 0x323) return ibm_hdc_read(&s->hdc, port - 0x320);
+    if (s->has_com[0] && port >= 0x3F8 && port <= 0x3FF) return ins8250_read(&s->com[0], port & 7);
+    if (s->has_com[1] && port >= 0x2F8 && port <= 0x2FF) return ins8250_read(&s->com[1], port & 7);
     if (empty_slot(port)) return 0xFF;
     iolog(s, port, false, 0);
     return 0xFF;
@@ -303,6 +305,8 @@ static void io_write8(uint16_t port, uint8_t val, void *ud) {
     if (cga_port(s, port)) { cga_io_write(&s->cga, port, val); return; }
     if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) { upd765_write(&s->fdc, port, val); return; }
     if (s->has_hdc && port >= 0x320 && port <= 0x323) { ibm_hdc_write(&s->hdc, port - 0x320, val); return; }
+    if (s->has_com[0] && port >= 0x3F8 && port <= 0x3FF) { ins8250_write(&s->com[0], port & 7, val); return; }
+    if (s->has_com[1] && port >= 0x2F8 && port <= 0x2FF) { ins8250_write(&s->com[1], port & 7, val); return; }
     if (empty_slot(port)) return;
     iolog(s, port, true, val);
 }
@@ -351,6 +355,59 @@ static bool hdc_dma_to_mem(void *ud, uint8_t val, bool *tc) {
     if (!i8237_transfer(&s->dma, 3, &phys, tc)) return false;
     bus_write8(phys, val, s);
     return true;
+}
+
+/* ── Asynchronous communications adapters: COM1 on IRQ4, COM2 on IRQ3 ───── */
+
+static void com1_set_irq(void *ud, bool level) {
+    Ibm5150State *s = ud;
+    i8259_set_irq(&s->pic, 4, level);
+}
+
+static void com2_set_irq(void *ud, bool level) {
+    Ibm5150State *s = ud;
+    i8259_set_irq(&s->pic, 3, level);
+}
+
+static void attach_com(Ibm5150State *s, int n) {
+    Ins8250 *u = &s->com[n];
+    u->clock_hz = IBM5150_CPU_HZ;
+    u->set_irq = n == 0 ? com1_set_irq : com2_set_irq;
+    u->ud = s;
+    s->has_com[n] = true;
+}
+
+/* -device msmouse: the mouse and the serial adapter it plugs into. */
+static void attach_mouse(Ibm5150State *s, int com) {
+    attach_com(s, com - 1);
+    msmouse_init(&s->mouse, IBM5150_CPU_HZ);
+    Ins8250 *u = &s->com[com - 1];
+    u->dev = &s->mouse;
+    u->dev_lines = msmouse_lines;
+    u->dev_rx = msmouse_rx;
+    s->has_mouse = true;
+}
+
+/* QEMU's mouse_move DX DY [DZ] and mouse_button STATE (1 left, 2 middle,
+ * 4 right). */
+static GemuMonCmd ibm5150_cmd_mouse_move(GemuMonitor *mon, const char *args, void *ud) {
+    Ibm5150State *s = ud;
+    int dx, dy;
+    if (!s->has_mouse) { gemu_monitor_printf(mon, "mouse_move: no mouse (-device msmouse)\n"); return GEMU_MON_NONE; }
+    if (sscanf(args, "%d %d", &dx, &dy) != 2) {
+        gemu_monitor_printf(mon, "usage: mouse_move dx dy\n");
+        return GEMU_MON_NONE;
+    }
+    msmouse_input(&s->mouse, dx, dy, s->mouse_buttons & 1, s->mouse_buttons & 4);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd ibm5150_cmd_mouse_button(GemuMonitor *mon, const char *args, void *ud) {
+    Ibm5150State *s = ud;
+    if (!s->has_mouse) { gemu_monitor_printf(mon, "mouse_button: no mouse (-device msmouse)\n"); return GEMU_MON_NONE; }
+    s->mouse_buttons = (uint8_t)atoi(args);
+    msmouse_input(&s->mouse, 0, 0, s->mouse_buttons & 1, s->mouse_buttons & 4);
+    return GEMU_MON_NONE;
 }
 
 /* ── Interrupts and timers ───────────────────────────────────────────────── */
@@ -402,6 +459,9 @@ static bool advance(Ibm5150State *s, unsigned clocks) {
     kb_service(s);
     if (s->has_fdc) upd765_tick(&s->fdc, clocks);
     if (s->has_hdc) ibm_hdc_tick(&s->hdc, clocks);
+    if (s->has_mouse) msmouse_tick(&s->mouse, clocks);
+    for (int i = 0; i < 2; i++)
+        if (s->has_com[i]) ins8250_tick(&s->com[i], clocks);
     return video_tick(s, clocks);
 }
 
@@ -729,6 +789,8 @@ static void ibm5150_reset(Ibm5150State *s) {
     mda_reset(&s->mda);
     if (s->has_fdc) { s->fdc.dor = 0; upd765_reset(&s->fdc); }
     if (s->has_hdc) ibm_hdc_reset(&s->hdc);
+    for (int i = 0; i < 2; i++)
+        if (s->has_com[i]) ins8250_reset(&s->com[i]);
     /* The PIT's outputs start high without a change callback; the PPI's
      * copy of timer 2 must match or POST's cassette test misses an edge. */
     s->ppi.timer2_out = i8253_out(&s->pit, 2);
@@ -818,6 +880,11 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     gemu_monitor_set_cpu_state_cb(s->monitor, ibm5150_mon_cpu_state, s);
     gemu_monitor_set_screendump_cb(s->monitor, ibm5150_screendump, s);
     gemu_monitor_bind(s->monitor, "sendkey", ibm5150_cmd_sendkey, s);
+    if (cfg->mouse_com) {
+        attach_mouse(s, cfg->mouse_com);
+        gemu_monitor_bind(s->monitor, "mouse_move", ibm5150_cmd_mouse_move, s);
+        gemu_monitor_bind(s->monitor, "mouse_button", ibm5150_cmd_mouse_button, s);
+    }
     attach_floppies(s);
     for (int u = 0; u < 4; u++)
         if (s->fdc.drive[u]) gemu_drive_attach_monitor(s->fdc.drive[u], s->monitor);
@@ -847,6 +914,7 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
             .aspect_h = s->vga == X86_VGA_MDA ? 3 : 0,
             .scale = cfg->display_scale > 0 ? cfg->display_scale : 1, /* 640x400 is big enough at 1x */
             .no_menu = true, /* full keyboard machine - no gamepad-style input menu */
+            .capture_pointer = s->has_mouse,
         };
         s->display = gemu_display_create(cfg->display_type, &dc);
         if (s->n_heads > 1) {
@@ -896,6 +964,9 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
             printf("  %s: %s\n", gemu_drive_name(s->fdc.drive[u]),
                    gemu_drive_inserted(s->fdc.drive[u]) ? gemu_drive_filename(s->fdc.drive[u])
                                                         : "(empty)");
+    if (s->has_mouse)
+        printf("  Mouse : Microsoft serial mouse on COM%d (click the window to capture, "
+               "Ctrl+Alt+G to release)\n", s->has_com[0] ? 1 : 2);
     if (s->has_hdc) {
         printf("  Fixed disk adapter: IBM, ROM at C8000h, IRQ 5, DMA 3\n");
         for (int u = 0; u < 2; u++)
@@ -935,6 +1006,14 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
         if (s->display) {
             gemu_display_poll(s->display);
             scan_keyboard(s);
+            if (s->has_mouse) {
+                GemuPointerState p = gemu_display_get_pointer(s->display);
+                /* a click shorter than a frame still counts: pressed says
+                 * the button went down since the last poll */
+                bool left = p.button || p.pressed, right = p.right_button || p.right_pressed;
+                if (p.rel_x || p.rel_y || left || right || s->mouse.left || s->mouse.right)
+                    msmouse_input(&s->mouse, p.rel_x, p.rel_y, left, right);
+            }
             video_present(s);
             gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor) || dead);
             if (gemu_display_should_quit(s->display)) running = false;

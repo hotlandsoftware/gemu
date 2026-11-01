@@ -74,7 +74,10 @@ static const GemuArgsDef def = {
         "                  Add the other card with -device mda[,phosphor=...] or\n"
         "                  -device cga for a second monitor; the View menu (or\n"
         "                  Ctrl+Alt+1/2) switches between them.\n"
-        "Not yet emulated: cassette, printer and serial ports.  Monitor:\n"
+        "\nMouse: -device msmouse[,port=com2]  Microsoft serial mouse on COM1\n"
+        "                  (or COM2), with its serial adapter.  Click the window\n"
+        "                  to capture the mouse, Ctrl+Alt+G to release it.\n"
+        "Not yet emulated: cassette, printer.  Monitor:\n"
         "'sendkey' types into the keyboard (sendkey PRINT spc 2+2 ret,\n"
         "sendkey ctrl-alt-delete); 'change floppy0 FILE' swaps diskettes.\n"
         "\nExample:\n"
@@ -186,6 +189,15 @@ int x86_setup(int argc, char *argv[]) {
                 }
                 cfg.hdc = X86_HDC_IBM;
                 cfg.hdc_opts = comma ? comma + 1 : NULL;
+                continue;
+            }
+            if (len == 7 && strncmp(dev, "msmouse", 7) == 0) {
+                cfg.mouse_com = 1;
+                if (comma && strcmp(comma + 1, "port=com2") == 0) cfg.mouse_com = 2;
+                else if (comma && strcmp(comma + 1, "port=com1") != 0) {
+                    fprintf(stderr, "gemu: -device msmouse takes port=com1 (default) or port=com2\n");
+                    return 1;
+                }
                 continue;
             }
             X86VgaType type;

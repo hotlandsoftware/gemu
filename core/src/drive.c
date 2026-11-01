@@ -26,6 +26,7 @@ struct GemuDrive {
     GemuDriveMedia media;
     bool           readonly;        /* as configured (cdrom is always read-only) */
     bool           snapshot;
+    bool           medium_ro;       /* this medium: a floppy image we may not write */
     bool           claimed;
     char           name[64];        /* id= or QEMU's default (ide0-hd0, ...) */
     char           file[512];       /* current medium, "" = empty */
@@ -72,6 +73,7 @@ static void close_medium(GemuDrive *d) {
     d->n_snap = 0;
     d->size = 0;
     d->file[0] = '\0';
+    d->medium_ro = false;
 }
 
 /* Open file as d's medium.  On failure leaves d empty and fills err. */
@@ -79,6 +81,16 @@ static bool open_medium(GemuDrive *d, const char *file, char *err, size_t err_le
     close_medium(d);
     bool ro = d->readonly || d->snapshot;
     FILE *f = fopen(file, ro ? "rb" : "r+b");
+    /* A floppy image without write permission is a write-protected
+     * diskette: writes fail as the drive reports them. */
+    if (!f && !ro && d->iface == GEMU_DRIVE_IF_FLOPPY &&
+        (errno == EACCES || errno == EPERM || errno == EROFS)) {
+        f = fopen(file, "rb");
+        if (f) {
+            d->medium_ro = true;
+            fprintf(stderr, "gemu: %s: '%s' is read-only, inserted write-protected\n", d->name, file);
+        }
+    }
     if (!f) {
         snprintf(err, err_len, "Could not open '%s': %s", file, strerror(errno));
         return false;
@@ -130,7 +142,7 @@ bool gemu_drive_read(GemuDrive *d, uint64_t off, void *buf, size_t len) {
 }
 
 bool gemu_drive_write(GemuDrive *d, uint64_t off, const void *buf, size_t len) {
-    if (!d || !d->f || d->readonly || off > d->size || len > d->size - off) return false;
+    if (!d || !d->f || d->readonly || d->medium_ro || off > d->size || len > d->size - off) return false;
     if (!d->snap) {
         bool ok = gemu_fseek(d->f, (long long)off, SEEK_SET) == 0 &&
                   fwrite(buf, 1, len, d->f) == len;
@@ -158,7 +170,7 @@ const char *gemu_drive_name(const GemuDrive *d)     { return d ? d->name : ""; }
 const char *gemu_drive_filename(const GemuDrive *d) { return d ? d->file : ""; }
 GemuDriveMedia gemu_drive_media(const GemuDrive *d) { return d ? d->media : GEMU_DRIVE_MEDIA_DISK; }
 bool gemu_drive_inserted(const GemuDrive *d)        { return d && d->f; }
-bool gemu_drive_readonly(const GemuDrive *d)        { return d && d->readonly; }
+bool gemu_drive_readonly(const GemuDrive *d)        { return d && (d->readonly || d->medium_ro); }
 uint64_t gemu_drive_size(const GemuDrive *d)        { return d && d->f ? d->size : 0; }
 
 static bool removable(const GemuDrive *d) {
@@ -211,7 +223,7 @@ static void mon_status(void *ud, char *buf, size_t len) {
     if (!d->f)
         snprintf(buf, len, "[not inserted]");
     else
-        snprintf(buf, len, "%s (raw%s%s)", d->file, d->readonly ? ", read-only" : "",
+        snprintf(buf, len, "%s (raw%s%s)", d->file, d->readonly || d->medium_ro ? ", read-only" : "",
                  d->snapshot ? ", snapshot" : "");
 }
 

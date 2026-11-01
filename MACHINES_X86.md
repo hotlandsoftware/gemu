@@ -11,7 +11,7 @@
 
 | Name | Full name | Status | Notes |
 |------|-----------|--------|-------|
-| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA or MDA (`-vga mda`), or both on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`). No cassette, printer, serial yet |
+| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA or MDA (`-vga mda`), or both on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`). No cassette, printer yet |
 
 ## IBM 5150 hardware
 
@@ -24,6 +24,7 @@
 | CGA | 40/80-column text, 320x200 4-color, 640x200 2-color; retrace timing |
 | MDA | 80x25 monochrome text in 9x14 cells (720x350, 4:3); monitor phosphor `-vga mda,phosphor=green|amber|white` (default green, the IBM 5151); underline/intense/reverse/blink attributes; 50 Hz timing |
 | uPD765 FDC | diskette adapter with up to 4 drives via `-drive if=floppy` / `-fda` (see docs/drive.md); DMA channel 2, IRQ6 |
+| INS8250 UART | asynchronous communications adapter: COM1 (3F8h, IRQ4) / COM2 (2F8h, IRQ3), all registers, interrupts through OUT2, loopback, character timing from the divisor |
 | Fixed disk adapter | IBM's Xebec card: two drives via `-hda` / `-hdb`, ports 320h-323h, ROM at C8000h, DMA channel 3, IRQ5; the adapter's command set, drive timing (below) |
 
 The DIP switches follow `-m` (64K default). The 19OCT81 BIOS can use up to
@@ -84,6 +85,20 @@ format sets it), and seeks of 3 ms plus 0.66 ms a cylinder, as the ST-412's
 are.  FORMAT's surface check of a 10 MB disk takes about three minutes, as
 it did on an XT.  On a cold boot the ROM sets the BIOS clock ahead by about
 23 s while it waits for a second drive, so DOS's time starts there.
+
+## Mouse
+
+`-device msmouse` connects a Microsoft serial mouse, with the serial adapter
+it plugs into, on COM1 (`-device msmouse,port=com2` for COM2).  It's the
+mouse Windows 1.01 Setup calls "Microsoft Mouse (Bus/Serial)", and the
+serial mouse DOS mouse drivers find.  The mouse runs on the power it draws
+from DTR and RTS, answers 'M' when they come up, and reports in
+three-byte packets at 1200 baud.
+
+Click the window to capture the host mouse; Ctrl+Alt+G (as in QEMU) or
+Ctrl+middle-click releases it.
+The monitor's `mouse_move DX DY` and `mouse_button STATE` (1 left, 4 right)
+work as in QEMU.
 
 ## CPU test suite
 

@@ -328,7 +328,7 @@ static int event_head(const SdlBackend *b, const SDL_Event *ev) {
 static void sdl_update_capture_title(GemuDisplay *d, SdlBackend *b) {
     char title[200];
     if (b->mouse_captured)
-        snprintf(title, sizeof(title), "%s - Press Ctrl-Middle Click To Release Input",
+        snprintf(title, sizeof(title), "%s - Press Ctrl+Alt+G To Release Input",
                  d->title[0] ? d->title : "GEMU");
     else
         snprintf(title, sizeof(title), "%s", d->title[0] ? d->title : "GEMU");
@@ -427,6 +427,13 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             continue;
         }
 
+        /* Ctrl+Alt+G releases a captured mouse, as in QEMU */
+        if (ev.type == SDL_KEYDOWN && b->mouse_captured && ev.key.keysym.sym == SDLK_g &&
+            (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_ALT)) {
+            sdl_set_mouse_captured(d, b, false);
+            continue;
+        }
+
         /* Ctrl+Alt+1..9 switches monitors, as in QEMU */
         if (ev.type == SDL_KEYDOWN && d->n_heads > 1 &&
             (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_ALT) &&
@@ -435,7 +442,14 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             continue;
         }
 
-        if (b->menubar) {
+        /* A captured mouse belongs to the guest.  (SDL still tracks a hidden
+         * cursor in relative mode, pinned to the window's edges, so near the
+         * top it would otherwise land on the menu bar and the bar would take
+         * the guest's clicks.) */
+        bool guest_mouse = b->mouse_captured &&
+            (ev.type == SDL_MOUSEMOTION || ev.type == SDL_MOUSEBUTTONDOWN ||
+             ev.type == SDL_MOUSEBUTTONUP || ev.type == SDL_MOUSEWHEEL);
+        if (b->menubar && !guest_mouse) {
             /* The menu key - Ctrl+Shift+Tab on every machine, the binding
              * screen's "Menu" key (Tab) or controller button where the guest
              * has no keyboard to type it on - puts focus on the menu bar. */

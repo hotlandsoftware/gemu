@@ -6,6 +6,8 @@
 #include "i8255.h"
 #include "upd765.h"
 #include "ibm_hdc.h"
+#include "ins8250.h"
+#include "msmouse.h"
 #include "cga.h"
 #include "mda.h"
 #include "pcspk.h"
@@ -57,6 +59,11 @@ typedef struct Ibm5150State {
     bool      has_hdc;
     uint8_t   hdc_rom[IBM5150_HDC_ROM_MAX];
     uint32_t  hdc_rom_size;
+    Ins8250   com[2];     /* asynchronous communications adapters: COM1, COM2 */
+    bool      has_com[2];
+    MsMouse   mouse;      /* -device msmouse, on one of them */
+    bool      has_mouse;
+    uint8_t   mouse_buttons; /* set by the monitor's mouse_button */
     uint8_t   nmi_mask;  /* port 0xA0 */
 
     Ibm5150IoLogEnt iolog[IBM5150_IOLOG_N];
