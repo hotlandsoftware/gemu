@@ -122,7 +122,7 @@ FAMILY_SRC = {
         'hardware/device/i8253.c', 'hardware/device/i8255.c', 'hardware/device/ibm_hdc.c',
         'hardware/device/ins8250.c', 'hardware/device/msmouse.c',
         'hardware/machine/x86/machine_ibm5150.c', 'audio/pcspk.c',
-        'vga/x86/cga.c', 'vga/x86/cgafont8x8.c', 'vga/x86/mda.c', 'vga/x86/mdafont8x14.c',
+        'vga/x86/cga.c', 'vga/x86/cgafont8x8.c', 'vga/x86/mda.c', 'vga/x86/mdafont8x14.c', 'vga/x86/hercules.c',
         'vga/multi/input_menu.c',
         'hardware/romdb.c',
         'src/x86_setup.c',

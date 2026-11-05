@@ -10,6 +10,7 @@
 #include "msmouse.h"
 #include "cga.h"
 #include "mda.h"
+#include "hercules.h"
 #include "pcspk.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
@@ -50,6 +51,8 @@ typedef struct Ibm5150State {
                                  * second one (-device), each on its own monitor */
     CgaDevice cga;
     MdaDevice mda;
+    HerculesDevice herc;
+    bool      has_herc;
     int       n_heads;    /* monitors: 1, or 2 with both cards */
     X86VgaType head_card[2]; /* card shown on each monitor, primary first */
     int       fb_w, fb_h; /* the shown card's framebuffer size */

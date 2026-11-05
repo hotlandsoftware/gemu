@@ -11,7 +11,7 @@
 
 | Name | Full name | Status | Notes |
 |------|-----------|--------|-------|
-| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA or MDA (`-vga mda`), or both on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`). No cassette, printer yet |
+| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA, MDA (`-vga mda`) or Hercules (`-vga hercules`), or a colour and a monochrome card on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`). No cassette, printer yet |
 
 ## IBM 5150 hardware
 
@@ -23,6 +23,7 @@
 | 8255 PPI | 5150 wiring: SW1/SW2 DIP switches, keyboard handshake and reset, speaker |
 | CGA | 40/80-column text, 320x200 4-color, 640x200 2-color; retrace timing |
 | MDA | 80x25 monochrome text in 9x14 cells (720x350, 4:3); monitor phosphor `-vga mda,phosphor=green|amber|white` (default green, the IBM 5151); underline/intense/reverse/blink attributes; 50 Hz timing |
+| Hercules | MDA-compatible text plus 720x348 graphics; 64K in two pages (the second at B8000 only when 3BFh enables it), configuration switch, vertical retrace in status bit 7; timing from the CRTC (9 or 16 dots per character), so graphics mode runs at ~50.9 Hz; same phosphors as the MDA |
 | uPD765 FDC | diskette adapter with up to 4 drives via `-drive if=floppy` / `-fda` (see docs/drive.md); DMA channel 2, IRQ6 |
 | INS8250 UART | asynchronous communications adapter: COM1 (3F8h, IRQ4) / COM2 (2F8h, IRQ3), all registers, interrupts through OUT2, loopback, character timing from the divisor |
 | Fixed disk adapter | IBM's Xebec card: two drives via `-hda` / `-hdb`, ports 320h-323h, ROM at C8000h, DMA channel 3, IRQ5; the adapter's command set, drive timing (below) |
@@ -43,6 +44,13 @@ once - they use different memory (B8000 vs B0000) and ports (3Dx vs 3Bx).
 ```
 ./bin/gemu -M ibm5150 -rom roms/ -vga cga -device mda,phosphor=amber
 ```
+
+The monochrome card can also be a Hercules Graphics Card (`-vga hercules` or
+`-device hercules`, with the same `phosphor=` option).  It's an MDA until a
+program enables graphics through its configuration port; with the second
+page enabled it also decodes B8000, where it collides with a CGA, as on
+real hardware (GEMU sends writes to both cards and returns the CGA's
+reads).  The MDA and the Hercules share ports, so only one fits.
 
 The window shows one monitor at a time: **View → Monitor 1 / Monitor 2**, or
 Ctrl+Alt+1 / Ctrl+Alt+2 as in QEMU.  **View → Detach ... to new window** puts

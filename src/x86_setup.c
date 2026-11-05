@@ -69,9 +69,11 @@ static const GemuArgsDef def = {
         "                  (5000059: 5, 10, 15 or 26 MB); type0=/type1=N choose\n"
         "                  one, romfile=FILE another ROM, interleave=N (default 6)\n"
         "                  how unformatted images are laid out.\n"
-        "\nVideo: -vga cga (default) or -vga mda[,phosphor=green|amber|white]\n"
-        "                  (the MDA's monitor: IBM 5151 green, amber or white).\n"
-        "                  Add the other card with -device mda[,phosphor=...] or\n"
+        "\nVideo: -vga cga (default), -vga mda[,phosphor=green|amber|white]\n"
+        "                  (the monochrome monitor: IBM 5151 green, amber or white)\n"
+        "                  or -vga hercules[,phosphor=...] (Hercules Graphics Card).\n"
+        "                  Add a monochrome card beside the CGA, or the CGA beside\n"
+        "                  one, with -device mda|hercules[,phosphor=...] or\n"
         "                  -device cga for a second monitor; the View menu (or\n"
         "                  Ctrl+Alt+1/2) switches between them.\n"
         "\nMouse: -device msmouse[,port=com2]  Microsoft serial mouse on COM1\n"
@@ -156,8 +158,8 @@ int x86_setup(int argc, char *argv[]) {
         if (strcmp(args.cpu, "8086") == 0) cfg.cpu = X86_CPU_8086;
         else if (strcmp(args.cpu, "8088") == 0) cfg.cpu = X86_CPU_8088;
     }
-    if (args.vga && strcmp(args.vga, "mda") == 0) {
-        cfg.vga = X86_VGA_MDA;
+    if (args.vga && (strcmp(args.vga, "mda") == 0 || strcmp(args.vga, "hercules") == 0)) {
+        cfg.vga = strcmp(args.vga, "mda") == 0 ? X86_VGA_MDA : X86_VGA_HERCULES;
         cfg.vga_opts = args.vga_opts;
     } else if (args.vga_opts) {
         fprintf(stderr, "gemu: -vga %s takes no options\n", args.vga);
@@ -203,12 +205,13 @@ int x86_setup(int argc, char *argv[]) {
             X86VgaType type;
             if (len == 3 && strncmp(dev, "mda", 3) == 0)      type = X86_VGA_MDA;
             else if (len == 3 && strncmp(dev, "cga", 3) == 0) type = X86_VGA_CGA;
+            else if (len == 8 && strncmp(dev, "hercules", 8) == 0) type = X86_VGA_HERCULES;
             else {
                 fprintf(stderr, "gemu: unknown x86 device '%.*s' (use -device ? to list)\n",
                         (int)len, dev);
                 return 1;
             }
-            if (comma && type != X86_VGA_MDA) {
+            if (comma && !x86_vga_mono(type)) {
                 fprintf(stderr, "gemu: -device cga takes no options\n");
                 return 1;
             }
@@ -241,10 +244,11 @@ int x86_setup(int argc, char *argv[]) {
         return 1;
     }
 
-    if (cfg.has_vga2 && cfg.vga2 == cfg.vga) {
-        fprintf(stderr, "gemu: -device %s: that card is already the -vga adapter "
-                        "(the second card must be the other of cga/mda)\n",
-                cfg.vga2 == X86_VGA_MDA ? "mda" : "cga");
+    if (cfg.has_vga2 && x86_vga_mono(cfg.vga2) == x86_vga_mono(cfg.vga)) {
+        static const char *const names[] = { "cga", "mda", "hercules" };
+        fprintf(stderr, "gemu: -device %s: can't go with -vga %s (one colour card, cga, and "
+                        "one monochrome card, mda or hercules, which share ports)\n",
+                names[cfg.vga2], names[cfg.vga]);
         return 1;
     }
 

@@ -28,8 +28,20 @@
  * each, each driving its own monitor (the BIOS starts on the one the DIP
  * switches name; DOS's MODE MONO / MODE CO80 switch between them). */
 
-/* VRAM windows: MDA B0000-B7FFF (4K mirrored), CGA B8000-BBFFF. */
+/* VRAM windows: MDA B0000-B7FFF (4K mirrored), CGA B8000-BBFFF, Hercules
+ * B0000-B7FFF and, when configured for it, B8000-BFFFF.  A Hercules set to
+ * its second page beside a CGA has both cards answering at B8000: the
+ * writes reach both, and the CGA's reads are what comes back. */
+static bool herc_mem(const Ibm5150State *s, uint32_t addr) {
+    return s->has_herc && addr >= IBM5150_MDA_BASE &&
+           hercules_mem_decoded(&s->herc, addr - IBM5150_MDA_BASE);
+}
+
 static bool video_mem_read(const Ibm5150State *s, uint32_t addr, uint8_t *val) {
+    if (herc_mem(s, addr) && !(s->has_cga && addr >= IBM5150_CGA_BASE && addr < IBM5150_CGA_END)) {
+        *val = hercules_mem_read(&s->herc, addr - IBM5150_MDA_BASE);
+        return true;
+    }
     if (s->has_mda && addr >= IBM5150_MDA_BASE && addr < IBM5150_MDA_END) {
         *val = mda_mem_read(&s->mda, addr - IBM5150_MDA_BASE);
         return true;
@@ -42,6 +54,10 @@ static bool video_mem_read(const Ibm5150State *s, uint32_t addr, uint8_t *val) {
 }
 
 static bool video_mem_write(Ibm5150State *s, uint32_t addr, uint8_t val) {
+    if (herc_mem(s, addr)) {
+        hercules_mem_write(&s->herc, addr - IBM5150_MDA_BASE, val);
+        if (!(s->has_cga && addr >= IBM5150_CGA_BASE && addr < IBM5150_CGA_END)) return true;
+    }
     if (s->has_mda && addr >= IBM5150_MDA_BASE && addr < IBM5150_MDA_END) {
         mda_mem_write(&s->mda, addr - IBM5150_MDA_BASE, val);
         return true;
@@ -59,6 +75,11 @@ static bool mda_port(const Ibm5150State *s, uint16_t port) {
     return s->has_mda && port >= 0x3B0 && port <= 0x3BB;
 }
 
+/* Hercules: the MDA's, and its configuration switch at 0x3BF. */
+static bool herc_port(const Ibm5150State *s, uint16_t port) {
+    return s->has_herc && ((port >= 0x3B0 && port <= 0x3BB) || port == 0x3BF);
+}
+
 static bool cga_port(const Ibm5150State *s, uint16_t port) {
     return s->has_cga && port >= 0x3D0 && port <= 0x3DF;
 }
@@ -66,8 +87,9 @@ static bool cga_port(const Ibm5150State *s, uint16_t port) {
 /* Both cards run; the primary's frames pace the machine. */
 static bool video_tick(Ibm5150State *s, uint32_t clocks) {
     bool mda_frame = s->has_mda && mda_tick(&s->mda, clocks);
+    bool herc_frame = s->has_herc && hercules_tick(&s->herc, clocks, IBM5150_CPU_HZ);
     bool cga_frame = s->has_cga && cga_tick(&s->cga, clocks);
-    return s->vga == X86_VGA_MDA ? mda_frame : cga_frame;
+    return s->vga == X86_VGA_MDA ? mda_frame : s->vga == X86_VGA_HERCULES ? herc_frame : cga_frame;
 }
 
 /* The card on the monitor the window shows (View menu). */
@@ -81,6 +103,10 @@ static void render_card(Ibm5150State *s, X86VgaType card) {
         s->fb_w = MDA_WIDTH;
         s->fb_h = MDA_HEIGHT;
         mda_render(&s->mda, s->fb, mdafont8x14);
+    } else if (card == X86_VGA_HERCULES) {
+        s->fb_w = HERCULES_WIDTH;
+        s->fb_h = HERCULES_HEIGHT;
+        hercules_render(&s->herc, s->fb, mdafont8x14);
     } else {
         s->fb_w = IBM5150_CGA_FB_W;
         s->fb_h = IBM5150_CGA_FB_H;
@@ -270,6 +296,7 @@ static uint8_t io_read8(uint16_t port, void *ud) {
     if (port >= 0x60 && port <= 0x63) return i8255_io_read(&s->ppi, port);
     if (port >= 0x80 && port <= 0x83) return i8237_page_read(&s->dma, port);
     if (mda_port(s, port)) return mda_io_read(&s->mda, port);
+    if (herc_port(s, port)) return hercules_io_read(&s->herc, port);
     if (cga_port(s, port)) return cga_io_read(&s->cga, port);
     if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) return upd765_read(&s->fdc, port);
     if (s->has_hdc && port >= 0x320 && port <= 0x323) return ibm_hdc_read(&s->hdc, port - 0x320);
@@ -302,6 +329,7 @@ static void io_write8(uint16_t port, uint8_t val, void *ud) {
     if (port >= 0x80 && port <= 0x83) { i8237_page_write(&s->dma, port, val); return; }
     if (port >= 0xA0 && port <= 0xAF) { s->nmi_mask = val; return; }
     if (mda_port(s, port)) { mda_io_write(&s->mda, port, val); return; }
+    if (herc_port(s, port)) { hercules_io_write(&s->herc, port, val); return; }
     if (cga_port(s, port)) { cga_io_write(&s->cga, port, val); return; }
     if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) { upd765_write(&s->fdc, port, val); return; }
     if (s->has_hdc && port >= 0x320 && port <= 0x323) { ibm_hdc_write(&s->hdc, port - 0x320, val); return; }
@@ -629,7 +657,7 @@ static uint32_t configure_switches(Ibm5150State *s, uint32_t ram) {
     uint32_t blocks = kb > 64 ? (kb - 64) / 32 : 0;
     if (blocks > 15) blocks = 15;
     s->ppi.sw1 = (uint8_t)(((planar / 16 - 1) << 2) |
-                           (s->vga == X86_VGA_MDA ? 0x30 : 0x20));   /* mono / 80x25 color */
+                           (x86_vga_mono(s->vga) ? 0x30 : 0x20));   /* mono / 80x25 color */
     s->ppi.sw2 = (uint8_t)blocks;
     return (planar + blocks * 32) << 10;
 }
@@ -787,6 +815,7 @@ static void ibm5150_reset(Ibm5150State *s) {
     i8255_reset(&s->ppi);
     cga_reset(&s->cga);
     mda_reset(&s->mda);
+    hercules_reset(&s->herc);
     if (s->has_fdc) { s->fdc.dor = 0; upd765_reset(&s->fdc); }
     if (s->has_hdc) ibm_hdc_reset(&s->hdc);
     for (int i = 0; i < 2; i++)
@@ -818,11 +847,14 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     }
     for (int i = 0; i < s->n_heads; i++) {
         if (s->head_card[i] == X86_VGA_CGA) { s->has_cga = true; continue; }
-        s->has_mda = true;
+        bool herc = s->head_card[i] == X86_VGA_HERCULES;
+        if (herc) s->has_herc = true;
+        else      s->has_mda = true;
         const char *opts = i == 0 ? cfg->vga_opts : cfg->vga2_opts;
         char err[160];
-        if (!mda_set_options(&s->mda, opts, err, sizeof(err))) {
-            fprintf(stderr, "gemu: %s mda: %s\n", i == 0 ? "-vga" : "-device", err);
+        if (herc ? !hercules_set_options(&s->herc, opts, err, sizeof(err))
+                 : !mda_set_options(&s->mda, opts, err, sizeof(err))) {
+            fprintf(stderr, "gemu: %s: %s\n", i == 0 ? "-vga" : "-device", err);
             free(s);
             return NULL;
         }
@@ -867,8 +899,8 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     s->pit.out_changed = pit_out_changed;
     s->pit.ud = s;
 
-    s->fb_w = s->vga == X86_VGA_MDA ? MDA_WIDTH  : IBM5150_CGA_FB_W;
-    s->fb_h = s->vga == X86_VGA_MDA ? MDA_HEIGHT : IBM5150_CGA_FB_H;
+    s->fb_w = x86_vga_mono(s->vga) ? MDA_WIDTH  : IBM5150_CGA_FB_W;   /* Hercules: the same */
+    s->fb_h = x86_vga_mono(s->vga) ? MDA_HEIGHT : IBM5150_CGA_FB_H;
     /* big enough for either card's picture */
     s->fb = calloc((size_t)MDA_WIDTH * IBM5150_CGA_FB_H, sizeof(uint32_t));
     if (!s->fb) { free(s->ram); free(s); return NULL; }
@@ -910,8 +942,8 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
             .monitor = s->monitor,
             /* The MDA's 720x350 filled a 4:3 monitor; CGA's 640x400 is drawn
              * with doubled scanlines and already has its shape. */
-            .aspect_w = s->vga == X86_VGA_MDA ? 4 : 0,
-            .aspect_h = s->vga == X86_VGA_MDA ? 3 : 0,
+            .aspect_w = x86_vga_mono(s->vga) ? 4 : 0,
+            .aspect_h = x86_vga_mono(s->vga) ? 3 : 0,
             .scale = cfg->display_scale > 0 ? cfg->display_scale : 1, /* 640x400 is big enough at 1x */
             .no_menu = true, /* full keyboard machine - no gamepad-style input menu */
             .capture_pointer = s->has_mouse,
@@ -920,9 +952,10 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
         if (s->n_heads > 1) {
             GemuDisplayHead heads[2];
             for (int i = 0; i < 2; i++) {
-                bool mda = s->head_card[i] == X86_VGA_MDA;
+                bool mda = x86_vga_mono(s->head_card[i]);
                 static char names[2][32];
-                snprintf(names[i], sizeof(names[i]), "Monitor %d (%s)", i + 1, mda ? "MDA" : "CGA");
+                snprintf(names[i], sizeof(names[i]), "Monitor %d (%s)", i + 1,
+                         s->head_card[i] == X86_VGA_HERCULES ? "Hercules" : mda ? "MDA" : "CGA");
                 heads[i] = (GemuDisplayHead){
                     .name = names[i],
                     .width = mda ? MDA_WIDTH : IBM5150_CGA_FB_W,
@@ -949,15 +982,27 @@ void ibm5150_destroy(Ibm5150State *s) {
     free(s);
 }
 
+static const char *card_name(X86VgaType t) {
+    return t == X86_VGA_MDA ? "MDA (monochrome)" : t == X86_VGA_HERCULES ? "Hercules (monochrome)" : "CGA";
+}
+
+static const char *video_desc(const Ibm5150State *s) {
+    static char buf[128];
+    if (s->n_heads > 1)
+        snprintf(buf, sizeof(buf), "%s + %s, View menu switches monitors",
+                 card_name(s->head_card[0]), card_name(s->head_card[1]));
+    else
+        snprintf(buf, sizeof(buf), "%s", card_name(s->vga));
+    return buf;
+}
+
 void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
     printf("gemu-x86: IBM PC 5150\n"
            "  RAM   : %u KiB\n"
            "  Video : %s\n"
            "  BASIC : %s\n",
            s->ram_size >> 10,
-           s->n_heads > 1 ? (s->vga == X86_VGA_MDA ? "MDA (monochrome) + CGA, View menu switches monitors"
-                                                   : "CGA + MDA (monochrome), View menu switches monitors")
-                          : s->vga == X86_VGA_MDA ? "MDA (monochrome)" : "CGA",
+           video_desc(s),
            s->has_basic ? "Cassette BASIC present" : "(none loaded)");
     for (int u = 0; u < 4; u++)
         if (s->fdc.drive[u])
@@ -1023,7 +1068,9 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
             }
 
             /* Pace to the adapter's frame rate (CGA 59.92 Hz, MDA 49.8 Hz). */
-            uint32_t frame_clocks = s->vga == X86_VGA_MDA ? MDA_CLOCKS_PER_FRAME
+            uint32_t frame_clocks = s->vga == X86_VGA_HERCULES
+                                    ? hercules_clocks_per_frame(&s->herc, IBM5150_CPU_HZ)
+                                  : s->vga == X86_VGA_MDA ? MDA_CLOCKS_PER_FRAME
                                                          : CGA_CLOCKS_PER_FRAME;
             next_frame += perf_hz * frame_clocks / IBM5150_CPU_HZ;
             uint64_t now = SDL_GetPerformanceCounter();

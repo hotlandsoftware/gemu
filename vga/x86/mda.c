@@ -26,7 +26,13 @@ void mda_reset(MdaDevice *m) {
     m->phosphor = phosphor;
 }
 
-bool mda_set_options(MdaDevice *m, const char *opts, char *err, size_t err_len) {
+void mda_phosphor_colors(MdaPhosphor p, uint32_t *normal, uint32_t *bright) {
+    *normal = phosphors[p].normal;
+    *bright = phosphors[p].bright;
+}
+
+bool mda_parse_options(const char *card, const char *opts, MdaPhosphor *phosphor,
+                       char *err, size_t err_len) {
     char buf[128];
     snprintf(buf, sizeof(buf), "%s", opts ? opts : "");
     for (char *o = buf; o && *o; ) {
@@ -35,7 +41,7 @@ bool mda_set_options(MdaDevice *m, const char *opts, char *err, size_t err_len) 
         char *val = strchr(o, '=');
         if (val) *val++ = '\0';
         if (strcmp(o, "phosphor") != 0 || !val) {
-            snprintf(err, err_len, "unknown mda option '%s' (try phosphor=green|amber|white)", o);
+            snprintf(err, err_len, "unknown %s option '%s' (try phosphor=green|amber|white)", card, o);
             return false;
         }
         size_t i;
@@ -44,10 +50,14 @@ bool mda_set_options(MdaDevice *m, const char *opts, char *err, size_t err_len) 
             snprintf(err, err_len, "unknown phosphor '%s' (green, amber or white)", val);
             return false;
         }
-        m->phosphor = (MdaPhosphor)i;
+        *phosphor = (MdaPhosphor)i;
         o = next;
     }
     return true;
+}
+
+bool mda_set_options(MdaDevice *m, const char *opts, char *err, size_t err_len) {
+    return mda_parse_options("mda", opts, &m->phosphor, err, err_len);
 }
 
 uint8_t mda_io_read(MdaDevice *m, uint16_t port) {
@@ -101,23 +111,30 @@ bool mda_tick(MdaDevice *m, uint32_t clocks) {
 void mda_render(const MdaDevice *m, uint32_t *argb, const uint8_t *font8x14) {
     for (int i = 0; i < MDA_WIDTH * MDA_HEIGHT; i++) argb[i] = MDA_BLACK;
     if (!(m->mode_ctrl & 0x08)) return;                 /* video disabled */
-    const uint32_t normal = phosphors[m->phosphor].normal;
-    const uint32_t bright = phosphors[m->phosphor].bright;
+    mda_draw_text(m->vram, MDA_VRAM_SIZE - 1, m->crtc, m->mode_ctrl, m->frame,
+                  m->phosphor, argb, font8x14);
+}
 
-    bool blink_enable = (m->mode_ctrl & 0x20) != 0;
-    bool char_blink_on = (m->frame & 16) != 0;          /* 32-frame cycle */
-    bool cursor_blink_on = (m->frame & 8) != 0;         /* 16-frame cycle */
-    uint16_t start  = (uint16_t)((m->crtc[12] << 8) | m->crtc[13]);
-    uint16_t cursor = (uint16_t)((m->crtc[14] << 8) | m->crtc[15]);
-    unsigned cur_start = m->crtc[10] & 0x1F, cur_end = m->crtc[11] & 0x1F;
-    bool cursor_off = (m->crtc[10] & 0x60) == 0x20;
+void mda_draw_text(const uint8_t *vram, uint32_t vram_mask, const uint8_t crtc[18],
+                   uint8_t mode_ctrl, uint32_t frame, MdaPhosphor phosphor,
+                   uint32_t *argb, const uint8_t *font8x14) {
+    const uint32_t normal = phosphors[phosphor].normal;
+    const uint32_t bright = phosphors[phosphor].bright;
+
+    bool blink_enable = (mode_ctrl & 0x20) != 0;
+    bool char_blink_on = (frame & 16) != 0;             /* 32-frame cycle */
+    bool cursor_blink_on = (frame & 8) != 0;            /* 16-frame cycle */
+    uint16_t start  = (uint16_t)((crtc[12] << 8) | crtc[13]);
+    uint16_t cursor = (uint16_t)((crtc[14] << 8) | crtc[15]);
+    unsigned cur_start = crtc[10] & 0x1F, cur_end = crtc[11] & 0x1F;
+    bool cursor_off = (crtc[10] & 0x60) == 0x20;
 
     for (int row = 0; row < 25; row++) {
         for (int col = 0; col < 80; col++) {
             uint16_t pos = (uint16_t)(start + row * 80 + col);
             uint32_t cell = (uint32_t)pos * 2u;
-            uint8_t ch   = m->vram[cell & (MDA_VRAM_SIZE - 1)];
-            uint8_t attr = m->vram[(cell + 1) & (MDA_VRAM_SIZE - 1)];
+            uint8_t ch   = vram[cell & vram_mask];
+            uint8_t attr = vram[(cell + 1) & vram_mask];
 
             /* Attribute decoding, as the MDA's attribute logic does it. */
             uint32_t fg, bg = MDA_BLACK;

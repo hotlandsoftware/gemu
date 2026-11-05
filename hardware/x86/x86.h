@@ -12,7 +12,12 @@ typedef enum {
 typedef enum {
     X86_VGA_CGA,
     X86_VGA_MDA,
+    X86_VGA_HERCULES,
 } X86VgaType;
+
+/* The MDA and Hercules both drive a monochrome monitor from ports
+ * 3B0h-3BFh: a PC has one of them, and a CGA beside it. */
+static inline bool x86_vga_mono(X86VgaType t) { return t == X86_VGA_MDA || t == X86_VGA_HERCULES; }
 
 #define X86_MAX_ROM_LOADS 8
 

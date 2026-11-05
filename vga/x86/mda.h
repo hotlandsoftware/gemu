@@ -58,3 +58,16 @@ bool    mda_tick(MdaDevice *m, uint32_t clocks);
 /* Render the screen into a 720x350 ARGB framebuffer (font: 256 glyphs x 14
  * bytes, MSB = leftmost pixel). */
 void    mda_render(const MdaDevice *m, uint32_t *argb, const uint8_t *font8x14);
+
+/* ── Shared with MDA-compatible cards (hercules.c) ───────────────────────── */
+
+/* "phosphor=green|amber|white" for the card named `card` (in messages). */
+bool    mda_parse_options(const char *card, const char *opts, MdaPhosphor *phosphor,
+                          char *err, size_t err_len);
+void    mda_phosphor_colors(MdaPhosphor p, uint32_t *normal, uint32_t *bright);
+/* Draw 80x25 MDA text - attributes, blink, cursor, the 9th column - into a
+ * 720x350 framebuffer, from vram (cells at (start + n) * 2, wrapped by
+ * vram_mask), the 6845's registers and the 3B8 mode control bits. */
+void    mda_draw_text(const uint8_t *vram, uint32_t vram_mask, const uint8_t crtc[18],
+                      uint8_t mode_ctrl, uint32_t frame, MdaPhosphor phosphor,
+                      uint32_t *argb, const uint8_t *font8x14);
