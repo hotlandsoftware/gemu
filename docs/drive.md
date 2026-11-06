@@ -1,4 +1,6 @@
-Disk images are attached the same way as in QEMU: with `-drive`, or with QEMU's shorthand options. Machines that predate this (NES Famicom Disk System, Atari 810) keep their own `-fda`/`-floppy`.
+Disk images are attached the same way as in QEMU: with `-drive`, or with QEMU's shorthand options.
+
+The NES's Famicom Disk System (`-device fds`) and the Atari 810 (`-device atari810`) take `-drive`, `-fda` and `-floppy` too. They read their own image formats (.fds, .atr), so `format=` isn't checked, and they keep their own write behaviour: FDS writes go to the game's save file, Atari writes stay in memory.
 
 # -drive
 ```
@@ -20,6 +22,8 @@ Disk images are attached the same way as in QEMU: with `-drive`, or with QEMU's 
 | `-cdrom FILE` | `-drive file=FILE,index=2,media=cdrom` |
 | `-fda`/`-fdb FILE` (also `-floppy`) | `-drive file=FILE,index=0..1,if=floppy` |
 | `-snapshot` | `snapshot=on` on every drive |
+
+As in QEMU, a machine can have default drives: the IBM 5150's drive A: (`floppy0`) is there and empty when no floppy drive is given, so you can insert a diskette later. `-nodefaults` turns default drives off.
 
 A drive the machine has no device for is an error ("machine type does not support if=...,bus=...,unit=..."), as in QEMU.
 

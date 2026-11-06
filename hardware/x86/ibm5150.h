@@ -62,6 +62,8 @@ typedef struct Ibm5150State {
     bool      has_hdc;
     uint8_t   hdc_rom[IBM5150_HDC_ROM_MAX];
     uint32_t  hdc_rom_size;
+    uint32_t  hdc_rom_mapped;   /* bytes on the bus at C8000h: 0 with rom=off */
+    uint8_t   hdc_irq;          /* IRQ jumper: 5 (IBM's setting) or 2 */
     Ins8250   com[2];     /* asynchronous communications adapters: COM1, COM2 */
     bool      has_com[2];
     MsMouse   mouse;      /* -device msmouse, on one of them */

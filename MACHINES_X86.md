@@ -24,7 +24,7 @@
 | CGA | 40/80-column text, 320x200 4-color, 640x200 2-color; retrace timing |
 | MDA | 80x25 monochrome text in 9x14 cells (720x350, 4:3); monitor phosphor `-vga mda,phosphor=green|amber|white` (default green, the IBM 5151); underline/intense/reverse/blink attributes; 50 Hz timing |
 | Hercules | MDA-compatible text plus 720x348 graphics; 64K in two pages (the second at B8000 only when 3BFh enables it), configuration switch, vertical retrace in status bit 7; timing from the CRTC (9 or 16 dots per character), so graphics mode runs at ~50.9 Hz; same phosphors as the MDA |
-| uPD765 FDC | diskette adapter with up to 4 drives via `-drive if=floppy` / `-fda` (see docs/drive.md); DMA channel 2, IRQ6 |
+| uPD765 FDC | diskette adapter with up to 4 drives via `-drive if=floppy` / `-fda` (see docs/drive.md); DMA channel 2, IRQ6. Without any, drive A: is there and empty (as QEMU's PC has an empty `floppy0`), so a diskette can be inserted later with `change floppy0 FILE` or Blocks → Change...; `-nodefaults` leaves the adapter out |
 | INS8250 UART | asynchronous communications adapter: COM1 (3F8h, IRQ4) / COM2 (2F8h, IRQ3), all registers, interrupts through OUT2, loopback, character timing from the divisor |
 | Fixed disk adapter | IBM's Xebec card: two drives via `-hda` / `-hdb`, ports 320h-323h, ROM at C8000h, DMA channel 3, IRQ5; the adapter's command set, drive timing (below) |
 
@@ -35,6 +35,24 @@ only uses 64K either way.
 ```
 ./bin/gemu -M ibm5150 -rom roms/
 ```
+
+GEMU sets the motherboard's DIP switches from the configuration: memory
+from `-m`, the display from `-vga`, the diskette drives from `-fda`/`-drive`.
+`-M ibm5150,KEY=VALUE,...` sets them differently, as you would on the
+board. The BIOS reads them at power-on.
+
+| Option | Switches | Effect |
+|--------|----------|--------|
+| `floppy=on\|off` | SW1-1 | diskette drives installed; off, POST skips them and boots Cassette BASIC |
+| `floppies=1-4` | SW1-7/8 | number of diskette drives; drives you haven't given are added empty |
+| `display=none\|cga40\|cga80\|mono` | SW1-5/6 | the display POST starts on: `cga40` boots in 40 columns |
+| `ram-switch=SIZE` | SW1-3/4, SW2 | memory the switches claim, 16K-544K, while `-m` stays what's fitted. Less makes POST faster; more fails POST's memory test |
+
+```
+./bin/gemu -M ibm5150,display=cga40,floppies=2 -rom roms/ -fda dos.img
+```
+
+The 8087 switch (SW1-2) isn't offered: GEMU doesn't emulate the 8087 yet.
 
 Two monitors: like the real machine, the 5150 can have a CGA and an MDA at
 once - they use different memory (B8000 vs B0000) and ports (3Dx vs 3Bx).
@@ -76,7 +94,10 @@ track):
 | 5000059 | 153x4, 5,326,848 bytes | 375x8, 26,112,000 | 306x6, 15,980,544 | 306x4, 10,653,696 |
 | 59X7291 | 306x4, 10,653,696 | 612x4, 21,307,392 | 615x4, 21,411,840 | 306x8, 21,307,392 |
 
-`type0=N` / `type1=N` pick between two types of the same size.  To set up
+`type0=N` / `type1=N` pick between two types of the same size.  The card's
+other jumpers are `irq=5|2` (IBM's ROM only works with 5, its default) and
+`rom=off`, which takes the ROM off the bus; the drive types still come from
+its table.  To set up
 a new disk, make an empty image of one of these sizes, then boot DOS from a
 diskette and run FDISK and `FORMAT C: /S`:
 

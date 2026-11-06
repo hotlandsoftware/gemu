@@ -51,6 +51,7 @@ static void print_usage(const GemuArgsDef *def) {
         printf("  %-14s CD-ROM (= -drive file=FILE,index=2,media=cdrom)\n", "-cdrom FILE");
         printf("  %-14s Floppies (= -drive file=FILE,index=0..1,if=floppy)\n", "-fda/-fdb FILE");
         printf("  %-14s Discard all disk writes on exit (snapshot=on everywhere)\n", "-snapshot");
+        printf("  %-14s Leave out the machine's default drives (QEMU syntax)\n", "-nodefaults");
     }
     printf("  %-14s Pause/halt instead of exiting on monitor shutdown\n", "-no-shutdown");
     printf("  %-14s Name the VM: window title becomes \"GEMU (NAME)\"\n", "-name NAME");
@@ -349,6 +350,7 @@ bool gemu_args_parse(int argc, char **argv,
                      const GemuArgsDef *def, GemuArgs *out,
                      int *rem_argc, char **rem_argv) {
     if (rem_argc) *rem_argc = 0;
+    if (def->block_devices && def->block_own_images) gemu_drive_set_own_images();
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -381,6 +383,10 @@ bool gemu_args_parse(int argc, char **argv,
             };
             if (strcmp(a, "-snapshot") == 0) {
                 gemu_drive_snapshot_all();
+                continue;
+            }
+            if (strcmp(a, "-nodefaults") == 0) {
+                gemu_drive_set_nodefaults();
                 continue;
             }
             bool handled = false;

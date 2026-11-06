@@ -13,6 +13,7 @@
 #include "gemu/gemu.h"
 #include "gemu/args.h"
 #include "gemu/monitor.h"
+#include "gemu/drive.h"
 #include <SDL2/SDL.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -122,6 +123,11 @@ static const GemuArgsDef def = {
                   | GEMU_DISP_F(GEMU_DISPLAY_CURSES)
 #endif
                   | GEMU_DISP_F(GEMU_DISPLAY_NONE),
+    /* -drive/-fda/-floppy: the NES's Famicom Disk System and the Atari
+     * 810 load their own .fds/.atr images from the drive's file. */
+    .block_devices    = true,
+    .block_default_if = GEMU_DRIVE_IF_FLOPPY,
+    .block_own_images = true,
     .extra_help =
         "\nArguments:\n"
         "  -m SIZE            Amount of memory i.e. 4K, 32K, 64K, 1M, etc.\n"
@@ -135,7 +141,9 @@ static const GemuArgsDef def = {
         "  -start ADDR        Override reset vector and start execution at ADDR\n"
         "  -cartridge FILE    Insert a cartridge\n"
         "  -symbols FILE      Load assembler labels for the monitor (DASM -s, VICE)\n"
-        "  -floppy FILE       Insert a floppy disk image (-fda is an alias)\n"
+        "  -fda FILE          Insert a floppy disk image (-floppy is an alias;\n"
+        "                     also -drive file=FILE[,if=floppy]): NES -device fds,\n"
+        "                     Atari 400/800 -device atari810\n"
         "  -tape [ADDR:]FILE  Insert a cassette tape\n"
 #ifdef HAVE_LUA
         "  -lua FILE          Run an FCEUX-Lua-subset script (NES only)\n"
@@ -612,9 +620,6 @@ int mos_setup(int argc, char *argv[]) {
             fprintf(stderr, "gemu: -lua: this build was compiled without Lua 5.1 support\n");
             return 1;
 #endif
-        } else if (strcmp(rem[i], "-fda") == 0 || strcmp(rem[i], "-floppy") == 0) {
-            if (i + 1 >= nrem) { fprintf(stderr, "gemu: %s requires an argument\n", rem[i]); return 1; }
-            cfg.fda_path = rem[++i];
         } else if (strcmp(rem[i], "-tape") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -tape requires an argument\n"); return 1; }
             const char *path = NULL;
@@ -758,6 +763,19 @@ int mos_setup(int argc, char *argv[]) {
             cfg.sound = MOS_SOUND_NONE;
     }
 
+    /* The floppy drive from -fda / -drive (gemu/drive.h): an empty one
+     * (-drive if=floppy) starts without a disk, as without -fda. */
+    GemuDrive *floppy0 = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, 0);
+    if (floppy0 && gemu_drive_filename(floppy0)[0])
+        cfg.fda_path = gemu_drive_filename(floppy0);
+    if (!gemu_drive_check_unclaimed(args.machine ? args.machine : "nes"))
+        return 1;
+    if (floppy0 && cfg.machine != MOS_MACHINE_NES && cfg.machine != MOS_MACHINE_ATARI400) {
+        fprintf(stderr, "gemu: -fda: machine type '%s' has no floppy drive\n",
+                args.machine ? args.machine : "?");
+        return 1;
+    }
+
     if (cfg.machine == MOS_MACHINE_NES) {
         if (!cfg.cart_path && !cfg.fds_enabled) {
             bool have_chips = cfg.is_arcade && cfg.n_roms > 0;
@@ -769,7 +787,7 @@ int mos_setup(int argc, char *argv[]) {
                 return 1;
             }
         }
-        if (cfg.fda_path && !cfg.fds_enabled && cfg.machine != MOS_MACHINE_ATARI400) {
+        if (floppy0 && !cfg.fds_enabled) {
             fprintf(stderr, "gemu: -fda requires -device fds\n");
             return 1;
         }
@@ -778,10 +796,10 @@ int mos_setup(int argc, char *argv[]) {
             fprintf(stderr, "gemu: atari2600 requires -cartridge FILE (a .bin/.a26 ROM image)\n");
             return 1;
         }
-    } else if (cfg.machine == MOS_MACHINE_ATARI400 &&
-               cfg.fda_path && !cfg.atari810) {
-        fprintf(stderr, "gemu: -floppy requires -device atari810\n");
+    } else if (cfg.machine == MOS_MACHINE_ATARI400 && floppy0 && !cfg.atari810) {
+        fprintf(stderr, "gemu: -fda requires -device atari810\n");
         return 1;
+
     } else if (cfg.machine != MOS_MACHINE_APPLE1) {
         if (cfg.n_roms == 0) {
             fprintf(stderr, "gemu: no ROM specified\n"

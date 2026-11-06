@@ -148,7 +148,7 @@ static uint8_t bus_read8(uint32_t addr, void *ud) {
         return s->basic[addr - IBM5150_BASIC_BASE];
     if (addr >= IBM5150_BIOS_BASE && addr < IBM5150_BIOS_BASE + IBM5150_BIOS_SIZE)
         return s->bios[addr - IBM5150_BIOS_BASE];
-    if (s->has_hdc && addr >= IBM5150_HDC_ROM_BASE && addr < IBM5150_HDC_ROM_BASE + s->hdc_rom_size)
+    if (s->has_hdc && addr >= IBM5150_HDC_ROM_BASE && addr < IBM5150_HDC_ROM_BASE + s->hdc_rom_mapped)
         return s->hdc_rom[addr - IBM5150_HDC_ROM_BASE];
     return 0xFF;
 }
@@ -175,7 +175,7 @@ static bool ibm5150_mon_read(void *ud, uint64_t addr, uint8_t *val) {
         *val = s->bios[addr - IBM5150_BIOS_BASE];
         return true;
     }
-    if (s->has_hdc && addr >= IBM5150_HDC_ROM_BASE && addr < IBM5150_HDC_ROM_BASE + s->hdc_rom_size) {
+    if (s->has_hdc && addr >= IBM5150_HDC_ROM_BASE && addr < IBM5150_HDC_ROM_BASE + s->hdc_rom_mapped) {
         *val = s->hdc_rom[addr - IBM5150_HDC_ROM_BASE];
         return true;
     }
@@ -366,7 +366,7 @@ static bool fdc_dma_to_mem(void *ud, uint8_t val, bool *tc) {
 
 static void hdc_set_irq(void *ud, bool level) {
     Ibm5150State *s = ud;
-    i8259_set_irq(&s->pic, 5, level);
+    i8259_set_irq(&s->pic, s->hdc_irq, level);
 }
 
 static bool hdc_dma_from_mem(void *ud, uint8_t *val, bool *tc) {
@@ -662,15 +662,79 @@ static uint32_t configure_switches(Ibm5150State *s, uint32_t ram) {
     return (planar + blocks * 32) << 10;
 }
 
-/* Floppy drives come from -drive if=floppy / -fda / -fdb: the diskette
- * adapter is installed when there's at least one, with as many drives as
- * the highest unit used (the 5150 supports four). */
-static void attach_floppies(Ibm5150State *s) {
+/* -M ibm5150,OPTS: DIP switch settings that override the ones worked out
+ * from the configuration.  -1 = not given. */
+typedef struct {
+    int floppy;      /* SW1-1: diskette drives installed (0/1) */
+    int floppies;    /* SW1-7/8: how many (1-4) */
+    int display;     /* SW1-5/6: 0 none, 1 CGA 40x25, 2 CGA 80x25, 3 monochrome */
+    long ram_kb;     /* SW1-3/4 + SW2: memory the switches claim */
+} Switches;
+
+static bool parse_switches(const char *opts, Switches *sw) {
+    *sw = (Switches){ -1, -1, -1, -1 };
+    if (!opts) return true;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", opts);
+    for (char *o = strtok(buf, ","); o; o = strtok(NULL, ",")) {
+        char *v = strchr(o, '=');
+        if (v) *v++ = '\0';
+        if (!v) {
+            fprintf(stderr, "gemu: -M ibm5150,%s: expected KEY=VALUE\n", o);
+            return false;
+        }
+        if (strcmp(o, "floppy") == 0 && (!strcmp(v, "on") || !strcmp(v, "off"))) {
+            sw->floppy = strcmp(v, "on") == 0;
+        } else if (strcmp(o, "floppies") == 0 && v[0] >= '1' && v[0] <= '4' && !v[1]) {
+            sw->floppies = v[0] - '0';
+        } else if (strcmp(o, "display") == 0) {
+            static const char *const names[] = { "none", "cga40", "cga80", "mono" };
+            for (int i = 0; i < 4; i++) if (strcmp(v, names[i]) == 0) sw->display = i;
+            if (sw->display < 0) {
+                fprintf(stderr, "gemu: -M ibm5150: display=none|cga40|cga80|mono\n");
+                return false;
+            }
+        } else if (strcmp(o, "ram-switch") == 0) {
+            char *end;
+            sw->ram_kb = strtol(v, &end, 10);
+            if (*end == 'K' || *end == 'k') end++;
+            if (*end || sw->ram_kb < 16 || sw->ram_kb > 544) {
+                fprintf(stderr, "gemu: -M ibm5150: ram-switch=16K-544K (what the switches can say)\n");
+                return false;
+            }
+        } else if (strcmp(o, "fpu") == 0) {
+            fprintf(stderr, "gemu: -M ibm5150: fpu= isn't available yet: GEMU doesn't emulate "
+                            "the 8087, and software trusting the switch would crash\n");
+            return false;
+        } else {
+            fprintf(stderr, "gemu: -M ibm5150: unknown switch '%s=%s' (floppy=on|off, "
+                            "floppies=1-4, display=none|cga40|cga80|mono, ram-switch=SIZE)\n", o, v);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Floppy drives come from -drive if=floppy / -fda / -fdb, with as many
+ * drives as the highest unit used (the 5150 supports four).  Without any,
+ * drive A: is there and empty, as QEMU's PC has an empty floppy0, so a
+ * diskette can be inserted later; -nodefaults leaves the diskette adapter
+ * out, and POST goes straight to Cassette BASIC.  floppies=N adds empty
+ * drives up to N. */
+static void attach_floppies(Ibm5150State *s, int want) {
     int count = 0;
     for (int u = 0; u < 4; u++) {
         s->fdc.drive[u] = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, u);
+        /* floppies=N: the drives it counts are there, empty if not given */
+        if (!s->fdc.drive[u] && u < want) {
+            char opts[32];
+            snprintf(opts, sizeof(opts), "if=floppy,index=%d", u);
+            if (gemu_drive_add(opts)) s->fdc.drive[u] = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, u);
+        }
         if (s->fdc.drive[u]) count = u + 1;
     }
+    if (!count && (s->fdc.drive[0] = gemu_drive_add_default(GEMU_DRIVE_IF_FLOPPY, 0)))
+        count = 1;
     if (!count) return;
     s->has_fdc = true;
     s->fdc.set_irq = fdc_set_irq;
@@ -719,7 +783,8 @@ static uint64_t hdc_type_bytes(const uint8_t *e) {
     return (uint64_t)(e[0] | e[1] << 8) * e[2] * IBM_HDC_SPT * IBM_HDC_SECTOR;
 }
 
-/* -device ibm-fixed-disk[,romfile=FILE][,interleave=N]: the card, its ROM
+/* -device ibm-fixed-disk[,romfile=FILE][,interleave=N][,irq=5|2][,rom=on|off]:
+ * the card, its ROM
  * (romfile=, or the one the ROM scan found: 5000059 before 59X7291) and
  * the drives from -hda/-hdb, each one's type jumpered to the table entry
  * its image is the size of. */
@@ -727,6 +792,8 @@ static bool attach_fixed_disk(Ibm5150State *s, const X86Config *cfg, const char 
     const char *romfile = scanned_rom;
     unsigned interleave = 6;   /* how IBM formatted these drives */
     int want_type[2] = { -1, -1 };
+    bool rom_on = true;
+    s->hdc_irq = 5;
     char opts[512];
     snprintf(opts, sizeof(opts), "%s", cfg->hdc_opts ? cfg->hdc_opts : "");
     for (char *o = strtok(opts, ","); o; o = strtok(NULL, ",")) {
@@ -740,9 +807,13 @@ static bool attach_fixed_disk(Ibm5150State *s, const X86Config *cfg, const char 
                 fprintf(stderr, "gemu: ibm-fixed-disk: interleave must be 1-16\n");
                 return false;
             }
+        } else if (strcmp(o, "irq=5") == 0 || strcmp(o, "irq=2") == 0) {
+            s->hdc_irq = (uint8_t)(o[4] - '0');
+        } else if (strcmp(o, "rom=on") == 0 || strcmp(o, "rom=off") == 0) {
+            rom_on = strcmp(o, "rom=on") == 0;
         } else {
-            fprintf(stderr, "gemu: ibm-fixed-disk: unknown option '%s' "
-                            "(romfile=, type0=0-3, type1=0-3, interleave=)\n", o);
+            fprintf(stderr, "gemu: ibm-fixed-disk: unknown option '%s' (romfile=, type0=0-3, "
+                            "type1=0-3, interleave=, irq=5|2, rom=on|off)\n", o);
             return false;
         }
     }
@@ -797,6 +868,9 @@ static bool attach_fixed_disk(Ibm5150State *s, const X86Config *cfg, const char 
         h->interleave[u] = (uint8_t)interleave;
         h->jumpers |= (uint8_t)(type << (u == 0 ? 2 : 0));
     }
+    /* rom=off: the ROM jumper out.  The drive types still come from the
+     * ROM's table - they're what the drive jumpers select. */
+    s->hdc_rom_mapped = rom_on ? s->hdc_rom_size : 0;
     h->clock_hz = IBM5150_CPU_HZ;
     h->set_irq = hdc_set_irq;
     h->dma_to_mem = hdc_dma_to_mem;
@@ -859,7 +933,16 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
             return NULL;
         }
     }
+    Switches sw;
+    if (!parse_switches(cfg->machine_opts, &sw)) { free(s); return NULL; }
     s->ram_size = configure_switches(s, ram);
+    if (sw.ram_kb > 0) {
+        /* switches claiming other than what's fitted: keep the RAM, set
+         * the switches from ram-switch= (more than fitted fails POST) */
+        uint32_t fitted = s->ram_size;
+        configure_switches(s, (uint32_t)sw.ram_kb << 10);
+        s->ram_size = fitted;
+    }
     s->ram = calloc(1, s->ram_size);
     if (!s->ram) { free(s); return NULL; }
 
@@ -917,7 +1000,17 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
         gemu_monitor_bind(s->monitor, "mouse_move", ibm5150_cmd_mouse_move, s);
         gemu_monitor_bind(s->monitor, "mouse_button", ibm5150_cmd_mouse_button, s);
     }
-    attach_floppies(s);
+    attach_floppies(s, sw.floppies);
+    if (sw.floppy >= 0)   s->ppi.sw1 = (uint8_t)((s->ppi.sw1 & ~0x01) | sw.floppy);
+    if (sw.floppies > 0)  s->ppi.sw1 = (uint8_t)((s->ppi.sw1 & ~0xC0) | (sw.floppies - 1) << 6);
+    if (sw.display >= 0)  s->ppi.sw1 = (uint8_t)((s->ppi.sw1 & ~0x30) | sw.display << 4);
+    if (cfg->machine_opts) {
+        static const char *const disp[] = { "none", "CGA 40x25", "CGA 80x25", "monochrome" };
+        printf("gemu: DIP switches: diskettes %s, %d drive(s), display %s, %u K\n",
+               s->ppi.sw1 & 1 ? "on" : "off", ((s->ppi.sw1 >> 6) & 3) + 1,
+               disp[(s->ppi.sw1 >> 4) & 3],
+               (((s->ppi.sw1 >> 2) & 3) + 1) * 16 + (s->ppi.sw2 & 0x1F) * 32);
+    }
     for (int u = 0; u < 4; u++)
         if (s->fdc.drive[u]) gemu_drive_attach_monitor(s->fdc.drive[u], s->monitor);
     if (cfg->hdc == X86_HDC_NONE &&
@@ -1013,7 +1106,8 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
         printf("  Mouse : Microsoft serial mouse on COM%d (click the window to capture, "
                "Ctrl+Alt+G to release)\n", s->has_com[0] ? 1 : 2);
     if (s->has_hdc) {
-        printf("  Fixed disk adapter: IBM, ROM at C8000h, IRQ 5, DMA 3\n");
+        printf("  Fixed disk adapter: IBM, %s, IRQ %u, DMA 3\n",
+               s->hdc_rom_mapped ? "ROM at C8000h" : "ROM disabled", s->hdc_irq);
         for (int u = 0; u < 2; u++)
             if (s->hdc.drive[u])
                 printf("  %s: %s (%u cylinders, %u heads, drive type %u)\n",

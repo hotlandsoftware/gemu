@@ -60,15 +60,21 @@ static const GemuArgsDef def = {
         "                  uses up to 544K, and POST takes ~50 s to test that)\n"
         "\nDiskettes: -fda/-fdb FILE or -drive file=FILE,if=floppy[,index=N]\n"
         "                  (160K/180K/320K/360K images; up to 4 drives).\n"
-        "                  With a drive in A: POST boots from it, otherwise\n"
-        "                  into Cassette BASIC.\n"
+        "                  Without one, A: is an empty drive (insert a diskette\n"
+        "                  with change floppy0 FILE or Blocks > Change..., then\n"
+        "                  reset); -nodefaults leaves the adapter out.  With no\n"
+        "                  diskette POST goes into Cassette BASIC.\n"
         "\nHard disks: -device ibm-fixed-disk -hda FILE [-hdb FILE]\n"
         "                  The IBM Fixed Disk Adapter (needs the 10/27/82 BIOS and\n"
         "                  the adapter ROM, found by -rom roms/ibm5150).  Each\n"
         "                  image's size picks its drive type from the ROM's table\n"
         "                  (5000059: 5, 10, 15 or 26 MB); type0=/type1=N choose\n"
         "                  one, romfile=FILE another ROM, interleave=N (default 6)\n"
-        "                  how unformatted images are laid out.\n"
+        "                  how unformatted images are laid out; irq=5|2 and\n"
+        "                  rom=off are the card's other jumpers.\n"
+        "\nDIP switches: -M ibm5150,floppy=on|off,floppies=1-4,\n"
+        "                  display=none|cga40|cga80|mono,ram-switch=SIZE\n"
+        "                  override the ones set from -m, -vga and the drives.\n"
         "\nVideo: -vga cga (default), -vga mda[,phosphor=green|amber|white]\n"
         "                  (the monochrome monitor: IBM 5151 green, amber or white)\n"
         "                  or -vga hercules[,phosphor=...] (Hercules Graphics Card).\n"
@@ -132,10 +138,7 @@ int x86_setup(int argc, char *argv[]) {
     if (!gemu_args_parse(argc, argv, &def, &args, &nrem, rem))
         return 1;
     gemu_monitor_set_default(args.monitor_spec);
-    if (args.machine_opts) {
-        fprintf(stderr, "gemu: -M machine feature options are not supported by x86 machines\n");
-        return 1;
-    }
+    cfg.machine_opts = args.machine_opts;   /* the machine's switches; it checks them */
 
     const char *alias = "ibm5150";
     if (args.machine) {

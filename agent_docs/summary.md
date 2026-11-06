@@ -52,7 +52,7 @@ Run `./bin/gemu -M ?` for the full sorted list. Key entries:
 - `-rom [ADDR:]FILE` - load ROM image (or directory for SHA-256 scan)
 - `-cartridge FILE` - insert cartridge (NES .nes, Studio II)
 - `-tape [ADDR:]FILE` - load cassette tape (KIM-1, COSMAC VIP)
-- `-fda FILE` - Famicom Disk System image
+- `-fda FILE` / `-drive file=FILE` - floppy image (5150 diskette, Famicom Disk System, Atari 810)
 - `-m SIZE` - RAM size (e.g. `32K`, `1M`)
 - `-display TYPE` - sdl | gtk | curses | none
 - `-scale N` - window scale factor

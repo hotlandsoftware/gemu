@@ -48,11 +48,11 @@ typedef struct {
     const char        *extra_help;      /* optional binary-specific usage text */
     /* QEMU-style block devices: -drive, -hda..-hdd, -cdrom, -fda/-fdb
      * (and -floppy), -snapshot are parsed into the drive table (gemu/drive.h)
-     * with block_default_if as -drive's default if=.  Families without it
-     * keep those options for themselves (e.g. NES -fda). */
+     * with block_default_if as -drive's default if=. */
     bool               vga_options;     /* -vga NAME,opts accepted (else an error) */
     bool               block_devices;
     int                block_default_if; /* GemuDriveInterface */
+    bool               block_own_images; /* machines load the files (gemu_drive_set_own_images) */
 } GemuArgsDef;
 
 /*

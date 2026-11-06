@@ -45,6 +45,8 @@ static GemuDrive         *drives[MAX_DRIVES];
 static int                n_drives;
 static GemuDriveInterface default_if = GEMU_DRIVE_IF_IDE;
 static bool               snapshot_all;
+static bool               no_defaults;
+static bool               own_images;
 
 static const struct {
     const char *name;
@@ -272,6 +274,18 @@ bool gemu_drive_check_unclaimed(const char *machine) {
     return ok;
 }
 
+void gemu_drive_set_own_images(void)  { own_images = true; }
+void gemu_drive_set_nodefaults(void) { no_defaults = true; }
+bool gemu_drive_defaults(void)        { return !no_defaults; }
+
+GemuDrive *gemu_drive_add_default(GemuDriveInterface iface, int unit) {
+    if (no_defaults || find(iface, 0, unit)) return NULL;
+    char opts[64];
+    snprintf(opts, sizeof(opts), "if=%s,index=%d", if_info[iface].name, unit);
+    if (!gemu_drive_add(opts)) return NULL;
+    return gemu_drive_get(iface, 0, unit);
+}
+
 void gemu_drive_snapshot_all(void) {
     snapshot_all = true;
     /* Applies to drives given before -snapshot too: reopen them read-only
@@ -376,7 +390,7 @@ bool gemu_drive_add(const char *opts) {
         } else if (!strcmp(key, "snapshot")) {
             if (!parse_bool(val, &d->snapshot)) DRIVE_ERR("snapshot must be on or off");
         } else if (!strcmp(key, "format")) {
-            if (!val || strcmp(val, "raw") != 0)
+            if (!own_images && (!val || strcmp(val, "raw") != 0))
                 DRIVE_ERR("unsupported format '%s' (only raw images are supported)", val ? val : "");
         } else if (!strcmp(key, "id")) {
             snprintf(id, sizeof(id), "%s", val ? val : "");
@@ -433,7 +447,9 @@ bool gemu_drive_add(const char *opts) {
         default_name(d);
     }
 
-    if (have_file) {
+    if (have_file && own_images) {
+        snprintf(d->file, sizeof(d->file), "%s", file);   /* the machine opens it */
+    } else if (have_file) {
         char err[600];
         if (!open_medium(d, file, err, sizeof(err))) DRIVE_ERR("%s", err);
     }

@@ -17,6 +17,9 @@
  * snapshot=on keeps every write in memory and discards it on exit.  Other
  * QEMU keys (cache=, aio=, discard=, werror=, ...) are accepted and ignored.
  *
+ * Machines with their own image formats (gemu_drive_set_own_images) take
+ * any format= and load the file themselves; the rest only read raw images.
+ *
  * Legacy options, exactly as QEMU defines them:
  *   -hda/-hdb/-hdc/-hdd FILE  = -drive file=FILE,index=0..3,media=disk
  *   -cdrom FILE               = -drive file=FILE,index=2,media=cdrom
@@ -69,7 +72,22 @@ bool        gemu_drive_add_legacy(GemuDriveInterface iface, int index,
 /* -snapshot: snapshot=on for every drive, including ones added later. */
 void        gemu_drive_snapshot_all(void);
 
+/* For machines that read their own image formats (NES .fds, Atari .atr):
+ * the drive table records each drive's file without opening it, and the
+ * machine loads gemu_drive_filename() itself.  Call before parsing. */
+void        gemu_drive_set_own_images(void);
+
+/* -nodefaults: machines add no default drives (QEMU's PC adds an empty
+ * floppy0 unless told not to).  gemu_drive_defaults() says whether they may. */
+void        gemu_drive_set_nodefaults(void);
+bool        gemu_drive_defaults(void);
+
 /* ── Machines ────────────────────────────────────────────────────────────── */
+
+/* An empty removable drive at unit on iface, as if given with -drive
+ * if=...,index=unit and no file= - for a machine's default drives.  NULL
+ * under -nodefaults or if the unit is taken. */
+GemuDrive  *gemu_drive_add_default(GemuDriveInterface iface, int unit);
 
 /* The drive at bus/unit on iface (marking it claimed), or NULL. */
 GemuDrive  *gemu_drive_get(GemuDriveInterface iface, int bus, int unit);
