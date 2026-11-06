@@ -240,6 +240,14 @@ bool a26_cart_load(A2600Cart *c, const char *path) {
         return false;
     }
     fclose(f);
+    /* An Atari 8-bit disk image run as cartridge code plays the TIA's
+     * noise at full volume; say what it is instead. */
+    if (size >= 16 && rom[0] == 0x96 && rom[1] == 0x02) {
+        fprintf(stderr, "atari2600: '%s' is an ATR disk image for the Atari 400/800, not a 2600 "
+                        "cartridge: use -M atari400 -device atari810 -fda FILE\n", path);
+        free(rom);
+        return false;
+    }
 
     double hz = c->cpu_hz;
     a26_cart_free(c);
