@@ -145,6 +145,14 @@ void gemu_display_set_paused(GemuDisplay *d, bool paused);
 void gemu_display_add_debug_item(GemuDisplay *d, const char *label,
                                  void (*activate)(void *ud), void *ud);
 
+/* ── Netplay menu ────────────────────────────────────────────────────────────
+ * Items under a Netplay menu before Help, for machines that can play over
+ * the network.  enabled (may be NULL) greys an item out while it's false. */
+#define GEMU_DISPLAY_MAX_NETPLAY_ITEMS 6
+void gemu_display_add_netplay_item(GemuDisplay *d, const char *label,
+                                   void (*activate)(void *ud),
+                                   bool (*enabled)(void *ud), void *ud);
+
 /* ── Monitors ────────────────────────────────────────────────────────────────
  * A machine with several display adapters (e.g. an IBM PC with both an MDA
  * and a CGA) registers one head per monitor, head 0 being the one the

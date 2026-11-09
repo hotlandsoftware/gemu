@@ -8,7 +8,7 @@
  *
  * The display layer builds the standard bar for each window
  * (gemu_display_build_menubar() in gemu_display_menu.c): Machine, Blocks,
- * Scale, Input, Debug, Help.  It's rebuilt whenever a menu opens, so checkmarks
+ * Input, Debug, View, Help.  It's rebuilt whenever a menu opens, so checkmarks
  * and drive names are always current.
  */
 

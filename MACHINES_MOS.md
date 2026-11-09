@@ -68,6 +68,11 @@ Simulated machines include:
 | um6578 | `UM6578 Enhanced Famiclone` | 199? | 🟢 | 🟢 | 🟢 | imperfect | 
 | vssmb | `VS. Super Mario Bros.` | 1986 | 🟢 | 🟢 | 🟢 | working | 
 
+### NES: Netplay
+
+Play over the network through a Kaillera server: Netplay > Connect... or the
+`netplay` monitor command. See [docs/netplay.md](docs/netplay.md).
+
 ### NES: Debug > Cartridge Pins
 
 This window shows the Famicom's 60-pin cartridge connector (the NES's 72-pin

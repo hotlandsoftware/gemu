@@ -167,6 +167,8 @@ static const MonCmdDef mon_cmds[] = {
       "move the mouse relative to its position", M_UM6578 " i2000", NULL, 0 },
     { "mousestate",  NULL,           "",
       "show mouse and controller state", M_UM6578 " i2000", NULL, 0 },
+    { "netplay",     NULL,           "[info | servers | connect <host[:port]> [name] [conn] | games | create | join <id> | start | leave | chat <text> | log | disconnect]",
+      "play over the network (Kaillera)", M_NES, NULL, 0 },
     { "panel",       NULL,           "<file>",
       "write the CPU/MMIO debug front panel image to file", "i2000", NULL, 0 },
     { "peek",        NULL,           "<addr> [len]",

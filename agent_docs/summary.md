@@ -129,7 +129,11 @@ core/       Shared infrastructure: args, monitor, VNC, display backends, TCG
   `GemuArgsDef.block_devices`; machines claim drives with `gemu_drive_get()`,
   register them with `gemu_drive_attach_monitor()`, and setups call
   `gemu_drive_check_unclaimed()`. User docs: `docs/drive.md`.
-- Window menu bar (Machine/Blocks/Scale/Input/Debug/Help): one model,
+- Netplay (core/src/netplay*.c, gemu/netplay.h): sessions with a backend per mode
+  (netplay_kaillera.c: Kaillera 0.83 as EmuLinker-K speaks it), lockstep frame
+  exchange, desync check via game chat; windows netplay_dialog_{sdl,gtk}.c.  The NES
+  starts games from an in-memory power-on snapshot (docs/netplay.md).
+- Window menu bar (Machine/Blocks/Input/Debug/View/Netplay/Help): one model,
   `gemu_display_build_menubar()` (`core/src/gemu_display_menu.c`, types in
   `gemu/menu.h`). SDL draws it inside the window above the picture
   (`gemu_menubar_sdl.c`, never on VNC); GTK turns it into a GtkMenuBar

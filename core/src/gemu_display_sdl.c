@@ -58,7 +58,7 @@ typedef struct {
     /* Window size asked for at creation.  Some setups (sdl2-compat on
      * Wayland with fractional scaling) apply the create-time size in device
      * pixels, so it's re-applied once the window is shown - by then
-     * SDL_SetWindowSize uses the same units as the Scale menu. */
+     * SDL_SetWindowSize uses the same units as -scale. */
     int    want_w, want_h;
     int    size_fixups;
 

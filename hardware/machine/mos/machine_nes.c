@@ -13,6 +13,10 @@
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
 #include "gemu/gemu_display.h"
+#include "gemu/netplay.h"
+#include "gemu/netplay_dialog.h"
+#include "gemu/sha256.h"
+#include "gemu/gemu.h"
 #include <SDL2/SDL.h>  /* needed for APU audio queue sync */
 #include <math.h>
 #include <stdio.h>
@@ -1067,10 +1071,30 @@ static void nes_chr_write(uint16_t addr, uint8_t val, void *ud) {
 
 static NesCheats    g_cheats;
 static CheatDialog *g_cheat_dialog;
+static void nes_np_setup(struct NesState *s);
+static void nes_np_end(struct NesState *s);
+static bool nes_np_frame(struct NesState *s);
+static void nes_np_after_frame(struct NesState *s);
+static void nes_np_reset_or(struct NesState *s);
+static void nes_np_game_name(const struct NesState *s, char *out, size_t len);
+
+/* Netplay (see "Netplay" below): the session, and while a game is on,
+ * where the player was before it. */
+static Netplay     *g_np;
+static NetplayDialog *g_np_dialog;   /* Netplay > Connect... / Lobby... */
+static bool         g_np_active;     /* this machine is playing a netplay game */
+static bool         g_np_port2;      /* ...and port 2, empty otherwise, has player 2's controller */
+static uint64_t     g_np_frame;
+static bool         g_np_reset;      /* Reset pressed: sent with our next input */
+static uint8_t     *g_poweron;       /* the machine as created: every player's start */
+static size_t       g_poweron_len;
+static uint8_t     *g_np_before;     /* the player's own game, put back afterwards */
+static size_t       g_np_before_len;
 
 static void nes_cheats_apply(void *ud) {
     NesState *s = ud;
     s->gg_count = 0;
+    if (g_np_active) return;   /* codes would change one player's game only */
     for (int i = 0; i < g_cheats.n && s->gg_count < NES_GG_MAX; i++) {
         if (!g_cheats.list[i].enabled) continue;
         NesGgPatch *g = &s->gg_patches[s->gg_count];
@@ -1614,7 +1638,7 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
         }
         if (s->cfg->ports[1] != NES_DEVICE_CONTROLLER &&
             s->cfg->ports[1] != NES_DEVICE_FC2_MIC &&
-            !nes_device_is_rob(s->cfg->ports[1])) return ctrl_open;
+            !nes_device_is_rob(s->cfg->ports[1]) && !g_np_port2) return ctrl_open;
         if (s->ctrl_strobe) return ctrl_open | ((s->ctrl_state[1] & NES_BTN_A) ? 1u : 0u);
         uint8_t bit = s->ctrl_shift[1] & 1;
         s->ctrl_shift[1] = (s->ctrl_shift[1] >> 1) | 0x80u;
@@ -2043,6 +2067,10 @@ static GemuMediaResult nes_media_change(void *ud, const char *arg,
         snprintf(err, err_len, "missing cartridge path");
         return GEMU_MEDIA_ERR;
     }
+    if (g_np_active) {
+        snprintf(err, err_len, "can't change the cartridge during a netplay game");
+        return GEMU_MEDIA_ERR;
+    }
     nes_sav_save(s);
     s->battery_autosave = false;
     s->sav_path[0] = '\0';
@@ -2055,6 +2083,13 @@ static GemuMediaResult nes_media_change(void *ud, const char *arg,
     nes_battery_setup(s);
     nes_cheats_load(s);         /* this cartridge's Game Genie codes */
     nes_install_mapper_hooks(s);
+    if (g_np) {                 /* listed under its own name; not a fresh power-on any more */
+        char game[NETPLAY_GAME_LEN];
+        nes_np_game_name(s, game, sizeof(game));
+        netplay_set_game(g_np, game);
+        free(g_poweron);
+        g_poweron = NULL;
+    }
     return GEMU_MEDIA_OK_RESET;
 }
 
@@ -2706,11 +2741,18 @@ NesState *nes_create(const MosConfig *cfg) {
 #endif
 
     nes_reset(s);
+    nes_np_setup(s);
 
     return s;
 }
 
 void nes_destroy(NesState *s) {
+    nes_np_end(s);              /* the player's own game back, then save it */
+    if (g_np_dialog) { g_np_dialog->destroy(g_np_dialog); g_np_dialog = NULL; }
+    netplay_destroy(g_np);
+    g_np = NULL;
+    free(g_poweron);
+    g_poweron = NULL;
     nes_save_persistent(s);
 #ifdef HAVE_LUA
     nes_lua_destroy(s->lua);
@@ -2761,28 +2803,52 @@ static uint8_t *nes_chr_ram(const NesState *s, uint64_t *len) {
     return NULL;
 }
 
-static bool nes_save_snapshot(NesState *s, const char *path) {
+/* Snapshots are built in memory (SnapBuf) - netplay keeps them there - and
+ * savevm/loadvm write and read them as files. */
+typedef struct { uint8_t *p; size_t n, cap; bool ok; } SnapBuf;
+
+static void sb_put(SnapBuf *b, const void *d, size_t n) {
+    if (!b->ok) return;
+    if (b->n + n > b->cap) {
+        size_t cap = b->cap ? b->cap : 65536;
+        while (cap < b->n + n) cap *= 2;
+        uint8_t *p = realloc(b->p, cap);
+        if (!p) { b->ok = false; return; }
+        b->p = p;
+        b->cap = cap;
+    }
+    memcpy(b->p + b->n, d, n);
+    b->n += n;
+}
+
+typedef struct { const uint8_t *p; size_t n, i; } SnapRd;
+
+static bool sr_get(SnapRd *r, void *d, size_t n) {
+    if (r->n - r->i < n) return false;
+    memcpy(d, r->p + r->i, n);
+    r->i += n;
+    return true;
+}
+
+static bool nes_snapshot_save(NesState *s, SnapBuf *b) {
     if (s->fds_enabled) {
         fprintf(stderr, "nes: savevm not supported for FDS yet\n");
         return false;
     }
-    FILE *f = fopen(path, "wb");
-    if (!f) return false;
-    bool ok = true;
+    *b = (SnapBuf){ .ok = true };
     uint64_t magic   = NES_SNAPSHOT_MAGIC;
     uint32_t version = NES_SNAPSHOT_VERSION;
-    ok &= fwrite(&magic,   sizeof(magic),   1, f) == 1;
-    ok &= fwrite(&version, sizeof(version), 1, f) == 1;
-    ok &= fwrite(&s->cart, sizeof(s->cart), 1, f) == 1;
+    sb_put(b, &magic, sizeof(magic));
+    sb_put(b, &version, sizeof(version));
+    sb_put(b, &s->cart, sizeof(s->cart));
 
     uint64_t chr_len;
     uint8_t *chr_ram = nes_chr_ram(s, &chr_len);
-    ok &= fwrite(&chr_len, sizeof(chr_len), 1, f) == 1;
-    if (chr_len)
-        ok &= fwrite(chr_ram, 1, chr_len, f) == chr_len;
+    sb_put(b, &chr_len, sizeof(chr_len));
+    if (chr_len) sb_put(b, chr_ram, chr_len);
 
     NesState *snap = malloc(sizeof(*snap));
-    if (!snap) { fclose(f); return false; }
+    if (!snap) { free(b->p); return false; }
     *snap = *s;
     snap->cfg     = NULL;
     snap->prg     = NULL;
@@ -2811,51 +2877,44 @@ static bool nes_save_snapshot(NesState *s, const char *path) {
 #ifdef HAVE_LUA
     snap->lua = NULL;
 #endif
-    ok &= fwrite(snap, sizeof(*snap), 1, f) == 1;
+    sb_put(b, snap, sizeof(*snap));
     free(snap);
-
-    fclose(f);
-    return ok;
+    if (!b->ok) { free(b->p); b->p = NULL; }
+    return b->ok;
 }
 
-static bool nes_load_snapshot(NesState *s, const char *path) {
+static bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
     if (s->fds_enabled) {
         fprintf(stderr, "nes: loadvm not supported for FDS yet\n");
         return false;
     }
-    FILE *f = fopen(path, "rb");
-    if (!f) return false;
+    SnapRd r = { data, len, 0 };
     bool ok = true;
     uint64_t magic   = 0;
     uint32_t version = 0;
     NesCart  cart     = {0};
-    ok &= fread(&magic,   sizeof(magic),   1, f) == 1;
-    ok &= fread(&version, sizeof(version), 1, f) == 1;
-    ok &= fread(&cart,    sizeof(cart),    1, f) == 1;
+    ok &= sr_get(&r, &magic, sizeof(magic));
+    ok &= sr_get(&r, &version, sizeof(version));
+    ok &= sr_get(&r, &cart, sizeof(cart));
     if (!ok || magic != NES_SNAPSHOT_MAGIC || version != NES_SNAPSHOT_VERSION ||
         cart.mapper != s->cart.mapper || cart.prg_banks != s->cart.prg_banks ||
         cart.chr_banks != s->cart.chr_banks) {
         fprintf(stderr, "nes: loadvm: snapshot doesn't match the loaded cartridge\n");
-        fclose(f);
         return false;
     }
 
     uint64_t chr_len = 0, want_len;
     uint8_t *chr_ram = nes_chr_ram(s, &want_len);
-    ok &= fread(&chr_len, sizeof(chr_len), 1, f) == 1;
-    if (chr_len != want_len) {
+    ok &= sr_get(&r, &chr_len, sizeof(chr_len));
+    if (!ok || chr_len != want_len) {
         fprintf(stderr, "nes: loadvm: CHR RAM size mismatch\n");
-        fclose(f);
         return false;
     }
-    if (chr_len)
-        ok &= fread(chr_ram, 1, chr_len, f) == chr_len;
+    if (chr_len && !sr_get(&r, chr_ram, chr_len)) return false;
 
     NesState *loaded = malloc(sizeof(*loaded));
-    if (!loaded) { fclose(f); return false; }
-    ok &= fread(loaded, sizeof(*loaded), 1, f) == 1;
-    if (!ok) { free(loaded); fclose(f); return false; }
-
+    if (!loaded) return false;
+    if (!sr_get(&r, loaded, sizeof(*loaded))) { free(loaded); return false; }
     const MosConfig *cfg     = s->cfg;
     uint8_t          *prg     = s->prg;
     uint8_t          *chr     = s->chr;
@@ -2929,9 +2988,206 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
     s->lua = lua;
 #endif
     nes_cheats_apply(s);    /* the codes that are on now, not the snapshot's */
-
-    fclose(f);
     return true;
+}
+
+static bool nes_save_snapshot(NesState *s, const char *path) {
+    SnapBuf b;
+    if (!nes_snapshot_save(s, &b)) return false;
+    FILE *f = fopen(path, "wb");
+    bool ok = f && fwrite(b.p, 1, b.n, f) == b.n;
+    if (f && fclose(f) != 0) ok = false;
+    free(b.p);
+    return ok;
+}
+
+static bool nes_load_snapshot(NesState *s, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    uint8_t *data = NULL;
+    size_t n = 0, cap = 0, got;
+    do {
+        if (n == cap) {
+            cap = cap ? cap * 2 : 1u << 20;
+            uint8_t *p = realloc(data, cap);
+            if (!p) { free(data); fclose(f); return false; }
+            data = p;
+        }
+        got = fread(data + n, 1, cap - n, f);
+        n += got;
+    } while (got);
+    fclose(f);
+    bool ok = nes_snapshot_load(s, data, n);
+    free(data);
+    return ok;
+}
+
+/* ── Netplay ───────────────────────────────────────────────────────────────
+ *
+ * Every player's NES has to run the same frames with the same input, so a
+ * netplay game starts every machine from the same state: the snapshot taken
+ * when this one was created (before any battery save was loaded, with
+ * PRG-RAM cleared), which is the same for everyone with the same ROM and
+ * settings.  The player's own game is kept aside and put back when the
+ * netplay game ends, and nothing is saved to their battery file meanwhile.
+ * Controller 1 is ours; the session hands back each player's, and players 1
+ * and 2 drive the two ports.  Reset goes through the session too, so every
+ * machine resets on the same frame. */
+
+#define NES_NP_SYNC_FRAMES 300   /* compare state every 5 s */
+
+/* The game's name in the lobby: the ROM's name, and a hash of what has to
+ * match for the games to stay in step (ROM contents, region, controllers). */
+static void nes_np_game_name(const NesState *s, char *out, size_t len) {
+    char base[256];
+    nes_game_basename(s->cart_path_buf, base, sizeof(base));
+    GemuSha256Ctx ctx;
+    uint8_t d[GEMU_SHA256_DIGEST_LEN];
+    gemu_sha256_init(&ctx);
+    if (s->prg) gemu_sha256_update(&ctx, s->prg, (size_t)s->cart.prg_banks * 0x4000u);
+    if (s->chr && !s->chr_is_ram) gemu_sha256_update(&ctx, s->chr, (size_t)s->cart.chr_banks * 0x2000u);
+    uint8_t cfg[4] = { (uint8_t)s->cfg->is_pal, (uint8_t)s->cfg->n_ports,
+                       (uint8_t)s->cfg->ports[0], (uint8_t)s->cfg->ports[1] };
+    gemu_sha256_update(&ctx, cfg, sizeof(cfg));
+    gemu_sha256_final(&ctx, d);
+    snprintf(out, len, "%.100s [%02x%02x%02x%02x]", base, d[0], d[1], d[2], d[3]);
+}
+
+/* The state compared between players: RAM, PRG-RAM and the CPU. */
+static uint32_t nes_np_state_hash(const NesState *s) {
+    uint32_t h = 2166136261u;
+    const uint8_t *parts[] = { s->ram, s->prg_ram };
+    const size_t sizes[] = { sizeof(s->ram), sizeof(s->prg_ram) };
+    for (int p = 0; p < 2; p++)
+        for (size_t i = 0; i < sizes[p]; i++) h = (h ^ parts[p][i]) * 16777619u;
+    uint8_t cpu[6] = { s->cpu.A, s->cpu.X, s->cpu.Y, s->cpu.SP, (uint8_t)s->cpu.PC, (uint8_t)(s->cpu.PC >> 8) };
+    for (int i = 0; i < 6; i++) h = (h ^ cpu[i]) * 16777619u;
+    return h;
+}
+
+static void nes_np_begin(NesState *s, int player, int players) {
+    const char *why = NULL;
+    if (s->cfg->is_arcade)    why = "Netplay is for NES/Famicom cartridges, not the VS. System";
+    else if (s->fds_enabled)  why = "Netplay doesn't support the Famicom Disk System yet";
+    else if (!g_poweron)      why = "This game was loaded with Change...: restart GEMU with -cartridge "
+                                    "for netplay, so it starts from a fresh power-on";
+#ifdef HAVE_LUA
+    if (!why && s->lua)       why = "Netplay can't run with a Lua script loaded";
+#endif
+    SnapBuf before;
+    if (!why && !nes_snapshot_save(s, &before)) why = "couldn't save your game state";
+    if (why) {
+        netplay_note(g_np, "%s - leaving the game", why);
+        netplay_leave_game(g_np);
+        return;
+    }
+    nes_save_persistent(s);          /* the player's battery save, as it is now */
+    g_np_before = before.p;
+    g_np_before_len = before.n;
+    nes_snapshot_load(s, g_poweron, g_poweron_len);
+    memset(s->prg_ram, 0, sizeof(s->prg_ram));
+    g_np_active = true;
+    /* A netplay game has a player 2 even when this NES has one controller
+     * (the default): plug one into the empty port for the game. */
+    g_np_port2 = players > 1 && s->cfg->ports[1] == NES_DEVICE_NONE;
+    s->gg_count = 0;
+    g_np_frame = 0;
+    g_np_reset = false;
+    netplay_note(g_np, "Console powered on - player %d of %d%s", player, players,
+                 players > 2 ? " (players 3 and up have no controller port)" : "");
+    netplay_ready(g_np);
+}
+
+static void nes_np_end(NesState *s) {
+    if (!g_np_active) return;
+    g_np_active = false;
+    g_np_port2 = false;
+    if (g_np_before) nes_snapshot_load(s, g_np_before, g_np_before_len);
+    free(g_np_before);
+    g_np_before = NULL;
+    netplay_note(g_np, "Netplay game over - back to your own game");
+}
+
+/* Before a frame: false while the other players' input hasn't arrived
+ * (run nothing this time round). */
+static bool nes_np_frame(NesState *s) {
+    int player, players;
+    if (g_np && netplay_take_start(g_np, &player, &players)) nes_np_begin(s, player, players);
+    if (!g_np_active) return true;
+    if (gemu_monitor_is_paused(s->monitor)) return true;   /* paused: everyone waits */
+    uint8_t local[NETPLAY_INPUT_BYTES] = { s->ctrl_state[0], g_np_reset ? NETPLAY_INPUT_RESET : 0 };
+    uint8_t all[NETPLAY_MAX_PLAYERS * NETPLAY_INPUT_BYTES];
+    int r = netplay_frame(g_np, local, all, &players);
+    if (r < 0) { nes_np_end(s); return true; }
+    if (r == 0) return false;
+    g_np_reset = false;
+    for (int p = 0; p < players; p++)
+        if (all[p * NETPLAY_INPUT_BYTES + 1] & NETPLAY_INPUT_RESET) {
+            nes_reset(s);
+            netplay_note(g_np, "Console reset (player %d)", p + 1);
+            break;
+        }
+    s->ctrl_state[0] = all[0];
+    s->ctrl_state[1] = players > 1 ? all[NETPLAY_INPUT_BYTES] : 0;
+    g_np_frame++;
+    return true;
+}
+
+static void nes_np_after_frame(NesState *s) {
+    if (g_np_active && g_np_frame % NES_NP_SYNC_FRAMES == 0)
+        netplay_sync_hash(g_np, g_np_frame, nes_np_state_hash(s));
+}
+
+/* Reset: in a netplay game every machine resets together. */
+static void nes_np_reset_or(NesState *s) {
+    if (g_np_active) { g_np_reset = true; return; }
+    nes_save_persistent(s);
+    nes_reset(s);
+}
+
+static GemuMonCmd nes_cmd_netplay(GemuMonitor *mon, const char *args, void *ud) {
+    (void)ud;
+    netplay_monitor(g_np, mon, args);
+    return GEMU_MON_NONE;
+}
+
+/* The Netplay menu */
+static bool nes_np_offline(void *ud) {
+    (void)ud;
+    NetplayInfo in;
+    netplay_info(g_np, &in);
+    return in.state == NETPLAY_OFFLINE;
+}
+
+static bool nes_np_online(void *ud) { return !nes_np_offline(ud); }
+
+static void nes_np_show(void *ud) {
+    (void)ud;
+    if (g_np_dialog) g_np_dialog->show(g_np_dialog);
+}
+
+static void nes_np_disconnect(void *ud) {
+    (void)ud;
+    netplay_disconnect(g_np);
+}
+
+static void nes_np_setup(NesState *s) {
+    if (s->cfg->is_arcade || s->fds_enabled || !s->prg) return;
+    SnapBuf b;
+    if (nes_snapshot_save(s, &b)) { g_poweron = b.p; g_poweron_len = b.n; }
+    char game[NETPLAY_GAME_LEN];
+    nes_np_game_name(s, game, sizeof(game));
+    g_np = netplay_create("GEMU " GEMU_VERSION_STR, game);
+    gemu_monitor_bind(s->monitor, "netplay", nes_cmd_netplay, s);
+    if (!s->display || !g_np) return;
+#ifdef GEMU_GTK
+    if (s->cfg->display_type == GEMU_DISPLAY_GTK) g_np_dialog = netplay_dialog_gtk_create(g_np);
+#endif
+    if (s->cfg->display_type == GEMU_DISPLAY_SDL) g_np_dialog = netplay_dialog_sdl_create(g_np);
+    if (!g_np_dialog) return;
+    gemu_display_add_netplay_item(s->display, "Connect...", nes_np_show, nes_np_offline, s);
+    gemu_display_add_netplay_item(s->display, "Lobby...", nes_np_show, nes_np_online, s);
+    gemu_display_add_netplay_item(s->display, "Disconnect", nes_np_disconnect, nes_np_online, s);
 }
 
 /* ── Monitor commands and memory view ────────────────────────────────────── */
@@ -3040,6 +3296,10 @@ static GemuMonCmd nes_cmd_loadvm(GemuMonitor *mon, const char *args, void *ud) {
     char vm_path[256];
     if (sscanf(args, "%255s", vm_path) != 1) {
         gemu_monitor_printf(mon, "usage: loadvm <file>\n");
+        return GEMU_MON_NONE;
+    }
+    if (g_np_active) {
+        gemu_monitor_printf(mon, "loadvm: not during a netplay game\n");
         return GEMU_MON_NONE;
     }
     if (nes_load_snapshot(s, vm_path))
@@ -3309,15 +3569,14 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             if (gemu_display_should_quit(s->display)) break;
             if (gemu_display_reset_requested(s->display)) {
                 gemu_display_clear_flags(s->display);
-                nes_save_persistent(s);
-                nes_reset(s);
+                nes_np_reset_or(s);
             }
         }
         /* Monitor commands */
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
             if      (cmd == GEMU_MON_QUIT)   { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else { quit = true; break; } }
-            else if (cmd == GEMU_MON_RESET)  { nes_save_persistent(s); nes_reset(s); }
+            else if (cmd == GEMU_MON_RESET)  nes_np_reset_or(s);
             else if (cmd == GEMU_MON_STEP) {
                 for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
                     nes_step_insn(s);
@@ -3338,8 +3597,10 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             if (s->vs_coin_latch[0] > 0) s->vs_coin_latch[0]--;
             if (s->vs_coin_latch[1] > 0) s->vs_coin_latch[1]--;
         }
+        /* Netplay: everyone's input for this frame, or wait for it */
+        bool np_waiting = !nes_np_frame(s);
 
-        if (!gemu_monitor_is_paused(s->monitor)) {
+        if (!gemu_monitor_is_paused(s->monitor) && !np_waiting) {
             /* Run one full frame (until PPU marks frame complete) */
             s->ppu.dirty = false;
             while (!s->ppu.dirty) {
@@ -3358,6 +3619,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             /* Flush APU samples to SDL audio */
             nes_sync_apu_to_cpu(s, s->cpu.cycle_count);
             apu2a03_flush(&s->apu);
+            nes_np_after_frame(s);
 
 #ifdef HAVE_LUA
             /* Resume the script for this frame; gui.* draws straight into
@@ -3427,7 +3689,9 @@ void nes_run(NesState *s, const MosConfig *cfg) {
          *   queue stays at ~3 frames. This locks emulation to the audio clock
          *   (exactly 60.099 fps) and eliminates drift entirely.
          * - Audio off / headless: fall back to a software timer. */
-        if (s->apu.audio_dev) {
+        if (np_waiting) {
+            SDL_Delay(1);       /* the network, not the audio, sets the pace */
+        } else if (s->apu.audio_dev) {
             while (gemu_audio_queued(s->apu.audio_dev) > AUDIO_QUEUE_MAX)
                 SDL_Delay(1);
         } else {
@@ -3442,6 +3706,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
         hex_editor_refresh(s->hex_editor);
         if (g_cheat_dialog) g_cheat_dialog->refresh(g_cheat_dialog);
         if (g_pin_window) g_pin_window->refresh(g_pin_window);
+        if (g_np_dialog) g_np_dialog->refresh(g_np_dialog);
         /* GTK event pump is done inside gemu_display_poll() via the backend */
     }
 

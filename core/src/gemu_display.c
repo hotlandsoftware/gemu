@@ -169,6 +169,17 @@ void gemu_display_add_debug_item(GemuDisplay *d, const char *label,
     d->debug_items[i].ud = ud;
 }
 
+void gemu_display_add_netplay_item(GemuDisplay *d, const char *label,
+                                   void (*activate)(void *ud),
+                                   bool (*enabled)(void *ud), void *ud) {
+    if (!d || !activate || d->n_netplay_items >= GEMU_DISPLAY_MAX_NETPLAY_ITEMS) return;
+    int i = d->n_netplay_items++;
+    snprintf(d->netplay_items[i].label, sizeof(d->netplay_items[i].label), "%s", label);
+    d->netplay_items[i].activate = activate;
+    d->netplay_items[i].enabled = enabled;
+    d->netplay_items[i].ud = ud;
+}
+
 /* ── Monitors ────────────────────────────────────────────────────────────── */
 
 void gemu_display_set_heads(GemuDisplay *d, const GemuDisplayHead *heads, int n) {

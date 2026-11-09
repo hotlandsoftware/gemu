@@ -3,10 +3,10 @@
  *
  *   Machine  Pause, Reset, Screenshot, Quit
  *   Blocks   one submenu per monitor media device: Change..., Eject, Flip
- *   Scale    window scale 1x-4x
  *   Input    one entry per input device (its bindings), reset bindings
  *   Debug    Hex Editor (machines that have one)
  *   View     which monitor to show (machines with several)
+ *   Netplay  Connect..., Lobby..., Disconnect (machines that can play online)
  *   Help     About GEMU
  *
  * Actions go through the machine's monitor where possible, so the menus do
@@ -126,17 +126,7 @@ static const char *base_name(const char *path) {
     return b;
 }
 
-/* ── Scale / Input / Help ────────────────────────────────────────────────── */
-
-static bool scale_is(void *ud, int scale) {
-    GemuDisplay *d = ud;
-    return d->ui_get_scale && d->ui_get_scale(d) == scale;
-}
-
-static void set_scale(void *ud, int scale) {
-    GemuDisplay *d = ud;
-    if (d->ui_set_scale) d->ui_set_scale(d, scale);
-}
+/* ── Input / Help ────────────────────────────────────────────────── */
 
 static void input_config(void *ud, int page) {
     GemuDisplay *d = ud;
@@ -182,6 +172,16 @@ static void hex_editor(void *ud, int arg) {
 static void debug_item(void *ud, int i) {
     GemuDisplay *d = ud;
     d->debug_items[i].activate(d->debug_items[i].ud);
+}
+
+static void netplay_item(void *ud, int i) {
+    GemuDisplay *d = ud;
+    d->netplay_items[i].activate(d->netplay_items[i].ud);
+}
+
+static bool netplay_item_enabled(void *ud, int i) {
+    GemuDisplay *d = ud;
+    return !d->netplay_items[i].enabled || d->netplay_items[i].enabled(d->netplay_items[i].ud);
 }
 
 static void about(void *ud, int arg) {
@@ -244,16 +244,6 @@ GemuMenu *gemu_display_build_menubar(GemuDisplay *d) {
         }
     }
 
-    if (d->ui_set_scale) {
-        GemuMenu *view = gemu_menu_add_submenu(bar, "Scale");
-        for (int s = 1; s <= 4; s++) {
-            char label[16];
-            snprintf(label, sizeof(label), "%dx", s);
-            it = gemu_menu_add(view, GEMU_MENU_RADIO, label, set_scale, d, s);
-            it->checked = scale_is;
-        }
-    }
-
     /* Input: one entry per input device (its key/controller bindings);
      * no tab at all when the machine has no remappable input. */
     int n_inputs = d->ui_input_pages ? d->ui_input_pages(d) : 0;
@@ -299,6 +289,14 @@ GemuMenu *gemu_display_build_menubar(GemuDisplay *d) {
                     snprintf(label, sizeof(label), "Close %s window", d->heads[i].name);
                     gemu_menu_add(view, GEMU_MENU_ACTION, label, close_head, d, i);
                 }
+        }
+    }
+
+    if (d->n_netplay_items) {
+        GemuMenu *np = gemu_menu_add_submenu(bar, "Netplay");
+        for (int i = 0; i < d->n_netplay_items; i++) {
+            it = gemu_menu_add(np, GEMU_MENU_ACTION, d->netplay_items[i].label, netplay_item, d, i);
+            it->enabled = netplay_item_enabled;
         }
     }
 

@@ -37,6 +37,9 @@ struct GemuDisplay {
     struct { char label[48]; void (*activate)(void *ud); void *ud; }
                  debug_items[GEMU_DISPLAY_MAX_DEBUG_ITEMS];
     int          n_debug_items;
+    struct { char label[48]; void (*activate)(void *ud); bool (*enabled)(void *ud); void *ud; }
+                 netplay_items[GEMU_DISPLAY_MAX_NETPLAY_ITEMS];
+    int          n_netplay_items;
     /* UI a backend can offer the menus (NULL = not available there) */
     int  (*ui_get_scale)(struct GemuDisplay *);
     void (*ui_set_scale)(struct GemuDisplay *, int scale);

@@ -38,7 +38,7 @@ CORE_SRC = [
     'core/third_party/cjson/cJSON.c',
     'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/args.c',
     'core/src/sha256.c', 'core/src/screendump.c', 'core/src/util.c',
-    'core/src/gemu_display_term.c', 'core/src/drive.c', 'core/src/audio_out.c',
+    'core/src/gemu_display_term.c', 'core/src/drive.c', 'core/src/audio_out.c', 'core/src/netplay.c', 'core/src/netplay_kaillera.c', 'core/src/netplay_lists.c', 'core/src/netplay_dialog_sdl.c',
     'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
     'core/src/gemu_display_vnc.c', 'core/src/gemu_display_menu.c',
     'core/src/gemu_menubar_sdl.c', 'core/src/menu.c', 'vga/multi/vgafont16.c',
@@ -48,7 +48,7 @@ CORE_SRC_CACA = ['core/src/gemu_display_caca.c']
 
 CORE_SRC_GTK = [
     'core/src/gemu_display_gtk.c',
-    'core/src/gtk_menu.c', 'core/src/video_gtk.c',
+    'core/src/gtk_menu.c', 'core/src/video_gtk.c', 'core/src/netplay_dialog_gtk.c',
 ]
 
 FAMILY_SRC = {
