@@ -130,7 +130,7 @@ void oki6295_flush(Okim6295 *o) {
         o->frame_n = 0;
         return;
     }
-    SDL_QueueAudio(o->audio_dev, o->frame_buf, (Uint32)(o->frame_n * (int)sizeof(float)));
+    gemu_audio_queue(o->audio_dev, o->frame_buf, (size_t)o->frame_n);
     o->frame_n = 0;
 }
 
@@ -144,31 +144,11 @@ bool oki6295_init(Okim6295 *o, uint32_t tick_clock_hz, uint32_t native_sample_ra
     o->step_period  = (double)tick_clock_hz / (double)native_sample_rate_hz;
     o->clock_pps    = (double)tick_clock_hz / (double)OKIM6295_SAMPLE_RATE;
 
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
-        fprintf(stderr, "oki6295: SDL_InitSubSystem(AUDIO) failed: %s\n", SDL_GetError());
-        return false;
-    }
-    SDL_AudioSpec want = {
-        .freq     = OKIM6295_SAMPLE_RATE,
-        .format   = AUDIO_F32SYS,
-        .channels = 1,
-        .samples  = 512,
-    };
-    SDL_AudioSpec have;
-    o->audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (!o->audio_dev) {
-        fprintf(stderr, "oki6295: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
-        return false;
-    }
-    SDL_PauseAudioDevice(o->audio_dev, 0);
-    return true;
+    o->audio_dev = gemu_audio_open("oki6295", (int)OKIM6295_SAMPLE_RATE);
+    return o->audio_dev != NULL;
 }
 
 void oki6295_destroy(Okim6295 *o) {
-    if (o->audio_dev) {
-        SDL_CloseAudioDevice(o->audio_dev);
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
-        o->audio_dev = 0;
-    }
+    gemu_audio_close(o->audio_dev);
+    o->audio_dev = NULL;
 }

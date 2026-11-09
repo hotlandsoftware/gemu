@@ -114,6 +114,7 @@ typedef struct Tia {
     uint8_t  dbg_vsync[2][TIA_MAX_LINES];   /* VSYNC was on during the line */
 
     TiaSound sound;
+    uint64_t sound_clock;   /* colour clocks the sound has run (lazy) */
 } Tia;
 
 #define TIA_HIDE_P0 0x01u

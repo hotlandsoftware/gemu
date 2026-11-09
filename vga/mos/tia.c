@@ -37,6 +37,8 @@ static uint8_t write_delay(uint8_t reg) {
  * where a copy starts.  156 starts the main copy; the others sit 16, 32 or
  * 64 clocks on. */
 static uint8_t decodes[8][TIA_WIDTH];
+/* Clocks from counter value c until a decode (0 = at c). */
+static uint8_t decode_dist[8][TIA_WIDTH];
 
 static void build_decodes(void) {
     memset(decodes, 0, sizeof(decodes));
@@ -46,6 +48,12 @@ static void build_decodes(void) {
     decodes[3][12] = 2; decodes[3][28] = 3;
     decodes[4][60] = 2;
     decodes[6][28] = 2; decodes[6][60] = 3;
+    for (int n = 0; n < 8; n++)
+        for (int c = 0; c < TIA_WIDTH; c++) {
+            int k = 0;
+            while (!decodes[n][(c + k) % TIA_WIDTH]) k++;
+            decode_dist[n][c] = (uint8_t)k;
+        }
 }
 
 #define PLAYER_OFFSET  (-5)   /* render counter at a player's start decode */
@@ -290,6 +298,15 @@ static void start_hmove(Tia *t) {
     t->m[0].moving = t->m[1].moving = t->p[0].moving = t->p[1].moving = t->bl.moving = true;
 }
 
+/* The sound runs lazily, in batches (tia_sound_run), caught up
+ * before anything that changes it and at the end of every tia_run. */
+static void sound_sync(Tia *t) {
+    if (t->clock > t->sound_clock) {
+        tia_sound_run(&t->sound, (uint32_t)(t->clock - t->sound_clock));
+        t->sound_clock = t->clock;
+    }
+}
+
 /* ── Register writes ─────────────────────────────────────────────────────── */
 
 static void end_frame(Tia *t) {
@@ -353,6 +370,7 @@ static void apply_write(Tia *t, uint8_t reg, uint8_t val) {
     case RESM0: case RESM1: missile_resm(t, reg - RESM0); break;
     case RESBL: ball_resbl(t); break;
     case AUDC0: case AUDC1: case AUDF0: case AUDF1: case AUDV0: case AUDV1:
+        sound_sync(t);
         tia_sound_write(&t->sound, reg, val);
         break;
     case GRP0:   /* writing GRP0 moves GRP1 to its delayed copy */
@@ -532,8 +550,6 @@ static void tick(Tia *t) {
         }
     }
 
-    tia_sound_clock(&t->sound);
-
     if (t->movement && (t->hctr & 3) == 0) movement_tick(t);
 
     if (t->hblank) {
@@ -575,13 +591,149 @@ int tia_object_x(const Tia *t, const TiaObject *o, int start_delay) {
     return (x0 + ticks + start_delay) % TIA_WIDTH;
 }
 
+/* ── Idle spans ───────────────────────────────────────────────────────────── *
+ *
+ * In the visible part of a line, while no object shows anything or is about
+ * to start (no start decode before the span ends), no HMOVE is running, no
+ * delayed write falls due and no debug view is on, a tick only advances the
+ * five position counters (and the render counters of drawings that show
+ * nothing) and draws playfield or background.  Those stretches are run in
+ * one go: the counters jump, and the picture is filled in runs
+ * that break where tick() would change something - each 4-clock playfield
+ * column and the reflect latch at clock 79.  The result is exactly what
+ * tick() would produce clock by clock (tests/a26_exact.c checks it). */
+
+/* Quiet HBLANK: no write due - nothing happens until the clock that ends
+ * it (which tick() handles), so jump there.  While HMOVE runs, only every
+ * 4th clock does something (movement_tick), so jump to the next of those. */
+static uint32_t hblank_span(const Tia *t, uint64_t target) {
+    if (!t->hblank || t->debug_view) return 0;
+    if (t->movement && (t->hctr & 3) == 0) return 0;
+    int end = t->ext_hblank ? TIA_HBLANK + 7 : TIA_HBLANK - 1;   /* tick() clears hblank here */
+    if (t->hctr >= end) return 0;
+    uint32_t n = (uint32_t)(end - t->hctr);
+    if (t->movement && 4u - (uint32_t)(t->hctr & 3) < n) n = 4u - (uint32_t)(t->hctr & 3);
+    if (target - t->clock < n) n = (uint32_t)(target - t->clock);
+    for (int i = 0; i < t->dq_n; i++) {
+        if (t->dq[i].when <= t->clock) return 0;
+        if (t->dq[i].when - t->clock < n) n = (uint32_t)(t->dq[i].when - t->clock);
+    }
+    /* The ext_hblank comb (x >= 0) is drawn by tick(). */
+    if (t->hctr + (int)n > TIA_HBLANK) n = (uint32_t)(TIA_HBLANK - t->hctr > 0 ? TIA_HBLANK - t->hctr : 0);
+    return n;
+}
+
+/* An object still drawing a copy is fine if it shows nothing for the rest
+ * of it: a player with no graphics (and no size change in progress), a
+ * missile or ball that isn't enabled.  Writes that could change that are
+ * delayed ones, which end the span.  RESMPx follows a drawing player. */
+static bool drawing_shows(const Tia *t) {
+    for (int i = 0; i < 2; i++) {
+        const TiaObject *p = &t->p[i], *m = &t->m[i];
+        if (p->rendering && (player_pattern(t, i) || p->divider_change >= 0 || t->resmp[i]))
+            return true;
+        if (m->rendering && (t->enam[i] || t->resmp[i])) return true;
+    }
+    return t->bl.rendering && (t->vdelbl ? t->enabl_old : t->enabl_new);
+}
+
+static uint32_t idle_span(const Tia *t, uint64_t target) {
+    if (t->hblank || t->movement || t->debug_view || t->debug_colors || t->hide) return 0;
+    if (drawing_shows(t)) return 0;
+    uint32_t n = (uint32_t)(TIA_LINE_CLOCKS - t->hctr);            /* to the end of the line */
+    if (target - t->clock < n) n = (uint32_t)(target - t->clock);
+    for (int i = 0; i < t->dq_n; i++) {
+        if (t->dq[i].when <= t->clock) return 0;
+        if (t->dq[i].when - t->clock < n) n = (uint32_t)(t->dq[i].when - t->clock);
+    }
+    for (int i = 0; i < 2; i++) {
+        uint32_t d = decode_dist[t->p[i].decode][t->p[i].counter];
+        if (d < n) n = d;
+        if (!t->resmp[i]) {
+            d = decode_dist[t->m[i].decode][t->m[i].counter];
+            if (d < n) n = d;
+        }
+    }
+    uint32_t d = (uint32_t)((156 + TIA_WIDTH - t->bl.counter) % TIA_WIDTH);
+    if (d < n) n = d;
+    return n;
+}
+
+/* n clocks of a drawing that shows nothing, as player_tick / missile_tick /
+ * ball_tick advance it (no start decode, no HMOVE in the span). */
+static void player_skip(TiaObject *p, uint32_t n) {
+    for (; n && p->rendering; n--) {
+        p->render++;
+        if (p->width == 1) {
+            if (p->render > 0) p->sample++;
+        } else if (p->render > 1 && ((p->render - 1) & (p->width - 1)) == 0) {
+            p->sample++;
+        }
+        if (p->sample > 7) p->rendering = false;
+    }
+}
+
+static void missile_skip(TiaObject *m, uint32_t n) {
+    for (; n && m->rendering; n--) {
+        if (m->render == -1) m->eff_width = m->width;
+        if (++m->render >= m->width) m->rendering = false;
+    }
+}
+
+static void ball_skip(TiaObject *b, uint32_t n) {
+    for (; n && b->rendering; n--)
+        if (++b->render >= b->width) b->rendering = false;
+}
+
+static void run_idle(Tia *t, uint32_t n) {
+    player_skip(&t->p[0], n); player_skip(&t->p[1], n);
+    missile_skip(&t->m[0], n); missile_skip(&t->m[1], n);
+    ball_skip(&t->bl, n);
+    TiaObject *objs[5] = { &t->p[0], &t->p[1], &t->m[0], &t->m[1], &t->bl };
+    for (int i = 0; i < 5; i++) {
+        objs[i]->on = false;
+        objs[i]->counter = (uint8_t)((objs[i]->counter + n) % TIA_WIDTH);
+    }
+    bool blank = t->vblank & 0x02u;
+    uint8_t *row = t->scanline < TIA_MAX_LINES ? t->fb[t->draw][t->scanline] : NULL;
+    int x = t->hctr - TIA_HBLANK, end = x + (int)n;
+    if (!blank) t->line_lit = true;
+    while (x < end) {
+        if (x == 0 || x == 79) t->pf_reflect = t->ctrlpf & 0x01u;
+        if ((x & 3) == 0) t->pf_bit = pf_bit_at(t, x);
+        int stop = (x | 3) + 1;
+        if (x < 79 && stop > 79) stop = 79;
+        if (stop > end) stop = end;
+        if (row) {
+            uint8_t c = 0;
+            if (!blank) {
+                uint8_t cpf = (!(t->ctrlpf & 0x04u) && (t->ctrlpf & 0x02u))
+                            ? t->colup[x >= 80] : t->colupf;   /* score mode */
+                c = t->pf_bit ? cpf : t->colubk;
+            }
+            memset(row + x, c, (size_t)(stop - x));
+        }
+        x = stop;
+    }
+    t->clock += n;
+    t->hctr += (int)n;
+    if (t->hctr >= TIA_LINE_CLOCKS) new_line(t);
+}
+
 void tia_run(Tia *t, uint64_t target) {
-    while (t->clock < target) tick(t);
+    while (t->clock < target) {
+        uint32_t n;
+        if ((n = hblank_span(t, target)) != 0) { t->clock += n; t->hctr += (int)n; }
+        else if ((n = idle_span(t, target)) != 0) run_idle(t, n);
+        else tick(t);
+    }
+    sound_sync(t);
 }
 
 /* ── Init ────────────────────────────────────────────────────────────────── */
 
 void tia_reset(Tia *t) {
+    sound_sync(t);
     TiaSound sound = t->sound;
     uint64_t clock = t->clock, frames = t->frame_count;
     uint32_t pots[4];
@@ -591,6 +743,7 @@ void tia_reset(Tia *t) {
     t->sound = sound;
     tia_sound_reset(&t->sound);
     t->clock = clock;
+    t->sound_clock = clock;
     t->frame_count = frames;
     memcpy(t->pot_charge, pots, sizeof(pots));
     t->fire[0] = fire0; t->fire[1] = fire1;

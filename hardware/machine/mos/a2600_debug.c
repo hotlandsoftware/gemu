@@ -19,6 +19,7 @@
  * visible, and while stopped the beam's position is marked.
  */
 #include "atari2600.h"
+#include "a2600_bus.h"
 #include <SDL2/SDL.h>
 #include <inttypes.h>
 #include <stdlib.h>

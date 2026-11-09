@@ -107,14 +107,42 @@ void tia_sound_clock(TiaSound *t) {
     }
 }
 
+void tia_sound_run(TiaSound *t, uint32_t n) {
+    while (n) {
+        uint32_t c = t->counter;
+        uint32_t next = c < 10 ? 10 : c < 38 ? 38 : c < 82 ? 82 : c < 150 ? 150 : 228;
+        uint32_t steps = next - c;
+        if (steps > n) steps = n;
+        for (int i = 0; i < 2; i++)
+            t->sum[i] += (t->ch[i].pulse_counter & 0x01u) * t->ch[i].audv * steps;
+        t->sum_n += steps;
+        t->counter = (uint8_t)(c + steps);
+        n -= steps;
+        if (t->counter != next) break;
+        switch (next) {
+        case 10: case 82:
+            channel_phase0(&t->ch[0]);
+            channel_phase0(&t->ch[1]);
+            break;
+        case 38: case 150:
+            channel_phase1(&t->ch[0]);
+            channel_phase1(&t->ch[1]);
+            emit(t);
+            break;
+        case 228:
+            t->counter = 0;
+            break;
+        }
+    }
+}
+
 void tia_sound_flush(TiaSound *t) {
-    if (t->dev && t->buf_n)
-        SDL_QueueAudio(t->dev, t->buf, (Uint32)(t->buf_n * sizeof(float)));
+    if (t->dev && t->buf_n) gemu_audio_queue(t->dev, t->buf, (size_t)t->buf_n);
     t->buf_n = 0;
 }
 
 uint32_t tia_sound_queued(const TiaSound *t) {
-    return t->dev ? SDL_GetQueuedAudioSize(t->dev) : 0;
+    return gemu_audio_queued(t->dev);
 }
 
 void tia_sound_write(TiaSound *t, uint8_t reg, uint8_t val) {
@@ -140,27 +168,11 @@ bool tia_sound_init(TiaSound *t, double tia_rate, bool want_output) {
     t->tia_rate = tia_rate;
     if (!want_output) return true;
 
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
-        fprintf(stderr, "tia: SDL audio init failed: %s\n", SDL_GetError());
-        return false;
-    }
-    SDL_AudioSpec want = {
-        .freq = TIA_SOUND_RATE, .format = AUDIO_F32SYS, .channels = 1, .samples = 512,
-    }, have;
-    t->dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (!t->dev) {
-        fprintf(stderr, "tia: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
-        return false;
-    }
-    SDL_PauseAudioDevice(t->dev, 0);
-    return true;
+    t->dev = gemu_audio_open("tia", TIA_SOUND_RATE);
+    return t->dev != NULL;
 }
 
 void tia_sound_destroy(TiaSound *t) {
-    if (t->dev) {
-        SDL_CloseAudioDevice(t->dev);
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
-        t->dev = 0;
-    }
+    gemu_audio_close(t->dev);
+    t->dev = NULL;
 }

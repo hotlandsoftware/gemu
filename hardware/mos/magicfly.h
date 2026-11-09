@@ -4,6 +4,7 @@
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
 #include <SDL2/SDL.h>
+#include "gemu/audio_out.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -117,7 +118,7 @@ typedef struct MagicflyState {
     double dac_sample_acc, dac_clock_pps;
     float  dac_frame_buf[1024];
     int    dac_frame_n;
-    SDL_AudioDeviceID audio_dev;
+    GemuAudioOut     *audio_dev;
 
     uint32_t held_actions;
 

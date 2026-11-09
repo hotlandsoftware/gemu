@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <SDL2/SDL.h>
+#include "gemu/audio_out.h"
 
 /*
  * OKI MSM6295 - 4-channel ADPCM voice synthesis LSI.
@@ -53,7 +54,7 @@ typedef struct Okim6295 {
     float frame_buf[1024];
     int   frame_n;
 
-    SDL_AudioDeviceID audio_dev;
+    GemuAudioOut     *audio_dev;
 } Okim6295;
 
 bool oki6295_init   (Okim6295 *o, uint32_t tick_clock_hz, uint32_t native_sample_rate_hz,

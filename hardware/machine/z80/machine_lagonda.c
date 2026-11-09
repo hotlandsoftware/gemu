@@ -683,14 +683,8 @@ static bool load_roms(LagondaState *s, const Z80Config *cfg) {
 }
 
 static bool audio_open(LagondaState *s) {
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) return false;
-    SDL_AudioSpec want = {
-        .freq = LAG_AUDIO_RATE, .format = AUDIO_F32SYS, .channels = 1, .samples = 512,
-    }, have;
-    s->audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (!s->audio_dev) { SDL_QuitSubSystem(SDL_INIT_AUDIO); return false; }
-    SDL_PauseAudioDevice(s->audio_dev, 0);
-    return true;
+    s->audio_dev = gemu_audio_open("lagonda", LAG_AUDIO_RATE);
+    return s->audio_dev != NULL;
 }
 
 LagondaState *lagonda_create(const Z80Config *cfg) {
@@ -774,7 +768,7 @@ LagondaState *lagonda_create(const Z80Config *cfg) {
 
 void lagonda_destroy(LagondaState *s) {
     if (!s) return;
-    if (s->audio_dev) { SDL_CloseAudioDevice(s->audio_dev); SDL_QuitSubSystem(SDL_INIT_AUDIO); }
+    gemu_audio_close(s->audio_dev);
     gemu_display_destroy(s->display);
     gemu_monitor_destroy(s->monitor);
     free(s->panel_fb);
@@ -825,13 +819,13 @@ void lagonda_run(LagondaState *s, const Z80Config *cfg) {
                 if (gemu_monitor_is_paused(s->monitor) || frame) break;
             }
             if (s->audio_dev && s->audio_n)
-                SDL_QueueAudio(s->audio_dev, s->audio_buf, (Uint32)(s->audio_n * sizeof(float)));
+                gemu_audio_queue(s->audio_dev, s->audio_buf, (size_t)s->audio_n);
             s->audio_n = 0;
         }
         present(s);
 
         if (s->audio_dev && !paused) {
-            while (SDL_GetQueuedAudioSize(s->audio_dev) > AUDIO_QUEUE_MAX) SDL_Delay(1);
+            while (gemu_audio_queued(s->audio_dev) > AUDIO_QUEUE_MAX) SDL_Delay(1);
         } else {
             uint64_t ran = s->cpu.cycles - start;
             double ms = ran ? ran * 1000.0 / s->clock_hz : 16.7;

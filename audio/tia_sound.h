@@ -10,6 +10,7 @@
  * sample per channel at ~31.4 kHz, which is resampled here for SDL.
  */
 #include <SDL2/SDL.h>
+#include "gemu/audio_out.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -40,7 +41,7 @@ typedef struct {
     float      buf[TIA_SOUND_BUF];
     int        buf_n;
 
-    SDL_AudioDeviceID dev;
+    GemuAudioOut     *dev;
 } TiaSound;
 
 /* tia_rate: TIA audio samples per second (color clock / 114).  Opens an SDL
@@ -52,5 +53,8 @@ void tia_sound_write(TiaSound *t, uint8_t reg, uint8_t val);   /* reg: 0x15-0x1A
 /* One color clock: phase 0 after clocks 9 and 81, phase 1 (and an output
  * sample, the average of the volumes since the last one) after 37 and 149. */
 void tia_sound_clock(TiaSound *t);
+/* Exactly n tia_sound_clock() calls, done per segment between
+ * the clock phases (the levels only change there and on register writes). */
+void tia_sound_run(TiaSound *t, uint32_t n);
 void tia_sound_flush(TiaSound *t);        /* queue buffered samples to SDL */
 uint32_t tia_sound_queued(const TiaSound *t);   /* bytes waiting in SDL's queue */

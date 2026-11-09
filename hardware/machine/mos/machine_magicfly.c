@@ -233,7 +233,7 @@ static void magicfly_dac_tick(MagicflyState *s) {
 
 static void magicfly_dac_flush(MagicflyState *s) {
     if (!s->audio_dev || s->dac_frame_n == 0) { s->dac_frame_n = 0; return; }
-    SDL_QueueAudio(s->audio_dev, s->dac_frame_buf, (Uint32)(s->dac_frame_n * (int)sizeof(float)));
+    gemu_audio_queue(s->audio_dev, s->dac_frame_buf, (size_t)s->dac_frame_n);
     s->dac_frame_n = 0;
 }
 
@@ -442,13 +442,7 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
 
     if (cfg->sound == MOS_SOUND_PCSPK) {
         s->dac_clock_pps = (double)MAGICFLY_CPU_HZ / 44100.0;
-        if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
-            SDL_AudioSpec want = { .freq = 44100, .format = AUDIO_F32SYS, .channels = 1, .samples = 512 };
-            SDL_AudioSpec have;
-            s->audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-            if (s->audio_dev) SDL_PauseAudioDevice(s->audio_dev, 0);
-            else fprintf(stderr, "%s: SDL_OpenAudioDevice failed: %s\n", name, SDL_GetError());
-        }
+        s->audio_dev = gemu_audio_open(name, 44100);
     }
 
     if (gemu_display_wanted(cfg->display_type)) {
@@ -474,7 +468,7 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
 void magicfly_destroy(MagicflyState *s) {
     if (!s) return;
     magicfly_nvram_save(s);
-    if (s->audio_dev) { SDL_CloseAudioDevice(s->audio_dev); SDL_QuitSubSystem(SDL_INIT_AUDIO); }
+    gemu_audio_close(s->audio_dev);
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
     free(s->prg);

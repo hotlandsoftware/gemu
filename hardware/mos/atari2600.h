@@ -80,6 +80,8 @@ typedef struct Atari2600State {
     uint8_t   bus;          /* last value on the data bus */
     uint16_t  last_addr;
     bool      wsync;        /* WSYNC written: hold the CPU to the end of the line */
+    uint8_t   bus_fast;     /* cartridge fast path (a2600_bus.c) */
+    uint16_t  bus_fast_mask;
 
     /* Console switches */
     bool      color;        /* Color (true) / B&W */

@@ -2799,7 +2799,7 @@ static bool nes_save_snapshot(NesState *s, const char *path) {
     snap->ppu.alt_palette_rgb = NULL;
     snap->apu.mem_read     = NULL; snap->apu.mem_ud       = NULL;
     snap->apu.write_tap    = NULL; snap->apu.write_tap_ud = NULL;
-    snap->apu.audio_dev    = 0;
+    snap->apu.audio_dev    = NULL;
     snap->fds.raw_disk = NULL;
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     snap->apu_midi.out = NULL;
@@ -2871,7 +2871,7 @@ static bool nes_load_snapshot(NesState *s, const char *path) {
     const uint32_t *ppu_alt_palette = s->ppu.alt_palette_rgb;
     void *apu_mem_ud       = s->apu.mem_ud;
     void *apu_write_tap_ud = s->apu.write_tap_ud;
-    SDL_AudioDeviceID audio_dev = s->apu.audio_dev;
+    GemuAudioOut *audio_dev = s->apu.audio_dev;
     uint8_t *fds_raw_disk = s->fds.raw_disk;
     typeof(s->cpu.mem_read)   cpu_mem_read   = s->cpu.mem_read;
     typeof(s->cpu.mem_write)  cpu_mem_write  = s->cpu.mem_write;
@@ -3428,7 +3428,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
          *   (exactly 60.099 fps) and eliminates drift entirely.
          * - Audio off / headless: fall back to a software timer. */
         if (s->apu.audio_dev) {
-            while (SDL_GetQueuedAudioSize(s->apu.audio_dev) > AUDIO_QUEUE_MAX)
+            while (gemu_audio_queued(s->apu.audio_dev) > AUDIO_QUEUE_MAX)
                 SDL_Delay(1);
         } else {
             Uint32 elapsed = SDL_GetTicks() - t0;

@@ -296,8 +296,95 @@ static inline void tick_one(Apu2a03 *a) {
 
 void apu2a03_tick(Apu2a03 *a) { tick_one(a); }
 
+/* ── Batched run ─────────────────────────────────────────────────────────────
+ * apu2a03_run() moves the channel timers on arithmetically between the
+ * cycles where anything else happens - an output sample, a frame counter
+ * step, a DMC timer expiry - and runs those through tick_one(), so the
+ * result is the same as ticking every cycle.  Unusual states (a pending
+ * $4017 write or flag clear, the DMC's start delay, an internal DMC fetch)
+ * just tick. */
+
+/* A down counter reloaded with `period` after reaching 0, clocked n times:
+ * returns how often it reloaded. */
+static inline uint32_t count_down(uint16_t *timer, uint16_t period, uint32_t n) {
+    if (n <= *timer) { *timer = (uint16_t)(*timer - n); return 0; }
+    uint32_t r = n - *timer - 1u;
+    *timer = (uint16_t)(period - r % (period + 1u));
+    return 1u + r / (period + 1u);
+}
+
+/* n cycles in which none of the events above happens. */
+static void fast_forward(Apu2a03 *a, uint32_t n) {
+    uint32_t e = count_down(&a->tri.timer, a->tri.timer_period, n);
+    if (e && a->tri.len > 0 && a->tri.lin > 0) a->tri.seq = (uint8_t)((a->tri.seq + e) & 31u);
+
+    uint32_t clocks = a->apu_clk ? n / 2u : (n + 1u) / 2u;   /* cycles with apu_clk set */
+    if (n & 1u) a->apu_clk = !a->apu_clk;
+    for (int i = 0; i < 2; i++) {
+        ApuPulse *p = &a->pulse[i];
+        e = count_down(&p->timer, p->timer_period, clocks);
+        p->seq = (uint8_t)((p->seq + e) & 7u);
+    }
+    for (e = count_down(&a->noise.timer, a->noise.period, clocks); e; e--) {
+        uint8_t feedback = a->noise.mode
+            ? ((a->noise.lfsr >> 6) & 1) ^ (a->noise.lfsr & 1)
+            : ((a->noise.lfsr >> 1) & 1) ^ (a->noise.lfsr & 1);
+        a->noise.lfsr = (uint16_t)((a->noise.lfsr >> 1) | (feedback << 14));
+    }
+
+    if (a->dmc_enabled) {
+        /* even (get) cycles among cycle+1 .. cycle+n: no expiry among them */
+        uint32_t gets = (uint32_t)(((a->cycle + n) >> 1) - (a->cycle >> 1));
+        a->dmc.timer = (uint16_t)(a->dmc.timer - gets);
+        if (a->dmc.buf_empty && a->dmc.bytes_rem > 0) a->dmc.dma_pending = true;
+    }
+    a->fc_div += n;
+    a->sample_acc += (double)n;   /* exact: the same as n additions of 1.0 */
+    a->cycle += n;
+}
+
+/* Cycles from now to the next event's tick (1 = the next cycle). */
+static uint64_t next_event(const Apu2a03 *a) {
+    /* the next output sample: sample_acc + d >= clock_pps */
+    double room = a->clock_pps - a->sample_acc;
+    uint64_t d = room < 1.0 ? 1u : (uint64_t)room;
+    if (a->sample_acc + (double)d < a->clock_pps) d++;
+    while (d > 1 && a->sample_acc + (double)(d - 1) >= a->clock_pps) d--;
+
+    static const uint32_t steps4[] = { 7457, 14913, 22371, 29828, 29829, 29830 };
+    static const uint32_t steps5[] = { 7457, 14913, 22371, 37281, 37282 };
+    const uint32_t *st = a->fc_mode ? steps5 : steps4;
+    int n = a->fc_mode ? 5 : 6;
+    uint64_t f = 1;                               /* past them all: just tick */
+    for (int i = 0; i < n; i++)
+        if (st[i] > a->fc_div) { f = st[i] - a->fc_div; break; }
+    if (f < d) d = f;
+
+    if (a->dmc_enabled) {
+        /* the timer expires on the get cycle where it is 0 */
+        uint64_t first_get = ((a->cycle + 1u) & 1u) ? 2u : 1u;
+        uint64_t x = first_get + 2u * a->dmc.timer;
+        if (x < d) d = x;
+    }
+    return d;
+}
+
 void apu2a03_run(Apu2a03 *a, uint64_t to) {
-    while (a->cycle < to) tick_one(a);
+    while (a->cycle < to) {
+        if (a->fc_write_delay || a->fc_clear_pending ||
+            (a->dmc_enabled && (a->dmc.start_delay ||
+                                (!a->dma_external && a->dmc.buf_empty && a->dmc.bytes_rem > 0)))) {
+            tick_one(a);
+            continue;
+        }
+        uint64_t left = to - a->cycle, d = next_event(a);
+        if (d <= left) {
+            if (d > 1) fast_forward(a, (uint32_t)(d - 1));
+            tick_one(a);
+        } else {
+            fast_forward(a, (uint32_t)left);
+        }
+    }
 }
 
 uint64_t apu2a03_until_event(const Apu2a03 *a) {
@@ -497,8 +584,7 @@ void apu2a03_flush(Apu2a03 *a) {
         a->frame_n = 0;
         return;
     }
-    SDL_QueueAudio(a->audio_dev, a->frame_buf,
-                   (Uint32)(a->frame_n * sizeof(float)));
+    gemu_audio_queue(a->audio_dev, a->frame_buf, a->frame_n);
     a->frame_n = 0;
 }
 
@@ -506,7 +592,7 @@ void apu2a03_flush(Apu2a03 *a) {
 
 void apu2a03_reset(Apu2a03 *a) {
     /* Silence all channels, keep audio device and external hooks */
-    SDL_AudioDeviceID dev = a->audio_dev;
+    GemuAudioOut *dev = a->audio_dev;
     double pps              = a->clock_pps;
     uint8_t (*mr)(uint16_t, void*) = a->mem_read;
     void *mu = a->mem_ud;
@@ -545,32 +631,11 @@ bool apu2a03_init(Apu2a03 *a, uint32_t cpu_clock_hz) {
     a->frame_irq_enabled = true;
     a->clock_pps     = (double)cpu_clock_hz / (double)APU2A03_SAMPLE_RATE;
 
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
-        fprintf(stderr, "apu: SDL_InitSubSystem(AUDIO) failed: %s\n", SDL_GetError());
-        return false;
-    }
-
-    SDL_AudioSpec want = {
-        .freq     = APU2A03_SAMPLE_RATE,
-        .format   = AUDIO_F32SYS,
-        .channels = 1,
-        .samples  = 512,
-    };
-    SDL_AudioSpec have;
-    a->audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (!a->audio_dev) {
-        fprintf(stderr, "apu: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
-        return false;
-    }
-    SDL_PauseAudioDevice(a->audio_dev, 0);
-    return true;
+    a->audio_dev = gemu_audio_open("apu", (int)APU2A03_SAMPLE_RATE);
+    return a->audio_dev != NULL;
 }
 
 void apu2a03_destroy(Apu2a03 *a) {
-    if (a->audio_dev) {
-        SDL_CloseAudioDevice(a->audio_dev);
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
-        a->audio_dev = 0;
-    }
+    gemu_audio_close(a->audio_dev);
+    a->audio_dev = NULL;
 }

@@ -64,7 +64,11 @@ Run `./bin/gemu -M ?` for the full sorted list. Key entries:
 ```
 cpu/        CPU cores: chip8_cpu.c, mos6502.c, cdp1802.c, octo.c
 vga/        Display chips: rp2c02.c (NES PPU), cdp1861.c, cdp1869.c
-audio/      Sound: apu2a03.c (NES APU), pcspk.c (PC speaker/CDP1802)
+audio/      Sound: apu2a03.c (NES APU), tia_sound.c, okim6295.c, pcspk.c (PC speaker/CDP1802)
+            Chips that produce samples queue them through core/src/audio_out.c
+            (gemu_audio_*: ring buffer + SDL callback, fades out on underrun);
+            don't call SDL_QueueAudio directly.  apu2a03_run/tia_sound_run run
+            in batches (bit-exact with per-cycle ticking - from wiigemu)
 hardware/   Machine glue, devices, ROM databases
   machine_chip8.c / machine_mos.c / machine_nes.c / machine_kim1.c
   machine_vip.c / machine_studio2.c / machine_pecom.c / machine_destroyer.c

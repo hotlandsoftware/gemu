@@ -38,6 +38,7 @@
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
 #include <SDL2/SDL.h>
+#include "gemu/audio_out.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -104,7 +105,7 @@ typedef struct LagondaState {
     uint64_t     insn_count;
 
     /* Audio: DAC -> filter -> output */
-    SDL_AudioDeviceID audio_dev;
+    GemuAudioOut     *audio_dev;
     float        audio_buf[LAG_AUDIO_BUF];
     int          audio_n;
     double       lp1, lp2, dc_x, dc_y;

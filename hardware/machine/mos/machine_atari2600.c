@@ -2,6 +2,7 @@
  * Atari 2600 machine - see hardware/mos/atari2600.h for the memory map.
  */
 #include "atari2600.h"
+#include "a2600_bus.h"
 #include "gemu/screendump.h"
 #include <SDL2/SDL.h>
 #include <inttypes.h>
@@ -165,67 +166,11 @@ static void update_tia_inputs(Atari2600State *s) {
     }
 }
 
-/* ── Memory map ──────────────────────────────────────────────────────────── */
-
-static inline void bus_access(Atari2600State *s, uint16_t addr) {
-    if (addr != s->last_addr) { s->cart.distinct++; s->last_addr = addr; }
-    tia_run(&s->tia, s->cpu.cycle_count * 3u);
-}
-
-static uint8_t a26_read(uint16_t addr, void *ud) {
-    Atari2600State *s = ud;
-    bus_access(s, addr);
-    uint8_t v;
-    if (addr & 0x1000u)        v = a26_cart_read(&s->cart, addr, s->bus, s->cpu.cycle_count);
-    else if (!(addr & 0x80u))  v = tia_read(&s->tia, addr, s->bus);
-    else if (!(addr & 0x200u)) v = s->riot.ram[addr & 0x7Fu];
-    else                       v = m6532_read(&s->riot, addr, s->cpu.cycle_count);
-    a26_cart_snoop(&s->cart, addr, v, false);
-    s->bus = v;
-    gemu_monitor_check_read(s->monitor, addr);
-    return v;
-}
-
-static void a26_write(uint16_t addr, uint8_t val, void *ud) {
-    Atari2600State *s = ud;
-    bus_access(s, addr);
-    if (addr & 0x1000u)        a26_cart_write(&s->cart, addr, val, s->cpu.cycle_count);
-    else if (!(addr & 0x80u))  s->wsync |= tia_write(&s->tia, addr, val);
-    else if (!(addr & 0x200u)) s->riot.ram[addr & 0x7Fu] = val;
-    else                       m6532_write(&s->riot, addr, val, s->cpu.cycle_count);
-    a26_cart_snoop(&s->cart, addr, val, true);
-    s->bus = val;
-    gemu_monitor_check_write(s->monitor, addr);
-}
-
-/* Supercharger BIOS hotspot access to the console's RAM. */
-static uint8_t ram_peek(void *ud, uint8_t addr) {
-    return ((Atari2600State *)ud)->riot.ram[addr & 0x7Fu];
-}
-static void ram_poke(void *ud, uint8_t addr, uint8_t val) {
-    ((Atari2600State *)ud)->riot.ram[addr & 0x7Fu] = val;
-}
-
-/* One instruction, then the WSYNC hold: RDY stays low until the TIA
- * reaches the start of the next scanline. */
-static void a26_step(Atari2600State *s) {
-    mos6502_step(&s->cpu);
-    if (s->wsync) {
-        s->wsync = false;
-        int left = (TIA_LINE_CLOCKS - s->tia.hctr) % TIA_LINE_CLOCKS;
-        s->cpu.cycle_count += (uint64_t)(left + 2) / 3u;
-    }
-}
-
 /* ── Reset / frame output ────────────────────────────────────────────────── */
 
 /* Power cycle (the console's own Reset is a switch the program reads). */
 static void a26_power_on(Atari2600State *s) {
-    tia_reset(&s->tia);
-    m6532_reset(&s->riot, s->cpu.cycle_count);
-    a26_cart_reset(&s->cart);
-    s->wsync = false;
-    mos6502_reset(&s->cpu);
+    a26_bus_power_on(s);
     if (s->cfg->has_start_addr) s->cpu.PC = s->cfg->start_addr;
     s->frame_start_cycle = s->cpu.cycle_count;
 }
@@ -415,9 +360,10 @@ static void a26_hex_toggle(void *ud) {
  * back around the live pointers on load (as the NES does). */
 
 #define A26_SNAPSHOT_MAGIC   0x3632494154414732ULL   /* "2GATAI26" */
-#define A26_SNAPSHOT_VERSION 1u
+#define A26_SNAPSHOT_VERSION 2u   /* 2: the lazily-run TIA's sound clock */
 
 static bool a26_save_snapshot(Atari2600State *s, const char *path) {
+    a26_bus_sync(s);
     FILE *f = fopen(path, "wb");
     if (!f) return false;
     Atari2600State *snap = malloc(sizeof(*snap));
@@ -427,7 +373,7 @@ static bool a26_save_snapshot(Atari2600State *s, const char *path) {
     snap->cpu.mem_read = NULL; snap->cpu.mem_write = NULL; snap->cpu.mem_ud = NULL;
     snap->riot.read_pa = NULL; snap->riot.read_pb = NULL; snap->riot.ud = NULL;
     snap->cart.rom = NULL;
-    snap->tia.sound.dev = 0;
+    snap->tia.sound.dev = NULL;
     snap->dbg.trace = NULL;
     snap->dbg.full_fb = NULL;
     uint64_t magic = A26_SNAPSHOT_MAGIC;
@@ -463,7 +409,7 @@ static bool a26_load_snapshot(Atari2600State *s, const char *path) {
     GemuMonitor *monitor = s->monitor;
     HexEditor *hex = s->hex_editor;
     uint8_t *rom = s->cart.rom;
-    SDL_AudioDeviceID dev = s->tia.sound.dev;
+    GemuAudioOut *dev = s->tia.sound.dev;
     void *ud = s->cpu.mem_ud;
     A26Debug dbg = s->dbg;   /* the debugger's settings aren't machine state */
     *s = *snap;
@@ -473,7 +419,7 @@ static bool a26_load_snapshot(Atari2600State *s, const char *path) {
     s->cart.rom = rom;
     s->tia.sound.dev = dev;
     s->tia.sound.buf_n = 0;
-    s->cpu.mem_read = a26_read; s->cpu.mem_write = a26_write; s->cpu.mem_ud = ud;
+    a26_bus_attach(s);
     s->riot.read_pa = a26_read_pa; s->riot.read_pb = a26_read_pb; s->riot.ud = ud;
     return true;
 }
@@ -578,7 +524,6 @@ Atari2600State *atari2600_create(const MosConfig *cfg) {
         if (!a26_cart_load(&s->cart, cfg->cart_path)) { free(s); return NULL; }
         snprintf(s->cart_path, sizeof(s->cart_path), "%s", cfg->cart_path);
     }
-    a26_cart_set_ram_access(ram_peek, ram_poke, s);
 
     tia_init(&s->tia);
     if (cfg->sound != MOS_SOUND_NONE &&
@@ -592,9 +537,7 @@ Atari2600State *atari2600_create(const MosConfig *cfg) {
     s->riot.ud = s;
 
     mos6502_init(&s->cpu);
-    s->cpu.mem_read  = a26_read;
-    s->cpu.mem_write = a26_write;
-    s->cpu.mem_ud    = s;
+    a26_bus_attach(s);
     mos_cpu_apply(&s->cpu, cfg->cpu);
     s->cpu.dummy_cycles = true;   /* hotspots see every bus cycle */
     for (int i = 0; i < 128; i++) s->lut[i] = palette_color(s, (uint8_t)(i << 1));
@@ -741,7 +684,8 @@ void atari2600_run(Atari2600State *s, const MosConfig *cfg) {
             } else if (cmd == GEMU_MON_RESET) {
                 a26_power_on(s);
             } else if (cmd == GEMU_MON_STEP) {
-                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--) a26_step(s);
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--) a26_bus_step(s);
+                a26_bus_sync(s);
             }
         }
         if (quit) break;
@@ -758,10 +702,11 @@ void atari2600_run(Atari2600State *s, const MosConfig *cfg) {
             while (!s->tia.frame_ready) {
                 if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
                 if (a26_debug_before_step(s)) break;
-                a26_step(s);
+                a26_bus_step(s);
                 if (a26_debug_after_step(s)) break;
                 if (gemu_monitor_is_paused(s->monitor)) break;
             }
+            a26_bus_sync(s);   /* the picture and debugger see where the beam is */
             frame_cycles = s->cpu.cycle_count - start;
             if (s->tia.frame_ready) {
                 s->tia.frame_ready = false;

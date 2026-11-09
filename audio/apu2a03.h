@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <SDL2/SDL.h>
+#include "gemu/audio_out.h"
 
 #define APU2A03_SAMPLE_RATE  44100u
 #define APU2A03_CPU_CLOCK    1789773u  /* NTSC */
@@ -86,7 +87,7 @@ typedef struct Apu2a03 {
     int      frame_n;
 
     /* SDL audio */
-    SDL_AudioDeviceID audio_dev;
+    GemuAudioOut     *audio_dev;
 
     /* Expansion audio: written before each tick by the host machine */
     float    fds_in;
@@ -120,7 +121,8 @@ void    apu2a03_write  (Apu2a03 *a, uint16_t addr, uint8_t val);
 uint8_t apu2a03_read   (Apu2a03 *a, uint16_t addr);
 
 void    apu2a03_tick   (Apu2a03 *a);   /* call once per CPU cycle */
-/* Tick up to and including CPU cycle `to` (a->cycle numbers the last one). */
+/* Tick up to and including CPU cycle `to` (a->cycle numbers the last one),
+ * in batches between events, with the same result as apu2a03_tick(). */
 void    apu2a03_run    (Apu2a03 *a, uint64_t to);
 /* Cycles until the APU could next change something the CPU sees without
  * touching a register - the frame IRQ, or the DMC asking for a DMA - so a
