@@ -7,6 +7,7 @@
  */
 
 #include "merced.h"
+#include <float.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
@@ -472,8 +473,29 @@ static void fr_write(Merced *m, unsigned r, MercedFpReg v) {
 
 /* FP <-> double conversion (approximate: fine for firmware arithmetic,
  * not IEEE-corner exact). */
+/* On x86 long double is the x87 80-bit format - a 64-bit significand with
+ * an explicit integer bit, like the register's - so normal values convert
+ * by moving bits instead of through ldexpl()/frexpl().  Denormals, zero and
+ * out-of-range values still take the libm path below. */
+#if LDBL_MANT_DIG == 64 && LDBL_MAX_EXP == 16384 && (defined(__x86_64__) || defined(__i386__))
+#define MERCED_X87_LDBL 1
+typedef struct { uint64_t mant; uint16_t sign_exp; } X87Bits;
+#endif
+
 static long double fp2d(MercedFpReg f) {
     if (f.exp == 0 && f.sig == 0) return f.sign ? -0.0 : 0.0;
+#ifdef MERCED_X87_LDBL
+    if (f.sig) {
+        unsigned lz = (unsigned)__builtin_clzll(f.sig);
+        int biased = (int)f.exp - 0xFFFF - (int)lz + 16383;
+        if (biased >= 1 && biased <= 32766) {
+            X87Bits b = { f.sig << lz, (uint16_t)(biased | (f.sign ? 0x8000 : 0)) };
+            long double d = 0;
+            memcpy(&d, &b, 10);
+            return d;
+        }
+    }
+#endif
     if (f.exp == 0x1003E) {   /* integer form */
         long double d = (long double)f.sig;
         return f.sign ? -d : d;
@@ -503,6 +525,18 @@ static MercedFpReg d2fp(long double d) {
         f.exp = 0x1FFFE;
         return f;
     }
+#ifdef MERCED_X87_LDBL
+    {
+        X87Bits b;
+        memcpy(&b, &d, 10);
+        unsigned biased = b.sign_exp & 0x7FFF;
+        if (biased != 0 && (b.mant >> 63)) {     /* normal */
+            f.sig = b.mant;
+            f.exp = (uint32_t)((int)biased - 16383 + 0xFFFF);
+            return f;
+        }
+    }
+#endif
     int e;
     d = frexpl(d, &e) * 2.0L;       /* d in [1, 2) */
     e--;
@@ -540,6 +574,162 @@ static MercedFpReg fp_result_static(long double d, unsigned precision) {
     }
     return d2fp(d);
 }
+
+/* fma/fms/fnma without fmal().  On x86 long double has no FMA instruction,
+ * so glibc's fmal() emulates one in software and saves, clears and restores
+ * the FP environment on every call - for firmware that is most of the
+ * emulator's time.  This computes the same thing in integers: the exact
+ * 128-bit product of the significands plus the addend, rounded once to a
+ * 64-bit significand (to nearest, ties to even - the host's mode, which
+ * fmal() also uses).  Within the range checked below there's no overflow,
+ * underflow or denormal anywhere, so the result is bit-for-bit what fmal()
+ * gives; anything else returns false and the caller uses fmal().  Only on
+ * hosts whose long double has a 64-bit significand: elsewhere fmal() rounds
+ * differently and this would change the result. */
+#if LDBL_MANT_DIG == 64
+typedef struct { uint64_t w[3]; } U192;   /* w[2] most significant */
+
+static unsigned u192_clz(const U192 *x) {
+    if (x->w[2]) return (unsigned)__builtin_clzll(x->w[2]);
+    if (x->w[1]) return 64u + (unsigned)__builtin_clzll(x->w[1]);
+    if (x->w[0]) return 128u + (unsigned)__builtin_clzll(x->w[0]);
+    return 192u;
+}
+
+static void u192_shl(U192 *x, unsigned n) {
+    while (n >= 64) { x->w[2] = x->w[1]; x->w[1] = x->w[0]; x->w[0] = 0; n -= 64; }
+    if (n) {
+        x->w[2] = x->w[2] << n | x->w[1] >> (64 - n);
+        x->w[1] = x->w[1] << n | x->w[0] >> (64 - n);
+        x->w[0] <<= n;
+    }
+}
+
+/* Shift right, ORing whatever falls off into bit 0. */
+static void u192_shr_sticky(U192 *x, unsigned n) {
+    if (n >= 192) {
+        bool any = x->w[0] | x->w[1] | x->w[2];
+        x->w[0] = any; x->w[1] = x->w[2] = 0;
+        return;
+    }
+    bool sticky = false;
+    while (n >= 64) { sticky |= x->w[0] != 0; x->w[0] = x->w[1]; x->w[1] = x->w[2]; x->w[2] = 0; n -= 64; }
+    if (n) {
+        sticky |= (x->w[0] << (64 - n)) != 0;
+        x->w[0] = x->w[0] >> n | x->w[1] << (64 - n);
+        x->w[1] = x->w[1] >> n | x->w[2] << (64 - n);
+        x->w[2] >>= n;
+    }
+    x->w[0] |= sticky;
+}
+
+static int u192_cmp(const U192 *a, const U192 *b) {
+    for (int i = 2; i >= 0; i--)
+        if (a->w[i] != b->w[i]) return a->w[i] < b->w[i] ? -1 : 1;
+    return 0;
+}
+
+static void u192_add(U192 *a, const U192 *b) {
+    uint64_t c = 0;
+    for (int i = 0; i < 3; i++) {
+        uint64_t s = a->w[i] + b->w[i];
+        uint64_t c1 = s < a->w[i];
+        a->w[i] = s + c;
+        c = c1 | (a->w[i] < s);
+    }
+}
+
+static void u192_sub(U192 *a, const U192 *b) {   /* a >= b */
+    uint64_t br = 0;
+    for (int i = 0; i < 3; i++) {
+        uint64_t d = a->w[i] - b->w[i];
+        uint64_t b1 = a->w[i] < b->w[i];
+        a->w[i] = d - br;
+        b1 |= d < br;
+        br = b1;
+    }
+}
+
+/* value = sig * 2^(exp - 0xFFFF - 63), as fp2d() reads a register.  Usable
+ * here when it's zero or its top bit lies well inside long double's normal
+ * range, so neither fp2d() nor fmal() ever saw a denormal or an overflow. */
+static bool fma_operand_ok(MercedFpReg f, int *top) {
+    if (f.sig == 0) return true;
+    *top = (int)f.exp - 0xFFFF - 63 + (63 - __builtin_clzll(f.sig));
+    return *top > -8000 && *top < 8000;
+}
+
+/* a * b + c, with neg_prod / neg_c flipping the product's / addend's sign.
+ * On success sets *out (zero comes back as all-zero, as d2fp() makes it). */
+static bool fma_exact(MercedFpReg a, MercedFpReg b, MercedFpReg c,
+                      bool neg_prod, bool neg_c, int *sign, uint64_t *mant, int *e) {
+    int ta = 0, tb = 0, tc = 0;
+    if (!fma_operand_ok(a, &ta) || !fma_operand_ok(b, &tb) || !fma_operand_ok(c, &tc))
+        return false;
+    bool p_zero = a.sig == 0 || b.sig == 0;
+    bool c_zero = c.sig == 0;
+    int sp = (a.sign ^ b.sign ^ neg_prod) & 1, sc = (c.sign ^ neg_c) & 1;
+
+    /* Both terms as 192-bit integers with the top bit at 190 (one bit of
+     * headroom for a carry); ex/ey are the exponents of their bit 0. */
+    U192 x = {{0, 0, 0}}, y = {{0, 0, 0}};
+    int ex = 0, ey = 0, sx = 0, sy = 0;
+    bool have_x = false, have_y = false;
+    if (!p_zero) {
+        uint64_t ah = a.sig >> 32, al = (uint32_t)a.sig;
+        uint64_t bh = b.sig >> 32, bl = (uint32_t)b.sig;
+        uint64_t t0 = al * bl, t1 = ah * bl + (t0 >> 32), t2 = al * bh + (uint32_t)t1;
+        x.w[1] = ah * bh + (t1 >> 32) + (t2 >> 32);
+        x.w[0] = (t2 << 32) | (uint32_t)t0;
+        unsigned lz = u192_clz(&x) - 1;
+        u192_shl(&x, lz);
+        ex = ((int)a.exp - 0xFFFF - 63) + ((int)b.exp - 0xFFFF - 63) - (int)lz;
+        sx = sp; have_x = true;
+    }
+    if (!c_zero) {
+        y.w[1] = c.sig;
+        unsigned lz = u192_clz(&y) - 1;
+        u192_shl(&y, lz);
+        ey = (int)c.exp - 0xFFFF - 63 - 64 - (int)lz;
+        sy = sc; have_y = true;
+    }
+    if (!have_x && !have_y) {
+        *sign = 0; *mant = 0; *e = 0;
+        return true;
+    }
+    if (have_x && (ta + tb > 15000 || ta + tb < -15000))
+        return false;
+    if (!have_x) { x = y; ex = ey; sx = sy; have_y = false; }
+    if (have_y) {
+        if (ey > ex || (ey == ex && u192_cmp(&y, &x) > 0)) {
+            U192 t = x; x = y; y = t;
+            int te = ex; ex = ey; ey = te;
+            int ts = sx; sx = sy; sy = ts;
+        }
+        /* Top bits are both at 190, so x >= y once aligned.  Bits only fall
+         * off y when it's 64+ places below x, and then at most one leading
+         * bit can cancel: the sticky bit stays far under the rounding point. */
+        u192_shr_sticky(&y, (unsigned)(ex - ey > 200 ? 200 : ex - ey));
+        if (sx == sy) u192_add(&x, &y);
+        else u192_sub(&x, &y);
+    }
+    unsigned lz = u192_clz(&x);
+    if (lz == 192) {                       /* exact cancellation: +0 */
+        *sign = 0; *mant = 0; *e = 0;
+        return true;
+    }
+    u192_shl(&x, lz);
+    ex -= (int)lz;
+    uint64_t m = x.w[2];
+    bool round = x.w[1] >> 63;
+    bool sticky = (x.w[1] << 1) != 0 || x.w[0] != 0;
+    if (round && (sticky || (m & 1))) {
+        if (++m == 0) { m = UINT64_C(1) << 63; ex++; }
+    }
+    *sign = sx; *mant = m; *e = ex + 128;     /* value = m * 2^e */
+    return true;
+}
+#endif
 
 /* Merced frcpa's architected 8-bit reciprocal estimate.  Ski expresses this
  * as a 256-entry table indexed by significand bits 62:55.  The table is
@@ -788,9 +978,17 @@ static int ext_highest_unmasked(Merced *m) {
         return 2;
     if (ext_pending_test(m, 0) && interrupt_unmasked(m, 0))
         return 0;
-    for (int v = 255; v >= 16; v--) {
-        if (ext_pending_test(m, (uint8_t)v) && interrupt_unmasked(m, (uint8_t)v))
-            return v;
+    /* Highest vector first, as before, but a byte at a time: this runs on
+     * every instruction while an interrupt waits masked. */
+    for (int i = 31; i >= 2; i--) {
+        unsigned bits = m->external_pending[i];
+        while (bits) {
+            unsigned b = 31u - (unsigned)__builtin_clz(bits);
+            int v = i * 8 + (int)b;
+            if (interrupt_unmasked(m, (uint8_t)v))
+                return v;
+            bits &= ~(1u << b);
+        }
     }
     return -1;
 }
@@ -1775,6 +1973,19 @@ static bool spec_defers(Merced *m, uint32_t vec) {
     return mask != 0 && (m->cr[CR_DCR] & mask);
 }
 
+/* ISR.ed describes the translation of the instruction which issued a data
+ * reference, not the data translation itself.  When its code-page PTE has
+ * ED set, all deferrable data faults report ISR.ed so the OS can choose its
+ * deferred-exception path.  NT maps the PFN initialization loop this way;
+ * omitting ED made its VHPT handler treat the fault as an ordinary miss and
+ * retry the same store forever.  NaT-page consumption is the architectural
+ * exception and forces ED clear (va_translate_ex()).  Only worked out when a
+ * fault is delivered: it scans the instruction TLB, and every load and
+ * store goes through va_translate_ex(). */
+static uint64_t code_ed_isr(Merced *m, bool ifetch) {
+    return (!ifetch && code_page_ed(m)) ? ISR_ED : 0;
+}
+
 static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
                             uint64_t isr_access, bool force,
                             uint64_t *pa, MercedStatus *st) {
@@ -1786,14 +1997,6 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
     /* A speculative reference whose fault is not deferred still reports that
      * it was speculative. */
     uint64_t spec_isr = spec ? ISR_SP : 0;
-    /* ISR.ed describes the translation of the instruction which issued a
-     * data reference, not the data translation itself.  When its code-page
-     * PTE has ED set, all deferrable data faults report ISR.ed so the OS can
-     * choose its deferred-exception path.  NT maps the PFN initialization
-     * loop this way; omitting ED made its VHPT handler treat the fault as an
-     * ordinary miss and retry the same store forever.  NaT-page consumption
-     * is the architectural exception and forces ED clear below. */
-    uint64_t code_ed_isr = (!ifetch && code_page_ed(m)) ? ISR_ED : 0;
     *st = MERCED_OK;
     bool is_rse = !ifetch && (isr_access & ISR_RS) != 0;
     bool on = force ||
@@ -1892,7 +2095,7 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         } else if (walk == VHPT_NOT_PRESENT) {
             if (spec && (silent_probe || spec_defers(m, VEC_PAGE_NOT_PRESENT))) return false;
             *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT,
-                                isr_access | spec_isr | code_ed_isr, va, true);
+                                isr_access | spec_isr | code_ed_isr(m, ifetch), va, true);
             return false;
         } else if (walk == VHPT_TRANSLATION) {
             if (spec && (silent_probe || spec_defers(m, VEC_VHPT))) return false;
@@ -1901,7 +2104,7 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
              * miss: vector 0 lets the OS make its page-table backing
              * resident before retrying the original reference. */
             *st = deliver_fault(m, VEC_VHPT,
-                                isr_access | spec_isr | code_ed_isr, va, true);
+                                isr_access | spec_isr | code_ed_isr(m, ifetch), va, true);
             return false;
         }
     }
@@ -1923,13 +2126,13 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         if (spec && (silent_probe || spec_defers(m, fvec)))
             return false;         /* ld.s: caller sets NaT, no fault */
         *st = deliver_fault(m, fvec,
-                            isr_access | spec_isr | code_ed_isr, va, true);
+                            isr_access | spec_isr | code_ed_isr(m, ifetch), va, true);
         return false;
     }
     if (!(e->pte & PTE_PRESENT)) {
         if (spec && (silent_probe || spec_defers(m, VEC_PAGE_NOT_PRESENT))) return false;
         *st = deliver_fault(m, VEC_PAGE_NOT_PRESENT,
-                            isr_access | spec_isr | code_ed_isr, va, true);
+                            isr_access | spec_isr | code_ed_isr(m, ifetch), va, true);
         return false;
     }
     {
@@ -1946,7 +2149,7 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
             /* A control-speculative load defers a deferrable fault rather
              * than raising it; the caller turns our refusal into a NaT. */
             if (spec && (silent_probe || spec_defers(m, fvec))) return false;
-            uint64_t fault_isr = isr_access | spec_isr | code_ed_isr;
+            uint64_t fault_isr = isr_access | spec_isr | code_ed_isr(m, ifetch);
             if (fvec == VEC_NAT) {
                 fault_isr &= ~ISR_ED;
                 fault_isr |= UINT64_C(0x20); /* NaT-page consumption code */
@@ -2194,15 +2397,19 @@ static uint64_t xlate_kind(const Merced *m, bool ifetch, uint64_t isr_access) {
            ((m->cr[CR_IVA] >> 61) == 0 ? 32u : 0u);
 }
 
-static MercedXlateEntry *xlate_slot(Merced *m, uint64_t va) {
+/* The access kind is part of the slot index as well as the tag: with the
+ * page alone, a loop loading and storing the same page had its read and
+ * write translations evict each other on every access. */
+static MercedXlateEntry *xlate_slot(Merced *m, uint64_t va, uint64_t kind) {
     MercedTranslationCache *tc = m->translation_cache;
-    return &tc->xlate[((va >> 12) ^ (va >> 61)) & (MERCED_XLATE_ENTRIES - 1)];
+    return &tc->xlate[((va >> 12) ^ (va >> 61) ^ (kind * 0x9E5u)) &
+                      (MERCED_XLATE_ENTRIES - 1)];
 }
 
 static bool xlate_lookup(Merced *m, uint64_t va, uint64_t kind, uint64_t *pa) {
     MercedTranslationCache *tc = m->translation_cache;
     if (!tc) return false;
-    const MercedXlateEntry *x = xlate_slot(m, va);
+    const MercedXlateEntry *x = xlate_slot(m, va, kind);
     if (x->tag == ((va & ~UINT64_C(0xFFF)) | kind | XLATE_TAG_VALID) &&
         x->generation == tc->xlate_generation &&
         x->psr_key == (m->psr & XLATE_PSR_KEY) &&
@@ -2216,7 +2423,7 @@ static bool xlate_lookup(Merced *m, uint64_t va, uint64_t kind, uint64_t *pa) {
 static void xlate_store(Merced *m, uint64_t va, uint64_t kind, uint64_t pa) {
     MercedTranslationCache *tc = m->translation_cache;
     if (!tc) return;
-    MercedXlateEntry *x = xlate_slot(m, va);
+    MercedXlateEntry *x = xlate_slot(m, va, kind);
     x->tag = (va & ~UINT64_C(0xFFF)) | kind | XLATE_TAG_VALID;
     x->generation = tc->xlate_generation;
     x->psr_key = m->psr & XLATE_PSR_KEY;
@@ -6147,15 +6354,7 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
             return mhalt(m, "unimpl F-unit fpma/parallel major %u", major);
         }
         warn_once(m, WARN_FP_APPROX, "FP ops use double-precision approximation");
-        long double a = fp2d(fr_read(m, f3));
-        long double bmul = fp2d(fr_read(m, f4));
-        long double c = fp2d(fr_read(m, f2));
-        long double r;
-        switch (major) {
-        case 8: case 9:  r = fmal(a, bmul, c); break;    /* fma */
-        case 0xA: case 0xB: r = fmal(a, bmul, -c); break;/* fms */
-        default: r = fmal(-a, bmul, c); break;           /* fnma */
-        }
+        MercedFpReg fa = fr_read(m, f3), fb = fr_read(m, f4), fc = fr_read(m, f2);
         /* Even major, x=0 is dynamic precision selected by the instruction's
          * FPSR status field; even major, x=1 is explicitly single precision.
          * Odd major, x=0 is double precision (odd/x=1 is parallel). */
@@ -6170,6 +6369,34 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
              * status field starting 13 bits higher. */
             unsigned pc = (unsigned)((m->ar[AR_FPSR] >> (8 + 13 * sf)) & 3);
             precision = (pc == 0) ? 1 : (pc == 2 ? 2 : 0);
+        }
+        bool have_r = false;
+        long double r = 0;
+#if LDBL_MANT_DIG == 64
+        int rsign, re;
+        uint64_t rmant;
+        if (fma_exact(fa, fb, fc, major >= 0xC, major == 0xA || major == 0xB,
+                      &rsign, &rmant, &re)) {
+            /* value = rmant * 2^re, rmant normalized (or zero) */
+            MercedFpReg res = { rmant, rmant ? (uint32_t)(re + 0xFFFF + 63) : 0,
+                                (uint8_t)(rmant ? rsign : 0), 0 };
+            if (precision == 0) {
+                fr_write(m, f1, res);       /* what d2fp(fmal(...)) gives */
+                return MERCED_OK;
+            }
+            have_r = true;
+            r = fp2d(res);
+        }
+#endif
+        if (!have_r) {
+            long double a = fp2d(fa);
+            long double bmul = fp2d(fb);
+            long double c = fp2d(fc);
+            switch (major) {
+            case 8: case 9:  r = fmal(a, bmul, c); break;    /* fma */
+            case 0xA: case 0xB: r = fmal(a, bmul, -c); break;/* fms */
+            default: r = fmal(-a, bmul, c); break;           /* fnma */
+            }
         }
         fr_write(m, f1, fp_result_static(r, precision));
         return MERCED_OK;
@@ -6446,8 +6673,8 @@ MercedStatus merced_step(Merced *m) {
          * execution into the native IVT.  The SDV BIOS then saves a native
          * intercept frame as though it were the interrupted x86 frame and
          * eventually IRETs into its F3:F4/data sentinel at F000:71A8. */
-        if (!ami_ivt_handoff && ext_highest_unmasked(m) >= 0 &&
-            (m->psr & PSR_I) && (m->psr & PSR_IC)) {
+        if (!ami_ivt_handoff && (m->psr & PSR_I) && (m->psr & PSR_IC) &&
+            ext_highest_unmasked(m) >= 0) {
             MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
             m->ninsts++;
             return ist;
@@ -6545,8 +6772,8 @@ MercedStatus merced_step(Merced *m) {
      * setup freeze in a rotating PFN-table-init loop. m->group_start is
      * only true when the current slot legitimately begins a fresh group. */
     if (!ami_ivt_handoff && m->group_start &&
-        ext_highest_unmasked(m) >= 0 &&
-        (m->psr & PSR_I) && (m->psr & PSR_IC)) {
+        (m->psr & PSR_I) && (m->psr & PSR_IC) &&
+        ext_highest_unmasked(m) >= 0) {
         MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
         m->ninsts++;
         return ist;

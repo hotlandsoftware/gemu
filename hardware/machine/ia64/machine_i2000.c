@@ -5197,10 +5197,22 @@ static void i2000_bench_check(Ia64I2000State *s) {
     uint64_t ninsts_delta = s->cpu->ninsts - window_start_ninsts;
     double elapsed_s = (double)(i2000_monotonic_ns() - window_start_ns) / 1e9;
     double slots_per_sec = (double)ninsts_delta / elapsed_s;
+    /* A fingerprint of the machine at the target, so a speed-up can be
+     * checked to leave emulation exactly as it was: same IP, same RAM.
+     * (Registers aren't hashed: guest code copies AR.ITC, which follows
+     * host time, into them.) */
+    const Merced *m = s->cpu;
+    uint64_t ram_h = UINT64_C(0xcbf29ce484222325);
+    for (uint64_t i = 0; i + 8 <= s->ram_size; i += 8) {
+        uint64_t w;
+        memcpy(&w, s->ram + i, 8);
+        ram_h = (ram_h ^ w) * UINT64_C(0x100000001b3);
+    }
     printf("gemu-bench: window=[%" PRIu64 ",%" PRIu64 "] ninsts_delta=%"
-           PRIu64 " elapsed=%.3fs slots/sec=%.0f bundle-equiv/sec=%.0f\n",
+           PRIu64 " elapsed=%.3fs slots/sec=%.0f bundle-equiv/sec=%.0f"
+           " ip=%016" PRIX64 " ram=%016" PRIX64 "\n",
            window_start_ninsts, s->cpu->ninsts, ninsts_delta, elapsed_s,
-           slots_per_sec, slots_per_sec / 3.0);
+           slots_per_sec, slots_per_sec / 3.0, m->ip, ram_h);
     fflush(stdout);
     exit(0);
 }
@@ -5358,13 +5370,23 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
     uint64_t itc_last_ns = i2000_monotonic_ns();
     uint32_t display_keys_held = 0;
 
+    /* A benchmark (GEMU_BENCH_NINSTS) runs the ITC off the instruction
+     * count instead, so the guest takes the same path however fast the
+     * host is and its end-of-run fingerprint can be compared across
+     * builds (with GEMU_FIXED_TIME pinning the RTC as well). */
+    uint64_t bench_warmup, bench_target;
+    i2000_bench_targets(&bench_warmup, &bench_target);
+    bool host_itc = bench_target == 0;
+
     bool running = true;
     while (running) {
         /* loadvm restores this CPU flag too, so reassert machine policy.
          * Paused time must not become one enormous timer jump on resume. */
-        merced_set_external_itc(s->cpu, true);
+        merced_set_external_itc(s->cpu, host_itc);
         uint64_t now_ns = i2000_monotonic_ns();
-        if (gemu_monitor_is_paused(s->monitor) || s->halted) {
+        if (!host_itc) {
+            itc_last_ns = now_ns;
+        } else if (gemu_monitor_is_paused(s->monitor) || s->halted) {
             itc_last_ns = now_ns;
         } else {
             uint64_t ticks = (now_ns - itc_last_ns) / I2000_ITC_TICK_NS;

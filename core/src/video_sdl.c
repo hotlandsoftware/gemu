@@ -36,24 +36,29 @@ struct GemuVideoSdl {
 
 static void gemu_video_sdl_clear(GemuVideoSdl *v);
 
-/* ReactOS's Direct3D runs on OpenGL (wined3d), and without a 3D driver
- * every frame goes through a software OpenGL (it also nags about it on
- * startup).  GDI is far faster there, so on ReactOS "auto" asks OpenGL
- * who renders and takes the software renderer unless that's a real GPU. */
-static bool video_sdl_is_reactos(void) {
+/* ReactOS and Wine run Direct3D on OpenGL (wined3d), so without a 3D
+ * driver every frame goes through a software OpenGL (ReactOS also nags
+ * about it on startup).  GDI is far faster there, so on those "auto" asks
+ * OpenGL who renders and takes the software renderer unless that's a real
+ * GPU.  Real Windows doesn't need this: its Direct3D doesn't sit on
+ * OpenGL, and many of its drivers ship no OpenGL at all.  Returns the
+ * system's name, or NULL on anything else. */
+static const char *video_sdl_d3d_on_gl(void) {
 #ifdef _WIN32
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (ntdll && GetProcAddress(ntdll, "wine_get_version")) return "Wine";
     HKEY key;
     char name[64] = "";
     DWORD len = sizeof(name) - 1, type = 0;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
                       0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
-        return false;
+        return NULL;
     bool ros = RegQueryValueExA(key, "ProductName", NULL, &type, (BYTE *)name, &len) == ERROR_SUCCESS &&
                type == REG_SZ && strstr(name, "ReactOS") != NULL;
     RegCloseKey(key);
-    return ros;
+    return ros ? "ReactOS" : NULL;
 #else
-    return false;
+    return NULL;
 #endif
 }
 
@@ -63,7 +68,7 @@ static bool video_sdl_gl_is_software(char *gl, size_t len) {
     gl[0] = 0;
 #ifndef _WIN32
     (void)len;
-    return false;   /* only asked on ReactOS */
+    return false;   /* only asked on ReactOS and Wine */
 #else
     SDL_Window *w = SDL_CreateWindow("", 0, 0, 16, 16, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
     if (!w) return true;
@@ -179,9 +184,9 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
 
     char gl[128] = "";
+    const char *d3d_on_gl = spec->renderer == GEMU_RENDERER_AUTO ? video_sdl_d3d_on_gl() : NULL;
     bool force_sw = spec->renderer == GEMU_RENDERER_SOFTWARE ||
-                    (spec->renderer == GEMU_RENDERER_AUTO && video_sdl_is_reactos() &&
-                     video_sdl_gl_is_software(gl, sizeof(gl)));
+                    (d3d_on_gl && video_sdl_gl_is_software(gl, sizeof(gl)));
     if (force_sw)
         v->renderer = SDL_CreateRenderer(v->window, -1, SDL_RENDERER_SOFTWARE);
     else
@@ -198,8 +203,8 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
             if (spec->renderer == GEMU_RENDERER_SOFTWARE)
                 fprintf(stderr, "%s: using SDL software renderer (forced)\n", who);
             else if (force_sw)
-                fprintf(stderr, "%s: using SDL software renderer (ReactOS without 3D acceleration, OpenGL: %s)\n",
-                        who, gl[0] ? gl : "none");
+                fprintf(stderr, "%s: using SDL software renderer (%s without 3D acceleration, OpenGL: %s)\n",
+                        who, d3d_on_gl, gl[0] ? gl : "none");
             else
                 fprintf(stderr, "%s: using SDL software renderer (auto-detected: %s)\n",
                         who, info.name ? info.name : "unknown");
