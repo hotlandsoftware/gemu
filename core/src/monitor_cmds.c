@@ -1147,8 +1147,8 @@ static GemuMonCmd cmd_poke(GemuMonitor *mon, const char *args) {
             return GEMU_MON_NONE;
         }
     }
-    mon_printf(mon, "wrote %zu byte%s at 0x%0*" PRIx64 "\n",
-               n, n == 1 ? "" : "s", addr_digits(mon), addr & addr_mask(mon));
+    mon_printf(mon, "wrote %u byte%s at 0x%0*" PRIx64 "\n",
+               (unsigned)n, n == 1 ? "" : "s", addr_digits(mon), addr & addr_mask(mon));
     return GEMU_MON_NONE;
 }
 

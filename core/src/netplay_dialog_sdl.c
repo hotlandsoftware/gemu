@@ -414,8 +414,10 @@ static void server_cell(SdlNetplayDialog *d, int row, int col, char *buf, size_t
     case 1: snprintf(buf, len, "%s", sv->address); break;
     case 2: snprintf(buf, len, "%s", sv->users); break;
     case 3: if (listed) snprintf(buf, len, "%d", sv->games); else buf[0] = 0; break;
-    case 4: if (sv->ping >= 0) snprintf(buf, len, "%dms", sv->ping);
-            else snprintf(buf, len, "%s", listed ? "-" : ""); break;
+    case 4:
+        if (sv->ping >= 0) snprintf(buf, len, "%dms", sv->ping);
+        else snprintf(buf, len, "%s", listed ? "-" : "");
+        break;
     default: snprintf(buf, len, "%s", sv->location); break;
     }
 }
@@ -491,7 +493,7 @@ static void draw_connect(SdlNetplayDialog *d) {
 
 static void draw_lobby(SdlNetplayDialog *d) {
     draw_table(d, &d->tab[T_GAMES], d->n_games, game_cell, game_color,
-               "(no games yet - Create Game offers this one)", d->focus == FOCUS_GAMES);
+               "(no games yet)", d->focus == FOCUS_GAMES);
     snprintf(d->users_title, sizeof(d->users_title),
              d->info.state >= NETPLAY_ROOM ? "In this game (%d)" : "Users (%d)", d->n_users);
     draw_table(d, &d->tab[T_USERS], d->n_users, user_cell, user_color, NULL, false);

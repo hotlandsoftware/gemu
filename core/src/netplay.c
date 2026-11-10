@@ -19,7 +19,7 @@
 
 uint32_t np_now_ms(void) {
 #ifdef _WIN32
-    return (uint32_t)GetTickCount64();
+    return (uint32_t)GetTickCount();   /* XP has no GetTickCount64; ms wraps the same */
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
