@@ -2185,8 +2185,10 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         /* Intel reset-control convention: bit 1 selects a hard reset and
          * bit 2 triggers it.  SAL writes 02h followed by 06h, then waits in
          * a dead loop for the platform reset to arrive. */
-        if (val & 0x04)
+        if (val & 0x04) {
             s->reset_requested = true;
+            merced_request_exit(s->cpu);   /* handled after this slot */
+        }
         return;
     }
     if (port == PCI_CFG_ADDR && size == 4) {
@@ -2582,10 +2584,23 @@ static inline uint64_t i2000_normalize_pa(Ia64I2000State *s, uint64_t addr) {
     return addr;
 }
 
+/* memcpy() with the access size spelled out, so the common widths compile
+ * to a single move instead of a library call (this is every RAM access). */
+static inline void i2000_ram_copy(const void *src, void *dst, unsigned size) {
+    switch (size) {
+    case 1: memcpy(dst, src, 1); break;
+    case 2: memcpy(dst, src, 2); break;
+    case 4: memcpy(dst, src, 4); break;
+    case 8: memcpy(dst, src, 8); break;
+    default: memcpy(dst, src, size); break;
+    }
+}
+
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64I2000State *s = ud;
-    for (unsigned i = 0; i < size; i++)
-        gemu_monitor_check_read(s->monitor, (uint32_t)(addr + i));
+    if (gemu_monitor_has_mem_breakpoints(s->monitor))
+        for (unsigned i = 0; i < size; i++)
+            gemu_monitor_check_read(s->monitor, (uint32_t)(addr + i));
     /* IA-64 region-6 uncached aliases carry 0xC in the top nibble.  The
      * chipset sees the physical address after those region bits are
      * stripped; retaining them made SDV's MMIO PCI configuration cycles
@@ -2654,7 +2669,7 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     }
     if (addr + size <= s->ram_size) {
         uint64_t v = 0;
-        memcpy(&v, s->ram + addr, size);
+        i2000_ram_copy(s->ram + addr, &v, size);
         return v;
     }
     if (addr >= I2000_CHIPSET_SCRATCH_BASE && addr + size <= I2000_RAM_MAX) {
@@ -2848,7 +2863,7 @@ static uint64_t bus_fetch(void *ud, uint64_t addr, unsigned size) {
 
 static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     Ia64I2000State *s = ud;
-    for (unsigned i = 0; i < size; i++) {
+    for (unsigned i = 0; gemu_monitor_has_mem_breakpoints(s->monitor) && i < size; i++) {
         if (gemu_monitor_check_write(s->monitor, (uint32_t)(addr + i)))
             fprintf(stderr, "i2000: watched write pa=%016" PRIX64
                     " size=%u val=%016" PRIX64 " ip=%016" PRIX64
@@ -2932,7 +2947,7 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
                     s->cpu->ip, s->cpu->ninsts);
             fflush(stderr);
         }
-        memcpy(s->ram + addr, &val, size);
+        i2000_ram_copy(&val, s->ram + addr, size);
         return;
     }
     if (addr >= I2000_CHIPSET_SCRATCH_BASE && addr + size <= I2000_RAM_MAX) {
@@ -5217,12 +5232,70 @@ static void i2000_bench_check(Ia64I2000State *s) {
     exit(0);
 }
 
+/* After a slot (or a run of them): carry out a platform reset the slot
+ * requested, or stop on a halt.  Returns false when the slice must end. */
+static bool i2000_after_step(Ia64I2000State *s, MercedStatus st) {
+    if (s->reset_requested) {
+        fprintf(stderr, "i2000: firmware requested a platform reset\n");
+        /* CF9 resets the processor while the 460GX retains the sticky
+         * configuration state SAL just programmed.  In particular,
+         * SAC CBNR bit 0 selects the second bootstrap phase, with the
+         * firmware range shadowed in RAM: the flash image is copied to
+         * 0x03C00000 and the top-of-4GiB window becomes RAM-backed for
+         * reads AND writes (the firmware's data segment lives up there
+         * - its physical-mode stores via the 0xFFFDxxxx alias must
+         * stick, or the SAL descriptors stay empty). */
+        s->fw_shadow_enabled = true;
+        if (I2000_FW_SHADOW_BASE + I2000_FLASH_SIZE <= s->ram_size)
+            memcpy(s->ram + I2000_FW_SHADOW_BASE, s->flash,
+                   I2000_FLASH_SIZE);
+        merced_reset(s->cpu);
+        s->halted = false;
+        s->reset_requested = false;
+        s->mmio_log_n = 0;
+        memset(s->mmio_log, 0, sizeof(s->mmio_log));
+        printf("i2000: processor reset, IP=0x%016" PRIX64 "\n",
+               s->cpu->ip);
+        return false;
+    }
+    if (st != MERCED_OK) {
+        s->halted = true;
+        s->halt_status = st;
+        i2000_report_halt(s);
+        return false;
+    }
+    return true;
+}
+
 static void i2000_run_slice(Ia64I2000State *s) {
     if (s->halted)
         return;
     bool check_exec = gemu_monitor_has_exec_breakpoints(s->monitor);
     bool check_mem = gemu_monitor_has_mem_breakpoints(s->monitor);
-    for (int i = 0; i < INSTR_PER_FRAME; i++) {
+    for (int i = 0; i < INSTR_PER_FRAME; ) {
+        /* Ordinary execution: one interrupt-poll quantum per call into the
+         * CPU's fast path.  It stops after a slot that requests a reset
+         * (merced_request_exit()) and, while CPUID still reports revision 0,
+         * when execution reaches the high-DRAM aperture, so everything
+         * below happens at the same instruction as in the slot-by-slot
+         * loop that follows.  That loop still runs whenever a breakpoint or
+         * watchpoint is set, and finishes a quantum the fast path left. */
+        bool rev0 = s->cpu->cpu_revision == 0;
+        if (!check_exec && !check_mem &&
+            (i & (IRQ_POLL_QUANTUM - 1)) == 0 &&
+            i + IRQ_POLL_QUANTUM <= INSTR_PER_FRAME &&
+            !(rev0 && (s->cpu->ip & UINT64_C(0x00000fff00000000)) ==
+                          I2000_HIGH_DRAM_TAG)) {
+            i2000_poll_interrupts(s);
+            unsigned n = 0;
+            MercedStatus st = merced_run_fast(
+                s->cpu, IRQ_POLL_QUANTUM, &n,
+                rev0 ? UINT64_C(0x00000fff00000000) : 0, I2000_HIGH_DRAM_TAG);
+            i += (int)n;
+            if (!i2000_after_step(s, st))
+                return;
+            continue;
+        }
         if (check_exec &&
             gemu_monitor_check_exec(s->monitor, (uint32_t)s->cpu->ip))
             return;
@@ -5246,40 +5319,14 @@ static void i2000_run_slice(Ia64I2000State *s) {
                 I2000_HIGH_DRAM_TAG)
             merced_set_cpu_revision(s->cpu, 6);
         MercedStatus st = merced_step(s->cpu);
+        i++;
         /* A memory watchpoint can be raised from inside the bus callback.
          * Stop this execution slice immediately so the reported IP remains
          * the instruction that performed the access. */
         if (check_mem && gemu_monitor_is_paused(s->monitor))
             return;
-        if (s->reset_requested) {
-            fprintf(stderr, "i2000: firmware requested a platform reset\n");
-            /* CF9 resets the processor while the 460GX retains the sticky
-             * configuration state SAL just programmed.  In particular,
-             * SAC CBNR bit 0 selects the second bootstrap phase, with the
-             * firmware range shadowed in RAM: the flash image is copied to
-             * 0x03C00000 and the top-of-4GiB window becomes RAM-backed for
-             * reads AND writes (the firmware's data segment lives up there
-             * - its physical-mode stores via the 0xFFFDxxxx alias must
-             * stick, or the SAL descriptors stay empty). */
-            s->fw_shadow_enabled = true;
-            if (I2000_FW_SHADOW_BASE + I2000_FLASH_SIZE <= s->ram_size)
-                memcpy(s->ram + I2000_FW_SHADOW_BASE, s->flash,
-                       I2000_FLASH_SIZE);
-            merced_reset(s->cpu);
-            s->halted = false;
-            s->reset_requested = false;
-            s->mmio_log_n = 0;
-            memset(s->mmio_log, 0, sizeof(s->mmio_log));
-            printf("i2000: processor reset, IP=0x%016" PRIX64 "\n",
-                   s->cpu->ip);
+        if (!i2000_after_step(s, st))
             return;
-        }
-        if (st != MERCED_OK) {
-            s->halted = true;
-            s->halt_status = st;
-            i2000_report_halt(s);
-            break;
-        }
     }
 }
 

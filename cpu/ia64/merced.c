@@ -46,7 +46,12 @@ static const char *merced_cached_getenv(const char *name) {
 /* All getenv uses below describe immutable startup/debug configuration.
  * Keep the spelling at call sites readable while ensuring none can regress
  * into a per-instruction CRT lookup. */
-#define getenv(name) merced_cached_getenv(name)
+#define getenv(name) (__extension__({                                   \
+    /* one lookup per call site; after that a load and a branch */          \
+    static const char *env_value_;                                          \
+    static bool env_done_;                                                  \
+    if (!env_done_) { env_value_ = merced_cached_getenv(name); env_done_ = true; } \
+    env_value_; }))
 
 /* ── Field helpers ───────────────────────────────────────────────────────── */
 
@@ -2318,7 +2323,18 @@ typedef struct {
     uint64_t va, pa, lo, hi, slots[3];
     uint32_t translation_generation, code_generation;
     uint8_t tmpl, valid;
+    /* Decoded once when the entry is filled (a pure function of the bundle
+     * bits), for merced_run_fast(): per slot, the handler merced_step()'s
+     * unit dispatch would reach (none for nops; X-unit slots go to
+     * exec_x()), its qualifying predicate register and stop bit; and
+     * whether slot 0 may be one of the firmware loop idioms merced_step()
+     * special-cases, or the template is reserved. */
+    MercedStatus (*fn[3])(Merced *m, uint64_t raw, int qp);
+    uint8_t kind[3], qpr[3], stop[3];
+    uint8_t slow_slot0, reserved;
 } MercedTbEntry;
+
+enum { SLOT_EXEC, SLOT_NOP, SLOT_X };
 
 /* Soft TLB: recent successful data/instruction translations, one 4 KiB
  * page per entry (IA-64's smallest page), so ordinary loads and stores skip
@@ -2342,6 +2358,12 @@ typedef struct {
     uint32_t translation_generation;
     MercedXlateEntry xlate[MERCED_XLATE_ENTRIES];
     uint32_t xlate_generation;
+    /* merced_request_exit(): stop merced_run_fast() after this slot. */
+    bool exit_request;
+    /* The TB entry fast_step() last checked against the bundle cache.  It
+     * stays right for as long as the bundle cache does: only merced_step()
+     * refills that cache or rewrites TB entries, and it clears this. */
+    MercedTbEntry *cur_tb;
 } MercedTranslationCache;
 
 static inline unsigned tb_index(uint64_t va) {
@@ -6561,7 +6583,84 @@ void merced_ia32_gr_write(Merced *m, unsigned reg, uint64_t value) {
     gr_write(m, reg, value, 0);
 }
 
+/* nop.m / nop.i / nop.f / nop.b and their hint/brp siblings: the encodings
+ * whose exec_* handler returns MERCED_OK straight away, with no effect,
+ * whatever the predicate.  Compilers pad most bundles with them (close to
+ * half of all slots in firmware), so they skip the decoders entirely. */
+static inline bool slot_is_nop(char unit, uint64_t raw) {
+    unsigned major = (unsigned)(raw >> 37) & 0xF;
+    unsigned x6 = (unsigned)(raw >> 27) & 0x3F;
+    switch (unit) {
+    case 'M':   /* M48: x3=0 (35:33), x2=0 (32:31), x4=1 (30:27) */
+    case 'I':   /* I18: x3=0 (35:33), x6=1 (32:27) */
+        return major == 0 && ((raw >> 27) & 0x1FF) == 1;
+    case 'F':   /* F16: x (33)=0, x6=1 */
+        return major <= 1 && ((raw >> 33) & 1) == 0 && x6 == 1;
+    case 'B':   /* B9 nop.b/hint.b, and brp (B6/B7 hints) */
+        return major == 2 && (x6 == 0x00 || x6 == 0x01 || x6 == 0x10 || x6 == 0x11);
+    default:
+        return false;
+    }
+}
+
+/* Fill a TB entry's decoded fields from its bundle bits.  slow_slot0 marks
+ * the bundle-only half of each slot-0 special case in merced_step() (the
+ * RAM-clear, empty-cloop and dead-loop idioms, and reserved templates), so
+ * merced_run_fast() can leave exactly those to merced_step() (a reserved
+ * template from any slot). */
+static void tb_decode(MercedTbEntry *tb) {
+    const char *units = bundle_units[tb->tmpl];
+    const uint64_t *sl = tb->slots;
+    tb->slow_slot0 = 0;
+    tb->reserved = units[0] == '?';
+    if (tb->reserved)
+        return;
+    for (unsigned i = 0; i < 3; i++) {
+        char u = units[i] == 'L' ? 'X' : units[i];
+        uint64_t raw = u == 'X' ? sl[2] : sl[i];
+        tb->qpr[i] = (uint8_t)bits(raw, 0, 6);
+        tb->stop[i] = bundle_stop_after[tb->tmpl][u == 'X' ? 2 : i];
+        tb->fn[i] = NULL;
+        if (u == 'X') {
+            tb->kind[i] = SLOT_X;
+            continue;
+        }
+        if (slot_is_nop(u, raw)) {
+            tb->kind[i] = SLOT_NOP;
+            continue;
+        }
+        tb->kind[i] = SLOT_EXEC;
+        unsigned major = (unsigned)bits(raw, 37, 4);
+        switch (u) {
+        case 'M':
+            /* exec_m()'s own routing, where it's a plain hand-off */
+            if (major <= 1) tb->fn[i] = exec_m_sys;
+            else if (major >= 4 && major <= 7) tb->fn[i] = exec_mem;
+            else tb->fn[i] = exec_m;
+            break;
+        case 'I': tb->fn[i] = exec_i; break;
+        case 'B': tb->fn[i] = exec_b; break;
+        default:  tb->fn[i] = exec_f; break;
+        }
+    }
+    bool fill = units[0] == 'M' && units[1] == 'M' && units[2] == 'B' &&
+        bits(sl[0], 37, 4) == 5 && bits(sl[1], 37, 4) == 5 &&
+        bits(sl[0], 30, 6) == 0x33 && bits(sl[1], 30, 6) == 0x33 &&
+        bits(sl[0], 0, 6) == 0 && bits(sl[1], 0, 6) == 0 &&
+        bits(sl[0], 13, 7) == 0 && bits(sl[1], 13, 7) == 0 &&
+        bits(sl[0], 6, 7) == 16 && bits(sl[1], 6, 7) == 16 &&
+        bits(sl[2], 37, 4) == 4 && bits(sl[2], 6, 3) == 5 &&
+        bits(sl[2], 0, 6) == 0;
+    bool empty_loop = units[0] == 'M' && units[1] == 'I' && units[2] == 'B' &&
+        sl[0] == 0x00008000000ull && sl[1] == 0x00008000000ull &&
+        bits(sl[2], 37, 4) == 4 && bits(sl[2], 0, 6) == 0 &&
+        (bits(sl[2], 6, 3) == 5 || bits(sl[2], 6, 3) == 0);
+    tb->slow_slot0 = fill || empty_loop;
+}
+
 MercedStatus merced_step(Merced *m) {
+    if (m->translation_cache)
+        ((MercedTranslationCache *)m->translation_cache)->cur_tb = NULL;
     /* EFI 0.99 Debug SDV's UNDI-not-found cleanup passes the 32-bit status
      * sentinel 0x80000000 to FreePool.  Its pool.c:439 assertion enters a
      * permanent dead loop instead of returning EFI_INVALID_PARAMETER.  Skip
@@ -6943,6 +7042,7 @@ MercedStatus merced_step(Merced *m) {
             tb->tmpl = (uint8_t)tmpl;
             tb->translation_generation = tc->translation_generation;
             tb->code_generation = tc->page_generation[tb_page_index(pa)];
+            tb_decode(tb);
             tb->valid = true;
         }
     }
@@ -7617,13 +7717,17 @@ MercedStatus merced_step(Merced *m) {
     }
     }
 
-    switch (unit) {
-    case 'M': st = exec_m(m, raw, qp); break;
-    case 'I': st = exec_i(m, raw, qp); break;
-    case 'B': st = exec_b(m, raw, qp); break;
-    case 'F': st = exec_f(m, raw, qp); break;
-    case 'X': st = exec_x(m, raw, lraw, qp); break;
-    default:  st = mhalt(m, "internal: unit %c", unit); break;
+    if (slot_is_nop(unit, raw)) {
+        st = MERCED_OK;
+    } else {
+        switch (unit) {
+        case 'M': st = exec_m(m, raw, qp); break;
+        case 'I': st = exec_i(m, raw, qp); break;
+        case 'B': st = exec_b(m, raw, qp); break;
+        case 'F': st = exec_f(m, raw, qp); break;
+        case 'X': st = exec_x(m, raw, lraw, qp); break;
+        default:  st = mhalt(m, "internal: unit %c", unit); break;
+        }
     }
 
     if (st != MERCED_OK) {
@@ -7659,6 +7763,159 @@ MercedStatus merced_step(Merced *m) {
     else
         m->ip = bundle_va | (slot + 1);
     return MERCED_OK;
+}
+
+/* Stop the current merced_run_fast() after the slot now executing - for
+ * platform events (a reset request from a bus write) that the caller must
+ * handle before the next instruction, as it would between merced_step()
+ * calls. */
+void merced_request_exit(Merced *m) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (tc) tc->exit_request = true;
+}
+
+/* The common case of merced_step(), many slots per call.  It handles a slot
+ * itself only when none of merced_step()'s special cases can apply (debug
+ * hooks, IA-32, the firmware entry-point shims, an undecoded or reserved
+ * bundle, the slot-0 loop idioms); otherwise it hands that slot to
+ * merced_step() before touching any state.  What it does do - interrupt
+ * recognition, the fetch-cache bookkeeping, dispatch and the end-of-slot
+ * accounting - is merced_step()'s code in the same order, so the two run
+ * the guest identically. */
+static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
+    uint64_t ip = m->ip;
+    if ((m->psr & PSR_IS) || ip == UINT64_C(0x000000007F38B362) ||
+        (ip & UINT64_C(0x1FFFFFFFFFFFFFF0)) == UINT64_C(0x00000000FFF05000))
+        return merced_step(m);
+    uint64_t bundle_va = ip & ~0xFull;
+    unsigned slot = (unsigned)(ip & 0xF);
+    if (slot > 2) return merced_step(m);
+    bool from_bundle_cache = m->bundle_cache_valid &&
+                             m->bundle_cache_translation_valid &&
+                             m->bundle_cache_va == bundle_va;
+    MercedTbEntry *tb;
+    if (from_bundle_cache) {
+        tb = tc->cur_tb;            /* checked on an earlier slot? */
+        if (!tb || tb->va != bundle_va) {
+            /* The decode is a pure function of the bundle bits, so any
+             * entry holding the same bits will do. */
+            tb = &tc->entry[tb_index(bundle_va)];
+            if (!(tb->valid && tb->va == bundle_va &&
+                  tb->lo == m->bundle_cache_lo && tb->hi == m->bundle_cache_hi))
+                return merced_step(m);
+            tc->cur_tb = tb;
+        }
+    } else {
+        tb = &tc->entry[tb_index(bundle_va)];
+        if (!(tb->valid && tb->va == bundle_va &&
+              tb->translation_generation == tc->translation_generation &&
+              tb->code_generation == tc->page_generation[tb_page_index(tb->pa)]))
+            return merced_step(m);
+    }
+    if (tb->reserved || (slot == 0 && tb->slow_slot0)) return merced_step(m);
+
+    /* -- from here on, merced_step()'s own sequence -- */
+    bool ami_ivt_handoff = m->cr[CR_IVA] == 0 &&
+                           ((ip >= UINT64_C(0x7F000000) &&
+                             ip < UINT64_C(0x80000000)) ||
+                            ((ip & UINT64_C(0x00000fff00000000)) ==
+                             UINT64_C(0x00000e0000000000)));
+    if (!ami_ivt_handoff && m->group_start &&
+        (m->psr & PSR_I) && (m->psr & PSR_IC) &&
+        ext_highest_unmasked(m) >= 0) {
+        MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
+        m->ninsts++;
+        return ist;
+    }
+    if (!ami_ivt_handoff && m->group_start &&
+        m->timer_pending && !(m->cr[CR_ITV] & (1ull << 16)) &&
+        interrupt_unmasked(m, (uint8_t)m->cr[CR_ITV]) &&
+        (m->psr & PSR_I) && (m->psr & PSR_IC)) {
+        MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
+        m->ninsts++;
+        return ist;
+    }
+
+    if (!from_bundle_cache) {
+        m->bundle_cache_valid = true;
+        m->bundle_cache_translation_valid = true;
+        m->bundle_cache_va = bundle_va;
+        m->bundle_cache_pa = tb->pa;
+        m->bundle_cache_lo = tb->lo;
+        m->bundle_cache_hi = tb->hi;
+        m->bundle_cache_tmpl = tb->tmpl;
+        m->bundle_cache_slots[0] = tb->slots[0];
+        m->bundle_cache_slots[1] = tb->slots[1];
+        m->bundle_cache_slots[2] = tb->slots[2];
+        tc->cur_tb = tb;
+    }
+    unsigned kind = tb->kind[slot];
+    m->slot_stop_after = tb->stop[slot];
+    int qp = pr_read(m, tb->qpr[slot]);
+    m->taken = 0;
+    uint64_t faults_before = m->nfaults;
+
+    MercedStatus st;
+    if (kind == SLOT_EXEC)
+        st = tb->fn[slot](m, tb->slots[slot], qp);
+    else if (kind == SLOT_NOP)
+        st = MERCED_OK;
+    else
+        st = exec_x(m, tb->slots[2], tb->slots[1], qp);
+    if (st != MERCED_OK) {
+        if (st == MERCED_HALT_UNIMPL) {
+            char unit = kind == SLOT_X ? 'X' : bundle_units[tb->tmpl][slot];
+            uint64_t raw = kind == SLOT_X ? tb->slots[2] : tb->slots[slot];
+            size_t len = strlen(m->halt_msg);
+            snprintf(m->halt_msg + len, sizeof(m->halt_msg) - len,
+                     " [%c-slot %u tmpl %s raw=0x%011" PRIX64 "]",
+                     unit, slot, bundle_units[tb->tmpl], raw);
+        }
+        return st;
+    }
+
+    m->ninsts++;
+    if (!m->external_itc)
+        itc_advance(m, 1);
+    if (m->nfaults == faults_before)
+        m->last_successful_bundle = bundle_va;
+    if (m->taken) {
+        m->group_start = 1;
+        m->taken = 0;
+        return MERCED_OK;
+    }
+    m->group_start = m->slot_stop_after;
+    if (kind == SLOT_X || slot == 2)
+        m->ip = bundle_va + 16;
+    else
+        m->ip = bundle_va | (slot + 1);
+    return MERCED_OK;
+}
+
+/* Like merced_run(), but through fast_step() when no debug facility is
+ * active.  Stops early on a non-OK status, merced_request_exit(), or (when
+ * stop_mask isn't 0) once (ip & stop_mask) == stop_value. */
+MercedStatus merced_run_fast(Merced *m, unsigned max_slots, unsigned *executed,
+                             uint64_t stop_mask, uint64_t stop_value) {
+    MercedTranslationCache *tc = translation_cache_on ? m->translation_cache : NULL;
+    unsigned n = 0;
+    MercedStatus st = MERCED_OK;
+    bool fast = tc && !debug_hooks_on && !trace_hi && !watch_ip_count &&
+                !heartbeat_on && !r18_debug_on && !r48_debug_on;
+    if (tc) tc->exit_request = false;
+    while (n < max_slots) {
+        if (fast && !target_trap_slot_armed && !m->trace_n)
+            st = fast_step(m, tc);
+        else
+            st = merced_step(m);
+        n++;
+        if (st != MERCED_OK || (tc && tc->exit_request) ||
+            (stop_mask && (m->ip & stop_mask) == stop_value))
+            break;
+    }
+    if (executed)
+        *executed = n;
+    return st;
 }
 
 MercedStatus merced_run(Merced *m, unsigned max_slots, unsigned *executed) {

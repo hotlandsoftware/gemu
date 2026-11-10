@@ -345,6 +345,12 @@ void    merced_set_cpu_model(Merced *m, uint8_t model);
  * describes why and the CPU is stopped at the offending IP. */
 MercedStatus merced_step(Merced *m);
 MercedStatus merced_run(Merced *m, unsigned max_slots, unsigned *executed);
+/* merced_run() through a fast path for ordinary execution (see merced.c).
+ * It also stops after the current slot on merced_request_exit(), or once
+ * (ip & stop_mask) == stop_value when stop_mask isn't 0. */
+MercedStatus merced_run_fast(Merced *m, unsigned max_slots, unsigned *executed,
+                             uint64_t stop_mask, uint64_t stop_value);
+void    merced_request_exit(Merced *m);
 
 /* IA-32 compatibility engine.  These hooks deliberately use the IA-64
  * translation machinery: IA-32 code and data references share the Merced
