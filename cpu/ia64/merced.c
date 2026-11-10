@@ -77,6 +77,8 @@ static int merced_dbg(void) {
  * getenv() per call would cost more than the emulation itself. */
 static bool r5_debug_on, r8_debug_on, r24_debug_on, r29_debug_on;
 static bool r18_debug_on, r48_debug_on, zero_loop_debug_on, bad_store_debug_on;
+static bool store_value_watch_on;
+static uint64_t store_value_watch;
 
 /* ── PSR / CFM / AR / CR layout ──────────────────────────────────────────── */
 
@@ -113,6 +115,7 @@ static bool r18_debug_on, r48_debug_on, zero_loop_debug_on, bad_store_debug_on;
  * real fault handler, so a delivered ld.s fault must report it. */
 #define ISR_SP (1ull << 36)
 #define ISR_RS (1ull << 37) /* register-stack-engine reference */
+#define ISR_IR (1ull << 38) /* incomplete register frame during an RSE fill */
 #define ISR_ED (1ull << 43)
 
 /* PTE fields (SDM Vol.2 4.1, "Translation Insertion Format"). */
@@ -201,7 +204,10 @@ static unsigned stacked_phys(const Merced *m, unsigned r) {
     return (m->bof + idx) % MERCED_RSE_CAPACITY;
 }
 
-static uint64_t gr_read(Merced *m, unsigned r, uint8_t *nat) {
+/* gr_read_inl()/gr_write_inl() are the accessors' bodies, forced inline for
+ * fast_op(); everything else calls the out-of-line gr_read()/gr_write(). */
+static inline __attribute__((always_inline))
+uint64_t gr_read_inl(Merced *m, unsigned r, uint8_t *nat) {
     if (nat) *nat = 0;
     if (r == 0) return 0;
     if (r < 16) { if (nat) *nat = m->nat_static[r]; return m->gr_static[r]; }
@@ -222,6 +228,10 @@ static uint64_t gr_read(Merced *m, unsigned r, uint8_t *nat) {
     unsigned p = stacked_phys(m, r);
     if (nat) *nat = m->nat_stack[p];
     return m->gr_stack[p];
+}
+
+static uint64_t gr_read(Merced *m, unsigned r, uint8_t *nat) {
+    return gr_read_inl(m, r, nat);
 }
 
 static uint8_t gr_nat(Merced *m, unsigned r) {
@@ -311,8 +321,8 @@ static bool alat_check_reg(Merced *m, unsigned reg, bool clear) {
     return false;
 }
 
-static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
-    if (r == 0) return;   /* writes to r0 fault on HW; ignore here */
+/* gr_write()'s debug traces, all keyed on a debug flag, r19 or one value. */
+static void gr_write_debug(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
     if (r == 24 && r24_debug_on &&
         (m->ip & ~UINT64_C(0xF)) >= UINT64_C(0x7FF0DF60) &&
         (m->ip & ~UINT64_C(0xF)) <= UINT64_C(0x7FF0E120)) {
@@ -381,6 +391,14 @@ static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
                     " ninsts=%" PRIu64 " b0=%016" PRIX64 "\n",
                     r, m->ip, m->ninsts, m->br[0]);
     }
+}
+
+static inline __attribute__((always_inline))
+void gr_write_inl(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
+    if (r == 0) return;   /* writes to r0 fault on HW; ignore here */
+    if (r24_debug_on || r8_debug_on || r5_debug_on || r29_debug_on ||
+        r == 19 || v == UINT64_C(0xE000010600000000))
+        gr_write_debug(m, r, v, nat);
     /* Ordinary GR writes do not invalidate an advanced-load entry for that
      * register.  The ALAT tracks memory conflicts, not the current GR value:
      * ld.c.nc must preserve an intervening computed value when no conflicting
@@ -414,6 +432,10 @@ static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
         m->rse_flushed_regs = pos;
     m->gr_stack[p] = v;
     m->nat_stack[p] = nat;
+}
+
+static void gr_write(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
+    gr_write_inl(m, r, v, nat);
 }
 
 static unsigned pr_phys(const Merced *m, unsigned i) {
@@ -830,6 +852,7 @@ static unsigned target_vhpt_entry_writes;
 static uint64_t phys_read(Merced *m, uint64_t pa, unsigned size);
 static void tlb_insert(Merced *m, MercedTlbEntry *e, uint64_t pte,
                        bool instruction);
+static bool translation_insert_fields_valid(uint64_t pte, uint64_t itir);
 static bool firmware_identity_pa(Merced *m, uint64_t va, uint64_t *pa);
 static void xlate_flush(Merced *m);
 static bool xlate_cacheable(const Merced *m, uint64_t va);
@@ -840,8 +863,7 @@ static void tlb_serialize_data(Merced *m);
 static void tlb_serialize_instruction(Merced *m);
 
 /* Hardware-style VHPT walk, tried on a TLB miss before falling back to the
- * software fault path - see the definition (after tlb_insert) for why this
- * is safe even if the hash math is subtly wrong. */
+ * software fault path. */
 enum {
     VHPT_MISS = 0,
     VHPT_HIT = 1,
@@ -1110,6 +1132,11 @@ static void nt_identify(Merced *m, uint64_t va, const char *what,
             what, va);
 }
 
+/* Monitor helper: name the PE image (and nearest export) holding va. */
+void merced_nt_identify(Merced *m, uint64_t va) {
+    nt_identify(m, va, "va", false);
+}
+
 /* Windows/IA-64's DebugPrint is a break 0x80014 with the message buffer's
  * virtual address in GR2 and its length in GR3 (NT rtl/ia64 debugstb.s).
  * Echoing it turns an otherwise anonymous kernel stall into a readable
@@ -1182,6 +1209,8 @@ static bool rse_restore_interrupted_partition(Merced *m, uint64_t iip,
 
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
+    if (isr & ISR_RS)
+        isr &= ~ISR_ED;
     m->nfaults++;
     /* Interruption delivery is both an instruction- and data-serialization
      * event (SDM Vol. 2, 3.1.4).  In particular, a ptc/ptr issued by a page
@@ -2046,22 +2075,6 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         if (!e)
             e = tlb_search(m->itc, MERCED_N_TC, rid, lookup_va, &m->itc_hint);
     }
-    /*
-     * The loader and early NT kernel retain pointers through the region-7
-     * KSEG alias VA payload = 0x80000000 + PA.  It remains valid after the
-     * firmware IVT is replaced; otherwise KdInitSystem faults before the
-     * recursive page-table window is ready and cascades into a PNP loop.
-     * Explicit TR/TC translations above always take precedence.
-     */
-    if (!e && vrn == 7 && m->bus.ram_size) {
-        uint64_t payload = va & UINT64_C(0x1FFFFFFFFFFFFFFF);
-        if (payload >= UINT64_C(0x80000000) &&
-            payload < m->region7_directmap_limit) {
-            *pa = payload - UINT64_C(0x80000000);
-            if (cacheable) xlate_store(m, va, kind, *pa);
-            return true;
-        }
-    }
     /* Before ExitBootServices, the SAL environment owns the IVT and services
      * loader translation misses with identity mappings, including the 460GX
      * 0xe00 high-DRAM aperture used for the firmware RSE backing store. This
@@ -2242,6 +2255,10 @@ static void watch_init(void) {
     r48_debug_on = getenv("MERCED_R48_DEBUG") != NULL;
     zero_loop_debug_on = getenv("MERCED_DEBUG_ZERO_LOOP") != NULL;
     bad_store_debug_on = getenv("MERCED_DEBUG_BAD_STORE") != NULL;
+    {
+        const char *sv = getenv("MERCED_DEBUG_STORE_VALUE");
+        if (sv) { store_value_watch = strtoull(sv, NULL, 16); store_value_watch_on = true; }
+    }
     if (getenv("MERCED_WATCH_AFTER"))
         watch_ip_after = strtoull(getenv("MERCED_WATCH_AFTER"), NULL, 0);
     ipspec = getenv("MERCED_WATCH_IP");
@@ -2332,9 +2349,38 @@ typedef struct {
     MercedStatus (*fn[3])(Merced *m, uint64_t raw, int qp);
     uint8_t kind[3], qpr[3], stop[3];
     uint8_t slow_slot0, reserved;
+    /* For the commonest SLOT_EXEC instructions, a specialized handler in
+     * fast_step() (FOP_*, FOP_GENERIC = call fn) and its operands already
+     * extracted: register numbers (or predicates, for compares), a flag or
+     * size byte, and the sign-extended immediate or branch displacement. */
+    uint8_t op[3], a1[3], a2[3], a3[3], x[3];
+    int32_t imm[3];
 } MercedTbEntry;
 
 enum { SLOT_EXEC, SLOT_NOP, SLOT_X };
+
+enum {
+    FOP_GENERIC,
+    FOP_ADD,        /* r1 = r2 + r3 + imm (imm 0/1)            A1 add */
+    FOP_SUB,        /* r1 = r2 - r3 - imm (imm 0/1)            A1 sub */
+    FOP_AND, FOP_ANDCM, FOP_OR, FOP_XOR,  /* r1 = r2 op r3     A1 */
+    FOP_SHLADD,     /* r1 = (r2 << imm) + r3                   A2 */
+    FOP_ADDI,       /* r1 = imm + r3          A4 adds, A5 addl */
+    FOP_SUBI,       /* r1 = imm - r3                           A3 sub */
+    FOP_ANDI, FOP_ANDCMI, FOP_ORI, FOP_XORI,  /* r1 = imm op r3  A3 */
+    FOP_CMP,        /* p1,p2 = r2|imm rel r3       A6/A8, x = CMPF_* */
+    FOP_LD,         /* r1 = [r3], x = size | LDST_* postincrement */
+    FOP_ST,         /* [r3] = r2, x = size | LDST_* postincrement */
+    FOP_SETF_SIG,   /* f1 = r2 */
+    FOP_GETF_SIG,   /* r1 = f2 */
+    FOP_EXT,        /* r1 = zxt/sxt r3, x = x6 */
+    FOP_BR_COND,    /* ip-relative br.cond */
+    FOP_BR_CLOOP,   /* ip-relative br.cloop */
+};
+
+enum { CMPF_LT = 0, CMPF_LTU = 1, CMPF_EQ = 2, CMPF_REL = 3,
+       CMPF_CMP4 = 4, CMPF_IMM = 8, CMPF_UNC = 16 };
+enum { LDST_SIZE = 0x0F, LDST_INC_IMM = 0x10, LDST_INC_REG = 0x20 };
 
 /* Soft TLB: recent successful data/instruction translations, one 4 KiB
  * page per entry (IA-64's smallest page), so ordinary loads and stores skip
@@ -2509,6 +2555,14 @@ static void phys_write(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
                     " ninsts=%" PRIu64 "\n",
                     pa, v, size, m->ip, m->ninsts);
     }
+    /* MERCED_DEBUG_STORE_VALUE=<hex>: who stores this exact 8-byte value? */
+    if (store_value_watch_on && size == 8 && v == store_value_watch) {
+        static unsigned n;
+        if (n++ < 16)
+            fprintf(stderr, "merced: STORE-VALUE pa=%016" PRIX64 " v=%016"
+                    PRIX64 " ip=%016" PRIX64 " ninsts=%" PRIu64 "\n",
+                    pa, v, m->ip, m->ninsts);
+    }
     if (bad_store_debug_on && size == 8 &&
         v == UINT64_C(0xE000010600000000) &&
         (m->ip >> 60) == UINT64_C(0xE)) {
@@ -2628,12 +2682,9 @@ void merced_reset(Merced *m) {
      * The model and revision (stepping) values are machine-configurable
      * (see merced_set_cpu_model()/merced_set_cpu_revision()) because
      * different consumers disagree about what they want to see here:
-     *   - i2000's own firmware cross-checks it against
-     *     machine_i2000.c's memcard_cfg[0][2][0x05] (CBN:05.2 processor
-     *     descriptor) - a mismatch reads as "no recognized processor"
-     *     and parks SAL at FFFE2020.  Revision 0 is therefore used during
-     *     that firmware's early enumeration; the machine promotes CPUID to
-     *     production Merced C0 when it hands off to a loaded EFI image.
+     *   - i2000 uses revision 0 for compatibility with the firmware's
+     *     early PAL bootstrap path, then promotes CPUID to production
+     *     Merced C0 when execution enters a loaded EFI application.
      *   - Windows for Itanium (SETUPLDR.EFI on the generic machine)
      *     refuses to proceed on anything it reads as "pre-B3 stepping" -
      *     real historical behavior, not an emulator bug. The generic
@@ -3208,7 +3259,12 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
                 if (debug_handler_spec)
                     fprintf(stderr, "merced: XP-SPEC result=nat-address\n");
             } else if (!va_translate(m, va, false, spec, ISR_R, &pa, &st)) {
-                if (st != MERCED_OK) return st;
+                /* A delivered fault also returns MERCED_OK, with taken
+                 * marking the transfer to its handler.  Only a deferred
+                 * speculative fault completes the load: a real fault must
+                 * preserve both destination and postincrement base for
+                 * the handler's retry. */
+                if (st != MERCED_OK || m->taken) return st;
                 gr_write(m, r1, 0, 1);             /* NaT on deferred spec load */
                 if (debug_handler_spec)
                     fprintf(stderr, "merced: XP-SPEC result=deferred-nat\n");
@@ -3351,15 +3407,25 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
             }
             return MERCED_OK;
         }
-        /* FP loads: x6 0x00-0x0F ldfe/ldf8/ldfs/ldfd(+spec), 0x1B ldf.fill;
+        /* FP loads: x6 0x00-0x0F ldfe/ldf8/ldfs/ldfd(+spec), 0x1B ldf.fill,
+         * 0x20-0x27 ldf*.c.clr/ldf*.c.nc;
          * stores: 0x30-0x33 stfe/stf8/stfs/stfd, 0x3B stf.spill */
         int is_st = (x6 >= 0x30);
+        bool check_load = x6 >= 0x20 && x6 <= 0x27;
         if (!qp) return MERCED_OK;
         uint64_t va = gr_read(m, r3, &n3), pa;
+        if (check_load && n3)
+            return deliver_fault(m, VEC_NAT,
+                                 ISR_NA | ISR_R | UINT64_C(0x10), 0, false);
         if (!va_translate(m, va, false, false, is_st ? ISR_W : ISR_R,
                           &pa, &st)) return st;
         unsigned fmt = x6 & 3;   /* 0=e 1=8 2=s 3=d */
-        if (!is_st && (x6 <= 0x0F || x6 == 0x1B)) {
+        /* FP ALAT entries are not retained, matching FP chk.a's existing
+         * conservative miss behavior.  The SDM permits ALAT entries to be
+         * invalidated at any time, so both check-load forms take their
+         * ordinary reload path, including translation faults and updates.
+         * Integer ALAT entries with the same register number are unrelated. */
+        if (!is_st && (x6 <= 0x0F || x6 == 0x1B || check_load)) {
             MercedFpReg f = {0, 0, 0, 0};
             if (x6 == 0x1B) {                       /* ldf.fill: spill format */
                 f.sig = phys_read(m, pa, 8);
@@ -3553,6 +3619,36 @@ enum {
     VHPT_ENTRY_ABORT = -1,
 };
 
+/* AMI relocates its EFI runtime image below the detected top of RAM.
+ * Firmware handoff handling must follow that relocation on smaller
+ * machines.  Retain the original 2 GiB window for older snapshots. */
+static bool ami_runtime_ip(const Merced *m, uint64_t ip) {
+    const uint64_t size = UINT64_C(0x01000000);
+    return (ip >= UINT64_C(0x7F000000) && ip < UINT64_C(0x80000000)) ||
+           (m->bus.ram_size >= size &&
+            ip >= m->bus.ram_size - size && ip < m->bus.ram_size);
+}
+
+/* EFI allocates applications below its runtime image, anywhere in ordinary
+ * RAM above the firmware shadow.  While IVA is unset, keep interrupts
+ * pending across those application entries as well as the firmware's own
+ * transition.  Once the loader installs an IVT, normal delivery resumes. */
+static bool ami_ivt_handoff_pending(const Merced *m) {
+    return m->cr[CR_IVA] == 0 &&
+           (ami_runtime_ip(m, m->ip) ||
+            (m->ip >= UINT64_C(0x04000000) && m->ip < m->bus.ram_size) ||
+            (m->ip & UINT64_C(0x00000fff00000000)) ==
+                UINT64_C(0x00000e0000000000) ||
+            (m->psr & PSR_IS));
+}
+
+/* The existing FreePool firmware workaround moves with the same image. */
+static bool ami_freepool_assert_ip(const Merced *m, uint64_t ip) {
+    const uint64_t offset = UINT64_C(0x80000000) - UINT64_C(0x7F38B362);
+    return ip == UINT64_C(0x7F38B362) ||
+           (m->bus.ram_size >= offset && ip == m->bus.ram_size - offset);
+}
+
 /* SAL/PAL firmware keeps its 1 MiB runtime image identity-addressable while
  * it owns the IVT (and while executing inside that image during a handoff).
  * The hardware VHPT walker uses the same carve-out when reading the table.
@@ -3565,14 +3661,12 @@ static bool firmware_identity_pa(Merced *m, uint64_t va, uint64_t *pa) {
     bool firmware_iva = m->cr[CR_IVA] == 0 ||
                         m->cr[CR_IVA] == UINT64_C(0x00010000);
     bool firmware_ip = m->ip >= base && m->ip < end;
-    bool ami_firmware_ip = m->ip >= UINT64_C(0x7F000000) &&
-                           m->ip < UINT64_C(0x80000000);
+    bool ami_firmware_ip = ami_runtime_ip(m, m->ip);
 
-    /* The i2000's 460GX encodes its high DRAM card/aperture selector in
-     * physical bits 43:32.  AMI places the RSE backing store in the top
-     * 64 MiB of that aperture.  It must remain physically addressable even
-     * with interruption collection disabled inside a miss handler; the
-     * later pre-ExitBootServices fallback cannot recover a nested miss. */
+    /* Older i2000 snapshots contain an RSE backing store in this synthetic
+     * aperture, created when incorrect SPD data inflated the firmware's
+     * memory map.  Preserve its identity mapping for those snapshots,
+     * including inside miss handlers with interruption collection off. */
     if (cpl == 0 && firmware_iva &&
         (va & UINT64_C(0x00000fff00000000)) ==
             UINT64_C(0x00000e0000000000) &&
@@ -3671,14 +3765,8 @@ static uint64_t vhpt_load_u64(Merced *m, uint64_t pa) {
  * would have used. Hash addressing and the long-format tag match
  * reference/qemu-system-ia64/target/ia64/op_helper.c's
  * ia64_vhpt_{short,long}_hash_address()/ia64_vhpt_long_tag() exactly.
- *
- * Safe by construction even if some corner of the math below is subtly
- * off: every failure mode here (wrong hash address, tag mismatch,
- * unreadable hash table, PTE not present) just returns false, and the
- * caller falls through to the software TLB-miss fault path that ran
- * unconditionally before this walker existed. A bug here can only cost
- * the speedup - it can't install a translation the OS didn't itself write
- * into its own VHPT. */
+ * Reserved entry encodings must fall back to a software TLB-miss fault
+ * without being cached; an OS may use them for software-managed mappings. */
 static uint64_t dbg_vhpt_calls, dbg_vhpt_disabled, dbg_vhpt_hit,
                 dbg_vhpt_unmapped, dbg_vhpt_tagfail, dbg_vhpt_np;
 
@@ -3776,42 +3864,6 @@ static int vhpt_walk(Merced *m, uint64_t va, bool ifetch) {
     uint64_t entry_pa;
     int entry_status = vhpt_entry_pa(m, entry_va, &entry_pa);
     if (entry_status != VHPT_ENTRY_TRANSLATED) {
-        static bool b520_vhpt_dumped;
-        if (!b520_vhpt_dumped && getenv("MERCED_DEBUG_B520_FAULT") &&
-            (m->ip & ~UINT64_C(0xF)) ==
-                UINT64_C(0xE00000008355B520)) {
-            b520_vhpt_dumped = true;
-            uint32_t entry_rid = (uint32_t)
-                ((m->rr[entry_va >> 61] >> 8) & 0xFFFFFFull);
-            fprintf(stderr, "merced: B520-VHPT va=%016" PRIX64
-                    " entry_va=%016" PRIX64 " status=%d"
-                    " pta=%016" PRIX64 " rr=%016" PRIX64
-                    " entry_rid=%06X\n",
-                    va, entry_va, entry_status, pta, rr, entry_rid);
-            for (unsigned i = 0; i < MERCED_N_DTR; i++) {
-                const MercedTlbEntry *x = &m->dtr[i];
-                if (x->valid)
-                    fprintf(stderr, "merced: B520-DTR[%u] rid=%06X"
-                            " va=%016" PRIX64 "-%016" PRIX64
-                            " pa=%016" PRIX64 " pte=%016" PRIX64
-                            " itir=%016" PRIX64 "\n",
-                            i, x->rid, x->va_start, x->va_end, x->pfn_base,
-                            x->pte, x->itir);
-            }
-            for (unsigned i = 0; i < MERCED_N_TC; i++) {
-                const MercedTlbEntry *x = &m->dtc[i];
-                if (x->valid && (x->rid == entry_rid ||
-                                 (x->va_start <= entry_va &&
-                                  entry_va <= x->va_end)))
-                    fprintf(stderr, "merced: B520-DTC[%u] rid=%06X"
-                            " va=%016" PRIX64 "-%016" PRIX64
-                            " pa=%016" PRIX64 " pte=%016" PRIX64
-                            " itir=%016" PRIX64 "\n",
-                            i, x->rid, x->va_start, x->va_end, x->pfn_base,
-                            x->pte, x->itir);
-            }
-            fflush(stderr);
-        }
         static unsigned mmu_debug_unmapped;
         if ((m->ip >> 61) == 7 && getenv("MERCED_MMU_DEBUG") &&
             mmu_debug_unmapped++ < 512)
@@ -3858,6 +3910,11 @@ static int vhpt_walk(Merced *m, uint64_t va, bool ifetch) {
             return VHPT_MISS; /* collision slot / stale memory, not our entry */
         }
     }
+    /* SDM Vol.2, VHPT Walker: unlike an explicit itc/itr, a reserved entry
+     * causes an ordinary TLB miss.  Leave these entries to the software
+     * miss handler instead of caching an unusable translation. */
+    if (!translation_insert_fields_valid(pte, itir))
+        return VHPT_MISS;
     if (!(pte & 1)) {
         dbg_vhpt_np++;
         static unsigned vhpt_np_debug;
@@ -4015,17 +4072,6 @@ static uint64_t rse_addr(Merced *m, int64_t regs_pos) {
                          regs_pos - m->rse_anchor_regs);
 }
 
-/* Inverse of rse_addr(): the register-units position that a backing-store
- * address maps to under the current anchor.  Walks in either direction,
- * skipping RNAT collection slots, mirroring rse_move_regs(). */
-static int64_t rse_addr_to_regs(Merced *m, uint64_t addr) {
-    uint64_t a = m->rse_anchor_addr;
-    int64_t regs = 0;
-    while (a < addr) { a += 8; if (rse_is_rnat_slot(a)) a += 8; regs++; }
-    while (a > addr) { a -= 8; if (rse_is_rnat_slot(a)) a -= 8; regs--; }
-    return m->rse_anchor_regs + regs;
-}
-
 /* Maps an absolute register-units position (same axis as bof_total) to its
  * gr_stack slot. Valid as long as it's within MERCED_N_STACKED of the
  * current frame - i.e. as long as real hardware wouldn't itself have needed
@@ -4045,10 +4091,18 @@ static MercedStatus rse_store_through(Merced *m, int64_t end) {
     static unsigned dbg_store291;
     for (int64_t p = m->rse_flushed_regs; p < end; p++) {
         uint32_t idx = rse_stack_slot(m, p);
-        uint64_t pa;
+        uint64_t addr = rse_addr(m, p), pa, rnat_pa = 0;
         MercedStatus st;
-        if (!va_translate(m, rse_addr(m, p), false, false,
+        if (!va_translate(m, addr, false, false,
                           ISR_W | ISR_RS, &pa, &st))
+            return st;
+        uint64_t bit = UINT64_C(1) << ((addr >> 3) & 63);
+        uint64_t rnat = (m->ar[AR_RNAT] & ~bit) |
+                        (m->nat_stack[idx] ? bit : 0);
+        bool end_group = rse_is_rnat_slot(addr + 8);
+        if (end_group &&
+            !va_translate(m, addr + 8, false, false,
+                          ISR_W | ISR_RS, &rnat_pa, &st))
             return st;
         if (getenv("MERCED_R36_DEBUG") && idx == 291 && dbg_store291++ < 64)
             fprintf(stderr, "merced: RSE store slot291 pos=%" PRId64
@@ -4058,6 +4112,15 @@ static MercedStatus rse_store_through(Merced *m, int64_t end) {
         if (m->ar[AR_RSC] & (UINT64_C(1) << 4))
             value = __builtin_bswap64(value);
         phys_write(m, pa, value, 8);
+        if (end_group) {
+            uint64_t word = rnat;
+            if (m->ar[AR_RSC] & (UINT64_C(1) << 4))
+                word = __builtin_bswap64(word);
+            phys_write(m, rnat_pa, word, 8);
+        }
+        m->ar[AR_RNAT] = end_group ? 0 : rnat;
+        /* Keep the completed prefix restartable if a later spill faults. */
+        m->rse_flushed_regs = p + 1;
     }
     m->rse_flushed_regs = end;
     return MERCED_OK;
@@ -4071,27 +4134,82 @@ static MercedStatus rse_spill_excess(Merced *m) {
     return rse_store_through(m, bsp - MERCED_N_STACKED);
 }
 
-/* flushrs: write every register from the last flushed position up to the
- * current ar.bsp (bof_total+sof) out to the backing store, then advance
- * ar.bspstore (rse_flushed_regs) to match. */
+/* flushrs spills the dirty parent frames up to BSP (the current frame's
+ * base).  Current-frame registers are not part of the dirty partition. */
 static MercedStatus rse_flush(Merced *m) {
-    int64_t target = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
+    int64_t target = (int64_t)m->bof_total;
     return rse_store_through(m, target);
 }
 
-/* loadrs: per ar.rsc.loadrs (a byte count), position ar.bspstore that many
- * bytes behind the current ar.bsp and re-read whatever falls in the newly
- * "unflushed" window back from the backing store - the values are already
- * resident in gr_stack (this model never evicts them), but re-reading keeps
- * behavior correct if something patched the backing store directly (e.g. an
- * OS context-switch path), which is exactly the scenario loadrs exists for.
- * If the target instead lands past the current flush point (asking to
- * advance ar.bspstore without anything having been flushed there), there's
- * nothing meaningful to load from memory, so just adopt it - matching this
- * model's lack of a real dirty/clean partition to fault on. */
+/* Fill only the clean portion of a restored frame.  Its backing store is
+ * authoritative after mov-to-BSPSTORE invalidates the old clean partition.
+ * Stage values and NaTs until every reference succeeds, so a fault cannot
+ * expose a partly restored frame or discard still-resident dirty values. */
+static bool rse_fill_range(Merced *m, int64_t start, int64_t end,
+                           bool incomplete, MercedStatus *st) {
+    *st = MERCED_OK;
+    if (start >= end)
+        return true;
+    uint64_t values[MERCED_RSE_CAPACITY];
+    uint8_t nats[MERCED_RSE_CAPACITY];
+    if ((uint64_t)(end - start) > MERCED_RSE_CAPACITY) {
+        *st = mhalt(m, "RSE fill exceeds register capacity");
+        return false;
+    }
+    uint64_t store = rse_addr(m, m->rse_flushed_regs);
+    uint64_t first_rnat = 0;
+    uint64_t access = ISR_R | ISR_RS | (incomplete ? ISR_IR : 0);
+    for (int64_t p = start; p < end; p++) {
+        uint64_t addr = rse_addr(m, p), pa;
+        if (!va_translate(m, addr, false, false, access, &pa, st))
+            return false;
+        uint64_t value = phys_read(m, pa, 8);
+        if (m->ar[AR_RSC] & (UINT64_C(1) << 4))
+            value = __builtin_bswap64(value);
+        uint64_t rnat_addr = addr | UINT64_C(0x1f8);
+        uint64_t rnat = m->ar[AR_RNAT];
+        if (rnat_addr < store) {
+            if (!va_translate(m, rnat_addr, false, false, access, &pa, st))
+                return false;
+            rnat = phys_read(m, pa, 8);
+            if (m->ar[AR_RSC] & (UINT64_C(1) << 4))
+                rnat = __builtin_bswap64(rnat);
+        }
+        if (p == start)
+            first_rnat = rnat;
+        values[p - start] = value;
+        nats[p - start] = (uint8_t)((rnat >> ((addr >> 3) & 63)) & 1);
+    }
+    for (int64_t p = start; p < end; p++) {
+        uint32_t slot = rse_stack_slot(m, p);
+        static unsigned dbg_load291;
+        if (getenv("MERCED_R36_DEBUG") && slot == 291 && dbg_load291++ < 64)
+            fprintf(stderr, "merced: RSE load slot291 pos=%" PRId64
+                    " va=%016" PRIX64 " value=%016" PRIX64 "\n",
+                    p, rse_addr(m, p), values[p - start]);
+        m->gr_stack[slot] = values[p - start];
+        m->nat_stack[slot] = nats[p - start];
+    }
+    m->rse_flushed_regs = start;
+    m->ar[AR_RNAT] = first_rnat;
+    if (incomplete)
+        m->psr &= ~(PSR_DA | PSR_DD);
+    return true;
+}
+
+static bool rse_fill_current_frame(Merced *m, MercedStatus *st) {
+    int64_t base = (int64_t)m->bof_total;
+    int64_t end = base + CFM_SOF(m->cfm);
+    if (end > m->rse_flushed_regs)
+        end = m->rse_flushed_regs;
+    return rse_fill_range(m, base, end, true, st);
+}
+
+/* loadrs positions BSPSTORE ar.rsc.loadrs bytes behind BSP, excluding RNAT
+ * words from the register count. Fill the clean portion from its current
+ * backing store and retain the dirty registers already resident in the ring. */
 static MercedStatus rse_load(Merced *m, uint64_t loadrs_bytes) {
-    static unsigned dbg_load291;
-    int64_t bsp_regs = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
+    int64_t bsp_regs = (int64_t)m->bof_total;
     uint64_t bsp_addr = rse_addr(m, bsp_regs);
     int64_t target = bsp_regs - rse_regs_in_window(bsp_addr, loadrs_bytes);
     /* Only the portion below the current BSPSTORE/load boundary needs a
@@ -4101,23 +4219,9 @@ static MercedStatus rse_load(Merced *m, uint64_t loadrs_bytes) {
      * those resident values need not have been eagerly spilled yet. */
     int64_t load_end = m->rse_flushed_regs < bsp_regs
                      ? m->rse_flushed_regs : bsp_regs;
-    for (int64_t p = target; p < load_end; p++) {
-        uint32_t idx = rse_stack_slot(m, p);
-        uint64_t pa;
-        MercedStatus st;
-        if (!va_translate(m, rse_addr(m, p), false, false,
-                          ISR_R | ISR_RS, &pa, &st))
-            return st;
-        uint64_t value = phys_read(m, pa, 8);
-        if (m->ar[AR_RSC] & (UINT64_C(1) << 4))
-            value = __builtin_bswap64(value);
-        if (getenv("MERCED_R36_DEBUG") && idx == 291 && dbg_load291++ < 64)
-            fprintf(stderr, "merced: RSE load slot291 pos=%" PRId64
-                    " va=%016" PRIX64 " value=%016" PRIX64 "\n",
-                    p, rse_addr(m, p), value);
-        m->gr_stack[idx] = value;
-        m->nat_stack[idx] = 0;   /* NaT collection words not modeled */
-    }
+    MercedStatus st;
+    if (!rse_fill_range(m, target, load_end, false, &st))
+        return st;
     m->rse_flushed_regs = target;
     return MERCED_OK;
 }
@@ -5266,62 +5370,18 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         m->ar[ar3] = ar3 == AR_RSC
                    ? rsc_value_for_write(m, ar_val) : ar_val;
         if (ar3 == AR_BSPSTORE) {
-            int64_t bsp_regs = (int64_t)m->bof_total +
-                               (int64_t)CFM_SOF(m->cfm);
+            int64_t bsp_regs = (int64_t)m->bof_total;
             int64_t dirty = bsp_regs > m->rse_flushed_regs
                           ? bsp_regs - m->rse_flushed_regs : 0;
             uint64_t new_store = m->ar[AR_BSPSTORE];
-            uint64_t cur_store = rse_addr(m, m->rse_flushed_regs);
-            /* rse_addr_to_regs() walks one 8-byte slot at a time from the
-             * current anchor to new_store - only safe to call when new_store
-             * is plausibly within the resident ring. A genuine cross-stack
-             * switch (e.g. an OS handing the RSE a fresh virtual backing
-             * store address, nowhere near the anchor - observed with a
-             * region-7 address while gemu-efi's SETUPLDR.EFI sets up its own
-             * environment) must be ruled out with cheap address arithmetic
-             * first, or the walk spins for the ~2^60 steps needed to bridge
-             * the gap between two unrelated addresses. */
-            uint64_t max_span =
-                (uint64_t)(MERCED_RSE_CAPACITY + MERCED_RSE_CAPACITY / 64 + 1) * 8;
-            bool resident_rewind = new_store < cur_store &&
-                                   (cur_store - new_store) <= max_span;
-            /* A backward rewind into the *current* backing store, landing at
-             * a still-resident frame: this is SetjmpLongjmp (EDK
-             * InternalLongJump does "flushrs; mov ar.bspstore=saved; loadrs;
-             * mov ar.pfs=saved; br.ret" to unwind several frames at once).
-             * The re-anchoring branch below is correct for a context switch
-             * onto a *fresh* stack, but here it would strand bof_total at the
-             * deep intervening frames, so the following br.ret's naive
-             * bof-=sol lands on the wrong physical slots.  Guard on
-             * new_store < cur_store (a rewind, not a fresh higher stack) and
-             * on the target still being within the resident ring, so a real
-             * cross-stack switch still falls through to re-anchoring. */
-            int64_t newpos = 0, new_base = 0;
-            if (resident_rewind) {
-                newpos = rse_addr_to_regs(m, new_store);
-                new_base = newpos - dirty;
-                int64_t back = (int64_t)m->bof_total - new_base;
-                resident_rewind = back > 0 && back < MERCED_RSE_CAPACITY;
-            }
-            if (resident_rewind) {
-                /* Teleport bof/bof_total to the store's true position under
-                 * the existing anchor, keeping position<->slot mapping intact. */
-                int64_t delta = new_base - (int64_t)m->bof_total;
-                m->bof_total = (uint64_t)new_base;
-                m->bof = (unsigned)(((int64_t)m->bof + delta) % MERCED_RSE_CAPACITY
-                                    + MERCED_RSE_CAPACITY) % MERCED_RSE_CAPACITY;
-                m->rse_flushed_regs = newpos;
-                m->ar[AR_BSP] = rse_addr(m, (int64_t)m->bof_total);
-            } else {
-                /* mov-to-BSPSTORE empties the clean partition but preserves
-                 * the dirty partition, rebasing BSP above the newly written
-                 * store.  Anchor the new address at the dirty boundary so
-                 * rse_addr() also accounts for intervening RNAT slots. */
-                m->rse_flushed_regs = bsp_regs - dirty;
-                m->rse_anchor_addr = new_store;
-                m->rse_anchor_regs = m->rse_flushed_regs;
-                m->ar[AR_BSP] = rse_addr(m, (int64_t)m->bof_total);
-            }
+            /* BSPSTORE invalidates the clean partition but preserves the
+             * current and dirty registers, even for a nearby backward
+             * rewind.  Automatic return fills restore the older frame;
+             * moving BOF here would incorrectly rename the live registers. */
+            m->rse_flushed_regs = bsp_regs - dirty;
+            m->rse_anchor_addr = new_store;
+            m->rse_anchor_regs = m->rse_flushed_regs;
+            m->ar[AR_BSP] = rse_addr(m, (int64_t)m->bof_total);
         }
         return MERCED_OK;
     }
@@ -5454,15 +5514,20 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
     uint8_t n2, n3;
     MercedStatus st;
 
-    /* Compare .unc is unusual: when its qualifying predicate is false it
-     * still clears both destination predicates.  Let the A-unit decoder see
-     * the instruction first, then discard every other predicated-off I op
-     * before opcode validation. */
+    /* Unconditional compares and tests clear both destination predicates
+     * even when their qualifying predicate is false.  A-unit compares are
+     * handled by exec_alu(); I-unit tbit/tnat .unc need the same treatment
+     * before discarding other predicated-off instructions. */
     if (major_is_alu(major)) {
         if (exec_alu(m, raw, qp, &st)) return st;
         if (st != MERCED_OK) return st;
     }
-    if (!qp) return MERCED_OK;
+    if (!qp) {
+        if (major == 5 && bits(raw, 33, 4) == 0 && bits(raw, 12, 1))
+            set_preds(m, (unsigned)bits(raw, 6, 6),
+                      (unsigned)bits(raw, 27, 6), 0, 0, 1);
+        return MERCED_OK;
+    }
 
     switch (major) {
     case 0: {
@@ -5524,10 +5589,10 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             }
             case 0x33: {                            /* mov r1=pr */
                 if (!qp) return MERCED_OK;
-                uint64_t v = 0;
-                for (unsigned i = 0; i < 64; i++)
-                    if (pr_read(m, i)) v |= 1ull << i;
-                gr_write(m, r1, v, 0);
+                /* Broadside predicate transfers ignore CFM.rrb.pr. An
+                 * interrupt must save the physical bits before cover
+                 * clears RRB, so a later restore preserves the pipeline. */
+                gr_write(m, r1, m->pr | 1, 0);
                 return MERCED_OK;
             }
             case 0x2A: {                            /* mov.i ar3=r2 */
@@ -5553,21 +5618,17 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
                                            (bits(raw, 24, 8) << 8) |
                                            (bits(raw, 6, 7) << 1), 17);
             uint64_t v = gr_read(m, r2, &n2);
-            for (unsigned i = 1; i < 64; i++)
-                if ((mask >> i) & 1) pr_write(m, i, (int)((v >> i) & 1));
+            if (n2) return deliver_fault(m, VEC_NAT, 0, 0, false);
+            m->pr = (m->pr & ~mask) | (v & mask) | 1;
             return MERCED_OK;
         }
         if (x3 == 2) {                              /* mov pr.rot=imm44 */
             if (!qp) return MERCED_OK;
-            /* The instruction carries an unsigned 28-bit immediate which
-             * occupies PR[16..43].  Bit 27 is stored in raw bit 36; it is
-             * not a sign bit.  Sign-extending it used to force PR[44..63]
-             * to one, making NT execute normally-false predicated paths in
-             * its VHPT interruption handler forever. */
-            uint64_t imm = ((bits(raw, 36, 1) << 27) |
-                            bits(raw, 6, 27)) << 16;
-            for (unsigned i = 16; i < 64; i++)
-                pr_write(m, i, (int)((imm >> i) & 1));
+            /* Sign-extend the encoded 28-bit immediate into physical
+             * PR[16..63], independently of the rotation base. */
+            uint64_t imm = (uint64_t)sext((bits(raw, 36, 1) << 27) |
+                                         bits(raw, 6, 27), 28) << 16;
+            m->pr = (m->pr & UINT64_C(0xffff)) | imm;
             return MERCED_OK;
         }
         if (x3 == 1) {                              /* chk.s.i */
@@ -5887,7 +5948,7 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             if (zb == 0) {                              /* mux1: byte permute */
                 unsigned mbt = (unsigned)bits(raw, 20, 4);
                 static const int perm[16][8] = {
-                    [0x0] = {7,7,7,7,7,7,7,7},          /* @brcst (byte 7) */
+                    [0x0] = {0,0,0,0,0,0,0,0},          /* @brcst (low byte) */
                     [0x8] = {0,4,2,6,1,5,3,7},          /* @mix */
                     [0x9] = {0,4,1,5,2,6,3,7},          /* @shuf */
                     [0xA] = {0,2,4,6,1,3,5,7},          /* @alt */
@@ -6091,6 +6152,11 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
                 ext_interrupt_in_service = false;
                 rfi_generation++;
             }
+            /* Mandatory fills fault in the restored target context, with
+             * ISR.ir set, and retry through a subsequent rfi. */
+            MercedStatus fill_status;
+            if (!rse_fill_current_frame(m, &fill_status))
+                return fill_status;
             return rse_spill_excess(m);
         }
         case 0x0C: m->psr &= ~PSR_BN; return MERCED_OK;             /* bsw.0 */
@@ -6119,10 +6185,17 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
             m->taken = 1;
             return MERCED_OK;
         }
-        case 0x21:                                  /* br.ret b2 */
+        case 0x21: {                                /* br.ret b2 */
             if (!qp) return MERCED_OK;
             do_ret(m, m->br[bits(raw, 13, 3)] & ~0xFull);
+            /* SDM Vol.2 6.6: a mandatory return fill faults at the target
+             * instruction, after BOF/CFM have changed, rather than replaying
+             * br.ret and popping the register frame a second time. */
+            MercedStatus fill_status;
+            if (!rse_fill_current_frame(m, &fill_status))
+                return fill_status;
             return rse_spill_excess(m);
+        }
         }
         return mhalt(m, "unimpl B-unit major 0 x6=0x%02X", x6);
     }
@@ -6313,10 +6386,16 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
                 uint32_t b_lo = (uint32_t)b.sig, b_hi = (uint32_t)(b.sig >> 32);
                 uint32_t lo, hi;
                 switch (x6) {
-                case 0x3A: lo = a_hi; hi = b_hi; break;               /* fmix.r */
-                case 0x3B: lo = a_lo; hi = b_lo; break;               /* fmix.l */
-                case 0x3C: lo = (a_hi & 1) ? ~0u : 0u; hi = b_hi; break; /* fsxt.r */
-                default:   lo = (uint32_t)((int32_t)a_lo >> 31); hi = b_lo; break; /* fsxt.l */
+                case 0x3A: hi = a_lo; lo = b_lo; break;               /* fmix.r */
+                case 0x3B: hi = a_hi; lo = b_hi; break;               /* fmix.l */
+                /* fsxt selects one 32-bit lane from f3 for the low half,
+                 * with the corresponding f2 lane's sign in the high half.
+                 * Windows uses fsxt.r f6=f0,f13 to truncate a hash product
+                 * to 32 bits before its integer division sequence. */
+                case 0x3C: hi = (a_lo >> 31) ? UINT32_MAX : 0;
+                           lo = b_lo; break;                /* fsxt.r */
+                default:   hi = (a_hi >> 31) ? UINT32_MAX : 0;
+                           lo = b_hi; break;                /* fsxt.l */
                 }
                 r.sig = (uint64_t)lo | ((uint64_t)hi << 32);
                 fr_write(m, f1, r);
@@ -6603,6 +6682,129 @@ static inline bool slot_is_nop(char unit, uint64_t raw) {
     }
 }
 
+/* Choose fast_op()'s specialized handler for one SLOT_EXEC instruction:
+ * only encodings it executes exactly as the generic handler fn would
+ * (the same operand reads, NaT rules, faults and state updates in the same
+ * order); everything else stays FOP_GENERIC. */
+static void tb_decode_op(MercedTbEntry *tb, unsigned i, char u, uint64_t raw) {
+    unsigned major = (unsigned)bits(raw, 37, 4);
+    tb->op[i] = FOP_GENERIC;
+    tb->a1[i] = (uint8_t)bits(raw, 6, 7);
+    tb->a2[i] = (uint8_t)bits(raw, 13, 7);
+    tb->a3[i] = (uint8_t)bits(raw, 20, 7);
+    tb->x[i] = 0;
+    tb->imm[i] = 0;
+    bool a_unit = u == 'M' || u == 'I';
+
+    if (a_unit && major == 8) {              /* exec_alu() major 8 */
+        unsigned x2a = (unsigned)bits(raw, 34, 2);
+        unsigned ve  = (unsigned)bits(raw, 33, 1);
+        unsigned x4  = (unsigned)bits(raw, 29, 4);
+        unsigned x2b = (unsigned)bits(raw, 27, 2);
+        int32_t imm8 = (int32_t)sext((bits(raw, 36, 1) << 7) |
+                                     bits(raw, 13, 7), 8);
+        static const uint8_t logic[4] = { FOP_AND, FOP_ANDCM, FOP_OR, FOP_XOR };
+        static const uint8_t logici[4] = { FOP_ANDI, FOP_ANDCMI, FOP_ORI, FOP_XORI };
+        if (x2a == 2) {                                  /* adds imm14 */
+            tb->op[i] = FOP_ADDI;
+            tb->imm[i] = (int32_t)sext((bits(raw, 36, 1) << 13) |
+                                       (bits(raw, 27, 6) << 7) |
+                                       bits(raw, 13, 7), 14);
+        } else if (x2a == 0 && !ve) {
+            switch (x4) {
+            case 0: tb->op[i] = FOP_ADD; tb->imm[i] = x2b == 1; break;
+            case 1: tb->op[i] = FOP_SUB; tb->imm[i] = x2b == 0; break;
+            case 3: tb->op[i] = logic[x2b]; break;
+            case 4: tb->op[i] = FOP_SHLADD; tb->imm[i] = (int32_t)x2b + 1; break;
+            case 9:
+                if (x2b == 1) { tb->op[i] = FOP_SUBI; tb->imm[i] = imm8; }
+                break;
+            case 0xB: tb->op[i] = logici[x2b]; tb->imm[i] = imm8; break;
+            }
+        }
+        return;
+    }
+    if (a_unit && major == 9) {              /* addl imm22, r3 in 0..3 */
+        tb->op[i] = FOP_ADDI;
+        tb->a3[i] = (uint8_t)bits(raw, 20, 2);
+        tb->imm[i] = (int32_t)sext((bits(raw, 36, 1) << 21) |
+                                   (bits(raw, 22, 5) << 16) |
+                                   (bits(raw, 27, 9) << 7) |
+                                   bits(raw, 13, 7), 22);
+        return;
+    }
+    if (a_unit && major >= 0xC && major <= 0xE) {
+        /* A6/A8 normal and .unc compares (not the parallel A7 forms or
+         * ta's .and/.or types).  exec_alu() has a debug print here. */
+        unsigned tbit = (unsigned)bits(raw, 36, 1);
+        unsigned x2 = (unsigned)bits(raw, 34, 2);
+        unsigned ta = (unsigned)bits(raw, 33, 1);
+        bool imm_form = x2 >= 2;
+        if (ta || (!imm_form && tbit) || getenv("CMP_A7_DEBUG"))
+            return;
+        tb->op[i] = FOP_CMP;
+        tb->a1[i] = (uint8_t)bits(raw, 6, 6);            /* p1 */
+        tb->a2[i] = (uint8_t)bits(raw, 27, 6);           /* p2 */
+        tb->x[i] = (uint8_t)((major == 0xC ? CMPF_LT :
+                              major == 0xD ? CMPF_LTU : CMPF_EQ) |
+                             (x2 == 1 || x2 == 3 ? CMPF_CMP4 : 0) |
+                             (imm_form ? CMPF_IMM : 0) |
+                             (bits(raw, 12, 1) ? CMPF_UNC : 0));
+        tb->imm[i] = imm_form ?
+            (int32_t)sext((bits(raw, 36, 1) << 7) | bits(raw, 13, 7), 8) :
+            (int32_t)bits(raw, 13, 7);                   /* r2 */
+        return;
+    }
+    if (u == 'M' && (major == 4 || major == 5)) {     /* exec_mem() */
+        unsigned x6 = (unsigned)bits(raw, 30, 6);
+        unsigned mbit = (unsigned)bits(raw, 36, 1);
+        unsigned xbit = (unsigned)bits(raw, 27, 1);
+        if (major == 4 && xbit) {
+            if (!mbit && x6 == 0x1C)
+                tb->op[i] = FOP_GETF_SIG;
+            return;
+        }
+        /* plain, .bias and .acq loads; plain and .rel stores */
+        bool load = x6 <= 0x03 || (x6 >= 0x10 && x6 <= 0x17);
+        bool store = x6 >= 0x30 && x6 <= 0x37;
+        if (!load && !store)
+            return;
+        tb->op[i] = load ? FOP_LD : FOP_ST;
+        tb->x[i] = (uint8_t)(1u << (x6 & 3));
+        if (major == 5) {
+            uint64_t lo7 = store ? bits(raw, 6, 7) : bits(raw, 13, 7);
+            tb->x[i] |= LDST_INC_IMM;
+            tb->imm[i] = (int32_t)sext((bits(raw, 36, 1) << 8) |
+                                       (bits(raw, 27, 1) << 7) | lo7, 9);
+        } else if (mbit) {
+            tb->x[i] |= LDST_INC_REG;
+        }
+        return;
+    }
+    if (u == 'M' && major == 6 && bits(raw, 27, 1) && !bits(raw, 36, 1) &&
+        bits(raw, 30, 6) == 0x1C) {
+        tb->op[i] = FOP_SETF_SIG;
+        return;
+    }
+    if (u == 'I' && major == 0 && bits(raw, 33, 3) == 0) {
+        unsigned x6 = (unsigned)bits(raw, 27, 6);
+        if ((x6 >= 0x10 && x6 <= 0x12) || (x6 >= 0x14 && x6 <= 0x16)) {
+            tb->op[i] = FOP_EXT;
+            tb->x[i] = (uint8_t)x6;
+        }
+        return;
+    }
+    if (u == 'B' && major == 4) {
+        unsigned btype = (unsigned)bits(raw, 6, 3);
+        if (btype != 0 && btype != 5)
+            return;
+        tb->op[i] = btype == 0 ? FOP_BR_COND : FOP_BR_CLOOP;
+        tb->imm[i] = (int32_t)(sext((bits(raw, 36, 1) << 20) |
+                                    bits(raw, 13, 20), 21) * 16);
+        return;
+    }
+}
+
 /* Fill a TB entry's decoded fields from its bundle bits.  slow_slot0 marks
  * the bundle-only half of each slot-0 special case in merced_step() (the
  * RAM-clear, empty-cloop and dead-loop idioms, and reserved templates), so
@@ -6621,6 +6823,7 @@ static void tb_decode(MercedTbEntry *tb) {
         tb->qpr[i] = (uint8_t)bits(raw, 0, 6);
         tb->stop[i] = bundle_stop_after[tb->tmpl][u == 'X' ? 2 : i];
         tb->fn[i] = NULL;
+        tb->op[i] = FOP_GENERIC;
         if (u == 'X') {
             tb->kind[i] = SLOT_X;
             continue;
@@ -6630,6 +6833,7 @@ static void tb_decode(MercedTbEntry *tb) {
             continue;
         }
         tb->kind[i] = SLOT_EXEC;
+        tb_decode_op(tb, i, u, raw);
         unsigned major = (unsigned)bits(raw, 37, 4);
         switch (u) {
         case 'M':
@@ -6665,9 +6869,9 @@ MercedStatus merced_step(Merced *m) {
      * sentinel 0x80000000 to FreePool.  Its pool.c:439 assertion enters a
      * permanent dead loop instead of returning EFI_INVALID_PARAMETER.  Skip
      * only that firmware build's assertion call and let its error path run. */
-    if (m->ip == UINT64_C(0x000000007F38B362)) {
+    if (ami_freepool_assert_ip(m, m->ip)) {
         gr_write(m, 8, UINT64_C(0x8000000000000002), 0);
-        m->ip = UINT64_C(0x000000007F38B370);
+        m->ip += 0xE;
     }
 
     if (target_trap_slot_armed &&
@@ -6754,15 +6958,10 @@ MercedStatus merced_step(Merced *m) {
      * the interrupt latched until firmware installs its next IVT, just as the
      * platform interrupt gate does during this handoff.  The window includes
      * AMI's IA-32 compatibility calls: their low IP no longer identifies the
-     * surrounding native firmware, but PSR.is does.  The i2000 loader also
-     * enters EFI applications through the 460GX tagged high-DRAM aperture
+     * surrounding native firmware, but PSR.is does.  Older i2000 snapshots
+     * also contain EFI applications in the synthetic high-DRAM aperture
      * (00000eXX...), before the application's IVT is installed. */
-    bool ami_ivt_handoff = m->cr[CR_IVA] == 0 &&
-                           ((m->ip >= UINT64_C(0x7F000000) &&
-                             m->ip < UINT64_C(0x80000000)) ||
-                            ((m->ip & UINT64_C(0x00000fff00000000)) ==
-                             UINT64_C(0x00000e0000000000)) ||
-                            (m->psr & PSR_IS));
+    bool ami_ivt_handoff = ami_ivt_handoff_pending(m);
 
     if (m->psr & PSR_IS) {
         /* IA-32 instructions are interruption points too.  This check must
@@ -7062,8 +7261,12 @@ MercedStatus merced_step(Merced *m) {
     /* SAL clears discovered RAM with two post-increment stores and a
      * br.cloop.  A 2 GiB clear otherwise costs over 400 million interpreted
      * slots, so preserve its architectural effects while filling direct
-     * machine memory in one operation. */
-    if (slot == 0 && m->bus.fill && units[0] == 'M' && units[1] == 'M' &&
+     * machine memory in one operation.  With data translation enabled,
+     * consecutive virtual pages can have unrelated physical mappings and
+     * each store can fault.  Leave those loops to normal execution rather
+     * than translating just the first address for a physical bulk fill. */
+    if (slot == 0 && !(m->psr & PSR_DT) && m->bus.fill &&
+        units[0] == 'M' && units[1] == 'M' &&
         units[2] == 'B' &&
         bits(slots[0], 37, 4) == 5 && bits(slots[1], 37, 4) == 5 &&
         bits(slots[0], 30, 6) == 0x33 && bits(slots[1], 30, 6) == 0x33 &&
@@ -7774,6 +7977,206 @@ void merced_request_exit(Merced *m) {
     if (tc) tc->exit_request = true;
 }
 
+/* va_translate(m, va, false, false, access, ...) for a data reference,
+ * answered inline when data translation is off or the soft TLB hits and
+ * none of va_translate()'s watches can fire; anything else goes to
+ * va_translate() itself. */
+static inline bool fast_dtranslate(Merced *m, uint64_t va, uint64_t access,
+                                   uint64_t *pa, MercedStatus *st) {
+    if (!(mmfault_armed && mmfault_hi) &&
+        !(va >= watch_va_base && va < watch_va_end) &&
+        (m->ip & ~UINT64_C(0xF)) != UINT64_C(0xE00000008301BE20)) {
+        if (!(m->psr & PSR_DT)) {
+            *st = MERCED_OK;
+            *pa = va & MERCED_PHYS_MASK;
+            return true;
+        }
+        if (xlate_cacheable(m, va) &&
+            xlate_lookup(m, va, xlate_kind(m, false, access), pa)) {
+            *st = MERCED_OK;
+            return true;
+        }
+    }
+    return va_translate(m, va, false, false, access, pa, st);
+}
+
+/* The specialized handlers tb_decode_op() chose: each is the generic
+ * handler's own path for that encoding, minus the decoding.  Operand reads
+ * the generic code makes and then ignores are left out, which is exact
+ * because gr_read() has no side effect while fast_step() runs (its one
+ * debug print, R29_DEBUG, keeps merced_run_fast() off fast_step()). */
+static inline MercedStatus fast_op(Merced *m, const MercedTbEntry *tb,
+                                   unsigned s, int qp) {
+    unsigned r1 = tb->a1[s], r2 = tb->a2[s], r3 = tb->a3[s];
+    unsigned x = tb->x[s];
+    int64_t imm = tb->imm[s];
+    uint8_t n2, n3;
+    uint64_t a, b, res, pa;
+    MercedStatus st;
+
+    switch (tb->op[s]) {
+    case FOP_ADD: case FOP_SUB: case FOP_AND: case FOP_ANDCM:
+    case FOP_OR: case FOP_XOR: case FOP_SHLADD:
+        if (!qp) return MERCED_OK;
+        b = gr_read_inl(m, r3, &n3);
+        a = gr_read_inl(m, r2, &n2);
+        switch (tb->op[s]) {
+        case FOP_ADD:   res = a + b + (uint64_t)imm; break;
+        case FOP_SUB:   res = a - b - (uint64_t)imm; break;
+        case FOP_AND:   res = a & b; break;
+        case FOP_ANDCM: res = a & ~b; break;
+        case FOP_OR:    res = a | b; break;
+        case FOP_XOR:   res = a ^ b; break;
+        default:        res = (a << imm) + b; break;
+        }
+        gr_write_inl(m, r1, res, n2 | n3);
+        return MERCED_OK;
+
+    case FOP_ADDI: case FOP_SUBI: case FOP_ANDI: case FOP_ANDCMI:
+    case FOP_ORI: case FOP_XORI:
+        if (!qp) return MERCED_OK;
+        b = gr_read_inl(m, r3, &n3);
+        switch (tb->op[s]) {
+        case FOP_ADDI:   res = (uint64_t)imm + b; break;
+        case FOP_SUBI:   res = (uint64_t)imm - b; break;
+        case FOP_ANDI:   res = (uint64_t)imm & b; break;
+        case FOP_ANDCMI: res = (uint64_t)imm & ~b; break;
+        case FOP_ORI:    res = (uint64_t)imm | b; break;
+        default:         res = (uint64_t)imm ^ b; break;
+        }
+        gr_write_inl(m, r1, res, n3);
+        return MERCED_OK;
+
+    case FOP_CMP: {
+        /* r1/r2 hold p1/p2; imm the immediate or the r2 register */
+        b = gr_read_inl(m, r3, &n3);
+        uint8_t nat = n3;
+        int64_t sa;
+        if (x & CMPF_IMM) {
+            sa = imm;
+            a = (uint64_t)sa;
+        } else {
+            a = gr_read_inl(m, (unsigned)imm, &n2);
+            sa = (int64_t)a;
+            nat |= n2;
+        }
+        int64_t sb = (int64_t)b;
+        if (x & CMPF_CMP4) {
+            sa = (int32_t)sa; sb = (int32_t)sb;
+            a = (uint32_t)a;  b = (uint32_t)b;
+        }
+        int rel;
+        switch (x & CMPF_REL) {
+        case CMPF_LT:  rel = sa < sb; break;
+        case CMPF_LTU: rel = a < b; break;
+        default:       rel = a == b; break;
+        }
+        if (nat && qp) {
+            pr_write(m, r1, 0);
+            pr_write(m, r2, 0);
+            return MERCED_OK;
+        }
+        set_preds(m, r1, r2, qp, rel, (x & CMPF_UNC) ? 1 : 0);
+        return MERCED_OK;
+    }
+
+    case FOP_LD: {
+        if (!qp) return MERCED_OK;
+        uint64_t va = gr_read_inl(m, r3, &n3);
+        uint64_t reg_inc = 0;
+        uint8_t reg_inc_nat = 0;
+        if (x & LDST_INC_REG)
+            reg_inc = gr_read_inl(m, r2, &reg_inc_nat);
+        if (n3)
+            return deliver_fault(m, VEC_NAT, ISR_NA | ISR_R | UINT64_C(0x10),
+                                 0, false);
+        /* These are non-speculative loads.  Translation failure transfers
+         * control to the fault handler without committing either output. */
+        if (!fast_dtranslate(m, va, ISR_R, &pa, &st)) return st;
+        gr_write_inl(m, r1, phys_read(m, pa, x & LDST_SIZE), 0);
+        if (x & (LDST_INC_IMM | LDST_INC_REG)) {
+            uint64_t base = gr_read_inl(m, r3, &n3);
+            if (x & LDST_INC_IMM)
+                gr_write_inl(m, r3, base + (uint64_t)imm, n3);
+            else
+                gr_write_inl(m, r3, base + reg_inc, n3 | reg_inc_nat);
+        }
+        return MERCED_OK;
+    }
+
+    case FOP_ST: {
+        /* r1 is the postincrement register, r2 the value */
+        if (!qp) return MERCED_OK;
+        uint64_t va = gr_read_inl(m, r3, &n3);
+        uint64_t reg_inc = 0;
+        uint8_t reg_inc_nat = 0;
+        if (x & LDST_INC_REG)
+            reg_inc = gr_read_inl(m, r1, &reg_inc_nat);
+        if (n3)
+            return deliver_fault(m, VEC_NAT, ISR_NA | ISR_W | UINT64_C(0x10),
+                                 0, false);
+        uint64_t v = gr_read_inl(m, r2, &n2);
+        if (n2)
+            return deliver_fault(m, VEC_NAT, ISR_W | UINT64_C(0x10), 0, false);
+        if (!fast_dtranslate(m, va, ISR_W, &pa, &st)) return st;
+        phys_write(m, pa, v, x & LDST_SIZE);
+        if (x & LDST_INC_IMM)
+            gr_write_inl(m, r3, va + (uint64_t)imm, n3);
+        else if (x & LDST_INC_REG)
+            gr_write_inl(m, r3, va + reg_inc, n3 | reg_inc_nat);
+        return MERCED_OK;
+    }
+
+    case FOP_SETF_SIG: {
+        if (!qp) return MERCED_OK;
+        MercedFpReg f = {0, 0, 0, 0};
+        f.sig = gr_read_inl(m, r2, &n2);
+        f.exp = 0x1003E;
+        f.nat = n2;
+        fr_write(m, r1, f);
+        return MERCED_OK;
+    }
+
+    case FOP_GETF_SIG: {
+        if (!qp) return MERCED_OK;
+        MercedFpReg f = fr_read(m, r2);
+        gr_write_inl(m, r1, f.sig, f.nat);
+        return MERCED_OK;
+    }
+
+    case FOP_EXT:
+        if (!qp) return MERCED_OK;
+        a = gr_read_inl(m, r3, &n3);
+        switch (x) {
+        case 0x10: a = (uint8_t)a; break;
+        case 0x11: a = (uint16_t)a; break;
+        case 0x12: a = (uint32_t)a; break;
+        case 0x14: a = (uint64_t)(int64_t)(int8_t)a; break;
+        case 0x15: a = (uint64_t)(int64_t)(int16_t)a; break;
+        default:   a = (uint64_t)(int64_t)(int32_t)a; break;
+        }
+        gr_write_inl(m, r1, a, n3);
+        return MERCED_OK;
+
+    case FOP_BR_COND:
+        if (qp) {
+            m->ip = (m->ip & ~UINT64_C(0xF)) + (uint64_t)imm;
+            m->taken = 1;
+        }
+        return MERCED_OK;
+
+    case FOP_BR_CLOOP:
+        /* exec_b()'s br.cloop doesn't consult qp either */
+        if (m->ar[AR_LC] != 0) {
+            m->ar[AR_LC]--;
+            m->ip = (m->ip & ~UINT64_C(0xF)) + (uint64_t)imm;
+            m->taken = 1;
+        }
+        return MERCED_OK;
+    }
+    return tb->fn[s](m, tb->slots[s], qp);
+}
+
 /* The common case of merced_step(), many slots per call.  It handles a slot
  * itself only when none of merced_step()'s special cases can apply (debug
  * hooks, IA-32, the firmware entry-point shims, an undecoded or reserved
@@ -7784,7 +8187,7 @@ void merced_request_exit(Merced *m) {
  * the guest identically. */
 static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
     uint64_t ip = m->ip;
-    if ((m->psr & PSR_IS) || ip == UINT64_C(0x000000007F38B362) ||
+    if ((m->psr & PSR_IS) || ami_freepool_assert_ip(m, ip) ||
         (ip & UINT64_C(0x1FFFFFFFFFFFFFF0)) == UINT64_C(0x00000000FFF05000))
         return merced_step(m);
     uint64_t bundle_va = ip & ~0xFull;
@@ -7815,11 +8218,7 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
     if (tb->reserved || (slot == 0 && tb->slow_slot0)) return merced_step(m);
 
     /* -- from here on, merced_step()'s own sequence -- */
-    bool ami_ivt_handoff = m->cr[CR_IVA] == 0 &&
-                           ((ip >= UINT64_C(0x7F000000) &&
-                             ip < UINT64_C(0x80000000)) ||
-                            ((ip & UINT64_C(0x00000fff00000000)) ==
-                             UINT64_C(0x00000e0000000000)));
+    bool ami_ivt_handoff = ami_ivt_handoff_pending(m);
     if (!ami_ivt_handoff && m->group_start &&
         (m->psr & PSR_I) && (m->psr & PSR_IC) &&
         ext_highest_unmasked(m) >= 0) {
@@ -7857,7 +8256,8 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
 
     MercedStatus st;
     if (kind == SLOT_EXEC)
-        st = tb->fn[slot](m, tb->slots[slot], qp);
+        st = tb->op[slot] == FOP_GENERIC ?
+             tb->fn[slot](m, tb->slots[slot], qp) : fast_op(m, tb, slot, qp);
     else if (kind == SLOT_NOP)
         st = MERCED_OK;
     else
@@ -7893,15 +8293,18 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
 }
 
 /* Like merced_run(), but through fast_step() when no debug facility is
- * active.  Stops early on a non-OK status, merced_request_exit(), or (when
- * stop_mask isn't 0) once (ip & stop_mask) == stop_value. */
-MercedStatus merced_run_fast(Merced *m, unsigned max_slots, unsigned *executed,
-                             uint64_t stop_mask, uint64_t stop_value) {
+ * active.  In addition to the masked stop address, an optional range lets
+ * the platform observe an EFI application handoff before its first slot. */
+MercedStatus merced_run_fast_range(Merced *m, unsigned max_slots,
+                                   unsigned *executed, uint64_t stop_mask,
+                                   uint64_t stop_value, uint64_t stop_lo,
+                                   uint64_t stop_hi) {
     MercedTranslationCache *tc = translation_cache_on ? m->translation_cache : NULL;
     unsigned n = 0;
     MercedStatus st = MERCED_OK;
     bool fast = tc && !debug_hooks_on && !trace_hi && !watch_ip_count &&
-                !heartbeat_on && !r18_debug_on && !r48_debug_on;
+                !heartbeat_on && !r18_debug_on && !r48_debug_on &&
+                !r29_debug_on;
     if (tc) tc->exit_request = false;
     while (n < max_slots) {
         if (fast && !target_trap_slot_armed && !m->trace_n)
@@ -7910,12 +8313,19 @@ MercedStatus merced_run_fast(Merced *m, unsigned max_slots, unsigned *executed,
             st = merced_step(m);
         n++;
         if (st != MERCED_OK || (tc && tc->exit_request) ||
-            (stop_mask && (m->ip & stop_mask) == stop_value))
+            (stop_mask && (m->ip & stop_mask) == stop_value) ||
+            (m->ip >= stop_lo && m->ip < stop_hi))
             break;
     }
     if (executed)
         *executed = n;
     return st;
+}
+
+MercedStatus merced_run_fast(Merced *m, unsigned max_slots, unsigned *executed,
+                             uint64_t stop_mask, uint64_t stop_value) {
+    return merced_run_fast_range(m, max_slots, executed, stop_mask, stop_value,
+                                 0, 0);
 }
 
 MercedStatus merced_run(Merced *m, unsigned max_slots, unsigned *executed) {

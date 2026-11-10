@@ -10,7 +10,7 @@
  * Skeleton physical memory map (what exists so far):
  *
  *   0x0000000000000000 +--------------------------+
- *                      | SDRAM (default 512 MiB,  |
+ *                      | SDRAM (default 2 GiB,    |
  *                      | i2000 max 2 GiB)         |
  *          ram_size    +--------------------------+
  *                      | (open bus - 460GX SAC/   |
@@ -18,9 +18,9 @@
  *   0x000000007FF00000 +--------------------------+
  *                      | chipset scratch (1 MiB), |
  *                      | always backed regardless |
- *                      | of ram_size - firmware   |
- *                      | places fixed-address     |
- *                      | descriptors here         |
+ *                      | of ram_size for legacy   |
+ *                      | firmware/snapshot        |
+ *                      | compatibility            |
  *   0x0000000080000000 +--------------------------+
  *                      | (open bus)               |
  *   0x00000000FFC00000 +--------------------------+
@@ -45,13 +45,10 @@
  * confirmed live (ar.lc tracing with -m 64M) that it zeroes a field there,
  * reads it straight back to compute a loop trip-count, and separately
  * stores a pointer ~0x3E000 below the same boundary into that descriptor.
- * Real chipsets route this whole architected window even when DRAM below
- * I2000_RAM_MAX isn't fully populated - the open-bus fallback elsewhere in
- * bus_read() returns all-ones, not the zero this probe expects, so it read
- * back garbage and spun forever. Backing it separately from `ram` keeps it
- * present at any -m size without inflating detected RAM. Sized well above
- * the largest offset seen so far (~0x3E000) since more of this pattern may
- * turn up with further tracing. */
+ * Retain separate backing for that firmware behavior and old snapshots;
+ * this is an emulator compatibility window, not installed RAM. Correctly
+ * sized AMI cold boots put their scratch descriptors below ram_size.
+ * Sized above the largest legacy offset seen so far (~0x3E000). */
 #define I2000_CHIPSET_SCRATCH_SIZE 0x100000ull                    /* 1 MiB */
 #define I2000_CHIPSET_SCRATCH_BASE (I2000_RAM_MAX - I2000_CHIPSET_SCRATCH_SIZE)
 
@@ -78,8 +75,8 @@ void            ia64_i2000_destroy(Ia64I2000State *s);
  * window so the reset bundles land at their architected addresses). */
 bool ia64_i2000_load_firmware(Ia64I2000State *s, const char *path);
 
-/* Physical address space accessors - the future Merced core (and 460GX
- * chipset models) go through these. Bundle/word fetch helpers will be
- * layered on top once the CPU lands. */
+/* Physical address space accessors for platform integration and tests. */
 uint8_t ia64_i2000_phys_read8 (Ia64I2000State *s, uint64_t addr);
 void    ia64_i2000_phys_write8(Ia64I2000State *s, uint64_t addr, uint8_t val);
+uint32_t ia64_i2000_phys_read32(Ia64I2000State *s, uint64_t addr);
+void     ia64_i2000_phys_write32(Ia64I2000State *s, uint64_t addr, uint32_t val);

@@ -15,3 +15,4 @@ tools/*.pyc
 *.log
 build-win/
 bin-win/
+.work-ia64/

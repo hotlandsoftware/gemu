@@ -108,9 +108,10 @@ static const char *i2000_cached_getenv(const char *name) {
 #define SMB_HSTCNT_START     (1u << 6)
 #define SMB_PROT_BYTE_DATA   2          /* smbhstcnt[4:2]: byte data r/w */
 #define SMB_PROT_QUICK       0
-/* Up to 8 simulated DIMM slots (SMBus slave addresses 0x50-0x57), matching
- * one 460GX Memory Card's row count (SSDM sec. 5.1/5.5.1) - see spd_init(). */
+/* The i2000 memory card has eight DIMM sockets, addressed at I2C slaves
+ * 0x50-0x57 and populated in matched groups of four. */
 #define I2000_SPD_SLOTS 8
+#define I2000_DIMMS_PER_ROW 4
 #define I2000_SPD_BASE_ADDR 0x50
 
 /* front panel framebuffer */
@@ -188,6 +189,7 @@ static const uint32_t i2000_keyboard_keysyms[] = {
 #define I82559_PCI_DEV          6u
 #define I82559_MMIO_BASE        0xC8100000u
 #define I82559_IO_BASE          0xC400u
+/* Retained only for snapshots made before the SPD memory-map fix. */
 #define I2000_HIGH_DRAM_TAG   UINT64_C(0x00000e0000000000)
 #define I2000_HIGH_DRAM_SIZE  (UINT64_C(64) * 1024 * 1024)
 #define I2000_HIGH_DRAM_BASE  (I2000_RAM_MAX - I2000_HIGH_DRAM_SIZE)
@@ -286,17 +288,14 @@ struct Ia64I2000State {
     uint8_t   cmos_index;
     uint8_t   cmos[128];
     uint32_t  pci_cfg_addr;
-    bool      ifb_smbus_cmd_read_once;
+    bool      ifb_smbus_cmd_read_once; /* reserved for old snapshot layout */
     uint8_t   ifb_cfg[256];
     uint8_t   ifb_usb_cfg[256];
     uint8_t   ifb_smbus_cfg[256];
     /* SMBus host-controller interface (IFB function 3, I/O regs at the
      * base programmed into ifb_smbus_cfg[0x20..0x23] - SSDM 248704-001
-     * sec. 14.3). Firmware uses this to read Serial Presence Detect (SPD)
-     * data from each DIMM row to compute total installed memory (sec.
-     * 5.5.1) rather than probing addresses; without real SPD data behind
-     * it, firmware fell back to an assumed max-memory layout regardless
-     * of -m, faulting on whatever wasn't actually backed. */
+     * sec. 14.3). It shares DIMM SPD contents with the SAC's memory-card
+     * I2C configuration window, which this firmware uses for RAM sizing. */
     uint8_t   smb_hststs, smb_hstcnt, smb_hstcmd, smb_hstadd;
     uint8_t   smb_hstdat0, smb_hstdat1;
     bool      spd_present[I2000_SPD_SLOTS];
@@ -440,7 +439,7 @@ struct Ia64I2000State {
     int32_t mouse_accum_dx, mouse_accum_dy;
     bool mouse_host_left, mouse_host_right;
     uint64_t mouse_next_report_itc;
-    /* v10 tail: separately-backed top of the 0xe00 memory-card aperture. */
+    /* v10 tail: backing for the erroneous high-memory map in old snapshots. */
     uint8_t *high_dram;
     /* v11: persistent writable flash overlay (the ROM itself stays clean). */
     char nvram_path[512];
@@ -480,6 +479,18 @@ struct Ia64I2000State {
     /* v23: OCW3 read-register selection for each legacy 8259. False is
      * IRR (the reset/default selection), true is ISR. */
     bool pic_master_read_isr, pic_slave_read_isr;
+    /* v25: IFB power-management registers, separate from the fixed 0x400
+     * GPIO/strap window. The aligned tail preserves the v24 struct size. */
+    uint64_t acpi_pm[8];
+    uint8_t apm_control, apm_status;
+    /* v26: empty UHCI host controller and its 1-ms frame clock. */
+    uint64_t uhci_regs[4];
+    uint64_t uhci_frame_itc;
+    /* v27: device interrupt output and ATA/ATAPI completion semantics. */
+    uint8_t atapi_device_control;
+    bool atapi_irq_asserted;
+    bool atapi_packet_command;
+    bool atapi_legacy_irq_latched;
 };
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -669,6 +680,19 @@ static const char *atapi_packet_name(uint8_t opcode) {
     }
 }
 
+/* Device INTRQ remains latched until a normal Status read. The output
+ * latch separately prevents one asserted edge from being delivered again
+ * after the CPU accepts its SAPIC vector. */
+static void atapi_clear_irq(Ia64I2000State *s) {
+    s->atapi_irq_pending = false;
+    s->atapi_irq_asserted = false;
+}
+
+static void atapi_latch_irq(Ia64I2000State *s) {
+    s->atapi_irq_pending = true;
+    s->atapi_irq_asserted = false;
+}
+
 static void atapi_defer_ready(Ia64I2000State *s, bool raise_irq) {
     s->atapi_ready_status = s->atapi_status;
     s->atapi_status = 0x80; /* BSY */
@@ -678,7 +702,7 @@ static void atapi_defer_ready(Ia64I2000State *s, bool raise_irq) {
         s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
     /* The completion interrupt belongs to the ready transition, not to the
      * command-register write while the device is still busy. */
-    s->atapi_irq_pending = false;
+    atapi_clear_irq(s);
 }
 
 static void atapi_begin_data_phase(Ia64I2000State *s) {
@@ -695,7 +719,7 @@ static void atapi_begin_data_phase(Ia64I2000State *s) {
     s->atapi_lba_mid = (uint8_t)phase;
     s->atapi_lba_high = (uint8_t)(phase >> 8);
     s->atapi_status = 0x48; /* DRDY|DRQ */
-    s->atapi_irq_pending = true;
+    atapi_latch_irq(s);
     s->atapi_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
 }
 
@@ -721,7 +745,7 @@ static void atapi_set_data(Ia64I2000State *s, const void *data, size_t len) {
         s->atapi_count = 0x03; /* command complete: CoD=1, I/O=1 */
         s->atapi_lba_mid = s->atapi_lba_high = 0;
         s->atapi_status = 0x40;
-        s->atapi_irq_pending = true;
+        atapi_latch_irq(s);
         s->atapi_irq_ready_ninsts =
             s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
     }
@@ -738,7 +762,7 @@ static void atapi_no_medium(Ia64I2000State *s) {
     s->atapi_count = 0x03; /* command completion, I/O to host */
     s->atapi_error = 0x20; /* sense key: NOT READY */
     s->atapi_status = 0x41; /* DRDY|ERR */
-    s->atapi_irq_pending = true;
+    atapi_latch_irq(s);
     s->atapi_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
     if (atapi_debug_enabled())
         fprintf(stderr, "i2000: ATAPI no medium status=%#04x error=%#04x\n",
@@ -833,7 +857,7 @@ static void atapi_reply(Ia64I2000State *s) {
             (len && !gemu_drive_read(s->cdrom, (uint64_t)lba * 2048, buf, len))) {
             free(buf); s->atapi_error = 0x50; s->atapi_status = 0x41;
             s->atapi_count = 0x03;
-            s->atapi_irq_pending = true;
+            atapi_latch_irq(s);
             s->atapi_irq_ready_ninsts =
                 s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
             if (atapi_debug_enabled())
@@ -851,7 +875,7 @@ static void atapi_reply(Ia64I2000State *s) {
         s->atapi_error = 0x50;
         s->atapi_status = 0x41;
         s->atapi_count = 0x03;
-        s->atapi_irq_pending = true;
+        atapi_latch_irq(s);
         s->atapi_irq_ready_ninsts =
             s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
         break;
@@ -1223,6 +1247,117 @@ static void int10_io_write(Ia64I2000State *s, unsigned reg, uint16_t v) {
     }
 }
 
+/* PCI IDE has four task-file/control I/O windows and one 16-byte bus-master
+ * window. Preserve their hardwired type/alignment bits on byte and dword
+ * accesses, including the all-ones sizing probe used by EFI and the OS. */
+static uint8_t cmd649_cfg_read8(Ia64I2000State *s, unsigned reg) {
+    if (reg >= 0x24 && reg < 0x28)
+        return 0; /* BAR5 is unimplemented. */
+    if (reg >= 0x10 && reg < 0x24) {
+        static const uint32_t masks[5] = {
+            UINT32_C(0xfffffff8), UINT32_C(0xfffffffc),
+            UINT32_C(0xfffffff8), UINT32_C(0xfffffffc),
+            UINT32_C(0xfffffff0),
+        };
+        unsigned bar = (reg - 0x10) / 4;
+        uint32_t value;
+        memcpy(&value, &s->cmd649_cfg[0x10 + bar * 4], sizeof(value));
+        value = (value & masks[bar]) | 1;
+        return (uint8_t)(value >> ((reg & 3) * 8));
+    }
+    return s->cmd649_cfg[reg];
+}
+
+/* Intel 460GX SSDM tables 9-1/9-3/9-4 and sections 13.2.9/14.2.7:
+ * LPC has no ordinary BARs. USB and SMBus implement only BAR4, decoding
+ * 16-bit I/O addresses in 32-byte and 16-byte windows respectively. */
+static uint8_t ifb_cfg_read8(Ia64I2000State *s, unsigned fun, unsigned reg) {
+    uint8_t *cfg = fun == 0 ? s->ifb_cfg :
+                   fun == 2 ? s->ifb_usb_cfg : s->ifb_smbus_cfg;
+    if (fun == 0 && reg >= 0x0f && reg < 0x40)
+        return 0;
+    if (fun != 0) {
+        if (reg >= 0x20 && reg < 0x24) {
+            uint32_t value;
+            memcpy(&value, cfg + 0x20, sizeof(value));
+            value = (value & (fun == 2 ? 0xffe0u : 0xfff0u)) | 1;
+            return (uint8_t)(value >> ((reg & 3) * 8));
+        }
+        if ((reg >= 0x10 && reg < 0x20) ||
+            (reg >= 0x24 && reg < 0x3c))
+            return 0;
+        if (reg == 4) return cfg[reg] & (fun == 2 ? 5 : 1);
+        if (reg == 5) return 0;
+    }
+    return cfg[reg];
+}
+
+static void ifb_cfg_write8(Ia64I2000State *s, unsigned fun,
+                            unsigned reg, uint8_t value) {
+    uint8_t *cfg = fun == 0 ? s->ifb_cfg :
+                   fun == 2 ? s->ifb_usb_cfg : s->ifb_smbus_cfg;
+    if (reg < 4 || (reg >= 8 && reg <= 0x0c) || reg == 0x0e ||
+        (fun == 0 && reg >= 0x0f && reg < 0x40) ||
+        (fun != 0 && ((reg >= 0x10 && reg < 0x20) ||
+                      (reg >= 0x24 && reg < 0x3c) || reg == 0x3d)) ||
+        (fun == 2 && reg == 0x60))
+        return;
+    cfg[reg] = value;
+    cfg[reg] = ifb_cfg_read8(s, fun, reg);
+}
+
+/* The i2000 connects a PXB in 64-bit mode to link 0, a dual-bus WXB
+ * to link 1, and a GXB to links 2/3. Function zero is the SAC's window;
+ * the attached bridge has its own function-one identity (GART is fn2).
+ * Normalize fixed fields on reads so old saved configuration latches
+ * cannot change the physical topology. */
+static uint8_t chipset_cfg_read8(Ia64I2000State *s, unsigned dev,
+                                  unsigned fun, unsigned reg) {
+    uint8_t value = s->chipset_cfg[dev][fun][reg];
+    uint32_t identity = 0;
+    unsigned revision = 0, buses = 0;
+    if (fun == 0) {
+        identity = dev == 4 ? UINT32_C(0x84e18086) : UINT32_C(0x84e08086);
+        revision = 3;
+    } else if (fun == 1) {
+        if (dev == 0x10) { identity = UINT32_C(0x84cb8086); revision = 5; buses = 1; }
+        if (dev == 0x12 || dev == 0x13) {
+            identity = UINT32_C(0x84e68086); revision = 7; buses = 2;
+        }
+        if (dev == 0x14) { identity = UINT32_C(0x84ea8086); revision = 2; buses = 1; }
+    } else if (fun == 2 && dev == 0x14) {
+        identity = UINT32_C(0x84e28086); revision = 2;
+    }
+    if (identity) {
+        if (reg < 4) return (uint8_t)(identity >> (reg * 8));
+        if (reg == 8) return (uint8_t)revision;
+        if (reg == 9) return 0;
+        if (reg == 0x0a) return fun == 2 ? 0x80 : 0;
+        if (reg == 0x0b) return 6;
+        if (reg == 0x0e) return fun == 0 && dev >= 0x10 ? 0x80 : 0;
+    }
+    if (dev == 0 && fun == 0) {
+        if (reg == 0x60) return 4; /* F16NUM: four physical links */
+        if (reg == 0x64) {
+            /* Indexed link probe: bit 7 completes the request; bit 6
+             * reports a connected link. An out-of-range probe completes
+             * without reporting a fifth link. ROM and EFI both poll this
+             * interface before programming the DEVNPRES bitmap. */
+            unsigned link = value & 0x3f;
+            return (uint8_t)(link | 0x80 | (link < 4 ? 0x40 : 0));
+        }
+    }
+    /* Each SAC expander window can describe two buses. The bridge's
+     * active count reflects its wiring/mode. Firmware uses these fields
+     * to mask unused windows and consumes the GXB's second link without
+     * creating another root bus. Preserve the writable upper bits. */
+    if (fun == 0 && dev >= 0x10 && reg == 0x42)
+        return (value & ~3u) | 2;
+    if (buses && reg == 0x80)
+        return (value & ~3u) | buses;
+    return value;
+}
+
 static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     uint32_t a = s->pci_cfg_addr;
     if (!(a & 0x80000000u) || lane + size > 4)
@@ -1243,33 +1378,21 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == 0 &&
         reg + size <= sizeof(s->ifb_cfg)) {
         uint64_t v = 0;
-        memcpy(&v, &s->ifb_cfg[reg], size);
+        for (unsigned i = 0; i < size; i++)
+            v |= (uint64_t)ifb_cfg_read8(s, fun, reg + i) << (i * 8);
         return v;
     }
     if (bus == 0 && dev == CMD649_PCI_DEV && (fun == 2 || fun == 3)) {
-        uint8_t *cfg = fun == 2 ? s->ifb_usb_cfg : s->ifb_smbus_cfg;
         uint64_t v = 0;
-        memcpy(&v, &cfg[reg], size);
-        if (fun == 3 && reg <= 4 && reg + size > 4) {
-            /* Command register bit 0 (I/O space enable) doubles as a
-             * software-driven busy pulse for the SMBus host controller's
-             * retry loop: it writes 1, then polls this same bit forever
-             * waiting for hardware to clear it, with no further writes in
-             * the steady state - so a fixed "clear the Nth read" model
-             * can't work; nothing ever arms a later read. The very first
-             * ever read (confirming the enable write stuck) needs to see
-             * the true set value; every read after that reports bit 0
-             * clear unconditionally, so the poll succeeds immediately. */
-            if (s->ifb_smbus_cmd_read_once)
-                v &= ~(UINT64_C(1) << ((4 - reg) * 8));
-            s->ifb_smbus_cmd_read_once = true;
-        }
+        for (unsigned i = 0; i < size; i++)
+            v |= (uint64_t)ifb_cfg_read8(s, fun, reg + i) << (i * 8);
         return v;
     }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
         reg + size <= sizeof(s->cmd649_cfg)) {
         uint64_t v = 0;
-        memcpy(&v, &s->cmd649_cfg[reg], size);
+        for (unsigned i = 0; i < size; i++)
+            v |= (uint64_t)cmd649_cfg_read8(s, reg + i) << (i * 8);
         if (atapi_debug_enabled() && reg < 4) {
             static unsigned identity_reads;
             if (identity_reads++ < 16)
@@ -1279,19 +1402,50 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
         return v;
     }
 
-    /* On bus zero, device 10h is the SAC's special CBN programming
-     * endpoint.  Firmware uses byte register 40h to select the bus on
-     * which the rest of the 460GX components appear. */
-    if (bus == 0 && dev == 0x10 && fun == 0 && reg == 0x40 && size == 1)
-        return s->chipset_bus;
+    /* The SAC's fixed CBN programming function remains on bus zero when
+     * the chipset moves. ACPI validates its vendor ID/header before
+     * reading CBNO at 40h; exposing only that byte makes the OS reject
+     * the function and interpret every chipset-derived resource as FFh.
+     * This function has the SAC identity and no BAR windows. */
+    if (bus == 0 && dev == 0x10 && fun == 0 && reg + size <= 256) {
+        uint64_t v = 0;
+        for (unsigned i = 0; i < size; i++) {
+            unsigned off = reg + i;
+            uint8_t byte = off == 0x40 ? s->chipset_bus :
+                           off < 0x10 ? chipset_cfg_read8(s, 0, 0, off) : 0;
+            v |= (uint64_t)byte << (i * 8);
+        }
+        return v;
+    }
     if (bus == s->chipset_bus && chipset_device_present(dev) &&
         reg + size <= 256) {
         uint64_t v = 0;
-        memcpy(&v, &s->chipset_cfg[dev][fun][reg], size);
+        for (unsigned i = 0; i < size; i++)
+            v |= (uint64_t)chipset_cfg_read8(s, dev, fun, reg + i) << (i * 8);
         return v;
     }
     if (bus == s->chipset_bus && (dev == 5 || dev == 6) &&
         reg + size <= 256) {
+        /* SAC translates memory-card configuration cycles into I2C.
+         * Its IIADR byte (00.0:68h) carries enable bit 7 and the seven-bit
+         * slave address; function 2's register offset selects the EEPROM
+         * byte.  Firmware selects a row multiplexer through bit 0 of
+         * register 48h in functions 4-7, clearing the other three first.
+         * Only function 4's selection connects to our eight DIMMs on card
+         * A.  Other selections/card B have no EEPROM acknowledgement.
+         * Ignoring this selection exposes the same DIMMs four times. */
+        unsigned iiadr = s->chipset_cfg[0][0][0x68];
+        if (fun == 2 && (iiadr & 0xf8) == (0x80 | I2000_SPD_BASE_ADDR)) {
+            unsigned dimm = iiadr & 7;
+            uint8_t (*card)[256] = s->memcard_cfg[dev - 5];
+            if (dev != 5 || !s->spd_present[dimm] ||
+                !(card[4][0x48] & 1) || (card[5][0x48] & 1) ||
+                (card[6][0x48] & 1) || (card[7][0x48] & 1))
+                return size_mask(size);
+            uint64_t v = 0;
+            memcpy(&v, &s->spd[dimm][reg], size);
+            return v;
+        }
         uint64_t v = 0;
         memcpy(&v, &s->memcard_cfg[dev - 5][fun][reg], size);
         return v;
@@ -1323,58 +1477,54 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
         i82559_pci_write(&s->i82559, reg, val, size);
         return;
     }
-    if (bus == 0 && dev == CMD649_PCI_DEV && fun == 0 &&
-        reg + size <= sizeof(s->ifb_cfg)) {
-        /* Identity, class code and header type are read-only.  The rest of
-         * the IFB LPC/FWH configuration space is mostly retained control
-         * latches; firmware programs ACPI/GPIO bases and decode enables
-         * here before entering EFI. */
-        for (unsigned i = 0; i < size; i++) {
-            unsigned off = reg + i;
-            if (off >= 4 && !(off >= 8 && off < 16))
-                s->ifb_cfg[off] = (uint8_t)(val >> (i * 8));
-        }
-        return;
-    }
-    if (bus == 0 && dev == CMD649_PCI_DEV && (fun == 2 || fun == 3)) {
-        uint8_t *cfg = fun == 2 ? s->ifb_usb_cfg : s->ifb_smbus_cfg;
-        for (unsigned i = 0; i < size; i++) {
-            unsigned off = reg + i;
-            if (off >= 4 && !(off >= 8 && off < 16))
-                cfg[off] = (uint8_t)(val >> (i * 8));
-        }
+    if (bus == 0 && dev == CMD649_PCI_DEV &&
+        (fun == 0 || fun == 2 || fun == 3)) {
+        for (unsigned i = 0; i < size; i++)
+            ifb_cfg_write8(s, fun, reg + i, (uint8_t)(val >> (i * 8)));
         return;
     }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
         reg + size <= sizeof(s->cmd649_cfg)) {
-        /* Identity, revision/class and header type are read-only.  Command,
-         * BAR and CMD timing registers are ordinary retained latches for the
-         * empty-controller model. */
+        /* Identity, revision/class and header type are read-only.  BAR
+         * address bits are writable, but their type/alignment bits are not. */
         for (unsigned i = 0; i < size; i++) {
             unsigned off = reg + i;
-            if (off >= 4 && !(off >= 8 && off < 16))
+            if (off >= 0x24 && off < 0x28)
+                continue;
+            if (off >= 4 && !(off >= 8 && off < 16)) {
                 s->cmd649_cfg[off] = (uint8_t)(val >> (i * 8));
+                if (off >= 0x10 && off < 0x24)
+                    s->cmd649_cfg[off] = cmd649_cfg_read8(s, off);
+            }
         }
         return;
     }
-    if (bus == 0 && dev == 0x10 && fun == 0 && reg == 0x40 && size == 1) {
-        s->chipset_bus = (uint8_t)val;
+    if (bus == 0 && dev == 0x10 && fun == 0 && reg + size <= 256) {
+        if (reg <= 0x40 && reg + size > 0x40)
+            s->chipset_bus = (uint8_t)(val >> ((0x40 - reg) * 8));
         return;
     }
     if (bus == s->chipset_bus && chipset_device_present(dev) &&
         reg + size <= 256) {
-        /* Device/vendor ID and class/revision are read-only on function 0
-         * (real identity); other functions have no such fixed header yet,
-         * so leave them fully writable until we know their layout. */
+        /* Keep fixed identities and physical straps independent of the
+         * writable configuration latches. Unmodeled functions retain
+         * their latch behavior until their register layout is modeled. */
         for (unsigned i = 0; i < size; i++) {
             unsigned off = reg + i;
-            if (fun != 0 || (off >= 4 && !(off >= 8 && off < 12)))
+            if (fun != 0 || (off >= 4 && !(off >= 8 && off < 12))) {
                 s->chipset_cfg[dev][fun][off] = (uint8_t)(val >> (i * 8));
+                s->chipset_cfg[dev][fun][off] = chipset_cfg_read8(s, dev, fun, off);
+            }
         }
         return;
     }
     if (bus == s->chipset_bus && (dev == 5 || dev == 6) &&
         reg + size <= 256) {
+        /* SPD EEPROMs are read-only, including absent rows.  An EEPROM
+         * write must not fall through into the configuration latches. */
+        unsigned iiadr = s->chipset_cfg[0][0][0x68];
+        if (fun == 2 && (iiadr & 0xf8) == (0x80 | I2000_SPD_BASE_ADDR))
+            return;
         memcpy(&s->memcard_cfg[dev - 5][fun][reg], &val, size);
         return;
     }
@@ -1600,10 +1750,10 @@ static void smbus_reg_write(Ia64I2000State *s, uint64_t off, uint64_t val,
 /* The SMBus base is whatever firmware programs into SMBBA (ifb_smbus_cfg
  * offset 0x20-0x23, bits[15:4]) - see smbus_reg_read/write's callers. */
 static bool smbus_port_offset(Ia64I2000State *s, uint64_t port, uint64_t *off) {
-    uint32_t bar;
-    memcpy(&bar, &s->ifb_smbus_cfg[0x20], sizeof(bar));
-    if (!(bar & 1))
-        return false;  /* SMBBA not yet programmed as an I/O BAR */
+    uint32_t bar = (uint32_t)ifb_cfg_read8(s, 3, 0x20) |
+                   (uint32_t)ifb_cfg_read8(s, 3, 0x21) << 8;
+    if (!(s->ifb_smbus_cfg[4] & 1))
+        return false;  /* PCI I/O decode is disabled. */
     uint32_t base = bar & 0xFFF0u;
     if (base == 0 || port < base || port - base > SMB_REGSPAN)
         return false;
@@ -1611,8 +1761,133 @@ static bool smbus_port_offset(Ia64I2000State *s, uint64_t port, uint64_t *off) {
     return true;
 }
 
+/* 460GX SSDM 11.1.8/9: function 0 PMBASE selects a 64-byte I/O window;
+ * ACPI_CNTL bit 0 enables its decode. APM B2/B3 remain decoded separately. */
+static bool acpi_port_offset(Ia64I2000State *s, uint64_t port,
+                             unsigned size, unsigned *off) {
+    uint32_t base = (uint32_t)s->ifb_cfg[0x40] |
+                    (uint32_t)s->ifb_cfg[0x41] << 8;
+    base &= 0xffc0;
+    if (!(s->ifb_cfg[0x44] & 1) || !base || port < base ||
+        port - base + size > sizeof(s->acpi_pm))
+        return false;
+    *off = (unsigned)(port - base);
+    return true;
+}
+
+static uint64_t acpi_pm_read(Ia64I2000State *s, unsigned off, unsigned size) {
+    const uint8_t *regs = (const uint8_t *)s->acpi_pm;
+    uint64_t itc = merced_get_itc(s->cpu);
+    uint32_t timer = (uint32_t)((itc / I2000_ITC_HZ) * 3579545u +
+                     (itc % I2000_ITC_HZ) * 3579545u / I2000_ITC_HZ) & 0xffffff;
+    uint64_t value = 0;
+    for (unsigned i = 0; i < size; i++) {
+        unsigned p = off + i;
+        uint8_t byte = p >= 8 && p < 12 ? timer >> ((p - 8) * 8) : regs[p];
+        value |= (uint64_t)byte << (i * 8);
+    }
+    return value;
+}
+
+static void acpi_pm_write(Ia64I2000State *s, unsigned off,
+                           uint64_t value, unsigned size) {
+    uint8_t *regs = (uint8_t *)s->acpi_pm;
+    for (unsigned i = 0; i < size; i++) {
+        unsigned p = off + i;
+        uint8_t byte = (uint8_t)(value >> (i * 8));
+        if (p >= 8 && p < 12) continue; /* free-running, read-only timer */
+        /* PM1_STS and the GPE status halves are write-one-to-clear. */
+        if (p < 2 || (p >= 12 && p < 14) || (p >= 22 && p < 24))
+            regs[p] &= (uint8_t)~byte;
+        else
+            regs[p] = byte;
+    }
+}
+
+static void uhci_reset(Ia64I2000State *s) {
+    memset(s->uhci_regs, 0, sizeof(s->uhci_regs));
+    uint8_t *regs = (uint8_t *)s->uhci_regs;
+    regs[12] = 0x40;                /* SOFMOD reset value */
+    regs[16] = regs[18] = 0x80;     /* two disconnected root-hub ports */
+    s->uhci_frame_itc = 0;
+}
+
+static bool uhci_port_offset(Ia64I2000State *s, uint64_t port,
+                             unsigned size, unsigned *off) {
+    uint32_t bar = (uint32_t)ifb_cfg_read8(s, 2, 0x20) |
+                   (uint32_t)ifb_cfg_read8(s, 2, 0x21) << 8;
+    unsigned base = bar & 0xffe0;
+    if (!(s->ifb_usb_cfg[4] & 1) || !(bar & 1) || !base ||
+        port < base || port - base + size > sizeof(s->uhci_regs))
+        return false;
+    *off = (unsigned)(port - base);
+    return true;
+}
+
+static void uhci_update_frames(Ia64I2000State *s) {
+    uint8_t *regs = (uint8_t *)s->uhci_regs;
+    uint64_t now = merced_get_itc(s->cpu);
+    if (regs[0] & 1) {
+        uint64_t frames = (now - s->uhci_frame_itc) / (I2000_ITC_HZ / 1000);
+        unsigned frame = ((unsigned)regs[6] | (unsigned)regs[7] << 8);
+        frame = (frame + frames) & 0x7ff;
+        regs[6] = (uint8_t)frame;
+        regs[7] = (uint8_t)(frame >> 8);
+        s->uhci_frame_itc += frames * (I2000_ITC_HZ / 1000);
+    } else {
+        s->uhci_frame_itc = now;
+    }
+}
+
+static uint64_t uhci_read(Ia64I2000State *s, unsigned off, unsigned size) {
+    uhci_update_frames(s);
+    uint8_t *regs = (uint8_t *)s->uhci_regs;
+    uint64_t value = 0;
+    for (unsigned i = 0; i < size; i++) {
+        unsigned p = off + i;
+        uint8_t byte = p == 2 ? ((regs[0] & 1) ? 0 : 0x20) : regs[p];
+        value |= (uint64_t)byte << (i * 8);
+    }
+    return value;
+}
+
+static void uhci_write(Ia64I2000State *s, unsigned off,
+                        uint64_t value, unsigned size) {
+    uhci_update_frames(s);
+    uint8_t *regs = (uint8_t *)s->uhci_regs;
+    /* No USB devices are attached. Commands and root-port resets still
+     * complete, while status has no pending transfer or connection event. */
+    if (off == 0 && size >= 2) {
+        if (value & 2) {
+            uhci_reset(s);          /* HCRESET self-clears on completion */
+            s->uhci_frame_itc = merced_get_itc(s->cpu);
+            return;
+        }
+        regs[0] = (uint8_t)value & 0xfd;
+    }
+    for (unsigned i = 0; i < size; i++) {
+        unsigned p = off + i;
+        uint8_t byte = (uint8_t)(value >> (i * 8));
+        if (p == 4) regs[p] = byte & 0xf; /* USBINTR */
+        else if ((p == 6 || p == 7) && off == 6 && size >= 2 && !(regs[0] & 1))
+            regs[p] = p == 6 ? byte : byte & 7;
+        else if (p >= 8 && p < 12)
+            regs[p] = p == 8 ? 0 : p == 9 ? byte & 0xf0 : byte;
+        else if (p == 12) regs[p] = byte & 0x7f;
+        else if (p == 17 || p == 19) regs[p] = byte & 0x12;
+    }
+}
+
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     static unsigned debug_reads;
+    unsigned acpi_off;
+    if (acpi_port_offset(s, port, size, &acpi_off))
+        return acpi_pm_read(s, acpi_off, size);
+    if (size == 1 && (port == 0xb2 || port == 0xb3))
+        return port == 0xb2 ? s->apm_control : s->apm_status;
+    unsigned uhci_off;
+    if (uhci_port_offset(s, port, size, &uhci_off))
+        return uhci_read(s, uhci_off, size);
     if (s->rage128.enabled && size == 2 && port >= INT10_IO_BASE &&
         port < INT10_IO_BASE + 16 && !(port & 1))
         return int10_io_read(s, (unsigned)(port - INT10_IO_BASE) / 2);
@@ -1636,27 +1911,6 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         if (smbus_port_offset(s, port, &off))
             return smbus_reg_read(s, off, size);
     }
-    if (port >= 0x1000 && port + size <= 0x1008) {
-        /* Firmware busy-polls a status byte here waiting for bit 0 to
-         * clear before SMBBA gets programmed (see smbus_port_offset()
-         * above, which takes over this same port range once it has) - or
-         * for whatever else turns out to share this range; what real
-         * hardware is mapped at this port outside of SMBus isn't
-         * established. No real device backs it otherwise, so read as
-         * idle/complete unconditionally rather than falling through to
-         * the generic all-ones "unmapped" response, which left bit 0
-         * permanently set and the poll spinning forever. */
-        return 0;
-    }
-    /* Post-IBV firmware polls this byte before entering the presentation
-     * application.  PCI resource allocation places it at 0x1110 without
-     * the optional NIC and at 0x1160 when the i82559 consumes the preceding
-     * I/O aperture.  No asynchronous device is currently modeled behind
-     * this legacy-I/O status register, so its quiescent value is zero.
-     * Returning floating-bus 0xff leaves its busy/error bits asserted and
-     * traps firmware in a tight retry loop. */
-    if ((port == 0x1110 || port == 0x1160) && size == 1)
-        return 0;
     if (port == 0x60 && size == 1) {               /* 8042 data */
         /* A real 8042 has one ordered output buffer.  Our keyboard and aux
          * queues are separate, so preserve a mouse packet already exposed
@@ -1778,7 +2032,7 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         uint8_t irr = 0;
         if (s->pit_irq_pending) irr |= 0x01;
         if (s->keyboard_irq_pending) irr |= 0x02;
-        if (s->mouse_irq_pending || s->atapi_irq_pending) irr |= 0x04;
+        if (s->mouse_irq_pending || s->atapi_legacy_irq_latched) irr |= 0x04;
         if (getenv("ATA_IRQ_TRACE"))
             fprintf(stderr, "i2000: PIC master %s read -> %#04x ninsts=%" PRIu64 "\n",
                     s->pic_master_read_isr ? "ISR" : "IRR",
@@ -1789,7 +2043,7 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     if (port == 0xA0 && size == 1) {
         uint8_t irr = 0;
         if (s->mouse_irq_pending) irr |= 0x10;
-        if (s->atapi_irq_pending) irr |= 0x80;
+        if (s->atapi_legacy_irq_latched) irr |= 0x80;
         if (getenv("ATA_IRQ_TRACE"))
             fprintf(stderr, "i2000: PIC slave %s read -> %#04x ninsts=%" PRIu64 "\n",
                     s->pic_slave_read_isr ? "ISR" : "IRR",
@@ -1866,15 +2120,16 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
                                 s->atapi_phase_end, s->atapi_data_len);
                 } else {
                     s->atapi_status = 0x40;
-                    s->atapi_count = 0x03; /* command complete */
-                    s->atapi_lba_mid = s->atapi_lba_high = 0;
-                    /* Packet PIO completion is a separate interrupt from
-                     * the one that announced the final data phase.  AtaPim
-                     * drains DRQ and then waits for this command-complete
-                     * phase (CoD=1, I/O=1). */
-                    s->atapi_irq_pending = true;
-                    s->atapi_irq_ready_ninsts =
-                        s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
+                    /* PACKET has a separate command-complete interrupt.
+                     * IDENTIFY PACKET is an ATA PIO-data-in command: its
+                     * only interrupt announced the 512-byte response. */
+                    if (s->atapi_packet_command) {
+                        s->atapi_count = 0x03; /* CoD=1, I/O=1 */
+                        s->atapi_lba_mid = s->atapi_lba_high = 0;
+                        atapi_latch_irq(s);
+                        s->atapi_irq_ready_ninsts =
+                            s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
+                    }
                     if (atapi_debug_enabled())
                         fprintf(stderr, "i2000: ATAPI PIO complete bytes=%zu "
                                 "status=%#04x reason=%#04x\n",
@@ -1892,7 +2147,11 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         case 4: result = s->atapi_lba_mid; break;
         case 5: result = s->atapi_lba_high; break;
         case 6: result = s->atapi_device; break;
-        case 7: result = s->atapi_status; break;
+        case 7:
+            result = s->atapi_status;
+            if (port == 0x177)
+                atapi_clear_irq(s); /* Alternate Status does not acknowledge. */
+            break;
         default: result = 0; break;
         }
         if (getenv("ATA_TASKFILE_TRACE") || getenv("ATA_LOOP_TRACE")) {
@@ -1975,6 +2234,30 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
     static unsigned debug_writes;
+    unsigned acpi_off;
+    if (acpi_port_offset(s, port, size, &acpi_off)) {
+        acpi_pm_write(s, acpi_off, val, size);
+        return;
+    }
+    if (size == 1 && (port == 0xb2 || port == 0xb3)) {
+        if (port == 0xb3) {
+            s->apm_status = (uint8_t)val;
+        } else {
+            s->apm_control = (uint8_t)val;
+            /* The i2000 AMI FADT advertises A0/A1 at SMI_CMD B2 for
+             * ACPI enable/disable. Model that firmware handshake without
+             * requiring a system-management interruption implementation. */
+            uint8_t *regs = (uint8_t *)s->acpi_pm;
+            if ((uint8_t)val == 0xa0) regs[4] |= 1;  /* SCI_EN */
+            if ((uint8_t)val == 0xa1) regs[4] &= (uint8_t)~1;
+        }
+        return;
+    }
+    unsigned uhci_off;
+    if (uhci_port_offset(s, port, size, &uhci_off)) {
+        uhci_write(s, uhci_off, val, size);
+        return;
+    }
     if (s->rage128.enabled && size == 2 && port >= INT10_IO_BASE &&
         port < INT10_IO_BASE + 16 && !(port & 1)) {
         int10_io_write(s, (unsigned)(port - INT10_IO_BASE) / 2,
@@ -2009,10 +2292,6 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
             return;
         }
     }
-    if (port >= 0x1000 && port + size <= 0x1008)
-        return; /* no real device behind it - see io_port_read */
-    if (port == 0x1110 && size == 1)
-        return;
     if (port >= 0x400 && port + size <= 0x440) {
         memcpy(&s->acpi_io[port - 0x400], &val, size);
         return;
@@ -2256,7 +2535,7 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                 /* This model has no secondary slave.  Do not let a failed
                  * slave probe leave an interrupt that can complete the
                  * master's next PACKET request prematurely. */
-                s->atapi_irq_pending = false;
+                atapi_clear_irq(s);
                 s->atapi_status_pending = false;
                 if (!is_slave) {
                     s->atapi_error = 0;
@@ -2280,9 +2559,10 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
             /* A new command supersedes any unacknowledged completion from
              * the previous one. The command below will latch IRQ15 again
              * when its data or completion phase becomes available. */
-            s->atapi_irq_pending = false;
+            atapi_clear_irq(s);
             s->atapi_status_pending = false;
             s->atapi_error = 0;
+            s->atapi_packet_command = (uint8_t)val == 0xa0;
             if (atapi_debug_enabled())
                 fprintf(stderr, "i2000: ATAPI ATA command=%#04x device=%#04x "
                         "features=%#04x byte-limit=%u itc=%" PRIu64
@@ -2331,7 +2611,7 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                 s->atapi_count = 1; s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB;
             } else {
                 s->atapi_error = 0x04; s->atapi_status = 0x41;
-                s->atapi_irq_pending = true;
+                atapi_latch_irq(s);
                 s->atapi_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
                 if (atapi_debug_enabled())
                     fprintf(stderr, "i2000: ATAPI unsupported ATA command=%#04x "
@@ -2345,11 +2625,27 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                 fprintf(stderr, "i2000: ATAPI device-control=%#04x (%s reset)\n",
                         (unsigned)(uint8_t)val,
                         (val & 4) ? "assert" : "deassert");
-            s->atapi_irq_pending = false;
-            s->atapi_status_pending = false;
-            if (val & 4) s->atapi_status = 0x80;
-            else { s->atapi_status = 0x40; s->atapi_count = 1;
-                   s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB; }
+            {
+                uint8_t old_control = s->atapi_device_control;
+                s->atapi_device_control = (uint8_t)val;
+                if (val & 2)
+                    s->atapi_irq_asserted = false; /* nIEN lowers the output. */
+                if ((old_control ^ val) & 4) {
+                    atapi_clear_irq(s);
+                    s->atapi_status_pending = false;
+                    s->atapi_packet_pos = 0;
+                    s->atapi_packet_command = false;
+                    s->atapi_data_pos = s->atapi_data_len;
+                    if (val & 4) {
+                        s->atapi_status = 0x80;
+                    } else {
+                        s->atapi_status = 0x40;
+                        s->atapi_count = s->atapi_lba_low = 1;
+                        s->atapi_lba_mid = 0x14;
+                        s->atapi_lba_high = 0xeb;
+                    }
+                }
+            }
             return;
         }
     }
@@ -2548,11 +2844,11 @@ static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi) {
     merced_raise_external(s->cpu, (uint8_t)rte);
 }
 
-/* SDV's 460GX memory map carries the memory-card/port selector in physical
- * address bits 43:32.  Aperture 0xe00 is distinct from the low firmware
- * mapping for data: EFI uses both at once, so folding tagged stores onto low
- * RAM corrupts its executable image and stacks. Back the top 64 MiB as a
- * complete private code-and-data aperture. */
+/* Older versions misread DIMM SPD data and let firmware report a RAM top
+ * of 0x00000e0080000000.  They backed its top 64 MiB separately so EFI could
+ * run there.  Keep that backing and its snapshot layout for existing saved
+ * states; this is not a hardware memory-card aperture.  Correctly sized
+ * cold boots place firmware and applications in installed low RAM. */
 static inline bool i2000_high_dram_addr(uint64_t addr, uint64_t *off) {
     if ((addr & UINT64_C(0x00000fff00000000)) != I2000_HIGH_DRAM_TAG)
         return false;
@@ -2563,16 +2859,16 @@ static inline bool i2000_high_dram_addr(uint64_t addr, uint64_t *off) {
     return true;
 }
 
-/* The 460GX aliases sign-extended SAL scratch addresses into its 2-GiB DRAM
- * aperture.  The production AMI SAL saves state at 0x7fffa030 and restores
- * it through ffffffffffffa030, so these addresses must meet in RAM. */
+/* SAL restores its top-of-RAM scratch words through sign-extended
+ * addresses.  Match the active bootstrap aperture, or the installed RAM
+ * boundary before the first save has selected one. */
 static inline uint64_t i2000_normalize_pa(Ia64I2000State *s, uint64_t addr) {
     addr &= MERCED_PHYS_MASK;
     if ((addr & UINT64_C(0x000fffff00000000)) ==
         UINT64_C(0x000fffff00000000)) {
         uint64_t base = s->flash_cmd_addr;
         if (!base)
-            base = UINT64_C(0x7fff0000);
+            base = (s->ram_size - UINT64_C(0x10000)) & ~UINT64_C(0xffff);
         addr = base | (addr & UINT64_C(0xffff));
     } else if (s->flash_cmd_addr &&
                ((addr & UINT64_C(0xffff)) == UINT64_C(0x6030) ||
@@ -2766,8 +3062,9 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
             }
             return (uint64_t)(s->pic_slave_base + 4); /* IRQ12 = slave IRQ4 */
         }
-        if (s->atapi_irq_pending) {
-            s->atapi_irq_pending = false;
+        if (s->atapi_legacy_irq_latched) {
+            s->atapi_legacy_irq_latched = false;
+            atapi_clear_irq(s);
             s->pic_master_isr |= 0x04; /* IRQ2 cascade */
             s->pic_slave_isr |= 0x80;  /* IRQ15 */
             if (atapi_debug_enabled()) {
@@ -3122,6 +3419,12 @@ uint8_t ia64_i2000_phys_read8(Ia64I2000State *s, uint64_t addr) {
 }
 void ia64_i2000_phys_write8(Ia64I2000State *s, uint64_t addr, uint8_t val) {
     bus_write(s, addr & MERCED_PHYS_MASK, val, 1);
+}
+uint32_t ia64_i2000_phys_read32(Ia64I2000State *s, uint64_t addr) {
+    return (uint32_t)bus_read(s, addr & MERCED_PHYS_MASK, 4);
+}
+void ia64_i2000_phys_write32(Ia64I2000State *s, uint64_t addr, uint32_t val) {
+    bus_write(s, addr & MERCED_PHYS_MASK, val, 4);
 }
 
 static bool i2000_bus_fill(void *ud, uint64_t addr, uint8_t val, uint64_t len) {
@@ -3507,7 +3810,8 @@ static bool i2000_screendump(void *ud, const char *path) {
  * real hardware the legacy IRQ1 thunk transfers 8042 scan codes into this
  * buffer.  GEMU deliberately suppresses interrupts while IVA is zero (the
  * native vector at 0x3000 is empty), so complete that transfer here for host
- * input while execution is in the 0x7fxxxxxx firmware presentation code.
+ * input while execution is in the firmware presentation code in the top
+ * 16 MiB of installed RAM.
  * Outside that narrowly identified environment the real PS/2 path remains
  * authoritative, avoiding duplicate keys for an OS with a live IRQ1 stack. */
 static uint8_t i2000_bios_scan(uint8_t ascii) {
@@ -3534,10 +3838,38 @@ static uint8_t i2000_bios_scan(uint8_t ascii) {
     }
 }
 
-static void i2000_efi_bios_key(Ia64I2000State *s, uint8_t ascii) {
-    if (!ascii || s->ram_size <= 0x43d || s->cpu->cr[2] != 0 ||
-        s->cpu->ip < UINT64_C(0x7f000000) ||
-        s->cpu->ip >= UINT64_C(0x80000000))
+/* INT16 scan code for a non-ASCII X11 keysym (arrows, editing and
+ * function keys); these enter the BIOS ring with ASCII 0. */
+static uint8_t i2000_bios_ext_scan(uint32_t keysym) {
+    switch (keysym) {
+    case 0xff52: return 0x48;   /* up */
+    case 0xff54: return 0x50;   /* down */
+    case 0xff51: return 0x4b;   /* left */
+    case 0xff53: return 0x4d;   /* right */
+    case 0xff50: return 0x47;   /* home */
+    case 0xff57: return 0x4f;   /* end */
+    case 0xff55: return 0x49;   /* page up */
+    case 0xff56: return 0x51;   /* page down */
+    case 0xff63: return 0x52;   /* insert */
+    case 0xffff: return 0x53;   /* delete */
+    case 0xffc8: return 0x85;   /* F11 */
+    case 0xffc9: return 0x86;   /* F12 */
+    default:
+        if (keysym >= 0xffbe && keysym <= 0xffc7)   /* F1-F10 */
+            return (uint8_t)(0x3b + (keysym - 0xffbe));
+        return 0;
+    }
+}
+
+/* Append one (ascii, scan) entry to the BIOS keyboard ring, while the
+ * firmware presentation environment is the one reading it. */
+static void i2000_efi_bios_ring_put(Ia64I2000State *s, uint8_t ascii,
+                                    uint8_t scan) {
+    const uint64_t firmware_window = UINT64_C(16) * 1024 * 1024;
+    if ((!ascii && !scan) || s->ram_size < firmware_window ||
+        s->cpu->cr[2] != 0 ||
+        s->cpu->ip < s->ram_size - firmware_window ||
+        s->cpu->ip >= s->ram_size)
         return;
     uint16_t head = (uint16_t)(s->ram[0x41a] | (s->ram[0x41b] << 8));
     uint16_t tail = (uint16_t)(s->ram[0x41c] | (s->ram[0x41d] << 8));
@@ -3548,9 +3880,19 @@ static void i2000_efi_bios_key(Ia64I2000State *s, uint8_t ascii) {
     if (next >= 0x3e) next = 0x1e;
     if (next == head) return; /* BIOS ring full */
     s->ram[0x400 + tail] = ascii;
-    s->ram[0x401 + tail] = i2000_bios_scan(ascii);
+    s->ram[0x401 + tail] = scan;
     s->ram[0x41c] = (uint8_t)next;
     s->ram[0x41d] = (uint8_t)(next >> 8);
+}
+
+static void i2000_efi_bios_key(Ia64I2000State *s, uint8_t ascii) {
+    if (ascii)
+        i2000_efi_bios_ring_put(s, ascii, i2000_bios_scan(ascii));
+}
+
+/* Non-ASCII keys (arrows, F-keys...) for the same environment. */
+static void i2000_efi_bios_ext_key(Ia64I2000State *s, uint32_t keysym) {
+    i2000_efi_bios_ring_put(s, 0, i2000_bios_ext_scan(keysym));
 }
 
 /* ── Drives ────────────────────────────────────────────────────────────────
@@ -3641,7 +3983,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * than hand-listing every scalar field, and it stays correct automatically
  * as fields get added. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 24u /* v24 adds the CPU's in-service vectors */
+#define I2000_SNAPSHOT_VERSION 27u /* v27 adds ATA control/interrupt output state */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -3812,9 +4154,17 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         /* v22 ended in bool fields and sizeof(struct) included tail padding
          * to the structure's 8-byte alignment. */
         state_size = (offsetof(Ia64I2000State, pic_master_read_isr) + 7u) & ~7u;
+    else if (version <= 24u)
+        state_size = offsetof(Ia64I2000State, acpi_pm);
+    else if (version == 25u)
+        state_size = offsetof(Ia64I2000State, uhci_regs);
+    else if (version == 26u)
+        state_size = offsetof(Ia64I2000State, atapi_device_control);
     else
         state_size = sizeof(*loaded);
     ok &= fread(loaded, state_size, 1, f) == 1;
+    if (version < 26u)
+        uhci_reset(loaded);
     if (ok) {
         char nvram_path[sizeof(s->nvram_path)];
         snprintf(nvram_path, sizeof(nvram_path), "%s", s->nvram_path);
@@ -3863,6 +4213,13 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
             s->atapi_status_pending = false;
             s->atapi_ready_irq = false;
         }
+        if (version < 27u) {
+            s->atapi_device_control = 0;
+            s->atapi_irq_asserted = false;
+            s->atapi_legacy_irq_latched = false;
+            /* The only 512-byte response in the previous model is A1. */
+            s->atapi_packet_command = s->atapi_data_len != 512;
+        }
         if (version < 5u) {
             rage128_init(&s->rage128, configured_rage128,
                          RAGE128_FB_BASE, RAGE128_IO_BASE,
@@ -3903,7 +4260,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
          * 0x58/0x50. This SDV's AtaPim waits for the ATAPI form without
          * DSC (0x48/0x40), so normalize those states when replaying them. */
         s->atapi_status &= ~0x10u;
-        if (s->atapi_data_len == 512 && s->atapi_data_pos == 0 &&
+        if (version < 27u && s->atapi_data_len == 512 && s->atapi_data_pos == 0 &&
             (s->atapi_status & 0x08)) {
             s->atapi_count = 1;
             s->atapi_lba_low = 1;
@@ -3942,10 +4299,10 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
          * Re-latch only that otherwise ownerless DRQ state; an acknowledged
          * interrupt remains represented by pic_slave_isr bit 7 and is not
          * duplicated. */
-        if ((s->atapi_status & 0x08) &&
+        if (version < 27u && (s->atapi_status & 0x08) &&
             s->atapi_data_pos < s->atapi_phase_end &&
             !s->atapi_irq_pending && !(s->pic_slave_isr & 0x80)) {
-            s->atapi_irq_pending = true;
+            atapi_latch_irq(s);
             s->atapi_irq_ready_ninsts = s->cpu->ninsts;
         }
         /* PIT deadlines describe host-time progression and must never be
@@ -4081,7 +4438,7 @@ static bool i2000_mon_read(void *ud, uint64_t addr, uint8_t *val) {
     return false;           /* sparse I/O ports, SAC registers, unmapped */
 }
 
-/* Writes RAM (low DRAM, the high-DRAM aperture and chipset scratch) only. */
+/* Writes RAM, legacy high-memory snapshot backing and chipset scratch. */
 static bool i2000_mon_write(void *ud, uint64_t addr, uint8_t val) {
     Ia64I2000State *s = ud;
     bool region6 = (addr >> 60) == 0xC;
@@ -4163,6 +4520,8 @@ static void i2000_type_key(Ia64I2000State *s, uint32_t keysym) {
             s->uart_rx_tail = next;
         }
         i2000_efi_bios_key(s, (uint8_t)keysym);
+    } else {
+        i2000_efi_bios_ext_key(s, keysym);
     }
     ps2_keyboard_tap(&s->ps2_keyboard, keysym);
 }
@@ -4429,6 +4788,8 @@ static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
     else if (!strcmp(keyarg, "esc"))   special = 0x1b;
     if (special) {
         ps2_keyboard_tap(&s->ps2_keyboard, special);
+        if (special > 0x7f)
+            i2000_efi_bios_ext_key(s, special);
         /* EFI's built-in shell uses the polled serial console in
          * this firmware revision (cr.iva remains zero, so it does
          * not consume PS/2 IRQ1 scan codes).  Real display ASCII
@@ -4535,15 +4896,62 @@ static GemuMonCmd i2000_cmd_atapistate(GemuMonitor *mon, const char *args,
     Ia64I2000State *s = ud;
     (void)args;
     gemu_monitor_printf(mon, "atapi: status=%#04x error=%#04x count=%#04x "
-           "device=%#04x irq_pending=%u irq_ready=%" PRIu64 " status_pending=%u "
+           "device=%#04x control=%#04x irq_pending=%u irq_asserted=%u "
+           "irq_ready=%" PRIu64 " status_pending=%u "
            "status_ready=%" PRIu64 " ready_status=%#04x ready_irq=%u "
            "data=%zu/%zu phase_end=%zu ninsts=%" PRIu64 "\n",
            s->atapi_status, s->atapi_error, s->atapi_count,
-           s->atapi_device, s->atapi_irq_pending,
+           s->atapi_device, s->atapi_device_control,
+           s->atapi_irq_pending, s->atapi_irq_asserted,
            s->atapi_irq_ready_ninsts, s->atapi_status_pending,
            s->atapi_status_ready_ninsts, s->atapi_ready_status,
            s->atapi_ready_irq, s->atapi_data_pos, s->atapi_data_len,
            s->atapi_phase_end, s->cpu->ninsts);
+    return GEMU_MON_NONE;
+}
+
+
+static GemuMonCmd i2000_cmd_ntsym(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    uint64_t va;
+    if (sscanf(args, "%" SCNx64, &va) != 1) {
+        gemu_monitor_printf(mon, "usage: ntsym <hex va>\n");
+        return GEMU_MON_NONE;
+    }
+    merced_nt_identify(s->cpu, va);
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd i2000_cmd_vgareg(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    (void)args;
+    gemu_monitor_printf(mon, "vga: misc_output=%02x text_mode=%d mode_set=%d\n",
+                        s->vga.misc_output, vga_ibm_is_text_mode(&s->vga),
+                        vga_ibm_mode_set(&s->vga));
+    gemu_monitor_printf(mon, "seq[0-7]:");
+    for (int i = 0; i < 8; i++) gemu_monitor_printf(mon, " %02x", s->vga.seq[i]);
+    gemu_monitor_printf(mon, "\ngc[0-15]:");
+    for (int i = 0; i < 16; i++) gemu_monitor_printf(mon, " %02x", s->vga.gc[i]);
+    gemu_monitor_printf(mon, "\ncrtc[0-31]:");
+    for (int i = 0; i < 32; i++) gemu_monitor_printf(mon, " %02x", s->vga.crtc[i]);
+    gemu_monitor_printf(mon, "\nattr[0-31]:");
+    for (int i = 0; i < 32; i++) gemu_monitor_printf(mon, " %02x", s->vga.attr[i]);
+    gemu_monitor_printf(mon, "\n");
+    return GEMU_MON_NONE;
+}
+
+static GemuMonCmd i2000_cmd_vgapeek(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    unsigned plane, off, count;
+    if (sscanf(args, "%u %x %u", &plane, &off, &count) == 3 && plane < 4 &&
+        count <= 256 && off + count <= 0x10000) {
+        gemu_monitor_printf(mon, "vgapeek plane=%u off=0x%x:", plane, off);
+        for (unsigned i = 0; i < count; i++)
+            gemu_monitor_printf(mon, " %02x", s->vga.vram[plane][off + i]);
+        gemu_monitor_printf(mon, "\n");
+    } else {
+        gemu_monitor_printf(mon, "usage: vgapeek <plane 0-3> <hex offset> <count>\n");
+    }
     return GEMU_MON_NONE;
 }
 
@@ -4565,6 +4973,9 @@ static void i2000_monitor_setup(Ia64I2000State *s) {
     gemu_monitor_bind(mon, "vhptstats",  i2000_cmd_vhptstats, s);
     gemu_monitor_bind(mon, "faultstats", i2000_cmd_faultstats, s);
     gemu_monitor_bind(mon, "atapistate", i2000_cmd_atapistate, s);
+    gemu_monitor_bind(mon, "vgareg",     i2000_cmd_vgareg, s);
+    gemu_monitor_bind(mon, "ntsym",      i2000_cmd_ntsym, s);
+    gemu_monitor_bind(mon, "vgapeek",    i2000_cmd_vgapeek, s);
     gemu_monitor_set_memory(mon, &(GemuMonMemory){
         .read = i2000_mon_read, .write = i2000_mon_write, .ud = s,
         .addr_bits = 64, .big_endian = false });
@@ -4572,7 +4983,7 @@ static void i2000_monitor_setup(Ia64I2000State *s) {
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
 
-/* Encode one DIMM row's Serial Presence Detect content for `bytes` of
+/* Encode one DIMM's Serial Presence Detect content for `bytes` of
  * capacity (must be a power of two) per the Intel/JEDEC "PC SDRAM Serial
  * Presence Detect" spec (JESD21-C sec. 4.1.2.5) that SSDM 248704-001
  * sec. 5.5.1 cites. Only the fields firmware's memory-sizing path actually
@@ -4581,21 +4992,21 @@ static void i2000_monitor_setup(Ia64I2000State *s) {
  * at conservative, spec-legal defaults since nothing here validates DIMM
  * timing against real electrical constraints anyway. Size formula used:
  * bytes = 2^(rows+cols) * (width_bits/8) * banks_per_device * phys_banks.
- * PC100/PC133 SDRAM devices have four internal banks; advertising one made
- * the SDV firmware derive a nonsensical top-of-memory value whose upper
- * half contained SPD byte 16 (0x0e), eventually producing addresses such as
- * 0x00000e007ffff000.  Keep one physical rank and a 64-bit module width, so
- * rows+cols = log2(bytes) - 5. */
+ * With one physical rank and a 64-bit module width, two internal banks
+ * give rows+cols = log2(bytes) - 4; four banks give log2(bytes) - 5.
+ * Each EEPROM describes one of the four matched DIMMs in a memory row. */
 static void spd_encode(uint8_t out[256], uint64_t bytes) {
     memset(out, 0, 256);
     unsigned total_bits = 0;
     for (uint64_t b = bytes; b > 1; b >>= 1)
         total_bits++;
-    unsigned addr_bits = total_bits - 5;
-    /* Period SDRAM DIMMs normally use 12-13 row bits and 9-11 column bits.
-     * Bias the split toward rows instead of generating impossible 14-column
-     * devices for large modules. */
-    unsigned rows = addr_bits > 10 ? 13 : (addr_bits + 1) / 2;
+    unsigned banks = bytes < (UINT64_C(64) << 20) ? 2 : 4;
+    unsigned addr_bits = total_bits - (banks == 2 ? 4 : 5);
+    /* Match the SDRAM device organizations supported by the 460GX:
+     * 16/32 MiB modules use 11 row bits and two banks, 64/128 MiB use
+     * 12 row bits and four banks, and 256 MiB uses 13 row bits. */
+    unsigned rows = bytes >= (UINT64_C(256) << 20) ? 13 :
+                    bytes >= (UINT64_C(64) << 20) ? 12 : 11;
     unsigned cols = addr_bits - rows;
     out[0]  = 128;   /* bytes used by module manufacturer */
     out[1]  = 8;     /* total SPD EEPROM size = 2^8 = 256 bytes */
@@ -4612,7 +5023,7 @@ static void spd_encode(uint8_t out[256], uint64_t bytes) {
     out[12] = 0x82;  /* refresh: normal rate, self-refresh supported */
     out[13] = 8;     /* primary SDRAM width (bits per chip) */
     out[16] = 0x0E;  /* burst lengths supported: 2, 4, 8 */
-    out[17] = 4;     /* internal banks per SDRAM device */
+    out[17] = (uint8_t)banks; /* internal banks per SDRAM device */
     out[18] = 0x06;  /* CAS latencies supported: CL2, CL3 */
     out[62] = 0x11;  /* SPD revision 1.1 */
     unsigned sum = 0;
@@ -4621,28 +5032,47 @@ static void spd_encode(uint8_t out[256], uint64_t bytes) {
     out[63] = (uint8_t)sum;  /* checksum over bytes 0-62 */
 }
 
-/* Populate simulated DIMM SPD content matching the actually-configured
- * ram_size, so firmware's real memory-detection path (SSDM sec. 5.5.1)
- * reports the true size instead of assuming a fixed maximum.  The i2000's
- * eight slots predate multi-gigabyte SDRAM DIMMs, so populate them with at
- * most 256 MiB each.  Representing 2 GiB as one fictional 2 GiB PC100 DIMM
- * overflowed fields in the firmware's SPD geometry calculation. */
+/* Two rows of four DIMMs can represent only sums of one or two supported
+ * row capacities.  Reject other sizes before allocating RAM rather than
+ * silently reporting a smaller population through SPD. */
+static bool i2000_ram_size_valid(uint64_t bytes) {
+    const uint64_t min_row = UINT64_C(64) << 20;
+    const uint64_t max_row = UINT64_C(1024) << 20;
+    if (bytes < min_row || bytes > I2000_RAM_MAX || bytes % min_row)
+        return false;
+    for (uint64_t row = min_row; row <= max_row; row <<= 1) {
+        if (bytes == row)
+            return true;
+        if (bytes > row) {
+            uint64_t other = bytes - row;
+            if (other >= min_row && other <= max_row &&
+                !(other & (other - 1)))
+                return true;
+        }
+    }
+    return false;
+}
+
+/* A 460GX memory row requires four identical DIMMs.  Populate the i2000's
+ * eight sockets in matched groups, with at most 256 MiB per module. */
 static void spd_init(Ia64I2000State *s) {
     memset(s->spd_present, 0, sizeof(s->spd_present));
     memset(s->spd, 0, sizeof(s->spd));
     unsigned slot = 0;
     uint64_t remaining = s->ram_size;
     while (remaining && slot < I2000_SPD_SLOTS) {
-        uint64_t chunk = remaining > UINT64_C(256) * 1024 * 1024
-                       ? UINT64_C(256) * 1024 * 1024 : remaining;
+        uint64_t chunk = remaining / I2000_DIMMS_PER_ROW;
+        if (chunk > UINT64_C(256) * 1024 * 1024)
+            chunk = UINT64_C(256) * 1024 * 1024;
         /* SPD geometry describes powers of two.  Use the largest module
          * that fits; ordinary supported -m sizes divide exactly. */
         while (chunk & (chunk - 1))
             chunk &= chunk - 1;
-        spd_encode(s->spd[slot], chunk);
-        s->spd_present[slot] = true;
-        remaining -= chunk;
-        slot++;
+        for (unsigned i = 0; i < I2000_DIMMS_PER_ROW; i++, slot++) {
+            spd_encode(s->spd[slot], chunk);
+            s->spd_present[slot] = true;
+        }
+        remaining -= chunk * I2000_DIMMS_PER_ROW;
     }
 }
 
@@ -4665,6 +5095,9 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     memset(s->ifb_smbus_cfg, 0, sizeof(s->ifb_smbus_cfg));
     memset(s->cmd649_cfg, 0, sizeof(s->cmd649_cfg));
     memset(s->acpi_io, 0, sizeof(s->acpi_io));
+    memset(s->acpi_pm, 0, sizeof(s->acpi_pm));
+    s->apm_control = s->apm_status = 0;
+    uhci_reset(s);
     s->uart_rx_head = s->uart_rx_tail = 0;
     memset(s->cmos, 0, sizeof(s->cmos));
     s->cmos_index = 0;
@@ -4685,9 +5118,12 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
      * Media presence affects SCSI packet results, not ATA device presence. */
     s->atapi_status = 0x40;
     s->atapi_packet_pos = 0;
+    s->atapi_device_control = 0;
+    s->atapi_packet_command = false;
+    s->atapi_legacy_irq_latched = false;
     s->atapi_byte_limit = 65536u;
     s->atapi_phase_end = 0;
-    s->atapi_irq_pending = false;
+    atapi_clear_irq(s);
     s->atapi_status_pending = false;
     s->atapi_ready_irq = false;
     free(s->atapi_data);
@@ -4730,6 +5166,7 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->ifb_usb_cfg[0x06] = 0x80; s->ifb_usb_cfg[0x07] = 0x02;
     s->ifb_usb_cfg[0x09] = 0x00; s->ifb_usb_cfg[0x0A] = 0x03;
     s->ifb_usb_cfg[0x0B] = 0x0C; s->ifb_usb_cfg[0x0E] = 0x00;
+    s->ifb_usb_cfg[0x20] = 0x01;                   /* 32-byte I/O BAR */
     s->ifb_usb_cfg[0x3D] = 0x04; s->ifb_usb_cfg[0x60] = 0x10;
 
     s->ifb_smbus_cfg[0x00] = 0x86; s->ifb_smbus_cfg[0x01] = 0x80;
@@ -4737,10 +5174,10 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->ifb_smbus_cfg[0x06] = 0x80; s->ifb_smbus_cfg[0x07] = 0x02;
     s->ifb_smbus_cfg[0x09] = 0x00; s->ifb_smbus_cfg[0x0A] = 0x05;
     s->ifb_smbus_cfg[0x0B] = 0x0C; s->ifb_smbus_cfg[0x0E] = 0x00;
+    s->ifb_smbus_cfg[0x20] = 0x01;                 /* 16-byte I/O BAR */
     s->ifb_smbus_cfg[0x3D] = 0x02;
 
-    /* Integrated CMD Technology PCI-649 Ultra ATA/100 controller at the
-     * i2000 IFB's fixed 00:03.1 function. */
+    /* The IDE model advertises a CMD Technology PCI-649 at 00:03.1. */
     s->cmd649_cfg[0x00] = 0x95; s->cmd649_cfg[0x01] = 0x10; /* 1095 */
     s->cmd649_cfg[0x02] = 0x49; s->cmd649_cfg[0x03] = 0x06; /* 0649 */
     s->cmd649_cfg[0x08] = 0x02;                    /* revision */
@@ -4748,43 +5185,27 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
     s->cmd649_cfg[0x0A] = 0x01;                    /* IDE subclass */
     s->cmd649_cfg[0x0B] = 0x01;                    /* mass storage */
     s->cmd649_cfg[0x0E] = 0x00;                    /* normal header */
+    for (unsigned bar = 0; bar < 5; bar++)
+        s->cmd649_cfg[0x10 + bar * 4] = 1;         /* I/O BAR, unassigned */
     s->cmd649_cfg[0x3C] = 15;                      /* secondary IDE IRQ15 */
     s->cmd649_cfg[0x3D] = 0x01;                    /* INTA */
-    /* Device numbers and roles per SSDM 248704-001 Table 2-1 (Device
-     * Mapping on Bus CBN): 00h/01h = SAC (82461GX), 04h = SDC (82462GX,
-     * not GXB as an earlier version of this table assumed - GXB has no
-     * fixed device number, it lives on an Expander bus per WXB/PXB/GXB
-     * board population), 05h/06h = Memory Card A/B (handled via
-     * memcard_cfg). Real vendor/device IDs aren't published in the
-     * datasheet or SSDM; these placeholders just need to be internally
-     * consistent and non-zero (0xFFFF reads as "no device"). */
-    static const struct { uint8_t dev; uint16_t did; } ids[] = {
-        { 0, 0x84E0 }, { 1, 0x84E0 },   /* SAC */
-        { 4, 0x84E2 },                  /* SDC */
-        { 0x10, 0x84E4 }, { 0x11, 0x84E4 }, { 0x12, 0x84E4 }, { 0x13, 0x84E4 },
-        { 0x14, 0x84E4 }, { 0x15, 0x84E4 }, { 0x16, 0x84E4 }, { 0x17, 0x84E4 },
-                                         /* Expander 0-3 buses a/b */
-    };
-    for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
-        uint8_t *c = s->chipset_cfg[ids[i].dev][0];
-        c[0] = 0x86; c[1] = 0x80;
-        c[2] = (uint8_t)ids[i].did; c[3] = (uint8_t)(ids[i].did >> 8);
-        c[0x0B] = 0x06;
+    /* CNTRL's primary/secondary enable bits describe the two channels
+     * exposed at the legacy taskfile ports. CmdIde checks these bits
+     * before creating channel devices; zero hid the boot CD entirely. */
+    s->cmd649_cfg[0x51] = 0x0c;
+    /* Device mapping follows 460GX SSDM Table 2-1; bridge population is
+     * the i2000 layout in the HP owner's guide, section 2.3. Seed the
+     * same physical identities and straps returned by configuration reads.
+     * F16NUM counts links, not DEVNPRES bits: the old value 32 made
+     * firmware wrap device numbers and overwrite the real root buses. */
+    for (unsigned dev = 0; dev < 32; dev++) {
+        if (!chipset_device_present(dev)) continue;
+        for (unsigned fun = 0; fun < 8; fun++)
+            for (unsigned reg = 0; reg < 256; reg++)
+                s->chipset_cfg[dev][fun][reg] = chipset_cfg_read8(s, dev, fun, reg);
     }
-    /* SAC dev0/fn0 byte 60h: a capability-bit count that gates a firmware
-     * loop walking the 32-bit feature mask at reg 70h and registering a
-     * handler for each clear bit. Left at zero (the memset default), that
-     * loop never runs even once, so a later, unconditional dispatch call
-     * (hardcoded to request feature type 6) finds an empty handler list,
-     * falls through to a NULL-derived default pointer, and eventually
-     * crashes dereferencing stale low memory. Real hardware's value isn't
-     * published anywhere we have; 20h matches the mask's full width so the
-     * loop at least examines every bit reg 70h can report. */
-    s->chipset_cfg[0][0][0x60] = 0x20;
-    /* Memory Card A/B (dev 5/6) live in memcard_cfg, not chipset_cfg - give
-     * their function 0 a real PCI identity too, or firmware sees an all-zero
-     * vendor ID at CBN:05.0/06.0 and concludes the card is absent before it
-     * ever reads the processor descriptor at CBN:05.2 below. */
+    /* Memory Card A/B (dev 5/6) configuration headers.  DIMM presence is
+     * determined separately by the selected function-2 SPD response. */
     static const struct { uint8_t card; uint16_t did; } mcids[] = {
         { 0, 0x84E3 }, { 1, 0x84E3 },   /* Memory Card A/B */
     };
@@ -4794,24 +5215,6 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
         c[2] = (uint8_t)mcids[i].did; c[3] = (uint8_t)(mcids[i].did >> 8);
         c[0x0B] = 0x06;
     }
-
-    /* The SDV firmware enumerates processors through the 460GX system-bus
-     * configuration mechanism.  Its address format is PCI-like: processor
-     * zero is CBN:05.2, and byte 02h contains the presence/type code 4.
-     * Bytes 03h-05h form the family/model/revision signature used to group
-     * compatible processors.  Advertise the one Merced CPU implemented by
-     * this machine; leaving this function all zero makes SAL conclude that
-     * no processor exists and deliberately enter its timer-calibrated park
-     * loop at FFFE2020.
-     *
-     * This must stay consistent with cpuid[3]'s family/model/revision in
-     * merced_reset() (cpu/ia64/merced.c) - firmware cross-checks the two, and a
-     * mismatch also lands in the FFFE2020 park loop as if no (recognized)
-     * processor were present. */
-    s->memcard_cfg[0][2][0x02] = 4;  /* processor present */
-    s->memcard_cfg[0][2][0x03] = 7;  /* Itanium family */
-    s->memcard_cfg[0][2][0x04] = 0;  /* Merced model */
-    s->memcard_cfg[0][2][0x05] = 0;  /* SDV prototype revision; see run loop */
 
     s->smb_hststs = s->smb_hstcnt = s->smb_hstcmd = s->smb_hstadd = 0;
     s->smb_hstdat0 = s->smb_hstdat1 = 0;
@@ -4823,6 +5226,12 @@ static void chipset_cfg_reset(Ia64I2000State *s) {
 }
 
 Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
+    if (!i2000_ram_size_valid(cfg->ram_size)) {
+        fprintf(stderr, "gemu: i2000: unsupported RAM size %" PRIu64
+                " bytes; use one or two rows of 64, 128, 256, 512 or"
+                " 1024 MiB (up to 2 GiB total)\n", cfg->ram_size);
+        return NULL;
+    }
     Ia64I2000State *s = calloc(1, sizeof(*s));
     if (!s)
         return NULL;
@@ -5097,19 +5506,15 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
         s->mouse_irq_pending = true;
         merced_raise_external(s->cpu, 0);
     }
-    /* The CMD-649 secondary channel is legacy IRQ15 (slave IRQ7). AtaPim
-     * waits for this interrupt after IDENTIFY/PACKET rather than polling
-     * DRQ continuously. Keep the device latch asserted until the firmware
-     * performs the shared legacy acknowledge read. */
-    /* CMD649 is a PCI device.  Its INTA reaches the platform's ExtINT
-     * bridge even while the firmware has the legacy slave-PIC mask set;
-     * AtaPim installs the IRQ15 handler before it submits the command. */
+    /* Secondary IDE uses GSI15. Windows installs a fixed SAPIC vector;
+     * firmware leaves that entry masked and uses its legacy ExtINT thunk.
+     * Device-control nIEN masks the output without discarding completion. */
     if (s->atapi_status_pending &&
         s->cpu->ninsts >= s->atapi_status_ready_ninsts) {
         s->atapi_status_pending = false;
         s->atapi_status = s->atapi_ready_status;
         if (s->atapi_ready_irq) {
-            s->atapi_irq_pending = true;
+            atapi_latch_irq(s);
             s->atapi_irq_ready_ninsts = s->cpu->ninsts;
         }
         if (atapi_debug_enabled())
@@ -5117,9 +5522,27 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
                     "reason=%#04x ninsts=%" PRIu64 "\n",
                     s->atapi_status, s->atapi_count, s->cpu->ninsts);
     }
-    if (s->atapi_irq_pending &&
-        s->cpu->ninsts >= s->atapi_irq_ready_ninsts) {
+    /* A PIC edge survives a device Status read until the legacy INTA
+     * replacement cycle acknowledges it. Keep that ownership separately
+     * from the device's INTRQ latch. */
+    if (s->atapi_legacy_irq_latched)
         merced_raise_external(s->cpu, 0);
+    if (s->atapi_irq_pending &&
+        !(s->atapi_device_control & 6) && !(s->atapi_device & 0x10) &&
+        s->cpu->ninsts >= s->atapi_irq_ready_ninsts) {
+        uint64_t rte = s->iosapic_rte[15];
+        if (!(rte & IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) <= 1) {
+            if (!s->atapi_irq_asserted) {
+                iosapic_raise_gsi(s, 15);
+                s->atapi_irq_asserted = true;
+            }
+        } else if (rte == IOSAPIC_RTE_MASK ||
+                   (!(rte & IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) == 7)) {
+            /* Preserve the firmware's reset-RTE ExtINT path. Masking a
+             * configured OS vector must not fall back to a legacy IRQ. */
+            s->atapi_legacy_irq_latched = true;
+            merced_raise_external(s->cpu, 0);
+        }
     }
 }
 
@@ -5249,6 +5672,7 @@ static bool i2000_after_step(Ia64I2000State *s, MercedStatus st) {
         if (I2000_FW_SHADOW_BASE + I2000_FLASH_SIZE <= s->ram_size)
             memcpy(s->ram + I2000_FW_SHADOW_BASE, s->flash,
                    I2000_FLASH_SIZE);
+        merced_set_cpu_revision(s->cpu, 0);
         merced_reset(s->cpu);
         s->halted = false;
         s->reset_requested = false;
@@ -5272,25 +5696,38 @@ static void i2000_run_slice(Ia64I2000State *s) {
         return;
     bool check_exec = gemu_monitor_has_exec_breakpoints(s->monitor);
     bool check_mem = gemu_monitor_has_mem_breakpoints(s->monitor);
+    const uint64_t efi_runtime_size = UINT64_C(0x01000000);
+    const uint64_t efi_app_base = UINT64_C(0x04000000);
+    bool efi_window_valid = s->fw_shadow_enabled &&
+                           s->ram_size > efi_app_base + efi_runtime_size;
+    uint64_t efi_app_end = efi_window_valid
+                        ? s->ram_size - efi_runtime_size : 0;
     for (int i = 0; i < INSTR_PER_FRAME; ) {
         /* Ordinary execution: one interrupt-poll quantum per call into the
          * CPU's fast path.  It stops after a slot that requests a reset
          * (merced_request_exit()) and, while CPUID still reports revision 0,
-         * when execution reaches the high-DRAM aperture, so everything
+         * when execution reaches a loaded EFI application, so everything
          * below happens at the same instruction as in the slot-by-slot
          * loop that follows.  That loop still runs whenever a breakpoint or
          * watchpoint is set, and finishes a quantum the fast path left. */
         bool rev0 = s->cpu->cpu_revision == 0;
+        bool efi_handoff = rev0 &&
+            ((efi_window_valid && s->cpu->ip >= efi_app_base &&
+              s->cpu->ip < efi_app_end) ||
+             (s->cpu->ip & UINT64_C(0x00000fff00000000)) ==
+                 I2000_HIGH_DRAM_TAG);
         if (!check_exec && !check_mem &&
             (i & (IRQ_POLL_QUANTUM - 1)) == 0 &&
             i + IRQ_POLL_QUANTUM <= INSTR_PER_FRAME &&
-            !(rev0 && (s->cpu->ip & UINT64_C(0x00000fff00000000)) ==
-                          I2000_HIGH_DRAM_TAG)) {
+            !efi_handoff) {
             i2000_poll_interrupts(s);
             unsigned n = 0;
-            MercedStatus st = merced_run_fast(
+            MercedStatus st = merced_run_fast_range(
                 s->cpu, IRQ_POLL_QUANTUM, &n,
-                rev0 ? UINT64_C(0x00000fff00000000) : 0, I2000_HIGH_DRAM_TAG);
+                rev0 ? UINT64_C(0x00000fff00000000) : 0,
+                I2000_HIGH_DRAM_TAG,
+                rev0 && efi_window_valid ? efi_app_base : 0,
+                rev0 && efi_window_valid ? efi_app_end : 0);
             i += (int)n;
             if (!i2000_after_step(s, st))
                 return;
@@ -5306,17 +5743,14 @@ static void i2000_run_slice(Ia64I2000State *s) {
          * the modeled hardware while bounding delivery skew to 15 slots. */
         if ((i & (IRQ_POLL_QUANTUM - 1)) == 0)
             i2000_poll_interrupts(s);
-        /* The 0.99 SDV firmware only completes SAL initialization when its
-         * prototype processor descriptor and CPUID both report revision 0.
-         * Windows/IA-64, however, deliberately rejects pre-B3 silicon.  EFI
-         * applications are loaded into the 460GX tagged high-DRAM aperture;
-         * once execution enters one, processor enumeration is complete and
-         * it is safe to expose the production Merced C0 revision (CPUID
-         * 0007000604).  This keeps the firmware's early cross-check coherent
-         * without presenting obsolete prototype silicon to the OS loader. */
-        if (s->cpu->cpu_revision == 0 &&
-            (s->cpu->ip & UINT64_C(0x00000fff00000000)) ==
-                I2000_HIGH_DRAM_TAG)
+        /* Revision 0 selects the supported PAL path during AMI startup,
+         * including calls from its runtime image in the top 16 MiB.
+         * Once execution enters an EFI application below that image, expose
+         * Merced C0 for Windows, which rejects pre-B3 silicon.  Older
+         * snapshots placed EFI applications in the synthetic high-DRAM
+         * aperture; keep their original transition as a compatibility
+         * fallback. */
+        if (efi_handoff)
             merced_set_cpu_revision(s->cpu, 6);
         MercedStatus st = merced_step(s->cpu);
         i++;
@@ -5336,6 +5770,7 @@ static void i2000_reset(Ia64I2000State *s) {
     uint8_t *i82559_option_rom = s->i82559.option_rom;
     size_t i82559_option_rom_size = s->i82559.option_rom_size;
     bool mouse_enabled = s->mouse_enabled;
+    merced_set_cpu_revision(s->cpu, 0);
     merced_reset(s->cpu);
     vga_ibm_reset(&s->vga);
     rage128_init(&s->rage128, rage128_enabled, RAGE128_FB_BASE,
@@ -5449,10 +5884,13 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                  i < sizeof(i2000_keyboard_keysyms) /
                      sizeof(i2000_keyboard_keysyms[0]); i++) {
                 uint32_t bit = GEMU_ACTION(i);
-                if (keys_changed & bit)
+                if (keys_changed & bit) {
                     ps2_keyboard_key(&s->ps2_keyboard,
                                      i2000_keyboard_keysyms[i],
                                      (keys_held & bit) != 0);
+                    if (keys_held & bit)
+                        i2000_efi_bios_ext_key(s, i2000_keyboard_keysyms[i]);
+                }
             }
             display_keys_held = keys_held;
             uint32_t cp;

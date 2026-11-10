@@ -18,16 +18,10 @@
  *  - Instructions execute sequentially; instruction-group parallelism is
  *    not modeled (a RAW hazard inside one group reads the NEW value here,
  *    old value on silicon - compilers never emit that, handcode rarely).
- *  - The stacked file is a 96-register circular buffer; there's no
- *    automatic background spill on physical-register-file overflow (real
- *    hardware would spill once >96 registers are outstanding across the
- *    active call chain - firmware that goes that deep between explicit
- *    flushes will read back corrupted frames, same as a real overflow the
- *    RSE never got a chance to service). flushrs/loadrs themselves DO
- *    perform real backing-store I/O (see rse_flush()/rse_load() in
- *    merced.c), but assume the ar.bspstore anchor established by firmware's
- *    last `mov ar.bspstore=r` sits at a fresh NaT-collection-group boundary,
- *    and don't model ar.rnat or per-slot NaT collection words at all.
+ *  - The RSE uses a larger software register ring while enforcing mandatory
+ *    spills for the 96-register physical file. Returns and loadrs refill
+ *    clean frames from the backing store, including RNAT collection words;
+ *    asynchronous background spill/fill timing is not modeled.
  *  - Memory attributes (UC/WB) are ignored beyond stripping bit 63 in
  *    physical addressing mode.
  */
@@ -127,7 +121,8 @@ typedef struct Merced {
     /* RSE backing-store bookkeeping. bof_total mirrors bof (updated at the
      * same four sites: call, return, cover, rfi-restore) but never wraps, so
      * it's a stable register-units axis for translating to/from real
-     * addresses. rse_anchor_{addr,regs} record the (address, bof_total+sof)
+     * addresses. rse_anchor_{addr,regs} record the backing-store address and
+     * register position
      * pair captured the last time firmware executed `mov ar.bspstore=r`
      * (architecturally the only way an address<->register-count
      * correspondence gets established); rse_flushed_regs is that same axis's
@@ -284,8 +279,8 @@ typedef struct Merced {
     /* one-shot warnings for approximated ops */
     uint32_t warned;
 
-    /* cpuid[3] revision field (see merced_reset()) - defaults to 0
-     * (matches i2000's own firmware cross-check); machines that need a
+    /* cpuid[3] revision field (see merced_reset()) - defaults to 0 for
+     * i2000's early PAL bootstrap compatibility; machines that need a
      * different reported stepping call merced_set_cpu_revision()
      * instead of poking cpuid[3] directly, so it survives merced_reset()
      * (e.g. the monitor's "reset" command, or a machine's own reset
@@ -306,7 +301,7 @@ typedef struct Merced {
     uint64_t pal_io_block_addr;        /* PAL_PLATFORM_ADDR type 1 */
     bool     pal_mc_expected;          /* PAL_MC_EXPECTED latch */
 
-    /* Upper bound of the persistent region-7 KSEG physical alias. */
+    /* Retained for snapshot layout compatibility; no implicit OS mapping. */
     uint64_t region7_directmap_limit;
 
     /* Host-only decoded translation cache.  Kept opaque here so the cache
@@ -350,12 +345,20 @@ MercedStatus merced_run(Merced *m, unsigned max_slots, unsigned *executed);
  * (ip & stop_mask) == stop_value when stop_mask isn't 0. */
 MercedStatus merced_run_fast(Merced *m, unsigned max_slots, unsigned *executed,
                              uint64_t stop_mask, uint64_t stop_value);
+/* Also stop when the next IP enters [stop_lo, stop_hi).  Passing 0, 0
+ * disables the range, preserving merced_run_fast() behavior. */
+MercedStatus merced_run_fast_range(Merced *m, unsigned max_slots,
+                                   unsigned *executed, uint64_t stop_mask,
+                                   uint64_t stop_value, uint64_t stop_lo,
+                                   uint64_t stop_hi);
 void    merced_request_exit(Merced *m);
 
 /* IA-32 compatibility engine.  These hooks deliberately use the IA-64
  * translation machinery: IA-32 code and data references share the Merced
  * TR/TC/RR resources architecturally. */
 MercedStatus merced_ia32_step(Merced *m);
+/* Print (to stderr) which NT PE image and export a guest VA lies in. */
+void merced_nt_identify(Merced *m, uint64_t va);
 bool merced_ia32_read(Merced *m, uint64_t va, unsigned size,
                       bool ifetch, uint64_t *value);
 bool merced_ia32_write(Merced *m, uint64_t va, unsigned size,
