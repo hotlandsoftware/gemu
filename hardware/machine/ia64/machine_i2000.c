@@ -1633,6 +1633,20 @@ static bool vga_port(uint64_t port) {
            port == 0x3D4 || port == 0x3D5 || port == 0x3DA;
 }
 
+/* A 16/32-bit I/O access whose every byte is a VGA register port.  As on
+ * a PC bus, it is that many byte accesses at consecutive ports, low byte
+ * first: Windows' boot video driver programs index/data pairs with single
+ * 16-bit OUTs (e.g. 0x0506 to 3CEh = GC[5]=6) when it switches to mode 12h
+ * for the bugcheck screen. */
+static bool vga_port_span(uint64_t port, unsigned size) {
+    if (size != 2 && size != 4)
+        return false;
+    for (unsigned i = 0; i < size; i++)
+        if (!vga_port(port + i))
+            return false;
+    return true;
+}
+
 static uint8_t cmos_bcd(unsigned v) {
     return (uint8_t)(((v / 10) << 4) | (v % 10));
 }
@@ -1906,6 +1920,12 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     }
     if (size == 1 && vga_port(port))
         return vga_ibm_io_read(&s->vga, (uint16_t)port);
+    if (vga_port_span(port, size)) {
+        uint64_t v = 0;
+        for (unsigned i = 0; i < size; i++)
+            v |= (uint64_t)vga_ibm_io_read(&s->vga, (uint16_t)(port + i)) << (8 * i);
+        return v;
+    }
     {
         uint64_t off;
         if (smbus_port_offset(s, port, &off))
@@ -2283,6 +2303,11 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
     }
     if (size == 1 && vga_port(port)) {
         vga_ibm_io_write(&s->vga, (uint16_t)port, (uint8_t)val);
+        return;
+    }
+    if (vga_port_span(port, size)) {
+        for (unsigned i = 0; i < size; i++)
+            vga_ibm_io_write(&s->vga, (uint16_t)(port + i), (uint8_t)(val >> (8 * i)));
         return;
     }
     {
@@ -2861,7 +2886,19 @@ static inline bool i2000_high_dram_addr(uint64_t addr, uint64_t *off) {
 
 /* SAL restores its top-of-RAM scratch words through sign-extended
  * addresses.  Match the active bootstrap aperture, or the installed RAM
- * boundary before the first save has selected one. */
+ * boundary before the first save has selected one.
+ *
+ * The plain-address form (...6030/...a030 at the top of a power-of-two
+ * aperture) only exists while the firmware runs its bootstrap phases, which
+ * end when it first enters a loaded EFI application (CPUID revision 0 -> 6,
+ * see the run loop; reset returns it to 0).  Afterwards those are ordinary
+ * RAM words: Windows Setup's TXTSETUP.SIF buffer landed on PA 0x7FA030
+ * (the top of the 8 MiB bootstrap aperture), its bytes there were diverted
+ * to the SAL scratch word, and Setup failed with a .SIF syntax error. */
+static inline bool i2000_sal_scratch_alias_active(const Ia64I2000State *s) {
+    return s->cpu->cpu_revision == 0;
+}
+
 static inline uint64_t i2000_normalize_pa(Ia64I2000State *s, uint64_t addr) {
     addr &= MERCED_PHYS_MASK;
     if ((addr & UINT64_C(0x000fffff00000000)) ==
@@ -2870,7 +2907,7 @@ static inline uint64_t i2000_normalize_pa(Ia64I2000State *s, uint64_t addr) {
         if (!base)
             base = (s->ram_size - UINT64_C(0x10000)) & ~UINT64_C(0xffff);
         addr = base | (addr & UINT64_C(0xffff));
-    } else if (s->flash_cmd_addr &&
+    } else if (s->flash_cmd_addr && i2000_sal_scratch_alias_active(s) &&
                ((addr & UINT64_C(0xffff)) == UINT64_C(0x6030) ||
                 (addr & UINT64_C(0xffff)) == UINT64_C(0xa030))) {
         uint64_t aperture_end = (addr & ~UINT64_C(0xffff)) + 0x10000;
@@ -3174,8 +3211,9 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
      * currently active aperture, then reloads them through sign-extended
      * addresses.  Remember the aperture selected by the real save rather
      * than assuming that it is always the final 2-GiB top. */
-    if (size == 8 && ((addr & UINT64_C(0xffff)) == UINT64_C(0x6030) ||
-                      (addr & UINT64_C(0xffff)) == UINT64_C(0xa030)) &&
+    if (size == 8 && i2000_sal_scratch_alias_active(s) &&
+        ((addr & UINT64_C(0xffff)) == UINT64_C(0x6030) ||
+         (addr & UINT64_C(0xffff)) == UINT64_C(0xa030)) &&
         addr < s->ram_size) {
         uint64_t aperture_end = (addr & ~UINT64_C(0xffff)) + 0x10000;
         if (aperture_end && !(aperture_end & (aperture_end - 1)))
@@ -4937,6 +4975,13 @@ static GemuMonCmd i2000_cmd_vgareg(GemuMonitor *mon, const char *args, void *ud)
     gemu_monitor_printf(mon, "\nattr[0-31]:");
     for (int i = 0; i < 32; i++) gemu_monitor_printf(mon, " %02x", s->vga.attr[i]);
     gemu_monitor_printf(mon, "\n");
+    gemu_monitor_printf(mon, "dac[0-15] (r,g,b):");
+    for (int i = 0; i < 16; i++)
+        gemu_monitor_printf(mon, " %02x%02x%02x", s->vga.dac[i][0],
+                            s->vga.dac[i][1], s->vga.dac[i][2]);
+    gemu_monitor_printf(mon, "\ndac write index=%u sub=%u mask=%02x\n",
+                        s->vga.dac_write_index, s->vga.dac_write_sub,
+                        s->vga.dac_mask);
     return GEMU_MON_NONE;
 }
 

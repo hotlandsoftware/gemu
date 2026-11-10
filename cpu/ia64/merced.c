@@ -823,6 +823,16 @@ static const MercedTlbEntry *tlb_search(const MercedTlbEntry *t, int n,
     return NULL;
 }
 
+/* The instruction TLB entry (TR first, then TC) translating va, if any. */
+static const MercedTlbEntry *itlb_entry(Merced *m, uint64_t va) {
+    uint32_t rid = (uint32_t)((m->rr[va >> 61] >> 8) & 0xFFFFFFull);
+    const MercedTlbEntry *e = tlb_search(m->itr, MERCED_N_ITR, rid, va,
+                                         &m->itr_hint);
+    if (!e)
+        e = tlb_search(m->itc, MERCED_N_TC, rid, va, &m->itc_hint);
+    return e;
+}
+
 /* Returns true and sets *pa on success; on failure delivers a fault (or
  * halts) and returns false with *st set. If force is true, always performs
  * the real region/TR/TC/VHPT lookup even when the corresponding psr.it/dt
@@ -2754,6 +2764,13 @@ static void do_ret(Merced *m, uint64_t target) {
     m->bof_total -= sol;
     m->cfm = new_cfm;
     m->ar[AR_EC] = (pfs >> 52) & 0x3F;
+    /* br.ret restores a LESS privileged level saved in PFS.ppl (the
+     * level br.call recorded), never a more privileged one.  This is what
+     * drops a system call back to user mode after epc promoted it. */
+    unsigned ppl = (unsigned)(pfs >> 62) & 3;
+    if (ppl > ((m->psr >> PSR_CPL_SHIFT) & 3))
+        m->psr = (m->psr & ~(UINT64_C(3) << PSR_CPL_SHIFT)) |
+                 ((uint64_t)ppl << PSR_CPL_SHIFT);
     /* Returning changes the stacked-register name mapping just as a call
      * does.  An ALAT association made in the callee must not accidentally
      * validate an ld.c in the caller that now has the same architectural
@@ -6161,7 +6178,30 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
         }
         case 0x0C: m->psr &= ~PSR_BN; return MERCED_OK;             /* bsw.0 */
         case 0x0D: m->psr |= PSR_BN; return MERCED_OK;              /* bsw.1 */
-        case 0x10: return MERCED_OK;                                /* epc */
+        case 0x10: {                                /* epc */
+            /* SDM Vol.3 "epc": PFS.ppl below the current level would let
+             * a following br.ret keep the promoted privilege (ar.pfs is
+             * user-writable), so that is an Illegal Operation fault. */
+            unsigned cpl = (unsigned)((m->psr >> PSR_CPL_SHIFT) & 3);
+            if (((m->ar[AR_PFS] >> 62) & 3) < cpl)
+                return deliver_fault(m, VEC_GENERAL, 0, 0, false);
+            unsigned new_cpl = cpl;
+            if (!(m->psr & PSR_IT)) {
+                new_cpl = 0;
+            } else {
+                /* Promote to the page's privilege level when the epc's
+                 * own page has execute/promote rights (TLB.ar = 7). */
+                const MercedTlbEntry *e = itlb_entry(m, m->ip);
+                if (e && ((e->pte >> PTE_AR_SHIFT) & 7) == 7) {
+                    unsigned pl = (unsigned)((e->pte >> PTE_PL_SHIFT) & 3);
+                    if (pl < cpl)
+                        new_cpl = pl;
+                }
+            }
+            m->psr = (m->psr & ~(UINT64_C(3) << PSR_CPL_SHIFT)) |
+                     ((uint64_t)new_cpl << PSR_CPL_SHIFT);
+            return MERCED_OK;
+        }
         case 0x20: {                                /* br.cond/br.ia b2 */
             if (!qp) return MERCED_OK;
             if (btype == 1) {

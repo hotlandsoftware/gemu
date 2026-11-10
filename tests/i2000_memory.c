@@ -1195,6 +1195,84 @@ static void check_predicate_transfer(unsigned form, unsigned rrb,
     merced_destroy(cpu);
 }
 
+/* epc promotes to the privilege level of its own page when that page has
+ * execute/promote rights (TLB.ar = 7), sets CPL 0 with instruction
+ * translation off, and faults when PFS.ppl is more privileged than CPL.
+ * br.ret then demotes to PFS.ppl, never promotes.  Windows' system-call
+ * gateway (E0000000FFA00020) depends on both; without them SMSS faulted
+ * reading the PCR and Setup stopped with SESSION5_INITIALIZATION_FAILED
+ * (Intel SDM Vol.3 epc, br.ret; Vol.2 4.1.1.6). */
+static void check_epc(unsigned scenario, bool fast) {
+    static const struct {
+        bool it; unsigned ar, pl, cpl, ppl, expect_cpl; bool fault;
+        unsigned ret_ppl, expect_ret_cpl;
+    } cases[] = {
+        {true,  7, 0, 3, 3, 0, false, 3, 3},  /* gateway: promote, return demotes */
+        {true,  7, 1, 3, 3, 1, false, 3, 3},  /* promote to the page's own PL */
+        {true,  3, 3, 3, 3, 3, false, 3, 3},  /* no promote rights: unchanged */
+        {true,  7, 0, 3, 0, 3, true,  0, 0},  /* PFS.ppl < CPL: illegal op */
+        {false, 3, 3, 3, 3, 0, false, 3, 3},  /* translation off: CPL 0 */
+        {true,  7, 0, 3, 3, 0, false, 0, 0},  /* br.ret never promotes... */
+        {true,  7, 2, 2, 2, 2, false, 3, 3},  /* ...but does demote */
+    };
+    const __uint128_t nop = UINT64_C(0x08000000);
+    const __uint128_t epc = UINT64_C(0x10) << 27;
+    const __uint128_t ret = (UINT64_C(0x21) << 27) | (4 << 6);   /* br.ret b0 */
+    TestPredicateFixture fixture = {.bundle = {
+        0x11 | (nop << 5) | (nop << 46) | (epc << 87),
+        0x11 | (nop << 5) | (nop << 46) | (ret << 87),
+    }};
+    MercedBus bus = {.ud = &fixture, .read = test_predicate_read,
+                     .fetch = test_predicate_read, .write = handoff_write};
+    Merced *cpu = merced_create(&bus);
+    if (!cpu) { failures++; return; }
+    const unsigned rid = 5;
+    cpu->ip = 0x1000;
+    cpu->cr[2] = 0x8000;                       /* IVA */
+    cpu->cr[72] = UINT64_C(1) << 16;           /* ITV masked */
+    cpu->rr[0] = ((uint64_t)rid << 8) | (13 << 2);
+    cpu->itr[0] = (MercedTlbEntry){
+        .va_start = 0, .va_end = 0x1fff, .pfn_base = 0, .rid = rid, .ps = 13,
+        .valid = 1, .itir = 13 << 2,
+        .pte = 1 | (UINT64_C(1) << 5) | ((uint64_t)cases[scenario].ar << 9) |
+               ((uint64_t)cases[scenario].pl << 7),
+    };
+    cpu->psr = (UINT64_C(1) << 13) | (UINT64_C(1) << 44) |
+               (cases[scenario].it ? UINT64_C(1) << 36 : 0) |
+               ((uint64_t)cases[scenario].cpl << 32);
+    cpu->ar[64] = (uint64_t)cases[scenario].ppl << 62;     /* ar.pfs */
+    cpu->br[0] = 0x3000;
+    bool ok = true;
+    for (unsigned i = 0; i < 3; i++)
+        ok &= handoff_step(cpu, fast) == MERCED_OK;
+    unsigned cpl = (unsigned)((cpu->psr >> 32) & 3);
+    bool faulted = cpu->nfaults != 0;
+    if (!ok || faulted != cases[scenario].fault ||
+        (cases[scenario].fault ? cpu->ip != 0xd400
+                               : (cpl != cases[scenario].expect_cpl ||
+                                  cpu->ip != 0x1010))) {
+        fprintf(stderr, "epc scenario %u %s: cpl=%u/%u faults=%" PRIu64
+                " ip=%016" PRIx64 "\n", scenario, fast ? "fast" : "slow",
+                cpl, cases[scenario].expect_cpl, cpu->nfaults, cpu->ip);
+        failures++;
+    } else if (!cases[scenario].fault) {
+        cpu->ar[64] = (uint64_t)cases[scenario].ret_ppl << 62;
+        for (unsigned i = 0; i < 3; i++)
+            ok &= handoff_step(cpu, fast) == MERCED_OK;
+        cpl = (unsigned)((cpu->psr >> 32) & 3);
+        if (!ok || cpu->ip != 0x3000 || cpu->nfaults != 0 ||
+            cpl != (cases[scenario].expect_ret_cpl > cases[scenario].expect_cpl
+                    ? cases[scenario].expect_ret_cpl
+                    : cases[scenario].expect_cpl)) {
+            fprintf(stderr, "br.ret after epc scenario %u %s: cpl=%u ip=%016"
+                    PRIx64 " faults=%" PRIu64 "\n", scenario,
+                    fast ? "fast" : "slow", cpl, cpu->ip, cpu->nfaults);
+            failures++;
+        }
+    }
+    merced_destroy(cpu);
+}
+
 static void test_predicate_expect(uint64_t actual, uint64_t expected,
                                   const char *what, uint64_t raw,
                                   bool qualified, bool nat, bool fast) {
@@ -1859,6 +1937,8 @@ int main(void) {
     for (unsigned fast = 0; fast < 2; fast++) {
         for (unsigned scenario = 0; scenario < 4; scenario++)
             check_region7_translation(fast, scenario);
+        for (unsigned scenario = 0; scenario < 7; scenario++)
+            check_epc(scenario, fast);
         check_predicate_irq_pipeline(fast, false);
         check_predicate_irq_pipeline(fast, true);
         const unsigned predicate_rrbs[] = {0, 1, 17, 47};
@@ -1929,5 +2009,6 @@ int main(void) {
     puts("Merced mux1: all byte permutations, low-byte broadcast, NaT and predication passed");
     puts("Merced rotating predicates: IRQ save, cover, restore and rfi preserve pipeline stages");
     puts("Merced predicate transfers: physical PR bits, immediate sign extension, qualifiers and NaT passed");
+    puts("Merced epc/br.ret: gateway promotion, PFS.ppl fault, physical mode and demotion passed");
     return 0;
 }
