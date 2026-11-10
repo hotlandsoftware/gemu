@@ -9,6 +9,9 @@
 #ifdef HAVE_SDL_IMAGE
 #include <SDL2/SDL_image.h>
 #endif
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 struct GemuVideoSdl {
     SDL_Window     *window;
@@ -32,6 +35,26 @@ struct GemuVideoSdl {
 };
 
 static void gemu_video_sdl_clear(GemuVideoSdl *v);
+
+/* ReactOS's Direct3D runs on OpenGL, and without a 3D driver every frame
+ * goes through a software OpenGL (it also nags about it on startup).  GDI
+ * is far faster there, so "auto" means software on ReactOS. */
+static bool video_sdl_is_reactos(void) {
+#ifdef _WIN32
+    HKEY key;
+    char name[64] = "";
+    DWORD len = sizeof(name) - 1, type = 0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                      0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return false;
+    bool ros = RegQueryValueExA(key, "ProductName", NULL, &type, (BYTE *)name, &len) == ERROR_SUCCESS &&
+               type == REG_SZ && strstr(name, "ReactOS") != NULL;
+    RegCloseKey(key);
+    return ros;
+#else
+    return false;
+#endif
+}
 
 static bool video_sdl_is_kmsdrm(void) {
     const char *driver = SDL_GetCurrentVideoDriver();
@@ -127,7 +150,9 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
 
-    if (spec->renderer == GEMU_RENDERER_SOFTWARE)
+    bool force_sw = spec->renderer == GEMU_RENDERER_SOFTWARE ||
+                    (spec->renderer == GEMU_RENDERER_AUTO && video_sdl_is_reactos());
+    if (force_sw)
         v->renderer = SDL_CreateRenderer(v->window, -1, SDL_RENDERER_SOFTWARE);
     else
         v->renderer = SDL_CreateRenderer(v->window, -1, SDL_RENDERER_ACCELERATED);
@@ -139,11 +164,15 @@ GemuVideoSdl *gemu_video_sdl_create(const GemuVideoSdlSpec *spec) {
     if (SDL_GetRendererInfo(v->renderer, &info) == 0) {
         v->software = (info.flags & SDL_RENDERER_SOFTWARE) != 0;
         if (v->software) {
-            const char *why = spec->renderer == GEMU_RENDERER_SOFTWARE
-                ? "forced" : "auto-detected";
+            const char *why = spec->renderer == GEMU_RENDERER_SOFTWARE ? "forced"
+                            : force_sw ? "ReactOS" : "auto-detected";
             fprintf(stderr, "%s: using SDL software renderer (%s: %s)\n",
                     spec->log_prefix ? spec->log_prefix : "gemu",
                     why, info.name ? info.name : "unknown");
+            /* Tool windows opened after this (Game Genie, hex editor,
+             * netplay...) ask for SDL's default renderer: make that the
+             * software one too, so they don't bring up Direct3D/OpenGL. */
+            SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
         }
     }
 
