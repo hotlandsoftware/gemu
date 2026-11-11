@@ -1,5 +1,5 @@
 #ifndef _WIN32
-#  define _POSIX_C_SOURCE 199309L
+#  define _POSIX_C_SOURCE 200809L
 #endif
 #include "kim1.h"
 #include "gemu/util.h"
