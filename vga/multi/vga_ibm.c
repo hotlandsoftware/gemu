@@ -229,7 +229,33 @@ void vga_ibm_render(const VgaIbm *v, uint32_t *argb, int fb_w, int fb_h,
         int rows = (int)((v->crtc[0x12] | ((v->crtc[7] & 2) << 7) |
                           ((v->crtc[7] & 0x40) << 3)) + 1) / (int)max_scan;
         if (rows <= 0 || rows > 60) rows = 25;
-        int cw = 8, ch = 16;
+        /* The character cell is as tall as the CRTC's maximum scan line
+         * (Windows Setup uses 8x12 cells, 33 rows on 400 lines), and its
+         * glyphs come from the font loaded into plane 2 - 32 bytes per
+         * character, in the bank the sequencer's character map select
+         * (SR3) names.  A guest that never loaded one (firmware using
+         * the BIOS default) gets the built-in 8x16 font, row-scaled to
+         * the cell.  Drawing every mode with 16-line cells pushed Setup's
+         * bottom rows - including its "F8=I agree" key line - off the
+         * frame. */
+        int cw = 8, ch = (int)max_scan;
+        static const uint16_t map_base[8] = {
+            0x0000, 0x4000, 0x8000, 0xC000, 0x2000, 0x6000, 0xA000, 0xE000
+        };
+        unsigned map_a = ((v->seq[3] >> 5) & 1u) << 2 | ((v->seq[3] >> 2) & 3u);
+        uint32_t font_base = map_base[map_a];
+        /* Plane 2 holds a usable font only if a space is blank, 'A' has
+         * pixels and differs from 'B' (firmware may leave it filled). */
+        bool space_blank = true, a_set = false, a_differs = false;
+        for (int y = 0; y < ch && y < 32; y++) {
+            uint8_t sp = v->vram[2][(font_base + ' ' * 32u + (unsigned)y) & 0xFFFF];
+            uint8_t a  = v->vram[2][(font_base + 'A' * 32u + (unsigned)y) & 0xFFFF];
+            uint8_t b  = v->vram[2][(font_base + 'B' * 32u + (unsigned)y) & 0xFFFF];
+            space_blank &= sp == 0;
+            a_set |= a != 0;
+            a_differs |= a != b;
+        }
+        bool plane2_font = space_blank && a_set && a_differs;
         int ox = (fb_w - cols * cw) / 2, oy = (fb_h - rows * ch) / 2;
         if (ox < 0) ox = 0;
         if (oy < 0) oy = 0;
@@ -246,7 +272,10 @@ void vga_ibm_render(const VgaIbm *v, uint32_t *argb, int fb_w, int fb_h,
                 int px = ox + col * cw, py = oy + row * ch;
                 if (px + cw > fb_w || py + ch > fb_h) continue;
                 for (int y = 0; y < ch; y++) {
-                    uint8_t bits = glyph[y];
+                    uint8_t bits = plane2_font
+                        ? (y < 32 ? v->vram[2][(font_base + (uint32_t)ch_code * 32 +
+                                                (uint32_t)y) & 0xFFFF] : 0)
+                        : glyph[(y * 16) / ch];
                     for (int x = 0; x < cw; x++)
                         argb[(py + y) * fb_w + (px + x)] =
                             (bits & (0x80 >> x)) ? fg : bg;

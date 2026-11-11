@@ -137,7 +137,14 @@ static bool keymap(uint32_t key, KeyMap *out) {
     case 0xff56: out->scan=0x51; out->extended=true; return true; /* PgDn */
     case 0xff57: out->scan=0x4f; out->extended=true; return true; /* End */
     case 0xff63: out->scan=0x52; out->extended=true; return true; /* Insert */
-    default: return false;
+    case 0xffc8: out->scan=0x57; return true;                     /* F11 */
+    case 0xffc9: out->scan=0x58; return true;                     /* F12 */
+    default:
+        if (key >= 0xffbe && key <= 0xffc7) {                     /* F1-F10 */
+            out->scan = (uint8_t)(0x3b + (key - 0xffbe));
+            return true;
+        }
+        return false;
     }
 }
 

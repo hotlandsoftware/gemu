@@ -144,6 +144,58 @@ static void test_os_mask(void) {
     CHECK(irq(s, 0x60) && !irq(s, 0));
     ia64_i2000_destroy(s);
 }
+static void route_gsi(Ia64I2000State *s, unsigned gsi, uint32_t rte) {
+    bus_write(s, IOSAPIC_BASE + IOSAPIC_REGSEL_OFF, 0x10 + 2 * gsi, 4);
+    bus_write(s, IOSAPIC_BASE + IOSAPIC_WINDOW_OFF, rte, 4);
+}
+/* Windows' i8042 driver takes IRQ1 through the fixed vector it programs in
+ * GSI1 (0x80 in XP Setup).  One edge per byte the 8042 makes available:
+ * accepting the vector doesn't re-raise it, a data-port read lets the next
+ * byte raise a fresh edge, and a masked OS vector never falls back to the
+ * legacy ExtINT path. */
+static void test_keyboard(void) {
+    Ia64I2000State *s = machine();
+    route_gsi(s, 1, 0x80);
+    i2000_type_key(s, 'a');            /* make + break scancodes */
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x80) && !irq(s, 0) && s->keyboard_gsi_asserted);
+    merced_ack_external(s->cpu, 0x80);
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0x80));              /* acceptance is not a new edge */
+    io_port_read(s, 0x60, 1);
+    CHECK(!s->keyboard_gsi_asserted);
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x80));               /* second byte: fresh edge */
+    merced_ack_external(s->cpu, 0x80);
+    for (unsigned i = 0; i < 8 && (s->kbc_out_pos < s->kbc_out_len ||
+                                   ps2_keyboard_has_data(&s->ps2_keyboard)); i++)
+        io_port_read(s, 0x60, 1);
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0x80) && !irq(s, 0));
+    s->pic_master_mask = 0xf8;         /* PIC IRQ1 open, as Windows leaves it */
+    route_gsi(s, 1, 0x80 | IOSAPIC_RTE_MASK);
+    i2000_type_key(s, 'b');
+    s->cpu->ninsts += 1000000;
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0x80) && !irq(s, 0)); /* masked OS vector: no fallback */
+    route_gsi(s, 1, 0x80);
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x80));
+    /* Function keys (Setup's F8=I agree) reach the 8042 as set-1 codes. */
+    while (s->kbc_out_pos < s->kbc_out_len || ps2_keyboard_has_data(&s->ps2_keyboard))
+        io_port_read(s, 0x60, 1);
+    i2000_type_key(s, 0xffc5);         /* F8 */
+    CHECK(io_port_read(s, 0x60, 1) == 0x42 && io_port_read(s, 0x60, 1) == 0xC2);
+    i2000_type_key(s, 0xffc9);         /* F12 */
+    CHECK(io_port_read(s, 0x60, 1) == 0x58 && io_port_read(s, 0x60, 1) == 0xD8);
+    i2000_type_key(s, 'b');
+    i2000_poll_interrupts(s);
+    CHECK(i2000_save_snapshot(s, "kbd.vmstate"));
+    s->keyboard_gsi_asserted = false;
+    CHECK(i2000_load_snapshot(s, "kbd.vmstate"));
+    CHECK(s->keyboard_gsi_asserted);
+    ia64_i2000_destroy(s);
+}
 /* Produce exact prior-version tails from the current snapshot, preserving
  * the CPU position. This catches struct padding and migration mistakes. */
 static void old_snapshot(unsigned version, size_t old_size) {
@@ -203,6 +255,7 @@ static void test_snapshots(void) {
         offsetof(Ia64I2000State, acpi_pm),
         offsetof(Ia64I2000State, uhci_regs),
         offsetof(Ia64I2000State, atapi_device_control),
+        0, /* v27: checked separately below */
     };
     for (unsigned version = 24; version <= 26; version++) {
         old_snapshot(version, old_sizes[version - 24]);
@@ -213,11 +266,240 @@ static void test_snapshots(void) {
         i2000_poll_interrupts(s);
         CHECK(irq(s, 0x60));
     }
+    /* v27 ends in bools; its sizeof() padding now holds v28's keyboard edge.
+     * Loading it must keep the CPU state aligned and clear the new field. */
+    io_port_read(s, 0x177, 1);
+    s->keyboard_gsi_asserted = true;
+    CHECK(i2000_save_snapshot(s, "irq-current.vmstate"));
+    old_snapshot(27, (offsetof(Ia64I2000State, keyboard_gsi_asserted) + 7u) & ~7u);
+    CHECK(i2000_load_snapshot(s, "irq-old.vmstate"));
+    CHECK(s->cpu->gr_static[8] == UINT64_C(0x123456789abcdef0));
+    CHECK(!s->keyboard_gsi_asserted);
+    ia64_i2000_destroy(s);
+}
+/* Primary-channel ATA disk, as Windows' IDE driver uses it (GSI14). */
+static void ata_wait(Ia64I2000State *s) {
+    s->cpu->ninsts += ATAPI_IRQ_LATENCY_NINSTS;
+    i2000_poll_interrupts(s);
+}
+static void ata_task(Ia64I2000State *s, uint8_t device, uint32_t lba,
+                     uint8_t count, uint8_t cmd) {
+    io_port_write(s, 0x1F6, device | ((lba >> 24) & 0x0F), 1);
+    io_port_write(s, 0x1F2, count, 1);
+    io_port_write(s, 0x1F3, lba & 0xFF, 1);
+    io_port_write(s, 0x1F4, (lba >> 8) & 0xFF, 1);
+    io_port_write(s, 0x1F5, (lba >> 16) & 0xFF, 1);
+    io_port_write(s, 0x1F7, cmd, 1);
+}
+/* One interrupt: raised once, acknowledged by a normal Status read. */
+static uint8_t ata_take_irq(Ia64I2000State *s) {
+    CHECK(!irq(s, 0x70));
+    ata_wait(s);
+    CHECK(irq(s, 0x70));
+    merced_ack_external(s->cpu, 0x70);
+    CHECK(s->ata_irq_pending);
+    uint8_t alt = (uint8_t)io_port_read(s, 0x3F6, 1);
+    CHECK(s->ata_irq_pending);               /* Alternate Status doesn't ack */
+    uint8_t st = (uint8_t)io_port_read(s, 0x1F7, 1);
+    CHECK(st == alt && !s->ata_irq_pending);
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0x70));
+    return st;
+}
+static void ata_read_sector(Ia64I2000State *s, uint32_t expect_lba) {
+    uint8_t buf[512];
+    for (unsigned i = 0; i < 512; i += 2) {
+        uint16_t w = (uint16_t)io_port_read(s, 0x1F0, 2);
+        buf[i] = (uint8_t)w; buf[i + 1] = (uint8_t)(w >> 8);
+    }
+    uint32_t tag;
+    memcpy(&tag, buf, 4);
+    CHECK(tag == expect_lba && buf[511] == (uint8_t)expect_lba);
+}
+static void ata_write_sector(Ia64I2000State *s, uint32_t tag) {
+    uint8_t buf[512];
+    memset(buf, 0xA5 ^ (uint8_t)tag, sizeof(buf));
+    memcpy(buf, &tag, 4);
+    for (unsigned i = 0; i < 512; i += 2)
+        io_port_write(s, 0x1F0, buf[i] | (buf[i + 1] << 8), 2);
+}
+static void test_ata(void) {
+    const uint32_t sectors = 2048;          /* 1 MiB image */
+    FILE *f = fopen("ata.img", "wb");
+    CHECK(f);
+    for (uint32_t n = 0; n < sectors; n++) {
+        uint8_t sec[512];
+        memset(sec, (uint8_t)n, sizeof(sec));
+        memcpy(sec, &n, 4);
+        CHECK(fwrite(sec, 1, sizeof(sec), f) == sizeof(sec));
+    }
+    fclose(f);
+    CHECK(gemu_drive_add_legacy(GEMU_DRIVE_IF_IDE, 0, GEMU_DRIVE_MEDIA_DISK, "ata.img"));
+    Ia64I2000State *s = machine();
+    CHECK(s->hda);
+
+    /* Firmware phase, GSI14 at its reset value.  The disk is busy (BSY,
+     * no interrupt) until ready, and a Status read in that window must not
+     * lose the interrupt.  With cr.iva zero (the SDV's IA-32 INT 13h
+     * "BIOS CallBacks"), completion sets the BIOS data area's disk flag
+     * 40:8E that that code polls, instead of an ExtINT nothing takes. */
+    s->cpu->cr[2] = 0;
+    s->ram[0x48E] = 0;
+    ata_task(s, 0xE0, 0, 1, 0x20);
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x80 && s->ata_irq_pending);
+    ata_wait(s);
+    CHECK(s->ram[0x48E] == 0xFF && !s->ata_legacy_irq_latched && !irq(s, 0));
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x58);
+    ata_read_sector(s, 0);
+    /* With a firmware IVA, the legacy IRQ14 latch survives the Status read
+     * and is acknowledged as slave PIC input 6. */
+    s->cpu->cr[2] = 0x10000;
+    s->ram[0x48E] = 0;
+    ata_task(s, 0xE0, 3, 1, 0x20);
+    s->cpu->ninsts += ATAPI_IRQ_LATENCY_NINSTS;
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x58);      /* delivers, then acks */
+    CHECK(s->ata_legacy_irq_latched && irq(s, 0) && !s->ata_irq_pending);
+    CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == s->pic_slave_base + 6u);
+    CHECK(!s->ata_legacy_irq_latched && s->ram[0x48E] == 0);
+    ata_read_sector(s, 3);
+    s->cpu->cr[2] = 0;
+    route_gsi(s, 14, 0x70);
+
+    /* IDENTIFY: data-in interrupt, then the words Windows relies on. */
+    ata_task(s, 0xE0, 0, 0, 0xEC);
+    CHECK(ata_take_irq(s) == 0x58);
+    uint16_t id[256];
+    for (unsigned i = 0; i < 256; i++) id[i] = (uint16_t)io_port_read(s, 0x1F0, 2);
+    CHECK(id[0] == 0x0040 && (id[49] & 0x0200) && !(id[49] & 0x0100));
+    CHECK(id[60] == sectors && id[61] == 0 && id[63] == 0 && id[88] == 0);
+    CHECK((id[47] & 0xFF) == ATA_MAX_MULTIPLE);
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x50);
+    ata_wait(s);
+    CHECK(!irq(s, 0x70));                    /* no interrupt after data-in */
+
+    /* Device 1 is absent: it reads as no device and runs nothing. */
+    io_port_write(s, 0x1F6, 0xF0, 1);
+    CHECK(io_port_read(s, 0x1F7, 1) == 0 && io_port_read(s, 0x3F6, 1) == 0);
+    io_port_write(s, 0x1F7, 0xEC, 1);
+    ata_wait(s);
+    CHECK(!irq(s, 0x70) && !s->ata_irq_pending);
+    io_port_write(s, 0x1F6, 0xE0, 1);
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x50);
+
+    /* An ATA disk aborts IDENTIFY PACKET DEVICE. */
+    ata_task(s, 0xE0, 0, 0, 0xA1);
+    CHECK(ata_take_irq(s) == 0x51 && io_port_read(s, 0x1F1, 1) == 0x04);
+
+    /* READ SECTORS: one DRQ block and interrupt per sector. */
+    ata_task(s, 0xE0, 5, 3, 0x20);
+    for (uint32_t n = 5; n < 8; n++) {
+        CHECK(ata_take_irq(s) == 0x58);
+        ata_read_sector(s, n);
+    }
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x50);
+    ata_wait(s);
+    CHECK(!irq(s, 0x70));
+
+    /* Multiple mode is on at power-up (firmware relies on it); disabled,
+     * READ MULTIPLE aborts.  Then blocks of the SET MULTIPLE count. */
+    CHECK(s->ata_multiple == ATA_MAX_MULTIPLE && (id[59] & 0x1FF) == 0x100 + ATA_MAX_MULTIPLE);
+    ata_task(s, 0xE0, 0, 0, 0xC6);
+    CHECK(ata_take_irq(s) == 0x50 && s->ata_multiple == 0);
+    ata_task(s, 0xE0, 0, 3, 0xC4);
+    CHECK(ata_take_irq(s) == 0x51);
+    ata_task(s, 0xE0, 0, 3, 0xC6);          /* 3 is not a power of two */
+    CHECK(ata_take_irq(s) == 0x51);
+    ata_task(s, 0xE0, 0, 2, 0xC6);
+    CHECK(ata_take_irq(s) == 0x50 && s->ata_multiple == 2);
+    ata_task(s, 0xE0, 10, 5, 0xC4);
+    for (uint32_t n = 10; n < 15;) {
+        CHECK(ata_take_irq(s) == 0x58);
+        unsigned block = n + 2 <= 15 ? 2 : 1;
+        for (unsigned i = 0; i < block; i++) ata_read_sector(s, n++);
+    }
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x50);
+
+    /* WRITE SECTORS: first block without an interrupt, then one per block,
+     * the last being the completion. */
+    ata_task(s, 0xE0, 20, 2, 0x30);
+    CHECK(io_port_read(s, 0x3F6, 1) == 0x58);
+    ata_wait(s);
+    CHECK(!irq(s, 0x70) && !s->ata_irq_pending);
+    ata_write_sector(s, 0x1000);
+    CHECK(ata_take_irq(s) == 0x58);
+    ata_write_sector(s, 0x1001);
+    CHECK(ata_take_irq(s) == 0x50);
+    /* WRITE MULTIPLE (blocks of 2): 3 sectors at 30. */
+    ata_task(s, 0xE0, 30, 3, 0xC5);
+    ata_write_sector(s, 0x2000); ata_write_sector(s, 0x2001);
+    CHECK(ata_take_irq(s) == 0x58);
+    ata_write_sector(s, 0x2002);
+    CHECK(ata_take_irq(s) == 0x50);
+    const uint32_t written[][2] = {{20, 0x1000}, {21, 0x1001}, {30, 0x2000},
+                                   {31, 0x2001}, {32, 0x2002}};
+    for (unsigned i = 0; i < 5; i++) {
+        uint8_t sec[512];
+        uint32_t tag;
+        CHECK(gemu_drive_read(s->hda, (uint64_t)written[i][0] * 512, sec, 512));
+        memcpy(&tag, sec, 4);
+        CHECK(tag == written[i][1] && sec[511] == (uint8_t)(0xA5 ^ written[i][1]));
+    }
+    ata_task(s, 0xE0, 22, 1, 0x20);         /* neighbours untouched */
+    CHECK(ata_take_irq(s) == 0x58);
+    ata_read_sector(s, 22);
+
+    /* Out of range: IDNF.  CHS: C/H/S 0/1/1 is LBA 63. */
+    ata_task(s, 0xE0, sectors - 1, 2, 0x20);
+    CHECK(ata_take_irq(s) == 0x51 && io_port_read(s, 0x1F1, 1) == 0x10);
+    io_port_write(s, 0x1F6, 0xA1, 1);       /* CHS, head 1 */
+    io_port_write(s, 0x1F2, 1, 1);
+    io_port_write(s, 0x1F3, 1, 1);          /* sector 1 */
+    io_port_write(s, 0x1F4, 0, 1);
+    io_port_write(s, 0x1F5, 0, 1);
+    io_port_write(s, 0x1F7, 0x20, 1);
+    CHECK(ata_take_irq(s) == 0x58);
+    ata_read_sector(s, 63);
+
+    /* nIEN holds the interrupt back without losing it. */
+    io_port_write(s, 0x3F6, 2, 1);
+    ata_task(s, 0xE0, 0, 1, 0x40);          /* READ VERIFY */
+    ata_wait(s);
+    CHECK(!irq(s, 0x70) && s->ata_irq_pending);
+    io_port_write(s, 0x3F6, 0, 1);
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x70));
+    merced_ack_external(s->cpu, 0x70);
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x50);
+
+    /* SRST: ATA disk signature, device 0 selected, no interrupt. */
+    io_port_write(s, 0x3F6, 4, 1);
+    CHECK(io_port_read(s, 0x3F6, 1) == 0x80);
+    io_port_write(s, 0x3F6, 0, 1);
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x50 && io_port_read(s, 0x1F1, 1) == 1);
+    CHECK(io_port_read(s, 0x1F2, 1) == 1 && io_port_read(s, 0x1F3, 1) == 1);
+    CHECK(io_port_read(s, 0x1F4, 1) == 0 && io_port_read(s, 0x1F5, 1) == 0);
+    ata_wait(s);
+    CHECK(!irq(s, 0x70));
+
+    /* v29 snapshot round trip, and a v28 tail (ending in bools whose
+     * padding v29's first fields occupy) loading with clean ATA state. */
+    ata_task(s, 0xE0, 0, 1, 0x40);
+    s->cpu->gr_static[8] = UINT64_C(0x0fedcba987654321);
+    CHECK(i2000_save_snapshot(s, "irq-current.vmstate"));
+    ata_clear_irq(s);
+    CHECK(i2000_load_snapshot(s, "irq-current.vmstate"));
+    CHECK(s->ata_irq_pending && s->ata_multiple == 2);
+    old_snapshot(28, (offsetof(Ia64I2000State, ata_irq_pending) + 7u) & ~7u);
+    CHECK(i2000_load_snapshot(s, "irq-old.vmstate"));
+    CHECK(s->cpu->gr_static[8] == UINT64_C(0x0fedcba987654321));
+    CHECK(!s->ata_irq_pending && s->ata_multiple == ATA_MAX_MULTIPLE && !s->ata_xfer_cmd);
     ia64_i2000_destroy(s);
 }
 int main(void) {
     test_identify(); test_control(); test_packet_phases(); test_legacy(); test_os_mask();
     test_snapshots();
+    test_keyboard();
+    test_ata();   /* last: registers a global -hda drive */
     printf("i2000 ATAPI interrupt regressions: %u checks passed\n", checks);
     return 0;
 }

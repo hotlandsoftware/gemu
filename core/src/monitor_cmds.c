@@ -145,6 +145,8 @@ static const MonCmdDef mon_cmds[] = {
       "show machine information ('help info' lists subcommands)", NULL, cmd_info, 0 },
     { "input",       "input-state",  "",
       "show keyboard controller and PIT state", "i2000", NULL, 0 },
+    { "iosapic",     NULL,           "",
+      "show programmed I/O SAPIC redirection entries", "i2000", NULL, 0 },
     { "key",         NULL,           "<key|text>",
       "inject a key (up, down, enter, ...) or type text", M_IA64, NULL, 0 },
     { "loadvm",      NULL,           "<file>",
