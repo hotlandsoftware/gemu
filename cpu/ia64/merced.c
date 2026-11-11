@@ -90,6 +90,8 @@ static uint64_t store_value_watch;
 #define PSR_IC   (1ull << 13)
 #define PSR_I    (1ull << 14)
 #define PSR_DT   (1ull << 17)
+#define PSR_DFL  (1ull << 18)
+#define PSR_DFH  (1ull << 19)
 #define PSR_PP   (1ull << 21)
 #define PSR_DI   (1ull << 22)
 #define PSR_RT   (1ull << 27)
@@ -171,7 +173,7 @@ enum {
     VEC_BREAK = 0x2C00, VEC_EXTINT = 0x3000,
     VEC_PAGE_NOT_PRESENT = 0x5000, VEC_KEY_PERMISSION = 0x5100,
     VEC_INST_ACCESS_RIGHTS = 0x5200, VEC_DATA_ACCESS_RIGHTS = 0x5300,
-    VEC_GENERAL = 0x5400,
+    VEC_GENERAL = 0x5400, VEC_DISABLED_FP = 0x5500,
     VEC_NAT = 0x5600, VEC_SPEC = 0x5700, VEC_UNALIGNED = 0x5A00,
     VEC_IA32_INTERCEPT = 0x6A00,
 };
@@ -1176,47 +1178,6 @@ static void nt_debugprint(Merced *m) {
     fflush(stderr);
 }
 
-static bool rse_preserve_interrupted_partition(Merced *m, uint64_t iip,
-                                                uint64_t ipsr) {
-    if (m->interruption_rse_depth >=
-        sizeof(m->interruption_rse) / sizeof(m->interruption_rse[0]))
-        return false;
-    typeof(m->interruption_rse[0]) *s =
-        &m->interruption_rse[m->interruption_rse_depth++];
-    s->iip = iip;
-    s->ipsr = ipsr;
-    memcpy(s->gr_stack, m->gr_stack, sizeof(s->gr_stack));
-    memcpy(s->nat_stack, m->nat_stack, sizeof(s->nat_stack));
-    s->bof = m->bof;
-    s->bof_total = m->bof_total;
-    s->anchor_addr = m->rse_anchor_addr;
-    s->anchor_regs = m->rse_anchor_regs;
-    s->flushed_regs = m->rse_flushed_regs;
-    return true;
-}
-
-static bool rse_restore_interrupted_partition(Merced *m, uint64_t iip,
-                                               uint64_t ipsr) {
-    if (m->interruption_rse_depth == 0)
-        return false;
-    typeof(m->interruption_rse[0]) *s =
-        &m->interruption_rse[m->interruption_rse_depth - 1];
-    /* A deliberately rewritten IIP/IPSR is a context switch, not a return
-     * to the interrupted partition.  Drop the stale implementation record
-     * without overwriting the target context's RSE resources. */
-    m->interruption_rse_depth--;
-    if (s->iip != iip || s->ipsr != ipsr)
-        return false;
-    memcpy(m->gr_stack, s->gr_stack, sizeof(s->gr_stack));
-    memcpy(m->nat_stack, s->nat_stack, sizeof(s->nat_stack));
-    m->bof = s->bof;
-    m->bof_total = s->bof_total;
-    m->rse_anchor_addr = s->anchor_addr;
-    m->rse_anchor_regs = s->anchor_regs;
-    m->rse_flushed_regs = s->flushed_regs;
-    return true;
-}
-
 static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
                                   uint64_t ifa, bool set_ifa) {
     if (isr & ISR_RS)
@@ -1749,6 +1710,10 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
     if (ia32) {
         m->ar[25] = gr_read(m, 25, NULL); /* AR.CSD */
         m->ar[26] = gr_read(m, 26, NULL); /* AR.SSD */
+        /* IA-32 exit marks enabled low FP state dirty (Vol.2 10.4.2).
+         * Include it in saved IPSR as well as the native handler's PSR so
+         * lazy context saving cannot discard FR8..FR15 after interruption. */
+        if (!(m->psr & PSR_DFL)) m->psr |= PSR_MFL;
     }
     unsigned slot = ia32 ? 0 : (unsigned)(m->ip & 3);
     uint64_t interrupted_iip =
@@ -1757,8 +1722,6 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
         m->psr | ((uint64_t)slot << PSR_RI_SHIFT);
     if (vec == VEC_EXTINT)
         ext_interrupt_in_service = true;
-    rse_preserve_interrupted_partition(m, interrupted_iip,
-                                       interrupted_ipsr);
     m->cr[CR_IPSR] = interrupted_ipsr;
     m->cr[CR_IIP]  = interrupted_iip;
     m->cr[CR_ISR]  = isr | ((uint64_t)slot << 41) |
@@ -3646,13 +3609,24 @@ static bool ami_runtime_ip(const Merced *m, uint64_t ip) {
             ip >= m->bus.ram_size - size && ip < m->bus.ram_size);
 }
 
-/* EFI allocates applications below its runtime image, anywhere in ordinary
- * RAM above the firmware shadow.  While IVA is unset, keep interrupts
- * pending across those application entries as well as the firmware's own
- * transition.  Once the loader installs an IVT, normal delivery resumes. */
+/* EFI allocates applications below its runtime image. While IVA is unset,
+ * keep interrupts pending across those entries as well as the firmware's
+ * own transition. Once the loader installs an IVT, normal delivery resumes. */
 static bool ami_ivt_handoff_pending(const Merced *m) {
+    /* PE utilities can use a preferred base below the 64 MiB shadow limit:
+     * NVRBOOT enters at 0x01042000. Recognize the AMI shell's physical-mode
+     * region/VHPT setup there, while it still exposes bootstrap revision 0.
+     * IVA=0 remains a valid interrupt table for other low-memory code. */
+    bool low_application = m->ip >= UINT64_C(0x00100000) &&
+                           m->ip < UINT64_C(0x04000000) &&
+                           m->ip < m->bus.ram_size &&
+                           m->cpu_revision == 0 &&
+                           ((m->psr >> PSR_CPL_SHIFT) & 3) == 0 &&
+                           !(m->psr & (PSR_IT | PSR_DT | PSR_RT)) &&
+                           m->cr[CR_PTA] == UINT64_C(0x40) &&
+                           m->rr[0] == UINT64_C(0x100030);
     return m->cr[CR_IVA] == 0 &&
-           (ami_runtime_ip(m, m->ip) ||
+           (low_application || ami_runtime_ip(m, m->ip) ||
             (m->ip >= UINT64_C(0x04000000) && m->ip < m->bus.ram_size) ||
             (m->ip & UINT64_C(0x00000fff00000000)) ==
                 UINT64_C(0x00000e0000000000) ||
@@ -4999,9 +4973,10 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
             bool hit = x3 < 6 && alat_check_reg(m, reg, x3 & 1);
             if (hit)
                 return MERCED_OK;
+            /* M22/M23 use contiguous imm20b in bits 32:13.  Bits 12:6
+             * name the checked register, unlike chk.s's split immediate. */
             int64_t disp = sext((bits(raw, 36, 1) << 20) |
-                                (bits(raw, 20, 13) << 7) |
-                                bits(raw, 6, 7), 21) << 4;
+                                bits(raw, 13, 20), 21) * 16;
             m->ip = (m->ip & ~0xFull) + (uint64_t)disp;
             m->taken = 1;
             return MERCED_OK;
@@ -5046,18 +5021,28 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
                  sof | ((uint64_t)sol << 7) | ((uint64_t)sor << 14);
         return rse_spill_excess(m);
     }
-    if (x3 == 1) {
-        /* M20 chk.s.m r2,target25 - this is the actual, correct home for
-         * chk.s.m per the ISA's opcode tables (op=1,x3=1); we have no
-         * ALAT/speculation model to fault against, so - like the M22/M23
-         * chk.a variants above - this only ever needs to take its branch
-         * when the checked register is NaT-like-zero. */
+    if (x3 == 1 || x3 == 3) {
+        /* M20 chk.s.m r2,target25 / M21 chk.s f2,target25. The checked
+         * source occupies bits 19:13, between the two immediate fields. */
         if (!qp) return MERCED_OK;
-        gr_read(m, r2, &n2);
-        if (n2) {
+        bool failed;
+        if (x3 == 3) {
+            unsigned disabled = r2 >= 32 ? 2 : r2 >= 2 ? 1 : 0;
+            if ((disabled == 1 && (m->psr & PSR_DFL)) ||
+                (disabled == 2 && (m->psr & PSR_DFH)))
+                return deliver_fault(m, VEC_DISABLED_FP, disabled, 0, false);
+            MercedFpReg f = fr_read(m, r2);
+            /* ldf.fill also supplies the architectural register encoding.
+             * Its sign-one counterpart is a pseudo-zero, not NaTVal. */
+            failed = f.nat || (!f.sign && f.exp == 0x1fffe && f.sig == 0);
+        } else {
+            gr_read(m, r2, &n2);
+            failed = n2;
+        }
+        if (failed) {
             int64_t disp = sext((bits(raw, 36, 1) << 20) |
-                                (bits(raw, 20, 13) << 7) | bits(raw, 6, 7), 21) << 4;
-            m->ip = (m->ip & ~0xFull) + (uint64_t)disp;
+                                (bits(raw, 20, 13) << 7) | bits(raw, 6, 7), 21) * 16;
+            m->ip = (m->ip & ~UINT64_C(0xF)) + (uint64_t)disp;
             m->taken = 1;
         }
         return MERCED_OK;
@@ -6124,8 +6109,6 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
                         (uint64_t)(uint32_t)iip, m->ip, r12, retfield,
                         m->br[0], m->ninsts);
             }
-            bool restored_rse =
-                rse_restore_interrupted_partition(m, iip, ipsr);
             /* rfi is an instruction and data translation serialization
              * point; complete any deferred ptr/ptc invalidations before
              * executing in the restored context. */
@@ -6152,11 +6135,9 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
                  * snapshot of the physical register file.  Handler frames
                  * and deliberate context switches share the architectural
                  * RSE partitions and backing store. */
-                if (!restored_rse) {
-                    m->bof = (m->bof + MERCED_RSE_CAPACITY -
-                              CFM_SOF(new_cfm)) % MERCED_RSE_CAPACITY;
-                    m->bof_total -= CFM_SOF(new_cfm);
-                }
+                m->bof = (m->bof + MERCED_RSE_CAPACITY -
+                          CFM_SOF(new_cfm)) % MERCED_RSE_CAPACITY;
+                m->bof_total -= CFM_SOF(new_cfm);
                 m->cfm = new_cfm;
             }
             /* RFI restores a different stacked-register frame.  QEMU and
@@ -6663,33 +6644,149 @@ static const bool bundle_stop_after[32][3] = {
 };
 
 
+static bool ia32_operand_addresses(Merced *m, uint64_t va, unsigned size,
+                                    bool ifetch, uint64_t access,
+                                    uint64_t pa[8], bool *contiguous) {
+    MercedStatus st;
+    if (!size || size > 8) return false;
+    if (!va_translate(m, va, ifetch, false, access, &pa[0], &st))
+        return false;
+    *contiguous = true;
+    /* Translation permissions are uniform within the minimum 4 KiB page.
+     * Most operands need one lookup. A split operand must validate every
+     * page before a bus read/write, including multi-byte instruction fetches.
+     * Keep the full address: IA-32 I/O uses the 64-bit AR.KR0 aperture. */
+    if ((va & 0xfff) <= 0x1000 - size) return true;
+    for (unsigned i = 1; i < size; i++) {
+        if (!va_translate(m, va + i, ifetch, false, access, &pa[i], &st))
+            return false;
+        if (pa[i] != pa[0] + i) *contiguous = false;
+    }
+    return true;
+}
+
+static bool ia32_read_access(Merced *m, uint64_t va, unsigned size,
+                              bool ifetch, uint64_t access, uint64_t *value) {
+    uint64_t pa[8];
+    bool contiguous;
+    if (!ia32_operand_addresses(m, va, size, ifetch, access,
+                                  pa, &contiguous)) return false;
+    if (contiguous) {
+        *value = ifetch ? phys_fetch(m, pa[0], size) : phys_read(m, pa[0], size);
+    } else {
+        *value = 0;
+        for (unsigned i = 0; i < size; i++) {
+            uint64_t byte = ifetch ? phys_fetch(m, pa[i], 1) : phys_read(m, pa[i], 1);
+            *value |= (byte & 0xff) << (8 * i);
+        }
+    }
+    return true;
+}
+
 bool merced_ia32_read(Merced *m, uint64_t va, unsigned size,
                       bool ifetch, uint64_t *value) {
-    uint64_t pa;
-    MercedStatus st;
-    if (!va_translate(m, va, ifetch, false, ifetch ? ISR_X : ISR_R,
-                      &pa, &st))
-        return false;
-    *value = ifetch ? phys_fetch(m, pa, size) : phys_read(m, pa, size);
-    return true;
+    return ia32_read_access(m, va, size, ifetch, ifetch ? ISR_X : ISR_R, value);
+}
+
+bool merced_ia32_read_for_write(Merced *m, uint64_t va, unsigned size,
+                                uint64_t *value) {
+    return ia32_read_access(m, va, size, false, ISR_R | ISR_W, value);
+}
+
+bool merced_ia32_probe_write(Merced *m, uint64_t va, unsigned size) {
+    uint64_t pa[8];
+    bool contiguous;
+    return ia32_operand_addresses(m, va, size, false, ISR_W, pa, &contiguous);
 }
 
 bool merced_ia32_write(Merced *m, uint64_t va, unsigned size,
                        uint64_t value) {
-    uint64_t pa;
-    MercedStatus st;
-    if (!va_translate(m, va, false, false, ISR_W, &pa, &st))
-        return false;
-    phys_write(m, pa, value, size);
+    uint64_t pa[8];
+    bool contiguous;
+    if (!ia32_operand_addresses(m, va, size, false, ISR_W, pa, &contiguous)) return false;
+    if (contiguous) {
+        phys_write(m, pa[0], value, size);
+    } else {
+        for (unsigned i = 0; i < size; i++)
+            phys_write(m, pa[i], (value >> (8 * i)) & 0xff, 1);
+    }
     return true;
+}
+
+static bool ia32_read_modify_write(Merced *m, uint64_t va, unsigned size,
+                                    uint64_t acc, uint64_t src, uint64_t *dest,
+                                    bool compare) {
+    uint64_t pa[8];
+    /* IA-32 read-modify-write faults report both ISR.r and ISR.w. Check
+     * every byte before any bus side effect: an unaligned operand can span
+     * discontiguous pages, and a mismatch still requires write permission. */
+    bool contiguous;
+    if (!ia32_operand_addresses(m, va, size, false, ISR_R | ISR_W,
+                                  pa, &contiguous)) return false;
+    uint64_t mask = size == 8 ? UINT64_MAX : (UINT64_C(1) << (size * 8)) - 1;
+    if (contiguous) {
+        *dest = phys_read(m, pa[0], size) & mask;
+    } else {
+        *dest = 0;
+        for (unsigned i = 0; i < size; i++)
+            *dest |= (phys_read(m, pa[i], 1) & 0xff) << (8 * i);
+    }
+    uint64_t value = compare ? (acc == *dest ? src : *dest) : (*dest + src) & mask;
+    if (contiguous) {
+        phys_write(m, pa[0], value, size);
+    } else {
+        for (unsigned i = 0; i < size; i++)
+            phys_write(m, pa[i], (value >> (8 * i)) & 0xff, 1);
+    }
+    return true;
+}
+
+bool merced_ia32_cmpxchg(Merced *m, uint64_t va, unsigned size,
+                         uint64_t acc, uint64_t src, uint64_t *dest) {
+    return ia32_read_modify_write(m, va, size, acc, src, dest, true);
+}
+
+bool merced_ia32_xadd(Merced *m, uint64_t va, unsigned size,
+                      uint32_t src, uint32_t *dest) {
+    uint64_t old;
+    if (!ia32_read_modify_write(m, va, size, 0, src, &old, false)) return false;
+    *dest = (uint32_t)old;
+    return true;
+}
+
+bool merced_ia32_read_operand(Merced *m, uint64_t va, unsigned size,
+                              uint32_t *value) {
+    uint64_t result;
+    if (!merced_ia32_read(m, va, size, false, &result)) return false;
+    *value = (uint32_t)result;
+    return true;
+}
+
+bool merced_ia32_write_operand(Merced *m, uint64_t va, unsigned size,
+                               uint32_t value) {
+    return merced_ia32_write(m, va, size, value);
+}
+
+MercedStatus merced_ia32_disabled_transition(Merced *m) {
+    return deliver_fault(m, VEC_GENERAL, 0x40, 0, false);
+}
+
+MercedStatus merced_ia32_disabled_fp(Merced *m) {
+    return deliver_fault(m, VEC_DISABLED_FP, 1, 0, false);
+}
+
+MercedStatus merced_ia32_fp_exception(Merced *m, unsigned vector) {
+    /* #NM (7) and delayed x87 #MF (16) use the IA-32 Exception vector.
+     * Itanium delivers #MF regardless of CFLG.CR0.ne; there is no IRQ13
+     * fallback. FCR/FSR and the saved numeric pointers remain untouched. */
+    return deliver_fault(m, 0x6900, (uint64_t)vector << 16, 0, false);
 }
 
 MercedStatus merced_ia32_instruction_intercept(Merced *m, uint64_t iim,
                                                 uint16_t code) {
-    /* IA-32 system instructions (including HLT) are intercepted into the
-     * IA-64 IVT rather than executed directly on Itanium.  ISR.vector zero
-     * identifies an instruction intercept; IIM carries any instruction-
-     * specific immediate (zero for HLT). */
+    /* IA-32 system instructions and invalid opcodes are intercepted into
+     * the native IVT. ISR.vector zero identifies an instruction intercept;
+     * IIM holds the instruction bytes after prefixes, zero padded. */
     m->cr[CR_IIM] = iim;
     return deliver_fault(m, VEC_IA32_INTERCEPT, code, 0, false);
 }
@@ -8460,10 +8557,10 @@ void merced_dump_state(const Merced *m, char *buf, size_t len) {
       (unsigned)((m->psr >> 27) & 1), (unsigned)((m->psr >> 44) & 1),
       (unsigned)((m->psr >> 3) & 1));
     P("CFM sof=%u sol=%u sor=%u rrb=%u/%u/%u  bof=%u/%" PRIu64
-      "  PR %016" PRIX64 "  irq-rse-depth=%u\n",
+      "  PR %016" PRIX64 "\n",
       CFM_SOF(m->cfm), CFM_SOL(m->cfm), CFM_SOR(m->cfm),
       CFM_RRB_GR(m->cfm), CFM_RRB_FR(m->cfm), CFM_RRB_PR(m->cfm),
-      m->bof, m->bof_total, m->pr, m->interruption_rse_depth);
+      m->bof, m->bof_total, m->pr);
     for (unsigned r = 0; r < 32; r += 4) {
         P("r%-3u %016" PRIX64 " %016" PRIX64 " %016" PRIX64 " %016" PRIX64 "\n",
           r,

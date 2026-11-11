@@ -131,13 +131,11 @@ typedef struct Merced {
     uint64_t rse_anchor_addr;
     int64_t  rse_anchor_regs;
     int64_t  rse_flushed_regs;
-    /*
-     * The implementation models the RSE's dirty/clean/invalid partitions
-     * with a compact circular register file.  A real interruption protects
-     * the interrupted partition while its handler executes cover/flushrs
-     * and may switch BSPSTORE.  Preserve that implementation-private state
-     * until the matching rfi; architectural CR/AR state remains guest-owned.
-     */
+    /* Reserved snapshot-layout storage from the former implementation-private
+     * interruption register cache. Do not restore registers from these fields:
+     * interruption handlers and context switches manage the architectural RSE
+     * backing store, and unrelated frames can resume at the same IIP/IPSR.
+     * Retain the fields so existing raw CPU snapshots keep their layout. */
     struct {
         uint64_t iip, ipsr;
         uint64_t gr_stack[MERCED_RSE_CAPACITY];
@@ -361,8 +359,22 @@ MercedStatus merced_ia32_step(Merced *m);
 void merced_nt_identify(Merced *m, uint64_t va);
 bool merced_ia32_read(Merced *m, uint64_t va, unsigned size,
                       bool ifetch, uint64_t *value);
+bool merced_ia32_read_for_write(Merced *m, uint64_t va, unsigned size,
+                                uint64_t *value);
+bool merced_ia32_probe_write(Merced *m, uint64_t va, unsigned size);
 bool merced_ia32_write(Merced *m, uint64_t va, unsigned size,
                        uint64_t value);
+bool merced_ia32_cmpxchg(Merced *m, uint64_t va, unsigned size,
+                         uint64_t acc, uint64_t src, uint64_t *dest);
+bool merced_ia32_xadd(Merced *m, uint64_t va, unsigned size,
+                      uint32_t src, uint32_t *dest);
+bool merced_ia32_read_operand(Merced *m, uint64_t va, unsigned size,
+                              uint32_t *value);
+bool merced_ia32_write_operand(Merced *m, uint64_t va, unsigned size,
+                               uint32_t value);
+MercedStatus merced_ia32_disabled_transition(Merced *m);
+MercedStatus merced_ia32_disabled_fp(Merced *m);
+MercedStatus merced_ia32_fp_exception(Merced *m, unsigned vector);
 MercedStatus merced_ia32_instruction_intercept(Merced *m, uint64_t iim,
                                                 uint16_t code);
 uint64_t merced_ia32_gr_read(Merced *m, unsigned reg);

@@ -10,7 +10,7 @@
 
 | Name | Full name | Status | Notes |
 |------|-----------|--------|-------|
-| `i2000` | HP i2000 (2001) | preliminary | Boots supported firmware to EFI, exposes an ATAPI CD-ROM, starts the Windows XP IA-64 CD loader |
+| `i2000` | HP i2000 (2001) | preliminary | Boots supported firmware to EFI and Windows XP IA-64 text-mode Setup, with ATA disk and ATAPI CD-ROM support |
 
 ## HP i2000 hardware
 
@@ -19,7 +19,7 @@
 - RAM: 2 GiB by default; smaller matched DIMM populations are supported
 - Firmware: 4 MiB flash containing PAL, SAL, and EFI
 - Display: emulated VGA/Rage 128 firmware interface
-- Storage: secondary-master ATAPI CD-ROM backed by a raw ISO image
+- Storage: primary-master ATA disk backed by a raw image and secondary-master ATAPI CD-ROM backed by a raw ISO image
 - Legacy devices: PIC/IOSAPIC, PIT, RTC/CMOS, keyboard, mouse, serial, and SMBus support
 - Persistent, firmware-specific flash/NVRAM and full-machine snapshots
 
@@ -73,11 +73,25 @@ media=disk`. i2000 exposes exactly one IDE drive per channel, so `-drive`
 only accepts `index=0` - there's no slave/secondary device to attach a
 second image to.
 
+To create a disposable 4 GiB installation disk, run from the repository root:
+
+```sh
+qemu-img create -f raw roms/ItaniumTest.img 4G
+./bin/gemu -M i2000 -m 512m -rom roms/bios117c.BIN \
+  -cdrom "roms/Windows XP 64-Bit Edition Version 2003 (Itanium).iso" \
+  -hda roms/ItaniumTest.img
+```
+
+Creating the image again erases its contents. VM snapshots do not include disk
+contents; preserve a matching disk image when saving an installation checkpoint.
+
 The monitor's `sendkey` types into the guest: QEMU key names (`ret`, `spc`,
 `esc`, `tab`, `up`, `f8`, ...) or plain text, e.g. `sendkey ret` at the
 "Press any key to boot from CD-ROM" prompt.
 
-The monitor supports `savevm PATH` and `loadvm PATH`. Keep the same `-rom` and
+Snapshots are manual: use the monitor's `savevm PATH` and `loadvm PATH`.
+Pause with `stop` before saving and copying the matching disk image. The
+emulator does not create periodic snapshots. Keep the same `-rom` and
 `-cdrom`/`-drive` arguments when restoring a checkpoint; explicitly configured
 CD media is retained across the restore.
 
@@ -93,14 +107,28 @@ NVRAM is stored per firmware image under the GEMU configuration directory.
 If firmware state becomes unusable after changing ROMs, remove only the
 corresponding `i2000-<firmware-hash>.nvram` file and cold boot.
 
+Older builds incorrectly asserted the board's manufacturing-mode GPIO input,
+making EFI discard Windows' boot entry and regenerate its boot list. The normal
+input level now preserves the entry, including the original short device path
+written by Windows Setup. Existing NVRAM may retain `MfgMode=1`: boot the updated
+emulator to the EFI menu or shell once to clear it before restoring a missing
+Windows option.
+From the EFI shell on the system partition, run `\MSUtil\nvrboot.efi`, use Import
+on `\EFI\Microsoft\WINNT50\Boot0003`, then Push the imported entry to the top.
+Quit NVRBOOT, then type `reset` at the EFI shell.
+The backup's number and filesystem mapping can differ between installations.
+Keep the disk; restoring a missing boot entry does not require formatting it.
+
 ## Current limitations
 
-- Windows XP IA-64 Setup boots from CD and reaches **Setup is starting
-  Windows**. The RAM-map, CPU, and chipset fixes let it progress into PCI
-  enumeration, IDE-controller attachment, and CD reads through the Windows
-  driver. Interactive Setup has not yet been reached: later kernel/filesystem
-  initialization remains blocked. The latest 2 GiB cold run stops at bugcheck
-  `0x50` in `cdfs.sys`. Completing installation remains unverified.
+- Windows XP IA-64 boots from CD into interactive text-mode Setup with
+  512 MiB of RAM. Full NTFS formatting on a 4 GiB raw disk completes and
+  Setup copies files into the Windows folders and restarts into EFI.
+  The normal EFI boot manager launches the original Windows boot entry after
+  repairing entries lost by older builds. Graphical Setup reaches the
+  "Installing Windows" stage, and 32-bit RSAENH and DSSENH registration succeeds.
+  INITPKI registration reaches an unimplemented x87 `FLDZ` in `MSASN1.dll`;
+  the same routine also needs `FLD1` and `FADD`. Installation remains incomplete.
 - The Merced core and 460GX platform model remain incomplete; other operating
   systems and firmware revisions may encounter unimplemented instructions or
   devices.
@@ -109,9 +137,9 @@ corresponding `i2000-<firmware-hash>.nvram` file and cold boot.
 
 ## Roadmap
 
-1. Resolve the remaining HAL/kernel initialization failures in Windows Setup.
+1. Complete Windows Setup and boot the installed system from the ATA disk.
 2. Complete the remaining Merced, PAL, and 460GX behavior.
-3. Boot Windows XP/Server 2003 for Itanium beyond text-mode Setup.
+3. Validate Windows Server 2003 for Itanium installation and startup.
 4. Add and validate Linux/IA-64 boot support.
 
 ## Memory and boot regression checks
@@ -146,6 +174,73 @@ ATAPI interrupt checks cover IOSAPIC routing, interrupt masking, status
 acknowledgement, device reset, and separate IDENTIFY and PACKET completion
 behavior. Version 27 snapshots preserve the interrupt and command-phase
 state; regression checks also load snapshots from versions 24 through 26.
+Machine-reset checks preserve memory backing and pending NVRAM updates across
+monitor resets, firmware processor resets, and subsequent snapshot save/load.
+Reset previously cleared a host memory pointer, causing the next autosave to
+crash even when guest execution had resumed successfully.
+CF9 hard resets also reset PCI/IDE configuration and interrupt routing, while
+retaining the SAC bootstrap latches (CBNR, CCSR, and configuration word 44h).
+Keeping the previous OS's device state made restarted EFI lose its disk and
+CD-ROM; clearing word 44h instead made initial firmware boot loop on reset.
+CPU-only resets leave device configuration intact.
+
+ATA storage checks use a sparse 4 GiB image to verify sector and multiple-sector
+PIO transfers through the physical I/O decoder, including 256-sector commands,
+different data widths, the 2 GiB boundary, and the end of the disk. Read-back
+through the controller and an independently opened backing file must agree.
+
+CPU checks cover `chk.a` recovery targets and interruption returns across
+register-stack context switches. An incorrectly decoded `chk.a` target made
+Windows' disk driver jump into an unrelated function during formatting. A
+private interruption-register cache could also restore an older thread's
+registers when two threads resumed at the same instruction. `rfi` now uses the
+architectural register stack and backing store established by the handler.
+
+Floating-point `chk.s` checks cover NaTVal recovery, signed targets, predication,
+rotating and constant registers, and disabled-register-bank faults in both CPU
+execution paths. Windows' first graphical session executes this instruction in
+`WIN32K.SYS`; the missing implementation previously halted at the background
+screen before graphical Setup appeared. EFI handoff checks also cover utilities
+loaded below 64 MiB, where pending interrupts previously stopped `NVRBOOT` before
+its first instruction.
+
+IA-32 `CMPXCHG`, `CMPXCHG8B` and `XADD` checks cover operand widths, register
+aliases, flags, failed-comparison writeback, and precise read-modify-write faults.
+Cross-page accesses check both pages before modifying memory and can resume
+through native `rfi` after the fault is repaired. Graphical Setup also exercises
+the IA-32 compatibility engine.
+
+`LEAVE`, direct/indirect `JMPE`, and `SCAS` checks cover native-mode transitions,
+stack widths, repeated comparisons and precise faults. Repeated MOVS/LODS/STOS
+now update the remaining count after each completed element; previously a page
+fault could resume from an advanced pointer with the original count and overrun
+the destination. Guarded-buffer tests check retry through native `rfi`, including
+word/dword elements crossing discontiguous or protected pages.
+
+`CMPS` checks cover both source and destination faults, repeated comparison
+conditions, direction, and address widths. IA-32 SIB address decoding retains
+the scaled index when no base register is present; losing it made Windows'
+loader jump into instruction bytes instead of the selected jump-table entry.
+Regressions cover the actual failing loader instruction, every index and scale,
+segment overrides, and address wraparound.
+Ordinary IA-32 operands and instruction fetches also translate both pages of
+a split access before using the bus. Relocation tests check that a DWORD
+crossing discontiguous pages updates the intended bytes without corrupting
+neighboring physical memory, and that arithmetic retries preserve input flags.
+Return instructions fetch their cleanup immediate before popping the stack,
+so a split instruction-page fault cannot consume the return address twice.
+Double shifts cover both operand widths, immediate and CL counts, aliases,
+flags, and protected memory even when the masked count is zero.
+
+IA-32 floating-point control checks cover `FWAIT`, `FNSTCW`, `FLDCW`, and
+`FNCLEX`, including disabled hardware, pending exceptions, and preservation
+of the SSE controls held in the upper FCR bits. The literal MSVCRT control-word
+initialization sequence is checked in both CPU execution paths.
+The common-controls display-scaling sequence exercises integer loads, multiply,
+binary64 loads/stores, comparison and status transfers on the x87 stack. Its
+tests check exact scale values and balanced TOP/empty state for every initial
+TOP. Leaving IA-32 marks low floating-point registers modified when DFL is clear,
+including the saved context used to resume after a native fault or interrupt.
 
 Integer `mux1` checks cover every byte permutation, including the low-byte
 broadcast used by Windows to fill allocation bitmaps, with NaT propagation
@@ -165,4 +260,5 @@ Build and run these ROM-independent checks with:
 ninja
 python3 tools/ia64/run_i2000_memory_test.py
 python3 tools/ia64/run_i2000_interrupt_test.py
+python3 tools/ia64/run_i2000_ata_storage_test.py
 ```

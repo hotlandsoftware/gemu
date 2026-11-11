@@ -186,6 +186,11 @@ int ia64_setup(int argc, char *argv[]) {
         return 1;
     }
 
+    /* The i2000 has a PS/2 mouse port, so like a real machine it comes with
+     * a mouse attached; -nodefaults leaves it off.  (-device mouse is still
+     * accepted for existing command lines.) */
+    cfg.mouse_enabled = strcmp(alias, "i2000") == 0 && gemu_drive_defaults();
+
     const char *rom_arg = args.rom_path;
     const char *serial_spec = NULL;
     for (int i = 0; i < nrem; i++) {

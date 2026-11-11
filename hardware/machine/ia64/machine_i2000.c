@@ -16,11 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
-#ifdef _WIN32
-#include <direct.h>
-#endif
 
 /* Device debug flags are immutable startup configuration.  Several checks
  * live in port/MMIO handlers, so consulting MinGW's CRT environment on every
@@ -256,7 +252,9 @@ struct Ia64I2000State {
     uint64_t  flash_cmd_addr;
 
     bool      halted;
-    bool      reset_requested;
+    /* Keep the former bool's one-byte snapshot slot. Legacy true requests
+     * were CF9 hard resets; 2 additionally represents a CPU-only reset. */
+    uint8_t   reset_requested; /* 0 = none, 1 = system, 2 = processor */
     bool      fw_shadow_enabled;
     MercedStatus halt_status;
 
@@ -373,13 +371,10 @@ struct Ia64I2000State {
     MmioLogEnt mmio_log[MMIO_LOG_N];
     int        mmio_log_n;
 
-    /* Wall-clock (not instruction-count) periodic autosave, so a long,
-     * mostly-idle-waiting debug session always has a recent rollback point
-     * without needing a human to remember to snapshot. Two rotating slots
-     * rather than one: if the process is killed mid-write of the current
-     * slot, the other one is still intact. */
-    time_t     last_autosave;
-    unsigned   autosave_slot;
+    /* Reserved former autosave fields: keep their types and positions so
+     * existing raw-structure snapshots retain the same byte layout. */
+    time_t     reserved_autosave_time;
+    unsigned   reserved_autosave_slot;
 
     /* Keep newly-added host-only pointers at the end: v3 snapshots contain
      * every preceding byte and can therefore still be restored exactly.
@@ -2334,12 +2329,14 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         s->pit0_read_phase ^= 1;
         return v;
     }
-    if (port == 0x404)
-        /* System status/GPIO word. Bit 24 reports J29 in its normal running
-         * position. Returning zero reports OVRD/CLRCMOS instead, making the
-         * SDV firmware stop with "Hardware Override / Power off and reset
-         * hardware jumper!". Other strap bits remain deasserted. */
-        return UINT32_C(0x01000000);
+    if (port >= 0x404 && port + size <= 0x408)
+        /* Board GPIO inputs: bit 24 (GPIO18/J29) selects normal running
+         * rather than OVRD/CLRCMOS. Bit 18 (GPIO12) deasserts manufacturing
+         * mode; AMI otherwise deletes Boot/Driver variables and rebuilds
+         * BootOrder on every boot, discarding Windows Setup's boot entry.
+         * Return the same input levels for byte, word and dword reads. */
+        return (UINT32_C(0x01040000) >> ((port - 0x404) * 8)) &
+               size_mask(size);
     if (port >= 0x400 && port + size <= 0x440) {
         uint64_t v = 0;
         memcpy(&v, &s->acpi_io[port - 0x400], size);
@@ -2574,6 +2571,8 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
             return;
         }
     }
+    if (port >= 0x404 && port + size <= 0x408)
+        return; /* Board strap inputs do not change on software writes. */
     if (port >= 0x400 && port + size <= 0x440) {
         memcpy(&s->acpi_io[port - 0x400], &val, size);
         return;
@@ -2747,7 +2746,7 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
          * bit 2 triggers it.  SAL writes 02h followed by 06h, then waits in
          * a dead loop for the platform reset to arrive. */
         if (val & 0x04) {
-            s->reset_requested = true;
+            s->reset_requested = (val & 0x02) ? 1 : 2;
             merced_request_exit(s->cpu);   /* handled after this slot */
         }
         return;
@@ -4513,9 +4512,6 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->cdrom = cdrom;
         s->hda = hda;
         i2000_drive_info_refresh(s);
-        /* Restart the autosave clock from now, not from whatever wall time
-         * the snapshot itself was taken at. */
-        s->last_autosave = time(NULL);
         /* A snapshot taken right at (or after) a halt is exactly the point
          * of loading it back in - to keep going, typically to retest a
          * fix for whatever caused that halt. Don't leave it stuck. */
@@ -4660,36 +4656,6 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
 
     fclose(f);
     return ok;
-}
-
-#define I2000_AUTOSAVE_DIR "snapshots"
-#define I2000_AUTOSAVE_PERIOD_SEC 300
-
-/* Called once per run_slice from the main loop. Wall-clock gated (not
- * instruction-count gated) since the whole point is a rollback point every
- * few minutes of real debugging time, regardless of how fast or slow any
- * particular stretch of firmware executes. Silent no-op until the first
- * period has elapsed, so a quick one-off run doesn't pay for a snapshot it
- * will never use. */
-static bool i2000_autosave_tick(Ia64I2000State *s) {
-    time_t now = time(NULL);
-    if (s->last_autosave == 0) {
-        s->last_autosave = now;
-        return false;
-    }
-    if (now - s->last_autosave < I2000_AUTOSAVE_PERIOD_SEC)
-        return false;
-    s->last_autosave = now;
-    char path[256];
-    snprintf(path, sizeof(path), "%s/autosave_%u.vmstate",
-             I2000_AUTOSAVE_DIR, s->autosave_slot);
-    s->autosave_slot ^= 1u;
-    if (i2000_save_snapshot(s, path))
-        printf("i2000: autosaved to %s (ninsts=%" PRIu64 ")\n",
-               path, s->cpu->ninsts);
-    else
-        fprintf(stderr, "i2000: autosave to %s FAILED\n", path);
-    return true;
 }
 
 /* ── Monitor memory view ─────────────────────────────────────────────────── */
@@ -5037,7 +5003,7 @@ static GemuMonCmd i2000_cmd_mousemove(GemuMonitor *mon, const char *args,
      * the full pipeline (packet build, IRQ delivery, ack) without
      * needing a live display. */
     if (!s->mouse_enabled) {
-        gemu_monitor_printf(mon, "mousemove: no mouse attached (-device mouse)\n");
+        gemu_monitor_printf(mon, "mousemove: no mouse attached (started with -nodefaults)\n");
     } else if (!s->mouse_streaming) {
         gemu_monitor_printf(mon, "mousemove: mouse attached but guest hasn't "
                             "enabled streaming yet (mouse_streaming=0)\n");
@@ -5626,12 +5592,6 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     if (!s)
         return NULL;
 
-#ifdef _WIN32
-    _mkdir(I2000_AUTOSAVE_DIR); /* ignore EEXIST/already-there */
-#else
-    mkdir(I2000_AUTOSAVE_DIR, 0755); /* ignore EEXIST/already-there */
-#endif
-
     s->pic_master_mask = 0xFF;
     s->pic_slave_mask = 0xFF;
     s->mouse_enabled = cfg->mouse_enabled;
@@ -6073,9 +6033,26 @@ static void i2000_bench_check(Ia64I2000State *s) {
 static bool i2000_after_step(Ia64I2000State *s, MercedStatus st) {
     if (s->reset_requested) {
         fprintf(stderr, "i2000: firmware requested a platform reset\n");
-        /* CF9 resets the processor while the 460GX retains the sticky
-         * configuration state SAL just programmed.  In particular,
-         * SAC CBNR bit 0 selects the second bootstrap phase, with the
+        if (s->reset_requested == 1) {
+            /* CF9 SYS_RST resets the platform, including PCI/IDE and the
+             * interrupt routes programmed by the previous OS. Keep the
+             * sticky SAC bootstrap latches, not the entire device state:
+             * stale SAPIC vectors otherwise hide disks from restarted EFI. */
+            uint32_t cbnr = s->sac_cbnr, ccsr = s->sac_ccsr;
+            /* SAL programs SAC 44h before resetting, then checks bit 7
+             * against its CMOS setting on the next bootstrap pass. This
+             * configuration latch must survive the reset it requests. */
+            uint8_t sac_config[2];
+            memcpy(sac_config, &s->chipset_cfg[0][0][0x44], sizeof(sac_config));
+            i2000_reset(s);
+            s->sac_cbnr = cbnr;
+            s->sac_ccsr = ccsr;
+            memcpy(&s->chipset_cfg[0][0][0x44], sac_config, sizeof(sac_config));
+        } else {
+            merced_set_cpu_revision(s->cpu, 0);
+            merced_reset(s->cpu);
+        }
+        /* SAC CBNR bit 0 selects the second bootstrap phase, with the
          * firmware range shadowed in RAM: the flash image is copied to
          * 0x03C00000 and the top-of-4GiB window becomes RAM-backed for
          * reads AND writes (the firmware's data segment lives up there
@@ -6085,8 +6062,6 @@ static bool i2000_after_step(Ia64I2000State *s, MercedStatus st) {
         if (I2000_FW_SHADOW_BASE + I2000_FLASH_SIZE <= s->ram_size)
             memcpy(s->ram + I2000_FW_SHADOW_BASE, s->flash,
                    I2000_FLASH_SIZE);
-        merced_set_cpu_revision(s->cpu, 0);
-        merced_reset(s->cpu);
         s->halted = false;
         s->reset_requested = false;
         s->mmio_log_n = 0;
@@ -6183,6 +6158,14 @@ static void i2000_reset(Ia64I2000State *s) {
     uint8_t *i82559_option_rom = s->i82559.option_rom;
     size_t i82559_option_rom_size = s->i82559.option_rom_size;
     bool mouse_enabled = s->mouse_enabled;
+    /* The snapshot-compatible tail mixes resettable device state with
+     * host-owned backing and persistent flash bookkeeping. Retain those
+     * across the bulk reset below: losing high_dram crashes the next
+     * snapshot, while losing NVRAM bookkeeping discards pending updates. */
+    uint8_t *high_dram = s->high_dram;
+    char nvram_path[sizeof(s->nvram_path)];
+    memcpy(nvram_path, s->nvram_path, sizeof(nvram_path));
+    bool nvram_dirty = s->nvram_dirty;
     merced_set_cpu_revision(s->cpu, 0);
     merced_reset(s->cpu);
     vga_ibm_reset(&s->vga);
@@ -6190,6 +6173,9 @@ static void i2000_reset(Ia64I2000State *s) {
                  RAGE128_IO_BASE, RAGE128_MMIO_BASE, 17);
     memset(&s->int10_req, 0,
            sizeof(*s) - offsetof(Ia64I2000State, int10_req));
+    s->high_dram = high_dram;
+    memcpy(s->nvram_path, nvram_path, sizeof(s->nvram_path));
+    s->nvram_dirty = nvram_dirty;
     i82559_init(&s->i82559, i82559_enabled, I82559_MMIO_BASE,
                 I82559_IO_BASE, 18, bus_read, bus_write, s);
     s->i82559.option_rom = i82559_option_rom;
@@ -6423,8 +6409,6 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             i2000_run_slice(s);
-            if (!s->halted && i2000_autosave_tick(s))
-                itc_last_ns = i2000_monotonic_ns();
             i2000_bench_check(s);
         }
 

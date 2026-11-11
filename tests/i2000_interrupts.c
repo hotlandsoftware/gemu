@@ -19,6 +19,28 @@ static Ia64I2000State *machine(void) {
 static bool irq(Ia64I2000State *s, unsigned vector) {
     return (s->cpu->external_pending[vector >> 3] >> (vector & 7)) & 1;
 }
+static void test_gpio_straps(void) {
+    Ia64I2000State *s = machine();
+    const uint64_t gpio = I2000_IO_BASE + 0x404;
+    for (unsigned reset = 0; reset < 2; reset++) {
+        /* Both active-low board straps must stay deasserted, including
+         * when firmware reads the high bytes of the GPIO data register. */
+        CHECK(bus_read(s, gpio, 4) == UINT32_C(0x01040000));
+        CHECK(bus_read(s, gpio, 2) == 0);
+        CHECK(bus_read(s, gpio + 2, 2) == 0x0104);
+        CHECK(bus_read(s, gpio + 2, 1) == 4);
+        CHECK(bus_read(s, gpio + 3, 1) == 1);
+        CHECK(bus_read(s, gpio | UINT64_C(0xc000000000000000), 4) ==
+              UINT32_C(0x01040000));
+        bus_write(s, gpio, 0, 4);
+        CHECK(bus_read(s, gpio, 4) == UINT32_C(0x01040000));
+        bus_write(s, gpio + 2, 0xffff, 2);
+        bus_write(s, gpio + 3, 0, 1);
+        CHECK(bus_read(s, gpio, 4) == UINT32_C(0x01040000));
+        i2000_reset(s);
+    }
+    ia64_i2000_destroy(s);
+}
 static void route(Ia64I2000State *s, unsigned vector) {
     bus_write(s, IOSAPIC_BASE + IOSAPIC_REGSEL_OFF, 0x2e, 4);
     bus_write(s, IOSAPIC_BASE + IOSAPIC_WINDOW_OFF, vector, 4);
@@ -495,10 +517,122 @@ static void test_ata(void) {
     CHECK(!s->ata_irq_pending && s->ata_multiple == ATA_MAX_MULTIPLE && !s->ata_xfer_cmd);
     ia64_i2000_destroy(s);
 }
+static void test_cf9_reset(void) {
+    for (unsigned warm = 0; warm < 2; warm++) {
+        Ia64I2000State *s = machine();
+        /* The same hard-reset signal must work during SAL bootstrap and
+         * after an OS has programmed PCI/IDE and fixed SAPIC vectors. */
+        s->sac_cbnr = warm ? 0x81 : 1;
+        s->sac_ccsr = 0x80;
+        s->chipset_cfg[0][0][0x44] = 0x80;
+        s->chipset_cfg[0][0][0x45] = 6;
+        s->fw_shadow_enabled = warm;
+        merced_set_cpu_revision(s->cpu, warm ? 6 : 0);
+        io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x80008040), 4);
+        io_port_write(s, PCI_CFG_DATA, 4, 1); /* assigned chipset bus */
+        io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x80001910), 4);
+        io_port_write(s, PCI_CFG_DATA, 0x3049, 4); /* IDE BAR */
+        route_gsi(s, 14, 0x70);
+        route_gsi(s, 15, 0x60);
+        identify(s);
+        CHECK(s->atapi_data && s->atapi_irq_pending);
+        io_port_write(s, 0x376, 2, 1); /* IDE nIEN */
+        bus_write(s, 0x100000, UINT64_C(0x0123456789abcdef), 8);
+
+        io_port_write(s, RESET_CTRL_PORT, 2, 1);
+        CHECK(!s->reset_requested);
+        io_port_write(s, RESET_CTRL_PORT, 6, 1);
+        CHECK(s->reset_requested == 1);
+        CHECK(!i2000_after_step(s, MERCED_OK));
+        CHECK(s->sac_cbnr == (warm ? 0x81u : 1u) && s->sac_ccsr == 0x80);
+        CHECK(s->chipset_cfg[0][0][0x44] == 0x80 &&
+              s->chipset_cfg[0][0][0x45] == 6);
+        CHECK(s->fw_shadow_enabled && s->cpu->ip == IA64_RESET_VECTOR);
+        CHECK(s->chipset_bus == 0xff && s->cmd649_cfg[0x10] == 1);
+        for (unsigned i = 0; i < 64; i++) CHECK(s->iosapic_rte[i] == IOSAPIC_RTE_MASK);
+        CHECK(!s->atapi_data && !s->atapi_status_pending);
+        CHECK(!s->atapi_irq_pending && !s->atapi_device_control);
+        CHECK(s->atapi_status == 0x40 && s->atapi_lba_mid == 0x14 &&
+              s->atapi_lba_high == 0xeb);
+        CHECK(bus_read(s, 0x100000, 8) == UINT64_C(0x0123456789abcdef));
+        io_port_write(s, 0x177, 0xa1, 1);
+        ready(s);
+        CHECK(irq(s, 0) && !irq(s, 0x60)); /* EFI legacy interrupt routing */
+
+        /* Clearing SYS_RST requests only a processor reset. */
+        route_gsi(s, 15, 0x60);
+        io_port_write(s, RESET_CTRL_PORT, 4, 1);
+        CHECK(s->reset_requested == 2);
+        CHECK(!i2000_after_step(s, MERCED_OK));
+        CHECK(s->iosapic_rte[15] == 0x60);
+        ia64_i2000_destroy(s);
+    }
+}
+
+/* A reset clears device state, but must retain host-owned buffers and the
+ * pending flash overlay.  Windows Setup exposed a NULL high_dram pointer
+ * when the first autosave after a monitor reset wrote its 64 MiB backing. */
+static void test_reset_snapshot(void) {
+    Ia64I2000State *s = machine();
+    uint8_t *high_dram = s->high_dram;
+    const uint64_t high = I2000_HIGH_DRAM_TAG | I2000_HIGH_DRAM_BASE;
+    const uint64_t tail = high + I2000_HIGH_DRAM_SIZE - 8;
+    const uint64_t first_value = UINT64_C(0x0123456789abcdef);
+    const uint64_t last_value = UINT64_C(0xfedcba9876543210);
+    bus_write(s, high, first_value, 8);
+    bus_write(s, tail, last_value, 8);
+    snprintf(s->nvram_path, sizeof(s->nvram_path), "reset-nvram.bin");
+    s->mouse_enabled = true;
+
+    for (unsigned reset = 0; reset < 2; reset++) {
+        s->mouse_streaming = true;
+        i2000_reset(s);             /* monitor/display reset */
+        CHECK(s->high_dram == high_dram);
+        CHECK(strcmp(s->nvram_path, "reset-nvram.bin") == 0);
+        CHECK(s->mouse_enabled && !s->mouse_streaming);
+        CHECK(bus_read(s, high, 8) == first_value);
+        CHECK(bus_read(s, tail, 8) == last_value);
+
+        /* Firmware's second bootstrap stage immediately requests CF9.
+         * Reproduce the user's monitor reset -> CF9 reset -> autosave. */
+        io_port_write(s, RESET_CTRL_PORT, 0x02, 1);
+        io_port_write(s, RESET_CTRL_PORT, 0x06, 1);
+        CHECK(s->reset_requested);
+        CHECK(!i2000_after_step(s, MERCED_OK));
+        CHECK(!s->reset_requested && s->fw_shadow_enabled);
+        CHECK(s->cpu->ip == IA64_RESET_VECTOR);
+        CHECK(i2000_save_snapshot(s, "reset.vmstate"));
+        bus_write(s, high, 0, 8);
+        bus_write(s, tail, 0, 8);
+        CHECK(i2000_load_snapshot(s, "reset.vmstate"));
+        CHECK(s->high_dram == high_dram);
+        CHECK(bus_read(s, high, 8) == first_value);
+        CHECK(bus_read(s, tail, 8) == last_value);
+    }
+    /* Complete a real flash byte-program command, then reset before
+     * shutdown. No firmware file or user's NVRAM is involved. Do this
+     * after the snapshot cycles, since loadvm deliberately clears dirty. */
+    bus_write(s, I2000_FLASH_BASE + 0x20000, 0x40, 1);
+    bus_write(s, I2000_FLASH_BASE + 0x20000, 0x5a, 1);
+    CHECK(s->flash[0x20000] == 0x5a && s->nvram_dirty);
+    i2000_reset(s);
+    CHECK(s->nvram_dirty && s->flash[0x20000] == 0x5a);
+    CHECK(strcmp(s->nvram_path, "reset-nvram.bin") == 0);
+    ia64_i2000_destroy(s);          /* pending flash update must still save */
+    FILE *f = fopen("reset-nvram.bin", "rb");
+    CHECK(f);
+    CHECK(fseek(f, 0x20000, SEEK_SET) == 0);
+    CHECK(fgetc(f) == 0x5a);
+    CHECK(fclose(f) == 0);
+}
+
 int main(void) {
     test_identify(); test_control(); test_packet_phases(); test_legacy(); test_os_mask();
     test_snapshots();
     test_keyboard();
+    test_gpio_straps();
+    test_cf9_reset();
+    test_reset_snapshot();
     test_ata();   /* last: registers a global -hda drive */
     printf("i2000 ATAPI interrupt regressions: %u checks passed\n", checks);
     return 0;
