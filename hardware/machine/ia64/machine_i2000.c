@@ -903,6 +903,17 @@ static bool ata_busy(const Ia64I2000State *s) {
     return s->ata_irq_pending && s->cpu->ninsts < s->ata_irq_ready_ninsts;
 }
 
+/* Whether the 8259 pair would pass legacy ISA IRQ n to the CPU: its own
+ * mask bit clear and, for the slave's IRQs 8-15, the IRQ2 cascade too.  A
+ * masked request isn't delivered (EFI masks IRQ15 and polls the CD; an
+ * IRQ15 it never enabled left its CD driver timing out every read). */
+static bool i2000_pic_irq_open(const Ia64I2000State *s, unsigned irq) {
+    if (irq < 8)
+        return !(s->pic_master_mask & (1u << irq));
+    return !(s->pic_slave_mask & (1u << (irq - 8))) &&
+           !(s->pic_master_mask & 0x04);
+}
+
 /* Drive INTRQ out once the disk is ready: the OS's fixed GSI14 vector, or -
  * while that entry is in its reset state or ExtINT - the firmware's legacy
  * IRQ14, whose PIC edge then survives Status reads until the ExtINT
@@ -919,8 +930,8 @@ static void ata_deliver_irq(Ia64I2000State *s) {
         s->ata_irq_asserted = true;
     } else if (rte == I460GX_IOSAPIC_RTE_MASK ||
                (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) == 7)) {
-        s->ata_irq_asserted = true;
         if (s->cpu->cr[2] == 0 && s->ram_size > 0x48E) {
+            s->ata_irq_asserted = true;
             /* The SDV's "BIOS CallBacks" disk path runs the IA-32 BIOS's
              * INT 13h with cr.iva zero, where GEMU delivers no external
              * interrupts (see i2000_efi_bios_key()).  That code polls the
@@ -929,10 +940,11 @@ static void ata_deliver_irq(Ia64I2000State *s) {
              * instead, or every sector waits out the BIOS timeout (seconds
              * each, a multi-minute firmware boot). */
             s->ram[0x48E] = 0xFF;
-        } else {
+        } else if (i2000_pic_irq_open(s, 14)) {
+            s->ata_irq_asserted = true;
             s->ata_legacy_irq_latched = true;
             merced_raise_external(s->cpu, 0);
-        }
+        }   /* masked: stays pending until unmasked or acknowledged */
     }
 }
 
@@ -1652,6 +1664,29 @@ static void cmos_sync_live_clock(Ia64I2000State *s) {
     s->cmos[0x09] = cmos_bcd((unsigned)(tmv.tm_year % 100));
 }
 
+/* The two IDE channels' INTRQ lines as the 8259 sees them: asserted while
+ * a completion is pending and visible (not BSY, nIEN/SRST clear, the
+ * present drive selected) until a normal Status read lowers them.  IRR
+ * reports a raised line whether or not IMR masks it - AMI's IA-32 BIOS
+ * waits for IRQ14/15 by polling IRR with interrupts off, and EFI keeps
+ * IRQ15 masked while it does. */
+static bool i2000_ata_intrq_line(const Ia64I2000State *s) {
+    return s->ata_irq_pending && !ata_busy(s) &&
+           !(s->ata_device_control & 6) && !(s->ata_device & 0x10);
+}
+static bool i2000_atapi_intrq_line(const Ia64I2000State *s) {
+    return s->atapi_irq_pending && !(s->atapi_device_control & 6) &&
+           !(s->atapi_device & 0x10) &&
+           s->cpu->ninsts >= s->atapi_irq_ready_ninsts;
+}
+static uint8_t i2000_pic_slave_irr(const Ia64I2000State *s) {
+    uint8_t irr = 0;
+    if (s->mouse_irq_pending) irr |= 0x10;
+    if (s->ata_legacy_irq_latched || i2000_ata_intrq_line(s)) irr |= 0x40;
+    if (s->atapi_legacy_irq_latched || i2000_atapi_intrq_line(s)) irr |= 0x80;
+    return irr;
+}
+
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     static unsigned debug_reads;
     uint64_t value;
@@ -1808,8 +1843,10 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         uint8_t irr = 0;
         if (s->pit_irq_pending) irr |= 0x01;
         if (s->keyboard_irq_pending) irr |= 0x02;
+        /* IRQ2 is the slave's INT output: its unmasked requests only. */
         if (s->mouse_irq_pending || s->atapi_legacy_irq_latched ||
-            s->ata_legacy_irq_latched) irr |= 0x04;
+            s->ata_legacy_irq_latched ||
+            (i2000_pic_slave_irr(s) & (uint8_t)~s->pic_slave_mask)) irr |= 0x04;
         if (getenv("ATA_IRQ_TRACE"))
             fprintf(stderr, "i2000: PIC master %s read -> %#04x ninsts=%" PRIu64 "\n",
                     s->pic_master_read_isr ? "ISR" : "IRR",
@@ -1818,10 +1855,7 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         return s->pic_master_read_isr ? s->pic_master_isr : irr;
     }
     if (port == 0xA0 && size == 1) {
-        uint8_t irr = 0;
-        if (s->mouse_irq_pending) irr |= 0x10;
-        if (s->atapi_legacy_irq_latched) irr |= 0x80;
-        if (s->ata_legacy_irq_latched) irr |= 0x40;
+        uint8_t irr = i2000_pic_slave_irr(s);
         if (getenv("ATA_IRQ_TRACE"))
             fprintf(stderr, "i2000: PIC slave %s read -> %#04x ninsts=%" PRIu64 "\n",
                     s->pic_slave_read_isr ? "ISR" : "IRR",
@@ -5112,9 +5146,13 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
         } else if (rte == I460GX_IOSAPIC_RTE_MASK ||
                    (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) == 7)) {
             /* Preserve the firmware's reset-RTE ExtINT path. Masking a
-             * configured OS vector must not fall back to a legacy IRQ. */
-            s->atapi_legacy_irq_latched = true;
-            merced_raise_external(s->cpu, 0);
+             * configured OS vector must not fall back to a legacy IRQ, and
+             * a PIC-masked IRQ15 isn't delivered either: EFI masks it and
+             * polls the CD. */
+            if (i2000_pic_irq_open(s, 15)) {
+                s->atapi_legacy_irq_latched = true;
+                merced_raise_external(s->cpu, 0);
+            }
         }
     }
 }

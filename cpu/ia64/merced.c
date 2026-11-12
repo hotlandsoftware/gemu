@@ -5387,7 +5387,21 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         }
         return MERCED_OK;
     }
-    case 0x2C: case 0x3C: {                         /* mov cr3=r2 */
+    case 0x3C: {
+        /* Not an architected encoding (mov cr3=r2 is 0x2C).  Merced's PAL
+         * uses it beside its model-specific register accesses (0x06/0x16),
+         * e.g. writing "register 2" = 0 while it polls an MSR during a
+         * service EFI calls at runtime.  Treating it as mov cr cleared
+         * cr.iva there: EFI's timer interrupt then never fired again, so
+         * the Boot Manager and loader countdowns froze until a key was
+         * pressed.  No modelled state corresponds to it. */
+        if (getenv("MERCED_DEBUG_X6_3C"))
+            fprintf(stderr, "merced: x6=3C reg=%u value=%016" PRIX64
+                    " ip=%016" PRIX64 "\n", (unsigned)bits(raw, 20, 7),
+                    gr_read(m, r2, NULL), m->ip);
+        return MERCED_OK;
+    }
+    case 0x2C: {                                    /* mov cr3=r2 */
         unsigned cr3 = (unsigned)bits(raw, 20, 7);
         m->cr[cr3] = gr_read(m, r2, &n2);
         if (cr3 == CR_EOI) {                        /* retire highest in-service */
@@ -5399,6 +5413,12 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
             fprintf(stderr, "merced: cr.tpr <- %016" PRIX64 " at ip=%016"
                     PRIX64 " ninsts=%" PRIu64 "\n", m->cr[cr3], m->ip,
                     m->ninsts);
+        }
+        if (cr3 == CR_IVA && getenv("MERCED_DEBUG_IVA")) {
+            /* Every IVA write: who installs or drops an interrupt table. */
+            fprintf(stderr, "merced: IVA-WRITE %016" PRIX64 " ip=%016" PRIX64
+                    " b0=%016" PRIX64 " psr=%016" PRIX64 " ninsts=%" PRIu64
+                    "\n", m->cr[cr3], m->ip, m->br[0], m->psr, m->ninsts);
         }
         if (cr3 == CR_IVA) {
             static unsigned n;

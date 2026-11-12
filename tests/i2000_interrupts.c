@@ -140,7 +140,21 @@ static void test_packet_phases(void) {
 }
 static void test_legacy(void) {
     Ia64I2000State *s = machine();
-    identify(s); /* Reset RTE15 is masked: firmware's ExtINT path. */
+    /* Reset PIC masks IRQ15: an 8259 shows the request in IRR but doesn't
+     * deliver it.  AMI's IA-32 BIOS polls IRR this way with IRQ15 masked
+     * while EFI reads the CD; the master's IRQ2 cascade stays clear. */
+    identify(s);
+    CHECK(!irq(s, 0) && !irq(s, 0x60) && !s->atapi_legacy_irq_latched);
+    CHECK((io_port_read(s, 0xA0, 1) & 0x80) && !(io_port_read(s, 0x20, 1) & 0x04));
+    CHECK(io_port_read(s, 0x177, 1) == 0x48);  /* Status read lowers INTRQ */
+    CHECK(!(io_port_read(s, 0xA0, 1) & 0x80));
+    for (unsigned i = 0; i < 256; i++) io_port_read(s, 0x170, 2);
+    ready(s);
+    /* Unmasked (slave IRQ7, master cascade IRQ2): the firmware's reset-RTE
+     * ExtINT path delivers it. */
+    io_port_write(s, 0x21, 0xFB, 1);
+    io_port_write(s, 0xA1, 0x7F, 1);
+    identify(s);
     CHECK(irq(s, 0) && !irq(s, 0x60));
     CHECK(io_port_read(s, 0x177, 1) == 0x48);
     CHECK(!s->atapi_irq_pending && s->atapi_legacy_irq_latched);
@@ -408,10 +422,21 @@ static void test_ata(void) {
     CHECK(s->ram[0x48E] == 0xFF && !s->ata_legacy_irq_latched && !irq(s, 0));
     CHECK(io_port_read(s, 0x1F7, 1) == 0x58);
     ata_read_sector(s, 0);
-    /* With a firmware IVA, the legacy IRQ14 latch survives the Status read
-     * and is acknowledged as slave PIC input 6. */
+    /* With a firmware IVA but IRQ14 still masked (reset PIC), the request
+     * only shows in the slave's IRR; it is not delivered. */
     s->cpu->cr[2] = 0x10000;
     s->ram[0x48E] = 0;
+    ata_task(s, 0xE0, 2, 1, 0x20);
+    ata_wait(s);
+    CHECK(!irq(s, 0) && !s->ata_legacy_irq_latched &&
+          (io_port_read(s, 0xA0, 1) & 0x40));
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x58 && !(io_port_read(s, 0xA0, 1) & 0x40));
+    ata_read_sector(s, 2);
+    /* Unmasked as EFI leaves it (slave IRQ6, master cascade IRQ2), the
+     * legacy IRQ14 latch survives the Status read and is acknowledged as
+     * slave PIC input 6. */
+    io_port_write(s, 0x21, 0xFB, 1);
+    io_port_write(s, 0xA1, 0xBF, 1);
     ata_task(s, 0xE0, 3, 1, 0x20);
     s->cpu->ninsts += ATAPI_IRQ_LATENCY_NINSTS;
     CHECK(io_port_read(s, 0x1F7, 1) == 0x58);      /* delivers, then acks */
@@ -588,7 +613,14 @@ static void test_cf9_reset(void) {
         CHECK(bus_read(s, 0x100000, 8) == UINT64_C(0x0123456789abcdef));
         io_port_write(s, 0x177, 0xa1, 1);
         ready(s);
-        CHECK(irq(s, 0) && !irq(s, 0x60)); /* EFI legacy interrupt routing */
+        /* EFI legacy interrupt routing: reset masks IRQ15, so the request
+         * shows in the slave's IRR; unmasking it (and the cascade)
+         * delivers the ExtINT. */
+        CHECK(!irq(s, 0) && !irq(s, 0x60) && (io_port_read(s, 0xA0, 1) & 0x80));
+        io_port_write(s, 0x21, 0xFB, 1);
+        io_port_write(s, 0xA1, 0x7F, 1);
+        i2000_poll_interrupts(s);
+        CHECK(irq(s, 0) && !irq(s, 0x60));
 
         /* Clearing SYS_RST requests only a processor reset. */
         route_gsi(s, 15, 0x60);
