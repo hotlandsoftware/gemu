@@ -1,7 +1,7 @@
 #pragma once
 #include "mos6502.h"
 #include "mos6502cfg.h"
-#include "pia6821.h"
+#include "controller/pia6821.h"
 #include "okim6295.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"

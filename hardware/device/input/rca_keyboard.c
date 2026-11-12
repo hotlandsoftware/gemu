@@ -1,4 +1,4 @@
-#include "rca_keyboard.h"
+#include "input/rca_keyboard.h"
 #include <stdbool.h>
 
 void rca_device_attach(RcaConfig *cfg, RcaKeyboardType dev) {

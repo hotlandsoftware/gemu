@@ -1,4 +1,4 @@
-#include "pia6821.h"
+#include "controller/pia6821.h"
 #include <string.h>
 
 void pia6821_init(Pia6821 *p) {

@@ -1,4 +1,4 @@
-#include "i8255.h"
+#include "controller/i8255.h"
 #include <string.h>
 
 void i8255_reset(I8255 *p) {

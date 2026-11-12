@@ -1,4 +1,4 @@
-#include "m6532.h"
+#include "controller/m6532.h"
 #include <string.h>
 
 /* Cycles after the timer write at which it underflows to $FF. */

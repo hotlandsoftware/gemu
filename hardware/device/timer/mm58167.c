@@ -1,7 +1,7 @@
 /*
  * MM58167A real-time clock - see mm58167.h.
  */
-#include "mm58167.h"
+#include "timer/mm58167.h"
 #include <string.h>
 
 #define CRYSTAL_HZ 32768u

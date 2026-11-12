@@ -12,7 +12,7 @@
  *   E5 read long             E6 write long
  * Anything else ends with "invalid command".
  */
-#include "ibm_hdc.h"
+#include "storage/ibm_hdc.h"
 #include <string.h>
 
 enum { PH_IDLE, PH_CMD, PH_BUSY, PH_PIO_OUT, PH_PIO_IN, PH_DMA, PH_STATUS };

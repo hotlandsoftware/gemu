@@ -32,9 +32,9 @@
 #include "z80cfg.h"
 #include "tms9918.h"
 #include "msm5205.h"
-#include "mm58167.h"
-#include "adc0809.h"
-#include "ppi8255.h"
+#include "timer/mm58167.h"
+#include "controller/adc0809.h"
+#include "controller/ppi8255.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
 #include <SDL2/SDL.h>

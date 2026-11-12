@@ -1,7 +1,7 @@
 /*
  * 8255A PPI - see ppi8255.h.
  */
-#include "ppi8255.h"
+#include "controller/ppi8255.h"
 
 void ppi8255_reset(Ppi8255 *p) {
     p->control = 0x9B;   /* mode 0, all inputs */

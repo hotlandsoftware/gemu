@@ -1,6 +1,6 @@
 #pragma once
 #include "mos6502cfg.h"
-#include "fds.h"
+#include "storage/fds.h"
 #include "mos6502.h"
 #include "rp2c02.h"
 #include "apu2a03.h"
@@ -13,7 +13,7 @@
 #include "nes_boards.h"
 #include "nes_pins.h"
 #ifdef HAVE_ROB
-#  include "rob.h"
+#  include "input/rob.h"
 #  include "rob_window.h"
 #endif
 #ifdef HAVE_LUA

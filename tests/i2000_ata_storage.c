@@ -128,8 +128,8 @@ int main(void) {
                       .display_type = GEMU_DISPLAY_NONE};
     Ia64I2000State *s = ia64_i2000_create(&cfg);
     CHECK(s && s->hda);
-    bus_write(s, IOSAPIC_BASE + IOSAPIC_REGSEL_OFF, 0x2c, 4);
-    bus_write(s, IOSAPIC_BASE + IOSAPIC_WINDOW_OFF, VECTOR, 4);
+    bus_write(s, I460GX_IOSAPIC_BASE, 0x2c, 4);
+    bus_write(s, I460GX_IOSAPIC_BASE + 0x10, VECTOR, 4);
     const unsigned counts[] = {1, 2, 15, 16, 17, 255, 256};
     const unsigned blocks[] = {0, 1, 2, 4, 8, 16};
     for (unsigned width = 1; width <= 8; width *= 2)

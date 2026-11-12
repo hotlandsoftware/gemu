@@ -1,5 +1,5 @@
 #pragma once
-#include "fds.h"
+#include "storage/fds.h"
 
 /* Fill f->bios[] with a minimal stub ROM:
  *   $E18B  NMI  → JMP ($DFFA)

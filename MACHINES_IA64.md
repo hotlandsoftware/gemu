@@ -26,6 +26,12 @@
 The machine definition recognizes the SDV EFI 0.99 debug image and HP firmware
 revisions 1.17c and 1.30. Firmware images are not distributed with GEMU.
 
+The reusable 460GX model lives in `hardware/device/chipset/i460gx.c` and `i460gx.h`,
+alongside the other hardware devices. It owns SAC/SDC and expander configuration,
+memory-card I2C routing, IFB PCI/SMBus/PM/UHCI registers, and the I/O SAPIC.
+`hardware/machine/ia64/machine_i2000.c` supplies the bridge topology, DIMM SPD
+contents, clock and firmware callbacks, memory map, and device-to-CPU wiring.
+
 ## Physical memory map
 
 | Range | What |
@@ -95,13 +101,9 @@ emulator does not create periodic snapshots. Keep the same `-rom` and
 `-cdrom`/`-drive` arguments when restoring a checkpoint; explicitly configured
 CD media is retained across the restore.
 
-Cold boot after updating from versions with the incorrect EFI RAM map.
-Existing snapshots retain their old firmware memory descriptors and cannot
-pick up the RAM-discovery fix merely by being loaded into a newer emulator.
-Checkpoints made before the register-stack fixes also retain old backing-store
-and NaT state. Firmware PCI bus numbers and resource assignments likewise
-remain in old snapshots; the corrected chipset registers do not repair those
-assignments on restore. Use a cold boot when validating these fixes.
+The 460GX separation introduces snapshot format version 31. Earlier snapshots
+are rejected before loading any guest state; cold boot after updating. Disk
+images and persistent NVRAM are separate from this snapshot format change.
 
 NVRAM is stored per firmware image under the GEMU configuration directory.
 If firmware state becomes unusable after changing ROMs, remove only the
@@ -167,13 +169,13 @@ decoding, and the IFB ACPI enable/disable handshake. Correcting the expander
 count prevents firmware from assigning buses to nonexistent links. The ACPI
 register window follows its programmed base independently of GPIO straps.
 The empty UHCI controller supports reset, run/stop status, disconnected root
-ports, and relocatable I/O registers. Version 26 snapshots preserve its state
-along with the ACPI state added in version 25.
+ports, and relocatable I/O registers. Snapshots preserve its state along with
+the chipset's PCI, SMBus, ACPI, and interrupt registers.
 
 ATAPI interrupt checks cover IOSAPIC routing, interrupt masking, status
 acknowledgement, device reset, and separate IDENTIFY and PACKET completion
-behavior. Version 27 snapshots preserve the interrupt and command-phase
-state; regression checks also load snapshots from versions 24 through 26.
+behavior. Snapshot checks cover interrupt and command-phase state, chipset
+callback rebinding, and rejection of incompatible snapshot versions.
 Machine-reset checks preserve memory backing and pending NVRAM updates across
 monitor resets, firmware processor resets, and subsequent snapshot save/load.
 Reset previously cleared a host memory pointer, causing the next autosave to
@@ -253,11 +255,16 @@ preserving dirty and current-frame registers, RNAT collection boundaries and
 byte order, and fill faults that retry at the return target without popping
 the frame twice. CPU checks exercise both slow and fast execution paths.
 
+The standalone chipset check links the 460GX without a machine or CPU. It
+exercises alternate bridge wiring, independent board callbacks and clocks,
+SPD access, interrupt delivery, and cold/warm reset behavior.
+
 Build and run these ROM-independent checks with:
 
 ```sh
 ./configure --target-list=ia64 --build-dir=build/ia64 --bindir=bin
 ninja
+python3 tools/ia64/run_i460gx_test.py
 python3 tools/ia64/run_i2000_memory_test.py
 python3 tools/ia64/run_i2000_interrupt_test.py
 python3 tools/ia64/run_i2000_ata_storage_test.py

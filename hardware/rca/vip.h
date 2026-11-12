@@ -4,7 +4,7 @@
 #include "cdp1869.h"
 #include "rca.h"
 #include "pcspk.h"
-#include "tape.h"
+#include "storage/tape.h"
 #include "gemu/monitor.h"
 #include <stdlib.h>
 

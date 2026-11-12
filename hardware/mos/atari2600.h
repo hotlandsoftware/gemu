@@ -2,7 +2,7 @@
 #include "mos6502.h"
 #include "mos6502cfg.h"
 #include "tia.h"
-#include "m6532.h"
+#include "controller/m6532.h"
 #include "a2600_cart.h"
 #include "hex_editor.h"
 #include "gemu/monitor.h"

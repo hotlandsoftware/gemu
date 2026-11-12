@@ -63,7 +63,8 @@ FAMILY_SRC = {
         'cpu/ia64/merced_ia32.c',
         'hardware/machine/ia64/machine_i2000.c',
         'hardware/machine/ia64/machine_generic_ia64.c',
-        'hardware/device/ps2_keyboard.c',
+        'hardware/device/chipset/i460gx.c',
+        'hardware/device/input/ps2_keyboard.c',
         'hardware/device/network/i82559.c',
         'hardware/romdb.c',
         'vga/multi/input_menu.c',
@@ -85,26 +86,26 @@ FAMILY_SRC = {
         'hardware/machine/mos/machine_mos.c', 'hardware/machine/mos/machine_apple1.c',
         'hardware/machine/mos/machine_nes.c', 'hardware/machine/mos/nes_boards.c',
         'hardware/machine/mos/machine_kim1.c',
-        'hardware/machine/mos/machine_5clown.c', 'hardware/device/pia6821.c',
+        'hardware/machine/mos/machine_5clown.c', 'hardware/device/controller/pia6821.c',
         'hardware/machine/mos/machine_magicfly.c',
         'hardware/machine/mos/machine_um6578.c',
         'hardware/machine/mos/machine_atari400.c',
         'hardware/machine/mos/machine_atari2600.c', 'hardware/machine/mos/a2600_cart.c',
         'hardware/machine/mos/a2600_debug.c', 'hardware/machine/mos/a2600_bus.c',
-        'vga/mos/tia.c', 'audio/tia_sound.c', 'hardware/device/m6532.c',
+        'vga/mos/tia.c', 'audio/tia_sound.c', 'hardware/device/controller/m6532.c',
         'vga/mos/antic.c', 'audio/pokey.c',
         'crt/ntsc_decode.c', 'crt/nes_ntsc_encode.c', 'crt/crt_tube.c',
-        'hardware/device/fds.c', 'hardware/device/fds_hle.c',
-        'hardware/device/vt100.c', 'hardware/romdb.c',
+        'hardware/device/storage/fds.c', 'hardware/device/storage/fds_hle.c',
+        'hardware/device/terminal/vt100.c', 'hardware/romdb.c',
         # Hex editors, chosen by display at run time (hex_editor_select.c):
         # the native Win32 one is empty off Windows, the SDL one on it; the
         # GTK one is FAMILY_SRC_GTK's.
-        'hardware/device/hex_editor_select.c',
-        'hardware/device/hex_editor_win32.c',
-        'hardware/device/hex_editor_sdl.c',
-        'hardware/device/nes_cheats.c', 'hardware/device/cheat_dialog_sdl.c',
-        'hardware/machine/mos/nes_pins.c', 'hardware/device/nes_pin_panel.c',
-        'hardware/device/nes_pin_window_sdl.c',
+        'window/hex_editor_select.c',
+        'window/hex_editor_win32.c',
+        'window/hex_editor_sdl.c',
+        'hardware/machine/mos/nes_cheats.c', 'window/cheat_dialog_sdl.c',
+        'hardware/machine/mos/nes_pins.c', 'window/nes_pin_panel.c',
+        'window/nes_pin_window_sdl.c',
         'src/mos_setup.c',
     ],
     'rca': [
@@ -113,14 +114,14 @@ FAMILY_SRC = {
         'audio/pcspk.c',
         'hardware/machine/rca/machine_vip.c', 'hardware/machine/rca/machine_destroyer.c',
         'hardware/machine/rca/machine_studio2.c', 'hardware/machine/rca/machine_pecom.c',
-        'hardware/device/rca_keyboard.c', 'hardware/device/tape.c', 'hardware/romdb.c',
+        'hardware/device/input/rca_keyboard.c', 'hardware/device/storage/tape.c', 'hardware/romdb.c',
         'src/rca_setup.c',
     ],
     'x86': [
         'cpu/x86/i8086.c',
-        'hardware/device/i8237.c', 'hardware/device/i8259.c', 'hardware/device/upd765.c',
-        'hardware/device/i8253.c', 'hardware/device/i8255.c', 'hardware/device/ibm_hdc.c',
-        'hardware/device/ins8250.c', 'hardware/device/msmouse.c',
+        'hardware/device/controller/i8237.c', 'hardware/device/controller/i8259.c', 'hardware/device/storage/upd765.c',
+        'hardware/device/timer/i8253.c', 'hardware/device/controller/i8255.c', 'hardware/device/storage/ibm_hdc.c',
+        'hardware/device/serial/ins8250.c', 'hardware/device/input/msmouse.c',
         'hardware/machine/x86/machine_ibm5150.c', 'audio/pcspk.c',
         'vga/x86/cga.c', 'vga/x86/cgafont8x8.c', 'vga/x86/mda.c', 'vga/x86/mdafont8x14.c', 'vga/x86/hercules.c',
         'vga/multi/input_menu.c',
@@ -132,15 +133,15 @@ FAMILY_SRC = {
         'hardware/machine/z80/machine_z80.c',
         'hardware/machine/z80/machine_lagonda.c',
         'vga/multi/tms9918.c', 'audio/msm5205.c',
-        'hardware/device/mm58167.c', 'hardware/device/adc0809.c', 'hardware/device/ppi8255.c',
+        'hardware/device/timer/mm58167.c', 'hardware/device/controller/adc0809.c', 'hardware/device/controller/ppi8255.c',
         'hardware/romdb.c',
         'src/z80_setup.c',
     ],
 }
 
 FAMILY_SRC_GTK = {
-    'mos': ['hardware/device/hex_editor.c', 'hardware/device/cheat_dialog_gtk.c',
-            'hardware/device/nes_pin_window_gtk.c'],
+    'mos': ['window/hex_editor_gtk.c', 'window/cheat_dialog_gtk.c',
+            'window/nes_pin_window_gtk.c'],
 }
 
 FAMILY_SRC_ALSA = {
@@ -152,11 +153,11 @@ FAMILY_SRC_WINMIDI = {
 }
 
 FAMILY_SRC_ROB = {
-    'mos': ['hardware/device/rob.c', 'hardware/device/rob_window.c'],
+    'mos': ['hardware/device/input/rob.c', 'window/rob_window.c'],
 }
 
 FAMILY_SRC_LUA = {
-    'mos': ['hardware/device/nes_lua.c'],
+    'mos': ['hardware/machine/mos/nes_lua.c'],
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -630,7 +631,7 @@ def main():
 
     # All sources share a single unified include path - no per-family separation.
     inc_dirs = ['core/include', 'core/third_party/cjson', 'cpu', 'vga', 'audio', 'crt',
-                'hardware', 'hardware/machine', 'hardware/device',
+                'hardware', 'hardware/machine', 'hardware/device', 'window',
                 'hardware/chip8', 'hardware/ia64', 'hardware/mos',
                 'hardware/other', 'hardware/rca', 'hardware/x86', 'hardware/z80',
                 'hardware/machine/chip8', 'hardware/machine/ia64',
@@ -686,7 +687,7 @@ def main():
         if have_winmidi:
             ld_parts += ['-lwinmm']
         if 'mos' in targets:
-            # Native Win32 hex editor (hardware/device/hex_editor_win32.c): tab control
+            # Native Win32 hex editor (window/hex_editor_win32.c): tab control
             # + SetWindowSubclass need comctl32, and the GDI text/bitmap
             # calls need gdi32 - neither is in MinGW's default link set
             # (user32, pulled in by the existing SDL File-menu code, is).

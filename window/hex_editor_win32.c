@@ -1,5 +1,5 @@
 /*
- * Native Win32 hex editor - GTK-free equivalent of hex_editor.c.
+ * Native Win32 hex editor - GTK-free equivalent of hex_editor_gtk.c.
  *
  * One tab-per-region window (SysTabControl32) whose page is a single
  * owner-drawn child (class "GemuHexView") that paints directly from the
@@ -67,7 +67,7 @@ struct HexEditorWin32 {
 static ATOM g_view_class;
 static ATOM g_win_class;
 
-/* ── Formatting (mirrors hex_editor.c's format_hex_line/hex_byte_col) ────── */
+/* ── Formatting (mirrors hex_editor_gtk.c's format_hex_line/hex_byte_col) ── */
 
 static int hex_byte_col(int i) {
     int col = HEX_DATA_START + i * 3;

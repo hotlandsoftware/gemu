@@ -3,9 +3,9 @@
 #endif
 #include "nes.h"
 #include "gemu/util.h"
-#include "fds.h"
+#include "storage/fds.h"
 #include "romdb.h"
-#include "fds_hle.h"
+#include "storage/fds_hle.h"
 #include "apu2a03.h"
 #include "nes_ntsc_encode.h"
 #include "ntsc_decode.h"

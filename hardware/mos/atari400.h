@@ -3,7 +3,7 @@
 #include "mos6502cfg.h"
 #include "antic.h"
 #include "pokey.h"
-#include "pia6821.h"
+#include "controller/pia6821.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
 #include <stdint.h>

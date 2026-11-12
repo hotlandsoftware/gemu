@@ -8,7 +8,7 @@
 #include "um6578.h"
 #include "atari400.h"
 #include "atari2600.h"
-#include "vt100.h"
+#include "terminal/vt100.h"
 #include "romdb.h"
 #include "gemu/gemu.h"
 #include "gemu/args.h"

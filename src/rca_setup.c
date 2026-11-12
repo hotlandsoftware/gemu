@@ -4,7 +4,7 @@
 #include "studio2.h"
 #include "pecom.h"
 #include "romdb.h"
-#include "rca_keyboard.h"
+#include "input/rca_keyboard.h"
 #include "gemu/gemu.h"
 #include "gemu/args.h"
 #include "gemu/monitor.h"

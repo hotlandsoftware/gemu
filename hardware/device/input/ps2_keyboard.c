@@ -1,6 +1,6 @@
 /* Generic PS/2 Keyboard Device */
 
-#include "ps2_keyboard.h"
+#include "input/ps2_keyboard.h"
 
 #include <string.h>
 

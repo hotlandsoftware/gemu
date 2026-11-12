@@ -1,7 +1,7 @@
 /*
  * ADC0809 - see adc0809.h.
  */
-#include "adc0809.h"
+#include "controller/adc0809.h"
 #include <math.h>
 #include <string.h>
 

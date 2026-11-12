@@ -7,7 +7,7 @@
  *             vt100_key_available / vt100_poll / vt100_should_quit
  */
 
-#include "vt100.h"
+#include "terminal/vt100.h"
 #include "gemu/gemu_display.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,7 +16,7 @@
 #include <stdbool.h>
 
 #ifdef HAVE_TTF
-#include "vt100_font.h"
+#include "terminal/vt100_font.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 

@@ -37,13 +37,13 @@ static void test_gpio_straps(void) {
         bus_write(s, gpio + 2, 0xffff, 2);
         bus_write(s, gpio + 3, 0, 1);
         CHECK(bus_read(s, gpio, 4) == UINT32_C(0x01040000));
-        i2000_reset(s);
+        i2000_reset(s, false);
     }
     ia64_i2000_destroy(s);
 }
 static void route(Ia64I2000State *s, unsigned vector) {
-    bus_write(s, IOSAPIC_BASE + IOSAPIC_REGSEL_OFF, 0x2e, 4);
-    bus_write(s, IOSAPIC_BASE + IOSAPIC_WINDOW_OFF, vector, 4);
+    bus_write(s, I460GX_IOSAPIC_BASE, 0x2e, 4);
+    bus_write(s, I460GX_IOSAPIC_BASE + 0x10, vector, 4);
 }
 static void ready(Ia64I2000State *s) {
     s->cpu->ninsts += ATAPI_IRQ_LATENCY_NINSTS;
@@ -157,7 +157,7 @@ static void test_legacy(void) {
 }
 static void test_os_mask(void) {
     Ia64I2000State *s = machine();
-    route(s, 0x60 | IOSAPIC_RTE_MASK);
+    route(s, 0x60 | I460GX_IOSAPIC_RTE_MASK);
     identify(s);
     CHECK(!irq(s, 0x60) && !irq(s, 0));
     CHECK(s->atapi_irq_pending && !s->atapi_irq_asserted);
@@ -167,8 +167,8 @@ static void test_os_mask(void) {
     ia64_i2000_destroy(s);
 }
 static void route_gsi(Ia64I2000State *s, unsigned gsi, uint32_t rte) {
-    bus_write(s, IOSAPIC_BASE + IOSAPIC_REGSEL_OFF, 0x10 + 2 * gsi, 4);
-    bus_write(s, IOSAPIC_BASE + IOSAPIC_WINDOW_OFF, rte, 4);
+    bus_write(s, I460GX_IOSAPIC_BASE, 0x10 + 2 * gsi, 4);
+    bus_write(s, I460GX_IOSAPIC_BASE + 0x10, rte, 4);
 }
 /* Windows' i8042 driver takes IRQ1 through the fixed vector it programs in
  * GSI1 (0x80 in XP Setup).  One edge per byte the 8042 makes available:
@@ -195,7 +195,7 @@ static void test_keyboard(void) {
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x80) && !irq(s, 0));
     s->pic_master_mask = 0xf8;         /* PIC IRQ1 open, as Windows leaves it */
-    route_gsi(s, 1, 0x80 | IOSAPIC_RTE_MASK);
+    route_gsi(s, 1, 0x80 | I460GX_IOSAPIC_RTE_MASK);
     i2000_type_key(s, 'b');
     s->cpu->ninsts += 1000000;
     i2000_poll_interrupts(s);
@@ -218,32 +218,17 @@ static void test_keyboard(void) {
     CHECK(s->keyboard_gsi_asserted);
     ia64_i2000_destroy(s);
 }
-/* Produce exact prior-version tails from the current snapshot, preserving
- * the CPU position. This catches struct padding and migration mistakes. */
-static void old_snapshot(unsigned version, size_t old_size) {
-    FILE *in = fopen("irq-current.vmstate", "rb");
+/* An unsupported version must be rejected from its header, without reading
+ * a differently laid-out payload or changing the running machine. */
+static void old_snapshot(unsigned version, uint64_t ram_size) {
     FILE *out = fopen("irq-old.vmstate", "wb");
-    CHECK(in && out);
-    CHECK(!fseek(in, 0, SEEK_END));
-    long length = ftell(in);
-    rewind(in);
-    long prefix = length - sizeof(Merced) - sizeof(Ia64I2000State) + old_size;
-    uint8_t bytes[65536];
-    for (long left = prefix; left;) {
-        size_t n = left > (long)sizeof(bytes) ? sizeof(bytes) : (size_t)left;
-        CHECK(fread(bytes, 1, n, in) == n && fwrite(bytes, 1, n, out) == n);
-        left -= n;
-    }
-    CHECK(!fseek(in, length - sizeof(Merced), SEEK_SET));
-    for (size_t left = sizeof(Merced); left;) {
-        size_t n = left > sizeof(bytes) ? sizeof(bytes) : left;
-        CHECK(fread(bytes, 1, n, in) == n && fwrite(bytes, 1, n, out) == n);
-        left -= n;
-    }
+    CHECK(out);
+    uint64_t magic = I2000_SNAPSHOT_MAGIC;
     uint32_t v = version;
-    CHECK(!fseek(out, 8, SEEK_SET));
+    CHECK(fwrite(&magic, sizeof(magic), 1, out) == 1);
     CHECK(fwrite(&v, sizeof(v), 1, out) == 1);
-    fclose(in); fclose(out);
+    CHECK(fwrite(&ram_size, sizeof(ram_size), 1, out) == 1);
+    CHECK(fclose(out) == 0);
 }
 static void test_snapshots(void) {
     Ia64I2000State *s = machine();
@@ -273,31 +258,81 @@ static void test_snapshots(void) {
     io_port_write(s, 0x376, 0, 1);
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x60));
-    const size_t old_sizes[] = {
-        offsetof(Ia64I2000State, acpi_pm),
-        offsetof(Ia64I2000State, uhci_regs),
-        offsetof(Ia64I2000State, atapi_device_control),
-        0, /* v27: checked separately below */
-    };
-    for (unsigned version = 24; version <= 26; version++) {
-        old_snapshot(version, old_sizes[version - 24]);
-        CHECK(i2000_load_snapshot(s, "irq-old.vmstate"));
+    for (unsigned version = 9; version < I2000_SNAPSHOT_VERSION; version++) {
+        old_snapshot(version, s->ram_size);
+        s->ram[0x1234] = 0x5a;
+        s->chipset.sac_ccsr = 0x12345678;
+        CHECK(!i2000_load_snapshot(s, "irq-old.vmstate"));
+        CHECK(s->ram[0x1234] == 0x5a);
+        CHECK(s->chipset.sac_ccsr == 0x12345678);
         CHECK(s->cpu->gr_static[8] == UINT64_C(0x123456789abcdef0));
-        CHECK(s->atapi_device_control == 0 && !s->atapi_irq_asserted);
-        CHECK(!s->atapi_packet_command && s->atapi_irq_pending);
-        i2000_poll_interrupts(s);
+        CHECK(s->atapi_irq_pending && s->atapi_irq_asserted);
         CHECK(irq(s, 0x60));
     }
-    /* v27 ends in bools; its sizeof() padding now holds v28's keyboard edge.
-     * Loading it must keep the CPU state aligned and clear the new field. */
-    io_port_read(s, 0x177, 1);
-    s->keyboard_gsi_asserted = true;
-    CHECK(i2000_save_snapshot(s, "irq-current.vmstate"));
-    old_snapshot(27, (offsetof(Ia64I2000State, keyboard_gsi_asserted) + 7u) & ~7u);
-    CHECK(i2000_load_snapshot(s, "irq-old.vmstate"));
+    /* Rejected input did not overwrite the valid checkpoint. */
+    CHECK(i2000_load_snapshot(s, "irq-current.vmstate"));
+    CHECK(s->atapi_device_control == 2 && !s->atapi_irq_asserted);
     CHECK(s->cpu->gr_static[8] == UINT64_C(0x123456789abcdef0));
-    CHECK(!s->keyboard_gsi_asserted);
     ia64_i2000_destroy(s);
+}
+static void pci_write(Ia64I2000State *s, unsigned bus, unsigned dev,
+                       unsigned fun, unsigned reg, uint32_t value) {
+    io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x80000000) | bus << 16 |
+                  dev << 11 | fun << 8 | (reg & 0xfc), 4);
+    io_port_write(s, PCI_CFG_DATA + (reg & 3), value, 4);
+}
+static void test_chipset_snapshot(void) {
+    Ia64I2000State *source = machine();
+    bus_write(source, I460GX_SAC_CBNR, 0x81, 4);
+    bus_write(source, I460GX_SAC_CCSR, 0x80, 4);
+    pci_write(source, 0, 0x10, 0, 0x40, 0x32); /* CBN */
+    pci_write(source, 0x32, 0, 0, 0x44, 0x680);
+    pci_write(source, 0x32, 5, 4, 0x48, 1);   /* memory-card row select */
+    pci_write(source, 0, 3, 3, 0x20, 0x1a01); /* SMBus */
+    pci_write(source, 0, 3, 3, 4, 1);
+    io_port_write(source, 0x1a03, 2, 1);
+    io_port_write(source, 0x1a04, 0xa1, 1);
+    io_port_write(source, 0x1a02, 0x48, 1);
+    pci_write(source, 0, 3, 0, 0x40, 0xa01);  /* PM */
+    pci_write(source, 0, 3, 0, 0x44, 1);
+    io_port_write(source, 0xa04, 0x400, 2);
+    io_port_write(source, 0xb2, 0xa0, 1);
+    pci_write(source, 0, 3, 2, 0x20, 0x1201); /* UHCI */
+    pci_write(source, 0, 3, 2, 4, 1);
+    io_port_write(source, 0x1206, 42, 2);
+    io_port_write(source, 0x1200, 1, 2);
+    route_gsi(source, 1, 0x80);
+    CHECK(i2000_save_snapshot(source, "chipset.vmstate"));
+
+    /* Restore into another board so stale callback pointers are observable. */
+    Ia64I2000State *s = machine();
+    CHECK(i2000_load_snapshot(s, "chipset.vmstate"));
+    CHECK(s->chipset.sac_cbnr == 0x81 && s->chipset.sac_ccsr == 0x80);
+    CHECK(s->chipset.chipset_bus == 0x32);
+    CHECK(s->chipset.chipset_cfg[0][0][0x45] == 6);
+    CHECK(s->chipset.memcard_cfg[0][4][0x48] == 1);
+    CHECK(io_port_read(s, 0x1a00, 1) == 2);
+    CHECK(io_port_read(s, 0x1a05, 1) == 4);
+    CHECK(io_port_read(s, 0xa04, 2) == 0x401);
+    CHECK(io_port_read(s, 0xb2, 1) == 0xa0);
+    CHECK(io_port_read(s, 0x1206, 2) == 42);
+    CHECK(s->chipset.config.opaque == s);
+    s->spd[0][2] = 0x5a;
+    io_port_write(s, 0x1a02, 0x48, 1);
+    CHECK(io_port_read(s, 0x1a05, 1) == 0x5a);
+    CHECK(io_port_read(source, 0x1a05, 1) == 4);
+    io_port_write(s, 0xb2, 0xa1, 1);
+    CHECK(io_port_read(s, 0xa04, 2) == 0x400);
+    CHECK(io_port_read(source, 0xa04, 2) == 0x401);
+    s->cpu->ar[44] += I2000_ITC_HZ / 1000;
+    CHECK(io_port_read(s, 0xa08, 4) == 3579);
+    CHECK(io_port_read(s, 0x1206, 2) == 43);
+    CHECK(io_port_read(source, 0x1206, 2) == 42);
+    i2000_type_key(s, 'a');
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x80) && !irq(source, 0x80));
+    ia64_i2000_destroy(s);
+    ia64_i2000_destroy(source);
 }
 /* Primary-channel ATA disk, as Windows' IDE driver uses it (GSI14). */
 static void ata_wait(Ia64I2000State *s) {
@@ -503,18 +538,14 @@ static void test_ata(void) {
     ata_wait(s);
     CHECK(!irq(s, 0x70));
 
-    /* v29 snapshot round trip, and a v28 tail (ending in bools whose
-     * padding v29's first fields occupy) loading with clean ATA state. */
+    /* Current snapshot round trip preserves an outstanding ATA command. */
     ata_task(s, 0xE0, 0, 1, 0x40);
     s->cpu->gr_static[8] = UINT64_C(0x0fedcba987654321);
     CHECK(i2000_save_snapshot(s, "irq-current.vmstate"));
     ata_clear_irq(s);
     CHECK(i2000_load_snapshot(s, "irq-current.vmstate"));
     CHECK(s->ata_irq_pending && s->ata_multiple == 2);
-    old_snapshot(28, (offsetof(Ia64I2000State, ata_irq_pending) + 7u) & ~7u);
-    CHECK(i2000_load_snapshot(s, "irq-old.vmstate"));
     CHECK(s->cpu->gr_static[8] == UINT64_C(0x0fedcba987654321));
-    CHECK(!s->ata_irq_pending && s->ata_multiple == ATA_MAX_MULTIPLE && !s->ata_xfer_cmd);
     ia64_i2000_destroy(s);
 }
 static void test_cf9_reset(void) {
@@ -522,10 +553,10 @@ static void test_cf9_reset(void) {
         Ia64I2000State *s = machine();
         /* The same hard-reset signal must work during SAL bootstrap and
          * after an OS has programmed PCI/IDE and fixed SAPIC vectors. */
-        s->sac_cbnr = warm ? 0x81 : 1;
-        s->sac_ccsr = 0x80;
-        s->chipset_cfg[0][0][0x44] = 0x80;
-        s->chipset_cfg[0][0][0x45] = 6;
+        s->chipset.sac_cbnr = warm ? 0x81 : 1;
+        s->chipset.sac_ccsr = 0x80;
+        s->chipset.chipset_cfg[0][0][0x44] = 0x80;
+        s->chipset.chipset_cfg[0][0][0x45] = 6;
         s->fw_shadow_enabled = warm;
         merced_set_cpu_revision(s->cpu, warm ? 6 : 0);
         io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x80008040), 4);
@@ -544,12 +575,12 @@ static void test_cf9_reset(void) {
         io_port_write(s, RESET_CTRL_PORT, 6, 1);
         CHECK(s->reset_requested == 1);
         CHECK(!i2000_after_step(s, MERCED_OK));
-        CHECK(s->sac_cbnr == (warm ? 0x81u : 1u) && s->sac_ccsr == 0x80);
-        CHECK(s->chipset_cfg[0][0][0x44] == 0x80 &&
-              s->chipset_cfg[0][0][0x45] == 6);
+        CHECK(s->chipset.sac_cbnr == (warm ? 0x81u : 1u) && s->chipset.sac_ccsr == 0x80);
+        CHECK(s->chipset.chipset_cfg[0][0][0x44] == 0x80 &&
+              s->chipset.chipset_cfg[0][0][0x45] == 6);
         CHECK(s->fw_shadow_enabled && s->cpu->ip == IA64_RESET_VECTOR);
-        CHECK(s->chipset_bus == 0xff && s->cmd649_cfg[0x10] == 1);
-        for (unsigned i = 0; i < 64; i++) CHECK(s->iosapic_rte[i] == IOSAPIC_RTE_MASK);
+        CHECK(s->chipset.chipset_bus == 0xff && s->cmd649_cfg[0x10] == 1);
+        for (unsigned i = 0; i < 64; i++) CHECK(s->chipset.iosapic_rte[i] == I460GX_IOSAPIC_RTE_MASK);
         CHECK(!s->atapi_data && !s->atapi_status_pending);
         CHECK(!s->atapi_irq_pending && !s->atapi_device_control);
         CHECK(s->atapi_status == 0x40 && s->atapi_lba_mid == 0x14 &&
@@ -564,7 +595,7 @@ static void test_cf9_reset(void) {
         io_port_write(s, RESET_CTRL_PORT, 4, 1);
         CHECK(s->reset_requested == 2);
         CHECK(!i2000_after_step(s, MERCED_OK));
-        CHECK(s->iosapic_rte[15] == 0x60);
+        CHECK(s->chipset.iosapic_rte[15] == 0x60);
         ia64_i2000_destroy(s);
     }
 }
@@ -586,7 +617,7 @@ static void test_reset_snapshot(void) {
 
     for (unsigned reset = 0; reset < 2; reset++) {
         s->mouse_streaming = true;
-        i2000_reset(s);             /* monitor/display reset */
+        i2000_reset(s, false);             /* monitor/display reset */
         CHECK(s->high_dram == high_dram);
         CHECK(strcmp(s->nvram_path, "reset-nvram.bin") == 0);
         CHECK(s->mouse_enabled && !s->mouse_streaming);
@@ -615,7 +646,7 @@ static void test_reset_snapshot(void) {
     bus_write(s, I2000_FLASH_BASE + 0x20000, 0x40, 1);
     bus_write(s, I2000_FLASH_BASE + 0x20000, 0x5a, 1);
     CHECK(s->flash[0x20000] == 0x5a && s->nvram_dirty);
-    i2000_reset(s);
+    i2000_reset(s, false);
     CHECK(s->nvram_dirty && s->flash[0x20000] == 0x5a);
     CHECK(strcmp(s->nvram_path, "reset-nvram.bin") == 0);
     ia64_i2000_destroy(s);          /* pending flash update must still save */
@@ -629,6 +660,7 @@ static void test_reset_snapshot(void) {
 int main(void) {
     test_identify(); test_control(); test_packet_phases(); test_legacy(); test_os_mask();
     test_snapshots();
+    test_chipset_snapshot();
     test_keyboard();
     test_gpio_straps();
     test_cf9_reset();

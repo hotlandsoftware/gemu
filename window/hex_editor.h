@@ -1,9 +1,9 @@
 #pragma once
 /* Debug > Hex Editor.  Three implementations, chosen by the display in use
  * (hex_editor_select.c), as the Game Genie window chooses its own:
- *   hardware/device/hex_editor.c        GTK, with -display gtk (GTK builds)
- *   hardware/device/hex_editor_sdl.c    an SDL window, with -display sdl
- *   hardware/device/hex_editor_win32.c  native Win32, with -display sdl on Windows
+ *   window/hex_editor_gtk.c    GTK, with -display gtk (GTK builds)
+ *   window/hex_editor_sdl.c    an SDL window, with -display sdl
+ *   window/hex_editor_win32.c  native Win32, with -display sdl on Windows
  * Every build compiles the ones its platform can run. */
 #include <stdint.h>
 #include <stdbool.h>

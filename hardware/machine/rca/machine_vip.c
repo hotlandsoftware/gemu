@@ -3,7 +3,7 @@
 #endif
 #include "vip.h"
 #include "gemu/util.h"
-#include "rca_keyboard.h"
+#include "input/rca_keyboard.h"
 #include "gemu/gemu.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"

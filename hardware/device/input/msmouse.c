@@ -1,5 +1,5 @@
 /* Microsoft serial mouse: see msmouse.h. */
-#include "msmouse.h"
+#include "input/msmouse.h"
 #include <string.h>
 
 #define START_US 10000          /* from power to 'M' */

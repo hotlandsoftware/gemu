@@ -1,4 +1,4 @@
-#include "i8253.h"
+#include "timer/i8253.h"
 #include <string.h>
 
 static void set_out(I8253 *p, unsigned idx, bool level) {

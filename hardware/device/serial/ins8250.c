@@ -1,5 +1,5 @@
 /* INS8250 UART: see ins8250.h. */
-#include "ins8250.h"
+#include "serial/ins8250.h"
 
 #define LSR_DR   0x01
 #define LSR_OE   0x02
