@@ -232,6 +232,45 @@ static void test_keyboard(void) {
     CHECK(s->keyboard_gsi_asserted);
     ia64_i2000_destroy(s);
 }
+/* Windows routes the 8042's aux output (IRQ12) through GSI12 too.  Without
+ * it, an unread mouse byte sits first in the single 8042 output buffer and
+ * starves the keyboard as well.  Like IRQ1: one edge per byte, re-armed by a
+ * data-port read; and the 8042 only drives IRQ12 with command-byte INT2. */
+static void test_mouse(void) {
+    Ia64I2000State *s = machine();
+    route_gsi(s, 1, 0x80);
+    route_gsi(s, 12, 0x90);
+    s->kbc_command_byte &= (uint8_t)~0x02;
+    aux_queue_byte(s, 0xfa);           /* reset reply: ACK, AA, 00 */
+    aux_queue_byte(s, 0xaa);
+    aux_queue_byte(s, 0x00);
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0x90) && !irq(s, 0)); /* INT2 off: polled, no IRQ12 */
+    s->kbc_command_byte |= 0x02;
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x90) && s->mouse_gsi_asserted);
+    merced_ack_external(s->cpu, 0x90);
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0x90));              /* acceptance is not a new edge */
+    i2000_type_key(s, 'a');            /* queued behind the aux bytes */
+    CHECK(io_port_read(s, 0x60, 1) == 0xfa && !s->mouse_gsi_asserted);
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x90));               /* next aux byte: fresh edge */
+    merced_ack_external(s->cpu, 0x90);
+    CHECK(io_port_read(s, 0x60, 1) == 0xaa);
+    CHECK(io_port_read(s, 0x60, 1) == 0x00);
+    if (irq(s, 0x80)) merced_ack_external(s->cpu, 0x80);
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0x90));              /* aux drained */
+    CHECK(irq(s, 0x80));               /* the keyboard byte is reachable */
+    CHECK(io_port_read(s, 0x60, 1) == 0x1e);
+    route_gsi(s, 12, 0x90 | I460GX_IOSAPIC_RTE_MASK);
+    aux_queue_byte(s, 0x08);
+    s->cpu->ninsts += 1000000;
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0x90) && !irq(s, 0)); /* masked OS vector: no fallback */
+    ia64_i2000_destroy(s);
+}
 /* An unsupported version must be rejected from its header, without reading
  * a differently laid-out payload or changing the running machine. */
 static void old_snapshot(unsigned version, uint64_t ram_size) {
@@ -715,6 +754,7 @@ int main(void) {
     test_snapshots();
     test_chipset_snapshot();
     test_keyboard();
+    test_mouse();
     test_gpio_straps();
     test_cf9_reset();
     test_reset_snapshot();

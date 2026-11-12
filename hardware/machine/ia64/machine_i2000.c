@@ -446,6 +446,10 @@ struct Ia64I2000State {
     /* the firmware's legacy IRQ14 (slave PIC input 6) for the disk,
      * latched until its ExtINT acknowledge like the CD's IRQ15. */
     bool ata_legacy_irq_latched;
+    /* aux IRQ12 output edge for an OS-programmed fixed GSI12 vector;
+     * cleared by each 8042 data-port read. Occupies what was padding
+     * before `chipset`, so the snapshot layout is unchanged. */
+    bool mouse_gsi_asserted;
 
     I460GX chipset;
 };
@@ -1741,6 +1745,7 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         /* Consuming a byte ends the current IRQ1 edge; the next poll raises
          * a new one if another byte is waiting. */
         s->keyboard_gsi_asserted = false;
+        s->mouse_gsi_asserted = false;
         /* A real 8042 has one ordered output buffer.  Our keyboard and aux
          * queues are separate, so preserve a mouse packet already exposed
          * through AUX/IRQ12: letting a later keyboard/controller byte jump
@@ -5120,7 +5125,21 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * instruction between the deadline and the guest actually taking it is
      * harmless, not a flood - mouse_retry_ninsts is the real rate limiter,
      * not this flag. */
-    if (s->aux_out_pos < s->aux_out_len &&
+    uint64_t aux_rte = s->chipset.iosapic_rte[12];
+    bool aux_fixed = !(aux_rte & I460GX_IOSAPIC_RTE_MASK) &&
+                     ((aux_rte >> 8) & 7) <= 1;
+    if (aux_fixed) {
+        /* Windows' i8042 driver takes IRQ12 through its own GSI12 vector,
+         * like IRQ1 above; the PIC is masked by then.  Without this, the
+         * first aux byte (e.g. the mouse's reset reply) was never signalled
+         * and, sitting first in the shared output buffer, also starved the
+         * keyboard.  The 8042 only drives IRQ12 with command-byte INT2 set. */
+        if (s->aux_out_pos < s->aux_out_len && (s->kbc_command_byte & 0x02) &&
+            !s->mouse_gsi_asserted) {
+            iosapic_raise_gsi(s, 12);
+            s->mouse_gsi_asserted = true;
+        }
+    } else if (s->aux_out_pos < s->aux_out_len &&
         s->cpu->ninsts >= s->mouse_retry_ninsts &&
         s->mouse_wait_rfi_generation == 0 &&
         !(s->pic_slave_mask & 0x10) && !(s->pic_master_mask & 0x04)) {

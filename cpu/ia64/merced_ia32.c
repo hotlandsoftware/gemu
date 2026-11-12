@@ -9,6 +9,7 @@
 #include "merced.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -284,7 +285,7 @@ static bool rmwrite(X86 *x, RM rm, unsigned size, uint32_t v) {
  * IA-64 FP helpers intentionally approximate exceptional values, and the
  * host's long double format/rounding mode is not part of the guest state. */
 enum { X87_ZERO, X87_FINITE, X87_INF, X87_NAN, X87_UNSUPPORTED };
-enum { X87_IE = 1, X87_DE = 2, X87_OE = 8, X87_UE = 16, X87_PE = 32,
+enum { X87_IE = 1, X87_DE = 2, X87_ZE = 4, X87_OE = 8, X87_UE = 16, X87_PE = 32,
        X87_SF = 64, X87_C0 = 0x100, X87_C1 = 0x200, X87_C2 = 0x400,
        X87_C3 = 0x4000 };
 typedef struct {
@@ -316,7 +317,8 @@ static X87Number x87_from_fr(MercedFpReg f) {
                  (f.sig << 1) ? X87_NAN : X87_INF;
     } else if (!f.exp) {
         n = x87_normalize(f.sig, -16382, f.sign);
-        n.denormal = f.sig != 0 && !(f.sig >> 63);
+        /* Pseudo-denormals (J=1) are denormal operands too (DE, special tag). */
+        n.denormal = f.sig != 0;
     } else if (!(f.sig >> 63) || f.exp < 0xc001 || f.exp > 0x13ffe) {
         n.kind = X87_UNSUPPORTED;
     } else {
@@ -573,6 +575,302 @@ static unsigned x87_compare(X87Number a, X87Number b, unsigned *exceptions) {
     }
     return cmp == 0 ? X87_C3 : cmp < 0 ? X87_C0 : 0;
 }
+/* FUCOM-style compares only signal IE for SNaN and unsupported operands. */
+static unsigned x87_compare_quiet(X87Number a, X87Number b, bool quiet,
+                                  unsigned *exceptions) {
+    if (a.kind >= X87_NAN || b.kind >= X87_NAN) {
+        if (!quiet || a.kind == X87_UNSUPPORTED || b.kind == X87_UNSUPPORTED ||
+            x87_signaling(a) || x87_signaling(b))
+            *exceptions |= X87_IE;
+        return X87_C0 | X87_C2 | X87_C3;
+    }
+    return x87_compare(a, b, exceptions);
+}
+
+static X87U128 u128_add(X87U128 a, X87U128 b) {
+    X87U128 r = {a.lo + b.lo, a.hi + b.hi};
+    if (r.lo < a.lo) r.hi++;
+    return r;
+}
+static X87U128 u128_sub(X87U128 a, X87U128 b) {           /* a >= b */
+    X87U128 r = {a.lo - b.lo, a.hi - b.hi};
+    if (a.lo < b.lo) r.hi--;
+    return r;
+}
+static unsigned x87_precision(uint16_t fcw) {
+    unsigned pc = (fcw >> 8) & 3;
+    return pc == 0 ? 24 : pc == 2 ? 53 : 64;
+}
+static X87Number x87_negate(X87Number n) {
+    if (n.kind < X87_NAN) n.sign ^= 1;  /* NaNs propagate unchanged */
+    return n;
+}
+static X87Number x87_infinity(unsigned sign) {
+    return (X87Number){.sig = UINT64_C(1) << 63, .sign = sign, .kind = X87_INF};
+}
+static int x87_magnitude_cmp(X87Number a, X87Number b) {
+    if (a.kind != b.kind) return a.kind > b.kind ? 1 : -1; /* ZERO<FINITE<INF */
+    if (a.kind != X87_FINITE) return 0;
+    if (a.exp != b.exp) return a.exp > b.exp ? 1 : -1;
+    return a.sig == b.sig ? 0 : a.sig > b.sig ? 1 : -1;
+}
+static X87Number x87_add(X87Number a, X87Number b, uint16_t fcw,
+                         unsigned *exceptions, bool *c1) {
+    if (a.kind >= X87_NAN || b.kind >= X87_NAN) return x87_nan(a, b, exceptions);
+    if (a.denormal || b.denormal) *exceptions |= X87_DE;
+    if (a.kind == X87_INF && b.kind == X87_INF && a.sign != b.sign) {
+        *exceptions |= X87_IE;
+        return x87_indefinite();
+    }
+    if ((*exceptions & X87_DE) && !(fcw & X87_DE)) return a;
+    if (a.kind == X87_INF) return x87_infinity(a.sign);
+    if (b.kind == X87_INF) return x87_infinity(b.sign);
+    unsigned rc = (fcw >> 10) & 3;
+    if (a.kind == X87_ZERO && b.kind == X87_ZERO)
+        return (X87Number){.sign = a.sign == b.sign ? a.sign : rc == 1,
+                           .kind = X87_ZERO};
+    if (x87_magnitude_cmp(a, b) < 0) {
+        X87Number t = a; a = b; b = t;
+    }
+    /* 63 guard bits below each significand, plus a sticky bit for any
+     * shifted-out part of b: enough for correct rounding at 64 bits. */
+    X87U128 sum = u128_shl(u128_from64(a.sig), 63);
+    if (b.kind != X87_ZERO) {
+        X87U128 addend = u128_shl(u128_from64(b.sig), 63);
+        unsigned d = (unsigned)(a.exp - b.exp);
+        if (d >= 127) addend = u128_from64(1);
+        else if (d) {
+            bool lost = !u128_is_zero(u128_low_bits(addend, d));
+            addend = u128_shr(addend, d);
+            if (lost) addend.lo |= 1;
+        }
+        sum = a.sign == b.sign ? u128_add(sum, addend) : u128_sub(sum, addend);
+    }
+    if (u128_is_zero(sum)) return (X87Number){.sign = rc == 1, .kind = X87_ZERO};
+    return x87_round(sum, a.exp - 126, a.sign, x87_precision(fcw),
+                     -16382, 16383, fcw, false, exceptions, c1);
+}
+static X87Number x87_divide(X87Number a, X87Number b, uint16_t fcw,
+                            unsigned *exceptions, bool *c1) {
+    unsigned sign = a.sign ^ b.sign;
+    if (a.kind >= X87_NAN || b.kind >= X87_NAN) return x87_nan(a, b, exceptions);
+    if ((a.kind == X87_INF && b.kind == X87_INF) ||
+        (a.kind == X87_ZERO && b.kind == X87_ZERO)) {
+        *exceptions |= X87_IE;
+        return x87_indefinite();
+    }
+    if (b.kind == X87_ZERO && a.kind != X87_INF) {   /* ZE outranks DE */
+        *exceptions |= X87_ZE;
+        return x87_infinity(sign);
+    }
+    if (a.denormal || b.denormal) *exceptions |= X87_DE;
+    if ((*exceptions & X87_DE) && !(fcw & X87_DE)) return a;
+    if (a.kind == X87_INF) return x87_infinity(sign);
+    if (a.kind == X87_ZERO || b.kind == X87_INF)
+        return (X87Number){.sign = sign, .kind = X87_ZERO};
+    X87U128 rem = u128_from64(a.sig), d = u128_from64(b.sig), q = {0, 0};
+    for (unsigned i = 0; i < 66; i++) {
+        q = u128_shl(q, 1);
+        if (u128_cmp(rem, d) >= 0) {
+            rem = u128_sub(rem, d);
+            q.lo |= 1;
+        }
+        rem = u128_shl(rem, 1);
+    }
+    q = u128_shl(q, 1);
+    if (!u128_is_zero(rem)) q.lo |= 1;
+    return x87_round(q, a.exp - b.exp - 66, sign, x87_precision(fcw),
+                     -16382, 16383, fcw, false, exceptions, c1);
+}
+static X87Number x87_sqrt(X87Number a, uint16_t fcw, unsigned *exceptions,
+                          bool *c1) {
+    if (a.kind >= X87_NAN) return x87_nan(a, a, exceptions);
+    if (a.kind == X87_ZERO) return a;
+    if (a.sign) {
+        *exceptions |= X87_IE;
+        return x87_indefinite();
+    }
+    if (a.denormal) {
+        *exceptions |= X87_DE;
+        if (!(fcw & X87_DE)) return a;
+    }
+    if (a.kind == X87_INF) return a;
+    /* value = sig * 2^(exp-63); make the power even with sig placed at
+     * bit 126 or 127, so the integer root has exactly 64 bits. */
+    int e = a.exp - 63;
+    unsigned shift = (e & 1) ? 63 : 64;
+    e -= (int)shift;
+    X87U128 n = u128_shl(u128_from64(a.sig), shift), root = {0, 0};
+    X87U128 bit = u128_bit(126);
+    while (u128_cmp(bit, n) > 0) bit = u128_shr(bit, 2);
+    while (!u128_is_zero(bit)) {
+        X87U128 trial = u128_add(root, bit);
+        root = u128_shr(root, 1);
+        if (u128_cmp(n, trial) >= 0) {
+            n = u128_sub(n, trial);
+            root = u128_add(root, bit);
+        }
+        bit = u128_shr(bit, 2);
+    }
+    /* n is the remainder: the next root bit is set iff remainder > root,
+     * and that case can never be an exact half. */
+    bool half = u128_cmp(n, root) > 0;
+    X87U128 v = u128_shl(root, 2);
+    if (half) v.lo |= 2;
+    if (half || !u128_is_zero(n)) v.lo |= 1;
+    return x87_round(v, e / 2 - 2, 0, x87_precision(fcw),
+                     -16382, 16383, fcw, false, exceptions, c1);
+}
+/* Round to an integer magnitude per FCW.RC.  False when it needs > 64 bits. */
+static bool x87_round_to_int(X87Number n, unsigned rc, uint64_t *magnitude,
+                             bool *inexact, bool *up) {
+    *inexact = *up = false;
+    if (n.kind == X87_ZERO) { *magnitude = 0; return true; }
+    if (n.exp > 63) return false;
+    unsigned shift = (unsigned)(63 - n.exp);
+    if (!shift) { *magnitude = n.sig; return true; }
+    uint64_t q = shift < 64 ? n.sig >> shift : 0;
+    uint64_t rem = shift < 64 ? n.sig & ((UINT64_C(1) << shift) - 1) : n.sig;
+    uint64_t h = shift < 64 ? UINT64_C(1) << (shift - 1) :
+                 shift == 64 ? UINT64_C(1) << 63 : 0;
+    int half = shift > 64 ? -1 : rem > h ? 1 : rem == h ? 0 : -1;
+    *inexact = rem != 0;
+    *up = *inexact && (rc == 0 ? half > 0 || (half == 0 && (q & 1)) :
+                       rc == 1 ? n.sign != 0 : rc == 2 ? n.sign == 0 : false);
+    if (*up) q++;
+    *magnitude = q;
+    return true;
+}
+static X87Number x87_round_int_value(X87Number a, uint16_t fcw,
+                                     unsigned *exceptions, bool *c1) {
+    if (a.kind >= X87_NAN) return x87_nan(a, a, exceptions);
+    if (a.denormal) {
+        *exceptions |= X87_DE;
+        if (!(fcw & X87_DE)) return a;
+    }
+    if (a.kind != X87_FINITE || a.exp >= 63) return a;
+    uint64_t mag;
+    bool inexact, up;
+    x87_round_to_int(a, (fcw >> 10) & 3, &mag, &inexact, &up);
+    if (inexact) *exceptions |= X87_PE;
+    *c1 = up;
+    if (!mag) return (X87Number){.sign = a.sign, .kind = X87_ZERO};
+    return x87_normalize(mag, 63, a.sign);
+}
+/* FIST: a 16/32/64-bit two's complement image, or integer indefinite. */
+static uint64_t x87_store_int(X87Number n, unsigned bits, uint16_t fcw,
+                              unsigned *exceptions, bool *c1) {
+    uint64_t indefinite = UINT64_C(1) << (bits - 1);
+    uint64_t mag;
+    bool inexact, up;
+    if (n.kind >= X87_INF ||
+        !x87_round_to_int(n, (fcw >> 10) & 3, &mag, &inexact, &up) ||
+        mag > (n.sign ? indefinite : indefinite - 1)) {
+        *exceptions |= X87_IE;
+        return indefinite;
+    }
+    if (inexact) *exceptions |= X87_PE;
+    *c1 = up;
+    uint64_t v = n.sign ? (uint64_t)0 - mag : mag;
+    return bits == 64 ? v : v & ((UINT64_C(1) << bits) - 1);
+}
+static X87Number x87_from_int(int64_t v) {
+    uint64_t mag = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    return x87_normalize(mag, 63, v < 0);
+}
+static X87Number x87_from_single(uint32_t bits) {
+    unsigned exp = (bits >> 23) & 0xff, sign = bits >> 31;
+    uint64_t frac = bits & 0x7fffff;
+    if (exp == 0xff)
+        return (X87Number){.sig = UINT64_C(1) << 63 | (frac << 40),
+                           .sign = sign, .kind = frac ? X87_NAN : X87_INF};
+    X87Number n = x87_normalize((frac | (exp ? UINT64_C(1) << 23 : 0)) << 40,
+                                exp ? (int)exp - 127 : -126, sign);
+    n.denormal = exp == 0 && frac != 0;
+    return n;
+}
+static uint32_t x87_store_single(X87Number n, uint16_t fcw,
+                                 unsigned *exceptions, bool *c1) {
+    if (n.kind == X87_UNSUPPORTED) {
+        *exceptions |= X87_IE;
+        n = x87_indefinite();
+    } else if (x87_signaling(n)) {
+        *exceptions |= X87_IE;
+        n.sig |= UINT64_C(1) << 62;
+    }
+    if (n.kind == X87_FINITE)
+        n = x87_round(u128_from64(n.sig), n.exp - 63, n.sign, 24, -126, 127,
+                      fcw, true, exceptions, c1);
+    uint32_t bits = (uint32_t)n.sign << 31;
+    if (n.kind == X87_INF) return bits | 0x7f800000;
+    if (n.kind == X87_NAN)
+        return bits | 0x7fc00000 | (uint32_t)((n.sig >> 40) & 0x7fffff);
+    if (n.kind == X87_ZERO) return bits;
+    if (n.exp < -126) {
+        unsigned shift = (unsigned)(-126 - n.exp) + 40;
+        return bits | (uint32_t)(shift < 64 ? n.sig >> shift : 0);
+    }
+    return bits | ((uint32_t)(n.exp + 127) << 23) | (uint32_t)((n.sig >> 40) & 0x7fffff);
+}
+/* 80-bit memory images map to the register format bit-for-bit. */
+static MercedFpReg x87_fr_from_m80(uint64_t sig, uint16_t se) {
+    unsigned e = se & 0x7fff;
+    MercedFpReg f = {.sig = sig, .sign = se >> 15};
+    f.exp = e == 0x7fff ? 0x1ffff : e == 0 ? 0 : e - 0x3fff + 0xffff;
+    return f;
+}
+static uint16_t x87_m80_sign_exp(MercedFpReg f) {
+    unsigned e;
+    if (f.nat) return 0xffff;
+    if (f.exp == 0x1ffff) e = 0x7fff;
+    else if (f.exp == 0) e = 0;
+    else {
+        int v = (int)f.exp - 0xffff + 0x3fff;
+        e = v <= 0 ? 0 : v >= 0x7fff ? 0x7fff : (unsigned)v;
+    }
+    return (uint16_t)(e | (f.sign << 15));
+}
+static unsigned x87_tag(const Merced *m, unsigned physical) {
+    if (x87_empty(m, physical)) return 3;
+    MercedFpReg f = m->fr[8 + physical];
+    X87Number n = x87_from_fr(f);
+    if (!f.exp && !f.sig) return 1;
+    return n.kind == X87_FINITE && !n.denormal ? 0 : 2;
+}
+static void x87_set_empty_tags(Merced *m, unsigned empty_mask) {
+    uint64_t tags = 0;
+    for (unsigned i = 0; i < 8; i++)
+        if (empty_mask & (1u << i)) tags |= UINT64_C(1) << (16 + 2 * i);
+    m->ar[28] = (m->ar[28] & ~UINT64_C(0xffff0000)) | tags;
+}
+
+/* Transcendentals use the host's long double. The x87 microcode's own
+ * approximations are not bit-reproducible anyway, so only the format,
+ * exceptions and stack effects are modelled exactly. */
+static long double x87_to_host(X87Number n) {
+    if (n.kind == X87_ZERO) return n.sign ? -0.0L : 0.0L;
+    if (n.kind == X87_INF) return n.sign ? -HUGE_VALL : HUGE_VALL;
+    long double v = ldexpl((long double)n.sig, n.exp - 63);
+    return n.sign ? -v : v;
+}
+static X87Number x87_from_host(long double v, uint16_t fcw,
+                               unsigned *exceptions, bool *c1) {
+    if (isnan(v)) {
+        *exceptions |= X87_IE;
+        return x87_indefinite();
+    }
+    unsigned sign = signbit(v) != 0;
+    if (isinf(v)) return x87_infinity(sign);
+    if (v == 0) return (X87Number){.sign = sign, .kind = X87_ZERO};
+    int e;
+    long double frac = frexpl(fabsl(v), &e);   /* [0.5, 1) */
+    long double scaled = ldexpl(frac, 64);
+    uint64_t sig = scaled >= 18446744073709551615.0L ? UINT64_MAX : (uint64_t)scaled;
+    *exceptions |= X87_PE;
+    return x87_round(u128_from64(sig), e - 64, sign, 64, -16382, 16383, fcw,
+                     false, exceptions, c1);
+}
+
 static uint16_t x87_selector(X86 *x, unsigned seg) {
     /* Segment selectors are packed into GR16 (DS,ES,FS,GS) and GR17
      * (CS,SS,LDT,TSS), independently of their descriptor cache GRs. */
@@ -586,6 +884,663 @@ static void x87_pointers(X86 *x, uint8_t op, uint8_t mr, const RM *rm) {
                     (uint32_t)(x->start - sbase(x, X_CS));
     if (!rm->is_reg)
         x->m->ar[30] = ((uint64_t)x87_selector(x, rm->seg) << 32) | rm->off;
+}
+
+/* Which D8-DF encodings exist (P6-class x87, as Merced's IA-32 engine). */
+static bool x87_supported(uint8_t op, uint8_t mr) {
+    unsigned sub = (mr >> 3) & 7;
+    if (mr < 0xc0) {
+        switch (op) {
+        case 0xd9: return sub != 1;
+        case 0xdb: return sub != 1 && sub != 4 && sub != 6;
+        case 0xdd: return sub != 1 && sub != 5;
+        case 0xdf: return sub != 1 && sub != 4 && sub != 6; /* no FBLD/FBSTP */
+        default: return true;
+        }
+    }
+    switch (op) {
+    case 0xd8: case 0xdc: return true;
+    case 0xd9: return !(mr >= 0xd1 && mr <= 0xd7) && mr != 0xe2 && mr != 0xe3 &&
+                      mr != 0xe6 && mr != 0xe7 && mr != 0xef;
+    case 0xda: return mr < 0xe0 || mr == 0xe9;
+    case 0xdb: return mr < 0xe5 || (mr >= 0xe8 && mr < 0xf8);
+    case 0xdd: return mr < 0xf0;
+    case 0xde: return mr < 0xd8 || mr == 0xd9 || mr >= 0xe0;
+    default:   return mr < 0xe1 || (mr >= 0xe8 && mr < 0xf8); /* DF */
+    }
+}
+/* FNINIT/FNCLEX/FNSTCW/FNSTSW/FNSTENV/FNSAVE don't check pending faults. */
+static bool x87_no_wait(uint8_t op, uint8_t mr) {
+    unsigned sub = (mr >> 3) & 7;
+    if (mr < 0xc0)
+        return (op == 0xd9 && (sub == 6 || sub == 7)) ||
+               (op == 0xdd && (sub == 6 || sub == 7));
+    return (op == 0xdb && mr >= 0xe0 && mr <= 0xe4) || (op == 0xdf && mr == 0xe0);
+}
+
+static void x87_init(Merced *m) {
+    m->ar[21] = (m->ar[21] & ~UINT64_C(0xffff)) | 0x037f;
+    m->ar[28] = (m->ar[28] & ~UINT64_C(0xffffffff)) | UINT64_C(0x55550000);
+    m->ar[29] = m->ar[30] = 0;
+}
+static bool x87_read_bytes(Merced *m, uint32_t addr, unsigned n, uint8_t *buf) {
+    for (unsigned i = 0; i < n;) {
+        unsigned c = n - i >= 8 ? 8 : n - i >= 4 ? 4 : n - i >= 2 ? 2 : 1;
+        uint64_t v;
+        if (!merced_ia32_read(m, (uint32_t)(addr + i), c, false, &v)) return false;
+        for (unsigned k = 0; k < c; k++) buf[i + k] = (uint8_t)(v >> (8 * k));
+        i += c;
+    }
+    return true;
+}
+static bool x87_probe_bytes(Merced *m, uint32_t addr, unsigned n) {
+    for (unsigned i = 0; i < n;) {
+        unsigned c = n - i >= 8 ? 8 : n - i >= 4 ? 4 : n - i >= 2 ? 2 : 1;
+        if (!merced_ia32_probe_write(m, (uint32_t)(addr + i), c)) return false;
+        i += c;
+    }
+    return true;
+}
+static bool x87_write_bytes(Merced *m, uint32_t addr, unsigned n, const uint8_t *buf) {
+    for (unsigned i = 0; i < n;) {
+        unsigned c = n - i >= 8 ? 8 : n - i >= 4 ? 4 : n - i >= 2 ? 2 : 1;
+        uint64_t v = 0;
+        for (unsigned k = 0; k < c; k++) v |= (uint64_t)buf[i + k] << (8 * k);
+        if (!merced_ia32_write(m, (uint32_t)(addr + i), c, v)) return false;
+        i += c;
+    }
+    return true;
+}
+static uint64_t x87_le(const uint8_t *p, unsigned n) {
+    uint64_t v = 0;
+    for (unsigned i = 0; i < n; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+static void x87_put_le(uint8_t *p, unsigned n, uint64_t v) {
+    for (unsigned i = 0; i < n; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+/* FSTENV/FSAVE image (protected-mode layout, 16- or 32-bit form). */
+static unsigned x87_store_env(Merced *m, bool op32, uint8_t *buf) {
+    unsigned ftw = 0;
+    for (unsigned p = 0; p < 8; p++) ftw |= x87_tag(m, p) << (2 * p);
+    uint64_t fir = m->ar[29], fdr = m->ar[30];
+    uint16_t fcw = (uint16_t)m->ar[21], fsw = (uint16_t)m->ar[28];
+    if (op32) {
+        x87_put_le(buf + 0, 4, 0xffff0000u | fcw);
+        x87_put_le(buf + 4, 4, 0xffff0000u | fsw);
+        x87_put_le(buf + 8, 4, 0xffff0000u | ftw);
+        x87_put_le(buf + 12, 4, (uint32_t)fir);
+        x87_put_le(buf + 16, 4, (uint16_t)(fir >> 32) | ((uint32_t)((fir >> 48) & 0x7ff) << 16));
+        x87_put_le(buf + 20, 4, (uint32_t)fdr);
+        x87_put_le(buf + 24, 4, 0xffff0000u | (uint16_t)(fdr >> 32));
+        return 28;
+    }
+    x87_put_le(buf + 0, 2, fcw);
+    x87_put_le(buf + 2, 2, fsw);
+    x87_put_le(buf + 4, 2, ftw);
+    x87_put_le(buf + 6, 2, (uint16_t)fir);
+    x87_put_le(buf + 8, 2, (uint16_t)(fir >> 32));
+    x87_put_le(buf + 10, 2, (uint16_t)fdr);
+    x87_put_le(buf + 12, 2, (uint16_t)(fdr >> 32));
+    return 14;
+}
+static void x87_load_env(Merced *m, bool op32, const uint8_t *buf) {
+    uint16_t fcw, fsw, ftw, cs, ds;
+    uint32_t ip, dp, fop = 0;
+    if (op32) {
+        fcw = (uint16_t)x87_le(buf, 2); fsw = (uint16_t)x87_le(buf + 4, 2);
+        ftw = (uint16_t)x87_le(buf + 8, 2); ip = (uint32_t)x87_le(buf + 12, 4);
+        cs = (uint16_t)x87_le(buf + 16, 2); fop = (uint32_t)x87_le(buf + 18, 2) & 0x7ff;
+        dp = (uint32_t)x87_le(buf + 20, 4); ds = (uint16_t)x87_le(buf + 24, 2);
+    } else {
+        fcw = (uint16_t)x87_le(buf, 2); fsw = (uint16_t)x87_le(buf + 2, 2);
+        ftw = (uint16_t)x87_le(buf + 4, 2); ip = (uint32_t)x87_le(buf + 6, 2);
+        cs = (uint16_t)x87_le(buf + 8, 2); dp = (uint32_t)x87_le(buf + 10, 2);
+        ds = (uint16_t)x87_le(buf + 12, 2);
+    }
+    fcw = (fcw & 0x1f3f) | 0x40;
+    m->ar[21] = (m->ar[21] & ~UINT64_C(0xffff)) | fcw;
+    unsigned empty = 0;
+    for (unsigned p = 0; p < 8; p++)
+        if (((ftw >> (2 * p)) & 3) == 3) empty |= 1u << p;
+    m->ar[28] = (m->ar[28] & ~UINT64_C(0xffff)) | (fsw & 0x7f7f);
+    x87_set_empty_tags(m, empty);
+    if (fsw & ~fcw & 0x3f) m->ar[28] |= 0x8080;
+    m->ar[29] = ((uint64_t)fop << 48) | ((uint64_t)cs << 32) | ip;
+    m->ar[30] = ((uint64_t)ds << 32) | dp;
+}
+
+static unsigned x87_phys(const Merced *m, unsigned i) { return (x87_top(m) + i) & 7; }
+static X87Number x87_get(const Merced *m, unsigned i, unsigned *exceptions) {
+    unsigned p = x87_phys(m, i);
+    if (x87_empty(m, p)) {
+        *exceptions |= X87_IE | X87_SF;
+        return x87_indefinite();
+    }
+    return x87_from_fr(m->fr[8 + p]);
+}
+static void x87_set_st(Merced *m, unsigned i, X87Number n) { x87_put(m, x87_phys(m, i), n); }
+static void x87_push_fr(Merced *m, MercedFpReg f) {
+    unsigned next = (x87_top(m) + 7) & 7;
+    x87_set_top(m, next);
+    m->fr[8 + next] = f;
+    m->ar[28] &= ~(UINT64_C(1) << (16 + 2 * next));
+}
+/* Stack overflow check for a push: the masked response pushes indefinite. */
+static bool x87_push_ok(const Merced *m, unsigned *exceptions, bool *c1) {
+    if (x87_empty(m, (x87_top(m) + 7) & 7)) return true;
+    *exceptions |= X87_IE | X87_SF;
+    *c1 = true;
+    return false;
+}
+static X87Number x87_arith(unsigned code, X87Number a, X87Number b, uint16_t fcw,
+                           unsigned *exceptions, bool *c1) {
+    switch (code) {
+    case 0: return x87_add(a, b, fcw, exceptions, c1);
+    case 1: return x87_multiply(a, b, fcw, exceptions, c1);
+    case 4: return x87_add(a, x87_negate(b), fcw, exceptions, c1);
+    case 5: return x87_add(b, x87_negate(a), fcw, exceptions, c1);
+    case 6: return x87_divide(a, b, fcw, exceptions, c1);
+    default: return x87_divide(b, a, fcw, exceptions, c1);
+    }
+}
+static unsigned x87_examine(const Merced *m, bool *c1) {
+    unsigned p = x87_top(m);
+    MercedFpReg f = m->fr[8 + p];
+    *c1 = f.sign != 0;
+    if (x87_empty(m, p)) return X87_C3 | X87_C0;
+    X87Number n = x87_from_fr(f);
+    switch (n.kind) {
+    case X87_NAN: return X87_C0;
+    case X87_INF: return X87_C2 | X87_C0;
+    case X87_ZERO: return X87_C3;
+    case X87_FINITE: return n.denormal ? X87_C3 | X87_C2 : X87_C2;
+    default: return 0;
+    }
+}
+/* FPREM (round toward zero) / FPREM1 (round to nearest) partial remainder,
+ * reduced completely in one step: the low quotient bits match what a
+ * C2-polling loop would end with. */
+static X87Number x87_remainder(X87Number a, X87Number b, bool nearest, uint16_t fcw,
+                               unsigned *exceptions, bool *c1, unsigned *cc) {
+    *cc = 0;
+    if (a.kind >= X87_NAN || b.kind >= X87_NAN) return x87_nan(a, b, exceptions);
+    if (a.kind == X87_INF || b.kind == X87_ZERO) {
+        *exceptions |= X87_IE;
+        return x87_indefinite();
+    }
+    if (a.denormal || b.denormal) {
+        *exceptions |= X87_DE;
+        if (!(fcw & X87_DE)) return a;
+    }
+    if (a.kind == X87_ZERO || b.kind == X87_INF) return a;
+    int d = a.exp - b.exp;
+    uint64_t q = 0;
+    unsigned sign = a.sign;
+    X87U128 rem;
+    int scale;
+    if (d < 0) {
+        if (!nearest || d < -1 || a.sig <= b.sig) return a;
+        /* |b|/2 < |a| < |b|: the nearest quotient is 1. */
+        rem = u128_from64(b.sig * 2 - a.sig);
+        scale = b.exp - 64;
+        sign ^= 1;
+        q = 1;
+    } else {
+        X87U128 r = u128_from64(a.sig), dv = u128_from64(b.sig);
+        for (int k = 0; k <= d; k++) {
+            q <<= 1;
+            if (u128_cmp(r, dv) >= 0) {
+                r = u128_sub(r, dv);
+                q |= 1;
+            }
+            if (k < d) r = u128_shl(r, 1);
+        }
+        if (nearest) {
+            int c = u128_cmp(u128_shl(r, 1), dv);
+            if (c > 0 || (c == 0 && (q & 1))) {
+                r = u128_sub(dv, r);
+                q++;
+                sign ^= 1;
+            }
+        }
+        rem = r;
+        scale = b.exp - 63;
+    }
+    *cc = ((q & 4) ? X87_C0 : 0) | ((q & 2) ? X87_C3 : 0);
+    *c1 = (q & 1) != 0;
+    if (u128_is_zero(rem)) return (X87Number){.sign = a.sign, .kind = X87_ZERO};
+    bool ignored = false;
+    return x87_round(rem, scale, sign, 64, -16382, 16383, fcw, false,
+                     exceptions, &ignored);
+}
+static X87Number x87_scale(X87Number a, X87Number b, uint16_t fcw,
+                           unsigned *exceptions, bool *c1) {
+    if (a.kind >= X87_NAN || b.kind >= X87_NAN) return x87_nan(a, b, exceptions);
+    if (a.denormal || b.denormal) {
+        *exceptions |= X87_DE;
+        if (!(fcw & X87_DE)) return a;
+    }
+    if (b.kind == X87_INF) {
+        if ((!b.sign && a.kind == X87_ZERO) || (b.sign && a.kind == X87_INF)) {
+            *exceptions |= X87_IE;
+            return x87_indefinite();
+        }
+        if (a.kind == X87_ZERO || a.kind == X87_INF) return a;
+        return b.sign ? (X87Number){.sign = a.sign, .kind = X87_ZERO}
+                      : x87_infinity(a.sign);
+    }
+    if (a.kind != X87_FINITE) return a;
+    int k = 0;
+    if (b.kind == X87_FINITE && b.exp >= 0)
+        k = b.exp > 20 ? 1 << 21 : (int)(b.sig >> (63 - b.exp));
+    if (b.sign) k = -k;
+    return x87_round(u128_from64(a.sig), a.exp - 63 + k, a.sign, 64,
+                     -16382, 16383, fcw, false, exceptions, c1);
+}
+
+/* Execute one D8-DF instruction after x87_ready.  False on a memory fault
+ * (raised before any FP state is changed). */
+static bool x87_execute(X86 *x, uint8_t op, uint8_t mr, const RM *rm) {
+    Merced *m = x->m;
+    unsigned sub = (mr >> 3) & 7, i = mr & 7;
+    bool mem = mr < 0xc0;
+    uint16_t fcw = (uint16_t)m->ar[21];
+    uint8_t buf[108] = {0};
+
+    /* Control instructions: no FIP/FDP update, no numeric status. */
+    if (op == 0xdb && mr >= 0xe0 && mr <= 0xe4) {
+        if (mr == 0xe2) m->ar[28] &= ~UINT64_C(0x80ff); /* flags, SF, ES, B */
+        else if (mr == 0xe3) x87_init(m);
+        return true;                                    /* FENI/FDISI/FSETPM */
+    }
+    if (op == 0xdf && mr == 0xe0) {
+        setxr(x, 0, 2, (uint16_t)m->ar[28]);
+        return true;
+    }
+    if (mem && (op == 0xd9 || op == 0xdd) && sub >= 4) {
+        if (op == 0xd9 && sub == 7) return wb(x, rm->addr, 2, (uint16_t)m->ar[21]);
+        if (op == 0xdd && sub == 7) return wb(x, rm->addr, 2, (uint16_t)m->ar[28]);
+        if (op == 0xd9 && sub == 5) {
+            uint32_t word;
+            if (!rb(x, rm->addr, 2, false, &word)) return false;
+            uint16_t ncw = (word & 0x1f3f) | 0x40;
+            m->ar[21] = (m->ar[21] & ~UINT64_C(0xffff)) | ncw;
+            bool pending = (m->ar[28] & ~ncw & 0x3f) != 0;
+            m->ar[28] = (m->ar[28] & ~UINT64_C(0x8080)) | (pending ? 0x8080 : 0);
+            return true;
+        }
+        bool save = op == 0xdd;
+        unsigned env = x->op32 ? 28 : 14, total = env + (save ? 80 : 0);
+        if (sub == 6) { /* FNSTENV / FNSAVE */
+            if (!x87_probe_bytes(m, rm->addr, total)) return false;
+            x87_store_env(m, x->op32, buf);
+            if (save)
+                for (unsigned j = 0; j < 8; j++) {
+                    MercedFpReg f = m->fr[8 + x87_phys(m, j)];
+                    x87_put_le(buf + env + 10 * j, 8, f.sig);
+                    x87_put_le(buf + env + 10 * j + 8, 2, x87_m80_sign_exp(f));
+                }
+            if (!x87_write_bytes(m, rm->addr, total, buf)) return false;
+            if (save) x87_init(m);
+            else m->ar[21] |= 0x3f; /* FNSTENV masks every exception */
+            return true;
+        }
+        /* FLDENV / FRSTOR */
+        if (!x87_read_bytes(m, rm->addr, total, buf)) return false;
+        x87_load_env(m, x->op32, buf);
+        if (save)
+            for (unsigned j = 0; j < 8; j++)
+                m->fr[8 + x87_phys(m, j)] =
+                    x87_fr_from_m80(x87_le(buf + env + 10 * j, 8),
+                                    (uint16_t)x87_le(buf + env + 10 * j + 8, 2));
+        return true;
+    }
+
+    /* Numeric instructions: resolve memory faults first. */
+    unsigned msize = 0;
+    bool mstore = false;
+    if (mem) {
+        switch (op) {
+        case 0xd8: case 0xda: msize = 4; break;
+        case 0xdc: msize = 8; break;
+        case 0xde: msize = 2; break;
+        case 0xd9: msize = 4; mstore = sub >= 2; break;
+        case 0xdb: msize = sub >= 5 ? 10 : 4; mstore = sub == 2 || sub == 3 || sub == 7; break;
+        case 0xdd: msize = 8; mstore = sub >= 2; break;
+        default:   msize = sub >= 5 ? 8 : 2; mstore = sub == 2 || sub == 3 || sub == 7; break;
+        }
+        if (mstore ? !x87_probe_bytes(m, rm->addr, msize)
+                   : !x87_read_bytes(m, rm->addr, msize, buf)) return false;
+    }
+    uint64_t data = x87_le(buf, 8);
+    x87_pointers(x, op, mr, rm);
+
+    unsigned exc = 0, top = x87_top(m);
+    bool c1 = false;
+#define X87_BLOCKED() (exc & ~fcw & (X87_IE | X87_DE | X87_ZE))
+    int code = -1;          /* arithmetic or compare: sub-opcode */
+    unsigned dest = 0, pops = 0;
+    X87Number a = {0}, b = {0};
+    bool quiet = false, to_eflags = false;
+
+    if (mem && (op == 0xd8 || op == 0xda || op == 0xdc || op == 0xde)) {
+        a = x87_get(m, 0, &exc);
+        b = op == 0xd8 ? x87_from_single((uint32_t)data) :
+            op == 0xdc ? x87_from_double(data) :
+            op == 0xda ? x87_from_int((int32_t)data) : x87_from_int((int16_t)data);
+        code = sub;
+        pops = sub == 3;
+    } else if (!mem && (op == 0xd8 || op == 0xdc || op == 0xde)) {
+        if (sub == 2 || sub == 3) {             /* FCOM, FCOMP, aliases, FCOMPP */
+            if (op == 0xde && sub == 3 && i != 1) goto done; /* unsupported */
+            a = x87_get(m, 0, &exc);
+            b = x87_get(m, i, &exc);
+            code = sub;
+            pops = op == 0xde ? (sub == 3 ? 2 : 1) : sub == 3;
+        } else if (op == 0xd8) {
+            a = x87_get(m, 0, &exc);
+            b = x87_get(m, i, &exc);
+            code = sub;
+        } else {                                /* ST(i) = ST(i) op ST(0) */
+            a = x87_get(m, i, &exc);
+            b = x87_get(m, 0, &exc);
+            code = sub >= 4 ? sub ^ 1 : sub;
+            dest = i;
+            pops = op == 0xde;
+        }
+    } else if (op == 0xda && !mem && mr == 0xe9) {           /* FUCOMPP */
+        a = x87_get(m, 0, &exc);
+        b = x87_get(m, 1, &exc);
+        code = 3; pops = 2; quiet = true;
+    } else if (!mem && (op == 0xdb || op == 0xdf) && mr >= 0xe8 && mr < 0xf8) {
+        a = x87_get(m, 0, &exc);                         /* F(U)COMI(P) */
+        b = x87_get(m, i, &exc);
+        code = 3; quiet = mr < 0xf0; to_eflags = true; pops = op == 0xdf;
+    } else if (!mem && (op == 0xdd) && mr >= 0xe0) {     /* FUCOM(P) */
+        a = x87_get(m, 0, &exc);
+        b = x87_get(m, i, &exc);
+        code = 3; quiet = true; pops = sub == 5;
+    }
+
+    if (code == 2 || code == 3) {
+        unsigned cc = (exc & X87_SF) ? X87_C0 | X87_C2 | X87_C3
+                                     : x87_compare_quiet(a, b, quiet, &exc);
+        if (!X87_BLOCKED()) {
+            if (to_eflags) {
+                uint32_t f = eflags(x) & ~(FL_ZF | FL_PF | FL_CF | FL_OF | FL_SF | FL_AF);
+                if (cc & X87_C3) f |= FL_ZF;
+                if (cc & X87_C2) f |= FL_PF;
+                if (cc & X87_C0) f |= FL_CF;
+                setflags(x, f);
+            } else m->ar[28] = (m->ar[28] & ~UINT64_C(0x4500)) | cc;
+            while (pops--) x87_pop(m);
+        }
+        goto done;
+    }
+    if (code >= 0) {
+        X87Number r = x87_arith((unsigned)code, a, b, fcw, &exc, &c1);
+        if (!X87_BLOCKED()) {
+            x87_set_st(m, dest, r);
+            while (pops--) x87_pop(m);
+        }
+        goto done;
+    }
+
+    if (mem) {
+        bool load = !mstore;
+        if (load) {                                     /* FLD / FILD */
+            MercedFpReg f;
+            bool c1_ok = x87_push_ok(m, &exc, &c1);
+            if (!c1_ok) {
+                f = x87_to_fr(x87_indefinite());
+            } else if (op == 0xdb && sub == 5) {         /* FLD m80 */
+                f = x87_fr_from_m80(data, (uint16_t)x87_le(buf + 8, 2));
+                X87Number n = x87_from_fr(f);
+                if (n.kind == X87_UNSUPPORTED) {
+                    exc |= X87_IE;
+                    f = x87_to_fr(x87_indefinite());
+                } else if (x87_signaling(n)) {
+                    exc |= X87_IE;
+                    f.sig |= UINT64_C(1) << 62;
+                } /* no DE: extended-format sources are exempt */
+            } else {
+                X87Number n;
+                if (op == 0xd9) n = x87_from_single((uint32_t)data);
+                else if (op == 0xdd) n = x87_from_double(data);
+                else if (op == 0xdb) n = x87_from_int((int32_t)data);
+                else n = sub == 5 ? x87_from_int((int64_t)data) : x87_from_int((int16_t)data);
+                if (x87_signaling(n)) {
+                    exc |= X87_IE;
+                    n.sig |= UINT64_C(1) << 62;
+                } else if (n.denormal) exc |= X87_DE;
+                f = x87_to_fr(n);
+            }
+            /* Even an unmasked denormal-operand exception pushes. */
+            if (!(exc & ~fcw & X87_IE)) x87_push_fr(m, f);
+        } else {                                        /* FST / FIST */
+            bool empty = x87_empty(m, top);
+            MercedFpReg raw = m->fr[8 + top];
+            X87Number n = x87_get(m, 0, &exc);
+            unsigned n_bytes = msize;
+            uint64_t bits;
+            if (op == 0xdb && sub == 7) {               /* FSTP m80: exact */
+                if (empty) raw = x87_to_fr(x87_indefinite());
+                bits = raw.sig;
+                x87_put_le(buf + 8, 2, x87_m80_sign_exp(raw));
+            } else if (op == 0xd9) bits = x87_store_single(n, fcw, &exc, &c1);
+            else if (op == 0xdd) bits = x87_store_double(n, fcw, &exc, &c1);
+            else if (op == 0xdb) bits = x87_store_int(n, 32, fcw, &exc, &c1);
+            else bits = x87_store_int(n, msize * 8, fcw, &exc, &c1);
+            x87_put_le(buf, n_bytes < 8 ? n_bytes : 8, bits);
+            if (!(exc & ~fcw & (X87_IE | X87_OE | X87_UE))) {
+                if (!x87_write_bytes(m, rm->addr, n_bytes, buf)) return false;
+                if (sub != 2) x87_pop(m);
+            }
+        }
+        goto done;
+    }
+
+    /* Remaining register forms. */
+    if (op == 0xd9 && mr < 0xc8) {                       /* FLD ST(i) */
+        unsigned src = x87_phys(m, i);
+        MercedFpReg f = m->fr[8 + src];
+        if (x87_empty(m, src)) {
+            exc |= X87_IE | X87_SF;
+            f = x87_to_fr(x87_indefinite());
+        }
+        if (!x87_push_ok(m, &exc, &c1)) f = x87_to_fr(x87_indefinite());
+        if (!(exc & ~fcw & X87_IE)) x87_push_fr(m, f);
+    } else if ((op == 0xd9 && mr < 0xd0) || (op == 0xdd && mr >= 0xc8 && mr < 0xd0) ||
+               (op == 0xdf && mr >= 0xc8 && mr < 0xd0)) { /* FXCH */
+        unsigned p0 = top, pi = x87_phys(m, i);
+        bool e0 = x87_empty(m, p0), ei = x87_empty(m, pi);
+        if (e0 || ei) {
+            exc |= X87_IE | X87_SF;
+            if (!(fcw & X87_IE)) goto done;
+            if (e0) x87_put(m, p0, x87_indefinite());
+            if (ei) x87_put(m, pi, x87_indefinite());
+        }
+        MercedFpReg t = m->fr[8 + p0];
+        m->fr[8 + p0] = m->fr[8 + pi];
+        m->fr[8 + pi] = t;
+    } else if (op == 0xd9 && mr == 0xd0) {               /* FNOP */
+    } else if ((op == 0xd9 && mr >= 0xd8 && mr < 0xe0) || (op == 0xdd && mr >= 0xd0 && mr < 0xe0) ||
+               (op == 0xdf && mr >= 0xd0 && mr < 0xe0)) { /* FST(P) ST(i) */
+        bool pop = !(op == 0xdd && mr < 0xd8);
+        bool empty = x87_empty(m, top);
+        if (empty) exc |= X87_IE | X87_SF;
+        if (!(exc & ~fcw & X87_IE)) {
+            unsigned target = x87_phys(m, i);
+            if (empty) x87_put(m, target, x87_indefinite());
+            else {
+                /* Register stores transfer the extended encoding unchanged,
+                 * even SNaN or unsupported patterns. */
+                m->fr[8 + target] = m->fr[8 + top];
+                m->ar[28] &= ~(UINT64_C(1) << (16 + 2 * target));
+            }
+            if (pop) x87_pop(m);
+        }
+    } else if ((op == 0xdd || op == 0xdf) && mr < 0xc8) { /* FFREE(P) */
+        m->ar[28] |= UINT64_C(1) << (16 + 2 * x87_phys(m, i));
+        if (op == 0xdf) x87_pop(m);
+    } else if ((op == 0xda || op == 0xdb) && mr < 0xe0) { /* FCMOVcc */
+        uint32_t f = eflags(x);
+        bool cond = sub == 0 ? (f & FL_CF) : sub == 1 ? (f & FL_ZF) :
+                    sub == 2 ? (f & (FL_CF | FL_ZF)) : (f & FL_PF);
+        if (op == 0xdb) cond = !cond;
+        unsigned src = x87_phys(m, i);
+        if (x87_empty(m, top) || x87_empty(m, src)) {
+            exc |= X87_IE | X87_SF;
+            if (fcw & X87_IE) x87_put(m, top, x87_indefinite());
+        } else if (cond) m->fr[8 + top] = m->fr[8 + src];
+    } else if (op == 0xd9 && (mr == 0xe0 || mr == 0xe1)) { /* FCHS / FABS */
+        if (x87_empty(m, top)) {
+            exc |= X87_IE | X87_SF;
+            if (fcw & X87_IE) x87_put(m, top, x87_indefinite());
+        } else m->fr[8 + top].sign = mr == 0xe0 ? !m->fr[8 + top].sign : 0;
+    } else if (op == 0xd9 && mr == 0xe4) {               /* FTST */
+        a = x87_get(m, 0, &exc);
+        unsigned cc = (exc & X87_SF) ? X87_C0 | X87_C2 | X87_C3
+                    : x87_compare(a, (X87Number){.kind = X87_ZERO}, &exc);
+        if (!X87_BLOCKED()) m->ar[28] = (m->ar[28] & ~UINT64_C(0x4500)) | cc;
+    } else if (op == 0xd9 && mr == 0xe5) {               /* FXAM */
+        unsigned cc = x87_examine(m, &c1);
+        m->ar[28] = (m->ar[28] & ~UINT64_C(0x4500)) | cc;
+    } else if (op == 0xd9 && mr >= 0xe8 && mr <= 0xee) { /* constants */
+        static const struct { uint64_t sig; int exp; int adjust; } k[] = {
+            {UINT64_C(0x8000000000000000), 0, 0},   /* 1 */
+            {UINT64_C(0xd49a784bcd1b8afe), 1, 1},   /* log2(10): RC=up adds 1 */
+            {UINT64_C(0xb8aa3b295c17f0bc), 0, -1},  /* log2(e): down/chop -1 */
+            {UINT64_C(0xc90fdaa22168c235), 1, -1},  /* pi */
+            {UINT64_C(0x9a209a84fbcff799), -2, -1}, /* log10(2) */
+            {UINT64_C(0xb17217f7d1cf79ac), -1, -1}, /* ln(2) */
+        };
+        MercedFpReg f = {0};
+        if (mr != 0xee) {
+            unsigned rc = (fcw >> 10) & 3, n = mr - 0xe8;
+            uint64_t sig = k[n].sig;
+            if (k[n].adjust > 0 && rc == 2) sig++;
+            if (k[n].adjust < 0 && (rc == 1 || rc == 3)) sig--;
+            f = x87_to_fr((X87Number){.sig = sig, .exp = k[n].exp, .kind = X87_FINITE});
+        }
+        if (!x87_push_ok(m, &exc, &c1)) f = x87_to_fr(x87_indefinite());
+        if (!(exc & ~fcw & X87_IE)) x87_push_fr(m, f);
+    } else if (op == 0xd9 && (mr == 0xf6 || mr == 0xf7)) { /* FDECSTP/FINCSTP */
+        x87_set_top(m, mr == 0xf6 ? top + 7 : top + 1);
+    } else if (op == 0xd9 && (mr == 0xfa || mr == 0xfc || mr == 0xf0 ||
+                              mr == 0xfe || mr == 0xff)) { /* unary on ST0 */
+        a = x87_get(m, 0, &exc);
+        X87Number r;
+        if (mr == 0xfa) r = x87_sqrt(a, fcw, &exc, &c1);
+        else if (mr == 0xfc) r = x87_round_int_value(a, fcw, &exc, &c1);
+        else if (a.kind >= X87_NAN) r = x87_nan(a, a, &exc);
+        else if (mr != 0xf0 && a.kind == X87_INF) {
+            exc |= X87_IE;
+            r = x87_indefinite();
+        } else if (mr != 0xf0 && a.kind == X87_FINITE && a.exp >= 63) {
+            m->ar[28] |= X87_C2;                         /* out of range */
+            goto done;
+        } else {
+            if (a.denormal) exc |= X87_DE;
+            long double v = x87_to_host(a);
+            if (a.kind == X87_ZERO && mr != 0xff) r = a;
+            else if (mr == 0xf0) r = x87_from_host(expm1l(v * 0.693147180559945309417232121458176568L), fcw, &exc, &c1);
+            else r = x87_from_host(mr == 0xfe ? sinl(v) : cosl(v), fcw, &exc, &c1);
+            if (mr != 0xf0) m->ar[28] &= ~(uint64_t)X87_C2;
+        }
+        if (!X87_BLOCKED()) x87_set_st(m, 0, r);
+    } else if (op == 0xd9 && (mr == 0xf2 || mr == 0xfb)) { /* FPTAN / FSINCOS */
+        a = x87_get(m, 0, &exc);
+        X87Number r0, r1;
+        if (a.kind == X87_FINITE && a.exp >= 63) {
+            m->ar[28] |= X87_C2;
+            goto done;
+        }
+        m->ar[28] &= ~(uint64_t)X87_C2;
+        if (a.kind >= X87_NAN) r0 = r1 = x87_nan(a, a, &exc);
+        else if (a.kind == X87_INF) {
+            exc |= X87_IE;
+            r0 = r1 = x87_indefinite();
+        } else {
+            if (a.denormal) exc |= X87_DE;
+            long double v = x87_to_host(a);
+            if (mr == 0xf2) {
+                r0 = a.kind == X87_ZERO ? a : x87_from_host(tanl(v), fcw, &exc, &c1);
+                r1 = (X87Number){.sig = UINT64_C(1) << 63, .kind = X87_FINITE};
+            } else {
+                r0 = a.kind == X87_ZERO ? a : x87_from_host(sinl(v), fcw, &exc, &c1);
+                r1 = x87_from_host(cosl(v), fcw, &exc, &c1);
+            }
+        }
+        if (!x87_push_ok(m, &exc, &c1)) r0 = r1 = x87_indefinite();
+        if (!X87_BLOCKED()) {
+            x87_set_st(m, 0, r0);
+            x87_push_fr(m, x87_to_fr(r1));
+        }
+    } else if (op == 0xd9 && mr == 0xf4) {               /* FXTRACT */
+        a = x87_get(m, 0, &exc);
+        X87Number e, s;
+        if (a.kind >= X87_NAN) e = s = x87_nan(a, a, &exc);
+        else if (a.kind == X87_ZERO) {
+            exc |= X87_ZE;
+            e = x87_infinity(1);
+            s = a;
+        } else if (a.kind == X87_INF) {
+            e = x87_infinity(0);
+            s = a;
+        } else {
+            if (a.denormal) exc |= X87_DE;
+            e = x87_from_int(a.exp);
+            s = (X87Number){.sig = a.sig, .sign = a.sign, .kind = X87_FINITE};
+        }
+        if (!x87_push_ok(m, &exc, &c1)) e = s = x87_indefinite();
+        if (!X87_BLOCKED()) {
+            x87_set_st(m, 0, e);
+            x87_push_fr(m, x87_to_fr(s));
+        }
+    } else if (op == 0xd9 && (mr == 0xf5 || mr == 0xf8)) { /* FPREM1 / FPREM */
+        a = x87_get(m, 0, &exc);
+        b = x87_get(m, 1, &exc);
+        unsigned cc = 0;
+        X87Number r = x87_remainder(a, b, mr == 0xf5, fcw, &exc, &c1, &cc);
+        if (!X87_BLOCKED()) {
+            x87_set_st(m, 0, r);
+            m->ar[28] = (m->ar[28] & ~UINT64_C(0x4500)) | cc;
+        }
+    } else if (op == 0xd9 && mr == 0xfd) {               /* FSCALE */
+        a = x87_get(m, 0, &exc);
+        b = x87_get(m, 1, &exc);
+        X87Number r = x87_scale(a, b, fcw, &exc, &c1);
+        if (!X87_BLOCKED()) x87_set_st(m, 0, r);
+    } else if (op == 0xd9 && (mr == 0xf1 || mr == 0xf3 || mr == 0xf9)) {
+        a = x87_get(m, 0, &exc);                         /* FYL2X/FPATAN/FYL2XP1 */
+        b = x87_get(m, 1, &exc);
+        X87Number r;
+        if (a.kind >= X87_NAN || b.kind >= X87_NAN) r = x87_nan(b, a, &exc);
+        else {
+            if (a.denormal || b.denormal) exc |= X87_DE;
+            long double xv = x87_to_host(a), yv = x87_to_host(b);
+            if (mr == 0xf3) r = x87_from_host(atan2l(yv, xv), fcw, &exc, &c1);
+            else if (mr == 0xf1 && a.kind == X87_ZERO && b.kind == X87_FINITE) {
+                exc |= X87_ZE;
+                r = x87_infinity(!b.sign);
+            } else {
+                long double l = mr == 0xf1 ? log2l(xv)
+                              : log1pl(xv) * 1.44269504088896340735992468100189214L;
+                r = x87_from_host(yv * l, fcw, &exc, &c1);
+            }
+        }
+        if (!X87_BLOCKED()) {
+            x87_set_st(m, 1, r);
+            x87_pop(m);
+        }
+    }
+done:
+#undef X87_BLOCKED
+    x87_status(m, exc, c1);
+    return true;
 }
 
 static void logic_flags(X86 *x, uint32_t v, unsigned size) {
@@ -1544,119 +2499,20 @@ MercedStatus merced_ia32_step(Merced *m) {
         unsigned prefix_len = x.pc - x.start - 1;
         if (!fetch(&x, 1, &q)) goto fault;
         uint8_t mr = q;
-        unsigned sub = (mr >> 3) & 7;
-        bool clear = op == 0xdb && mr == 0xe2; /* fnclex */
-        bool load = op == 0xd9 && sub == 5 && mr < 0xc0; /* fldcw m16 */
-        bool store = op == 0xd9 && sub == 7 && mr < 0xc0; /* fnstcw m16 */
-        bool status_ax = op == 0xdf && mr == 0xe0; /* fnstsw ax */
-        bool fild = op == 0xdb && sub == 0 && mr < 0xc0;
-        bool fld = op == 0xdd && sub == 0 && mr < 0xc0;
-        bool fmul = op == 0xdc && sub == 1 && mr < 0xc0;
-        bool fcomp = op == 0xdc && sub == 3 && mr < 0xc0;
-        bool fst = op == 0xdd && (sub == 2 || sub == 3) && mr < 0xc0;
-        bool fstp_reg = op == 0xdd && (mr & 0xf8) == 0xd8;
-        bool numeric = fild || fld || fmul || fcomp || fst || fstp_reg;
-        if (!clear && !load && !store && !status_ax && !numeric)
+        if (!x87_supported(op, mr))
             return xhalt(&x, "IA-32 x87 %02X %02X unimplemented at %08X", op, mr, x.start);
         RM rm = {.is_reg = true, .reg = mr & 7};
-        if (!clear && !status_ax && !decode_rm(&x, mr, &rm)) goto fault;
+        if (!decode_rm(&x, mr, &rm)) goto fault;
         if (x.locked) {
             uint16_t code;
             if (!intercept_code(&x, prefix_len, &code)) goto fault;
             return merced_ia32_instruction_intercept(m, op | ((uint64_t)mr << 8), code);
         }
         MercedStatus status;
-        /* FNSTCW/FNCLEX are the no-wait forms. An explicit 9B is its own
-         * waiting instruction; FLDCW checks existing pending exceptions. */
-        if (!x87_ready(&x, load || numeric, false, &status)) return status;
-        if (clear) {
-            m->ar[28] &= ~UINT64_C(0x80ff); /* exception flags, SF, ES, B */
-        } else if (status_ax) {
-            setxr(&x, 0, 2, m->ar[28]);
-        } else if (store) {
-            if (!wb(&x, rm.addr, 2, (uint16_t)m->ar[21])) goto fault;
-        } else if (load) {
-            uint32_t word;
-            if (!rb(&x, rm.addr, 2, false, &word)) goto fault;
-            uint16_t fcw = (word & 0x1f3f) | 0x40;
-            m->ar[21] = (m->ar[21] & ~UINT64_C(0xffff)) | fcw;
-            bool pending = (m->ar[28] & ~fcw & 0x3f) != 0;
-            m->ar[28] = (m->ar[28] & ~UINT64_C(0x8080)) | (pending ? 0x8080 : 0);
-        } else {
-            /* Resolve all memory faults before changing FP status, pointers,
-             * tags or TOP. Stores need W permission even if an unmasked
-             * numeric exception subsequently suppresses their write cycle. */
-            uint64_t data = 0;
-            if (fst) {
-                if (!merced_ia32_probe_write(m, rm.addr, 8)) goto fault;
-            } else if (!rm.is_reg &&
-                       !merced_ia32_read(m, rm.addr, fild ? 4 : 8, false, &data)) goto fault;
-            unsigned top = x87_top(m), exceptions = 0;
-            uint16_t fcw = m->ar[21];
-            bool c1 = false;
-            X87Number a = x87_from_fr(m->fr[8 + top]), result = a;
-            x87_pointers(&x, op, mr, &rm);
-            if (fild || fld) {
-                unsigned next = (top + 7) & 7;
-                if (!x87_empty(m, next)) {
-                    exceptions = X87_IE | X87_SF;
-                    c1 = true;
-                    result = x87_indefinite();
-                } else if (fild) {
-                    int64_t integer = (int32_t)data;
-                    result = x87_normalize(integer < 0 ? -integer : integer, 63, integer < 0);
-                } else {
-                    result = x87_from_double(data);
-                    if (x87_signaling(result)) {
-                        exceptions = X87_IE;
-                        result.sig |= UINT64_C(1) << 62;
-                    } else if (result.denormal) exceptions = X87_DE;
-                }
-                /* FLD has a specific exception rule: even an unmasked
-                 * denormal-operand exception pushes the normalized value. */
-                if (!(exceptions & ~fcw & X87_IE)) {
-                    x87_set_top(m, next);
-                    x87_put(m, next, result);
-                }
-            } else {
-                bool empty = x87_empty(m, top);
-                if (empty) {
-                    exceptions = X87_IE | X87_SF;
-                    a = result = x87_indefinite();
-                }
-                if (fmul) {
-                    if (!empty) result = x87_multiply(a, x87_from_double(data), fcw,
-                                                       &exceptions, &c1);
-                    if (!(exceptions & ~fcw & (X87_IE | X87_DE))) x87_put(m, top, result);
-                } else if (fcomp) {
-                    unsigned cc = empty ? X87_C0 | X87_C2 | X87_C3 :
-                                  x87_compare(a, x87_from_double(data), &exceptions);
-                    if (!(exceptions & ~fcw & (X87_IE | X87_DE))) {
-                        m->ar[28] = (m->ar[28] & ~UINT64_C(0x4500)) | cc;
-                        x87_pop(m);
-                    }
-                } else if (fst) {
-                    uint64_t bits = x87_store_double(a, fcw, &exceptions, &c1);
-                    if (!(exceptions & ~fcw & (X87_IE | X87_OE | X87_UE))) {
-                        if (!merced_ia32_write(m, rm.addr, 8, bits)) goto fault;
-                        if (sub == 3) x87_pop(m);
-                    }
-                } else { /* FSTP ST(i), including the common discard ST(0). */
-                    if (!(exceptions & ~fcw & X87_IE)) {
-                        unsigned target = (top + rm.reg) & 7;
-                        if (empty) x87_put(m, target, a);
-                        else {
-                            /* Register stores transfer the extended encoding
-                             * unchanged, even SNaN or unsupported patterns. */
-                            m->fr[8 + target] = m->fr[8 + top];
-                            m->ar[28] &= ~(UINT64_C(1) << (16 + 2 * target));
-                        }
-                        x87_pop(m);
-                    }
-                }
-            }
-            x87_status(m, exceptions, c1);
-        }
+        /* The FN* forms don't check pending exceptions; an explicit 9B is
+         * its own waiting instruction. */
+        if (!x87_ready(&x, !x87_no_wait(op, mr), false, &status)) return status;
+        if (!x87_execute(&x, op, mr, &rm)) goto fault;
     } else if (op == 0xf6 || op == 0xf7) {
         if(!fetch(&x,1,&q))goto fault;
         uint8_t mr=q;RM rm;if(!decode_rm(&x,mr,&rm))goto fault;

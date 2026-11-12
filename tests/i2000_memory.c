@@ -5085,7 +5085,219 @@ static void check_ia32_bit_scan(bool fast, unsigned size, bool reverse,
     merced_destroy(cpu);
 }
 
+
+#if defined(__x86_64__) && defined(__linux__)
+#include <sys/mman.h>
+/* Differential x87 check: run one instruction on the host FPU and on the
+ * emulated IA-32 engine from identical state, inside
+ *   fninit; fldcw [edi]; fld tbyte [edi+10h]; fld tbyte [edi+20h]; fnclex;
+ *   <insn [esi]>; fnsave [edi+40h]
+ * and compare the saved control/status/tag words, all eight registers and
+ * the memory operand.  The bytes decode identically in 64-bit and 32-bit
+ * mode because they only address through (r/e)di and (r/e)si. */
+typedef struct { uint8_t insn[3]; unsigned len; unsigned mem; bool cc; } X87DiffOp;
+
+static uint64_t x87_diff_rng = UINT64_C(0x9e3779b97f4a7c15);
+static uint64_t x87_diff_rand(void) {
+    x87_diff_rng ^= x87_diff_rng << 13;
+    x87_diff_rng ^= x87_diff_rng >> 7;
+    x87_diff_rng ^= x87_diff_rng << 17;
+    return x87_diff_rng;
+}
+/* A binary80 image: mostly ordinary values near 1, some extremes. */
+static void x87_diff_value(uint8_t *p, int center) {
+    uint64_t r = x87_diff_rand(), sig = x87_diff_rand() | (UINT64_C(1) << 63);
+    unsigned kind = r % 32, exp;
+    if (kind < 20) exp = (unsigned)(0x3fff + center + (int)((r >> 8) % 129) - 64);
+    else if (kind < 22) exp = 0x7ffe - (unsigned)((r >> 8) % 4);
+    else if (kind < 24) exp = 1 + (unsigned)((r >> 8) % 4);
+    else if (kind < 25) { exp = 0; sig = 0; }
+    else if (kind < 26) { exp = 0x7fff; sig = UINT64_C(1) << 63; }
+    else if (kind < 27) { exp = 0x7fff; sig |= UINT64_C(1) << 62; }
+    else if (kind < 28) { exp = 0; sig >>= 1 + (r >> 8) % 70; }
+    else if (kind < 30) { exp = 0x3fff + (unsigned)((r >> 8) % 70); sig >>= ((r >> 16) % 3) ? 0 : 0; }
+    else { exp = 0x3fff + (unsigned)((r >> 8) % 8); sig &= ~UINT64_C(0xffffffff); }
+    if (exp && exp < 0x7fff && kind >= 28) sig = (sig >> ((r >> 20) % 50)) << ((r >> 20) % 50);
+    for (unsigned i = 0; i < 8; i++) p[i] = (uint8_t)(sig >> (8 * i));
+    unsigned se = exp | (unsigned)((r >> 40) & 1) << 15;
+    p[8] = (uint8_t)se; p[9] = (uint8_t)(se >> 8);
+}
+static void x87_diff_memory(uint8_t *p, const X87DiffOp *op) {
+    uint64_t r = x87_diff_rand(), v = x87_diff_rand();
+    unsigned kind = r % 8;
+    if (op->mem == 4 && (op->insn[0] == 0xd8 || op->insn[0] == 0xd9)) {
+        uint32_t s = (uint32_t)v;
+        if (kind < 5) s = (s & 0x807fffff) | (uint32_t)(127 + (int)((r >> 8) % 60) - 30) << 23;
+        else if (kind == 5) s &= 0x807fffff;
+        memcpy(p, &s, 4);
+    } else if (op->mem == 8 && (op->insn[0] == 0xdc || op->insn[0] == 0xdd)) {
+        if (kind < 5) v = (v & UINT64_C(0x800fffffffffffff)) |
+                          (uint64_t)(1023 + (int)((r >> 8) % 120) - 60) << 52;
+        else if (kind == 5) v &= UINT64_C(0x800fffffffffffff);
+        memcpy(p, &v, 8);
+    } else if (op->mem == 10) {
+        x87_diff_value(p, 0);
+    } else {
+        if (kind < 4) v = (uint64_t)(int64_t)((int)(v % 2001) - 1000);
+        memcpy(p, &v, 8);
+    }
+}
+static void check_ia32_x87_differential(bool fast) {
+    static const X87DiffOp ops[] = {
+#define M(a, b, n) {{a, b}, 2, n, false}
+#define MC(a, b, n) {{a, b}, 2, n, true}
+#define R(a, b) {{a, b}, 2, 0, false}
+#define RC(a, b) {{a, b}, 2, 0, true}
+        M(0xd8,0x06,4), M(0xd8,0x0e,4), MC(0xd8,0x16,4), MC(0xd8,0x1e,4),
+        M(0xd8,0x26,4), M(0xd8,0x2e,4), M(0xd8,0x36,4), M(0xd8,0x3e,4),
+        M(0xdc,0x06,8), M(0xdc,0x0e,8), MC(0xdc,0x16,8), MC(0xdc,0x1e,8),
+        M(0xdc,0x26,8), M(0xdc,0x2e,8), M(0xdc,0x36,8), M(0xdc,0x3e,8),
+        M(0xda,0x06,4), M(0xda,0x0e,4), MC(0xda,0x16,4), M(0xda,0x26,4), M(0xda,0x3e,4),
+        M(0xde,0x06,2), M(0xde,0x0e,2), MC(0xde,0x1e,2), M(0xde,0x2e,2), M(0xde,0x36,2),
+        R(0xd8,0xc1), R(0xd8,0xc9), RC(0xd8,0xd1), RC(0xd8,0xd9), R(0xd8,0xe1),
+        R(0xd8,0xe9), R(0xd8,0xf1), R(0xd8,0xf9),
+        R(0xdc,0xc1), R(0xdc,0xc9), R(0xdc,0xe1), R(0xdc,0xe9), R(0xdc,0xf1), R(0xdc,0xf9),
+        R(0xde,0xc1), R(0xde,0xc9), RC(0xde,0xd9), R(0xde,0xe1), R(0xde,0xe9),
+        R(0xde,0xf1), R(0xde,0xf9),
+        RC(0xda,0xe9), RC(0xdd,0xe1), RC(0xdd,0xe9), RC(0xd9,0xe4), RC(0xd9,0xe5),
+        R(0xd9,0xc1), R(0xd9,0xc9), R(0xdd,0xd9), R(0xdd,0xd1), R(0xdd,0xc1),
+        R(0xd9,0xe0), R(0xd9,0xe1), R(0xd9,0xe8), R(0xd9,0xe9), R(0xd9,0xea),
+        R(0xd9,0xeb), R(0xd9,0xec), R(0xd9,0xed), R(0xd9,0xee), R(0xd9,0xf4),
+        RC(0xd9,0xf5), RC(0xd9,0xf8), R(0xd9,0xfa), R(0xd9,0xfc), R(0xd9,0xfd),
+        R(0xd9,0xf6), R(0xd9,0xf7), R(0xd9,0xd0),
+        M(0xd9,0x06,4), M(0xdd,0x06,8), M(0xdb,0x06,4), M(0xdf,0x06,2),
+        M(0xdf,0x2e,8), M(0xdb,0x2e,10),
+        M(0xd9,0x16,4), M(0xd9,0x1e,4), M(0xdd,0x16,8), M(0xdd,0x1e,8),
+        M(0xdb,0x16,4), M(0xdb,0x1e,4), M(0xdf,0x16,2), M(0xdf,0x1e,2),
+        M(0xdf,0x3e,8), M(0xdb,0x3e,10),
+#undef M
+#undef MC
+#undef R
+#undef RC
+    };
+    uint8_t *host = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (host == MAP_FAILED) { failures++; return; }
+    static const uint8_t pre[] = {0xdb,0xe3, 0xd9,0x2f, 0xdb,0x6f,0x10,
+                                  0xdb,0x6f,0x20, 0xdb,0xe2};
+    static const uint8_t post[] = {0xdd,0x77,0x40};
+    unsigned mismatches = 0, cases = 0;
+    for (unsigned o = 0; o < sizeof(ops) / sizeof(ops[0]); o++) {
+        const X87DiffOp *op = &ops[o];
+        uint8_t code[32];
+        unsigned n = 0;
+        memcpy(code, pre, sizeof(pre)); n = sizeof(pre);
+        memcpy(code + n, op->insn, op->len); n += op->len;
+        memcpy(code + n, post, sizeof(post)); n += sizeof(post);
+        memcpy(host, code, n);
+        host[n] = 0xc3;
+        void (*thunk)(void *, void *) = (void (*)(void *, void *))(void *)host;
+        bool reported = false;
+        for (unsigned t = 0; t < 400; t++) {
+            uint8_t state[0xb0] = {0}, mem[16] = {0}, hstate[0xb0], hmem[16];
+            uint64_t r = x87_diff_rand();
+            uint16_t cw = 0x007f | (uint16_t)(((r >> 2) & 3) << 10) |
+                          (uint16_t)((r & 1) ? 0x300 : ((r >> 4) & 1) ? 0x200 : 0);
+            state[0] = (uint8_t)cw; state[1] = (uint8_t)(cw >> 8);
+            x87_diff_value(state + 0x10, 0);
+            x87_diff_value(state + 0x20, (r >> 5) & 1 ? (int)((r >> 6) % 40) : 0);
+            x87_diff_memory(mem, op);
+            memcpy(hstate, state, sizeof(state));
+            memcpy(hmem, mem, sizeof(mem));
+            thunk(hstate, hmem);
+
+            Ia32CmpxchgFixture f = {0};
+            memcpy(f.ram.memory + 0x1000, code, n);
+            memcpy(f.ram.memory + 0x5000, state, sizeof(state));
+            memcpy(f.ram.memory + 0x5100, mem, sizeof(mem));
+            MercedBus bus = {.ud=&f,.read=ia32_cmpxchg_read,.write=ia32_cmpxchg_write,
+                             .ram_size=sizeof(f.ram.memory)};
+            Merced *cpu = merced_create(&bus);
+            if (!cpu) { failures++; break; }
+            cpu->ip = 0x1000;
+            cpu->psr = (UINT64_C(1)<<13)|(UINT64_C(1)<<17)|(UINT64_C(1)<<19)|
+                       (UINT64_C(1)<<34)|(UINT64_C(1)<<44);
+            cpu->gr_static[25] = (UINT64_C(1)<<62)|0x800;
+            cpu->gr_static[27] = 0x1000;
+            cpu->gr_static[17] = 0x33; cpu->gr_static[16] = 0x2b;
+            cpu->gr_static[14] = 0x3100;  /* ESI */
+            cpu->gr_static[15] = 0x3000;  /* EDI */
+            cpu->ar[21] = (UINT64_C(0x1f80)<<32)|0x037f;
+            cpu->ar[28] = UINT64_C(0x55550000);
+            cpu->ar[24] = UINT64_C(0x246);
+            cpu->cr[2] = 0x8000; cpu->cr[72] = UINT64_C(1)<<16;
+            cpu->rr[0] = (1<<8)|(12<<2);
+            cpu->dtr[0] = (MercedTlbEntry){.va_start=0x4000,.va_end=0x4fff,.pfn_base=0x5000,
+                .rid=1,.ps=12,.valid=1,.itir=(1<<8)|(12<<2),.pte=0x5461};
+            for (unsigned s = 0; s < 8 && cpu->ip != 0x1000 + n; s++)
+                if (handoff_step(cpu, fast) != MERCED_OK) break;
+            const uint8_t *es = f.ram.memory + 0x5000, *em = f.ram.memory + 0x5100;
+            cases++;
+            bool host_c2 = hstate[0x45] & 4;
+            if ((op->insn[1] == 0xf5 || op->insn[1] == 0xf8) && op->insn[0] == 0xd9 && host_c2)
+                continue; /* hardware partial remainder; ours reduces fully */
+            uint16_t sw_mask = op->cc ? 0xffff : (uint16_t)~0x4500;
+            uint16_t hsw = (uint16_t)(hstate[0x44] | hstate[0x45] << 8);
+            uint16_t esw = (uint16_t)(es[0x44] | es[0x45] << 8);
+            bool same = cpu->ip == 0x1000 + n &&
+                        !memcmp(hstate + 0x40, es + 0x40, 2) &&
+                        (hsw & sw_mask) == (esw & sw_mask) &&
+                        !memcmp(hstate + 0x48, es + 0x48, 2) &&
+                        !memcmp(hmem, em, sizeof(mem));
+            /* Empty registers keep stale host contents; compare live ones. */
+            unsigned htop = (hsw >> 11) & 7;
+            for (unsigned j = 0; j < 8 && same; j++) {
+                unsigned phys = (htop + j) & 7;
+                unsigned tag = ((hstate[0x48] | hstate[0x49] << 8) >> (2 * phys)) & 3;
+                if (tag != 3 && memcmp(hstate + 0x5c + 10 * j, es + 0x5c + 10 * j, 10))
+                    same = false;
+            }
+            if (!same) {
+                mismatches++;
+                if (!reported) {
+                    reported = true;
+                    fprintf(stderr, "x87 diff %02X %02X cw=%04X ip=%" PRIx64 " sw host=%04X emu=%04X\n",
+                            op->insn[0], op->insn[1], cw, cpu->ip, hsw, esw);
+                    fprintf(stderr, "  in  a=");
+                    for (int k = 9; k >= 0; k--) fprintf(stderr, "%02X", state[0x20 + k]);
+                    fprintf(stderr, " b=");
+                    for (int k = 9; k >= 0; k--) fprintf(stderr, "%02X", state[0x10 + k]);
+                    fprintf(stderr, " mem=");
+                    for (int k = 9; k >= 0; k--) fprintf(stderr, "%02X", mem[k]);
+                    fprintf(stderr, "\n  tags host=%02X%02X emu=%02X%02X\n",
+                            hstate[0x49], hstate[0x48], es[0x49], es[0x48]);
+                    for (unsigned j = 0; j < 2; j++) {
+                        fprintf(stderr, "  ST%u host=", j);
+                        for (int k = 9; k >= 0; k--) fprintf(stderr, "%02X", hstate[0x5c + 10 * j + k]);
+                        fprintf(stderr, " emu=");
+                        for (int k = 9; k >= 0; k--) fprintf(stderr, "%02X", es[0x5c + 10 * j + k]);
+                        fprintf(stderr, "\n");
+                    }
+                    fprintf(stderr, "  mem host=");
+                    for (int k = 9; k >= 0; k--) fprintf(stderr, "%02X", hmem[k]);
+                    fprintf(stderr, " emu=");
+                    for (int k = 9; k >= 0; k--) fprintf(stderr, "%02X", em[k]);
+                    fprintf(stderr, "\n");
+                }
+            }
+            merced_destroy(cpu);
+        }
+    }
+    munmap(host, 4096);
+    if (mismatches) {
+        fprintf(stderr, "x87 differential (%s): %u of %u cases differ from host FPU\n",
+                fast ? "fast" : "slow", mismatches, cases);
+        failures++;
+    } else printf("Merced x87 differential (%s): %u cases match the host FPU\n",
+                  fast ? "fast" : "slow", cases);
+}
+#endif
+
 int main(void) {
+#if defined(__x86_64__) && defined(__linux__)
+    for (unsigned fast = 0; fast < 2; fast++)
+        check_ia32_x87_differential(fast);
+#endif
     for (unsigned fast=0;fast<2;fast++)
         for (unsigned size=2;size<=4;size+=2)
             for (unsigned reverse=0;reverse<2;reverse++) {
