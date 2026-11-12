@@ -4349,8 +4349,9 @@ static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
             i2000_efi_bios_key(s, *p);
             queued++;
         }
-        gemu_monitor_printf(mon, "key: queued %zu character%s; use 'key enter' "
-                            "to submit\n", queued, queued == 1 ? "" : "s");
+        gemu_monitor_printf(mon, "key: queued %" PRIu64 " character%s; use "
+                            "'key enter' to submit\n", (uint64_t)queued,
+                            queued == 1 ? "" : "s");
     }
     return GEMU_MON_NONE;
 }
@@ -4428,14 +4429,16 @@ static GemuMonCmd i2000_cmd_atapistate(GemuMonitor *mon, const char *args,
            "device=%#04x control=%#04x irq_pending=%u irq_asserted=%u "
            "irq_ready=%" PRIu64 " status_pending=%u "
            "status_ready=%" PRIu64 " ready_status=%#04x ready_irq=%u "
-           "data=%zu/%zu phase_end=%zu ninsts=%" PRIu64 "\n",
+           "data=%" PRIu64 "/%" PRIu64 " phase_end=%" PRIu64
+           " ninsts=%" PRIu64 "\n",
            s->atapi_status, s->atapi_error, s->atapi_count,
            s->atapi_device, s->atapi_device_control,
            s->atapi_irq_pending, s->atapi_irq_asserted,
            s->atapi_irq_ready_ninsts, s->atapi_status_pending,
            s->atapi_status_ready_ninsts, s->atapi_ready_status,
-           s->atapi_ready_irq, s->atapi_data_pos, s->atapi_data_len,
-           s->atapi_phase_end, s->cpu->ninsts);
+           s->atapi_ready_irq, (uint64_t)s->atapi_data_pos,
+           (uint64_t)s->atapi_data_len, (uint64_t)s->atapi_phase_end,
+           s->cpu->ninsts);
     return GEMU_MON_NONE;
 }
 

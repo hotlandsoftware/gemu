@@ -386,49 +386,99 @@ static X87Number x87_nan(X87Number a, X87Number b, unsigned *exceptions) {
     return n;
 }
 
-static unsigned x87_bit_length(__uint128_t v) {
-    uint64_t hi = v >> 64;
-    return hi ? 128 - __builtin_clzll(hi) : 64 - __builtin_clzll((uint64_t)v);
+/* Unsigned 128-bit values for the x87 rounding path: an exact 64x64-bit
+ * product plus the shifts, masks and compares rounding needs.  Spelled out
+ * with two 64-bit halves because 32-bit targets (i686 MinGW) have no
+ * __int128; every target runs this same code. */
+typedef struct { uint64_t lo, hi; } X87U128;
+
+static X87U128 u128_from64(uint64_t v) { return (X87U128){v, 0}; }
+static bool u128_is_zero(X87U128 v) { return !(v.lo | v.hi); }
+static int u128_cmp(X87U128 a, X87U128 b) {
+    if (a.hi != b.hi) return a.hi > b.hi ? 1 : -1;
+    if (a.lo != b.lo) return a.lo > b.lo ? 1 : -1;
+    return 0;
+}
+static X87U128 u128_bit(unsigned n) {                     /* 1 << n, n < 128 */
+    return n < 64 ? (X87U128){UINT64_C(1) << n, 0}
+                  : (X87U128){0, UINT64_C(1) << (n - 64)};
+}
+static X87U128 u128_shl(X87U128 v, unsigned n) {
+    if (n >= 128) return (X87U128){0, 0};
+    if (n >= 64) return (X87U128){0, v.lo << (n - 64)};
+    if (!n) return v;
+    return (X87U128){v.lo << n, (v.hi << n) | (v.lo >> (64 - n))};
+}
+static X87U128 u128_shr(X87U128 v, unsigned n) {
+    if (n >= 128) return (X87U128){0, 0};
+    if (n >= 64) return (X87U128){v.hi >> (n - 64), 0};
+    if (!n) return v;
+    return (X87U128){(v.lo >> n) | (v.hi << (64 - n)), v.hi >> n};
+}
+static X87U128 u128_low_bits(X87U128 v, unsigned n) {    /* v mod 2^n */
+    if (n >= 128) return v;
+    if (n >= 64) return (X87U128){v.lo, n == 64 ? 0 : v.hi & ((UINT64_C(1) << (n - 64)) - 1)};
+    return (X87U128){n ? v.lo & ((UINT64_C(1) << n) - 1) : 0, 0};
+}
+static X87U128 u128_inc(X87U128 v) {
+    v.lo++;
+    if (!v.lo) v.hi++;
+    return v;
+}
+static X87U128 u128_mul64(uint64_t a, uint64_t b) {
+#ifdef __SIZEOF_INT128__
+    /* One native widening multiply where the compiler has 128-bit
+     * integers (all 64-bit hosts); the same result as the version below. */
+    unsigned __int128 p = (unsigned __int128)a * b;
+    return (X87U128){(uint64_t)p, (uint64_t)(p >> 64)};
+#else
+    uint64_t a0 = (uint32_t)a, a1 = a >> 32, b0 = (uint32_t)b, b1 = b >> 32;
+    uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+    uint64_t mid = (p00 >> 32) + (uint32_t)p01 + (uint32_t)p10;
+    return (X87U128){(mid << 32) | (uint32_t)p00,
+                     p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32)};
+#endif
+}
+
+static unsigned x87_bit_length(X87U128 v) {
+    return v.hi ? 128 - (unsigned)__builtin_clzll(v.hi)
+                : 64 - (unsigned)__builtin_clzll(v.lo);
 }
 /* Round an exact positive integer times 2^scale. When shift >= 128 the
  * result can still round away from zero; do not perform an invalid shift. */
-static X87Number x87_round_integer(__uint128_t value, int scale, int shift,
+static X87Number x87_round_integer(X87U128 value, int scale, int shift,
                                     unsigned sign, unsigned rc,
                                     bool *inexact, bool *up) {
-    __uint128_t q, rem;
+    X87U128 q, rem = {0, 0};
     int half = -1;
     if (shift <= 0) {
-        q = value << -shift;
-        rem = 0;
+        q = u128_shl(value, (unsigned)-shift);
     } else if (shift < 128) {
-        q = value >> shift;
-        rem = value & (((__uint128_t)1 << shift) - 1);
-        __uint128_t midpoint = (__uint128_t)1 << (shift - 1);
-        half = rem == midpoint ? 0 : rem > midpoint ? 1 : -1;
+        q = u128_shr(value, (unsigned)shift);
+        rem = u128_low_bits(value, (unsigned)shift);
+        half = u128_cmp(rem, u128_bit((unsigned)shift - 1));
     } else {
-        q = 0;
+        q = (X87U128){0, 0};
         rem = value;
-        if (shift == 128) {
-            __uint128_t midpoint = (__uint128_t)1 << 127;
-            half = value == midpoint ? 0 : value > midpoint ? 1 : -1;
-        }
+        if (shift == 128)
+            half = u128_cmp(value, u128_bit(127));
     }
-    *inexact = rem != 0;
-    *up = rem && (rc == 0 ? half > 0 || (half == 0 && (q & 1)) :
-                  rc == 1 ? sign != 0 : rc == 2 ? sign == 0 : false);
-    if (*up) q++;
-    if (!q) return (X87Number){.sign = sign, .kind = X87_ZERO};
+    *inexact = !u128_is_zero(rem);
+    *up = *inexact && (rc == 0 ? half > 0 || (half == 0 && (q.lo & 1)) :
+                       rc == 1 ? sign != 0 : rc == 2 ? sign == 0 : false);
+    if (*up) q = u128_inc(q);
+    if (u128_is_zero(q)) return (X87Number){.sign = sign, .kind = X87_ZERO};
     unsigned bits = x87_bit_length(q);
     /* At most 65 bits survive (the extra one is a rounding carry). */
-    uint64_t sig = bits > 64 ? q >> (bits - 64) : q << (64 - bits);
+    uint64_t sig = bits > 64 ? u128_shr(q, bits - 64).lo : q.lo << (64 - bits);
     return (X87Number){.sig = sig, .exp = scale + shift + (int)bits - 1,
                        .sign = sign, .kind = X87_FINITE};
 }
-static X87Number x87_round(__uint128_t value, int scale, unsigned sign,
+static X87Number x87_round(X87U128 value, int scale, unsigned sign,
                             unsigned precision, int emin, int emax,
                             uint16_t fcw, bool memory, unsigned *exceptions,
                             bool *c1) {
-    if (!value) return (X87Number){.sign = sign, .kind = X87_ZERO};
+    if (u128_is_zero(value)) return (X87Number){.sign = sign, .kind = X87_ZERO};
     unsigned rc = (fcw >> 10) & 3;
     int bits = x87_bit_length(value), shift = bits - (int)precision;
     bool inexact;
@@ -478,7 +528,7 @@ static X87Number x87_multiply(X87Number a, X87Number b, uint16_t fcw,
         return (X87Number){.sign = sign, .kind = X87_ZERO};
     unsigned pc = (fcw >> 8) & 3;
     unsigned precision = pc == 0 ? 24 : pc == 2 ? 53 : 64;
-    return x87_round((__uint128_t)a.sig * b.sig, a.exp + b.exp - 126,
+    return x87_round(u128_mul64(a.sig, b.sig), a.exp + b.exp - 126,
                       sign, precision, -16382, 16383, fcw, false, exceptions, c1);
 }
 static uint64_t x87_store_double(X87Number n, uint16_t fcw,
@@ -491,7 +541,7 @@ static uint64_t x87_store_double(X87Number n, uint16_t fcw,
         n.sig |= UINT64_C(1) << 62;
     }
     if (n.kind == X87_FINITE)
-        n = x87_round(n.sig, n.exp - 63, n.sign, 53, -1022, 1023,
+        n = x87_round(u128_from64(n.sig), n.exp - 63, n.sign, 53, -1022, 1023,
                        fcw, true, exceptions, c1);
     uint64_t bits = (uint64_t)n.sign << 63;
     if (n.kind == X87_INF) return bits | UINT64_C(0x7ff0000000000000);
