@@ -422,6 +422,18 @@ static void test_ata(void) {
     CHECK(s->ram[0x48E] == 0xFF && !s->ata_legacy_irq_latched && !irq(s, 0));
     CHECK(io_port_read(s, 0x1F7, 1) == 0x58);
     ata_read_sector(s, 0);
+    /* Inside an IA-32 BIOS callback (PSR.is), even with a firmware IVA:
+     * EFI enters those with PSR.i clear, so the BIOS's IRQ14 handler can't
+     * run; completion sets its 40:8E flag the same way. */
+    s->cpu->cr[2] = 0x10000;
+    s->cpu->psr |= UINT64_C(1) << 34;
+    s->ram[0x48E] = 0;
+    ata_task(s, 0xE0, 1, 1, 0x20);
+    ata_wait(s);
+    CHECK(s->ram[0x48E] == 0xFF && !s->ata_legacy_irq_latched && !irq(s, 0));
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x58);
+    ata_read_sector(s, 1);
+    s->cpu->psr &= ~(UINT64_C(1) << 34);
     /* With a firmware IVA but IRQ14 still masked (reset PIC), the request
      * only shows in the slave's IRR; it is not delivered. */
     s->cpu->cr[2] = 0x10000;
@@ -437,6 +449,8 @@ static void test_ata(void) {
      * slave PIC input 6. */
     io_port_write(s, 0x21, 0xFB, 1);
     io_port_write(s, 0xA1, 0xBF, 1);
+    s->cpu->psr |= UINT64_C(1) << 14;              /* native code, PSR.i on */
+    s->ram[0x48E] = 0;
     ata_task(s, 0xE0, 3, 1, 0x20);
     s->cpu->ninsts += ATAPI_IRQ_LATENCY_NINSTS;
     CHECK(io_port_read(s, 0x1F7, 1) == 0x58);      /* delivers, then acks */
@@ -444,6 +458,13 @@ static void test_ata(void) {
     CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == s->pic_slave_base + 6u);
     CHECK(!s->ata_legacy_irq_latched && s->ram[0x48E] == 0);
     ata_read_sector(s, 3);
+    /* Native code with PSR.i clear can't take it either: BIOS flag. */
+    s->cpu->psr &= ~(UINT64_C(1) << 14);
+    ata_task(s, 0xE0, 4, 1, 0x20);
+    ata_wait(s);
+    CHECK(s->ram[0x48E] == 0xFF && !s->ata_legacy_irq_latched && !irq(s, 0));
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x58);
+    ata_read_sector(s, 4);
     s->cpu->cr[2] = 0;
     route_gsi(s, 14, 0x70);
 

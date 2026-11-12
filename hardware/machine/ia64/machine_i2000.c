@@ -930,7 +930,17 @@ static void ata_deliver_irq(Ia64I2000State *s) {
         s->ata_irq_asserted = true;
     } else if (rte == I460GX_IOSAPIC_RTE_MASK ||
                (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) == 7)) {
-        if (s->cpu->cr[2] == 0 && s->ram_size > 0x48E) {
+        if ((s->cpu->cr[2] == 0 || (s->cpu->psr & (UINT64_C(1) << 34)) ||
+             !(s->cpu->psr & (UINT64_C(1) << 14))) &&
+            s->ram_size > 0x48E) {
+            /* Also whenever the interrupt can't be delivered now: inside an
+             * IA-32 BIOS callback (PSR.is), or in the native intercept code
+             * around one (PSR.i clear) - EFI runs those with interrupts off,
+             * so IRQ14 can't reach the BIOS's own handler before its 40:8E
+             * wait times out.  Lost that way: the first GPT read after boot
+             * (no partitions, so the Windows boot entry was "Not Found"),
+             * and later a READ MULTIPLE block inside FPSWA.EFI ("Device
+             * Error"). */
             s->ata_irq_asserted = true;
             /* The SDV's "BIOS CallBacks" disk path runs the IA-32 BIOS's
              * INT 13h with cr.iva zero, where GEMU delivers no external
@@ -996,6 +1006,10 @@ static void ata_write_block(Ia64I2000State *s, bool irq) {
 
 /* The host has read the whole current data-in block. */
 static void ata_data_in_done(Ia64I2000State *s) {
+    if (getenv("ATA_DEBUG"))
+        fprintf(stderr, "i2000: ATA data-in block read lba=%u sectors=%u "
+                "ninsts=%" PRIu64 "\n", s->ata_xfer_lba, s->ata_block_sectors,
+                s->cpu->ninsts);
     if (s->ata_xfer_cmd == 0x20 || s->ata_xfer_cmd == 0x21 ||
         s->ata_xfer_cmd == 0xC4) {
         s->ata_xfer_lba += s->ata_block_sectors;
@@ -1113,6 +1127,10 @@ static void ata_command(Ia64I2000State *s, uint8_t cmd) {
                 "count=%u features=%#04x ninsts=%" PRIu64 "\n", cmd,
                 s->ata_device, s->ata_lba_high, s->ata_lba_mid, s->ata_lba_low,
                 s->ata_count, s->ata_features, s->cpu->ninsts);
+    if (getenv("ATA_DEBUG") && s->ata_data_len &&
+        s->ata_data_pos < s->ata_data_len)
+        fprintf(stderr, "i2000: ATA command %#04x abandons %zu unread "
+                "data bytes\n", cmd, (size_t)(s->ata_data_len - s->ata_data_pos));
     s->ata_error = 0;
     ata_clear_irq(s);
     switch (cmd) {

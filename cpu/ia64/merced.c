@@ -7128,13 +7128,20 @@ MercedStatus merced_step(Merced *m) {
          * execution into the native IVT.  The SDV BIOS then saves a native
          * intercept frame as though it were the interrupted x86 frame and
          * eventually IRETs into its F3:F4/data sentinel at F000:71A8. */
-        if (!ami_ivt_handoff && (m->psr & PSR_I) && (m->psr & PSR_IC) &&
-            ext_highest_unmasked(m) >= 0) {
+        /* While IA-32 instructions execute, external interrupts also need
+         * EFLAGS.IF (SDM Vol.2: delivered only if PSR.i and EFLAG.if are
+         * both 1).  AMI's IA-32 BIOS issues an IDE command under cli and
+         * then polls the 8259's IRR for IRQ14/15; delivering the interrupt
+         * inside that window let EFI acknowledge it first, so every BIOS
+         * disk/CD wait timed out (and keyboard IRQs starved behind it). */
+        bool ia32_if = (m->ar[24] & (UINT64_C(1) << 9)) != 0;
+        if (!ami_ivt_handoff && ia32_if && (m->psr & PSR_I) &&
+            (m->psr & PSR_IC) && ext_highest_unmasked(m) >= 0) {
             MercedStatus ist = deliver_fault(m, VEC_EXTINT, 0, 0, false);
             m->ninsts++;
             return ist;
         }
-        if (!ami_ivt_handoff && m->timer_pending &&
+        if (!ami_ivt_handoff && ia32_if && m->timer_pending &&
             !(m->cr[CR_ITV] & (1ull << 16)) &&
             interrupt_unmasked(m, (uint8_t)m->cr[CR_ITV]) &&
             (m->psr & PSR_I) && (m->psr & PSR_IC)) {
