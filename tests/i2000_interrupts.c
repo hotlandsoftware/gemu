@@ -224,6 +224,15 @@ static void test_keyboard(void) {
     CHECK(io_port_read(s, 0x60, 1) == 0x42 && io_port_read(s, 0x60, 1) == 0xC2);
     i2000_type_key(s, 0xffc9);         /* F12 */
     CHECK(io_port_read(s, 0x60, 1) == 0x58 && io_port_read(s, 0x60, 1) == 0xD8);
+    /* Modifiers are real held keys: Setup's Shift+F10 opens a console. */
+    ps2_keyboard_key(&s->ps2_keyboard, 0xffe1, true);   /* Left Shift */
+    ps2_keyboard_tap(&s->ps2_keyboard, 0xffc7);          /* F10 */
+    ps2_keyboard_key(&s->ps2_keyboard, 0xffe1, false);
+    CHECK(io_port_read(s, 0x60, 1) == 0x2A && io_port_read(s, 0x60, 1) == 0x44 &&
+          io_port_read(s, 0x60, 1) == 0xC4 && io_port_read(s, 0x60, 1) == 0xAA);
+    ps2_keyboard_tap(&s->ps2_keyboard, 0xffe4);          /* Right Ctrl */
+    CHECK(io_port_read(s, 0x60, 1) == 0xE0 && io_port_read(s, 0x60, 1) == 0x1D &&
+          io_port_read(s, 0x60, 1) == 0xE0 && io_port_read(s, 0x60, 1) == 0x9D);
     i2000_type_key(s, 'b');
     i2000_poll_interrupts(s);
     CHECK(i2000_save_snapshot(s, "kbd.vmstate"));

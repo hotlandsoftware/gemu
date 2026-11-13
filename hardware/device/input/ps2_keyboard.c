@@ -137,6 +137,12 @@ static bool keymap(uint32_t key, KeyMap *out) {
     case 0xff56: out->scan=0x51; out->extended=true; return true; /* PgDn */
     case 0xff57: out->scan=0x4f; out->extended=true; return true; /* End */
     case 0xff63: out->scan=0x52; out->extended=true; return true; /* Insert */
+    case 0xffe1: out->scan=0x2a; return true;                     /* LShift */
+    case 0xffe2: out->scan=0x36; return true;                     /* RShift */
+    case 0xffe3: out->scan=0x1d; return true;                     /* LCtrl */
+    case 0xffe4: out->scan=0x1d; out->extended=true; return true; /* RCtrl */
+    case 0xffe9: out->scan=0x38; return true;                     /* LAlt */
+    case 0xffea: out->scan=0x38; out->extended=true; return true; /* RAlt */
     case 0xffc8: out->scan=0x57; return true;                     /* F11 */
     case 0xffc9: out->scan=0x58; return true;                     /* F12 */
     default:

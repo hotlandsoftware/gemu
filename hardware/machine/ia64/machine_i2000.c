@@ -116,6 +116,12 @@ enum {
     I2000_KEY_F1,       /* F1-F12 follow in order: Windows Setup uses F3,
                          * F6, F8 ... and they have no ASCII code for the
                          * window's typed-text path. */
+    I2000_KEY_LSHIFT = I2000_KEY_F1 + 12,
+    I2000_KEY_RSHIFT,
+    I2000_KEY_LCTRL,
+    I2000_KEY_RCTRL,
+    I2000_KEY_LALT,
+    I2000_KEY_RALT,
 };
 
 static const GemuActionDef i2000_keyboard_actions[] = {
@@ -141,6 +147,14 @@ static const GemuActionDef i2000_keyboard_actions[] = {
     { "key_f10",        GEMU_ACTION(I2000_KEY_F1 + 9), "F10" },
     { "key_f11",        GEMU_ACTION(I2000_KEY_F1 + 10), "F11" },
     { "key_f12",        GEMU_ACTION(I2000_KEY_F1 + 11), "F12" },
+    /* Modifiers are held keys too: Setup's Shift+F10 console, Ctrl/Alt
+     * combinations.  Typed text only ever carried its own synthetic Shift. */
+    { "key_lshift",     GEMU_ACTION(I2000_KEY_LSHIFT), "Left Shift" },
+    { "key_rshift",     GEMU_ACTION(I2000_KEY_RSHIFT), "Right Shift" },
+    { "key_lctrl",      GEMU_ACTION(I2000_KEY_LCTRL),  "Left Ctrl" },
+    { "key_rctrl",      GEMU_ACTION(I2000_KEY_RCTRL),  "Right Ctrl" },
+    { "key_lalt",       GEMU_ACTION(I2000_KEY_LALT),   "Left Alt" },
+    { "key_ralt",       GEMU_ACTION(I2000_KEY_RALT),   "Right Alt" },
 };
 
 static const uint32_t i2000_keyboard_keysyms[] = {
@@ -148,6 +162,7 @@ static const uint32_t i2000_keyboard_keysyms[] = {
     0xff57, 0xff55, 0xff56, 0xff63, 0xffff,
     0xffbe, 0xffbf, 0xffc0, 0xffc1, 0xffc2, 0xffc3,     /* F1-F6 */
     0xffc4, 0xffc5, 0xffc6, 0xffc7, 0xffc8, 0xffc9,     /* F7-F12 */
+    0xffe1, 0xffe2, 0xffe3, 0xffe4, 0xffe9, 0xffea,     /* Shift/Ctrl/Alt L,R */
 };
 _Static_assert(sizeof(i2000_keyboard_keysyms) / sizeof(i2000_keyboard_keysyms[0]) ==
                sizeof(i2000_keyboard_actions) / sizeof(i2000_keyboard_actions[0]),
@@ -5558,8 +5573,15 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             display_keys_held = keys_held;
             uint32_t cp;
             while ((cp = gemu_display_pop_raw_key(s->display)) != 0) {
-                if (cp <= 0x7F)
+                if (cp <= 0x7F) {
                     i2000_type_key(s, cp);
+                    /* An uppercase character carries its own Shift make/
+                     * break; re-assert a Shift the user is still holding. */
+                    if (keys_held & GEMU_ACTION(I2000_KEY_LSHIFT))
+                        ps2_keyboard_key(&s->ps2_keyboard, 0xffe1, true);
+                    if (keys_held & GEMU_ACTION(I2000_KEY_RSHIFT))
+                        ps2_keyboard_key(&s->ps2_keyboard, 0xffe2, true);
+                }
             }
             if (gemu_display_should_quit(s->display)) {
                 if (cfg->no_shutdown) gemu_display_clear_flags(s->display);
