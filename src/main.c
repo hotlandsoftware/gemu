@@ -76,6 +76,7 @@ static void print_usage(const char *prog) {
     fprintf(f, "Standard options:\n");
     OPT("-M <machine>",       "Select emulated machine (use -M ? to list all)");
     OPT("-cpu <type>",        "CPU model, if selectable (use -cpu ? to list)");
+    OPT("-accel <type>",      "Execution engine: jit (IA-64 default) | interpreter");
     OPT("-vga <type>",        "Video chip, if selectable (use -vga ? to list)");
     OPT("-h, -help",          "Show this help");
     fprintf(f, "\n");

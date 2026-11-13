@@ -1876,7 +1876,14 @@ typedef struct {
      * stays right for as long as the bundle cache does: only merced_step()
      * refills that cache or rewrites TB entries, and it clears this. */
     MercedTbEntry *cur_tb;
+    /* -accel jit state (merced_jit.c); survives tb_flush(), which empties
+     * it instead. */
+    struct MercedJit *jit;
 } MercedTranslationCache;
+
+struct MercedJit;
+static void mj_flush(struct MercedJit *j);
+static void mj_destroy(struct MercedJit *j);
 
 static inline unsigned tb_index(uint64_t va) {
     return (unsigned)(((va >> 4) ^ (va >> 18)) & (MERCED_TB_ENTRIES - 1));
@@ -1890,7 +1897,10 @@ static inline unsigned tb_page_index(uint64_t pa) {
 static void tb_flush(Merced *m) {
     MercedTranslationCache *tc = m->translation_cache;
     if (!tc) return;
+    struct MercedJit *jit = tc->jit;
     memset(tc, 0, sizeof(*tc));
+    tc->jit = jit;
+    mj_flush(jit);
     tc->translation_generation = 1;
     tc->xlate_generation = 1;
 }
@@ -2027,6 +2037,8 @@ Merced *merced_create(const MercedBus *bus) {
 
 void merced_destroy(Merced *m) {
     if (!m) return;
+    if (m->translation_cache)
+        mj_destroy(((MercedTranslationCache *)m->translation_cache)->jit);
     free(m->translation_cache);
     free(m);
 }
@@ -7144,9 +7156,13 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
     return MERCED_OK;
 }
 
+#define MERCED_JIT_INCLUDED
+#include "merced_jit.c"
+
 /* Like merced_run(), but through fast_step() when no debug facility is
- * active.  In addition to the masked stop address, an optional range lets
- * the platform observe an EFI application handoff before its first slot. */
+ * active - or through translated code, with -accel jit.  In addition to the
+ * masked stop address, an optional range lets the platform observe an EFI
+ * application handoff before its first slot. */
 MercedStatus merced_run_fast_range(Merced *m, unsigned max_slots,
                                    unsigned *executed, uint64_t stop_mask,
                                    uint64_t stop_value, uint64_t stop_lo,
@@ -7156,6 +7172,9 @@ MercedStatus merced_run_fast_range(Merced *m, unsigned max_slots,
     MercedStatus st = MERCED_OK;
     bool fast = tc && !debug_hooks_on && !trace_hi && !watch_ip_count &&
                 !heartbeat_on;
+    if (fast && tc->jit && tc->jit->enabled && !m->trace_n)
+        return mj_run(m, tc, max_slots, executed, stop_mask, stop_value,
+                      stop_lo, stop_hi);
     if (tc) tc->exit_request = false;
     while (n < max_slots) {
         if (fast && !m->trace_n)

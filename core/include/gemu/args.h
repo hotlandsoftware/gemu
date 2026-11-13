@@ -7,7 +7,7 @@
  * Universal argument parser shared by all gemu binaries.
  *
  * Each binary registers its supported devices and flags via GemuArgsDef.
- * gemu_args_parse() handles -M, -cpu, -vga, -display, -scale, -vnc,
+ * gemu_args_parse() handles -M, -cpu, -accel, -vga, -display, -scale, -vnc,
  * -monitor, -gmp/-qmp, and -h.
  * Binary-specific flags (e.g. chip8's -hz) are returned unmodified in
  * rem_argv[0..(*rem_argc)-1]; rem_argv must be pre-allocated to argc entries.
@@ -42,6 +42,9 @@ typedef struct {
     int                n_machines;
     const GemuDevDesc *cpus;            /* NULL / n_cpus=0 → -cpu not listed */
     int                n_cpus;
+    const GemuDevDesc *accels;          /* -accel engines, first = default;
+                                         * NULL → only "interpreter" */
+    int                n_accels;
     const GemuDevDesc *vgas;            /* NULL / n_vgas=0 → -vga not listed */
     int                n_vgas;
     unsigned           display_mask;    /* bitfield of supported GemuDisplayType */
@@ -65,6 +68,7 @@ typedef struct {
     const char     *machine;       /* NULL until -M given */
     const char     *machine_opts;  /* comma tail from -M machine,opt,... */
     const char     *cpu;           /* NULL until -cpu given */
+    const char     *accel;         /* NULL until -accel given (validated) */
     const char     *vga;           /* NULL until -vga given (name only) */
     const char     *vga_opts;      /* comma tail from -vga name,opt=val,... */
     GemuDisplayType display_type;

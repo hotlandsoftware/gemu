@@ -38,6 +38,7 @@ static void print_usage(const GemuArgsDef *def) {
         printf("  %-14s Machine feature toggles, e.g. nes,-feature\n", "-M M,OPTS");
     if (def->n_cpus > 0)
         printf("  %-14s CPU model         (use -cpu ? to list)\n", "-cpu TYPE");
+    printf("  %-14s Execution engine  (use -accel ? to list)\n", "-accel TYPE");
     if (def->n_vgas > 0)
         printf("  %-14s Video chip        (use -vga ? to list)\n", "-vga TYPE");
     printf("  %-14s Display backend   (use -display ? to list)\n", "-display TYPE");
@@ -475,6 +476,28 @@ bool gemu_args_parse(int argc, char **argv,
             if (!dev_validate(def->prog, "-cpu", def->cpus, def->n_cpus, v))
                 return false;
             out->cpu = v;
+            continue;
+        }
+
+        /* ── -accel TYPE ── */
+        if (strcmp(a, "-accel") == 0) {
+            static const GemuDevDesc interp_only[] = {
+                { "interpreter", "Interpret guest instructions one at a time" },
+            };
+            const GemuDevDesc *accels = def->n_accels ? def->accels : interp_only;
+            int n_accels = def->n_accels ? def->n_accels : 1;
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: -accel requires an argument\n", def->prog);
+                return false;
+            }
+            const char *v = argv[++i];
+            if (is_help(v)) {
+                list_devices("accelerators", accels, n_accels);
+                exit(0);
+            }
+            if (!dev_validate(def->prog, "-accel", accels, n_accels, v))
+                return false;
+            out->accel = v;
             continue;
         }
 

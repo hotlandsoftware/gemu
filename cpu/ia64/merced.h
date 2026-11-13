@@ -362,6 +362,30 @@ void    merced_set_cycles_per_slot(Merced *m, unsigned cycles);
  * once PAL has registered its PALE_PMI entry point. */
 void    merced_pmi_raise(Merced *m, unsigned vector);
 
+/* Execution engine for merced_run_fast*(): the interpreter, or the dynamic
+ * translator (merced_jit.c), which turns guest code into x86-64 and runs
+ * the guest exactly as the interpreter would, slot for slot.  Returns the
+ * engine actually selected - the JIT needs an x86-64 host.  merced_step()
+ * and merced_run() always interpret. */
+typedef enum {
+    MERCED_ACCEL_INTERPRETER = 0,
+    MERCED_ACCEL_JIT = 1,
+} MercedAccel;
+MercedAccel merced_set_accel(Merced *m, MercedAccel accel);
+MercedAccel merced_get_accel(const Merced *m);
+
+/* Plain RAM the JIT may load from and store to directly, bypassing the bus
+ * callbacks.  `page` returns the host address of the 4 KiB physical page
+ * pa_page (called with bus.ud) when every access within it is an ordinary
+ * copy, except possibly those starting at page offset *slow_off (set it to
+ * 0xFFFF when there is no such offset); NULL when the page must go through
+ * the bus.  Host pages must stay valid until merced_direct_ram_changed(),
+ * which the machine calls whenever the answer for any page may change. */
+typedef uint8_t *(*MercedDirectPageFn)(void *ud, uint64_t pa_page,
+                                       uint16_t *slow_off);
+void merced_set_direct_ram(Merced *m, MercedDirectPageFn page);
+void merced_direct_ram_changed(Merced *m);
+
 /* Execute one instruction slot. On anything but MERCED_OK, halt_msg
  * describes why and the CPU is stopped at the offending IP. */
 MercedStatus merced_step(Merced *m);

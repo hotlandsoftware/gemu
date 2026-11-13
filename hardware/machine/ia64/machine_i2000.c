@@ -98,6 +98,14 @@ static const char *i2000_cached_getenv(const char *name) {
 
 #define INSTR_PER_FRAME 50000
 #define IRQ_POLL_QUANTUM 16
+/* Translated code amortizes its block dispatch over far more slots than 16;
+ * at JIT speed this quantum is still well under a microsecond of guest time.
+ * GEMU_IRQ_QUANTUM=<power of two> overrides either default (running both
+ * engines with the same quantum makes their GEMU_CPI runs identical). */
+#define JIT_IRQ_POLL_QUANTUM 512
+/* File-static rather than in Ia64I2000State: that struct is snapshotted raw,
+ * so a new field would invalidate existing snapshots. */
+static unsigned irq_poll_quantum = IRQ_POLL_QUANTUM;
 
 /* Minimum instruction gap between a mouse byte being serviced and the next
  * one being offered - see the ack handler's mouse branch for why this can't
@@ -2349,6 +2357,8 @@ static void i2000_update_fast_ram(Ia64I2000State *s) {
             end = rom;
     }
     s->fast_ram_end = end;
+    if (s->cpu)
+        merced_direct_ram_changed(s->cpu);
 }
 
 /* An access wholly inside the plain-RAM span. The two scratch offsets are
@@ -2360,6 +2370,19 @@ static inline bool i2000_plain_ram(const Ia64I2000State *s, uint64_t addr,
            size <= s->fast_ram_end - addr && !s->mem_watch &&
            (addr & UINT64_C(0xffff)) != UINT64_C(0x6030) &&
            (addr & UINT64_C(0xffff)) != UINT64_C(0xa030);
+}
+
+/* The JIT's direct-RAM pages: those wholly inside the plain-RAM span, with
+ * the SAL scratch offset i2000_plain_ram() excludes left to the bus. */
+static uint8_t *i2000_direct_page(void *ud, uint64_t pa_page,
+                                  uint16_t *slow_off) {
+    Ia64I2000State *s = ud;
+    if (pa_page < I2000_FAST_RAM_BASE || s->mem_watch ||
+        pa_page + 0x1000 > s->fast_ram_end)
+        return NULL;
+    unsigned off16 = (unsigned)(pa_page & 0xF000);
+    *slow_off = (off16 == 0x6000 || off16 == 0xA000) ? 0x030 : 0xFFFF;
+    return s->ram + pa_page;
 }
 
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
@@ -4292,31 +4315,23 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
         vga_init(&s->vga, s->vram, RAGE128_VRAM_SIZE);
         Rage128Wiring wiring = i2000_rage_wiring(s);
         rage128_init(&s->rage128, &s->vga, &wiring);
-        /* The card's own BIOS; -rom DIR with the ROM set can replace it. */
-        if (!ia64_i2000_load_video_rom(s, "roms/rage128gl_pci_113-53008-100.rom"))
-            fprintf(stderr, "i2000: warning: Rage 128 video BIOS not found "
-                    "(roms/rage128gl_pci_113-53008-100.rom)\n");
+        /* The card's own BIOS, found by -rom DIR's SHA-256 scan. */
+        if (!cfg->video_rom || !ia64_i2000_load_video_rom(s, cfg->video_rom))
+            fprintf(stderr, "Rage 128 video BIOS not found - point -rom at"
+                    "folder holding it\n");
     }
     if (cfg->i82559_enabled) {
         /* The SDV EFI expects the integrated 82559 to supply an EFI UNDI
          * driver through its PCI expansion ROM.  Merely exposing the PCI
          * function leaves Boot Manager's network-device cleanup on a broken
          * firmware error path ("Could not load UNDI" followed by a pool
-         * assertion).  Prefer an installed ROM, with the in-tree QEMU ROM as
-         * the development-tree fallback; its EEPRO100 PCI ID is retagged to
-         * the integrated controller's 8086:1229 ID. */
-        static const char *const undi_rom_paths[] = {
-            "roms/efi-eepro100.rom",
-            "reference/qemu-system-ia64/pc-bios/efi-eepro100.rom",
-            "reference/qemu-system-ia64-merced/pc-bios/efi-eepro100.rom",
-        };
-        for (unsigned i = 0;
-             !s->nic_rom && i < sizeof(undi_rom_paths) / sizeof(undi_rom_paths[0]);
-             i++) {
-            size_t len;
-            uint8_t *rom = pci_rom_load(undi_rom_paths[i], &len);
-            if (!rom)
-                continue;
+         * assertion).  The ROM is an IA-64 build of QEMU's EEPRO100 EFI
+         * image (the stock one carries only x86 drivers), found by -rom
+         * DIR's SHA-256 scan as region "nic"; its PCI ID is retagged to the
+         * integrated controller's 8086:1229. */
+        size_t len;
+        uint8_t *rom = cfg->nic_rom ? pci_rom_load(cfg->nic_rom, &len) : NULL;
+        if (rom) {
             pci_rom_retag(rom, len, E100_VENDOR_ID, E100_DEVICE_ID);
             len = pci_rom_keep_efi(rom, len, 0x0200);
             if (len) {
@@ -4327,7 +4342,9 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
             }
         }
         if (!s->nic_rom)
-            fprintf(stderr, "i2000: warning: LAN EFI UNDI ROM not found\n");
+            fprintf(stderr, "i2000: warning: no LAN EFI UNDI ROM "
+                    "(efi-eepro100.rom); point -rom at the folder holding "
+                    "it\n");
         s->nic_enabled = true;
         E100Config nic_cfg = { .boot_rom = s->nic_rom != NULL };
         E100Wiring wiring = i2000_nic_wiring(s);
@@ -4352,6 +4369,20 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     if (!s->cpu) {
         ia64_i2000_destroy(s);
         return NULL;
+    }
+    bool jit = cfg->jit &&
+               merced_set_accel(s->cpu, MERCED_ACCEL_JIT) == MERCED_ACCEL_JIT;
+    irq_poll_quantum = jit ? JIT_IRQ_POLL_QUANTUM : IRQ_POLL_QUANTUM;
+    if (jit)
+        merced_set_direct_ram(s->cpu, i2000_direct_page);
+    {
+        const char *q = getenv("GEMU_IRQ_QUANTUM");
+        unsigned long v = q ? strtoul(q, NULL, 0) : 0;
+        if (v && !(v & (v - 1)) && v <= INSTR_PER_FRAME)
+            irq_poll_quantum = (unsigned)v;
+        else if (q)
+            fprintf(stderr, "i2000: GEMU_IRQ_QUANTUM must be a power of two "
+                    "up to %d; ignoring '%s'\n", INSTR_PER_FRAME, q);
     }
     i2000_smbus_init(s);
     s->monitor = gemu_monitor_create();
@@ -4763,13 +4794,13 @@ static void i2000_run_slice(Ia64I2000State *s) {
         bool efi_handoff = rev0 && efi_window_valid &&
             s->cpu->ip >= efi_app_base && s->cpu->ip < efi_app_end;
         if (!check_exec && !check_mem &&
-            (i & (IRQ_POLL_QUANTUM - 1)) == 0 &&
-            i + IRQ_POLL_QUANTUM <= INSTR_PER_FRAME &&
+            (i & (irq_poll_quantum - 1)) == 0 &&
+            i + (int)irq_poll_quantum <= INSTR_PER_FRAME &&
             !efi_handoff) {
             i2000_poll_interrupts(s);
             unsigned n = 0;
             MercedStatus st = merced_run_fast_range(
-                s->cpu, IRQ_POLL_QUANTUM, &n,
+                s->cpu, irq_poll_quantum, &n,
                 0, 0,
                 rev0 && efi_window_valid ? efi_app_base : 0,
                 rev0 && efi_window_valid ? efi_app_end : 0);
@@ -4786,7 +4817,7 @@ static void i2000_run_slice(Ia64I2000State *s) {
          * poll, and checking those on every IA-64 slot was a large fraction
          * of execution time.  A 16-slot quantum is far below the latency of
          * the modeled hardware while bounding delivery skew to 15 slots. */
-        if ((i & (IRQ_POLL_QUANTUM - 1)) == 0)
+        if ((i & (irq_poll_quantum - 1)) == 0)
             i2000_poll_interrupts(s);
         /* Revision 0 selects the supported PAL path during AMI startup,
          * including calls from its runtime image in the top 16 MiB.

@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 # ── Source file lists per family ───────────────────────────────────────────────
 
 CORE_SRC = [
-    'core/src/memory.c', 'core/src/tcg.c', 'core/src/monitor.c',
+    'core/src/memory.c', 'core/src/tcg.c', 'core/src/jit_mem.c', 'core/src/monitor.c',
     'core/src/monitor_cmds.c', 'core/src/monitor_qmp.c',
     'core/src/monitor_block.c', 'core/src/monitor_symbols.c',
     'core/third_party/cjson/cJSON.c',

@@ -51,6 +51,10 @@ typedef struct {
     bool            menu_disabled; /* machine XML's menu="disabled" */
     bool            mouse_enabled; /* -device mouse (i2000 only) */
     bool            i82559_enabled; /* -net nic,model=i82559/baset */
+    bool            jit;            /* -accel jit (default) vs interpreter */
+    /* Option ROMs found by -rom DIR (SHA-256 matched), or NULL. */
+    const char     *video_rom;      /* Rage 128 video BIOS */
+    const char     *nic_rom;        /* 82559 EFI UNDI driver */
 } Ia64Config;
 
 typedef struct Ia64I2000State Ia64I2000State;

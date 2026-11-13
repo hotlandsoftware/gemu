@@ -55,12 +55,47 @@ latch. The RTC runs on the same time base, with a real update-in-progress bit.
 Debug switches: `PM_DEBUG` (power management), `FWH_DEBUG` (firmware hubs),
 `I2C_DEBUG` (bus transactions and absent addresses), `IOSAPIC_DEBUG`.
 
-The video BIOS is not built in: install `rage128gl_pci_113-53008-100.rom` in `roms/`
-or pass the directory holding it to `-rom` (it is recognised by SHA-256 like the firmware).
-The EFI UNDI image for the LAN comes from `roms/efi-eepro100.rom`. The IA-32 core
+ROMs are found the same way as on the other machines: point `-rom` at a folder (or
+.zip), and the firmware, the Rage 128 video BIOS (`rage128gl_pci_113-53008-100.rom`)
+and the LAN's EFI UNDI driver (an IA-64 build of QEMU's `efi-eepro100.rom`, region
+`nic` in `data/machine/ia64/i2000.xml`) are picked out by SHA-256.
+`-rom` may be repeated. A file names the firmware explicitly, which matters when the
+folder holds more than one image; otherwise the first by file name is used. The IA-32 core
 follows the Itanium System Environment for interruptions: `INT n`, `IRET`, and
 `CLI`/`STI`/`POPF` (with CFLG.ii) go through the native interruption vectors and the
 firmware's handlers, and external interrupts are gated by `PSR.i && (!CFLG.if || EFLAG.if)`.
+
+## Execution engines (`-accel`)
+
+`-accel jit` (the default) translates IA-64 code into x86-64 host code;
+`-accel interpreter` runs the original slot-at-a-time interpreter. Both run
+the guest identically, slot for slot: with `GEMU_CPI` and the same
+`GEMU_IRQ_QUANTUM`, the two engines reach bit-identical machine state. The JIT needs
+an x86-64 host and falls back to the interpreter elsewhere. The `generic`
+machine steps the CPU one slot at a time and always interprets.
+
+The translator lives in `cpu/ia64/merced_jit.c`, which is included by
+`merced.c`, and uses the emitter in `core/include/gemu/jit_x64.h`. A
+translated block covers up to 16 bundles of one 4 KiB page. Each slot is handled
+one of four ways:
+
+| Tier | Covers |
+|------|--------|
+| native x86-64 | A-unit ALU and compares, `zxt`/`sxt`, `movl`, `br.cond`, `br.cloop` |
+| native memory | `ld`/`st` with post-increment, through a host TLB into plain RAM |
+| direct call | interpreter handlers with inline bookkeeping: I-unit bit-field ops, F unit, `getf`/`setf` |
+| full helper | system instructions and indirect branches; leaves the block if anything changed |
+
+With the JIT, the i2000 polls platform interrupts every 512 slots instead of 16.
+
+Developer switches:
+
+- `MERCED_JIT_STATS=1` prints translation statistics at exit, including the
+  instructions most often left to helpers. Those are the next candidates for
+  native code.
+- `GEMU_IRQ_QUANTUM=<power of two>` overrides the poll quantum for either engine.
+- `python3 tools/ia64/run_merced_jit_test.py [programs] [first-seed]` runs
+  random programs under both engines and compares their full state.
 
 ## Physical memory map
 
@@ -82,7 +117,7 @@ Boot firmware with an optional IA-64 installation CD:
 
 ```sh
 ./bin/gemu -M i2000 \
-  -rom "reference/fwver130.BIN" \
+  -rom roms/ \
   -cdrom "roms/windows-ia64.iso" \
   -monitor stdio
 ```
@@ -113,7 +148,7 @@ To create a disposable 4 GiB installation disk, run from the repository root:
 
 ```sh
 qemu-img create -f raw roms/ItaniumTest.img 4G
-./bin/gemu -M i2000 -m 512m -rom roms/bios117c.BIN \
+./bin/gemu -M i2000 -m 512m -rom roms/ -rom roms/bios117c.BIN \
   -cdrom "roms/Windows XP 64-Bit Edition Version 2003 (Itanium).iso" \
   -hda roms/ItaniumTest.img
 ```
@@ -164,8 +199,9 @@ Keep the disk; restoring a missing boot entry does not require formatting it.
 - The Merced core and 460GX platform model remain incomplete; other operating
   systems and firmware revisions may encounter unimplemented instructions or
   devices.
-- Emulation is instruction-heavy and substantially slower than native i2000
-  hardware.
+- Emulation is substantially slower than native i2000 hardware. The JIT
+  still sends system instructions, indirect branches, and FP arithmetic
+  through the interpreter, and it does not chain blocks yet.
 
 ## Roadmap
 

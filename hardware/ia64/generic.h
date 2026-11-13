@@ -212,6 +212,8 @@ typedef struct {
      *                     debugger at */
     const char     *serial_spec;
     bool            menu_disabled; /* machine XML's menu="disabled" */
+    bool            jit;           /* -accel jit (this machine steps the
+                                    * CPU slot by slot: always interprets) */
 } GenericConfig;
 
 typedef struct Ia64GenericState Ia64GenericState;

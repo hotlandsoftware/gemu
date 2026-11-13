@@ -44,12 +44,20 @@ static const GemuDevDesc vgas[] = {
 #include "generated/vgas_ia64.inc"
 };
 
+/* The first entry is the default. */
+static const GemuDevDesc accels[] = {
+    { "jit",         "Translate IA-64 code to host code (x86-64 hosts) [default]" },
+    { "interpreter", "Interpret one instruction slot at a time" },
+};
+
 static const GemuArgsDef def = {
     .prog         = "gemu",
     .machines     = machines,
     .n_machines   = (int)(sizeof machines / sizeof *machines),
     .cpus         = cpus,
     .n_cpus       = (int)(sizeof cpus / sizeof *cpus),
+    .accels       = accels,
+    .n_accels     = (int)(sizeof accels / sizeof *accels),
     .vgas         = vgas,
     .n_vgas       = (int)(sizeof vgas / sizeof *vgas),
     .display_mask = GEMU_DISP_F(GEMU_DISPLAY_SDL) | GEMU_DISP_F(GEMU_DISPLAY_NONE)
@@ -113,20 +121,47 @@ static uint64_t parse_size(const char *s) {
 
 /* ── Setup ───────────────────────────────────────────────────────────────── */
 
+/* What -rom DIR scans found, by region, resolved before the machine is
+ * created (the LAN's EEPROM records whether it has a boot ROM). */
+#define IA64_MAX_FIRMWARE 8
 typedef struct {
-    Ia64I2000State *machine;
-    int             loaded;
+    char *firmware[IA64_MAX_FIRMWARE];
+    int   n_firmware;
+    char *video_rom;
+    char *nic_rom;
 } RomScanCtx;
 
 static bool romdb_add_ia64(const char *path, const char *region, uint32_t addr, void *ud) {
     (void)addr;   /* one flash image, always top-aligned */
     RomScanCtx *ctx = ud;
     if (region && strcmp(region, "vga") == 0) {
-        ia64_i2000_load_video_rom(ctx->machine, path);
+        free(ctx->video_rom);
+        ctx->video_rom = strdup(path);
+    } else if (region && strcmp(region, "nic") == 0) {
+        free(ctx->nic_rom);
+        ctx->nic_rom = strdup(path);
+    } else if (ctx->n_firmware < IA64_MAX_FIRMWARE) {
+        ctx->firmware[ctx->n_firmware++] = strdup(path);
+    }
+    return true;
+}
+
+static int cmp_path(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* -rom DIR (or .zip): scan by SHA-256; -rom FILE: the firmware image. */
+static bool ia64_rom_arg(const char *arg, const char *alias, RomScanCtx *ctx,
+                         const char **firmware_file) {
+    struct stat st;
+    if ((stat(arg, &st) == 0 && S_ISDIR(st.st_mode)) || romdb_is_zip(arg)) {
+        if (romdb_load_dir(arg, alias, romdb_add_ia64, ctx) < 0) {
+            fprintf(stderr, "gemu: cannot scan '%s'\n", arg);
+            return false;
+        }
         return true;
     }
-    if (ia64_i2000_load_firmware(ctx->machine, path))
-        ctx->loaded++;
+    *firmware_file = arg;
     return true;
 }
 
@@ -195,12 +230,16 @@ int ia64_setup(int argc, char *argv[]) {
      * accepted for existing command lines.) */
     cfg.mouse_enabled = strcmp(alias, "i2000") == 0 && gemu_drive_defaults();
 
-    const char *rom_arg = args.rom_path;
+    RomScanCtx roms = {0};
+    const char *firmware_file = NULL;
+    if (args.rom_path && !ia64_rom_arg(args.rom_path, alias, &roms, &firmware_file))
+        return 1;
     const char *serial_spec = NULL;
     for (int i = 0; i < nrem; i++) {
         if (strcmp(rem[i], "-rom") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -rom requires an argument\n"); return 1; }
-            rom_arg = rem[++i];
+            if (!ia64_rom_arg(rem[++i], alias, &roms, &firmware_file))
+                return 1;
         } else if (strcmp(rem[i], "-m") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -m requires an argument\n"); return 1; }
             uint64_t sz = parse_size(rem[++i]);
@@ -261,6 +300,20 @@ int ia64_setup(int argc, char *argv[]) {
         return 1;
     }
     cfg.no_shutdown = args.no_shutdown;
+    cfg.jit = !args.accel || strcmp(args.accel, "jit") == 0;
+
+    /* An explicit -rom FILE picks the firmware; otherwise the scans' only
+     * match, or the first by file name when a folder holds several. */
+    const char *rom_arg = firmware_file;
+    if (!rom_arg && roms.n_firmware) {
+        qsort(roms.firmware, (size_t)roms.n_firmware, sizeof(char *), cmp_path);
+        rom_arg = roms.firmware[0];
+        for (int i = 1; i < roms.n_firmware; i++)
+            fprintf(stderr, "gemu: %s: using firmware '%s', not '%s' "
+                    "(-rom FILE selects one)\n", alias, rom_arg, roms.firmware[i]);
+    }
+    cfg.video_rom = roms.video_rom;
+    cfg.nic_rom = roms.nic_rom;
 
     if (serial_spec && strcmp(alias, "generic-ia64") != 0) {
         fprintf(stderr, "gemu: -serial is only supported by the generic machine\n");
@@ -279,6 +332,7 @@ int ia64_setup(int argc, char *argv[]) {
             .display_type = cfg.display_type,
             .display_scale = cfg.display_scale,
             .no_shutdown = cfg.no_shutdown,
+            .jit = cfg.jit,
             .cpu = args.cpu,
             .serial_spec = serial_spec,
             .menu_disabled = cfg.menu_disabled,
@@ -312,22 +366,10 @@ int ia64_setup(int argc, char *argv[]) {
 
     bool have_fw = false;
     if (rom_arg) {
-        struct stat st;
-        if ((stat(rom_arg, &st) == 0 && S_ISDIR(st.st_mode)) || romdb_is_zip(rom_arg)) {
-            RomScanCtx ctx = { .machine = s };
-            int n = romdb_load_dir(rom_arg, alias, romdb_add_ia64, &ctx);
-            if (n < 0) {
-                fprintf(stderr, "gemu: cannot scan '%s'\n", rom_arg);
-                ia64_i2000_destroy(s);
-                return 1;
-            }
-            have_fw = ctx.loaded > 0;
-        } else {
-            have_fw = ia64_i2000_load_firmware(s, rom_arg);
-            if (!have_fw) {
-                ia64_i2000_destroy(s);
-                return 1;
-            }
+        have_fw = ia64_i2000_load_firmware(s, rom_arg);
+        if (!have_fw) {
+            ia64_i2000_destroy(s);
+            return 1;
         }
     }
 
