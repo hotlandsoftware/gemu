@@ -1418,6 +1418,50 @@ static void i2000_rtc_irq(void *opaque, bool level) {
         i460gx_pm_rtc_alarm(&s->chipset);
 }
 
+/* Days since 1970-01-01 of a proleptic Gregorian date, and the inverse. These
+ * stand in for timegm()/gmtime_r(), which not every host C library has. */
+static int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static int64_t tm_to_seconds(const struct tm *tm) {
+    int64_t days = days_from_civil(tm->tm_year + 1900, (unsigned)tm->tm_mon + 1,
+                                   (unsigned)tm->tm_mday);
+    return days * 86400 + tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec;
+}
+
+static void seconds_to_tm(int64_t seconds, struct tm *tm) {
+    int64_t days = seconds / 86400;
+    int64_t rem = seconds % 86400;
+    if (rem < 0) {
+        rem += 86400;
+        days--;
+    }
+    int64_t z = days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    unsigned day = doy - (153 * mp + 2) / 5 + 1;
+    unsigned month = mp < 10 ? mp + 3 : mp - 9;
+    int64_t year = (int64_t)yoe + era * 400 + (month <= 2);
+    memset(tm, 0, sizeof(*tm));
+    tm->tm_year = (int)(year - 1900);
+    tm->tm_mon = (int)month - 1;
+    tm->tm_mday = (int)day;
+    tm->tm_hour = (int)(rem / 3600);
+    tm->tm_min = (int)(rem % 3600 / 60);
+    tm->tm_sec = (int)(rem % 60);
+    tm->tm_wday = (int)(((days % 7) + 11) % 7);   /* 1970-01-01 was a Thursday */
+    tm->tm_yday = (int)(days - days_from_civil(year, 1, 1));
+}
+
 /* The host's local calendar time as a seconds count that treats it as UTC,
  * so differences are exact whatever the zone. GEMU_FIXED_TIME pins it for
  * reproducible boots. */
@@ -1426,22 +1470,20 @@ static int64_t host_naive_seconds(void) {
     if (fixed)
         return (int64_t)strtoll(fixed, NULL, 10);
     time_t now = time(NULL);
-    struct tm local;
-    localtime_r(&now, &local);
-    return (int64_t)timegm(&local);
+    const struct tm *local = localtime(&now);
+    return local ? tm_to_seconds(local) : (int64_t)now;
 }
 
 static void rtc_set_naive_seconds(Ia64I2000State *s, int64_t seconds) {
-    time_t t = (time_t)seconds;
     struct tm tm;
-    gmtime_r(&t, &tm);
+    seconds_to_tm(seconds, &tm);
     mc146818_set_time(&s->rtc, &tm);
 }
 
 static int64_t rtc_naive_seconds(Ia64I2000State *s) {
     struct tm tm;
     mc146818_get_time(&s->rtc, &tm);
-    return (int64_t)timegm(&tm);
+    return tm_to_seconds(&tm);
 }
 
 /* A cell with no stored state: the clock starts at the host's time, in BCD
