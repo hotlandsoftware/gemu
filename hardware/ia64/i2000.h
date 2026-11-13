@@ -40,18 +40,6 @@
 #define I2000_RAM_MAX      0x80000000ull                          /* 2 GiB */
 #define IA64_RESET_VECTOR  0xFFFFFFB0ull
 
-/* The SDV 0.99 debug BIOS places a small per-processor descriptor just
- * below I2000_RAM_MAX regardless of how much RAM is actually configured:
- * confirmed live (ar.lc tracing with -m 64M) that it zeroes a field there,
- * reads it straight back to compute a loop trip-count, and separately
- * stores a pointer ~0x3E000 below the same boundary into that descriptor.
- * Retain separate backing for that firmware behavior and old snapshots;
- * this is an emulator compatibility window, not installed RAM. Correctly
- * sized AMI cold boots put their scratch descriptors below ram_size.
- * Sized above the largest legacy offset seen so far (~0x3E000). */
-#define I2000_CHIPSET_SCRATCH_SIZE 0x100000ull                    /* 1 MiB */
-#define I2000_CHIPSET_SCRATCH_BASE (I2000_RAM_MAX - I2000_CHIPSET_SCRATCH_SIZE)
-
 typedef struct {
     uint64_t        ram_size;
     /* Disks come from the shared drive table (gemu/drive.h): ide0-hd0
@@ -74,6 +62,9 @@ void            ia64_i2000_destroy(Ia64I2000State *s);
 /* Load a firmware flash image (at most 4 MiB, top-aligned into the flash
  * window so the reset bundles land at their architected addresses). */
 bool ia64_i2000_load_firmware(Ia64I2000State *s, const char *path);
+/* Install the display card's video BIOS image (PCI expansion ROM). False if
+ * the machine has no display card or the file is not a ROM image. */
+bool ia64_i2000_load_video_rom(Ia64I2000State *s, const char *path);
 
 /* Physical address space accessors for platform integration and tests. */
 uint8_t ia64_i2000_phys_read8 (Ia64I2000State *s, uint64_t addr);

@@ -290,6 +290,21 @@ typedef struct Merced {
      * merced_reset() the same way cpu_revision does. */
     uint8_t  cpu_model;
 
+    /* A machine with no video BIOS ROM sets this to have `int 10h` from
+     * IA-32 code serviced by a built-in text-mode shim instead of being
+     * dispatched through the real-mode IVT. Survives merced_reset(). */
+    bool     ia32_int10_shim;
+
+    /* Clock-ratio strap latched from the board at RESET# and reported in
+     * MSR 0x617 bits 25:22 (ratio (8 + code) / 2 of the bus clock). Set via
+     * merced_set_clock_ratio_code(); survives merced_reset(). Without a
+     * strap the MSR keeps its generic behaviour. */
+    uint8_t  clock_ratio_code;
+    bool     clock_ratio_strapped;
+    /* ITC ticks charged per executed instruction slot while the ITC is not
+     * driven by the host (see merced_set_external_itc()). */
+    unsigned slot_cycles;
+
     /* Firmware-visible PAL state.  These outlive a single PAL call because
      * the procedures that set them are "register this with the processor"
      * calls whose effect a later call (or a machine check) reads back. */
@@ -334,6 +349,19 @@ void    merced_set_cpu_revision(Merced *m, uint8_t revision);
  * Takes effect immediately and persists across merced_reset(). */
 void    merced_set_cpu_model(Merced *m, uint8_t model);
 
+/* Sets the board's clock-ratio strap (4 bits). Takes effect immediately and
+ * persists across merced_reset(). */
+void    merced_set_clock_ratio_code(Merced *m, uint8_t code);
+
+/* Charges `cycles` ITC ticks per executed slot when the ITC follows the
+ * instruction count rather than the host clock. Persists across reset. */
+void    merced_set_cycles_per_slot(Merced *m, unsigned cycles);
+
+/* Latches a Platform Management Interrupt on `vector` (0-15; 0 is the PMI#
+ * pin). It is taken at the next instruction group boundary with PSR.ic set,
+ * once PAL has registered its PALE_PMI entry point. */
+void    merced_pmi_raise(Merced *m, unsigned vector);
+
 /* Execute one instruction slot. On anything but MERCED_OK, halt_msg
  * describes why and the CPU is stopped at the offending IP. */
 MercedStatus merced_step(Merced *m);
@@ -375,6 +403,10 @@ bool merced_ia32_write_operand(Merced *m, uint64_t va, unsigned size,
 MercedStatus merced_ia32_disabled_transition(Merced *m);
 MercedStatus merced_ia32_disabled_fp(Merced *m);
 MercedStatus merced_ia32_fp_exception(Merced *m, unsigned vector);
+MercedStatus merced_ia32_software_interrupt(Merced *m, unsigned vector,
+                                            bool int_n);
+MercedStatus merced_ia32_sysflag_trap(Merced *m, unsigned kind,
+                                      uint64_t old_eflag);
 MercedStatus merced_ia32_instruction_intercept(Merced *m, uint64_t iim,
                                                 uint16_t code);
 uint64_t merced_ia32_gr_read(Merced *m, unsigned reg);
@@ -382,6 +414,8 @@ void merced_ia32_gr_write(Merced *m, unsigned reg, uint64_t value);
 
 /* Latch a platform interrupt for delivery through cr.ivr. */
 void merced_raise_external(Merced *m, uint8_t vector);
+/* Whether `vector` is still latched, i.e. not yet taken by the processor. */
+bool merced_external_pending(const Merced *m, uint8_t vector);
 void merced_ack_external(Merced *m, uint8_t vector);
 /* Monotonic count of completed *external-interrupt* servicing specifically
  * (an rfi whose matching entry was VEC_EXTINT) - NOT every rfi in the

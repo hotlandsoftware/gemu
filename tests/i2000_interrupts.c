@@ -23,22 +23,145 @@ static void test_gpio_straps(void) {
     Ia64I2000State *s = machine();
     const uint64_t gpio = I2000_IO_BASE + 0x404;
     for (unsigned reset = 0; reset < 2; reset++) {
-        /* Both active-low board straps must stay deasserted, including
-         * when firmware reads the high bytes of the GPIO data register. */
-        CHECK(bus_read(s, gpio, 4) == UINT32_C(0x01040000));
-        CHECK(bus_read(s, gpio, 2) == 0);
+        /* Firmware enables the IFB's GPIO block at 400h. J29 drives three
+         * input pins; the rest read their pull-ups. Both active-low board
+         * straps must stay deasserted, including when firmware reads the high
+         * bytes of the GPIO data register. */
+        io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x800018d0), 4);
+        io_port_write(s, PCI_CFG_DATA, 0x401, 4);
+        io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x800018d4), 4);
+        io_port_write(s, PCI_CFG_DATA, 1, 4);
+        CHECK(bus_read(s, gpio, 4) == UINT32_C(0x010401ff));
+        CHECK(bus_read(s, gpio, 2) == 0x01ff);
         CHECK(bus_read(s, gpio + 2, 2) == 0x0104);
         CHECK(bus_read(s, gpio + 2, 1) == 4);
         CHECK(bus_read(s, gpio + 3, 1) == 1);
         CHECK(bus_read(s, gpio | UINT64_C(0xc000000000000000), 4) ==
-              UINT32_C(0x01040000));
+              UINT32_C(0x010401ff));
+        /* Inputs do not change on software writes. */
         bus_write(s, gpio, 0, 4);
-        CHECK(bus_read(s, gpio, 4) == UINT32_C(0x01040000));
+        CHECK(bus_read(s, gpio, 4) == UINT32_C(0x010401ff));
         bus_write(s, gpio + 2, 0xffff, 2);
         bus_write(s, gpio + 3, 0, 1);
-        CHECK(bus_read(s, gpio, 4) == UINT32_C(0x01040000));
+        CHECK(bus_read(s, gpio, 4) == UINT32_C(0x010401ff));
         i2000_reset(s, false);
     }
+    ia64_i2000_destroy(s);
+}
+/* The IFB's real-time clock: a real update cycle with UIP ahead of it, a
+ * running time, periodic interrupts through IRQ8 and the RTC_STS event, and
+ * state that survives a processor reset. */
+static uint64_t itc_for_oscillator(uint64_t counts) {
+    return counts * I2000_ITC_HZ / 32768;
+}
+static uint8_t rtc_read(Ia64I2000State *s, uint8_t index) {
+    io_port_write(s, 0x70, index, 1);
+    return (uint8_t)io_port_read(s, 0x71, 1);
+}
+static void rtc_write(Ia64I2000State *s, uint8_t index, uint8_t value) {
+    io_port_write(s, 0x70, index, 1);
+    io_port_write(s, 0x71, value, 1);
+}
+static uint64_t itc_for_pit(uint64_t clocks) {
+    return clocks * UINT64_C(733084000) / UINT64_C(1193182);
+}
+static uint8_t pit_count(Ia64I2000State *s, unsigned channel) {
+    io_port_write(s, 0x43, channel << 6, 1);                /* latch */
+    uint8_t lo = (uint8_t)io_port_read(s, 0x40 + channel, 1);
+    uint8_t hi = (uint8_t)io_port_read(s, 0x40 + channel, 1);
+    return (uint8_t)(((unsigned)hi << 8 | lo) >> 8);
+}
+/* The interval timer counts the ITC down at 1.193182 MHz, drives IRQ0 and
+ * channel 2 reports through port 61h. */
+static void test_pit(void) {
+    Ia64I2000State *s = machine();
+    s->cpu->ar[44] = 0;
+    io_port_write(s, 0x43, 0x34, 1);          /* channel 0, mode 2, lo/hi */
+    io_port_write(s, 0x40, 0x00, 1);
+    io_port_write(s, 0x40, 0x10, 1);          /* count 4096 */
+    s->cpu->ar[44] = itc_for_pit(1000);
+    uint8_t high = pit_count(s, 0);
+    CHECK(high == 0x0c);                      /* 4096 - 1000 - 1 */
+    s->cpu->ar[44] = itc_for_pit(3000);
+    CHECK(pit_count(s, 0) < high);
+
+    /* A rising edge at the end of the period latches IRQ0 behind the mask. */
+    io_port_write(s, 0x21, 0x01, 1);
+    CHECK(!s->pit_irq_pending);
+    s->cpu->ar[44] = itc_for_pit(5000);
+    i2000_poll_interrupts(s);
+    CHECK(s->pit_irq_pending && !irq(s, 0));
+    io_port_write(s, 0x21, 0x00, 1);          /* unmask */
+    CHECK(irq(s, 0));
+
+    /* Channel 2: gated through port 61h, output visible in bit 5. */
+    io_port_write(s, 0x43, 0xb0, 1);          /* channel 2, mode 0, lo/hi */
+    io_port_write(s, 0x42, 0x40, 1);
+    io_port_write(s, 0x42, 0x00, 1);          /* count 64 */
+    io_port_write(s, 0x61, 0x01, 1);          /* gate on */
+    CHECK(!(io_port_read(s, 0x61, 1) & 0x20));
+    s->cpu->ar[44] += itc_for_pit(100);
+    CHECK(io_port_read(s, 0x61, 1) & 0x20);
+    /* The refresh toggle alternates about every 15 us. */
+    uint8_t first = io_port_read(s, 0x61, 1) & 0x10;
+    s->cpu->ar[44] += itc_for_pit(18);
+    CHECK((io_port_read(s, 0x61, 1) & 0x10) != first);
+    ia64_i2000_destroy(s);
+}
+static void test_rtc(void) {
+    Ia64I2000State *s = machine();
+    /* The divider starts half a second from an update: UIP rises 16 counts
+     * before it and the time advances when the 65-count update ends. */
+    s->cpu->ar[44] = 0;
+    CHECK(!(rtc_read(s, 0x0a) & 0x80));
+    uint8_t seconds = rtc_read(s, 0x00);
+    s->cpu->ar[44] = itc_for_oscillator(16384 - 8);
+    CHECK(rtc_read(s, 0x0a) & 0x80);
+    s->cpu->ar[44] = itc_for_oscillator(16384 + 30);
+    CHECK(rtc_read(s, 0x0a) & 0x80);                 /* mid-update */
+    s->cpu->ar[44] = itc_for_oscillator(16384 + 200);
+    CHECK(!(rtc_read(s, 0x0a) & 0x80));
+    CHECK(rtc_read(s, 0x00) != seconds);
+    /* Register D reports valid RAM; C reads zero with nothing enabled. */
+    CHECK(rtc_read(s, 0x0d) & 0x80);
+
+    /* Periodic interrupt: RS = 6 is 1 ms. IRQ8 stays up, and RTC_STS is set,
+     * until register C is read. */
+    rtc_write(s, 0x0b, 0x42);                        /* PIE, 24-hour BCD */
+    s->cpu->ar[44] += itc_for_oscillator(200);
+    rtc_write(s, 0x0b, 0x42);                        /* a poll point */
+    CHECK(s->rtc_irq);
+    CHECK(s->chipset.pm.pm1_sts & 0x0400);
+    CHECK(rtc_read(s, 0x0c) & 0xc0);
+    CHECK(!s->rtc_irq && rtc_read(s, 0x0c) == 0);
+
+    /* Alarm: seconds, minutes and hours matching raise AF at the update. */
+    rtc_write(s, 0x0b, 0x22);                        /* AIE, 24-hour */
+    rtc_write(s, 0x01, 0xc0);                        /* don't care */
+    rtc_write(s, 0x03, 0xc0);
+    rtc_write(s, 0x05, 0xc0);
+    s->cpu->ar[44] += itc_for_oscillator(32768);
+    CHECK(rtc_read(s, 0x0c) & 0xa0);                 /* IRQF and AF */
+
+    /* The extended bank needs the upper-128 enable and is separate RAM. */
+    io_port_write(s, 0x72, 0x10, 1);
+    io_port_write(s, 0x73, 0x5a, 1);                 /* aliases 70h/71h */
+    io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x800018c8), 4);
+    io_port_write(s, PCI_CFG_DATA, 0x04, 1);         /* U128E */
+    io_port_write(s, 0x72, 0x10, 1);
+    io_port_write(s, 0x73, 0xa5, 1);
+    io_port_write(s, 0x72, 0x10, 1);
+    CHECK(io_port_read(s, 0x73, 1) == 0xa5);
+    CHECK(rtc_read(s, 0x10) == 0x5a);                /* standard bank intact */
+
+    /* The cell keeps its RAM across a processor reset, and the clock runs. */
+    rtc_write(s, 0x20, 0x77);
+    uint8_t before = rtc_read(s, 0x00);
+    s->cpu->ar[44] = itc_for_oscillator(3 * 32768);
+    i2000_reset(s, false);
+    CHECK(rtc_read(s, 0x20) == 0x77);
+    s->cpu->ar[44] = itc_for_oscillator(2 * 32768);
+    CHECK(rtc_read(s, 0x00) != before);
     ia64_i2000_destroy(s);
 }
 static void route(Ia64I2000State *s, unsigned vector) {
@@ -345,6 +468,8 @@ static void pci_write(Ia64I2000State *s, unsigned bus, unsigned dev,
 }
 static void test_chipset_snapshot(void) {
     Ia64I2000State *source = machine();
+    /* Each board's Scratch EEPROM (SMBus slave 0x50) holds its own byte. */
+    source->cart_scratch.mem[2] = 4;
     bus_write(source, I460GX_SAC_CBNR, 0x81, 4);
     bus_write(source, I460GX_SAC_CCSR, 0x80, 4);
     pci_write(source, 0, 0x10, 0, 0x40, 0x32); /* CBN */
@@ -352,12 +477,13 @@ static void test_chipset_snapshot(void) {
     pci_write(source, 0x32, 5, 4, 0x48, 1);   /* memory-card row select */
     pci_write(source, 0, 3, 3, 0x20, 0x1a01); /* SMBus */
     pci_write(source, 0, 3, 3, 4, 1);
+    pci_write(source, 0, 3, 3, 0x40, 1);      /* host enable */
     io_port_write(source, 0x1a03, 2, 1);
     io_port_write(source, 0x1a04, 0xa1, 1);
     io_port_write(source, 0x1a02, 0x48, 1);
     pci_write(source, 0, 3, 0, 0x40, 0xa01);  /* PM */
     pci_write(source, 0, 3, 0, 0x44, 1);
-    io_port_write(source, 0xa04, 0x400, 2);
+    io_port_write(source, 0xa04, 0x401, 2);   /* SLP_TYP and SCI_EN */
     io_port_write(source, 0xb2, 0xa0, 1);
     pci_write(source, 0, 3, 2, 0x20, 0x1201); /* UHCI */
     pci_write(source, 0, 3, 2, 4, 1);
@@ -379,11 +505,11 @@ static void test_chipset_snapshot(void) {
     CHECK(io_port_read(s, 0xb2, 1) == 0xa0);
     CHECK(io_port_read(s, 0x1206, 2) == 42);
     CHECK(s->chipset.config.opaque == s);
-    s->spd[0][2] = 0x5a;
+    s->cart_scratch.mem[2] = 0x5a;
     io_port_write(s, 0x1a02, 0x48, 1);
     CHECK(io_port_read(s, 0x1a05, 1) == 0x5a);
     CHECK(io_port_read(source, 0x1a05, 1) == 4);
-    io_port_write(s, 0xb2, 0xa1, 1);
+    io_port_write(s, 0xa04, 0x400, 2);        /* SCI_EN off on this board */
     CHECK(io_port_read(s, 0xa04, 2) == 0x400);
     CHECK(io_port_read(source, 0xa04, 2) == 0x401);
     s->cpu->ar[44] += I2000_ITC_HZ / 1000;
@@ -702,13 +828,11 @@ static void test_cf9_reset(void) {
 }
 
 /* A reset clears device state, but must retain host-owned buffers and the
- * pending flash overlay.  Windows Setup exposed a NULL high_dram pointer
- * when the first autosave after a monitor reset wrote its 64 MiB backing. */
+ * pending flash overlay, and RAM contents survive a monitor reset. */
 static void test_reset_snapshot(void) {
     Ia64I2000State *s = machine();
-    uint8_t *high_dram = s->high_dram;
-    const uint64_t high = I2000_HIGH_DRAM_TAG | I2000_HIGH_DRAM_BASE;
-    const uint64_t tail = high + I2000_HIGH_DRAM_SIZE - 8;
+    const uint64_t high = 0x100000;
+    const uint64_t tail = 0x1000000;
     const uint64_t first_value = UINT64_C(0x0123456789abcdef);
     const uint64_t last_value = UINT64_C(0xfedcba9876543210);
     bus_write(s, high, first_value, 8);
@@ -719,7 +843,6 @@ static void test_reset_snapshot(void) {
     for (unsigned reset = 0; reset < 2; reset++) {
         s->mouse_streaming = true;
         i2000_reset(s, false);             /* monitor/display reset */
-        CHECK(s->high_dram == high_dram);
         CHECK(strcmp(s->nvram_path, "reset-nvram.bin") == 0);
         CHECK(s->mouse_enabled && !s->mouse_streaming);
         CHECK(bus_read(s, high, 8) == first_value);
@@ -737,13 +860,28 @@ static void test_reset_snapshot(void) {
         bus_write(s, high, 0, 8);
         bus_write(s, tail, 0, 8);
         CHECK(i2000_load_snapshot(s, "reset.vmstate"));
-        CHECK(s->high_dram == high_dram);
         CHECK(bus_read(s, high, 8) == first_value);
         CHECK(bus_read(s, tail, 8) == last_value);
     }
     /* Complete a real flash byte-program command, then reset before
      * shutdown. No firmware file or user's NVRAM is involved. Do this
      * after the snapshot cycles, since loadvm deliberately clears dirty. */
+    /* The IFB gates flash writes on BIOS_WEN, and each hub block starts
+     * write-locked; the firmware's flash driver unlocks a block with 91h and
+     * a write of the lock register at block+2. */
+    bus_write(s, I2000_FLASH_BASE + 0x20000, 0x40, 1);
+    bus_write(s, I2000_FLASH_BASE + 0x20000, 0x5a, 1);
+    CHECK(s->flash[0x20000] == 0xff && !s->nvram_dirty);
+    io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x8000184c), 4);
+    io_port_write(s, PCI_CFG_DATA + 2, 0xc5, 1);        /* BIOSEN.BIOS_WEN */
+    bus_write(s, I2000_FLASH_BASE + 0x20000, 0xff, 1);
+    bus_write(s, I2000_FLASH_BASE + 0x20000, 0x40, 1);
+    bus_write(s, I2000_FLASH_BASE + 0x20000, 0x5a, 1);
+    CHECK(s->flash[0x20000] == 0xff);                   /* write-locked block */
+    bus_write(s, I2000_FLASH_BASE + 0x20000, 0xff, 1);
+    bus_write(s, I2000_FLASH_BASE + 0x20000, 0x91, 1);
+    bus_write(s, I2000_FLASH_BASE + 0x20002, 0x00, 1);
+    bus_write(s, I2000_FLASH_BASE + 0x20000, 0xff, 1);
     bus_write(s, I2000_FLASH_BASE + 0x20000, 0x40, 1);
     bus_write(s, I2000_FLASH_BASE + 0x20000, 0x5a, 1);
     CHECK(s->flash[0x20000] == 0x5a && s->nvram_dirty);
@@ -765,6 +903,8 @@ int main(void) {
     test_keyboard();
     test_mouse();
     test_gpio_straps();
+    test_pit();
+    test_rtc();
     test_cf9_reset();
     test_reset_snapshot();
     test_ata();   /* last: registers a global -hda drive */

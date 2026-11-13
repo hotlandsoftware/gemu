@@ -119,8 +119,12 @@ typedef struct {
 } RomScanCtx;
 
 static bool romdb_add_ia64(const char *path, const char *region, uint32_t addr, void *ud) {
-    (void)region; (void)addr;   /* one flash image, always top-aligned */
+    (void)addr;   /* one flash image, always top-aligned */
     RomScanCtx *ctx = ud;
+    if (region && strcmp(region, "vga") == 0) {
+        ia64_i2000_load_video_rom(ctx->machine, path);
+        return true;
+    }
     if (ia64_i2000_load_firmware(ctx->machine, path))
         ctx->loaded++;
     return true;
@@ -248,7 +252,14 @@ int ia64_setup(int argc, char *argv[]) {
 
     cfg.display_type = args.display_type;
     cfg.display_scale = args.display_scale;
-    cfg.vga = args.vga ? args.vga : "std";
+    bool is_i2000 = strcmp(alias, "generic-ia64") != 0;
+    /* The i2000's display is the Rage 128 and its own video BIOS; "std" is
+     * the generic machine's plain VGA. */
+    cfg.vga = args.vga ? args.vga : (is_i2000 ? "rage128" : "std");
+    if (is_i2000 && strcmp(cfg.vga, "std") == 0) {
+        fprintf(stderr, "gemu: %s has a Rage 128 display (-vga rage128) or none (-vga none)\n", alias);
+        return 1;
+    }
     cfg.no_shutdown = args.no_shutdown;
 
     if (serial_spec && strcmp(alias, "generic-ia64") != 0) {

@@ -18,7 +18,8 @@
 - Chipset: Intel 460GX (SAC/SDC, PXB PCI bridges, GXB AGP, and IFB legacy I/O)
 - RAM: 2 GiB by default; smaller matched DIMM populations are supported
 - Firmware: 4 MiB flash containing PAL, SAL, and EFI
-- Display: emulated VGA/Rage 128 firmware interface
+- Display: ATI Rage 128 GL PCI (00:02.0) driven by its own x86 video BIOS, which runs in the IA-32 core; the card and the VGA core behind it live in `vga/multi/`
+- LAN: Intel 82559 (00:05.0, `-net nic,model=baset`) with the full serial-EEPROM, PHY and command/receive-unit model in `hardware/device/network/e100.c`; no packet transport is attached yet
 - Storage: primary-master ATA disk backed by a raw image and secondary-master ATAPI CD-ROM backed by a raw ISO image
 - Legacy devices: PIC/IOSAPIC, PIT, RTC/CMOS, keyboard, mouse, serial, and SMBus support
 - Persistent, firmware-specific flash/NVRAM and full-machine snapshots
@@ -26,11 +27,40 @@
 The machine definition recognizes the SDV EFI 0.99 debug image and HP firmware
 revisions 1.17c and 1.30. Firmware images are not distributed with GEMU.
 
-The reusable 460GX model lives in `hardware/device/chipset/i460gx.c` and `i460gx.h`,
-alongside the other hardware devices. It owns SAC/SDC and expander configuration,
-memory-card I2C routing, IFB PCI/SMBus/PM/UHCI registers, and the I/O SAPIC.
-`hardware/machine/ia64/machine_i2000.c` supplies the bridge topology, DIMM SPD
-contents, clock and firmware callbacks, memory map, and device-to-CPU wiring.
+The reusable 460GX model lives in `hardware/device/chipset/`, alongside the other
+hardware devices, and links no CPU or machine code:
+
+| File | What |
+|------|------|
+| `i460gx.c` | reset, the I/O SAPIC, SAC mailbox registers, UHCI registers |
+| `i460gx_pci.c` | configuration space: PID, IFB functions, SAC/SDC, memory cards, expanders |
+| `i460gx_smbus.c` | IFB SMBus host controller |
+| `i460gx_pm.c` | IFB power management: APM ports, ACPI/SMI block, GPIO block, SCI/SMI#, sleep states |
+| `i460gx_fwh.c` | firmware hub interface: FWHDE/FWHS/BIOSEN decode of the four 82802AC parts |
+
+The parts it drives live in `hardware/device/i2c/` (I2C bus, EEPROM, Itanium
+cartridge PIROM and scratch EEPROM, LM87) and `hardware/device/storage/fwh82802.c`.
+`hardware/machine/ia64/machine_i2000.c` supplies the board: bridge topology, DIMM
+SPD EEPROMs, the SMBus segment's devices, the J29 jumper pins, clock and firmware
+callbacks, and the device-to-CPU wiring. The chipset's SMI# is the processor's PMI#
+pin; the firmware's own PMI handler services it.
+
+Timing: the ITC counts at the processor clock, 733.084 MHz (133.288 MHz bus x 11/2),
+paced from the host clock. `GEMU_CPI=<n>` paces it by the instruction count instead,
+charging n ticks per executed slot, so firmware that polls the ITC for a delay does not
+burn real time waiting for it (a cold boot reaches the EFI shell in about half the time
+at `GEMU_CPI=4`). The processor's clock-ratio strap comes from the board's SMBus
+latch. The RTC runs on the same time base, with a real update-in-progress bit.
+
+Debug switches: `PM_DEBUG` (power management), `FWH_DEBUG` (firmware hubs),
+`I2C_DEBUG` (bus transactions and absent addresses), `IOSAPIC_DEBUG`.
+
+The video BIOS is not built in: install `rage128gl_pci_113-53008-100.rom` in `roms/`
+or pass the directory holding it to `-rom` (it is recognised by SHA-256 like the firmware).
+The EFI UNDI image for the LAN comes from `roms/efi-eepro100.rom`. The IA-32 core
+follows the Itanium System Environment for interruptions: `INT n`, `IRET`, and
+`CLI`/`STI`/`POPF` (with CFLG.ii) go through the native interruption vectors and the
+firmware's handlers, and external interrupts are gated by `PSR.i && (!CFLG.if || EFLAG.if)`.
 
 ## Physical memory map
 
@@ -265,6 +295,8 @@ Build and run these ROM-independent checks with:
 ./configure --target-list=ia64 --build-dir=build/ia64 --bindir=bin
 ninja
 python3 tools/ia64/run_i460gx_test.py
+python3 tools/ia64/run_rage128_test.py
+python3 tools/ia64/run_e100_test.py
 python3 tools/ia64/run_i2000_memory_test.py
 python3 tools/ia64/run_i2000_interrupt_test.py
 python3 tools/ia64/run_i2000_ata_storage_test.py

@@ -1,12 +1,16 @@
 #include "i2000.h"
 #include "merced.h"
 #include "chipset/i460gx.h"
+#include "i2c/at24.h"
+#include "i2c/i2c.h"
+#include "i2c/itanium_cart.h"
+#include "i2c/lm87.h"
+#include "timer/i8253.h"
+#include "timer/mc146818.h"
 #include "input_menu.h"
-#include "vga_ibm.h"
-#include "vgafont16.h"
-#include "vgabios_rom.h"
 #include "rage128.h"
-#include "network/i82559.h"
+#include "network/e100.h"
+#include "network/pci_rom.h"
 #include "input/ps2_keyboard.h"
 #include "gemu/gemu_display.h"
 #include "gemu/drive.h"
@@ -84,8 +88,8 @@ static const char *i2000_cached_getenv(const char *name) {
 #define I2000_SPD_BASE_ADDR 0x50
 
 /* front panel framebuffer */
-#define FB_W 640
-#define FB_H 480
+#define FB_W 800
+#define FB_H 600
 #define CELL_W 6
 #define CELL_H 8
 #define COLS (FB_W / CELL_W)     /* 106 */
@@ -101,6 +105,8 @@ static const char *i2000_cached_getenv(const char *name) {
  * Matches the PIT's own tick granularity, which is already known safe. */
 #define MOUSE_RETRY_DELAY_INSTS 1000u
 #define KEYBOARD_RETRY_DELAY_INSTS 10000u
+/* Instructions between presentations of a still-asserted level interrupt. */
+#define SCI_REPRESENT_INSTS 20000u
 
 enum {
     I2000_KEY_UP,
@@ -168,8 +174,9 @@ _Static_assert(sizeof(i2000_keyboard_keysyms) / sizeof(i2000_keyboard_keysyms[0]
                sizeof(i2000_keyboard_actions) / sizeof(i2000_keyboard_actions[0]),
                "one keysym per keyboard action");
 #define MOUSE_BACKLOG_MAX       254
-#define I2000_ITC_HZ UINT64_C(200000000)
-#define I2000_ITC_TICK_NS 5u
+/* The processor runs at 11/2 of the 133.288 MHz front-side bus (ratio strap
+ * code 3), and the ITC counts at the processor clock: 733.084 MHz. */
+#define I2000_ITC_HZ UINT64_C(733084000)
 #define I8254_INPUT_HZ UINT64_C(1193182)
 /* Command completion must not be visible in the same CPU instant as the
  * command-register write - AtaPim arms its waiter after submission, so an
@@ -186,19 +193,8 @@ _Static_assert(sizeof(i2000_keyboard_keysyms) / sizeof(i2000_keyboard_keysyms[0]
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES  32
 
-#define RAGE128_PCI_DEV       5u
-#define RAGE128_FB_BASE       0xC4000000ull
-#define RAGE128_IO_BASE       0xC300u
-#define RAGE128_MMIO_BASE     0xC8000000ull
-#define I82559_PCI_DEV          6u
-#define I82559_MMIO_BASE        0xC8100000u
-#define I82559_IO_BASE          0xC400u
-/* Retained only for snapshots made before the SPD memory-map fix. */
-#define I2000_HIGH_DRAM_TAG   UINT64_C(0x00000e0000000000)
-#define I2000_HIGH_DRAM_SIZE  (UINT64_C(64) * 1024 * 1024)
-#define I2000_HIGH_DRAM_BASE  (I2000_RAM_MAX - I2000_HIGH_DRAM_SIZE)
-#define I2000_FLASH_CHIP_SIZE UINT64_C(0x100000)
-#define I2000_FLASH_CHIPS     (I2000_FLASH_SIZE / I2000_FLASH_CHIP_SIZE)
+#define RAGE128_PCI_DEV       2u
+#define NIC_PCI_DEV             5u
 
 typedef struct {
     uint64_t addr;
@@ -208,14 +204,6 @@ typedef struct {
     uint8_t  size;
 } MmioLogEnt;
 
-typedef struct {
-    bool read_status;
-    bool read_id;
-    uint8_t status;
-    uint8_t cmd;
-    uint32_t cmd_addr;
-} I2000FlashChip;
-
 struct Ia64I2000State {
     GemuMonitor *monitor;
     GemuDisplay *display;
@@ -223,21 +211,25 @@ struct Ia64I2000State {
 
     uint8_t  *ram;
     uint64_t  ram_size;
-    /* Backs [I2000_CHIPSET_SCRATCH_BASE, I2000_RAM_MAX) independent of
-     * ram_size - see the comment on I2000_CHIPSET_SCRATCH_SIZE in i2000.h. */
-    uint8_t  *chipset_scratch;
+    /* Plain-RAM fast path: [I2000_FAST_RAM_BASE, fast_ram_end) holds no
+     * device window, so a load or store there is a copy. See
+     * i2000_update_fast_ram(). mem_watch mirrors the monitor's memory
+     * breakpoints, which every access must still honour. */
+    uint64_t  fast_ram_end;
+    bool      mem_watch;
+    /* The IFB's real-time clock. Battery-backed: it is not reset with the
+     * devices below. rtc_irq is IRQ8's level, presented to the CPU through the
+     * I/O SAPIC until the guest reads register C. */
+    Mc146818  rtc;
+    bool      rtc_irq;
+    uint64_t  rtc_retry_ninsts;
     uint8_t  *flash;
     char      flash_file[512];
     uint32_t  flash_image_size;
     bool      flash_loaded;
-    bool      flash_read_status;
-    bool      flash_read_id;
-    uint8_t   flash_status;
-    uint8_t   flash_cmd;
-    /* Legacy scalar flash command address retained for old snapshots.  The
-     * per-chip command state superseded it; at runtime it now tracks the
-     * active top-of-aperture SAL scratch alias. */
-    uint64_t  flash_cmd_addr;
+    /* Base of the DRAM aperture whose top holds SAL's scratch words; see
+     * i2000_normalize_pa(). */
+    uint64_t  sal_scratch_base;
 
     bool      halted;
     /* Keep the former bool's one-byte snapshot slot. Legacy true requests
@@ -255,38 +247,32 @@ struct Ia64I2000State {
     /* devices */
     uint8_t   post_code;
     bool      legacy_irq_routed;
+    /* Interval timer, clocked at 1.193182 MHz from the ITC: its state is
+     * brought up to date from the ITC whenever it is accessed or polled.
+     * port61 is the system-control port B latch (bit 0 gates channel 2). */
+    I8253     pit;
+    uint64_t  pit_itc_mark;      /* ITC value the timer was last advanced to */
+    uint64_t  pit_remainder;     /* leftover ITC ticks x 1193182 */
+    uint64_t  pit_clock;         /* PIT clocks since reset */
     uint8_t   port61;
-    uint8_t   pit2_polls;
     uint8_t   pic_master_mask, pic_slave_mask;
     uint8_t   pic_master_base, pic_slave_base;
     uint8_t   pic_master_icw, pic_slave_icw;
-    uint16_t  pit0_reload, pit0_latch;
-    uint8_t   pit0_write_phase;
-    uint64_t  pit0_next_irq;
-    /* PIT channel 1 (port 0x41): unlike channel 0, this has no standard
-     * ISA IRQ wiring on real hardware (classically DRAM refresh, not an
-     * interrupt source) and firmware never touches any I/O SAPIC RTE to
-     * configure it either - confirmed live (IOSAPIC_DEBUG) that every RTE
-     * stays at its default masked reset value the whole time this SDV
-     * BIOS spins waiting on a channel-1-armed count. Delivered directly
-     * at the vector firmware itself put in cr.itv (0x80) despite masking
-     * cr.itv's own local-timer path - the working theory being that 0x80
-     * is just firmware's conventional timer-ISR vector, fed here by
-     * whichever physical timer is actually active. */
-    uint16_t  pit1_reload, pit1_latch;
-    uint8_t   pit1_write_phase;
-    uint64_t  pit1_next_irq;
     uint8_t   kbc_command_byte;
     uint8_t   kbc_pending_write; /* 0=keyboard data, 1=command byte, 2=output port, 3=aux */
     uint8_t   kbc_out[8];
     uint8_t   kbc_out_pos, kbc_out_len;
-    uint8_t   cmos_index;
-    uint8_t   cmos[128];
     uint32_t  pci_cfg_addr;
-    bool      spd_present[I2000_SPD_SLOTS];
-    uint8_t   spd[I2000_SPD_SLOTS][256];
+    /* Memory card A's row-0 I2C segment holds one SPD EEPROM per populated
+     * socket. The IFB SMBus segment is separate: it carries the processor
+     * cartridge's PIROM and Scratch EEPROM and the board's clock-ratio latch. */
+    I2cBus    memcard_i2c;
+    I2cBus    smbus;
+    At24      spd[I2000_SPD_SLOTS];
+    ItaniumCartRom cart_pirom, cart_scratch;
+    Lm87      hardware_monitor;
+    uint8_t   ratio_latch;
     uint8_t   cmd649_cfg[256];
-    uint8_t   acpi_io[64];
     /* ide1-cd0 from the drive table (NULL = no drive configured; present
      * but !gemu_drive_inserted() = empty tray).  A pointer replacing the
      * old FILE *. The
@@ -318,29 +304,24 @@ struct Ia64I2000State {
     uint8_t   uart_ier, uart_lcr, uart_mcr, uart_scr, uart_dll, uart_dlm;
     uint8_t   uart_rx[256], uart_rx_head, uart_rx_tail;
 
-    VgaIbm    vga;
-    /* The video BIOS option ROM shadow, kept separate from plain system RAM
-     * (like `flash`) so a generic "clear all of RAM" firmware loop - which
-     * legitimately treats the whole reported memory range as ordinary RAM -
-     * can't wipe it out before IA-32 mode ever gets to use it. Real chipsets
-     * exclude this range from the reported memory map for the same reason. */
-    uint8_t   vga_rom_shadow[0x10000];
+    /* The SDV's display card: a Rage 128 with the VGA core behind it. The
+     * frame buffer and the video BIOS image are host-owned buffers, saved
+     * and restored with the machine's snapshots separately from the structs. */
+    bool      video_enabled;
+    Vga       vga;
+    Rage128   rage128;
+    uint8_t  *vram;                 /* RAGE128_VRAM_SIZE bytes */
+    uint8_t  *video_rom;
+    uint32_t  video_rom_len;
+    /* The onboard Intel 82559 10/100 Base-T LAN (-net nic): the card is
+     * plain state; its EFI UNDI ROM is a host-owned image. */
+    bool      nic_enabled;
+    E100      nic;
+    uint8_t  *nic_rom;
+    uint32_t  nic_rom_len;
 
     MmioLogEnt mmio_log[MMIO_LOG_N];
     int        mmio_log_n;
-
-    /* tail.  Rage128 needs only the display engine and linear
-     * framebuffer for EFI/Windows setup; AGP and 3D are intentionally out
-     * of scope.  The 64 MiB PCI aperture mirrors the installed 8 MiB VRAM. */
-    Rage128 rage128;
-
-    /* IA64-VPC-compatible INT 10h/VBE bridge. */
-    struct { uint16_t ax, bx, cx, dx, di, es; } int10_req, int10_res;
-    uint32_t int10_signature;
-    uint8_t int10_response[512];
-    uint16_t int10_response_len, int10_response_pos;
-    uint8_t int10_signature_words;
-    uint16_t int10_mode;
 
     /* PS/2 mouse (-device mouse), routed through the
      * existing 8042 aux-device path (kbc_pending_write==3, port 0xD4/0x60)
@@ -398,18 +379,11 @@ struct Ia64I2000State {
     int32_t mouse_accum_dx, mouse_accum_dy;
     bool mouse_host_left, mouse_host_right;
     uint64_t mouse_next_report_itc;
-    /* backing for the erroneous high-memory map in old snapshots. */
-    uint8_t *high_dram;
     /* persistent writable flash overlay (the ROM itself stays clean). */
     char nvram_path[512];
     bool nvram_dirty;
     /* legacy IRQ1 latch for queued 8042 keyboard/controller output. */
     bool keyboard_irq_pending;
-    /* channel-0 read sequencing and counter epoch. */
-    uint8_t pit0_read_phase;
-    uint64_t pit0_epoch_ninsts;
-    /* optional onboard Intel 82559-compatible 10/100 Base-T NIC. */
-    I82559 i82559;
     /* reusable PS/2 keyboard device behind this machine's 8042. */
     Ps2Keyboard ps2_keyboard;
     uint64_t keyboard_retry_ninsts;
@@ -420,11 +394,6 @@ struct Ia64I2000State {
     /* command completion is not visible in the same CPU instant as
      * the command-register write. AtaPim arms its waiter after submission. */
     uint64_t atapi_irq_ready_ninsts;
-    /* the 4 MiB firmware array is four independently-commanded Intel
-     * 1 MiB devices. A read-array command sent to one device must not reset
-     * identifier/status mode in another. The legacy scalar fields near the
-     * start of this structure remain solely for old snapshot compatibility. */
-    I2000FlashChip flash_chip[I2000_FLASH_CHIPS];
     /* ATAPI PIO transfers are split at the host-programmed byte limit
      * and interrupt once per data phase. */
     uint32_t atapi_byte_limit;
@@ -466,8 +435,20 @@ struct Ia64I2000State {
      * before `chipset`, so the snapshot layout is unchanged. */
     bool mouse_gsi_asserted;
 
+    /* IFB power-management wiring. SCI is a level on the legacy line the IFB
+     * routes it to; it reaches the CPU through that line's I/O SAPIC entry
+     * and is re-presented until the handler clears the source. */
+    int       sci_irq;
+    bool      sci_level;
+    uint64_t  sci_retry_ninsts;
+    bool      cpu_stopped;          /* S1: processors held in Stop-Grant */
+    bool      power_off_requested;  /* S3/S4/S5: main power removed */
+    bool      wake_reset_requested; /* woken from S3/S4/S5 */
+
     I460GX chipset;
 };
+
+static void i2000_update_fast_ram(Ia64I2000State *s);
 
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -628,9 +609,63 @@ static void mouse_device_command(Ia64I2000State *s, uint8_t cmd) {
     }
 }
 
-static uint64_t pit_interval_itc(uint16_t reload) {
-    uint64_t count = reload ? reload : UINT64_C(0x10000);
-    return (count * I2000_ITC_HZ + I8254_INPUT_HZ - 1) / I8254_INPUT_HZ;
+/* The system timer's output is IRQ0: each rising edge of channel 0 latches
+ * the request in the 8259 and, if it is unmasked, offers it to the processor
+ * as an ExtINT (see i2000_poll_interrupts). */
+static void i2000_pit_out(void *ud, unsigned channel, bool level) {
+    Ia64I2000State *s = ud;
+    if (channel != 0 || !level)
+        return;
+    iosapic_raise_gsi(s, 0);
+    s->pit_irq_pending = true;
+    if (!(s->pic_master_mask & 1))
+        merced_raise_external(s->cpu, 0);
+}
+
+/* Advance the timer to the present ITC. */
+static void i2000_pit_run(Ia64I2000State *s) {
+    uint64_t now = merced_get_itc(s->cpu);
+    if (now < s->pit_itc_mark) {            /* the ITC was set backwards */
+        s->pit_itc_mark = now;
+        return;
+    }
+    uint64_t scaled = (now - s->pit_itc_mark) * I8254_INPUT_HZ +
+                      s->pit_remainder;
+    s->pit_itc_mark = now;
+    s->pit_remainder = scaled % I2000_ITC_HZ;
+    uint64_t clocks = scaled / I2000_ITC_HZ;
+    s->pit_clock += clocks;
+    while (clocks) {
+        uint32_t step = clocks > UINT32_MAX ? UINT32_MAX : (uint32_t)clocks;
+        i8253_tick(&s->pit, step);
+        clocks -= step;
+    }
+}
+
+static void i2000_pit_reset(Ia64I2000State *s) {
+    s->pit.out_changed = i2000_pit_out;
+    s->pit.ud = s;
+    i8253_reset(&s->pit);
+    i8253_set_gate(&s->pit, 2, false);      /* port 61h bit 0 is clear */
+    s->pit_itc_mark = s->cpu ? merced_get_itc(s->cpu) : 0;
+    s->pit_remainder = 0;
+    s->pit_clock = 0;
+    s->port61 = 0;
+}
+
+/* System control port B (61h): bit 0 gates channel 2, bit 1 is the speaker
+ * enable, bit 4 the refresh toggle (about every 15 us) and bit 5 channel
+ * 2's output. */
+static uint8_t i2000_port61_read(Ia64I2000State *s) {
+    i2000_pit_run(s);
+    return (uint8_t)((s->port61 & 0x0F) | (((s->pit_clock / 18) & 1) << 4) |
+                     (i8253_out(&s->pit, 2) ? 0x20 : 0));
+}
+
+static void i2000_port61_write(Ia64I2000State *s, uint8_t value) {
+    i2000_pit_run(s);
+    s->port61 = value & 0x0F;
+    i8253_set_gate(&s->pit, 2, value & 1);
 }
 
 static uint64_t size_mask(unsigned size) {
@@ -1215,227 +1250,6 @@ static void ata_command(Ia64I2000State *s, uint8_t cmd) {
     }
 }
 
-enum {
-    INT10_AX, INT10_BX, INT10_CX, INT10_DX,
-    INT10_DI, INT10_ES, INT10_EXEC, INT10_DATA
-};
-#define INT10_IO_BASE 0x1e0u
-#define INT10_TRIGGER 0x4941u
-
-typedef struct I2000VbeMode {
-    uint16_t number, width, height;
-    uint8_t bpp;
-} I2000VbeMode;
-
-static const I2000VbeMode i2000_vbe_modes[] = {
-    { 0x111, 640, 480, 16 }, { 0x112, 640, 480, 24 },
-    { 0x114, 800, 600, 16 }, { 0x115, 800, 600, 24 },
-    { 0x117, 1024, 768, 16 }, { 0x118, 1024, 768, 24 },
-    { 0x11a, 1280, 1024, 16 }, { 0x11b, 1280, 1024, 24 },
-    { 0x141, 640, 400, 32 }, { 0x142, 640, 480, 32 },
-    { 0x143, 800, 600, 32 }, { 0x144, 1024, 768, 32 },
-    { 0x145, 1280, 1024, 32 },
-};
-
-static const uint8_t int10_handler[] = {
-    0x55,0x89,0xe5,0x50,0x52,0xba,0xe0,0x01,0xef,0x83,0xc2,0x02,
-    0x89,0xd8,0xef,0x83,0xc2,0x02,0x89,0xc8,0xef,0x83,0xc2,0x02,
-    0x8b,0x46,0xfc,0xef,0x83,0xc2,0x02,0x89,0xf8,0xef,0x83,0xc2,
-    0x02,0x8c,0xc0,0xef,0x83,0xc2,0x02,0x81,0x7e,0xfe,0x00,0x4f,
-    0x75,0x0f,0x83,0xc2,0x02,0x26,0x8b,0x05,0xef,0x26,0x8b,0x45,
-    0x02,0xef,0x83,0xea,0x02,0xb8,0x41,0x49,0xef,0xed,0x89,0xc1,
-    0xe3,0x0a,0x57,0x83,0xc2,0x02,0xfc,0xed,0xab,0xe2,0xfc,0x5f,
-    0xba,0xe0,0x01,0xed,0x89,0x46,0xfe,0x83,0xc2,0x02,0xed,0x89,
-    0xc3,0x83,0xc2,0x02,0xed,0x89,0xc1,0x83,0xc2,0x02,0xed,0x89,
-    0xc2,0x8b,0x46,0xfe,0x89,0xec,0x5d,0xcf
-};
-static const uint8_t int10_rom_init[] = {
-    0x50,0x1e,0x31,0xc0,0x8e,0xd8,0xc7,0x06,0x40,0x00,0x00,0x01,
-    0xc7,0x06,0x42,0x00,0x00,0xc0,0x1f,0x58,0xcb
-};
-
-static void put16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
-static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
-
-static void i2000_make_int10_rom(uint8_t rom[512]) {
-    memset(rom, 0, 512);
-    rom[0] = 0x55; rom[1] = 0xaa; rom[2] = 1;
-    memcpy(rom + 3, int10_rom_init, sizeof(int10_rom_init));
-    put16(rom + 0x18, 0x20);
-    memcpy(rom + 0x20, "PCIR", 4);
-    put16(rom + 0x24, RAGE128_VENDOR_ID);
-    put16(rom + 0x26, RAGE128_DEVICE_ID);
-    put16(rom + 0x2a, 0x18);
-    rom[0x2f] = 0x03; put16(rom + 0x30, 1); put16(rom + 0x32, 0x0100);
-    rom[0x35] = 0x80;
-    put16(rom + 0x48, 0x80); put16(rom + 0xb0, 0xc0);
-    put16(rom + 0xc8, 23000); put16(rom + 0xce, 2700);
-    put16(rom + 0xd0, 4); put32(rom + 0xd2, 12000); put32(rom + 0xd6, 35000);
-    memcpy(rom + 0x100, int10_handler, sizeof(int10_handler));
-    memcpy(rom + 0x180, "GEMU IA64 VBE", 14);
-    memcpy(rom + 0x190, "GEMU", 5);
-    memcpy(rom + 0x1a0, "IA64 Rage128 VBE", 17);
-    memcpy(rom + 0x1c0, "1.0", 4);
-    for (size_t i = 0; i < sizeof(i2000_vbe_modes)/sizeof(i2000_vbe_modes[0]); i++)
-        put16(rom + 0x1d0 + i * 2, i2000_vbe_modes[i].number);
-    put16(rom + 0x1d0 + sizeof(i2000_vbe_modes)/sizeof(i2000_vbe_modes[0]) * 2,
-          0xffff);
-    uint8_t sum = 0;
-    for (size_t i = 0; i < 511; i++) sum = (uint8_t)(sum + rom[i]);
-    rom[511] = (uint8_t)-sum;
-}
-
-static void i2000_load_vga_option_rom(Ia64I2000State *s) {
-    memset(s->vga_rom_shadow, 0xff, sizeof(s->vga_rom_shadow));
-    memcpy(s->vga_rom_shadow, vgabios_rom, vgabios_rom_len);
-    if (s->rage128.enabled) {
-        /* Keep the proven SeaVGABIOS execution path, but make its PCI data
-         * agree with the Rage128 function firmware discovered at 00:05.0. */
-        for (size_t i = 0; i + 8 <= vgabios_rom_len; i++) {
-            if (!memcmp(s->vga_rom_shadow + i, "PCIR", 4)) {
-                put16(s->vga_rom_shadow + i + 4, RAGE128_VENDOR_ID);
-                put16(s->vga_rom_shadow + i + 6, RAGE128_DEVICE_ID);
-                break;
-            }
-        }
-        uint8_t sum = 0;
-        size_t len = (size_t)s->vga_rom_shadow[2] * 512;
-        for (size_t i = 0; i < len; i++)
-            sum = (uint8_t)(sum + s->vga_rom_shadow[i]);
-        s->vga_rom_shadow[len - 1] -= sum;
-    }
-}
-
-static const I2000VbeMode *int10_find_mode(uint16_t number) {
-    number &= 0x01ff;
-    for (size_t i = 0; i < sizeof(i2000_vbe_modes)/sizeof(i2000_vbe_modes[0]); i++)
-        if (i2000_vbe_modes[i].number == number) return &i2000_vbe_modes[i];
-    return NULL;
-}
-
-static uint32_t int10_rom_ptr(uint16_t off) { return 0xc0000000u | off; }
-
-static void int10_response(Ia64I2000State *s, size_t len) {
-    memset(s->int10_response, 0, sizeof(s->int10_response));
-    s->int10_response_len = (uint16_t)len;
-    s->int10_response_pos = 0;
-}
-
-static void int10_program_mode(Ia64I2000State *s, const I2000VbeMode *m,
-                               bool no_clear) {
-    rage128_program_mode(&s->rage128, m->width, m->height, m->bpp,
-                         no_clear);
-    s->int10_mode = m->number;
-    if (getenv("RAGE128_DEBUG"))
-        fprintf(stderr, "i2000: INT10 set VBE mode %#x %ux%ux%u\n",
-                m->number, m->width, m->height, m->bpp);
-}
-
-static void int10_execute(Ia64I2000State *s) {
-    s->int10_res = s->int10_req;
-    int10_response(s, 0);
-    uint16_t ax = s->int10_req.ax;
-    if (getenv("RAGE128_DEBUG"))
-        fprintf(stderr, "i2000: INT10 ax=%04x bx=%04x cx=%04x dx=%04x\n",
-                ax, s->int10_req.bx, s->int10_req.cx, s->int10_req.dx);
-    if ((ax & 0xff00) == 0x4f00) {
-        switch (ax & 0xff) {
-        case 0x00: {
-            size_t len = s->int10_signature == 0x32454256u ? 512 : 256;
-            int10_response(s, len);
-            uint8_t *p = s->int10_response;
-            memcpy(p, "VESA", 4); put16(p + 4, 0x0300);
-            put32(p + 6, int10_rom_ptr(0x180));
-            put32(p + 14, int10_rom_ptr(0x1d0));
-            put16(p + 18, RAGE128_VRAM_SIZE >> 16);
-            put16(p + 20, 0x0100); put32(p + 22, int10_rom_ptr(0x190));
-            put32(p + 26, int10_rom_ptr(0x1a0));
-            put32(p + 30, int10_rom_ptr(0x1c0));
-            s->int10_res.ax = 0x004f;
-            break;
-        }
-        case 0x01: {
-            const I2000VbeMode *m = int10_find_mode(s->int10_req.cx);
-            if (!m) { s->int10_res.ax = 0x014f; break; }
-            int10_response(s, 256);
-            uint8_t *p = s->int10_response;
-            unsigned bytes = (m->bpp + 7) / 8;
-            uint32_t image = (uint32_t)m->width * m->height * bytes;
-            unsigned pages = RAGE128_VRAM_SIZE / ((image + 0xffff) & ~0xffffu);
-            put16(p, 0x00bb); p[2] = 7; put16(p + 4, 64); put16(p + 6, 64);
-            put16(p + 8, 0xa000); put16(p + 16, m->width * bytes);
-            put16(p + 18, m->width); put16(p + 20, m->height);
-            p[22]=8; p[23]=16; p[24]=1; p[25]=m->bpp; p[26]=1; p[27]=6;
-            p[28]=64; p[29]=(uint8_t)(pages ? pages-1 : 0); p[30]=1;
-            p[31]=m->bpp==16?5:8; p[32]=m->bpp==16?11:16;
-            p[33]=m->bpp==16?6:8; p[34]=m->bpp==16?5:8;
-            p[35]=m->bpp==16?5:8; p[37]=m->bpp==32?8:0;
-            p[38]=m->bpp==32?24:0; p[39]=m->bpp==32?2:0;
-            put32(p + 40, RAGE128_FB_BASE); put16(p + 50, m->width * bytes);
-            p[52]=p[53]=p[29]; memcpy(p + 54, p + 31, 8);
-            s->int10_res.ax = 0x004f;
-            break;
-        }
-        case 0x02: {
-            const I2000VbeMode *m = int10_find_mode(s->int10_req.bx);
-            if (!m) s->int10_res.ax = 0x014f;
-            else { int10_program_mode(s, m, s->int10_req.bx & 0x8000);
-                   s->int10_res.ax = 0x004f; }
-            break;
-        }
-        case 0x03:
-            s->int10_res.bx = s->int10_mode ? s->int10_mode | 0x4000 : 3;
-            s->int10_res.ax = 0x004f; break;
-        case 0x05: case 0x06: case 0x07:
-            s->int10_res.ax = 0x004f; break;
-        case 0x10:
-            if ((s->int10_req.bx & 0xff) == 0) s->int10_res.bx = 0x0f30;
-            s->int10_res.ax = 0x004f; break;
-        default: s->int10_res.ax = 0x024f; break;
-        }
-    } else if ((ax >> 8) == 0x00) {
-        s->int10_mode = 0;
-    } else if ((ax >> 8) == 0x0f) {
-        s->int10_res.ax = s->int10_mode ? (80u << 8 | 3) : (80u << 8 | 3);
-        s->int10_res.bx &= 0xff;
-    } else if ((ax >> 8) == 0x1a && !(ax & 0xff)) {
-        s->int10_res.ax = 0x001a; s->int10_res.bx = 8;
-    }
-}
-
-static uint64_t int10_io_read(Ia64I2000State *s, unsigned reg) {
-    switch (reg) {
-    case INT10_AX: return s->int10_res.ax; case INT10_BX: return s->int10_res.bx;
-    case INT10_CX: return s->int10_res.cx; case INT10_DX: return s->int10_res.dx;
-    case INT10_DI: return s->int10_res.di; case INT10_ES: return s->int10_res.es;
-    case INT10_EXEC: return s->int10_response_len / 2;
-    case INT10_DATA:
-        if (s->int10_response_pos < s->int10_response_len) {
-            uint16_t v; memcpy(&v, s->int10_response + s->int10_response_pos, 2);
-            s->int10_response_pos += 2; return v;
-        }
-        return 0;
-    default: return 0xffff;
-    }
-}
-
-static void int10_io_write(Ia64I2000State *s, unsigned reg, uint16_t v) {
-    switch (reg) {
-    case INT10_AX: s->int10_req.ax=v; s->int10_signature=0;
-                   s->int10_signature_words=0; break;
-    case INT10_BX: s->int10_req.bx=v; break; case INT10_CX: s->int10_req.cx=v; break;
-    case INT10_DX: s->int10_req.dx=v; break; case INT10_DI: s->int10_req.di=v; break;
-    case INT10_ES: s->int10_req.es=v; break;
-    case INT10_EXEC: if (v == INT10_TRIGGER) int10_execute(s); break;
-    case INT10_DATA:
-        if (s->int10_signature_words < 2) {
-            s->int10_signature |= (uint32_t)v << (s->int10_signature_words * 16);
-            s->int10_signature_words++;
-        }
-        break;
-    }
-}
-
 /* PCI IDE has four task-file/control I/O windows and one 16-byte bus-master
  * window. Preserve their hardwired type/alignment bits on byte and dword
  * accesses, including the all-ones sizing probe used by EFI and the OS. */
@@ -1465,14 +1279,12 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
-    if (s->rage128.enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
+    if (s->video_enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
         fun == 0 && reg + size <= sizeof(s->rage128.cfg))
-        return rage128_pci_read(&s->rage128, reg, size);
-    if (s->i82559.enabled && bus == 0 && dev == I82559_PCI_DEV &&
-        fun == 0 && reg + size <= sizeof(s->i82559.cfg)) {
-        if (getenv("I82559_DEBUG"))
-            fprintf(stderr, "i82559: pci read reg=%02x size=%u\n", reg, size);
-        return i82559_pci_read(&s->i82559, reg, size);
+        return rage128_cfg_read(&s->rage128, reg, size);
+    if (s->nic_enabled && bus == 0 && dev == NIC_PCI_DEV && fun == 0 &&
+        reg + size <= 256) {
+        return e100_cfg_read(&s->nic, reg, size);
     }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
         reg + size <= sizeof(s->cmd649_cfg)) {
@@ -1508,14 +1320,16 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
-    if (s->rage128.enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
+    if (s->video_enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
         fun == 0 && reg + size <= sizeof(s->rage128.cfg)) {
-        rage128_pci_write(&s->rage128, reg, val, size);
+        rage128_cfg_write(&s->rage128, reg, size, (uint32_t)val);
+        i2000_update_fast_ram(s);
         return;
     }
-    if (s->i82559.enabled && bus == 0 && dev == I82559_PCI_DEV &&
-        fun == 0 && reg + size <= sizeof(s->i82559.cfg)) {
-        i82559_pci_write(&s->i82559, reg, val, size);
+    if (s->nic_enabled && bus == 0 && dev == NIC_PCI_DEV && fun == 0 &&
+        reg + size <= 256) {
+        e100_cfg_write(&s->nic, reg, size, (uint32_t)val);
+        i2000_update_fast_ram(s);
         return;
     }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
@@ -1545,9 +1359,6 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
 /* ── Serial console ──────────────────────────────────────────────────────── */
 
 static void con_newline(Ia64I2000State *s) {
-    if (getenv("CON_TIME_DEBUG") && s->console[s->con_row][0])
-        fprintf(stderr, "i2000: CON [%s] itc=%" PRIu64 " ninsts=%" PRIu64 "\n",
-                s->console[s->con_row], merced_get_itc(s->cpu), s->cpu->ninsts);
     s->con_col = 0;
     if (++s->con_row >= CON_ROWS) {
         memmove(s->console[0], s->console[1], sizeof(s->console) - sizeof(s->console[0]));
@@ -1564,50 +1375,6 @@ static void con_putc(Ia64I2000State *s, char c) {
     if (s->con_col >= COLS) con_newline(s);
     s->console[s->con_row][s->con_col++] = c;
     s->console[s->con_row][s->con_col] = 0;
-    if (getenv("CDB_FAIL_TRACE") &&
-        strstr(s->console[s->con_row], "failed to update CDB")) {
-        static bool traced;
-        if (!traced) {
-            traced = true;
-            fprintf(stderr, "i2000: CDB failure text emitted, ip=%016" PRIx64
-                    " ninsts=%" PRIu64 " call history:\n", s->cpu->ip,
-                    s->cpu->ninsts);
-            merced_dump_calls(s->cpu, 600, stderr);
-        }
-    }
-    if (getenv("CDB_FAIL_TRACE") &&
-        strstr(s->console[s->con_row], "CDBFMM.c")) {
-        static bool assertion_traced;
-        if (!assertion_traced) {
-            assertion_traced = true;
-            fprintf(stderr, "i2000: CDBFMM assertion emitted, ip=%016" PRIx64
-                    " ninsts=%" PRIu64 " call history:\n", s->cpu->ip,
-                    s->cpu->ninsts);
-            merced_dump_calls(s->cpu, 600, stderr);
-        }
-    }
-    if (getenv("MFG_TRACE") &&
-        strstr(s->console[s->con_row], "MFG Mode detected")) {
-        static bool traced;
-        if (!traced) {
-            traced = true;
-            fprintf(stderr, "i2000: MFG Mode text emitted, ip=%016" PRIx64
-                    " ninsts=%" PRIu64 " call history:\n", s->cpu->ip,
-                    s->cpu->ninsts);
-            merced_dump_calls(s->cpu, 600, stderr);
-        }
-    }
-    if (getenv("MFG_TRACE") &&
-        strstr(s->console[s->con_row], "Entering CDB Save")) {
-        static bool traced;
-        if (!traced) {
-            traced = true;
-            fprintf(stderr, "i2000: Entering-CDB-Save text emitted, ip=%016"
-                    PRIx64 " ninsts=%" PRIu64 " call history:\n", s->cpu->ip,
-                    s->cpu->ninsts);
-            merced_dump_calls(s->cpu, 600, stderr);
-        }
-    }
 }
 
 /* ── Physical bus ────────────────────────────────────────────────────────── */
@@ -1635,70 +1402,57 @@ static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
     }
 }
 
-static bool vga_port(uint64_t port) {
-    return port == 0x3B4 || port == 0x3B5 || port == 0x3BA ||
-           (port >= 0x3C0 && port <= 0x3CF) ||
-           port == 0x3D4 || port == 0x3D5 || port == 0x3DA;
+/* The RTC counts on the machine's own time base, so it advances exactly as
+ * fast as the guest does, whether the ITC follows the host clock or the
+ * instruction count. */
+static uint64_t i2000_rtc_clock(void *opaque) {
+    Ia64I2000State *s = opaque;
+    return s->cpu ? merced_get_itc(s->cpu) : 0;
 }
 
-/* A 16/32-bit I/O access whose every byte is a VGA register port.  As on
- * a PC bus, it is that many byte accesses at consecutive ports, low byte
- * first: Windows' boot video driver programs index/data pairs with single
- * 16-bit OUTs (e.g. 0x0506 to 3CEh = GC[5]=6) when it switches to mode 12h
- * for the bugcheck screen. */
-static bool vga_port_span(uint64_t port, unsigned size) {
-    if (size != 2 && size != 4)
-        return false;
-    for (unsigned i = 0; i < size; i++)
-        if (!vga_port(port + i))
-            return false;
-    return true;
+/* IRQ8 changed level. An assertion is also the IFB's RTC_STS event. */
+static void i2000_rtc_irq(void *opaque, bool level) {
+    Ia64I2000State *s = opaque;
+    s->rtc_irq = level;
+    if (level)
+        i460gx_pm_rtc_alarm(&s->chipset);
 }
 
-static uint8_t cmos_bcd(unsigned v) {
-    return (uint8_t)(((v / 10) << 4) | (v % 10));
-}
-
-/* The static cmos[] array (fixed at reset, never touched again) satisfies
- * anything that just wants a valid-looking byte back, but firmware
- * commonly calibrates or synchronizes against the RTC by reading a time
- * register, then re-reading it later and waiting for the VALUE to change -
- * a permanently frozen clock makes that an infinite wait no matter what
- * byte comes back. Refresh the standard time/date registers (0-9) from
- * real host time on every access so any such wait resolves within a real
- * second or so. Status register A's UIP (bit 7, update-in-progress) is
- * left at 0 always rather than pulsed, which is a fine approximation:
- * real hardware only asserts it for ~244us out of every second, so a
- * poll for "not updating" would see it clear almost immediately anyway. */
-static void cmos_sync_live_clock(Ia64I2000State *s) {
-    time_t t;
+/* The host's local calendar time as a seconds count that treats it as UTC,
+ * so differences are exact whatever the zone. GEMU_FIXED_TIME pins it for
+ * reproducible boots. */
+static int64_t host_naive_seconds(void) {
     const char *fixed = getenv("GEMU_FIXED_TIME");
-    if (fixed) {
-        /* Real wall-clock time makes cold boots non-reproducible run to
-         * run - firmware that reads the RTC into a computation (not just
-         * displaying it) can diverge between two otherwise-identical
-         * boots. Advance a fixed base by simulated elapsed seconds
-         * (approximated from instruction count) instead, so calibration
-         * loops waiting for the clock to change still terminate, but
-         * deterministically. */
-        t = (time_t)strtoll(fixed, NULL, 10) +
-            (time_t)(s->cpu->ninsts / UINT64_C(2000000));
-    } else {
-        t = time(NULL);
-    }
-    struct tm tmv;
-#ifdef _WIN32
-    localtime_s(&tmv, &t);
-#else
-    localtime_r(&t, &tmv);
-#endif
-    s->cmos[0x00] = cmos_bcd((unsigned)tmv.tm_sec);
-    s->cmos[0x02] = cmos_bcd((unsigned)tmv.tm_min);
-    s->cmos[0x04] = cmos_bcd((unsigned)tmv.tm_hour);
-    s->cmos[0x06] = (uint8_t)(tmv.tm_wday + 1);
-    s->cmos[0x07] = cmos_bcd((unsigned)tmv.tm_mday);
-    s->cmos[0x08] = cmos_bcd((unsigned)(tmv.tm_mon + 1));
-    s->cmos[0x09] = cmos_bcd((unsigned)(tmv.tm_year % 100));
+    if (fixed)
+        return (int64_t)strtoll(fixed, NULL, 10);
+    time_t now = time(NULL);
+    struct tm local;
+    localtime_r(&now, &local);
+    return (int64_t)timegm(&local);
+}
+
+static void rtc_set_naive_seconds(Ia64I2000State *s, int64_t seconds) {
+    time_t t = (time_t)seconds;
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    mc146818_set_time(&s->rtc, &tm);
+}
+
+static int64_t rtc_naive_seconds(Ia64I2000State *s) {
+    struct tm tm;
+    mc146818_get_time(&s->rtc, &tm);
+    return (int64_t)timegm(&tm);
+}
+
+/* A cell with no stored state: the clock starts at the host's time, in BCD
+ * with 24-hour mode. Extended byte 3 bit 3 is the firmware's "previous boot
+ * completed" flag; the bootstrap takes its recovery path whenever it is
+ * clear, which is what a real board's cleared CMOS would do once and then
+ * set. */
+static void i2000_rtc_initialise(Ia64I2000State *s) {
+    mc146818_set_defaults(&s->rtc);
+    rtc_set_naive_seconds(s, host_naive_seconds());
+    s->rtc.nv[128 + 3] = 0x08;
 }
 
 /* The two IDE channels' INTRQ lines as the 8259 sees them: asserted while
@@ -1725,35 +1479,16 @@ static uint8_t i2000_pic_slave_irr(const Ia64I2000State *s) {
 }
 
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
-    static unsigned debug_reads;
     uint64_t value;
     if (i460gx_ifb_io_read(&s->chipset, 0, port, size, &value) ||
         i460gx_ifb_io_read(&s->chipset, 2, port, size, &value))
         return value;
-    if (s->rage128.enabled && size == 2 && port >= INT10_IO_BASE &&
-        port < INT10_IO_BASE + 16 && !(port & 1))
-        return int10_io_read(s, (unsigned)(port - INT10_IO_BASE) / 2);
-    if (s->rage128.enabled) {
-        uint32_t base = rage128_bar(&s->rage128, 0x14, RAGE128_IO_BASE,
-                                   ~UINT32_C(0xff));
-        if (port >= base && port + size <= base + 0x100)
-            return rage128_mmio_read(&s->rage128,
-                                     (unsigned)(port - base), size);
-    }
-    if (s->i82559.enabled) {
-        uint32_t base = i82559_bar(&s->i82559, 0x14, I82559_IO_BASE,
-                                  ~UINT32_C(0x3f));
-        if (port >= base && port + size <= base + I82559_IO_SIZE)
-            return i82559_reg_read(&s->i82559, (unsigned)(port - base), size);
-    }
-    if (size == 1 && vga_port(port))
-        return vga_ibm_io_read(&s->vga, (uint16_t)port);
-    if (vga_port_span(port, size)) {
-        uint64_t v = 0;
-        for (unsigned i = 0; i < size; i++)
-            v |= (uint64_t)vga_ibm_io_read(&s->vga, (uint16_t)(port + i)) << (8 * i);
-        return v;
-    }
+    if (s->video_enabled && port <= 0xFFFF &&
+        rage128_io_access(&s->rage128, false, (uint16_t)port, size, &value))
+        return value;
+    if (s->nic_enabled && port <= 0xFFFF &&
+        e100_io_access(&s->nic, false, (uint16_t)port, size, &value))
+        return value;
     if (i460gx_ifb_io_read(&s->chipset, 3, port, size, &value))
         return value;
     if (port == 0x60 && size == 1) {               /* 8042 data */
@@ -1821,44 +1556,16 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
                     s->cpu->ninsts);
         return st64;
     }
-    if ((port == 0x71 || port == 0x73) && size == 1)
-    {
-        /* 72h/73h is the i2000 IFB's own RTC/CFGRAM alias; 70h/71h is the
-         * universal, standard AT-compatible CMOS index/data pair that
-         * every x86-compatible BIOS (including the real-mode setup code
-         * this firmware runs before entering native SAL/EFI) expects to
-         * work regardless of platform, so both need to reach the same
-         * underlying state. */
-        if ((s->cmos_index & 0x7F) < 0x0A)
-            cmos_sync_live_clock(s);
-        uint8_t v = s->cmos[s->cmos_index & 0x7F];
-        if (getenv("CMOS_DEBUG"))
-            fprintf(stderr, "i2000: CMOS read reg=%#04x -> %#04x "
-                    "ninsts=%" PRIu64 " itc=%" PRIu64 " ip=%016" PRIx64 "\n",
-                    s->cmos_index & 0x7F, v, s->cpu->ninsts,
-                    merced_get_itc(s->cpu), s->cpu->ip);
-        if ((s->cmos_index & 0x7F) == 0x0A)
-            /* Status Register A bit 7 is UIP (update in progress). We don't
-             * emulate the real ~244us-per-second update window, and nothing
-             * else ever clears whatever got stored here (firmware itself
-             * can write this register, and did - a stale 1 bit is exactly
-             * what left an earlier boot spinning forever waiting for "not
-             * busy"). Force it clear on every read rather than trust
-             * whatever's retained; the other status-A bits (divider/rate
-             * select) are harmless to read back as stored. */
-            v &= ~0x80u;
-        if (getenv("MERCED_DEBUG") && debug_reads++ < 128)
-            fprintf(stderr, "i2000: CMOS[%02X] -> %02X\n",
-                    s->cmos_index & 0x7F, v);
-        return v;
+    if (port >= 0x70 && port <= 0x77 && size == 1) {
+        uint8_t v;
+        if (mc146818_io(&s->rtc, false, (uint16_t)port, &v,
+                        s->chipset.ifb_cfg[0xc8], s->chipset.ifb_cfg[0xfc] & 1))
+            return v;
     }
     if (port == PCI_CFG_ADDR && size == 4) return s->pci_cfg_addr;
     if (port >= PCI_CFG_DATA && port < PCI_CFG_DATA + 4)
         return pci_cfg_read(s, (unsigned)(port - PCI_CFG_DATA), size);
     if (port >= COM1_PORT && port < COM1_PORT + 8) {
-        if (getenv("MERCED_DEBUG") && debug_reads++ < 128)
-            fprintf(stderr, "i2000: COM1 read reg %u\n",
-                    (unsigned)(port - COM1_PORT));
         switch (port - COM1_PORT) {
         case 0:
             if (s->uart_lcr & 0x80) return s->uart_dll;
@@ -1903,45 +1610,12 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     }
     if (port == 0x21) return s->pic_master_mask;
     if (port == 0xA1) return s->pic_slave_mask;
-    if (port == 0x40 && size == 1) {
-        /* EFI reads the 8254 channel-0 count as low byte followed by high
-         * byte and uses the difference to calibrate its stall routine.  A
-         * constant 0xff (the old unimplemented-port result) makes that
-         * difference zero and trips var.c's NumberOfTicks assertion.
-         *
-         * Tie the counter to executed slots. Exact wall-clock frequency is
-         * not important here, but it must count down and both bytes of one
-         * read must describe essentially the same sample. */
-        uint32_t reload = s->pit0_reload ? s->pit0_reload : 0x10000u;
-        uint64_t elapsed = merced_get_itc(s->cpu) - s->pit0_epoch_ninsts;
-        uint64_t ticks = (elapsed * I8254_INPUT_HZ) / I2000_ITC_HZ;
-        uint16_t count = (uint16_t)(reload - (ticks % reload));
-        uint8_t v = s->pit0_read_phase ? (uint8_t)(count >> 8)
-                                       : (uint8_t)count;
-        s->pit0_read_phase ^= 1;
-        return v;
+    if (port >= 0x40 && port <= 0x43 && size == 1) {
+        i2000_pit_run(s);
+        return i8253_io_read(&s->pit, port);
     }
-    if (port >= 0x404 && port + size <= 0x408)
-        /* Board GPIO inputs: bit 24 (GPIO18/J29) selects normal running
-         * rather than OVRD/CLRCMOS. Bit 18 (GPIO12) deasserts manufacturing
-         * mode; AMI otherwise deletes Boot/Driver variables and rebuilds
-         * BootOrder on every boot, discarding Windows Setup's boot entry.
-         * Return the same input levels for byte, word and dword reads. */
-        return (UINT32_C(0x01040000) >> ((port - 0x404) * 8)) &
-               size_mask(size);
-    if (port >= 0x400 && port + size <= 0x440) {
-        uint64_t v = 0;
-        memcpy(&v, &s->acpi_io[port - 0x400], size);
-        return v;
-    }
-    if (port == 0x61) {                            /* PIT channel-2 gate/output */
-        if (s->pit2_polls < 2) s->pit2_polls++;
-        /* Bit 4 is the PIT channel-1 refresh-request toggle. Legacy BIOS
-         * delay code waits for both its rising and falling edges; holding
-         * it constant traps the IRQ1 handler in a permanent spin. */
-        uint8_t refresh = (s->cpu->ninsts >> 8) & 1 ? 0x10 : 0;
-        return s->port61 | refresh | (s->pit2_polls >= 2 ? 0x20 : 0);
-    }
+    if (port == 0x61 && size == 1)
+        return i2000_port61_read(s);
     if ((port >= 0x170 && port <= 0x177) || port == 0x376) {
         unsigned reg = port == 0x376 ? 7 : (unsigned)(port - 0x170);
         /* Only the secondary-channel master exists.  The firmware probes
@@ -2005,29 +1679,6 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
                 atapi_clear_irq(s); /* Alternate Status does not acknowledge. */
             break;
         default: result = 0; break;
-        }
-        if (getenv("ATA_TASKFILE_TRACE") || getenv("ATA_LOOP_TRACE")) {
-            static unsigned taskfile_reads;
-            static uint64_t prev_result = UINT64_MAX, prev_ip = UINT64_MAX;
-            static bool loop_dumped;
-            unsigned n = taskfile_reads++;
-            bool changed = result != prev_result || s->cpu->ip != prev_ip;
-            if (reg != 7 || n < 128 || changed || (n % 500) == 0) {
-                fprintf(stderr, "i2000: ATAPI taskfile read port=%#x reg=%u -> %#04" PRIx64
-                        " ip=%016" PRIx64 " ninsts=%" PRIu64 " n=%u%s\n",
-                        (unsigned)port, reg, result, s->cpu->ip,
-                        s->cpu->ninsts, n, changed ? " CHANGED" : "");
-            }
-            if (reg == 7 && n == 50 && !loop_dumped && getenv("ATA_LOOP_TRACE")) {
-                loop_dumped = true;
-                fprintf(stderr, "i2000: ATAPI status-poll loop, dumping call "
-                        "history + next bundles from ip=%016" PRIx64 ":\n",
-                        s->cpu->ip);
-                merced_dump_calls(s->cpu, 16, stderr);
-                s->cpu->trace_n = 60;
-            }
-            prev_result = result;
-            prev_ip = s->cpu->ip;
         }
         return result;
     }
@@ -2099,50 +1750,17 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
-    static unsigned debug_writes;
     if (i460gx_ifb_io_write(&s->chipset, 0, port, val, size) ||
         i460gx_ifb_io_write(&s->chipset, 2, port, val, size))
         return;
-    if (s->rage128.enabled && size == 2 && port >= INT10_IO_BASE &&
-        port < INT10_IO_BASE + 16 && !(port & 1)) {
-        int10_io_write(s, (unsigned)(port - INT10_IO_BASE) / 2,
-                       (uint16_t)val);
+    if (s->video_enabled && port <= 0xFFFF &&
+        rage128_io_access(&s->rage128, true, (uint16_t)port, size, &val))
         return;
-    }
-    if (s->rage128.enabled) {
-        uint32_t base = rage128_bar(&s->rage128, 0x14, RAGE128_IO_BASE,
-                                   ~UINT32_C(0xff));
-        if (port >= base && port + size <= base + 0x100) {
-            rage128_mmio_write(&s->rage128,
-                               (unsigned)(port - base), val, size);
-            return;
-        }
-    }
-    if (s->i82559.enabled) {
-        uint32_t base = i82559_bar(&s->i82559, 0x14, I82559_IO_BASE,
-                                  ~UINT32_C(0x3f));
-        if (port >= base && port + size <= base + I82559_IO_SIZE) {
-            i82559_reg_write(&s->i82559, (unsigned)(port - base), val, size);
-            return;
-        }
-    }
-    if (size == 1 && vga_port(port)) {
-        vga_ibm_io_write(&s->vga, (uint16_t)port, (uint8_t)val);
+    if (s->nic_enabled && port <= 0xFFFF &&
+        e100_io_access(&s->nic, true, (uint16_t)port, size, &val))
         return;
-    }
-    if (vga_port_span(port, size)) {
-        for (unsigned i = 0; i < size; i++)
-            vga_ibm_io_write(&s->vga, (uint16_t)(port + i), (uint8_t)(val >> (8 * i)));
-        return;
-    }
     if (i460gx_ifb_io_write(&s->chipset, 3, port, val, size))
         return;
-    if (port >= 0x404 && port + size <= 0x408)
-        return; /* Board strap inputs do not change on software writes. */
-    if (port >= 0x400 && port + size <= 0x440) {
-        memcpy(&s->acpi_io[port - 0x400], &val, size);
-        return;
-    }
     if (port == 0x21 && size == 1) {
         if (s->pic_master_icw) {
             if (s->pic_master_icw == 1)
@@ -2157,10 +1775,8 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                     s->pic_master_mask, (unsigned)val, s->pic_master_base,
                     s->cpu->ninsts);
         s->pic_master_mask = (uint8_t)val;
-        if (!(s->pic_master_mask & 1) && s->pit0_reload &&
-            !s->pit0_next_irq)
-            s->pit0_next_irq = merced_get_itc(s->cpu) +
-                               pit_interval_itc(s->pit0_reload);
+        if (!(s->pic_master_mask & 1) && s->pit_irq_pending)
+            merced_raise_external(s->cpu, 0);
         return;
     }
     if (port == 0xA1 && size == 1) {
@@ -2204,41 +1820,6 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
             *read_isr = (val & 0x01) != 0;
         }
         /* Other commands are OCWs. */
-        return;
-    }
-    if (port == 0x40 && size == 1) {
-        if (!s->pit0_write_phase) {
-            s->pit0_latch = (uint8_t)val;
-            s->pit0_write_phase = 1;
-        } else {
-            s->pit0_reload = s->pit0_latch | ((uint16_t)(uint8_t)val << 8);
-            s->pit0_write_phase = 0;
-            s->pit0_read_phase = 0;
-            s->pit0_epoch_ninsts = merced_get_itc(s->cpu);
-            s->pit0_next_irq = s->pit0_epoch_ninsts +
-                               pit_interval_itc(s->pit0_reload);
-            if (getenv("PIT_DEBUG"))
-                fprintf(stderr, "i2000: PIT0 reload=%u epoch_itc=%" PRIu64
-                        " next_irq_itc=%" PRIu64 " ninsts=%" PRIu64 "\n",
-                        s->pit0_reload, s->pit0_epoch_ninsts,
-                        s->pit0_next_irq, s->cpu->ninsts);
-        }
-        return;
-    }
-    if (port == 0x41 && size == 1) {
-        if (!s->pit1_write_phase) {
-            s->pit1_latch = (uint8_t)val;
-            s->pit1_write_phase = 1;
-        } else {
-            s->pit1_reload = s->pit1_latch | ((uint16_t)(uint8_t)val << 8);
-            s->pit1_write_phase = 0;
-            s->pit1_next_irq = merced_get_itc(s->cpu) +
-                               pit_interval_itc(s->pit1_reload);
-            if (getenv("PIT_DEBUG"))
-                fprintf(stderr, "i2000: PIT1 reload=%u next_irq_itc=%" PRIu64
-                        " ninsts=%" PRIu64 "\n",
-                        s->pit1_reload, s->pit1_next_irq, s->cpu->ninsts);
-        }
         return;
     }
     if (port == 0x64 && size == 1) {               /* 8042 command */
@@ -2291,21 +1872,11 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         s->kbc_pending_write = 0;
         return;
     }
-    if ((port == 0x70 || port == 0x72) && size == 1) {
-        /* The i2000 IFB exposes its RTC/configuration RAM at 72h/73h, but
-         * 70h/71h (standard AT CMOS index/data) must alias the same state -
-         * see the read-side comment. Bit 7 of 70h is conventionally the
-         * NMI-mask bit on real hardware; we don't model NMI, so it's
-         * harmlessly folded into the index like the rest of the byte. */
-        s->cmos_index = (uint8_t)val & 0x7F;
-        return;
-    }
-    if ((port == 0x71 || port == 0x73) && size == 1) {
-        if (getenv("MERCED_DEBUG") && debug_writes++ < 128)
-            fprintf(stderr, "i2000: CMOS[%02X] <- %02X\n",
-                    s->cmos_index & 0x7F, (unsigned)(uint8_t)val);
-        s->cmos[s->cmos_index & 0x7F] = (uint8_t)val;
-        return;
+    if (port >= 0x70 && port <= 0x77 && size == 1) {
+        uint8_t v = (uint8_t)val;
+        if (mc146818_io(&s->rtc, true, (uint16_t)port, &v,
+                        s->chipset.ifb_cfg[0xc8], s->chipset.ifb_cfg[0xfc] & 1))
+            return;
     }
     if (port == RESET_CTRL_PORT && size == 1) {
         /* Intel reset-control convention: bit 1 selects a hard reset and
@@ -2329,25 +1900,13 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         s->post_code = (uint8_t)val;
         return;
     }
-    if (port == 0x42) {                            /* PIT channel-2 count */
-        s->pit2_polls = 0;
+    if (port >= 0x40 && port <= 0x43 && size == 1) {
+        i2000_pit_run(s);
+        i8253_io_write(&s->pit, port, (uint8_t)val);
         return;
     }
-    if (port == 0x43) {
-        if (getenv("PIT_DEBUG"))
-            fprintf(stderr, "i2000: PIT command byte %#04x (channel=%u "
-                    "mode=%u) ninsts=%" PRIu64 "\n", (unsigned)(uint8_t)val,
-                    (unsigned)((uint8_t)val >> 6), (unsigned)(((uint8_t)val >> 1) & 7),
-                    s->cpu->ninsts);
-        if (((uint8_t)val >> 6) == 0) {
-            s->pit0_write_phase = 0;
-            s->pit0_read_phase = 0;
-        } else if (((uint8_t)val >> 6) == 1)
-            s->pit1_write_phase = 0;
-        return;
-    }
-    if (port == 0x61) {
-        s->port61 = (uint8_t)val & 0x0F;
+    if (port == 0x61 && size == 1) {
+        i2000_port61_write(s, (uint8_t)val);
         return;
     }
     if ((port >= 0x170 && port <= 0x177) || port == 0x376) {
@@ -2553,9 +2112,6 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         }
     }
     if (port >= COM1_PORT && port < COM1_PORT + 8) {
-        if (getenv("MERCED_DEBUG") && debug_writes++ < 128)
-            fprintf(stderr, "i2000: COM1 write reg %u <- %02X\n",
-                    (unsigned)(port - COM1_PORT), (unsigned)(uint8_t)val);
         switch (port - COM1_PORT) {
         case 0:
             if (s->uart_lcr & 0x80) { s->uart_dll = (uint8_t)val; return; }
@@ -2609,25 +2165,6 @@ static bool sparse_io_port(uint64_t offset, uint64_t *port) {
     return true;
 }
 
-static bool vga_mem_window(Ia64I2000State *s, uint64_t addr, unsigned size,
-                          uint32_t *voff) {
-    uint32_t base, wsize;
-    vga_ibm_aperture(&s->vga, &base, &wsize);
-    if (addr < base || addr + size > (uint64_t)base + wsize)
-        return false;
-    *voff = (uint32_t)(addr - base);
-    return true;
-}
-
-#define VGA_ROM_BASE 0xC0000ull
-
-static bool vga_rom_window(uint64_t addr, unsigned size, uint32_t *voff) {
-    if (addr < VGA_ROM_BASE || addr + size > VGA_ROM_BASE + 0x10000ull)
-        return false;
-    *voff = (uint32_t)(addr - VGA_ROM_BASE);
-    return true;
-}
-
 /* Deliver global system interrupt `gsi` if its redirection-table entry
  * isn't masked (SSDM Table 2-10). GSI N == legacy ISA IRQ N (no ACPI
  * interrupt source overrides modeled). Every entry defaults masked at
@@ -2666,21 +2203,6 @@ static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi) {
     merced_raise_external(s->cpu, vector);
 }
 
-/* Older versions misread DIMM SPD data and let firmware report a RAM top
- * of 0x00000e0080000000.  They backed its top 64 MiB separately so EFI could
- * run there.  Keep that backing and its snapshot layout for existing saved
- * states; this is not a hardware memory-card aperture.  Correctly sized
- * cold boots place firmware and applications in installed low RAM. */
-static inline bool i2000_high_dram_addr(uint64_t addr, uint64_t *off) {
-    if ((addr & UINT64_C(0x00000fff00000000)) != I2000_HIGH_DRAM_TAG)
-        return false;
-    uint64_t low = (uint32_t)addr;
-    if (low < I2000_HIGH_DRAM_BASE || low >= I2000_RAM_MAX)
-        return false;
-    *off = low - I2000_HIGH_DRAM_BASE;
-    return true;
-}
-
 /* SAL restores its top-of-RAM scratch words through sign-extended
  * addresses.  Match the active bootstrap aperture, or the installed RAM
  * boundary before the first save has selected one.
@@ -2700,16 +2222,16 @@ static inline uint64_t i2000_normalize_pa(Ia64I2000State *s, uint64_t addr) {
     addr &= MERCED_PHYS_MASK;
     if ((addr & UINT64_C(0x000fffff00000000)) ==
         UINT64_C(0x000fffff00000000)) {
-        uint64_t base = s->flash_cmd_addr;
+        uint64_t base = s->sal_scratch_base;
         if (!base)
             base = (s->ram_size - UINT64_C(0x10000)) & ~UINT64_C(0xffff);
         addr = base | (addr & UINT64_C(0xffff));
-    } else if (s->flash_cmd_addr && i2000_sal_scratch_alias_active(s) &&
+    } else if (s->sal_scratch_base && i2000_sal_scratch_alias_active(s) &&
                ((addr & UINT64_C(0xffff)) == UINT64_C(0x6030) ||
                 (addr & UINT64_C(0xffff)) == UINT64_C(0xa030))) {
         uint64_t aperture_end = (addr & ~UINT64_C(0xffff)) + 0x10000;
         if (aperture_end && !(aperture_end & (aperture_end - 1)))
-            addr = s->flash_cmd_addr | (addr & UINT64_C(0xffff));
+            addr = s->sal_scratch_base | (addr & UINT64_C(0xffff));
     }
     return addr;
 }
@@ -2726,8 +2248,85 @@ static inline void i2000_ram_copy(const void *src, void *dst, unsigned size) {
     }
 }
 
+/* Whether a PCI card decodes `addr` as memory: the display's legacy VGA
+ * window, and the frame buffer, register, flash and ROM BARs of the display
+ * and the LAN. DRAM has priority over a BAR: until firmware places one above
+ * memory (a BAR left at its power-on zero, or placed over RAM), it decodes
+ * nothing. The chipset's own space (I/O and local SAPICs, flash) at the top
+ * of the 4 GiB map has priority too. */
+static bool i2000_card_claims(const Ia64I2000State *s, uint64_t addr) {
+    uint64_t a, a_size, b, b_size, rom, rom_size;
+    if (s->video_enabled && addr >= 0xA0000 && addr < 0xC0000)
+        return rage128_mem_ranges(&s->rage128, &a, &a_size, &b, &b_size);
+    if (addr < s->ram_size || addr >= I460GX_IOSAPIC_BASE)
+        return false;
+    if (s->video_enabled) {
+        if (rage128_mem_ranges(&s->rage128, &a, &a_size, &b, &b_size) &&
+            (addr - a < a_size || addr - b < b_size))
+            return true;
+        if (rage128_rom_range(&s->rage128, &rom, &rom_size) &&
+            addr - rom < rom_size)
+            return true;
+    }
+    if (s->nic_enabled) {
+        if (e100_mem_ranges(&s->nic, &a, &a_size, &b, &b_size) &&
+            (addr - a < a_size || addr - b < b_size))
+            return true;
+        if (e100_rom_range(&s->nic, &rom, &rom_size) &&
+            addr - rom < rom_size)
+            return true;
+    }
+    return false;
+}
+
+/* Recompute the span of RAM that no device decodes. Devices take priority
+ * over RAM in the bus decode, so the span ends at the lowest base address of
+ * a PCI window that could fall in RAM. Call whenever such a BAR may have
+ * changed. */
+#define I2000_FAST_RAM_BASE UINT64_C(0x100000)
+
+static void i2000_update_fast_ram(Ia64I2000State *s) {
+    uint64_t end = s->ram_size;
+    uint64_t a, a_size, b, b_size, rom, rom_size;
+    if (s->video_enabled) {
+        if (rage128_mem_ranges(&s->rage128, &a, &a_size, &b, &b_size)) {
+            if (a_size && a >= s->ram_size && a < end) end = a;
+            if (b_size && b >= s->ram_size && b < end) end = b;
+        }
+        if (rage128_rom_range(&s->rage128, &rom, &rom_size) &&
+            rom >= s->ram_size && rom < end)
+            end = rom;
+    }
+    if (s->nic_enabled) {
+        if (e100_mem_ranges(&s->nic, &a, &a_size, &b, &b_size)) {
+            if (a_size && a >= s->ram_size && a < end) end = a;
+            if (b_size && b >= s->ram_size && b < end) end = b;
+        }
+        if (e100_rom_range(&s->nic, &rom, &rom_size) &&
+            rom >= s->ram_size && rom < end)
+            end = rom;
+    }
+    s->fast_ram_end = end;
+}
+
+/* An access wholly inside the plain-RAM span. The two scratch offsets are
+ * excluded because SAL's top-of-aperture words there are tracked and
+ * re-addressed by i2000_normalize_pa(). */
+static inline bool i2000_plain_ram(const Ia64I2000State *s, uint64_t addr,
+                                   unsigned size) {
+    return addr >= I2000_FAST_RAM_BASE && addr < s->fast_ram_end &&
+           size <= s->fast_ram_end - addr && !s->mem_watch &&
+           (addr & UINT64_C(0xffff)) != UINT64_C(0x6030) &&
+           (addr & UINT64_C(0xffff)) != UINT64_C(0xa030);
+}
+
 static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     Ia64I2000State *s = ud;
+    if (i2000_plain_ram(s, addr, size)) {
+        uint64_t v = 0;
+        i2000_ram_copy(s->ram + addr, &v, size);
+        return v;
+    }
     if (gemu_monitor_has_mem_breakpoints(s->monitor))
         for (unsigned i = 0; i < size; i++)
             gemu_monitor_check_read(s->monitor, (uint32_t)(addr + i));
@@ -2737,58 +2336,13 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
      * miss every device. */
     bool region6 = (addr >> 60) == 0xC;
     addr = i2000_normalize_pa(s, addr);
-    uint64_t high_off;
-    if (i2000_high_dram_addr(addr, &high_off) &&
-        high_off + size <= I2000_HIGH_DRAM_SIZE) {
-        uint64_t v = 0;
-        memcpy(&v, s->high_dram + high_off, size);
-        return v;
-    }
-    uint32_t voff;
-    if (s->rage128.enabled) {
-        uint64_t fb = rage128_bar(&s->rage128, 0x10, RAGE128_FB_BASE,
-                                 ~UINT32_C(0x03ffffff));
-        uint64_t mmio = rage128_bar(&s->rage128, 0x18, RAGE128_MMIO_BASE,
-                                   ~UINT32_C(0x3fff));
-        if (addr >= fb && addr + size <= fb + RAGE128_FB_APER_SIZE) {
-            uint32_t off = (uint32_t)(addr - fb) & (RAGE128_VRAM_SIZE - 1);
-            return rage128_vram_read(&s->rage128, off, size);
-        }
-        if (addr >= mmio && addr + size <= mmio + RAGE128_MMIO_SIZE)
-            return rage128_mmio_read(&s->rage128,
-                                     (unsigned)(addr - mmio), size);
-    }
-    if (s->i82559.enabled) {
-        uint64_t mmio = i82559_bar(&s->i82559, 0x10, I82559_MMIO_BASE,
-                                  ~UINT32_C(0xfff));
-        if (addr >= mmio && addr + size <= mmio + I82559_MMIO_SIZE)
-            return i82559_reg_read(&s->i82559, (unsigned)(addr - mmio), size);
-        uint32_t rombar = 0;
-        memcpy(&rombar, s->i82559.cfg + 0x30, sizeof(rombar));
-        uint64_t rombase = rombar & ~UINT32_C(0x7ff);
-        if ((rombar & 1) && s->i82559.option_rom && addr >= rombase &&
-            addr + size <= rombase + s->i82559.option_rom_size) {
-            uint64_t v = 0;
-            memcpy(&v, s->i82559.option_rom + (addr - rombase), size);
+    if (i2000_card_claims(s, addr)) {
+        uint64_t v;
+        if ((s->video_enabled &&
+             rage128_mem_access(&s->rage128, false, addr, size, &v)) ||
+            (s->nic_enabled &&
+             e100_mem_access(&s->nic, false, addr, size, &v)))
             return v;
-        }
-    }
-    /* vga_mem_window()/vga_rom_window() can only ever match addr < 0xD0000
-     * (the legacy VGA aperture + option-ROM shadow window) - skip both
-     * calls for the overwhelming majority of accesses, which land well
-     * above that legacy hole. */
-    if (addr < 0xD0000) {
-        if (vga_mem_window(s, addr, size, &voff)) {
-            uint64_t v = 0;
-            for (unsigned i = 0; i < size; i++)
-                v |= (uint64_t)vga_ibm_mem_read(&s->vga, voff + i) << (i * 8);
-            return v;
-        }
-        if (vga_rom_window(addr, size, &voff)) {
-            uint64_t v = 0;
-            memcpy(&v, s->vga_rom_shadow + voff, size);
-            return v;
-        }
     }
     if (region6 && addr + size <= I2000_FLASH_BASE) {
         uint32_t saved = s->pci_cfg_addr;
@@ -2800,11 +2354,6 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     if (addr + size <= s->ram_size) {
         uint64_t v = 0;
         i2000_ram_copy(s->ram + addr, &v, size);
-        return v;
-    }
-    if (addr >= I2000_CHIPSET_SCRATCH_BASE && addr + size <= I2000_RAM_MAX) {
-        uint64_t v = 0;
-        memcpy(&v, s->chipset_scratch + (addr - I2000_CHIPSET_SCRATCH_BASE), size);
         return v;
     }
     uint64_t chipset_value;
@@ -2924,42 +2473,13 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         }
         return s->pic_master_base; /* spurious/unattributed: old behavior */
     }
-    if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
-        uint64_t off = addr - I2000_FLASH_BASE;
-        unsigned chip_index = (unsigned)(off / I2000_FLASH_CHIP_SIZE);
-        uint64_t chip_off = off % I2000_FLASH_CHIP_SIZE;
-        I2000FlashChip *chip = &s->flash_chip[chip_index];
-        if (chip->read_status) {
-            uint64_t v = 0;
-            for (unsigned i = 0; i < size; i++)
-                v |= (uint64_t)chip->status << (i * 8);
+    {
+        /* The firmware window and the hubs' register space are the IFB's
+         * firmware hub interface: reads see the array, status, identifier or
+         * lock registers as each hub's command state says. */
+        uint64_t v;
+        if (i460gx_flash_access(&s->chipset, false, addr, size, &v))
             return v;
-        }
-        if (chip->read_id) {
-            uint64_t v = 0;
-            for (unsigned i = 0; i < size; i++) {
-                /* 82802AC identifier space is decoded within every 64 KiB
-                 * block: manufacturer and device codes are at +0/+1, while
-                 * +2 is that block's lock-status register.  Returning the
-                 * manufacturer ID for every even byte made +2 read as 0x89,
-                 * whose bit 0 tells FMM that every block is locked; CDB then
-                 * reported "not enough space" without issuing a write. */
-                uint32_t id_off = (uint32_t)(chip_off + i) & 0xFFFFu;
-                uint8_t id = id_off == 0 ? 0x89 :
-                             id_off == 1 ? 0xAC :
-                             id_off == 2 ? 0x00 : 0xFF;
-                v |= (uint64_t)id << (i * 8);
-            }
-            return v;
-        }
-        /* Reads through the top-of-4GiB window always see the ROM (the
-         * recovery-image scan depends on it); only writes divert into the
-         * RAM shadow, where the firmware reads them back through the low
-         * alias. */
-        uint64_t v = 0;
-        if (off + size <= I2000_FLASH_SIZE)
-            memcpy(&v, s->flash + off, size);
-        return v;
     }
     if (addr - I2000_IO_BASE < I2000_IO_SIZE) {
         uint64_t port;
@@ -2998,6 +2518,10 @@ static uint64_t bus_fetch(void *ud, uint64_t addr, unsigned size) {
 
 static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     Ia64I2000State *s = ud;
+    if (i2000_plain_ram(s, addr, size)) {
+        i2000_ram_copy(&val, s->ram + addr, size);
+        return;
+    }
     for (unsigned i = 0; gemu_monitor_has_mem_breakpoints(s->monitor) && i < size; i++) {
         if (gemu_monitor_check_write(s->monitor, (uint32_t)(addr + i)))
             fprintf(stderr, "i2000: watched write pa=%016" PRIX64
@@ -3018,55 +2542,14 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
         addr < s->ram_size) {
         uint64_t aperture_end = (addr & ~UINT64_C(0xffff)) + 0x10000;
         if (aperture_end && !(aperture_end & (aperture_end - 1)))
-            s->flash_cmd_addr = addr & ~UINT64_C(0xffff);
+            s->sal_scratch_base = addr & ~UINT64_C(0xffff);
     }
-    uint64_t high_off;
-    if (i2000_high_dram_addr(addr, &high_off) &&
-        high_off + size <= I2000_HIGH_DRAM_SIZE) {
-        memcpy(s->high_dram + high_off, &val, size);
+    if (i2000_card_claims(s, addr) &&
+        ((s->video_enabled &&
+          rage128_mem_access(&s->rage128, true, addr, size, &val)) ||
+         (s->nic_enabled &&
+          e100_mem_access(&s->nic, true, addr, size, &val))))
         return;
-    }
-    uint32_t voff;
-    if (s->rage128.enabled) {
-        uint64_t fb = rage128_bar(&s->rage128, 0x10, RAGE128_FB_BASE,
-                                 ~UINT32_C(0x03ffffff));
-        uint64_t mmio = rage128_bar(&s->rage128, 0x18, RAGE128_MMIO_BASE,
-                                   ~UINT32_C(0x3fff));
-        if (addr >= fb && addr + size <= fb + RAGE128_FB_APER_SIZE) {
-            uint32_t off = (uint32_t)(addr - fb) & (RAGE128_VRAM_SIZE - 1);
-            rage128_vram_write(&s->rage128, off, val, size);
-            return;
-        }
-        if (addr >= mmio && addr + size <= mmio + RAGE128_MMIO_SIZE) {
-            rage128_mmio_write(&s->rage128,
-                               (unsigned)(addr - mmio), val, size);
-            return;
-        }
-    }
-    if (s->i82559.enabled) {
-        uint64_t mmio = i82559_bar(&s->i82559, 0x10, I82559_MMIO_BASE,
-                                  ~UINT32_C(0xfff));
-        if (addr >= mmio && addr + size <= mmio + I82559_MMIO_SIZE) {
-            i82559_reg_write(&s->i82559, (unsigned)(addr - mmio), val, size);
-            return;
-        }
-    }
-    /* See the matching comment in bus_read(): both window checks can only
-     * ever match addr < 0xD0000. */
-    if (addr < 0xD0000) {
-        if (vga_mem_window(s, addr, size, &voff)) {
-            for (unsigned i = 0; i < size; i++)
-                vga_ibm_mem_write(&s->vga, voff + i, (uint8_t)(val >> (i * 8)));
-            return;
-        }
-        /* Read-only, like a real (locked) option ROM shadow: this is what
-         * keeps a generic "clear all of system RAM" firmware loop from
-         * wiping the video BIOS out before it's ever used, since real
-         * hardware wouldn't report this range as regular RAM in the first
-         * place. */
-        if (vga_rom_window(addr, size, &voff))
-            return;
-    }
     if (region6 && addr + size <= I2000_FLASH_BASE) {
         uint32_t saved = s->pci_cfg_addr;
         s->pci_cfg_addr = 0x80000000u | ((uint32_t)addr & 0xfffffffcu);
@@ -3075,156 +2558,38 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
         return;
     }
     if (addr + size <= s->ram_size) {
-        if (addr <= UINT64_C(0xE100) && addr + size > UINT64_C(0xE000) &&
-            getenv("INT13_LOAD_DEBUG")) {
-            fprintf(stderr, "merced: INT13-REGION-WRITE addr=%016" PRIX64
-                    " size=%u val=%016" PRIX64 " ip=%016" PRIX64
-                    " ninsts=%" PRIu64 "\n", addr, size, val,
-                    s->cpu->ip, s->cpu->ninsts);
-            fflush(stderr);
-        }
         i2000_ram_copy(&val, s->ram + addr, size);
-        return;
-    }
-    if (addr >= I2000_CHIPSET_SCRATCH_BASE && addr + size <= I2000_RAM_MAX) {
-        if (addr <= UINT64_C(0x7FFB0FEC) && addr + size > UINT64_C(0x7FFB0FEC) &&
-            getenv("SCRATCH_DEBUG")) {
-            fprintf(stderr, "merced: SCRATCH-WRITE addr=%016" PRIX64
-                    " size=%u val=%016" PRIX64 " ip=%016" PRIX64
-                    " ninsts=%" PRIu64 "\n", addr, size, val,
-                    s->cpu->ip, s->cpu->ninsts);
-            fflush(stderr);
-        }
-        if (addr <= UINT64_C(0x7FFA0068) && addr + size > UINT64_C(0x7FFA0068) &&
-            getenv("SAPIC_PTR_DEBUG")) {
-            fprintf(stderr, "merced: SAPICPTR-WRITE addr=%016" PRIX64
-                    " size=%u val=%016" PRIX64 " ip=%016" PRIX64
-                    " ninsts=%" PRIu64 "\n", addr, size, val,
-                    s->cpu->ip, s->cpu->ninsts);
-            fflush(stderr);
-        }
-        memcpy(s->chipset_scratch + (addr - I2000_CHIPSET_SCRATCH_BASE), &val, size);
         return;
     }
     if (i460gx_mmio_write(&s->chipset, addr, val, size))
         return;
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
         uint64_t off = addr - I2000_FLASH_BASE;
-        unsigned chip_index = (unsigned)(off / I2000_FLASH_CHIP_SIZE);
-        uint64_t chip_off = off % I2000_FLASH_CHIP_SIZE;
-        I2000FlashChip *chip = &s->flash_chip[chip_index];
-        /* BIOS 1.30 probes the Intel flash device with the standard
-         * clear-status/read-status/read-array command sequence.  Without
-        * command-state handling the status read returns an array byte and
-        * platform initialization reports EFI_OUT_OF_RESOURCES. */
         if (size == 1) {
-            if (chip->cmd == 0x40 || chip->cmd == 0x10) {
-                /* Intel byte-program operation.  Keep NVRAM updates in the
-                 * in-memory image; the user's ROM file remains untouched. */
-                uint8_t old = s->flash[off];
-                /* Intel NOR programming can only clear bits.  FMM relies on
-                 * that property to commit a record header in stages: writes
-                 * such as 3f -> 2f -> 23 -> f5 -> f1 must leave 0x21, not
-                 * replace it with 0xf1.  Treating program data as an ordinary
-                 * RAM store changes the record class and CDBFMM returns 0x2d.
-                 * A preceding block erase is what permits 0 -> 1 changes. */
-                s->flash[off] = old & (uint8_t)val;
-                /* The 460GX firmware window is shadowed into RAM after
-                 * relocation.  FMM programs through the top-of-4GiB FWH
-                 * alias but may verify through the low RAM shadow.  Keep
-                 * both views coherent; otherwise a successful program is
-                 * immediately read back as the stale pre-program byte and
-                 * CDBFMM rejects the completed transaction. */
+            /* Byte cycles are firmware hub command and data cycles. What the
+             * firmware programs or erases is mirrored into the RAM shadow so
+             * its read-back through the low alias stays coherent. */
+            i460gx_flash_access(&s->chipset, true, addr, size, &val);
+            uint32_t lo, n;
+            while (i460gx_flash_take_changes(&s->chipset, &lo, &n)) {
                 if (s->fw_shadow_enabled &&
-                    I2000_FW_SHADOW_BASE + off < s->ram_size)
-                    s->ram[I2000_FW_SHADOW_BASE + off] = s->flash[off];
-                s->nvram_dirty |= s->flash[off] != old;
-                chip->status = 0x80;
-                chip->read_status = true;
-                chip->read_id = false;
-                chip->cmd = 0;
-                return;
+                    I2000_FW_SHADOW_BASE + (uint64_t)lo + n <= s->ram_size)
+                    memcpy(s->ram + I2000_FW_SHADOW_BASE + lo, s->flash + lo, n);
+                s->nvram_dirty = true;
             }
-            if (chip->cmd == 0x20) {
-                if ((uint8_t)val == 0xD0) {
-                    uint64_t block = (uint64_t)chip_index *
-                                     I2000_FLASH_CHIP_SIZE +
-                                     (chip->cmd_addr & ~0xFFFFu);
-                    if (block + 0x10000 <= I2000_FLASH_SIZE) {
-                        memset(s->flash + block, 0xFF, 0x10000);
-                        if (s->fw_shadow_enabled &&
-                            I2000_FW_SHADOW_BASE + block + 0x10000 <=
-                                s->ram_size)
-                            memset(s->ram + I2000_FW_SHADOW_BASE + block,
-                                   0xFF, 0x10000);
-                        s->nvram_dirty = true;
-                    }
-                    chip->status = 0x80;
-                } else {
-                    chip->status = 0xB0; /* ready + erase error */
-                }
-                if (getenv("FLASH_DEBUG"))
-                    fprintf(stderr, "i2000: FLASH erase confirm off=%#" PRIx64
-                            " val=%#04x -> status=%#04x ninsts=%" PRIu64 "\n",
-                            off, (unsigned)(uint8_t)val,
-                            chip->status, s->cpu->ninsts);
-                chip->read_status = true;
-                chip->read_id = false;
-                chip->cmd = 0;
-                return;
-            }
-            if (getenv("FLASH_DEBUG") && (uint8_t)val != 0x70 &&
-                (uint8_t)val >= 0x10)
-                fprintf(stderr, "i2000: FLASH cmd=%#04x off=%#" PRIx64
-                        " ninsts=%" PRIu64 "\n", (unsigned)(uint8_t)val, off,
-                        s->cpu->ninsts);
-            if (((uint8_t)val == 0x90 || (uint8_t)val == 0x91) &&
-                off == 0xc0000 && s->cpu->ninsts > 5000000000ull &&
-                getenv("FLASH_ID_TRACE")) {
-                static bool traced;
-                if (!traced) {
-                    traced = true;
-                    fprintf(stderr, "i2000: FLASH ID probe off=0xc0000 ip=%016"
-                            PRIx64 " ninsts=%" PRIu64 " call history:\n",
-                            s->cpu->ip, s->cpu->ninsts);
-                    merced_dump_calls(s->cpu, 24, stderr);
-                    s->cpu->trace_n = 150;
-                }
-            }
-            switch ((uint8_t)val) {
-            case 0x50:                         /* clear status register */
-                chip->status = 0x80;           /* ready, no errors */
-                return;
-            case 0x70:                         /* read status register */
-                chip->read_status = true;
-                chip->read_id = false;
-                return;
-            case 0x90: case 0x91:              /* read identifier codes */
-                chip->read_status = false;
-                chip->read_id = true;
-                return;
-            case 0x10: case 0x40:              /* byte program setup */
-                chip->cmd = (uint8_t)val;
-                chip->cmd_addr = (uint32_t)chip_off;
-                return;
-            case 0x20:                         /* block erase setup */
-                chip->cmd = 0x20;
-                chip->cmd_addr = (uint32_t)chip_off;
-                return;
-            case 0xFF:                         /* read array */
-                chip->read_status = false;
-                chip->read_id = false;
-                chip->cmd = 0;
-                return;
-            }
+            return;
         }
-        /* Shadowed: writes through the alias land in the RAM copy.
-         * Unshadowed: flash programming cycles are ignored for now. */
+        /* Wider stores are not flash cycles: they are the firmware's cacheable
+         * data stores into the window, which a processor keeps in its cache.
+         * Until the caches are modelled they land in the RAM shadow. */
         if (s->fw_shadow_enabled && off + size <= I2000_FLASH_SIZE &&
             I2000_FW_SHADOW_BASE + I2000_FLASH_SIZE <= s->ram_size)
             memcpy(s->ram + I2000_FW_SHADOW_BASE + off, &val, size);
         return;
     }
+    /* The hubs' register space, 4 MiB below the window. */
+    if (i460gx_flash_access(&s->chipset, true, addr, size, &val))
+        return;
     if (addr - I2000_IO_BASE < I2000_IO_SIZE) {
         uint64_t port;
         if (sparse_io_port(addr - I2000_IO_BASE, &port)) {
@@ -3262,55 +2627,6 @@ static bool i2000_bus_fill(void *ud, uint64_t addr, uint8_t val, uint64_t len) {
 
 /* ── Firmware ────────────────────────────────────────────────────────────── */
 
-static bool i2000_repair_sdv_boot_timeout(Ia64I2000State *s) {
-    static const uint8_t name[] = {
-        'T',0,'i',0,'m',0,'e',0,'o',0,'u',0,'t',0,0,0
-    };
-    /* A former menu workaround changed this CDB-backed value directly.  That
-     * bypassed the firmware's CDB bookkeeping, so EFI detected an altered CDB
-     * and eventually failed trying to save it.  Undo only values that GEMU's
-     * workaround used; leave genuine guest configuration untouched.  This is
-     * also needed for snapshots and NVRAM files created by that version. */
-    for (size_t off = 0; off + sizeof(name) + 2 <= I2000_FLASH_SIZE; off++) {
-        if (memcmp(s->flash + off, name, sizeof(name)) != 0)
-            continue;
-        uint8_t *value = s->flash + off + sizeof(name);
-        uint16_t timeout = (uint16_t)value[0] | (uint16_t)value[1] << 8;
-        if (timeout != 60 && timeout != 3600 && timeout != 30000 &&
-            timeout != 65534)
-            continue;
-        value[0] = 7;
-        value[1] = 0;
-        fprintf(stderr, "i2000: repaired obsolete GEMU SDV boot timeout "
-                "(%u -> 7)\n", timeout);
-        return true;
-    }
-    return false;
-}
-
-static bool i2000_nvram_repair_bad_prefix(Ia64I2000State *s,
-                                          const uint8_t *rom_prefix) {
-    static const uint32_t factory[2] = { 0x390000, 0x3A0000 };
-    /* An earlier emulator version copied these ROM-resident factory record
-     * lists verbatim into the writable banks. They are input records, not
-     * formatted runtime CDB banks: firmware reports "No CDB found" and
-     * parks with status 5. Recognize only that exact emulator-created image
-     * so genuine guest NVRAM is never discarded. */
-    bool copied_factory =
-        !memcmp(s->flash, s->flash + factory[0], 0x10000) &&
-        !memcmp(s->flash + 0x10000, s->flash + factory[1], 0x10000);
-    bool erased = true;
-    for (uint32_t i = 0; i < 0x20000 && erased; i++)
-        erased = s->flash[i] == 0xff;
-    if (!copied_factory && !erased)
-        return false;
-    /* This prefix is not wholly NVRAM: the firmware image contains required
-     * CDB data around 0x17d20. Restore it byte-for-byte from the pristine
-     * ROM rather than erasing the whole range. */
-    memcpy(s->flash, rom_prefix, 0x20000);
-    return true;
-}
-
 static void i2000_nvram_load(Ia64I2000State *s) {
     if (!s->nvram_path[0])
         gemu_config_path(s->nvram_path, sizeof(s->nvram_path), "i2000.nvram");
@@ -3321,8 +2637,15 @@ static void i2000_nvram_load(Ia64I2000State *s) {
     FILE *f = fopen(s->nvram_path, "rb");
     if (!f)
         return;
+    /* The file is the flash image, then the RTC's battery-backed RAM and the
+     * offset of its time from the host's. */
     uint8_t *image = malloc(I2000_FLASH_SIZE);
     size_t got = image ? fread(image, 1, I2000_FLASH_SIZE, f) : 0;
+    uint8_t rtc_ram[MC146818_NV_SIZE];
+    uint8_t rtc_offset[8];
+    bool has_rtc = got == I2000_FLASH_SIZE &&
+                   fread(rtc_ram, 1, sizeof(rtc_ram), f) == sizeof(rtc_ram) &&
+                   fread(rtc_offset, 1, sizeof(rtc_offset), f) == sizeof(rtc_offset);
     int extra = fgetc(f);
     fclose(f);
     if (got != I2000_FLASH_SIZE || extra != EOF) {
@@ -3331,19 +2654,19 @@ static void i2000_nvram_load(Ia64I2000State *s) {
         free(image);
         return;
     }
-    uint8_t *rom_prefix = malloc(0x20000);
-    if (!rom_prefix) {
-        free(image);
-        return;
-    }
-    memcpy(rom_prefix, s->flash, 0x20000);
     memcpy(s->flash, image, I2000_FLASH_SIZE);
     free(image);
-    if (i2000_nvram_repair_bad_prefix(s, rom_prefix)) {
-        s->nvram_dirty = true;
-        printf("i2000: repaired corrupted NVRAM/ROM prefix\n");
+    if (has_rtc) {
+        /* The clock kept its offset from the host while the machine was off. */
+        int64_t offset = 0;
+        for (unsigned i = 0; i < 8; i++)
+            offset |= (int64_t)rtc_offset[i] << (8 * i);
+        memcpy(s->rtc.nv, rtc_ram, sizeof(rtc_ram));
+        s->rtc.battery = true;
+        mc146818_power_up(&s->rtc);
+        rtc_set_naive_seconds(s, host_naive_seconds() + offset);
+        s->rtc.dirty = false;
     }
-    free(rom_prefix);
     printf("i2000: loaded NVRAM '%s'\n", s->nvram_path);
 }
 
@@ -3359,7 +2682,16 @@ static void i2000_nvram_save(Ia64I2000State *s) {
     snprintf(tmp, sizeof(tmp), "%s.tmp", s->nvram_path);
     FILE *f = fopen(tmp, "wb");
     bool ok = f && fwrite(s->flash, 1, I2000_FLASH_SIZE, f) ==
-                   I2000_FLASH_SIZE && fflush(f) == 0;
+                   I2000_FLASH_SIZE;
+    if (ok) {
+        int64_t offset = rtc_naive_seconds(s) - host_naive_seconds();
+        uint8_t trailer[8];
+        for (unsigned i = 0; i < 8; i++)
+            trailer[i] = (uint8_t)((uint64_t)offset >> (8 * i));
+        ok = fwrite(s->rtc.nv, 1, sizeof(s->rtc.nv), f) == sizeof(s->rtc.nv) &&
+             fwrite(trailer, 1, sizeof(trailer), f) == sizeof(trailer) &&
+             fflush(f) == 0;
+    }
     if (f && fclose(f) != 0)
         ok = false;
     if (!ok || rename(tmp, s->nvram_path) != 0) {
@@ -3369,6 +2701,92 @@ static void i2000_nvram_save(Ia64I2000State *s) {
     }
     s->nvram_dirty = false;
     printf("i2000: saved NVRAM '%s'\n", s->nvram_path);
+}
+
+/* The display card runs on the machine's own time base, so its raster
+ * advances exactly as fast as the guest does. */
+static uint64_t i2000_rage_clock(void *opaque) {
+    Ia64I2000State *s = opaque;
+    return s->cpu ? merced_get_itc(s->cpu) : 0;
+}
+
+static void i2000_rage_irq(void *opaque, bool level) {
+    Ia64I2000State *s = opaque;
+    if (level)
+        iosapic_raise_gsi(s, 17);
+}
+
+/* The onboard LAN is a bus master: its descriptors and buffers are read and
+ * written through the same physical decode as the processor's accesses. */
+static bool i2000_nic_dma_read(void *opaque, uint64_t addr, void *buf,
+                               unsigned len) {
+    uint8_t *p = buf;
+    while (len) {
+        unsigned n = len >= 8 ? 8 : len >= 4 ? 4 : len >= 2 ? 2 : 1;
+        uint64_t v = bus_read(opaque, addr, n);
+        memcpy(p, &v, n);
+        p += n;
+        addr += n;
+        len -= n;
+    }
+    return true;
+}
+
+static bool i2000_nic_dma_write(void *opaque, uint64_t addr, const void *buf,
+                                unsigned len) {
+    const uint8_t *p = buf;
+    while (len) {
+        unsigned n = len >= 8 ? 8 : len >= 4 ? 4 : len >= 2 ? 2 : 1;
+        uint64_t v = 0;
+        memcpy(&v, p, n);
+        bus_write(opaque, addr, v, n);
+        p += n;
+        addr += n;
+        len -= n;
+    }
+    return true;
+}
+
+static void i2000_nic_irq(void *opaque, bool level) {
+    if (level)
+        iosapic_raise_gsi(opaque, 44);
+}
+
+static E100Wiring i2000_nic_wiring(Ia64I2000State *s) {
+    return (E100Wiring){ .clock = i2000_rage_clock, .clock_hz = I2000_ITC_HZ,
+                         .irq = i2000_nic_irq,
+                         .dma_read = i2000_nic_dma_read,
+                         .dma_write = i2000_nic_dma_write, .opaque = s };
+}
+
+static Rage128Wiring i2000_rage_wiring(Ia64I2000State *s) {
+    return (Rage128Wiring){ .clock = i2000_rage_clock,
+                            .clock_hz = I2000_ITC_HZ,
+                            .irq = i2000_rage_irq, .opaque = s };
+}
+
+/* Install the card's video BIOS image (a PCI expansion ROM, at most 128 KiB). */
+bool ia64_i2000_load_video_rom(Ia64I2000State *s, const char *path) {
+    if (!s->video_enabled)
+        return false;
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+    uint8_t *rom = malloc(RAGE128_ROM_BAR_SIZE);
+    size_t len = rom ? fread(rom, 1, RAGE128_ROM_BAR_SIZE, f) : 0;
+    bool ok = rom && len >= 0x1c && rom[0] == 0x55 && rom[1] == 0xaa &&
+              fgetc(f) == EOF;
+    fclose(f);
+    if (!ok) {
+        fprintf(stderr, "gemu: '%s' is not a video BIOS image\n", path);
+        free(rom);
+        return false;
+    }
+    free(s->video_rom);
+    s->video_rom = rom;
+    s->video_rom_len = (uint32_t)len;
+    rage128_set_rom(&s->rage128, rom, (uint32_t)len);
+    return true;
 }
 
 bool ia64_i2000_load_firmware(Ia64I2000State *s, const char *path) {
@@ -3414,8 +2832,6 @@ bool ia64_i2000_load_firmware(Ia64I2000State *s, const char *path) {
              firmware_id);
     gemu_config_path(s->nvram_path, sizeof(s->nvram_path), nvram_name);
     i2000_nvram_load(s);
-    if (i2000_repair_sdv_boot_timeout(s))
-        s->nvram_dirty = true;
     gemu_monitor_register_rom(s->monitor, (uint32_t)(I2000_FLASH_BASE + off),
                               (uint32_t)len, path);
     return true;
@@ -3501,104 +2917,30 @@ static void i2000_cpu_state(void *ud, char *buf, size_t buf_len) {
 }
 
 
+/* The card's native scan-out when its CRTC is programmed for one, otherwise
+ * the VGA core's picture, drawn from the origin of the frame buffer. */
 static void i2000_render_frame(Ia64I2000State *s) {
-    if (s->rage128.enabled &&
-        rage128_render(&s->rage128, s->fb, FB_W, FB_H))
-        return;
-    if (getenv("VGA_TEXT_DEBUG")) {
-        static unsigned printed;
-        if (printed < 20) {
-            printed++;
-            fprintf(stderr, "i2000: VGA-TEXT #%u ninsts=%" PRIu64 " crtc[1]=%02x crtc[7]=%02x "
-                    "crtc[9]=%02x crtc[0x12]=%02x crtc[0x13]=%02x "
-                    "crtc[0x14]=%02x crtc[0x17]=%02x seq[4]=%02x gc[6]=%02x\n",
-                    printed, s->cpu->ninsts, s->vga.crtc[1], s->vga.crtc[7],
-                    s->vga.crtc[9], s->vga.crtc[0x12], s->vga.crtc[0x13],
-                    s->vga.crtc[0x14], s->vga.crtc[0x17], s->vga.seq[4],
-                    s->vga.gc[6]);
-            fprintf(stderr, "i2000: VGA-WRITEREGS seq[2]=%02x gc[0]=%02x "
-                    "gc[1]=%02x gc[3]=%02x gc[4]=%02x gc[5]=%02x gc[8]=%02x "
-                    "attr[0x11]=%02x attr[0x12]=%02x\n",
-                    s->vga.seq[2], s->vga.gc[0], s->vga.gc[1], s->vga.gc[3],
-                    s->vga.gc[4], s->vga.gc[5], s->vga.gc[8],
-                    s->vga.attr[0x11], s->vga.attr[0x12]);
-            fprintf(stderr, "i2000: VGA-ATTR ");
-            for (int i = 0; i < 16; i++)
-                fprintf(stderr, "%02x ", s->vga.attr[i]);
-            fprintf(stderr, "\ni2000: VGA-ATTR-MODE attr[0x10]=%02x attr[0x13]=%02x "
-                    "attr[0x14]=%02x\n", s->vga.attr[0x10], s->vga.attr[0x13],
-                    s->vga.attr[0x14]);
-            fprintf(stderr, "i2000: VGA-DAC(idx0-15) ");
-            for (int i = 0; i < 16; i++)
-                fprintf(stderr, "[%u]=%02x,%02x,%02x ", i,
-                        s->vga.dac[i][0], s->vga.dac[i][1], s->vga.dac[i][2]);
-            fprintf(stderr, "\ni2000: VGA-DAC(idx16-63) ");
-            for (int i = 16; i < 64; i++)
-                fprintf(stderr, "[%u]=%02x,%02x,%02x ", i,
-                        s->vga.dac[i][0], s->vga.dac[i][1], s->vga.dac[i][2]);
-            fprintf(stderr, "\n");
-            {
-                /* Verified against exact pixel samples of a screendump:
-                 * y=10 = solid blue outer margin/frame (no text),
-                 * y=30 = teal band with "BIOS Configuration Manager" text,
-                 * y=65 = black tab-row band, y=200 = content pane. */
-                static const struct { const char *name; int row; } regions[] = {
-                    { "MARGIN", 10 }, { "REALTITLE", 30 },
-                    { "TABROW", 65 }, { "CONTENT", 200 },
-                    { "BOTTOMBAND", 440 }, { "CONTENTEDGE", 425 },
-                };
-                for (size_t r = 0; r < sizeof(regions) / sizeof(regions[0]); r++) {
-                    for (int plane = 0; plane < 4; plane++) {
-                        fprintf(stderr, "i2000: VGA-%s plane%d row%d[20..45]=",
-                                regions[r].name, plane, regions[r].row);
-                        for (int i = 20; i < 45; i++)
-                            fprintf(stderr, "%02x ",
-                                    s->vga.vram[plane][regions[r].row * 80 + i]);
-                        fprintf(stderr, "\n");
-                    }
-                }
-            }
-            for (int plane = 0; plane < 4; plane++) {
-                for (int row = 200; row < 204; row++) {
-                    fprintf(stderr, "i2000: VGA-BODY plane%d row%d[0..15]=",
-                            plane, row);
-                    for (int i = 20; i < 30; i++)
-                        fprintf(stderr, "%02x ",
-                                s->vga.vram[plane][row * 80 + i]);
-                    fprintf(stderr, "\n");
-                }
-            }
-            for (int plane = 0; plane < 4; plane++) {
-                for (int row = 16; row < 22; row++) {
-                    fprintf(stderr, "i2000: VGA-TEXT plane%d row%d[0..47]=",
-                            plane, row);
-                    for (int i = 0; i < 48; i++)
-                        fprintf(stderr, "%02x ",
-                                s->vga.vram[plane][row * 80 + i]);
-                    fprintf(stderr, "\n");
-                }
-            }
-            fflush(stderr);
-        }
+    uint32_t w, h, y0, y1;
+    bool shown = false;
+    if (s->video_enabled) {
+        rage128_tick(&s->rage128);
+        shown = rage128_scanout(&s->rage128, s->fb, FB_W, FB_H, &w, &h,
+                                true, &y0, &y1) ||
+                vga_blit_ex(&s->vga, s->fb, FB_W, FB_H, 640, 480, 1, &w, &h,
+                            true, &y0, &y1);
     }
-    vga_ibm_render(&s->vga, s->fb, FB_W, FB_H, vgafont16);
+    if (!shown) {
+        memset(s->fb, 0, sizeof(s->fb));
+        return;
+    }
+    /* Outside the picture the monitor shows nothing. */
+    for (uint32_t y = 0; y < FB_H; y++)
+        for (uint32_t x = (y < h ? w : 0); x < FB_W; x++)
+            s->fb[y * FB_W + x] = 0;
 }
 
 static bool i2000_screendump(void *ud, const char *path) {
     Ia64I2000State *s = ud;
-    if (s->rage128.enabled) {
-        size_t nonzero = rage128_nonzero_vram(&s->rage128);
-        fprintf(stderr,
-                "i2000: Rage128 screen gen=%08X hdisp=%08X vdisp=%08X "
-                "offset=%08X pitch=%08X nonzero_vram=%zu int10=%02X%02X:%02X%02X\n",
-                rage128_reg32(&s->rage128, 0x0050),
-                rage128_reg32(&s->rage128, 0x0200),
-                rage128_reg32(&s->rage128, 0x0208),
-                rage128_reg32(&s->rage128, 0x0224),
-                rage128_reg32(&s->rage128, 0x022c), nonzero,
-                s->ram[0x43], s->ram[0x42],
-                s->ram[0x41], s->ram[0x40]);
-    }
     i2000_render_frame(s);
     return gemu_screendump_argb(path, s->fb, FB_W, FB_H);
 }
@@ -3774,7 +3116,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 31u
+#define I2000_SNAPSHOT_VERSION 35u
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -3787,10 +3129,8 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fwrite(&s->ram_size, sizeof(s->ram_size), 1, f) == 1;
     ok &= fwrite(s->ram, 1, s->ram_size, f) == s->ram_size;
     ok &= fwrite(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
-    ok &= fwrite(s->chipset_scratch, 1, I2000_CHIPSET_SCRATCH_SIZE, f) ==
-          I2000_CHIPSET_SCRATCH_SIZE;
-    ok &= fwrite(s->high_dram, 1, I2000_HIGH_DRAM_SIZE, f) ==
-          I2000_HIGH_DRAM_SIZE;
+    if (s->video_enabled)
+        ok &= fwrite(s->vram, 1, RAGE128_VRAM_SIZE, f) == RAGE128_VRAM_SIZE;
     uint64_t atapi_len = (uint64_t)s->atapi_data_len;
     ok &= fwrite(&atapi_len, sizeof(atapi_len), 1, f) == 1;
     if (atapi_len)
@@ -3808,17 +3148,19 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     snap->cpu = NULL;
     snap->ram = NULL;
     snap->flash = NULL;
-    snap->chipset_scratch = NULL;
-    snap->high_dram = NULL;
+    snap->vram = NULL;
+    snap->video_rom = NULL;
     snap->cdrom = NULL;
     snap->atapi_data = NULL;
     snap->hda = NULL;
     snap->ata_data = NULL;
-    snap->i82559.guest_read = NULL;
-    snap->i82559.guest_write = NULL;
-    snap->i82559.guest_opaque = NULL;
-    snap->i82559.option_rom = NULL;
+    snap->nic_rom = NULL;
+    memset(&snap->nic.wiring, 0, sizeof(snap->nic.wiring));
     memset(&snap->chipset.config, 0, sizeof(snap->chipset.config));
+    memset(&snap->rtc.config, 0, sizeof(snap->rtc.config));
+    /* The I2C segments hold pointers into this run's device state. */
+    memset(&snap->memcard_i2c, 0, sizeof(snap->memcard_i2c));
+    memset(&snap->smbus, 0, sizeof(snap->smbus));
     ok &= fwrite(snap, sizeof(*snap), 1, f) == 1;
     free(snap);
 
@@ -3846,18 +3188,10 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         fclose(f);
         return false;
     }
-    uint8_t rom_prefix[0x20000];
-    memcpy(rom_prefix, s->flash, sizeof(rom_prefix));
     ok &= fread(s->ram, 1, s->ram_size, f) == s->ram_size;
     ok &= fread(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
-    if (ok)
-        i2000_repair_sdv_boot_timeout(s);
-    ok &= fread(s->chipset_scratch, 1, I2000_CHIPSET_SCRATCH_SIZE, f) ==
-          I2000_CHIPSET_SCRATCH_SIZE;
-    ok &= fread(s->high_dram, 1, I2000_HIGH_DRAM_SIZE, f) ==
-          I2000_HIGH_DRAM_SIZE;
-    if (ok && i2000_nvram_repair_bad_prefix(s, rom_prefix))
-        printf("i2000: repaired corrupted snapshot NVRAM/ROM prefix\n");
+    if (s->video_enabled)
+        ok &= fread(s->vram, 1, RAGE128_VRAM_SIZE, f) == RAGE128_VRAM_SIZE;
 
     uint64_t atapi_len = 0;
     ok &= fread(&atapi_len, sizeof(atapi_len), 1, f) == 1;
@@ -3882,13 +3216,17 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     GemuDrive *cdrom = s->cdrom;
     GemuDrive *hda = s->hda;
     I460GXConfig chipset_config = s->chipset.config;
-    uint8_t *i82559_option_rom = s->i82559.option_rom;
-    size_t i82559_option_rom_size = s->i82559.option_rom_size;
+    Mc146818Config rtc_config = s->rtc.config;
+    I2cBus memcard_i2c = s->memcard_i2c;
+    I2cBus smbus = s->smbus;
+    uint8_t *nic_rom = s->nic_rom;
+    uint32_t nic_rom_len = s->nic_rom_len;
     Merced *cpu = s->cpu;
     uint8_t *ram = s->ram;
     uint8_t *flash = s->flash;
-    uint8_t *chipset_scratch = s->chipset_scratch;
-    uint8_t *high_dram = s->high_dram;
+    uint8_t *vram = s->vram;
+    uint8_t *video_rom = s->video_rom;
+    uint32_t video_rom_len = s->video_rom_len;
     uint8_t *atapi_data = s->atapi_data;
     uint8_t *ata_data = s->ata_data;
     Ia64I2000State *loaded = malloc(sizeof(*loaded));
@@ -3903,9 +3241,13 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->cpu = cpu;
         s->ram = ram;
         s->flash = flash;
-        s->chipset_scratch = chipset_scratch;
-        s->high_dram = high_dram;
+        s->vram = vram;
+        s->video_rom = video_rom;
+        s->video_rom_len = video_rom_len;
         s->chipset.config = chipset_config;
+        s->rtc.config = rtc_config;
+        s->memcard_i2c = memcard_i2c;
+        s->smbus = smbus;
         snprintf(s->nvram_path, sizeof(s->nvram_path), "%s", nvram_path);
         /* Restore must not implicitly overwrite persistent machine NVRAM.
          * Subsequent guest flash writes mark it dirty normally. */
@@ -3915,13 +3257,22 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->cdrom = cdrom;
         s->hda = hda;
         i2000_drive_info_refresh(s);
+        i2000_update_fast_ram(s);
         /* A halt checkpoint can be resumed to test the faulting operation. */
         s->halted = false;
-        s->i82559.guest_read = bus_read;
-        s->i82559.guest_write = bus_write;
-        s->i82559.guest_opaque = s;
-        s->i82559.option_rom = i82559_option_rom;
-        s->i82559.option_rom_size = i82559_option_rom_size;
+        s->nic_rom = nic_rom;
+        s->nic_rom_len = nic_rom_len;
+        if (s->nic_enabled) {
+            E100Wiring wiring = i2000_nic_wiring(s);
+            e100_rebind(&s->nic, &wiring);
+            e100_set_rom(&s->nic, s->nic_rom, s->nic_rom_len);
+        }
+        if (s->video_enabled) {
+            Rage128Wiring wiring = i2000_rage_wiring(s);
+            vga_attach_vram(&s->vga, s->vram, RAGE128_VRAM_SIZE);
+            rage128_rebind(&s->rage128, &s->vga, &wiring);
+            rage128_set_rom(&s->rage128, s->video_rom, s->video_rom_len);
+        }
     }
     free(loaded);
 
@@ -3939,16 +3290,9 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->mouse_wait_rfi_generation = 0;
         s->keyboard_retry_ninsts = s->cpu->ninsts;
         s->mouse_next_report_itc = merced_get_itc(s->cpu);
-        /* Rebase active PIT deadlines onto the restored CPU clock. */
-        bool pit0_armed = s->pit0_next_irq != 0;
-        bool pit1_armed = s->pit1_next_irq != 0;
-        s->pit0_epoch_ninsts = merced_get_itc(s->cpu);
-        s->pit0_next_irq = pit0_armed
-                         ? s->pit0_epoch_ninsts +
-                           pit_interval_itc(s->pit0_reload) : 0;
-        s->pit1_next_irq = pit1_armed
-                         ? s->pit0_epoch_ninsts +
-                           pit_interval_itc(s->pit1_reload) : 0;
+        s->pit.out_changed = i2000_pit_out;
+        s->pit.ud = s;
+        s->pit_itc_mark = merced_get_itc(s->cpu);
     }
 
     fclose(f);
@@ -3968,51 +3312,12 @@ static bool i2000_mon_read(void *ud, uint64_t addr, uint8_t *val) {
     bool region6 = (addr >> 60) == 0xC;
     addr = i2000_normalize_pa(s, addr);
     uint64_t off;
-    if (i2000_high_dram_addr(addr, &off)) {
-        *val = s->high_dram[off];
-        return true;
-    }
-    if (s->rage128.enabled) {
-        uint64_t fb = rage128_bar(&s->rage128, 0x10, RAGE128_FB_BASE,
-                                 ~UINT32_C(0x03ffffff));
-        uint64_t mmio = rage128_bar(&s->rage128, 0x18, RAGE128_MMIO_BASE,
-                                   ~UINT32_C(0x3fff));
-        if (addr >= fb && addr < fb + RAGE128_FB_APER_SIZE)
-            return false;
-        if (addr >= mmio && addr < mmio + RAGE128_MMIO_SIZE)
-            return false;
-    }
-    if (s->i82559.enabled) {
-        uint64_t mmio = i82559_bar(&s->i82559, 0x10, I82559_MMIO_BASE,
-                                  ~UINT32_C(0xfff));
-        if (addr >= mmio && addr < mmio + I82559_MMIO_SIZE)
-            return false;
-        uint32_t rombar = 0;
-        memcpy(&rombar, s->i82559.cfg + 0x30, sizeof(rombar));
-        uint64_t rombase = rombar & ~UINT32_C(0x7ff);
-        if ((rombar & 1) && s->i82559.option_rom && addr >= rombase &&
-            addr < rombase + s->i82559.option_rom_size) {
-            *val = s->i82559.option_rom[addr - rombase];
-            return true;
-        }
-    }
-    if (addr < 0xD0000) {
-        uint32_t voff;
-        if (vga_mem_window(s, addr, 1, &voff))
-            return false;   /* planar reads load the VGA latches */
-        if (vga_rom_window(addr, 1, &voff)) {
-            *val = s->vga_rom_shadow[voff];
-            return true;
-        }
-    }
+    if (i2000_card_claims(s, addr))
+        return false;       /* device apertures have side effects */
     if (region6 && addr < I2000_FLASH_BASE)
         return false;       /* PCI configuration cycle */
     if (addr < s->ram_size) {
         *val = s->ram[addr];
-        return true;
-    }
-    if (addr >= I2000_CHIPSET_SCRATCH_BASE && addr < I2000_RAM_MAX) {
-        *val = s->chipset_scratch[addr - I2000_CHIPSET_SCRATCH_BASE];
         return true;
     }
     if (addr >= I460GX_IOSAPIC_BASE && addr < I460GX_IOSAPIC_BASE + I460GX_IOSAPIC_SIZE)
@@ -4020,63 +3325,26 @@ static bool i2000_mon_read(void *ud, uint64_t addr, uint8_t *val) {
     if (addr == I2000_LEGACY_ACK_ADDR)
         return false;       /* acknowledges the pending ExtINT */
     if (addr - I2000_FLASH_BASE < I2000_FLASH_SIZE) {
-        /* Same result bus_read() gives: status/ID-mode reads are pure
-         * functions of the chip state. */
+        /* The array contents; a guest read sees status or identifier codes
+         * when the firmware hub is in that mode. */
         off = addr - I2000_FLASH_BASE;
-        const I2000FlashChip *chip =
-            &s->flash_chip[(unsigned)(off / I2000_FLASH_CHIP_SIZE)];
-        if (chip->read_status) {
-            *val = (uint8_t)chip->status;
-        } else if (chip->read_id) {
-            uint32_t id_off = (uint32_t)(off % I2000_FLASH_CHIP_SIZE) & 0xFFFFu;
-            *val = id_off == 0 ? 0x89 : id_off == 1 ? 0xAC :
-                   id_off == 2 ? 0x00 : 0xFF;
-        } else {
-            *val = s->flash[off];
-        }
+        *val = s->flash[off];
         return true;
     }
     return false;           /* sparse I/O ports, SAC registers, unmapped */
 }
 
-/* Writes RAM, legacy high-memory snapshot backing and chipset scratch. */
+/* Writes RAM and the device windows a monitor write can reach. */
 static bool i2000_mon_write(void *ud, uint64_t addr, uint8_t val) {
     Ia64I2000State *s = ud;
     bool region6 = (addr >> 60) == 0xC;
     addr = i2000_normalize_pa(s, addr);
-    uint64_t off;
-    if (i2000_high_dram_addr(addr, &off)) {
-        s->high_dram[off] = val;
-        return true;
-    }
-    if (s->rage128.enabled) {
-        uint64_t fb = rage128_bar(&s->rage128, 0x10, RAGE128_FB_BASE,
-                                 ~UINT32_C(0x03ffffff));
-        uint64_t mmio = rage128_bar(&s->rage128, 0x18, RAGE128_MMIO_BASE,
-                                   ~UINT32_C(0x3fff));
-        if ((addr >= fb && addr < fb + RAGE128_FB_APER_SIZE) ||
-            (addr >= mmio && addr < mmio + RAGE128_MMIO_SIZE))
-            return false;
-    }
-    if (s->i82559.enabled) {
-        uint64_t mmio = i82559_bar(&s->i82559, 0x10, I82559_MMIO_BASE,
-                                  ~UINT32_C(0xfff));
-        if (addr >= mmio && addr < mmio + I82559_MMIO_SIZE)
-            return false;
-    }
-    if (addr < 0xD0000) {
-        uint32_t voff;
-        if (vga_mem_window(s, addr, 1, &voff) || vga_rom_window(addr, 1, &voff))
-            return false;
-    }
+    if (i2000_card_claims(s, addr))
+        return false;
     if (region6 && addr < I2000_FLASH_BASE)
         return false;
     if (addr < s->ram_size) {
         s->ram[addr] = val;
-        return true;
-    }
-    if (addr >= I2000_CHIPSET_SCRATCH_BASE && addr < I2000_RAM_MAX) {
-        s->chipset_scratch[addr - I2000_CHIPSET_SCRATCH_BASE] = val;
         return true;
     }
     return false;
@@ -4096,10 +3364,14 @@ static GemuMonCmd i2000_cmd_input(GemuMonitor *mon, const char *args, void *ud) 
            s->ps2_keyboard.queue_pos, s->ps2_keyboard.queue_len,
            s->keyboard_irq_pending, s->keyboard_retry_ninsts,
            s->cpu->ninsts);
-    gemu_monitor_printf(mon, "PIT0: reload=%u next=%" PRIu64 " now=%" PRIu64
-           " pending=%u mask=%02X\n",
-           s->pit0_reload ? (unsigned)s->pit0_reload : 65536u,
-           s->pit0_next_irq, merced_get_itc(s->cpu),
+    i2000_pit_run(s);
+    for (unsigned c = 0; c < 3; c++)
+        gemu_monitor_printf(mon, "PIT%u: mode=%u reload=%u count=%u out=%u "
+               "gate=%u\n", c, s->pit.ch[c].mode,
+               s->pit.ch[c].reload ? (unsigned)s->pit.ch[c].reload : 65536u,
+               (unsigned)s->pit.ch[c].count, s->pit.ch[c].out,
+               s->pit.ch[c].gate);
+    gemu_monitor_printf(mon, "IRQ0: pending=%u mask=%02X\n",
            s->pit_irq_pending, s->pic_master_mask);
     if (ps2_keyboard_has_data(&s->ps2_keyboard)) {
         gemu_monitor_printf(mon, "keyboard bytes:");
@@ -4544,11 +3816,14 @@ static GemuMonCmd i2000_cmd_iosapic(GemuMonitor *mon, const char *args, void *ud
                         s->kbc_out_pos < s->kbc_out_len ||
                         ps2_keyboard_has_data(&s->ps2_keyboard),
                         s->keyboard_gsi_asserted);
-    gemu_monitor_printf(mon, "cpu psr.i=%u psr.ic=%u tpr=%016" PRIX64
+    gemu_monitor_printf(mon, "cpu psr.i=%u psr.ic=%u psr.is=%u eflags.if=%u cflg=%" PRIX64
+                        " iva=%016" PRIX64 " tpr=%016" PRIX64
                         " lrr0=%016" PRIX64 " pending=%u in-service:",
                         (unsigned)((s->cpu->psr >> 14) & 1),
                         (unsigned)((s->cpu->psr >> 13) & 1),
-                        s->cpu->cr[66], s->cpu->cr[80],
+                        (unsigned)((s->cpu->psr >> 34) & 1),
+                        (unsigned)((s->cpu->ar[24] >> 9) & 1),
+                        s->cpu->ar[27], s->cpu->cr[2], s->cpu->cr[66], s->cpu->cr[80],
                         (unsigned)s->cpu->ext_pending_count);
     for (unsigned v = 0; v < 256; v++)
         if (s->cpu->ext_in_service[v >> 3] & (1u << (v & 7)))
@@ -4561,12 +3836,22 @@ static GemuMonCmd i2000_cmd_iosapic(GemuMonitor *mon, const char *args, void *ud
     return GEMU_MON_NONE;
 }
 
+/* A short press of the power button: the IFB sets PWRBTN_STS and the guest's
+ * ACPI handler decides what to do about it. */
+static GemuMonCmd i2000_cmd_powerdown(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    (void)mon; (void)args;
+    i460gx_pm_power_button(&s->chipset, true);
+    i460gx_pm_power_button(&s->chipset, false);
+    return GEMU_MON_NONE;
+}
+
 static GemuMonCmd i2000_cmd_vgareg(GemuMonitor *mon, const char *args, void *ud) {
     Ia64I2000State *s = ud;
     (void)args;
-    gemu_monitor_printf(mon, "vga: misc_output=%02x text_mode=%d mode_set=%d\n",
-                        s->vga.misc_output, vga_ibm_is_text_mode(&s->vga),
-                        vga_ibm_mode_set(&s->vga));
+    gemu_monitor_printf(mon, "vga: misc=%02x text_mode=%d blanked=%d\n",
+                        s->vga.misc, vga_text_mode(&s->vga),
+                        vga_blanked(&s->vga));
     gemu_monitor_printf(mon, "seq[0-7]:");
     for (int i = 0; i < 8; i++) gemu_monitor_printf(mon, " %02x", s->vga.seq[i]);
     gemu_monitor_printf(mon, "\ngc[0-15]:");
@@ -4578,11 +3863,10 @@ static GemuMonCmd i2000_cmd_vgareg(GemuMonitor *mon, const char *args, void *ud)
     gemu_monitor_printf(mon, "\n");
     gemu_monitor_printf(mon, "dac[0-15] (r,g,b):");
     for (int i = 0; i < 16; i++)
-        gemu_monitor_printf(mon, " %02x%02x%02x", s->vga.dac[i][0],
-                            s->vga.dac[i][1], s->vga.dac[i][2]);
+        gemu_monitor_printf(mon, " %02x%02x%02x", s->vga.dac[i * 3],
+                            s->vga.dac[i * 3 + 1], s->vga.dac[i * 3 + 2]);
     gemu_monitor_printf(mon, "\ndac write index=%u sub=%u mask=%02x\n",
-                        s->vga.dac_write_index, s->vga.dac_write_sub,
-                        s->vga.dac_mask);
+                        s->vga.dac_idx, s->vga.dac_sub, s->vga.pixel_mask);
     return GEMU_MON_NONE;
 }
 
@@ -4593,7 +3877,7 @@ static GemuMonCmd i2000_cmd_vgapeek(GemuMonitor *mon, const char *args, void *ud
         count <= 256 && off + count <= 0x10000) {
         gemu_monitor_printf(mon, "vgapeek plane=%u off=0x%x:", plane, off);
         for (unsigned i = 0; i < count; i++)
-            gemu_monitor_printf(mon, " %02x", s->vga.vram[plane][off + i]);
+            gemu_monitor_printf(mon, " %02x", s->vga.plane[plane][off + i]);
         gemu_monitor_printf(mon, "\n");
     } else {
         gemu_monitor_printf(mon, "usage: vgapeek <plane 0-3> <hex offset> <count>\n");
@@ -4621,6 +3905,7 @@ static void i2000_monitor_setup(Ia64I2000State *s) {
     gemu_monitor_bind(mon, "atapistate", i2000_cmd_atapistate, s);
     gemu_monitor_bind(mon, "vgareg",     i2000_cmd_vgareg, s);
     gemu_monitor_bind(mon, "iosapic",    i2000_cmd_iosapic, s);
+    gemu_monitor_bind(mon, "system_powerdown", i2000_cmd_powerdown, s);
     gemu_monitor_bind(mon, "ntsym",      i2000_cmd_ntsym, s);
     gemu_monitor_bind(mon, "vgapeek",    i2000_cmd_vgapeek, s);
     gemu_monitor_set_memory(mon, &(GemuMonMemory){
@@ -4703,8 +3988,7 @@ static bool i2000_ram_size_valid(uint64_t bytes) {
 /* A 460GX memory row requires four identical DIMMs.  Populate the i2000's
  * eight sockets in matched groups, with at most 256 MiB per module. */
 static void spd_init(Ia64I2000State *s) {
-    memset(s->spd_present, 0, sizeof(s->spd_present));
-    memset(s->spd, 0, sizeof(s->spd));
+    i2c_bus_init(&s->memcard_i2c, "memory card A");
     unsigned slot = 0;
     uint64_t remaining = s->ram_size;
     while (remaining && slot < I2000_SPD_SLOTS) {
@@ -4716,43 +4000,129 @@ static void spd_init(Ia64I2000State *s) {
         while (chunk & (chunk - 1))
             chunk &= chunk - 1;
         for (unsigned i = 0; i < I2000_DIMMS_PER_ROW; i++, slot++) {
-            spd_encode(s->spd[slot], chunk);
-            s->spd_present[slot] = true;
+            at24_init(&s->spd[slot]);
+            spd_encode(s->spd[slot].mem, chunk);
+            s->spd[slot].write_protect = true;
+            I2cDevice eeprom = at24_device(&s->spd[slot],
+                                           I2000_SPD_BASE_ADDR + slot);
+            i2c_attach(&s->memcard_i2c, &eeprom);
         }
         remaining -= chunk * I2000_DIMMS_PER_ROW;
     }
 }
 
-/* Board wiring for the reusable 460GX register model. */
-static uint64_t i2000_chipset_clock(void *opaque) {
-    Ia64I2000State *s = opaque;
-    return merced_get_itc(s->cpu);
-}
+/* The board's processor clock-ratio latch on the IFB SMBus. A write sets the
+ * ratio strap code the processor samples at the next reset; a receive-byte
+ * returns it. The emulated clock does not follow it. */
+#define I2000_RATIO_LATCH_ADDR 0x4e
+#define I2000_RATIO_CODE       3        /* (8 + 3) / 2 of the 133 MHz bus */
+#define I2000_HARDWARE_MONITOR_ADDR 0x2c
 
-static bool i2000_spd_read(void *opaque, unsigned card, unsigned row,
-                           unsigned slave, unsigned reg, uint8_t *value) {
-    Ia64I2000State *s = opaque;
-    unsigned dimm = slave - I2000_SPD_BASE_ADDR;
-    /* Eight sockets on memory card A, selected by function 4's row mux. */
-    if (card != 0 || row != 0 || dimm >= I2000_SPD_SLOTS || reg >= 256 ||
-        !s->spd_present[dimm])
-        return false;
-    *value = s->spd[dimm][reg];
+/* The J29 boot jumper's levels on the IFB's GPIO inputs, in GP register
+ * layout. Bit 24 (GPIO[18]) selects normal running rather than OVRD/CLRCMOS;
+ * bit 18 (GPIO[12]) deasserts manufacturing mode, which would otherwise make
+ * the boot manager rebuild BootOrder on every boot and discard an installer's
+ * boot entry; bit 19 (GPIO[13]) is the third pin the positions differ in.
+ * NORM is the documented default position. */
+#define I2000_J29_PINS UINT32_C(0x010c0000)
+#define I2000_J29_NORM UINT32_C(0x01040000)
+
+static bool ratio_latch_start(void *ctx, bool read) {
+    (void)ctx; (void)read;
     return true;
 }
 
-static void i2000_apm_command(void *opaque, uint8_t command) {
+static bool ratio_latch_write(void *ctx, uint8_t code) {
+    *(uint8_t *)ctx = code;
+    return true;
+}
+
+static uint8_t ratio_latch_read(void *ctx, bool ack) {
+    (void)ack;
+    return *(uint8_t *)ctx;
+}
+
+/* RESET# samples the ratio latch onto the processor's ratio strap, which
+ * PAL_FREQ_RATIOS reads from MSR 0x617. */
+static void i2000_sample_ratio_latch(Ia64I2000State *s) {
+    merced_set_clock_ratio_code(s->cpu, s->ratio_latch);
+}
+
+/* One processor cartridge: its Scratch EEPROM at 50h and its PIROM at 51h
+ * (the board's SMA[1:0] straps give the first slot 00b). The PIROM states
+ * the 733 MHz, 2 MB part. */
+static void i2000_smbus_init(Ia64I2000State *s) {
+    i2c_bus_init(&s->smbus, "IFB SMBus");
+    ItaniumPirom pirom = {
+        .sspec = "SL4LT", .production = true,
+        .cpuid3 = (s->cpu->cpuid[3] & ~UINT64_C(0xff00)) | UINT64_C(6) << 8,
+        .max_core_mhz = 733, .max_bus_mhz = 133, .l3_kb = 2048,
+        .tap_devices = 3, .scratch_present = true,
+    };
+    uint8_t image[128];
+    itanium_pirom_build(image, &pirom);
+    itanium_cart_rom_init(&s->cart_pirom, image, false);
+    itanium_cart_rom_init(&s->cart_scratch, NULL, true);
+    I2cDevice device = itanium_cart_rom_device(&s->cart_scratch, 0x50);
+    i2c_attach(&s->smbus, &device);
+    device = itanium_cart_rom_device(&s->cart_pirom, 0x51);
+    i2c_attach(&s->smbus, &device);
+    s->ratio_latch = I2000_RATIO_CODE;
+    device = (I2cDevice){ .addr = I2000_RATIO_LATCH_ADDR, .ctx = &s->ratio_latch,
+                          .start = ratio_latch_start, .write = ratio_latch_write,
+                          .read = ratio_latch_read };
+    i2c_attach(&s->smbus, &device);
+    i2000_sample_ratio_latch(s);
+
+    /* The baseboard's hardware monitor, ADD pin open. */
+    lm87_reset(&s->hardware_monitor);
+    device = lm87_device(&s->hardware_monitor, I2000_HARDWARE_MONITOR_ADDR);
+    i2c_attach(&s->smbus, &device);
+}
+
+/* Board wiring for the reusable 460GX register model. */
+static uint64_t i2000_chipset_clock(void *opaque) {
     Ia64I2000State *s = opaque;
-    /* AMI's FADT uses A0/A1 at SMI_CMD B2 for ACPI enable/disable.
-     * Supply the firmware handshake until SMI handling is implemented. */
-    uint8_t *regs = (uint8_t *)s->chipset.acpi_pm;
-    if (command == 0xa0) regs[4] |= 1;  /* SCI_EN */
-    if (command == 0xa1) regs[4] &= (uint8_t)~1;
+    return s->cpu ? merced_get_itc(s->cpu) : 0;
+}
+
+/* The IFB's SMI# is the processor's PMI# pin. The firmware's own PMI handler
+ * services it, including the ACPI enable and disable commands written to the
+ * APM port. */
+static void i2000_pm_smi(void *opaque, bool asserted) {
+    Ia64I2000State *s = opaque;
+    if (asserted && s->cpu)
+        merced_pmi_raise(s->cpu, 0);
+}
+
+static void i2000_pm_sci(void *opaque, unsigned irq, bool level) {
+    Ia64I2000State *s = opaque;
+    s->sci_irq = (int)irq;
+    s->sci_level = level;
+}
+
+static void i2000_pm_sleep(void *opaque, I460GXPmState state,
+                           bool power_button_override) {
+    Ia64I2000State *s = opaque;
+    (void)power_button_override;
+    if (state == I460GX_PM_S1_STPCLK || state == I460GX_PM_S1_SLP)
+        s->cpu_stopped = true;
+    else
+        s->power_off_requested = true;
+}
+
+static void i2000_pm_wake(void *opaque, I460GXPmState from) {
+    Ia64I2000State *s = opaque;
+    if (from == I460GX_PM_S1_STPCLK || from == I460GX_PM_S1_SLP)
+        s->cpu_stopped = false;
+    else
+        s->wake_reset_requested = true;
 }
 
 static void i2000_chipset_init(Ia64I2000State *s) {
     const I460GXConfig config = {
         .ifb_bus = 0, .ifb_dev = 3,
+        .pid_bus = 0, .pid_dev = 0,
         .cbn_bus = 0, .cbn_dev = 0x10,
         .link_count = 4,
         /* PXB on link 0, dual-bus WXB on link 1, GXB on links 2/3. */
@@ -4760,34 +4130,26 @@ static void i2000_chipset_init(Ia64I2000State *s) {
                       I460GX_BRIDGE_WXB, I460GX_BRIDGE_WXB,
                       I460GX_BRIDGE_GXB },
         .clock_hz = I2000_ITC_HZ, .clock = i2000_chipset_clock,
-        .spd_read = i2000_spd_read, .smbus_card = 0, .smbus_row = 0,
-        .apm_write = i2000_apm_command, .opaque = s,
+        .smbus = &s->smbus,
+        .flash = s->flash,
+        /* Eight sockets on memory card A, selected by function 4's row mux. */
+        .memcard_i2c = { [0][0] = &s->memcard_i2c },
+        .smi = i2000_pm_smi, .sci = i2000_pm_sci,
+        .sleep = i2000_pm_sleep, .wake = i2000_pm_wake, .opaque = s,
     };
     i460gx_init(&s->chipset, &config);
+    /* J29, the boot jumper, drives three of the IFB's GPIO input pins; the
+     * firmware reads them through GP Data once it enables the GPIO block. */
+    i460gx_pm_set_gpio_pins(&s->chipset, I2000_J29_PINS, I2000_J29_NORM);
 }
 
 static void i2000_devices_reset(Ia64I2000State *s, bool warm) {
-    s->flash_read_status = false;
-    s->flash_read_id = false;
-    s->flash_status = 0x80;
-    s->flash_cmd = 0;
-    s->flash_cmd_addr = 0;
-    memset(s->flash_chip, 0, sizeof(s->flash_chip));
-    for (unsigned i = 0; i < I2000_FLASH_CHIPS; i++)
-        s->flash_chip[i].status = 0x80;
+    s->sal_scratch_base = 0;
     s->pci_cfg_addr = 0;
     memset(s->cmd649_cfg, 0, sizeof(s->cmd649_cfg));
-    memset(s->acpi_io, 0, sizeof(s->acpi_io));
     s->uart_rx_head = s->uart_rx_tail = 0;
-    memset(s->cmos, 0, sizeof(s->cmos));
-    s->cmos_index = 0;
-    s->cmos[0x0A] = 0x26;                         /* divider, 32.768 kHz */
-    s->cmos[0x0B] = 0x02;                         /* 24-hour BCD mode */
-    s->cmos[0x0D] = 0x80;                         /* CMOS power valid */
-    /* Extended byte 3 bit 3: "previous boot completed" flag. The bootstrap
-     * takes the PspRecover path (and wants wpgbios.bin from recovery
-     * media) whenever it is clear, i.e. on CMOS loss. */
-    s->cmos[0x03] = 0x08;
+    mc146818_core_reset(&s->rtc);
+    i2000_pit_reset(s);
     s->atapi_error = s->atapi_features = 0;
     s->atapi_count = 1;
     s->atapi_lba_low = 1;
@@ -4870,47 +4232,68 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     s->ram_size = cfg->ram_size;
     s->ram = calloc(1, (size_t)s->ram_size);
     s->flash = malloc(I2000_FLASH_SIZE);
-    s->chipset_scratch = calloc(1, I2000_CHIPSET_SCRATCH_SIZE);
-    s->high_dram = calloc(1, I2000_HIGH_DRAM_SIZE);
-    if (!s->ram || !s->flash || !s->chipset_scratch || !s->high_dram) {
+    if (!s->ram || !s->flash) {
         fprintf(stderr, "gemu: cannot allocate %" PRIu64 " MiB guest RAM\n",
                 cfg->ram_size >> 20);
         ia64_i2000_destroy(s);
         return NULL;
     }
     memset(s->flash, 0xFF, I2000_FLASH_SIZE);
-    vga_ibm_reset(&s->vga);
-    rage128_init(&s->rage128,
-                 cfg->vga && strcmp(cfg->vga, "rage128") == 0,
-                 RAGE128_FB_BASE, RAGE128_IO_BASE, RAGE128_MMIO_BASE, 17);
-    i82559_init(&s->i82559, cfg->i82559_enabled, I82559_MMIO_BASE,
-                I82559_IO_BASE, 18, bus_read, bus_write, s);
+    if (cfg->vga && strcmp(cfg->vga, "none") != 0) {
+        s->vram = calloc(1, RAGE128_VRAM_SIZE);
+        if (!s->vram) {
+            fprintf(stderr, "gemu: cannot allocate video memory\n");
+            ia64_i2000_destroy(s);
+            return NULL;
+        }
+        s->video_enabled = true;
+        vga_init(&s->vga, s->vram, RAGE128_VRAM_SIZE);
+        Rage128Wiring wiring = i2000_rage_wiring(s);
+        rage128_init(&s->rage128, &s->vga, &wiring);
+        /* The card's own BIOS; -rom DIR with the ROM set can replace it. */
+        if (!ia64_i2000_load_video_rom(s, "roms/rage128gl_pci_113-53008-100.rom"))
+            fprintf(stderr, "i2000: warning: Rage 128 video BIOS not found "
+                    "(roms/rage128gl_pci_113-53008-100.rom)\n");
+    }
     if (cfg->i82559_enabled) {
         /* The SDV EFI expects the integrated 82559 to supply an EFI UNDI
          * driver through its PCI expansion ROM.  Merely exposing the PCI
          * function leaves Boot Manager's network-device cleanup on a broken
          * firmware error path ("Could not load UNDI" followed by a pool
          * assertion).  Prefer an installed ROM, with the in-tree QEMU ROM as
-         * the development-tree fallback.  i82559_load_option_rom() retags
-         * its EEPRO100 PCI ID to the integrated controller's 8086:1229 ID. */
+         * the development-tree fallback; its EEPRO100 PCI ID is retagged to
+         * the integrated controller's 8086:1229 ID. */
         static const char *const undi_rom_paths[] = {
             "roms/efi-eepro100.rom",
             "reference/qemu-system-ia64/pc-bios/efi-eepro100.rom",
             "reference/qemu-system-ia64-merced/pc-bios/efi-eepro100.rom",
         };
-        bool loaded = false;
         for (unsigned i = 0;
-             i < sizeof(undi_rom_paths) / sizeof(undi_rom_paths[0]); i++) {
-            if (i82559_load_option_rom(&s->i82559, undi_rom_paths[i])) {
-                loaded = i82559_keep_efi_option_rom(&s->i82559, 0x0200);
-                break;
+             !s->nic_rom && i < sizeof(undi_rom_paths) / sizeof(undi_rom_paths[0]);
+             i++) {
+            size_t len;
+            uint8_t *rom = pci_rom_load(undi_rom_paths[i], &len);
+            if (!rom)
+                continue;
+            pci_rom_retag(rom, len, E100_VENDOR_ID, E100_DEVICE_ID);
+            len = pci_rom_keep_efi(rom, len, 0x0200);
+            if (len) {
+                s->nic_rom = rom;
+                s->nic_rom_len = (uint32_t)len;
+            } else {
+                free(rom);
             }
         }
-        if (!loaded)
-            fprintf(stderr, "i2000: warning: i82559 EFI UNDI ROM not found\n");
+        if (!s->nic_rom)
+            fprintf(stderr, "i2000: warning: LAN EFI UNDI ROM not found\n");
+        s->nic_enabled = true;
+        E100Config nic_cfg = { .boot_rom = s->nic_rom != NULL };
+        E100Wiring wiring = i2000_nic_wiring(s);
+        e100_init(&s->nic, &nic_cfg, &wiring);
+        if (s->nic_rom)
+            e100_set_rom(&s->nic, s->nic_rom, s->nic_rom_len);
     }
     ps2_keyboard_init(&s->ps2_keyboard);
-    i2000_load_vga_option_rom(s);
     if (!i2000_claim_drives(s)) {
         ia64_i2000_destroy(s);
         return NULL;
@@ -4928,6 +4311,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
         ia64_i2000_destroy(s);
         return NULL;
     }
+    i2000_smbus_init(s);
     s->monitor = gemu_monitor_create();
     i2000_monitor_setup(s);
     gemu_monitor_set_cpu_state_cb(s->monitor, i2000_cpu_state, s);
@@ -4959,6 +4343,13 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
             return NULL;
         }
     }
+    mc146818_init(&s->rtc, &(Mc146818Config){
+        .clock = i2000_rtc_clock, .clock_hz = I2000_ITC_HZ,
+        .irq = i2000_rtc_irq, .opaque = s,
+        .debug = getenv("RTC_DEBUG") != NULL });
+    if (mc146818_power_up(&s->rtc))
+        i2000_rtc_initialise(s);
+    i2000_update_fast_ram(s);
     return s;
 }
 
@@ -4969,83 +4360,23 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
     gemu_display_destroy(s->display);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     merced_destroy(s->cpu);
-    i82559_destroy(&s->i82559);
+    free(s->nic_rom);
     free(s->atapi_data);
     free(s->ata_data);
     /* The drive table owns the drives; just stop them calling back here. */
     gemu_drive_set_change_cb(s->cdrom, NULL, NULL);
+    free(s->video_rom);
+    free(s->vram);
     free(s->flash);
-    free(s->chipset_scratch);
-    free(s->high_dram);
     free(s->ram);
     free(s);
 }
 
 /* ── Execution ───────────────────────────────────────────────────────────── */
 
-/* The SDV BIOS's FIT type-0x12 entry is its IA-32 compatibility runtime.
- * SAL shadows that image immediately below 1 MiB; the EFI interposer later
- * says "already Loaded by SAL" and only loads AmiRt13Tbl at 0xE3000.  The
- * shadow behaves like retained chipset/firmware memory, not ordinary DRAM.
- * Without it the IVT's IRQ0 vector, F000:FEA5, enters zero-filled RAM.
- *
- * Derive both source and length from the firmware's FIT instead of baking
- * this ROM's addresses into the machine.  Recheck the tail at PIT delivery
- * because SAL may enable the timer before a subsequent DRAM clear. */
-static void i2000_ensure_legacy_runtime(Ia64I2000State *s) {
-    static const uint8_t fit_magic[8] =
-        {'_', 'F', 'I', 'T', '_', ' ', ' ', ' '};
-    static bool checked;
-    static uint32_t flash_off;
-    static uint32_t runtime_size;
-
-    if (!checked) {
-        checked = true;
-        for (uint32_t off = 0; off + 16 <= I2000_FLASH_SIZE; off += 16) {
-            const uint8_t *hdr = s->flash + off;
-            if (memcmp(hdr, fit_magic, sizeof(fit_magic)) != 0)
-                continue;
-            uint32_t entries = (uint32_t)hdr[8] |
-                               ((uint32_t)hdr[9] << 8) |
-                               ((uint32_t)hdr[10] << 16);
-            if (!entries || entries > (I2000_FLASH_SIZE - off) / 16)
-                break;
-            for (uint32_t i = 1; i < entries; i++) {
-                const uint8_t *e = hdr + i * 16;
-                if ((e[14] & 0x7f) != 0x12)
-                    continue;
-                uint64_t addr;
-                memcpy(&addr, e, sizeof(addr));
-                addr &= MERCED_PHYS_MASK;
-                uint32_t units = (uint32_t)e[8] |
-                                 ((uint32_t)e[9] << 8) |
-                                 ((uint32_t)e[10] << 16);
-                uint64_t bytes = (uint64_t)units * 16;
-                if (addr < I2000_FLASH_BASE ||
-                    addr + bytes > I2000_FLASH_BASE + I2000_FLASH_SIZE ||
-                    !bytes || bytes > 0x100000)
-                    break;
-                flash_off = (uint32_t)(addr - I2000_FLASH_BASE);
-                runtime_size = (uint32_t)bytes;
-                break;
-            }
-            break;
-        }
-    }
-
-    uint32_t len = runtime_size;
-    if (!len || s->ram_size < 0x100000)
-        return;
-    uint32_t dst = 0x100000 - len;
-    const uint8_t *src = s->flash + flash_off;
-    if (memcmp(s->ram + dst + len - 8, src + len - 8, 8) != 0) {
-        memcpy(s->ram + dst, src, len);
-        fprintf(stderr, "i2000: restored FIT IA-32 runtime at %#x-%#x\n",
-                dst, dst + len - 1);
-    }
-}
-
 static void i2000_poll_interrupts(Ia64I2000State *s) {
+    if (s->nic_enabled)
+        e100_poll(&s->nic);
     if (s->mouse_wait_rfi_generation &&
         merced_rfi_generation() >= s->mouse_wait_rfi_generation) {
         s->mouse_wait_rfi_generation = 0;
@@ -5072,24 +4403,7 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * vector is exactly why this used to hang forever: firmware raises
      * cr.tpr to 0xC0 around ATA identify and never lowers it again, which
      * permanently masks any normal vector but must NOT mask ExtINT. */
-    uint64_t now_itc = merced_get_itc(s->cpu);
-    if (s->pit0_next_irq && (int64_t)(now_itc - s->pit0_next_irq) >= 0) {
-        i2000_ensure_legacy_runtime(s);
-        iosapic_raise_gsi(s, 0);  /* GSI 0 == legacy PIT/IRQ0, forward-compat */
-        if (!(s->pic_master_mask & 1)) {
-            s->pit_irq_pending = true;
-            merced_raise_external(s->cpu, 0);  /* ExtINT: IRQ0 unmasked */
-        }
-        s->pit0_next_irq = now_itc + pit_interval_itc(s->pit0_reload);
-    }
-    /* Channel 1 has no standard ISA IRQ wiring on real hardware (classically
-     * DRAM refresh, not an interrupt source) and firmware never configures
-     * any delivery path for it either - the reload-count register (port
-     * 0x41) is still modeled since real chipsets expose it, but nothing
-     * here raises an interrupt for it. */
-    if (s->pit1_next_irq && (int64_t)(now_itc - s->pit1_next_irq) >= 0) {
-        s->pit1_next_irq = now_itc + pit_interval_itc(s->pit1_reload);
-    }
+    i2000_pit_run(s);
     /* Controller replies and host keystrokes assert legacy IRQ1 whenever
      * the keyboard output buffer becomes non-empty. Previously we queued
      * the byte but never signalled the CPU, leaving firmware event waits in
@@ -5160,6 +4474,29 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
         !(s->pic_slave_mask & 0x10) && !(s->pic_master_mask & 0x04)) {
         s->mouse_irq_pending = true;
         merced_raise_external(s->cpu, 0);
+    }
+    /* SCI is level-triggered: present it through its I/O SAPIC entry again
+     * after each acknowledgement until the handler clears the source. */
+    if (s->sci_level && s->cpu->ninsts >= s->sci_retry_ninsts) {
+        unsigned gsi = (unsigned)s->sci_irq;
+        uint8_t vector;
+        bool extint;
+        if (i460gx_interrupt(&s->chipset, gsi, &vector, &extint) && !extint &&
+            !merced_external_pending(s->cpu, vector)) {
+            iosapic_raise_gsi(s, gsi);
+            s->sci_retry_ninsts = s->cpu->ninsts + SCI_REPRESENT_INSTS;
+        }
+    }
+    /* IRQ8 is level-triggered: present it through its I/O SAPIC entry again
+     * after each acknowledgement until the guest reads register C. */
+    if (s->rtc_irq && s->cpu->ninsts >= s->rtc_retry_ninsts) {
+        uint8_t vector;
+        bool extint;
+        if (i460gx_interrupt(&s->chipset, 8, &vector, &extint) && !extint &&
+            !merced_external_pending(s->cpu, vector)) {
+            iosapic_raise_gsi(s, 8);
+            s->rtc_retry_ninsts = s->cpu->ninsts + SCI_REPRESENT_INSTS;
+        }
     }
     /* Primary IDE (the -hda disk) uses GSI14; see ata_deliver_irq(). */
     if (s->ata_legacy_irq_latched)
@@ -5328,7 +4665,9 @@ static bool i2000_after_step(Ia64I2000State *s, MercedStatus st) {
              * latches, as a CF9 system reset does on this board. */
             i2000_reset(s, true);
         } else {
+            mc146818_clock_restart(&s->rtc);
             merced_set_cpu_revision(s->cpu, 0);
+            i2000_sample_ratio_latch(s);
             merced_reset(s->cpu);
         }
         /* SAC CBNR bit 0 selects the second bootstrap phase, with the
@@ -5359,10 +4698,11 @@ static bool i2000_after_step(Ia64I2000State *s, MercedStatus st) {
 }
 
 static void i2000_run_slice(Ia64I2000State *s) {
-    if (s->halted)
+    if (s->halted || s->cpu_stopped)
         return;
     bool check_exec = gemu_monitor_has_exec_breakpoints(s->monitor);
     bool check_mem = gemu_monitor_has_mem_breakpoints(s->monitor);
+    s->mem_watch = check_mem;
     const uint64_t efi_runtime_size = UINT64_C(0x01000000);
     const uint64_t efi_app_base = UINT64_C(0x04000000);
     bool efi_window_valid = s->fw_shadow_enabled &&
@@ -5378,11 +4718,8 @@ static void i2000_run_slice(Ia64I2000State *s) {
          * loop that follows.  That loop still runs whenever a breakpoint or
          * watchpoint is set, and finishes a quantum the fast path left. */
         bool rev0 = s->cpu->cpu_revision == 0;
-        bool efi_handoff = rev0 &&
-            ((efi_window_valid && s->cpu->ip >= efi_app_base &&
-              s->cpu->ip < efi_app_end) ||
-             (s->cpu->ip & UINT64_C(0x00000fff00000000)) ==
-                 I2000_HIGH_DRAM_TAG);
+        bool efi_handoff = rev0 && efi_window_valid &&
+            s->cpu->ip >= efi_app_base && s->cpu->ip < efi_app_end;
         if (!check_exec && !check_mem &&
             (i & (IRQ_POLL_QUANTUM - 1)) == 0 &&
             i + IRQ_POLL_QUANTUM <= INSTR_PER_FRAME &&
@@ -5391,8 +4728,7 @@ static void i2000_run_slice(Ia64I2000State *s) {
             unsigned n = 0;
             MercedStatus st = merced_run_fast_range(
                 s->cpu, IRQ_POLL_QUANTUM, &n,
-                rev0 ? UINT64_C(0x00000fff00000000) : 0,
-                I2000_HIGH_DRAM_TAG,
+                0, 0,
                 rev0 && efi_window_valid ? efi_app_base : 0,
                 rev0 && efi_window_valid ? efi_app_end : 0);
             i += (int)n;
@@ -5432,66 +4768,43 @@ static void i2000_run_slice(Ia64I2000State *s) {
 }
 
 static void i2000_reset(Ia64I2000State *s, bool warm) {
-    bool rage128_enabled = s->rage128.enabled;
-    bool i82559_enabled = s->i82559.enabled;
-    uint8_t *i82559_option_rom = s->i82559.option_rom;
-    size_t i82559_option_rom_size = s->i82559.option_rom_size;
     bool mouse_enabled = s->mouse_enabled;
-    /* The device tail mixes resettable state with
-     * host-owned backing and persistent flash bookkeeping. Retain those
-     * across the bulk reset below: losing high_dram crashes the next
-     * snapshot, while losing NVRAM bookkeeping discards pending updates. */
-    uint8_t *high_dram = s->high_dram;
+    /* The device tail mixes resettable state with persistent flash
+     * bookkeeping. Retain it across the bulk reset below: losing it discards
+     * pending NVRAM updates. */
     char nvram_path[sizeof(s->nvram_path)];
     memcpy(nvram_path, s->nvram_path, sizeof(nvram_path));
     bool nvram_dirty = s->nvram_dirty;
+    mc146818_clock_restart(&s->rtc);        /* the RTC keeps running */
     merced_set_cpu_revision(s->cpu, 0);
+    i2000_sample_ratio_latch(s);
     merced_reset(s->cpu);
-    vga_ibm_reset(&s->vga);
-    rage128_init(&s->rage128, rage128_enabled, RAGE128_FB_BASE,
-                 RAGE128_IO_BASE, RAGE128_MMIO_BASE, 17);
-    memset(&s->int10_req, 0,
+    if (s->video_enabled)
+        rage128_reset(&s->rage128);
+    if (s->nic_enabled)
+        e100_reset(&s->nic);
+    memset(&s->mouse_enabled, 0,
            offsetof(Ia64I2000State, chipset) -
-           offsetof(Ia64I2000State, int10_req));
-    s->high_dram = high_dram;
+           offsetof(Ia64I2000State, mouse_enabled));
     memcpy(s->nvram_path, nvram_path, sizeof(s->nvram_path));
     s->nvram_dirty = nvram_dirty;
-    i82559_init(&s->i82559, i82559_enabled, I82559_MMIO_BASE,
-                I82559_IO_BASE, 18, bus_read, bus_write, s);
-    s->i82559.option_rom = i82559_option_rom;
-    s->i82559.option_rom_size = i82559_option_rom_size;
+    i2000_update_fast_ram(s);
     ps2_keyboard_init(&s->ps2_keyboard);
     /* mouse_enabled is a CLI-configured setting (-device mouse), not
      * protocol state - a reset should clear the aux device's transient
      * state (queue, streaming flag, etc, all zeroed by the memset above)
      * without un-attaching the mouse itself. */
     s->mouse_enabled = mouse_enabled;
-    /* Selected VGA option ROM, shadowed at its conventional address so any
-     * legacy option-ROM scan (0x55 0xAA signature check) finds it, the same
-     * way a real add-in VGA card's ROM would appear at boot. */
-    i2000_load_vga_option_rom(s);
-    size_t vga_rom_len = vgabios_rom_len;
-    if (0xC0000ull + vga_rom_len <= s->ram_size)
-        memcpy(s->ram + 0xC0000, s->vga_rom_shadow, vga_rom_len);
     s->halted = false;
     s->reset_requested = false;
     s->fw_shadow_enabled = false;
     s->post_code = 0;
     s->legacy_irq_routed = false;
-    s->port61 = s->pit2_polls = 0;
     s->pic_master_mask = s->pic_slave_mask = 0xFF;
     s->pic_master_base = 0x08;
     s->pic_slave_base = 0x70;
     s->pic_master_icw = s->pic_slave_icw = 0;
     s->pic_master_isr = s->pic_slave_isr = 0;
-    s->pit0_reload = s->pit0_latch = 0;
-    s->pit0_write_phase = 0;
-    s->pit0_read_phase = 0;
-    s->pit0_epoch_ninsts = merced_get_itc(s->cpu);
-    s->pit0_next_irq = 0;
-    s->pit1_reload = s->pit1_latch = 0;
-    s->pit1_write_phase = 0;
-    s->pit1_next_irq = 0;
     i2000_devices_reset(s, warm);
     s->mmio_log_n = 0;
     memset(s->mmio_log, 0, sizeof(s->mmio_log));
@@ -5522,12 +4835,14 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                gemu_drive_size(s->hda) >> 20);
 
     gemu_monitor_start(s->monitor);
+    i2000_update_fast_ram(s);
 
     /* PAL_FREQ_RATIOS advertises a 200 MHz ITC.  Drive it from elapsed
      * machine time, not interpreted slots: otherwise a firmware 10 ms input
      * timer takes roughly half a second on a 3.8 Mslot/s host. */
     merced_set_external_itc(s->cpu, true);
     uint64_t itc_last_ns = i2000_monotonic_ns();
+    uint64_t itc_fraction = 0;
     uint32_t display_keys_held = 0;
 
     /* A benchmark (GEMU_BENCH_NINSTS) runs the ITC off the instruction
@@ -5536,7 +4851,15 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
      * builds (with GEMU_FIXED_TIME pinning the RTC as well). */
     uint64_t bench_warmup, bench_target;
     i2000_bench_targets(&bench_warmup, &bench_target);
-    bool host_itc = bench_target == 0;
+    /* GEMU_CPI=<n> paces the ITC by the instruction count instead of the
+     * host clock, charging n ticks per executed slot. The guest then takes
+     * the same path however fast the host is, and firmware that polls the ITC
+     * for a delay no longer burns real time (and a great many instructions)
+     * waiting for it. */
+    const char *cpi_text = getenv("GEMU_CPI");
+    unsigned cpi = cpi_text ? (unsigned)strtoul(cpi_text, NULL, 0) : 0;
+    merced_set_cycles_per_slot(s->cpu, cpi ? cpi : 1);
+    bool host_itc = bench_target == 0 && !cpi;
 
     bool running = true;
     while (running) {
@@ -5549,11 +4872,18 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
         } else if (gemu_monitor_is_paused(s->monitor) || s->halted) {
             itc_last_ns = now_ns;
         } else {
-            uint64_t ticks = (now_ns - itc_last_ns) / I2000_ITC_TICK_NS;
-            if (ticks) {
+            /* Exact ticks for the elapsed host time, carrying the remainder
+             * (in units of 1/10^9 tick). The span is bounded so the product
+             * cannot overflow. */
+            uint64_t elapsed_ns = now_ns - itc_last_ns;
+            if (elapsed_ns > UINT64_C(10000000000))
+                elapsed_ns = UINT64_C(10000000000);
+            itc_fraction += elapsed_ns * I2000_ITC_HZ;
+            uint64_t ticks = itc_fraction / UINT64_C(1000000000);
+            itc_fraction %= UINT64_C(1000000000);
+            itc_last_ns = now_ns;
+            if (ticks)
                 merced_advance_itc(s->cpu, ticks);
-                itc_last_ns += ticks * I2000_ITC_TICK_NS;
-            }
         }
         if (s->display) {
             uint32_t keys_held = gemu_display_poll(s->display);
@@ -5665,6 +4995,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                 uint32_t n = gemu_monitor_step_count(s->monitor);
                 if (n == 0) n = 1;
                 s->halted = false;
+                s->mem_watch = gemu_monitor_has_mem_breakpoints(s->monitor);
                 for (uint32_t k = 0; k < n && !s->halted; k++) {
                     if (gemu_monitor_check_exec(s->monitor,
                                                 (uint32_t)s->cpu->ip))
@@ -5696,11 +5027,31 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
         if (!gemu_monitor_is_paused(s->monitor)) {
             i2000_run_slice(s);
             i2000_bench_check(s);
+            i460gx_pm_poll(&s->chipset);
+            mc146818_poll(&s->rtc);
+            if (mc146818_take_dirty(&s->rtc))
+                s->nvram_dirty = true;
+        }
+        if (s->wake_reset_requested) {
+            /* A wake event from S3/S4/S5 powers the machine up and resets it. */
+            s->wake_reset_requested = false;
+            s->power_off_requested = false;
+            fprintf(stderr, "i2000: waking from a power-off state\n");
+            i2000_reset(s, false);
+        }
+        if (s->power_off_requested) {
+            s->power_off_requested = false;
+            fprintf(stderr, "i2000: the guest powered the machine off\n");
+            if (cfg->no_shutdown)
+                gemu_monitor_shutdown_or_pause(s->monitor, true);
+            else
+                running = false;
         }
 
         /* A slice is ~1-2 ms of guest time: draw at 60 Hz, not per slice,
          * and only sleep when the CPU isn't running. */
-        bool idle = s->halted || gemu_monitor_is_paused(s->monitor);
+        bool idle = s->halted || s->cpu_stopped ||
+                    gemu_monitor_is_paused(s->monitor);
         if (s->display) {
             static uint64_t last_frame_ns;
             uint64_t frame_ns = i2000_monotonic_ns();

@@ -1949,6 +1949,7 @@ MercedStatus merced_ia32_step(Merced *m) {
     }
     unsigned size = x.op32 ? 4 : 2;
     bool branch = false;
+    int sysflag = -1;       /* 0 CLI, 1 STI, 2 POPF: candidate system-flag trap */
 
     unsigned hi = m->trace_history_next % MERCED_TRACE_HISTORY;
     unsigned hi_ext = m->trace_history_next % MERCED_TRACE_EXT_HISTORY;
@@ -2066,6 +2067,7 @@ MercedStatus merced_ia32_step(Merced *m) {
     } else if (op == 0x9d) {
         if (!pop(&x, size, &q)) goto fault;
         setflags(&x, q);
+        sysflag = 2;
     } else if (op == 0x9e) {                       /* sahf */
         uint32_t mask = FL_SF|FL_ZF|FL_AF|FL_PF|FL_CF;
         setflags(&x, (eflags(&x) & ~mask) | (xr(&x, 4, 1) & mask));
@@ -2152,7 +2154,7 @@ MercedStatus merced_ia32_step(Merced *m) {
     } else if (op == 0xcd || op == 0xcc) {           /* int imm8 / int3 */
         uint32_t vec = 3;
         if (op == 0xcd && !fetch(&x,1,&vec)) goto fault;
-        if (op == 0xcd && vec == 0x10) {
+        if (op == 0xcd && vec == 0x10 && x.m->ia32_int10_shim) {
             /* No real video BIOS ROM behind the IVT to jump to - service
              * the call directly instead (see int10_handler()'s comment). */
             int10_handler(&x);
@@ -2163,26 +2165,23 @@ MercedStatus merced_ia32_step(Merced *m) {
             if (!ia32_active(&x))
                 return MERCED_OK;
         } else {
-            uint32_t ip_lo, cs_lo;
-            if (!push(&x,2,(uint16_t)eflags(&x)) ||
-                !push(&x,2,sel(&x,X_CS)) ||
-                !push(&x,2,(uint16_t)(x.pc-sbase(&x,X_CS))) ||
-                !rb(&x,vec*4,2,false,&ip_lo) || !rb(&x,vec*4+2,2,false,&cs_lo))
-                goto fault;
-            setseg_real(&x,X_CS,(uint16_t)cs_lo);
-            x.pc = sbase(&x,X_CS) + ip_lo;
-            setflags(&x, eflags(&x) & ~(FL_IF));
-            branch = true;
+            /* INT n is an IA_32_Interrupt, INT 3 an IA_32_Exception: both
+             * traps, delivered to the native IVT with IIP at the next
+             * instruction; the firmware's handler performs the transfer. */
+            m->ip = x.pc;
+            m->ninsts++;
+            return merced_ia32_software_interrupt(m, vec, op == 0xcd);
         }
-    } else if (op == 0xcf) {                        /* iret */
-        uint32_t ip_r, cs_r, fl_r;
-        if (!pop(&x,2,&ip_r) || !pop(&x,2,&cs_r) || !pop(&x,2,&fl_r)) goto fault;
-        setseg_real(&x,X_CS,(uint16_t)cs_r);
-        x.pc = sbase(&x,X_CS) + ip_r;
-        setflags(&x, fl_r);
-        branch = true;
-    } else if (op == 0xfa) setflags(&x, eflags(&x) & ~FL_IF);   /* cli */
-    else if (op == 0xfb) setflags(&x, eflags(&x) | FL_IF);      /* sti */
+    } else if (op == 0xcf) {                        /* iret, iretd */
+        /* Every form of IRET is an IA-32 instruction intercept (SDM Vol. 2,
+         * Table 10-5): the firmware's handler emulates it and resumes
+         * through rfi, which is also what restores PSR.i. */
+        unsigned prefix_len = (unsigned)(x.pc - x.start - 1);
+        uint16_t code;
+        if (!intercept_code(&x, prefix_len, &code)) goto fault;
+        return merced_ia32_instruction_intercept(m, 0xcf, code);
+    } else if (op == 0xfa) { setflags(&x, eflags(&x) & ~FL_IF); sysflag = 0; }   /* cli */
+    else if (op == 0xfb) { setflags(&x, eflags(&x) | FL_IF); sysflag = 1; }      /* sti */
     else if (op == 0xf8) setflags(&x, eflags(&x) & ~FL_CF);      /* clc */
     else if (op == 0xf9) setflags(&x, eflags(&x) | FL_CF);       /* stc */
     else if (op == 0xf5) setflags(&x, eflags(&x) ^ FL_CF);       /* cmc */
@@ -2610,6 +2609,11 @@ MercedStatus merced_ia32_step(Merced *m) {
             if(!fetch(&x,1,&q))goto fault;
             RM rm;if(!decode_rm(&x,(uint8_t)q,&rm)||
                 !rmwrite(&x,rm,1,condition(&x,op2&15)?1:0))goto fault;
+        } else if (op2 == 0xa0 || op2 == 0xa8) {       /* push fs / push gs */
+            if (!push(&x, size, sel(&x, op2 == 0xa0 ? X_FS : X_GS))) goto fault;
+        } else if (op2 == 0xa1 || op2 == 0xa9) {       /* pop fs / pop gs */
+            if (!pop(&x, size, &q)) goto fault;
+            setseg_real(&x, op2 == 0xa1 ? X_FS : X_GS, (uint16_t)q);
         } else if (op2 >= 0xc8 && op2 <= 0xcf) { /* bswap r32 */
             if (x.locked) {
                 uint16_t code;
@@ -2851,6 +2855,14 @@ MercedStatus merced_ia32_step(Merced *m) {
         fprintf(stderr, "merced: IA32-ENTER-EBDA from=%08X op=%02X to=%08X "
                 "ninsts=%" PRIu64 "\n", x.start, op, x.pc, m->ninsts);
         fflush(stderr);
+    }
+    /* IA_32_Intercept(SystemFlag): a trap once CLI, STI or POPF has changed
+     * EFLAG.if with CFLG.ii set, with IIM the EFLAG from before it. */
+    if (sysflag >= 0 && (m->ar[27] & (UINT64_C(1) << 8)) &&
+        ((entry_flags ^ eflags(&x)) & FL_IF)) {
+        m->ip = x.pc;
+        m->ninsts++;
+        return merced_ia32_sysflag_trap(m, (unsigned)sysflag, entry_flags);
     }
     m->ip=x.pc; m->ninsts++; return MERCED_OK;
 fault:

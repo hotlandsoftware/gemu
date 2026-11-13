@@ -135,13 +135,23 @@ static void check_ifb_config(void) {
     ia64_i2000_phys_write32(s, io_address(0xcfc), 0x1a00);
     expect(ia64_i2000_phys_read8(s, io_address(0x1a00)), 0,
            "SMBus status follows assigned I/O BAR", 64, 3);
-    ia64_i2000_phys_write8(s, io_address(0x1a03), 2); /* SPD memory type */
-    ia64_i2000_phys_write8(s, io_address(0x1a04), 0xa1); /* slave50 read */
+    /* The SMBus segment carries the processor cartridge's Scratch EEPROM at
+     * slave 50h, erased and writable. Enable the host controller, store a
+     * byte and read it back. */
+    config_select_bus(s, 0, 3, 3, 0x40);
+    ia64_i2000_phys_write8(s, io_address(0xcfc), 1);
+    ia64_i2000_phys_write8(s, io_address(0x1a03), 2); /* word address */
+    ia64_i2000_phys_write8(s, io_address(0x1a05), 0x4a);
+    ia64_i2000_phys_write8(s, io_address(0x1a04), 0xa0); /* slave50 write */
     ia64_i2000_phys_write8(s, io_address(0x1a02), 0x48); /* byte-data start */
     expect(ia64_i2000_phys_read8(s, io_address(0x1a00)), 2,
            "SMBus transaction completes at assigned base", 64, 3);
-    expect(ia64_i2000_phys_read8(s, io_address(0x1a05)), 4,
-           "SMBus reads populated SDRAM EEPROM", 64, 3);
+    ia64_i2000_phys_write8(s, io_address(0x1a00), 2);
+    ia64_i2000_phys_write8(s, io_address(0x1a05), 0);
+    ia64_i2000_phys_write8(s, io_address(0x1a04), 0xa1); /* slave50 read */
+    ia64_i2000_phys_write8(s, io_address(0x1a02), 0x48);
+    expect(ia64_i2000_phys_read8(s, io_address(0x1a05)), 0x4a,
+           "SMBus reads back a device on its segment", 64, 3);
     ia64_i2000_phys_write8(s, io_address(0x1a00), 2);
     expect(ia64_i2000_phys_read8(s, io_address(0x1a00)), 0,
            "SMBus completion is write-one-to-clear", 64, 3);
@@ -149,7 +159,7 @@ static void check_ifb_config(void) {
     ia64_i2000_phys_write32(s, io_address(0xcfc), 0x1b00);
     expect(ia64_i2000_phys_read8(s, io_address(0x1a00)), 0xff,
            "SMBus old I/O address is unmapped", 64, 3);
-    expect(ia64_i2000_phys_read8(s, io_address(0x1b05)), 4,
+    expect(ia64_i2000_phys_read8(s, io_address(0x1b05)), 0x4a,
            "SMBus relocation preserves register state", 64, 3);
     config_select_bus(s, 0, 3, 3, 4);
     ia64_i2000_phys_write8(s, io_address(0xcfc), 0);
@@ -354,19 +364,26 @@ static void check_acpi_enable(void) {
     expect(ia64_i2000_phys_read8(s, io_address(0xa04)), 0,
            "unrelated APM command does not enable SCI", 64, 0);
     ia64_i2000_phys_write8(s, io_address(0xb2), 0xa0);
-    expect(ia64_i2000_phys_read8(s, io_address(0xa04)), 1,
-           "FADT enable command sets SCI_EN", 64, 0);
+    expect(ia64_i2000_phys_read8(s, io_address(0xa04)), 0,
+           "APM command alone does not set SCI_EN (the firmware's PMI "
+           "handler does)", 64, 0);
     expect(ia64_i2000_phys_read8(s, io_address(0xb2)), 0xa0,
            "APM command latch", 64, 0);
-    expect(ia64_i2000_phys_read32(s, io_address(0x404)), 0x01040000,
-           "ACPI control does not alias GPIO strap", 64, 0);
+    expect(ia64_i2000_phys_read32(s, io_address(0x404)), UINT32_MAX,
+           "the GPIO block does not decode until enabled", 64, 0);
+    ia64_i2000_phys_write32(s, io_address(0xcf8), 0x800018d0);
+    ia64_i2000_phys_write32(s, io_address(0xcfc), 0x401);
+    ia64_i2000_phys_write32(s, io_address(0xcf8), 0x800018d4);
+    ia64_i2000_phys_write32(s, io_address(0xcfc), 1);
+    expect(ia64_i2000_phys_read32(s, io_address(0x404)), 0x010401ff,
+           "GPIO data carries the J29 strap on its input pins", 64, 0);
     ia64_i2000_phys_write8(s, io_address(0xa05), 4);
-    ia64_i2000_phys_write8(s, io_address(0xb2), 0xa1);
     expect(ia64_i2000_phys_read32(s, io_address(0xa04)), 0x400,
-           "FADT disable preserves other PM1 control bits", 64, 0);
+           "PM1 control keeps SLP_TYP", 64, 0);
     ia64_i2000_phys_write32(s, io_address(0xa00), UINT32_MAX);
-    expect(ia64_i2000_phys_read32(s, io_address(0xa00)), 0xffff0000,
-           "PM1 status is write-one-to-clear; enables are retained", 64, 0);
+    expect(ia64_i2000_phys_read32(s, io_address(0xa00)), 0x05210000,
+           "PM1 status is write-one-to-clear; defined enables are retained",
+           64, 0);
     uint32_t timer = ia64_i2000_phys_read32(s, io_address(0xa08));
     ia64_i2000_phys_write32(s, io_address(0xa08), UINT32_MAX);
     expect(ia64_i2000_phys_read32(s, io_address(0xa08)), timer,

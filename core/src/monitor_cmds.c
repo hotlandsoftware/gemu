@@ -212,6 +212,8 @@ static const MonCmdDef mon_cmds[] = {
       "execute count instructions (default 1), then stop", NULL, cmd_step, 0 },
     { "stop",        "halt",         "",
       "halt emulation", NULL, cmd_stop, 0 },
+    { "system_powerdown", NULL,      "",
+      "press the power button (the guest's ACPI handler decides)", "i2000", NULL, 0 },
     { "symbols",     "sym",          "[load <file> | reload | list [text] | clear]",
       "load assembler labels; addresses then accept names", NULL, mon_cmd_symbols, 0 },
     { "tia",         NULL,           "",
