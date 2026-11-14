@@ -13,7 +13,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 # Any configured object gives the compiler flags and include paths.
-FLAGS_FROM = ("build/vga/multi/rage128.o", "vga/multi/rage128.c")
+FLAGS_SOURCE = "vga/multi/rage128.c"
 SOURCES = (
     "hardware/device/network/e100.c",
     "hardware/device/network/pci_rom.c",
@@ -28,8 +28,19 @@ def command_for(target):
     return shlex.split(output.strip().splitlines()[-1])
 
 
+def reference_object():
+    targets = subprocess.check_output(
+        ["ninja", "-t", "targets", "all"], cwd=ROOT, text=True
+    )
+    for line in targets.splitlines():
+        target = line.split(":", 1)[0]
+        if target.endswith("/" + FLAGS_SOURCE[:-2] + ".o"):
+            return target
+    raise SystemExit("Configure GEMU with IA-64 enabled before running this test.")
+
+
 def main():
-    reference, reference_source = FLAGS_FROM
+    reference, reference_source = reference_object(), FLAGS_SOURCE
     base = command_for(reference)
     link = command_for("bin/gemu")
     with tempfile.TemporaryDirectory(prefix="e100-", dir=ROOT / "build") as tmp:

@@ -32,6 +32,10 @@
  *     count unless the machine drives it), stays out of the caller's stop
  *     range, and no interrupt could be delivered at any group boundary in
  *     it - otherwise the slot goes to fast_step().
+ *   - While the cache-array model observes (merced_cache.h) every fetch and
+ *     data access must reach it, which translated code's direct RAM access
+ *     and fetch-free dispatch bypass: no block is entered, and a helper
+ *     slot that starts the model's observation ends the block.
  *   - Native slots never change anything those conditions read.  Helper
  *     slots might, so after each one mj_helper() re-checks them (plus the
  *     block's own validity: key, code page, translation generation) and
@@ -287,7 +291,7 @@ static unsigned mj_helper(Merced *m, MercedJitBlock *b, unsigned i) {
 
     /* Is the rest of the block still admissible? */
     if (tc->exit_request || j->flush_pending || (m->psr & PSR_IS) ||
-        mj_key(m) != b->key ||
+        mj_key(m) != b->key || fetch_observed(m) ||
         tc->translation_generation != b->tgen ||
         tc->page_generation[tb_page_index(b->pa)] != b->code_gen ||
         mj_irq_blocks(m) ||
@@ -1283,7 +1287,7 @@ static MJEnter mj_enter(Merced *m, MercedTranslationCache *tc, MercedJit *j,
     uint64_t ip = m->ip;
     uint64_t bva = ip & ~UINT64_C(0xF);
     if ((m->psr & PSR_IS) || (ip & 0xF) > 2 || mj_sal_shim_bundle(bva) ||
-        mj_irq_blocks(m))
+        mj_irq_blocks(m) || fetch_observed(m))
         return MJ_INTERPRET;
 
     uint64_t key = mj_key(m);

@@ -611,7 +611,7 @@ static void handoff_expect(uint64_t actual, uint64_t expected,
 }
 
 static void check_efi_handoff(unsigned ram_mb, bool fast, bool timer,
-                              uint64_t entry, bool ami_context) {
+                              uint64_t entry) {
     MercedBus bus = {
         .ram_size = (uint64_t)ram_mb << 20,
         .read = handoff_read,
@@ -623,10 +623,6 @@ static void check_efi_handoff(unsigned ram_mb, bool fast, bool timer,
         return;
     }
     cpu->ip = entry;
-    if (ami_context) {
-        cpu->cr[8] = 0x40; /* AMI shell's PTA/RR0 during physical app calls. */
-        cpu->rr[0] = 0x100030;
-    }
     cpu->cr[72] = UINT64_C(1) << 16; /* ITV: mask timer during cache warmup. */
     for (unsigned slot = 0; slot < 3; slot++)
         handoff_expect(handoff_step(cpu, fast), MERCED_OK, "cache warmup",
@@ -662,51 +658,6 @@ static void check_efi_handoff(unsigned ram_mb, bool fast, bool timer,
                    ram_mb, fast, timer);
     handoff_expect(cpu->cr[19], entry, "saved interrupted IP",
                    ram_mb, fast, timer);
-    merced_destroy(cpu);
-}
-
-/* IVA=0 is architecturally valid. The low-application exception must not
- * suppress interrupts outside the observed firmware execution context. */
-static void check_low_efi_interrupt(bool fast, bool timer, unsigned scenario) {
-    const unsigned ram_mb = 512;
-    MercedBus bus = {.ram_size = (uint64_t)ram_mb << 20,
-                     .read = handoff_read, .write = handoff_write};
-    Merced *cpu = merced_create(&bus);
-    if (!cpu) { failures++; return; }
-    uint64_t entry = 0x01042000;
-    cpu->ip = entry;
-    cpu->cr[8] = 0x40;
-    cpu->rr[0] = 0x100030;
-    cpu->cr[72] = UINT64_C(1) << 16;
-    for (unsigned slot = 0; slot < 3; slot++)
-        handoff_expect(handoff_step(cpu, fast), MERCED_OK, "cache warmup",
-                       ram_mb, fast, timer);
-    cpu->psr = (UINT64_C(1) << 13) | (UINT64_C(1) << 14);
-    switch (scenario) {
-    case 0: merced_set_cpu_revision(cpu, 6); break;
-    case 1: cpu->cr[8] = 0; break;
-    case 2: cpu->rr[0] = 0x30; break;
-    case 3: cpu->psr |= UINT64_C(1) << 36; break; /* virtual instruction */
-    case 4: cpu->psr |= UINT64_C(1) << 17; break; /* virtual data */
-    case 5: cpu->psr |= UINT64_C(1) << 27; break; /* virtual RSE */
-    case 6: entry = 0x10000; break;             /* low interrupt vectors */
-    case 7: cpu->bus.ram_size = entry; break;   /* unbacked address */
-    case 8: cpu->psr |= UINT64_C(3) << 32; break; /* user privilege */
-    }
-    cpu->ip = entry;
-    cpu->group_start = 1;
-    if (timer) {
-        cpu->cr[72] = 0x40;
-        cpu->timer_pending = true;
-    } else {
-        merced_raise_external(cpu, 0);
-    }
-    handoff_expect(handoff_step(cpu, fast), MERCED_OK, "low-code IRQ status",
-                   ram_mb, fast, timer);
-    handoff_expect(cpu->ip, 0x3000, "IVA0 interrupt delivered outside AMI context",
-                   ram_mb, fast, timer);
-    handoff_expect(cpu->nfaults, 1, "one low-code interrupt", ram_mb, fast, timer);
-    handoff_expect(cpu->cr[19], entry, "saved low-code IP", ram_mb, fast, timer);
     merced_destroy(cpu);
 }
 
@@ -988,7 +939,7 @@ static void check_fp_check_load(unsigned x6, unsigned form, unsigned scenario,
         UINT64_C(0xc0c00000), UINT64_C(0xc018000000000000),
     };
     fixture.data[0] = initial_data[fmt];
-    fixture.data[1] = 0x30000; /* extended -3.0: sign1, exponent0x10000 */
+    fixture.data[1] = 0xC000;  /* ldfe's 80-bit -3.0: sign 1, exponent 0x4000 */
     MercedBus bus = {.ud = &fixture, .read = fpcheck_read, .write = handoff_write};
     Merced *cpu = merced_create(&bus);
     if (!cpu) {
@@ -2122,16 +2073,18 @@ static void check_advanced_branch(bool fast, unsigned form, bool backward,
     CHK_EXPECT(handoff_step(cpu, fast), MERCED_OK, "decode-cache warmup");
     CHK_EXPECT(handoff_step(cpu, fast), MERCED_OK, "advanced check status");
     bool hit = warm && form < 2;
-    uint64_t target = backward ? 0x2e90 : 0x3170;
-    CHK_EXPECT(cpu->ip, qualified && !hit ? target : 0x3002,
-               "recovery branch or fallthrough");
+    /* With translation off a missed check takes a Speculative Operation
+     * fault (vector 0x5700) rather than branching to the recovery code. */
+    bool spec_fault = qualified && !hit;
+    CHK_EXPECT(cpu->ip, spec_fault ? 0x5700 : 0x3002,
+               "speculation fault or fallthrough");
     CHK_EXPECT(cpu->gr_static[30], value, "checked value unchanged");
     CHK_EXPECT(cpu->cfm, 35 | (UINT64_C(30) << 7), "frame unchanged");
     CHK_EXPECT(cpu->bof, 8, "physical frame position unchanged");
     CHK_EXPECT(cpu->bof_total, 8, "logical frame position unchanged");
     CHK_EXPECT(cpu->ar[64], UINT64_C(0x12345678), "PFS unchanged");
     CHK_EXPECT(cpu->br[0], 0x8760, "return address unchanged");
-    CHK_EXPECT(cpu->nfaults, 0, "check does not fault");
+    CHK_EXPECT(cpu->nfaults, spec_fault, "only a missed check faults");
     CHK_EXPECT(cpu->alat_valid_mask != 0,
                warm && !(qualified && form == 1),
                "only a qualified integer clr consumes the integer entry");
@@ -2195,10 +2148,12 @@ static void check_control_branch(bool fast, unsigned source, bool backward,
     unsigned fault_code = fp && reg >= 2 ? (reg < 32 ? disabled & 1 : disabled & 2) : 0;
     bool fault = qualified && fault_code;
     bool branch = qualified && nat && !(fp && reg < 2) && source != 5;
-    uint64_t target = backward ? 0x2990 : 0x3670;
-    CHKS_EXPECT(cpu->ip, fault ? 0xd500 : branch ? target : 0x3002,
-                 "disabled fault, recovery branch or fallthrough");
-    CHKS_EXPECT(cpu->nfaults, fault, "only disabled FP access faults");
+    /* With translation off the processor cannot resteer in hardware: a failed
+     * check takes a Speculative Operation fault instead of branching. */
+    bool spec_fault = branch && !fault;
+    CHKS_EXPECT(cpu->ip, fault ? 0xd500 : spec_fault ? 0xd700 : 0x3002,
+                 "disabled fault, speculation fault or fallthrough");
+    CHKS_EXPECT(cpu->nfaults, fault || spec_fault, "only faults the instruction takes");
     CHKS_EXPECT(cpu->fr[physical].sig, value.sig, "source significand preserved");
     CHKS_EXPECT(cpu->fr[physical].exp, value.exp, "source exponent preserved");
     CHKS_EXPECT(cpu->fr[physical].sign, value.sign, "source sign preserved");
@@ -2209,6 +2164,10 @@ static void check_control_branch(bool fast, unsigned source, bool backward,
     CHKS_EXPECT(cpu->bof_total, 8, "logical frame position preserved");
     if (fault) {
         CHKS_EXPECT(cpu->cr[17] & 0xffff, fault_code, "disabled register bank code");
+        CHKS_EXPECT(cpu->cr[19], 0x3000, "fault saves bundle address");
+        CHKS_EXPECT((cpu->cr[16] >> 41) & 3, 1, "fault saves slot one");
+    } else if (spec_fault) {
+        CHKS_EXPECT(cpu->cr[17] & 0xffff, fp ? 3 : 1, "speculation code (chk.s fr / gr)");
         CHKS_EXPECT(cpu->cr[19], 0x3000, "fault saves bundle address");
         CHKS_EXPECT((cpu->cr[16] >> 41) & 3, 1, "fault saves slot one");
     } else {
@@ -5450,15 +5409,10 @@ int main(void) {
                  * firmware window, plus another valid EFI allocation well
                  * below the top64MiB to avoid an arbitrary-size workaround. */
                 check_efi_handoff(ram_mb, fast, timer,
-                    ((uint64_t)ram_mb << 20) - UINT64_C(0x0106e000), false);
-                check_efi_handoff(ram_mb, fast, timer, UINT64_C(0x08000000), false);
-                check_efi_handoff(ram_mb, fast, timer, UINT64_C(0x01042000), true);
+                    ((uint64_t)ram_mb << 20) - UINT64_C(0x0106e000));
+                check_efi_handoff(ram_mb, fast, timer, UINT64_C(0x08000000));
             }
     }
-    for (unsigned fast = 0; fast < 2; fast++)
-        for (unsigned timer = 0; timer < 2; timer++)
-            for (unsigned scenario = 0; scenario < 9; scenario++)
-                check_low_efi_interrupt(fast, timer, scenario);
     for (unsigned ifetch = 0; ifetch < 2; ifetch++) {
         for (unsigned long_format = 0; long_format < 2; long_format++) {
             for (unsigned ma = 1; ma <= 3; ma++)

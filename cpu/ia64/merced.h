@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
+typedef struct Merced Merced;
+#include "merced_cache.h"
+
 /*
  * Intel Itanium (Merced) - IA-64 interpreter core.
  *
@@ -68,6 +71,10 @@ typedef struct {
     /* Optional acceleration for architecturally ordinary repeated byte
      * stores. Return false if the range is not directly fillable. */
     bool     (*fill)(void *ud, uint64_t addr, uint8_t val, uint64_t len);
+    /* Optional: the address the chipset decodes `addr` as, for platform
+     * aliases of one memory (a processor cache is indexed by the decoded
+     * address, so every name of a line must reach it as the same one). */
+    uint64_t (*canonical)(void *ud, uint64_t addr);
 } MercedBus;
 
 typedef enum {
@@ -97,7 +104,7 @@ typedef struct {
     uint64_t itir, pte;         /* raw insert values, for debugging */
 } MercedTlbEntry;
 
-typedef struct Merced {
+struct Merced {
     MercedBus bus;
 
     /* --- architectural state --- */
@@ -157,14 +164,12 @@ typedef struct Merced {
     uint64_t pmc[32], pmd[32];
     uint64_t cpuid[8];
     /* Merced model-specific registers (opaque, no public documentation).
-     * PAL polls hardware-handshake status bits in these, with mixed
-     * polarities (wait-for-set and wait-for-clear). Reads of never-written
-     * MSRs alternate 0 / all-ones so either poll flavor completes within
-     * two iterations; written MSRs read back their stored value. */
+     * Written MSRs read back their stored value and never-written ones read
+     * 0, except the PMI latch and the clock-ratio strap below, and the
+     * registers merced_msr.c models once merced_set_msr_model() enables it. */
     uint64_t msr[4096];
     uint8_t  msr_written[4096];
-    uint8_t  msr_toggle[4096];
-    uint16_t msr_polls[4096];   /* reads since last write (poll detector) */
+    uint16_t msr_polls[4096];   /* reads since last write (poll report) */
 
     MercedTlbEntry itr[MERCED_N_ITR], dtr[MERCED_N_DTR];
     MercedTlbEntry itc[MERCED_N_TC], dtc[MERCED_N_TC];
@@ -277,12 +282,10 @@ typedef struct Merced {
     /* one-shot warnings for approximated ops */
     uint32_t warned;
 
-    /* cpuid[3] revision field (see merced_reset()) - defaults to 0 for
-     * i2000's early PAL bootstrap compatibility; machines that need a
-     * different reported stepping call merced_set_cpu_revision()
-     * instead of poking cpuid[3] directly, so it survives merced_reset()
-     * (e.g. the monitor's "reset" command, or a machine's own reset
-     * handling) rather than reverting to the default every time. */
+    /* cpuid[3] revision field (see merced_reset()).  A machine that needs
+     * a particular reported stepping calls merced_set_cpu_revision() instead
+     * of poking cpuid[3] directly, so it survives merced_reset() (e.g. the
+     * monitor's "reset" command, or a machine's own reset handling). */
     uint8_t  cpu_revision;
 
     /* cpuid[3] model field (bits 23:16) - 0 = Merced (Itanium), 1 =
@@ -322,10 +325,22 @@ typedef struct Merced {
     void *translation_cache;
 
     /* Local SAPIC in-service vectors (vectors 16-255): set when cr.ivr
-     * delivers a vector, cleared by cr.eoi.  Keep this last - snapshots
-     * before i2000 v24 end just before it. */
+     * delivers a vector, cleared by cr.eoi. */
     uint8_t ext_in_service[32];
-} Merced;
+
+    /* --- Merced MSR file and cache arrays (merced_msr.c, merced_cache.c) ---
+     * Everything here is plain data: a raw copy of the struct (a machine
+     * snapshot) carries the whole model, and merced_reset() clears the
+     * arrays like RESET# does.  Keep this block last. */
+    /* The machine models this processor's MSRs and cache arrays as PAL
+     * drives them (merced_set_msr_model()).  Wiring: survives merced_reset().
+     * Without it MSRs are plain storage and no cache array is modelled. */
+    bool         merced_msrs;
+    /* The L2/L3/L1 arrays behind PAL's array-access MSRs.  While
+     * cache.observe or cache.ic_track is set every data access and bundle
+     * fetch goes through the model and the JIT does not run. */
+    MercedCache  cache;
+};
 
 Merced *merced_create(const MercedBus *bus);
 void    merced_destroy(Merced *m);
@@ -352,6 +367,17 @@ void    merced_set_cpu_model(Merced *m, uint8_t model);
 /* Sets the board's clock-ratio strap (4 bits). Takes effect immediately and
  * persists across merced_reset(). */
 void    merced_set_clock_ratio_code(Merced *m, uint8_t code);
+
+/* Selects the Merced MSR file and cache-array model (merced_msr.c,
+ * merced_cache.c) instead of plain storage for mov msr[]/mov =msr[].  Takes
+ * effect immediately and persists across merced_reset(). */
+void    merced_set_msr_model(Merced *m, bool enabled);
+
+/* Physical memory access for the processor models: straight to the bus,
+ * bypassing the cache-array model, with the interpreter's own bookkeeping
+ * for stores (ALAT, decoded-code caches). */
+uint64_t merced_bus_read(Merced *m, uint64_t pa, unsigned size);
+void     merced_bus_write(Merced *m, uint64_t pa, uint64_t v, unsigned size);
 
 /* Charges `cycles` ITC ticks per executed slot when the ITC follows the
  * instruction count rather than the host clock. Persists across reset. */

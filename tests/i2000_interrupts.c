@@ -778,7 +778,6 @@ static void test_cf9_reset(void) {
         s->chipset.chipset_cfg[0][0][0x44] = 0x80;
         s->chipset.chipset_cfg[0][0][0x45] = 6;
         s->fw_shadow_enabled = warm;
-        merced_set_cpu_revision(s->cpu, warm ? 6 : 0);
         io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x80008040), 4);
         io_port_write(s, PCI_CFG_DATA, 4, 1); /* assigned chipset bus */
         io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x80001910), 4);

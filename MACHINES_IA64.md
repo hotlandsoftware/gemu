@@ -219,7 +219,7 @@ multiplexer, and supplies supported SDRAM geometries. Returning ordinary
 configuration bytes here previously produced the bogus RAM limit
 `0x00000E0080000000`.
 
-The regression suite checks RAM discovery, the EFI interrupt and CPU-revision
+The regression suite checks RAM discovery, the EFI interrupt and bootstrap-phase
 handoff boundary, reserved-entry rejection by the hardware VHPT walker, and
 the floating-point check-load instructions used by Windows HAL. It also
 checks that faulting integer loads preserve their destination and address

@@ -60,6 +60,9 @@ FAMILY_SRC = {
     ],
     'ia64': [
         'cpu/ia64/merced.c',
+        'cpu/ia64/merced_cache.c',
+        'cpu/ia64/merced_fp.c',
+        'cpu/ia64/merced_msr.c',
         'cpu/ia64/merced_ia32.c',
         'hardware/machine/ia64/machine_i2000.c',
         'hardware/machine/ia64/machine_generic_ia64.c',

@@ -7,7 +7,8 @@
  */
 
 #include "merced.h"
-#include <float.h>
+#include "merced_fp.h"
+#include "merced_msr.h"
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
@@ -90,12 +91,18 @@ static int merced_dbg(void) {
 #define PSR_DFH  (1ull << 19)
 #define PSR_PP   (1ull << 21)
 #define PSR_DI   (1ull << 22)
+#define PSR_SI   (1ull << 23)
 #define PSR_RT   (1ull << 27)
 #define PSR_MC   (1ull << 35)
 #define PSR_IS   (1ull << 34)
 #define PSR_DA   (1ull << 38)
 #define PSR_DD   (1ull << 39)
 #define PSR_IT   (1ull << 36)
+#define PSR_SS   (1ull << 40)
+#define PSR_TB   (1ull << 26)
+#define PSR_LP   (1ull << 25)
+#define PSR_DB   (1ull << 24)
+#define PSR_ID   (1ull << 37)
 #define PSR_ED   (1ull << 43)
 #define PSR_BN   (1ull << 44)
 #define PSR_IA   (1ull << 45)
@@ -171,6 +178,8 @@ enum {
     VEC_INST_ACCESS_RIGHTS = 0x5200, VEC_DATA_ACCESS_RIGHTS = 0x5300,
     VEC_GENERAL = 0x5400, VEC_DISABLED_FP = 0x5500,
     VEC_NAT = 0x5600, VEC_SPEC = 0x5700, VEC_UNALIGNED = 0x5A00,
+    VEC_DEBUG = 0x5900, VEC_UNSUPPORTED = 0x5B00, VEC_FP_FAULT = 0x5C00,
+    VEC_FP_TRAP = 0x5D00,
     VEC_IA32_INTERCEPT = 0x6A00,
 };
 
@@ -178,7 +187,6 @@ enum {
 enum {
     WARN_FLUSHRS = 1u << 0, WARN_PTC = 1u << 1, WARN_PROBE = 1u << 2,
     WARN_SEMAPHORE = 1u << 3, WARN_LFETCH_FAULT = 1u << 4,
-    WARN_FP_APPROX = 1u << 5,
 };
 
 static void warn_once(Merced *m, uint32_t bit, const char *msg) {
@@ -198,6 +206,10 @@ static unsigned stacked_phys(const Merced *m, unsigned r) {
         idx = (idx + CFM_RRB_GR(m->cfm)) % sor8;
     return (m->bof + idx) % MERCED_RSE_CAPACITY;
 }
+
+/* Set by a write to a stacked register beyond the current frame, an Illegal
+ * Operation fault the instruction delivers once it has finished. */
+static bool oof_write_pending;
 
 /* gr_read_inl()/gr_write_inl() are the accessors' bodies, forced inline for
  * fast_op(); everything else calls the out-of-line gr_read()/gr_write(). */
@@ -220,6 +232,10 @@ static uint64_t gr_read(Merced *m, unsigned r, uint8_t *nat) {
     return gr_read_inl(m, r, nat);
 }
 
+/* Floating-point registers share the ALAT with the integer ones, keyed from
+ * here by their physical number. */
+#define ALAT_FP_KEY 128u
+
 static inline void alat_set_valid(Merced *m, unsigned i, bool v) {
     m->alat[i].valid = v;
     if (v) m->alat_valid_mask |= (uint32_t)1u << i;
@@ -241,7 +257,7 @@ static void alat_invalidate_stacked(Merced *m) {
     while (bits_left) {
         unsigned i = (unsigned)__builtin_ctz(bits_left);
         bits_left &= bits_left - 1;
-        if (m->alat[i].reg >= 32)
+        if (m->alat[i].reg >= 32 && m->alat[i].reg < ALAT_FP_KEY)
             alat_set_valid(m, i, false);
     }
 }
@@ -318,6 +334,10 @@ void gr_write_inl(Merced *m, unsigned r, uint64_t v, uint8_t nat) {
         }
         return;
     }
+    if (__builtin_expect(r - 32 >= CFM_SOF(m->cfm), 0)) {
+        oof_write_pending = true;
+        return;
+    }
     unsigned p = stacked_phys(m, r);
     /* A returned frame may reuse a register position that was spilled by an
      * older frame.  Writing that position makes it dirty again; leaving the
@@ -357,6 +377,36 @@ static uint64_t rsc_value_for_write(const Merced *m, uint64_t value) {
         value = (value & ~(UINT64_C(3) << 2)) | ((uint64_t)cpl << 2);
     return value;
 }
+/* Value an application-register write leaves behind: the RSC privilege
+ * clamp, a BSPSTORE that is 8-byte aligned, a RNAT without its bit 63 and
+ * the 6-bit epilog count. */
+static uint64_t ar_value_for_write(const Merced *m, unsigned ar3, uint64_t value) {
+    switch (ar3) {
+    case AR_RSC:      return rsc_value_for_write(m, value);
+    case AR_BSPSTORE: return value & ~UINT64_C(7);
+    case AR_RNAT:     return value & ~(UINT64_C(1) << 63);
+    case AR_EC:       return value & 0x3F;
+    default:          return value;
+    }
+}
+/* Which application registers a unit may name (SDM vol. 1, table 3-3): AR0-47
+ * belong to the M unit, AR64-66 to the I unit, AR48-63 and AR112-127 are
+ * ignored from either and the rest are reserved. */
+enum { AR_OK, AR_IGNORED, AR_RESERVED };
+static int ar_class(unsigned ar, bool i_form) {
+    if ((ar >= 48 && ar <= 63) || ar >= 112) return AR_IGNORED;
+    if (i_form) return (ar >= 64 && ar <= 66) ? AR_OK : AR_RESERVED;
+    if (ar <= 7) return AR_OK;
+    switch (ar) {
+    case 16: case 17: case 18: case 19: case 21: case 24: case 25: case 26:
+    case 27: case 28: case 29: case 30: case 32: case 36: case 40: case 44:
+    case 45:
+        return AR_OK;
+    default:
+        return AR_RESERVED;
+    }
+}
+
 static void pr_write(Merced *m, unsigned i, int v) {
     if (i == 0) return;
     unsigned p = pr_phys(m, i);
@@ -377,282 +427,6 @@ static void fr_write(Merced *m, unsigned r, MercedFpReg v) {
     m->fr[fr_phys(m, r)] = v;
 }
 
-/* FP <-> double conversion (approximate: fine for firmware arithmetic,
- * not IEEE-corner exact). */
-/* On x86 long double is the x87 80-bit format - a 64-bit significand with
- * an explicit integer bit, like the register's - so normal values convert
- * by moving bits instead of through ldexpl()/frexpl().  Denormals, zero and
- * out-of-range values still take the libm path below. */
-#if LDBL_MANT_DIG == 64 && LDBL_MAX_EXP == 16384 && (defined(__x86_64__) || defined(__i386__))
-#define MERCED_X87_LDBL 1
-typedef struct { uint64_t mant; uint16_t sign_exp; } X87Bits;
-#endif
-
-static long double fp2d(MercedFpReg f) {
-    if (f.exp == 0 && f.sig == 0) return f.sign ? -0.0 : 0.0;
-#ifdef MERCED_X87_LDBL
-    if (f.sig) {
-        unsigned lz = (unsigned)__builtin_clzll(f.sig);
-        int biased = (int)f.exp - 0xFFFF - (int)lz + 16383;
-        if (biased >= 1 && biased <= 32766) {
-            X87Bits b = { f.sig << lz, (uint16_t)(biased | (f.sign ? 0x8000 : 0)) };
-            long double d = 0;
-            memcpy(&d, &b, 10);
-            return d;
-        }
-    }
-#endif
-    if (f.exp == 0x1003E) {   /* integer form */
-        long double d = (long double)f.sig;
-        return f.sign ? -d : d;
-    }
-    /* sig has an explicit integer bit: value = sig * 2^(exp - bias - 63).
-     * long double's 64-bit significand holds sig exactly. */
-    long double d = ldexpl((long double)f.sig, (int)f.exp - 0xFFFF - 63);
-    return f.sign ? -d : d;
-}
-static MercedFpReg d2fp(long double d) {
-    MercedFpReg f = {0, 0, 0, 0};
-    if (d == 0.0) return f;
-    if (d < 0) { f.sign = 1; d = -d; }
-    if (!isfinite(d)) {
-        /* This model has no Inf/NaN register encoding (see fp2d), and the
-         * normalize loop below never terminates for +Inf (d*=0.5 stays
-         * Inf). Clamp to the largest finite magnitude instead of hanging -
-         * consistent with the rest of this conversion being an approximate,
-         * not IEEE-corner-exact, model. */
-        static int warned;
-        if (!warned) {
-            warned = 1;
-            fprintf(stderr, "merced: note: FP result not finite (Inf/NaN), "
-                            "clamping instead of hanging\n");
-        }
-        f.sig = UINT64_MAX;
-        f.exp = 0x1FFFE;
-        return f;
-    }
-#ifdef MERCED_X87_LDBL
-    {
-        X87Bits b;
-        memcpy(&b, &d, 10);
-        unsigned biased = b.sign_exp & 0x7FFF;
-        if (biased != 0 && (b.mant >> 63)) {     /* normal */
-            f.sig = b.mant;
-            f.exp = (uint32_t)((int)biased - 16383 + 0xFFFF);
-            return f;
-        }
-    }
-#endif
-    int e;
-    d = frexpl(d, &e) * 2.0L;       /* d in [1, 2) */
-    e--;
-    long double scaled = d * 0x1p63L;
-    uint64_t sig = (uint64_t)scaled;
-    long double fraction = scaled - (long double)sig;
-    if (fraction > 0.5L || (fraction == 0.5L && (sig & 1))) {
-        sig++;
-        if (sig == 0) {
-            sig = UINT64_C(0x8000000000000000);
-            e++;
-        }
-    }
-    f.sig = sig;
-    f.exp = (uint32_t)(e + 0xFFFF);
-    return f;
-}
-
-/* Round an FMA-family result to the instruction's static precision before
- * converting it back to the Itanium floating-point register format.  The
- * register format has a 64-bit significand, but .s and .d instructions must
- * not retain those extra bits: later Newton iterations (and, in particular,
- * firmware decompression code) observe the rounded intermediate result.
- *
- * fp_result_static() is used for FMA-family results.  frcpa must return the
- * architected table estimate, not a full-precision reciprocal: compiler
- * Newton-Raphson sequences deliberately refine the low-precision estimate
- * and can produce a non-converging quotient if handed an exact reciprocal. */
-static MercedFpReg fp_result_static(long double d, unsigned precision) {
-    if (precision == 1) {
-        return d2fp((long double)(float)d);
-    }
-    if (precision == 2) {
-        return d2fp((long double)(double)d);
-    }
-    return d2fp(d);
-}
-
-/* fma/fms/fnma without fmal().  On x86 long double has no FMA instruction,
- * so glibc's fmal() emulates one in software and saves, clears and restores
- * the FP environment on every call - for firmware that is most of the
- * emulator's time.  This computes the same thing in integers: the exact
- * 128-bit product of the significands plus the addend, rounded once to a
- * 64-bit significand (to nearest, ties to even - the host's mode, which
- * fmal() also uses).  Within the range checked below there's no overflow,
- * underflow or denormal anywhere, so the result is bit-for-bit what fmal()
- * gives; anything else returns false and the caller uses fmal().  Only on
- * hosts whose long double has a 64-bit significand: elsewhere fmal() rounds
- * differently and this would change the result. */
-#if LDBL_MANT_DIG == 64
-typedef struct { uint64_t w[3]; } U192;   /* w[2] most significant */
-
-static unsigned u192_clz(const U192 *x) {
-    if (x->w[2]) return (unsigned)__builtin_clzll(x->w[2]);
-    if (x->w[1]) return 64u + (unsigned)__builtin_clzll(x->w[1]);
-    if (x->w[0]) return 128u + (unsigned)__builtin_clzll(x->w[0]);
-    return 192u;
-}
-
-static void u192_shl(U192 *x, unsigned n) {
-    while (n >= 64) { x->w[2] = x->w[1]; x->w[1] = x->w[0]; x->w[0] = 0; n -= 64; }
-    if (n) {
-        x->w[2] = x->w[2] << n | x->w[1] >> (64 - n);
-        x->w[1] = x->w[1] << n | x->w[0] >> (64 - n);
-        x->w[0] <<= n;
-    }
-}
-
-/* Shift right, ORing whatever falls off into bit 0. */
-static void u192_shr_sticky(U192 *x, unsigned n) {
-    if (n >= 192) {
-        bool any = x->w[0] | x->w[1] | x->w[2];
-        x->w[0] = any; x->w[1] = x->w[2] = 0;
-        return;
-    }
-    bool sticky = false;
-    while (n >= 64) { sticky |= x->w[0] != 0; x->w[0] = x->w[1]; x->w[1] = x->w[2]; x->w[2] = 0; n -= 64; }
-    if (n) {
-        sticky |= (x->w[0] << (64 - n)) != 0;
-        x->w[0] = x->w[0] >> n | x->w[1] << (64 - n);
-        x->w[1] = x->w[1] >> n | x->w[2] << (64 - n);
-        x->w[2] >>= n;
-    }
-    x->w[0] |= sticky;
-}
-
-static int u192_cmp(const U192 *a, const U192 *b) {
-    for (int i = 2; i >= 0; i--)
-        if (a->w[i] != b->w[i]) return a->w[i] < b->w[i] ? -1 : 1;
-    return 0;
-}
-
-static void u192_add(U192 *a, const U192 *b) {
-    uint64_t c = 0;
-    for (int i = 0; i < 3; i++) {
-        uint64_t s = a->w[i] + b->w[i];
-        uint64_t c1 = s < a->w[i];
-        a->w[i] = s + c;
-        c = c1 | (a->w[i] < s);
-    }
-}
-
-static void u192_sub(U192 *a, const U192 *b) {   /* a >= b */
-    uint64_t br = 0;
-    for (int i = 0; i < 3; i++) {
-        uint64_t d = a->w[i] - b->w[i];
-        uint64_t b1 = a->w[i] < b->w[i];
-        a->w[i] = d - br;
-        b1 |= d < br;
-        br = b1;
-    }
-}
-
-/* value = sig * 2^(exp - 0xFFFF - 63), as fp2d() reads a register.  Usable
- * here when it's zero or its top bit lies well inside long double's normal
- * range, so neither fp2d() nor fmal() ever saw a denormal or an overflow. */
-static bool fma_operand_ok(MercedFpReg f, int *top) {
-    if (f.sig == 0) return true;
-    *top = (int)f.exp - 0xFFFF - 63 + (63 - __builtin_clzll(f.sig));
-    return *top > -8000 && *top < 8000;
-}
-
-/* a * b + c, with neg_prod / neg_c flipping the product's / addend's sign.
- * On success sets *out (zero comes back as all-zero, as d2fp() makes it). */
-static bool fma_exact(MercedFpReg a, MercedFpReg b, MercedFpReg c,
-                      bool neg_prod, bool neg_c, int *sign, uint64_t *mant, int *e) {
-    int ta = 0, tb = 0, tc = 0;
-    if (!fma_operand_ok(a, &ta) || !fma_operand_ok(b, &tb) || !fma_operand_ok(c, &tc))
-        return false;
-    bool p_zero = a.sig == 0 || b.sig == 0;
-    bool c_zero = c.sig == 0;
-    int sp = (a.sign ^ b.sign ^ neg_prod) & 1, sc = (c.sign ^ neg_c) & 1;
-
-    /* Both terms as 192-bit integers with the top bit at 190 (one bit of
-     * headroom for a carry); ex/ey are the exponents of their bit 0. */
-    U192 x = {{0, 0, 0}}, y = {{0, 0, 0}};
-    int ex = 0, ey = 0, sx = 0, sy = 0;
-    bool have_x = false, have_y = false;
-    if (!p_zero) {
-        uint64_t ah = a.sig >> 32, al = (uint32_t)a.sig;
-        uint64_t bh = b.sig >> 32, bl = (uint32_t)b.sig;
-        uint64_t t0 = al * bl, t1 = ah * bl + (t0 >> 32), t2 = al * bh + (uint32_t)t1;
-        x.w[1] = ah * bh + (t1 >> 32) + (t2 >> 32);
-        x.w[0] = (t2 << 32) | (uint32_t)t0;
-        unsigned lz = u192_clz(&x) - 1;
-        u192_shl(&x, lz);
-        ex = ((int)a.exp - 0xFFFF - 63) + ((int)b.exp - 0xFFFF - 63) - (int)lz;
-        sx = sp; have_x = true;
-    }
-    if (!c_zero) {
-        y.w[1] = c.sig;
-        unsigned lz = u192_clz(&y) - 1;
-        u192_shl(&y, lz);
-        ey = (int)c.exp - 0xFFFF - 63 - 64 - (int)lz;
-        sy = sc; have_y = true;
-    }
-    if (!have_x && !have_y) {
-        *sign = 0; *mant = 0; *e = 0;
-        return true;
-    }
-    if (have_x && (ta + tb > 15000 || ta + tb < -15000))
-        return false;
-    if (!have_x) { x = y; ex = ey; sx = sy; have_y = false; }
-    if (have_y) {
-        if (ey > ex || (ey == ex && u192_cmp(&y, &x) > 0)) {
-            U192 t = x; x = y; y = t;
-            int te = ex; ex = ey; ey = te;
-            int ts = sx; sx = sy; sy = ts;
-        }
-        /* Top bits are both at 190, so x >= y once aligned.  Bits only fall
-         * off y when it's 64+ places below x, and then at most one leading
-         * bit can cancel: the sticky bit stays far under the rounding point. */
-        u192_shr_sticky(&y, (unsigned)(ex - ey > 200 ? 200 : ex - ey));
-        if (sx == sy) u192_add(&x, &y);
-        else u192_sub(&x, &y);
-    }
-    unsigned lz = u192_clz(&x);
-    if (lz == 192) {                       /* exact cancellation: +0 */
-        *sign = 0; *mant = 0; *e = 0;
-        return true;
-    }
-    u192_shl(&x, lz);
-    ex -= (int)lz;
-    uint64_t m = x.w[2];
-    bool round = x.w[1] >> 63;
-    bool sticky = (x.w[1] << 1) != 0 || x.w[0] != 0;
-    if (round && (sticky || (m & 1))) {
-        if (++m == 0) { m = UINT64_C(1) << 63; ex++; }
-    }
-    *sign = sx; *mant = m; *e = ex + 128;     /* value = m * 2^e */
-    return true;
-}
-#endif
-
-/* Merced frcpa's architected 8-bit reciprocal estimate.  Ski expresses this
- * as a 256-entry table indexed by significand bits 62:55.  The table is
- * exactly round(2^20 / (513 + 2*index)), so keep the equivalent integer form
- * here instead of embedding 256 constants. */
-static MercedFpReg fp_recip_estimate(MercedFpReg den) {
-    unsigned index = (unsigned)((den.sig >> 55) & 0xff);
-    unsigned divisor = 513 + 2 * index;
-    uint64_t estimate = (1048576u + divisor / 2) / divisor;
-    MercedFpReg r = {
-        .sig = estimate << 53,
-        .exp = 0x1fffdU - den.exp,
-        .sign = den.sign,
-        .nat = den.nat,
-    };
-    return r;
-}
 
 /* ── Memory / translation ────────────────────────────────────────────────── */
 
@@ -926,7 +700,7 @@ static bool dbg_read(Merced *m, uint64_t va, void *dst, size_t n) {
         MercedStatus st;
         if (!va_translate(m, va + i, false, true, 0, &pa, &st))
             return false;
-        d[i] = (uint8_t)phys_read(m, pa, 1);
+        d[i] = (uint8_t)merced_bus_read(m, pa, 1);
     }
     return true;
 }
@@ -1314,7 +1088,10 @@ static bool pmi_deliverable(const Merced *m) {
            m->msr[MSR_PALE_PMI];
 }
 
-static void deliver_pmi(Merced *m) {
+/* A PAL-based interruption: IIP/IPSR hold the interrupted state, IFS.v is
+ * clear, and execution continues in bank 0 at the physical address `entry`
+ * with translation off. */
+static void deliver_pal_interruption(Merced *m, uint64_t entry) {
     bool ia32 = (m->psr & PSR_IS) != 0;
     if (ia32) {
         m->ar[25] = gr_read(m, 25, NULL);
@@ -1333,8 +1110,27 @@ static void deliver_pmi(Merced *m) {
     if (m->cr[CR_DCR] & (1ull << 0))
         m->psr |= PSR_PP;
     m->psr_ic_inflight = 0;
-    m->ip = m->msr[MSR_PALE_PMI];
+    m->ip = entry;
     m->taken = 1;
+}
+
+static void deliver_pmi(Merced *m) {
+    deliver_pal_interruption(m, m->msr[MSR_PALE_PMI]);
+}
+
+/* Machine Check Abort into PALE_CHECK, raised by the cache-array model for a
+ * tag-parity or data-ECC error.  Merced's PAL_A (fw130) has three stubs under
+ * PALE_RESET: 0xFFFFFF90 -> 0xFFFF8120 is PALE_CHECK (ptc.e, saves
+ * r30/r31/pr in msr 0x400-0x402 like the PMI stub, treats the event as a
+ * reset while msr[0x625] bit 17 is clear, and with the self-test signature
+ * in msr[0x684] enters PAL_B + 0x10140 = 0xFFDF2DA0); 0xFFFFFFA0 ->
+ * 0xFFFF8680 is PALE_INIT (PAL_B + 0x10130, on to SALE_ENTRY).  The
+ * self-test handler (0xFFDF32D0) reads the faulting IP and PSR from IIP /
+ * IPSR and rfi's, so they are written as for PMI.  PSR.mc is set: further
+ * machine checks are held off until PAL clears it. */
+static void deliver_mca(Merced *m) {
+    deliver_pal_interruption(m, UINT64_C(0xFFFFFF90));
+    m->psr |= PSR_MC;
 }
 
 static bool va_translate(Merced *m, uint64_t va, bool ifetch, bool spec,
@@ -1552,13 +1348,21 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
     bool on = force ||
               (ifetch ? (m->psr & PSR_IT) != 0
                       : (m->psr & (is_rse ? PSR_RT : PSR_DT)) != 0);
+    /* The cache-array model needs each access's attribute (access_uc), which
+     * the soft TLB does not keep, so it is bypassed while the model observes.
+     * Walks and firmware-owned identity translations are write-back. */
+    const bool observed = m->cache.observe;
+    if (observed)
+        m->cache.access_uc = false;
     if (!on) {
         *pa = va & MERCED_PHYS_MASK;
+        if (observed && !ifetch)
+            m->cache.access_uc = (va >> 63) != 0;   /* physical: bit 63 is UC */
         return true;
     }
     bool cacheable = xlate_cacheable(m, va);
     uint64_t kind = xlate_kind(m, ifetch, isr_access);
-    if (cacheable && xlate_lookup(m, va, kind, pa))
+    if (cacheable && !observed && xlate_lookup(m, va, kind, pa))
         return true;
     unsigned vrn = (unsigned)(va >> 61);
     uint32_t rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
@@ -1693,12 +1497,34 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         }
     }
     *pa = (e->pfn_base + (lookup_va - e->va_start)) & MERCED_PHYS_MASK;
+    if (observed && !ifetch)
+        m->cache.access_uc = ((e->pte >> PTE_MA_SHIFT) & 7) != 0;   /* ma 0 = WB */
     if (cacheable) xlate_store(m, va, kind, *pa);
     return true;
 }
 
-static uint64_t phys_read(Merced *m, uint64_t pa, unsigned size) {
+uint64_t merced_bus_read(Merced *m, uint64_t pa, unsigned size) {
     return m->bus.read(m->bus.ud, pa & MERCED_PHYS_MASK, size);
+}
+
+/* A data read.  While the cache-array model observes it may hold the line
+ * (write-back accesses only: an uncacheable access bypasses the caches), and
+ * the attribute of the translation just made is consumed. */
+/* The address the cache model indexes a line by. */
+static inline uint64_t model_pa(const Merced *m, uint64_t pa) {
+    pa &= MERCED_PHYS_MASK;
+    return m->bus.canonical ? m->bus.canonical(m->bus.ud, pa) : pa;
+}
+
+static uint64_t phys_read(Merced *m, uint64_t pa, unsigned size) {
+    if (__builtin_expect(m->cache.observe, 0)) {
+        bool wb = !m->cache.access_uc;
+        uint64_t v;
+        m->cache.access_uc = false;
+        if (wb && merced_cache_load(m, model_pa(m, pa), size, &v))
+            return v;
+    }
+    return merced_bus_read(m, pa, size);
 }
 
 static uint64_t phys_fetch(Merced *m, uint64_t pa, unsigned size) {
@@ -1977,8 +1803,9 @@ static void xlate_store(Merced *m, uint64_t va, uint64_t kind, uint64_t pa) {
 
 void merced_flush_translation_cache(Merced *m) { tb_flush(m); }
 
-static void phys_write(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
-    pa &= MERCED_PHYS_MASK;
+/* Everything a store does besides reaching memory or the cache-array model:
+ * the debug watch, ALAT invalidation and dropping decoded code it overwrites. */
+static void phys_write_effects(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
     if (pa >= watch_pa_base && pa < watch_pa_end) {
         static unsigned watch_debug;
         if (watch_debug++ < 64) {
@@ -2006,6 +1833,24 @@ static void phys_write(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
         tc->page_generation[first]++;
         if (last != first)
             tc->page_generation[last]++;
+    }
+}
+
+void merced_bus_write(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
+    pa &= MERCED_PHYS_MASK;
+    phys_write_effects(m, pa, v, size);
+    m->bus.write(m->bus.ud, pa, v, size);
+}
+
+/* A data write; see phys_read() for the cache-array model. */
+static void phys_write(Merced *m, uint64_t pa, uint64_t v, unsigned size) {
+    pa &= MERCED_PHYS_MASK;
+    phys_write_effects(m, pa, v, size);
+    if (__builtin_expect(m->cache.observe, 0)) {
+        bool wb = !m->cache.access_uc;
+        m->cache.access_uc = false;
+        if (wb && merced_cache_store(m, model_pa(m, pa), size, v))
+            return;                     /* the L2 took it */
     }
     m->bus.write(m->bus.ud, pa, v, size);
 }
@@ -2052,6 +1897,7 @@ void merced_reset(Merced *m) {
     unsigned slot_cycles = m->slot_cycles;
     uint8_t clock_ratio_code = m->clock_ratio_code;
     bool clock_ratio_strapped = m->clock_ratio_strapped;
+    bool merced_msrs = m->merced_msrs;
     void *translation_cache = m->translation_cache;
     memset(m, 0, sizeof(*m));
     m->bus = bus;
@@ -2061,6 +1907,7 @@ void merced_reset(Merced *m) {
     m->ia32_int10_shim = ia32_int10_shim;
     m->clock_ratio_code = clock_ratio_code;
     m->clock_ratio_strapped = clock_ratio_strapped;
+    m->merced_msrs = merced_msrs;
     m->slot_cycles = slot_cycles ? slot_cycles : 1;
     m->translation_cache = translation_cache;
     tb_flush(m);
@@ -2085,14 +1932,10 @@ void merced_reset(Merced *m) {
      *
      * The model and revision (stepping) values are machine-configurable
      * (see merced_set_cpu_model()/merced_set_cpu_revision()) because
-     * different consumers disagree about what they want to see here:
-     *   - i2000 uses revision 0 for compatibility with the firmware's
-     *     early PAL bootstrap path, then promotes CPUID to production
-     *     Merced C0 when execution enters a loaded EFI application.
-     *   - Windows for Itanium (SETUPLDR.EFI on the generic machine)
-     *     refuses to proceed on anything it reads as "pre-B3 stepping" -
-     *     real historical behavior, not an emulator bug. The generic
-     *     machines expose revision 6 for this reason. */
+     * different consumers disagree about what they want to see here.
+     * Windows for Itanium (SETUPLDR.EFI) refuses to proceed on anything it
+     * reads as "pre-B3 stepping" - real historical behavior, not an
+     * emulator bug - so the machines expose revision 6 (Merced C0). */
     memcpy(&m->cpuid[0], "GenuineI", 8);
     memcpy(&m->cpuid[1], "ntel\0\0\0\0", 8);
     m->cpuid[2] = 0;
@@ -2120,6 +1963,10 @@ void merced_set_cycles_per_slot(Merced *m, unsigned cycles) {
 void merced_set_clock_ratio_code(Merced *m, uint8_t code) {
     m->clock_ratio_code = code & 0xf;
     m->clock_ratio_strapped = true;
+}
+
+void merced_set_msr_model(Merced *m, bool enabled) {
+    m->merced_msrs = enabled;
 }
 
 uint64_t merced_gr(const Merced *m, unsigned r) {
@@ -2259,6 +2106,281 @@ static void set_preds(Merced *m, unsigned p1, unsigned p2, int qp, int res, int 
     }
 }
 
+/* The faults a mov to an application register can take (SDM vol. 3, mov ar):
+ * a reserved, read-only (BSP) or mode-restricted (BSPSTORE/RNAT while the RSE
+ * is enabled) register is an Illegal Operation, a NaT source a NaT
+ * Consumption, a reserved RSC bit a Reserved Register/Field fault and a
+ * kernel register, ITC or RUC from a less privileged level a Privileged
+ * Register fault.  Returns true when the write must not go ahead; *st is the
+ * instruction's outcome. */
+static bool ar_write_blocked(Merced *m, unsigned ar, bool i_form,
+                             uint64_t value, uint8_t nat, MercedStatus *st) {
+    int cls = ar_class(ar, i_form);
+    if (cls == AR_RESERVED || ar == AR_BSP ||
+        ((ar == AR_BSPSTORE || ar == AR_RNAT) && (m->ar[AR_RSC] & 3u) != 0)) {
+        *st = deliver_fault(m, VEC_GENERAL, 0, 0, false);
+        return true;
+    }
+    if (nat) {
+        *st = deliver_fault(m, VEC_NAT, UINT64_C(0x10), 0, false);
+        return true;
+    }
+    if (cls == AR_IGNORED) {
+        *st = MERCED_OK;
+        return true;
+    }
+    if (((m->psr >> PSR_CPL_SHIFT) & 3) != 0 && (ar <= 7 || ar == 44 || ar == 45)) {
+        *st = deliver_fault(m, VEC_GENERAL, 0x20, 0, false);
+        return true;
+    }
+    /* ar.rsc defines only mode(2)/pl(2)/be(1) in bits 4:0 and loadrs in
+     * bits 29:16; everything else is reserved. */
+    if (ar == AR_RSC && (value & ~(0x1Full | (0x3FFFull << 16)))) {
+        *st = deliver_fault(m, VEC_GENERAL, 0x30, 0, false);
+        return true;
+    }
+    return false;
+}
+
+/* The same for a mov from an application register; an ignored register reads
+ * as zero (*value). */
+static bool ar_read_blocked(Merced *m, unsigned ar, bool i_form,
+                            uint64_t *value, MercedStatus *st) {
+    int cls = ar_class(ar, i_form);
+    if (cls == AR_RESERVED ||
+        ((ar == AR_BSPSTORE || ar == AR_RNAT) && (m->ar[AR_RSC] & 3u) != 0)) {
+        *st = deliver_fault(m, VEC_GENERAL, 0, 0, false);
+        return true;
+    }
+    if (((m->psr >> PSR_CPL_SHIFT) & 3) != 0 && (m->psr & PSR_SI) &&
+        (ar == 44 || ar == 45)) {
+        *st = deliver_fault(m, VEC_GENERAL, 0x20, 0, false);
+        return true;
+    }
+    if (cls == AR_IGNORED)
+        *value = 0;
+    return false;
+}
+
+/* A failed chk branches to its recovery code only where the processor can
+ * resteer in hardware; with translation off, interruption collection off or
+ * single-step/taken-branch traps on, it takes a Speculative Operation fault
+ * instead (vol. 2, 5.8.5).  code: 0 chk.a gr, 1 chk.s gr, 2 chk.a fr,
+ * 3 chk.s fr; imm is the instruction's 21-bit immediate, which IIM holds. */
+static MercedStatus chk_recover(Merced *m, unsigned code, uint64_t imm21) {
+    static const uint64_t hw = PSR_IC | PSR_IT;
+    if ((m->psr & hw) != hw || (m->psr & (PSR_SS | PSR_TB))) {
+        m->cr[CR_IIM] = imm21;
+        return deliver_fault(m, VEC_SPEC, code, 0, false);
+    }
+    m->ip = (m->ip & ~0xFull) + (uint64_t)(sext(imm21, 21) * 16);
+    m->taken = 1;
+    return MERCED_OK;
+}
+
+/* A reference that is not naturally aligned takes an Unaligned Data
+ * Reference fault when PSR.ac is set; a semaphore's always does. */
+#define DCACHE_LINE 64u
+
+static bool unaligned_fault(Merced *m, uint64_t va, unsigned size,
+                            uint64_t isr_access, bool always, MercedStatus *st) {
+    if (!(va & (size - 1u)))
+        return false;
+    /* Without PSR.ac only a reference that straddles a data cache line
+     * faults; a semaphore always does. */
+    if (!(always || (m->psr & PSR_AC)) &&
+        (va & (DCACHE_LINE - 1u)) + size <= DCACHE_LINE)
+        return false;
+    *st = deliver_fault(m, VEC_UNALIGNED, isr_access, va, true);
+    return true;
+}
+
+/* A privileged instruction executed at a privilege level above 0 takes a
+ * Privileged Operation fault. */
+static bool privileged_fault(Merced *m, MercedStatus *st) {
+    if (((m->psr >> PSR_CPL_SHIFT) & 3) == 0)
+        return false;
+    *st = deliver_fault(m, VEC_GENERAL, 0x10, 0, false);
+    return true;
+}
+
+/* The M-unit system instructions (opcode 1, x3 = 0) that are privileged, by
+ * x6: the indirect-register writes and the rr/dbr/ibr/pkr/pmc/msr reads, the
+ * translation instructions, tpa/tak, and the psr and cr moves.  pmd and
+ * cpuid reads, thash/ttag and the user-mask moves are not. */
+static bool m_sys_x6_privileged(unsigned x6) {
+    switch (x6) {
+    case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05:
+    case 0x06: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+    case 0x0E: case 0x0F: case 0x10: case 0x11: case 0x12: case 0x13:
+    case 0x14: case 0x16: case 0x1E: case 0x1F: case 0x24: case 0x25:
+    case 0x2C: case 0x2D: case 0x2E: case 0x2F: case 0x34:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* ── Performance monitors ────────────────────────────────────────────────── */
+
+/* Which PMC / PMD bits are implemented (Itanium Processor Reference Manual for
+ * Software Development, 245320-003, ch. 6): PMC4-7 are the generic counter
+ * controls, PMC8/9 the opcode matchers, PMC10-13 the event address registers
+ * and the branch trace buffer.  Writing a register stores only these bits. */
+static uint64_t pmc_value_for_write(unsigned idx, uint64_t v) {
+    static const uint64_t mask[14] = {
+        [0]  = UINT64_C(0x00000000000000F1),
+        [1]  = 0, [2] = 0, [3] = 0,
+        [4]  = UINT64_C(0x00000000037F7F7F),
+        [5]  = UINT64_C(0x00000000037F7F7F),
+        [6]  = UINT64_C(0x00000000033F7F7F),
+        [7]  = UINT64_C(0x00000000033F7F7F),
+        [8]  = UINT64_C(0xFFFFFFFE3FFFFFF8),
+        [9]  = UINT64_C(0xFFFFFFFE3FFFFFF8),
+        [10] = UINT64_C(0x00000000030F00CF),
+        [11] = UINT64_C(0x00000000130F00CF),
+        [12] = UINT64_C(0x000000000000FFCF),
+        [13] = UINT64_C(0x0000000000000001),
+    };
+    return idx < 14u ? v & mask[idx] : v;
+}
+
+/* The address fields hold a 51-bit virtual address: bits 60:51 read as
+ * copies of bit 50. */
+static uint64_t pmd_va_sext(uint64_t v) {
+    const uint64_t unimpl = UINT64_C(0x3FF) << 51;
+    return (v & (UINT64_C(1) << 50)) ? (v | unimpl) : (v & ~unimpl);
+}
+
+static uint64_t pmd_value_for_write(unsigned idx, uint64_t v) {
+    switch (idx) {
+    case 0:  return pmd_va_sext(v & ~UINT64_C(0x1C));       /* IEAR address, tlb, v */
+    case 1:  return v & UINT64_C(0xFFF);                    /* IEAR latency */
+    case 2:  return pmd_va_sext(v);                         /* DEAR data address */
+    case 3:  return v & UINT64_C(0xC000000000000FFF);       /* DEAR level, latency */
+    case 4: case 5: case 6: case 7:                         /* 32-bit counters, sign-extended */
+        return (uint64_t)(int64_t)(int32_t)(uint32_t)v;
+    case 16: return v & UINT64_C(0xF);                      /* BTB full, bbi */
+    case 17: return pmd_va_sext(v & ~UINT64_C(0x2));        /* DEAR instruction address */
+    default: return v;                                      /* 8-15: BTB, full width */
+    }
+}
+
+/* The generic counters PMC/PMD[4..7] count the events below; the model counts
+ * only these two.  A counter runs while PMC0.fr is clear, its plm bit for the
+ * current privilege level is set, PSR.pp (pm = 1) or PSR.up (pm = 0) is set
+ * and the instruction-set mask allows Itanium execution. */
+enum { PMU_EV_NOPS = 0x30, PMU_EV_STOPS = 0x2E };
+
+/* Whether any armed counter has an event to count; kept out of the Merced
+ * struct, which snapshots copy whole. */
+static bool pmu_count_on;
+
+static void pmu_update(Merced *m) {
+    bool on = false;
+    if (!(m->pmc[0] & 1u)) {
+        for (unsigned n = 4; n <= 7; n++) {
+            uint64_t pmc = m->pmc[n];
+            if (!(pmc & 0xFu))
+                continue;
+            unsigned es = (unsigned)(pmc >> 8) & 0x7Fu;
+            if (es == PMU_EV_NOPS || es == PMU_EV_STOPS)
+                on = true;
+        }
+    }
+    pmu_count_on = on;
+}
+
+static void pmu_count(Merced *m, unsigned es, uint64_t inc) {
+    unsigned cpl = (unsigned)((m->psr >> PSR_CPL_SHIFT) & 3);
+    for (unsigned n = 4; n <= 7; n++) {
+        uint64_t pmc = m->pmc[n];
+        if (((pmc >> 8) & 0x7Fu) != es || !((pmc >> cpl) & 1u))
+            continue;
+        bool pm = (pmc >> 6) & 1u;
+        if (pm ? !((m->psr >> 21) & 1u) : !((m->psr >> 2) & 1u))
+            continue;
+        if ((pmc >> 24) & 1u)                       /* ism: Itanium disabled */
+            continue;
+        uint64_t old = m->pmd[n] & UINT64_C(0xFFFFFFFF);
+        uint64_t sum = old + inc;
+        m->pmd[n] = (uint64_t)(int64_t)(int32_t)(uint32_t)sum;
+        if (sum >> 32) {                            /* carry out of bit 31 */
+            m->pmc[0] |= UINT64_C(1) << n;
+            if ((pmc >> 5) & 1u) {                  /* oi: freeze and interrupt */
+                m->pmc[0] |= 1u;
+                uint64_t pmv = m->cr[73];
+                if (!((pmv >> 16) & 1u))
+                    merced_raise_external(m, (uint8_t)(pmv & 0xFFu));
+            }
+        }
+    }
+    if (m->pmc[0] & 1u)
+        pmu_update(m);
+}
+
+/* A slot retired while a counter is armed. */
+static void pmu_retire(Merced *m, bool is_nop, int qp, unsigned stop_after) {
+    if (m->psr & PSR_IS)
+        return;
+    /* nop.m/i/b and nop.f all count: the architecture's list names the
+     * first three, but the firmware's own check only holds counting nop.f. */
+    if (is_nop && qp)
+        pmu_count(m, PMU_EV_NOPS, 1);
+    if (stop_after)
+        pmu_count(m, PMU_EV_STOPS, 1);
+}
+
+/* Data and instruction breakpoints (SDM vol. 2, 7.1).  DBR/IBR come in pairs:
+ * an address and a control word with the read/write or execute enable in bits
+ * 63:62, the privilege-level mask in 59:56 and an address mask in 55:0 (bits
+ * 63:56 always compare). */
+static bool data_debug_fault(Merced *m, uint64_t va, unsigned size,
+                             uint64_t isr_access, MercedStatus *st) {
+    if (!(m->psr & PSR_DB) || (m->psr & PSR_DD))
+        return false;
+    bool is_write = (isr_access & ISR_W) != 0, is_read = (isr_access & ISR_R) != 0;
+    unsigned cpl = (unsigned)((m->psr >> PSR_CPL_SHIFT) & 3);
+    for (unsigned i = 0; i + 1 < 16; i += 2) {
+        uint64_t addr = m->dbr[i], ctl = m->dbr[i + 1];
+        bool w = (ctl >> 62) & 1u, r = (ctl >> 63) & 1u;
+        if (!w && !r)
+            continue;                               /* pair disabled */
+        if (!((w && is_write) || (r && is_read)))
+            continue;
+        if (!((ctl >> (56 + cpl)) & 1u))
+            continue;
+        uint64_t cmp = (ctl & UINT64_C(0x00FFFFFFFFFFFFFF)) |
+                       UINT64_C(0xFF00000000000000);
+        for (unsigned b = 0; b < size; b++) {       /* any byte matching hits */
+            if ((((va + b) ^ addr) & cmp) == 0) {
+                *st = deliver_fault(m, VEC_DEBUG, isr_access, va, true);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* The same for an instruction fetch: the match is on the bundle. */
+static bool inst_debug_fault(Merced *m, uint64_t ip, MercedStatus *st) {
+    if (!(m->psr & PSR_DB) || (m->psr & PSR_ID))
+        return false;
+    unsigned cpl = (unsigned)((m->psr >> PSR_CPL_SHIFT) & 3);
+    for (unsigned i = 0; i + 1 < 16; i += 2) {
+        uint64_t ctl = m->ibr[i + 1];
+        if (!((ctl >> 63) & 1u) || !((ctl >> (56 + cpl)) & 1u))
+            continue;
+        uint64_t cmp = ((ctl & UINT64_C(0x00FFFFFFFFFFFFFF)) |
+                        UINT64_C(0xFF00000000000000)) & ~UINT64_C(0xF);
+        if (((ip ^ m->ibr[i]) & cmp) != 0)
+            continue;
+        *st = deliver_fault(m, VEC_DEBUG, ISR_X, ip, true);
+        return true;
+    }
+    return false;
+}
+
 /* ── A-unit (executes on M and I) ────────────────────────────────────────── */
 
 static inline bool major_is_alu(unsigned major) {
@@ -2299,39 +2421,49 @@ static int exec_alu(Merced *m, uint64_t raw, int qp, MercedStatus *st) {
             uint8_t nat = n2 | n3;
             uint64_t mask = (width >= 64) ? ~0ull : ((1ull << width) - 1);
             uint64_t smin = 1ull << (width - 1);   /* sign bit of a lane */
+            if (x4 == 4 || x4 == 6) {              /* A10 pshladd2 / pshradd2 */
+                unsigned count = x2b + 1;
+                for (unsigned sh = 0; sh < 64; sh += 16) {
+                    int64_t la = (int16_t)(a >> sh), lb = (int16_t)(b >> sh);
+                    /* A left shift that overflows saturates and the add is
+                     * skipped; an in-range shift is added with saturation. */
+                    int64_t v = x4 == 6 ? (la >> count) : (la * (1ll << count));
+                    if (!(v > 0x7FFF || v < -0x8000))
+                        v += lb;
+                    v = v > 0x7FFF ? 0x7FFF : v < -0x8000 ? -0x8000 : v;
+                    res |= ((uint64_t)v & 0xFFFF) << sh;
+                }
+                gr_write(m, r1, res, nat);
+                return 1;
+            }
             for (unsigned sh = 0; sh < 64; sh += width) {
                 int64_t la = (int64_t)sext((a >> sh) & mask, width);
                 int64_t lb = (int64_t)sext((b >> sh) & mask, width);
                 uint64_t ua = (a >> sh) & mask, ub = (b >> sh) & mask;
                 uint64_t r;
                 switch (x4) {
-                case 0:                        /* padd */
-                    if (x2b == 0) r = (ua + ub) & mask;
-                    else if (x2b == 1) {       /* sss: signed saturate */
-                        int64_t s = la + lb;
-                        int64_t hi = (int64_t)(smin - 1), lo = -(int64_t)smin;
-                        r = (uint64_t)(s > hi ? hi : s < lo ? lo : s) & mask;
-                    } else {                   /* uuu / uus: unsigned saturate */
-                        uint64_t s = ua + ub;
-                        r = s > mask ? mask : s;
+                case 0: case 1: {              /* padd / psub */
+                    bool sub = x4 == 1;
+                    int64_t u = sub ? (int64_t)ua - (int64_t)ub : (int64_t)ua + (int64_t)ub;
+                    int64_t sg = sub ? la - lb : la + lb;
+                    /* uus: the first operand is unsigned, the second signed */
+                    int64_t us = sub ? (int64_t)ua - lb : (int64_t)ua + lb;
+                    int64_t shi = (int64_t)(smin - 1), slo = -(int64_t)smin;
+                    int64_t umax = (int64_t)mask;
+                    switch (x2b) {
+                    case 0:  r = (uint64_t)u & mask; break;
+                    case 1:  r = (uint64_t)(sg > shi ? shi : sg < slo ? slo : sg) & mask; break;
+                    case 2:  r = (uint64_t)(u > umax ? umax : u < 0 ? 0 : u); break;
+                    default: r = (uint64_t)(us > umax ? umax : us < 0 ? 0 : us); break;
                     }
                     break;
-                case 1:                        /* psub */
-                    if (x2b == 0) r = (ua - ub) & mask;
-                    else if (x2b == 1) {       /* sss */
-                        int64_t s = la - lb;
-                        int64_t hi = (int64_t)(smin - 1), lo = -(int64_t)smin;
-                        r = (uint64_t)(s > hi ? hi : s < lo ? lo : s) & mask;
-                    } else {                   /* uuu / uus */
-                        r = ua < ub ? 0 : (ua - ub);
-                    }
+                }
+                case 2: case 3: {              /* pavg (.raz) / pavgsub */
+                    uint32_t n = x4 == 3 ? (uint32_t)(ua - ub) : (uint32_t)(ua + ub);
+                    /* pavg rounds to odd unless .raz rounds away from zero */
+                    r = (x4 == 2 && x2b == 3 ? (n + 1) >> 1 : (n >> 1) | (n & 1)) & mask;
                     break;
-                case 2:                        /* pavg (+raz rounds up) */
-                    r = ((ua + ub + (x2b == 3 ? 1 : 0)) >> 1) & mask;
-                    break;
-                case 3:                        /* pavgsub */
-                    { int64_t s = (la - lb); r = (uint64_t)(s >> 1) & mask; }
-                    break;
+                }
                 case 9:                        /* pcmp: all-ones if true */
                     if (x2b == 0) r = (ua == ub) ? mask : 0;      /* eq */
                     else r = (la > lb) ? mask : 0;                /* gt */
@@ -2535,6 +2667,19 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         warn_once(m, WARN_SEMAPHORE, "semaphore ops executed non-atomically");
         uint64_t va = gr_read(m, r3, &n3), pa;
         unsigned size = 1u << (x6 & 3);
+        if (data_debug_fault(m, va, size, ISR_R | ISR_W, &st)) return st;
+        if (unaligned_fault(m, va, size, ISR_R | ISR_W, true, &st)) return st;
+        /* A semaphore needs cacheable memory: a physical reference with
+         * address bit 63 set is uncacheable (vol. 2, 4.4.7). */
+        if (!(m->psr & PSR_DT) && (va >> 63))
+            return deliver_fault(m, VEC_UNSUPPORTED, ISR_R | ISR_W, va, true);
+        if (m->psr & PSR_DT) {
+            uint32_t rid = (uint32_t)((m->rr[va >> 61] >> 8) & 0xFFFFFFull);
+            const MercedTlbEntry *e = tlb_search(m->dtr, MERCED_N_DTR, rid, va, &m->dtr_hint);
+            if (!e) e = tlb_search(m->dtc, MERCED_N_TC, rid, va, &m->dtc_hint);
+            if (e && (e->pte & PTE_PRESENT) && ((e->pte >> PTE_MA_SHIFT) & 7) != 0)
+                return deliver_fault(m, VEC_UNSUPPORTED, ISR_R | ISR_W, va, true);
+        }
         if (!va_translate(m, va, false, false, ISR_R | ISR_W, &pa, &st)) return st;
         if (x6 <= 0x07) {                       /* cmpxchg.acq/.rel */
             uint64_t old = phys_read(m, pa, size);
@@ -2576,13 +2721,8 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         switch (x6) {
         case 0x1C: v = f.sig; break;                              /* getf.sig */
         case 0x1D: v = ((uint64_t)f.sign << 17) | f.exp; break;   /* getf.exp */
-        case 0x1E: {                                              /* getf.s */
-            double d = fp2d(f); float fl = (float)d; uint32_t u;
-            memcpy(&u, &fl, 4); v = u; break;
-        }
-        case 0x1F: {                                              /* getf.d */
-            double d = fp2d(f); uint64_t u; memcpy(&u, &d, 8); v = u; break;
-        }
+        case 0x1E: v = merced_fp_to_single_mem(f); break;         /* getf.s */
+        case 0x1F: v = merced_fp_to_double_mem(f); break;         /* getf.d */
         default: return mhalt(m, "unimpl getf x6=0x%02X", x6);
         }
         gr_write(m, r1, v, f.nat);
@@ -2620,6 +2760,10 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
                 return deliver_fault(m, VEC_NAT,
                                      ISR_NA | ISR_R | UINT64_C(0x10),
                                      0, false);
+            if (!n3 && data_debug_fault(m, va, size, ISR_R, &st))
+                return st;
+            if (!n3 && unaligned_fault(m, va, size, ISR_R, false, &st))
+                return st;
             if (n3) {
                 gr_write(m, r1, 0, 1);
             } else if (!va_translate(m, va, false, spec, ISR_R, &pa, &st)) {
@@ -2676,6 +2820,8 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
             if (x6 != 0x3B && n2)
                 return deliver_fault(m, VEC_NAT,
                                      ISR_W | UINT64_C(0x10), 0, false);
+            if (data_debug_fault(m, va, size, ISR_W, &st)) return st;
+            if (unaligned_fault(m, va, size, ISR_W, false, &st)) return st;
             if (!va_translate(m, va, false, false, ISR_W, &pa, &st)) return st;
             if (x6 == 0x3B) {
                 unsigned bit = (unsigned)((va >> 3) & 0x3F);
@@ -2694,6 +2840,64 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
 
     if (major == 6 || major == 7) {
         /* FP load/store + lfetch + setf */
+        if (major == 6 && xbit && !(x6 >= 0x1C && x6 <= 0x1F)) {
+            /* M11 ldfps / ldfpd / ldfp8 and their check forms: a pair of
+             * floating-point loads into two registers of opposite parity. */
+            if (!qp) return MERCED_OK;
+            unsigned fmt = x6 & 3, fa = r1, fb = r2;
+            bool chk = x6 >= 0x20 && x6 <= 0x27, spec = ((x6 >> 2) & 3) == 1 || ((x6 >> 2) & 3) == 3;
+            if (fmt == 0 || (x6 > 0x0F && !chk))
+                return mhalt(m, "unimpl M ldfp x6=0x%02X", x6);
+            if ((fr_phys(m, fa) & 1u) == (fr_phys(m, fb) & 1u))
+                return deliver_fault(m, VEC_GENERAL, 0, 0, false);
+            uint64_t va = gr_read(m, r3, &n3), pa;
+            unsigned total = fmt == 2 ? 8 : 16;
+            if (n3 && !spec)
+                return deliver_fault(m, VEC_NAT, ISR_NA | ISR_R | UINT64_C(0x10), 0, false);
+            if (data_debug_fault(m, va, total, ISR_R, &st)) return st;
+            if (unaligned_fault(m, va, total, ISR_R, false, &st)) return st;
+            unsigned ka = ALAT_FP_KEY + fr_phys(m, fa), kb = ALAT_FP_KEY + fr_phys(m, fb);
+            unsigned esz = total / 2;
+            bool skip = false;
+            if (chk) {
+                if (!va_translate(m, va, false, false, ISR_R, &pa, &st)) return st;
+                bool ha = alat_check(m, ka, pa, esz, x6 < 0x24);
+                bool hb = alat_check(m, kb, pa + esz, esz, x6 < 0x24);
+                skip = ha && hb;
+            } else if (!va_translate(m, va, false, spec, ISR_R, &pa, &st)) {
+                if (st != MERCED_OK || m->taken) return st;
+                MercedFpReg nat = {0, 0, 0, 1};
+                fr_write(m, fa, nat);
+                fr_write(m, fb, nat);
+                skip = true;
+            } else {
+                alat_invalidate_reg(m, ka);
+                alat_invalidate_reg(m, kb);
+            }
+            if (!skip) {
+                MercedFpReg f[2];
+                for (unsigned k = 0; k < 2; k++) {
+                    uint64_t u = phys_read(m, pa + k * esz, esz);
+                    if (fmt == 1) {
+                        MercedFpReg g = {u, 0x1003E, 0, 0};
+                        f[k] = g;
+                    } else if (fmt == 2) {
+                        f[k] = merced_fp_from_single_mem((uint32_t)u);
+                    } else {
+                        f[k] = merced_fp_from_double_mem(u);
+                    }
+                }
+                fr_write(m, fa, f[0]);
+                fr_write(m, fb, f[1]);
+                if (((x6 >> 2) & 3) == 2 || ((x6 >> 2) & 3) == 3) {  /* .a / .sa */
+                    alat_set(m, ka, pa, esz);
+                    alat_set(m, kb, pa + esz, esz);
+                }
+            }
+            if (mbit)
+                gr_write(m, r3, va + total, n3);
+            return MERCED_OK;
+        }
         if (major == 6 && xbit && mbit == 0) {     /* M18 setf */
             if (!qp) return MERCED_OK;
             uint64_t v = gr_read(m, r2, &n2);
@@ -2703,10 +2907,8 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
             case 0x1D: f.exp = (uint32_t)(v & 0x1FFFF);           /* setf.exp */
                        f.sign = (uint8_t)((v >> 17) & 1);
                        f.sig = 0x8000000000000000ull; break;
-            case 0x1E: { float fl; uint32_t u = (uint32_t)v;      /* setf.s */
-                         memcpy(&fl, &u, 4); f = d2fp((double)fl); break; }
-            case 0x1F: { double d; uint64_t u = v;                /* setf.d */
-                         memcpy(&d, &u, 8); f = d2fp(d); break; }
+            case 0x1E: f = merced_fp_from_single_mem((uint32_t)v); break;   /* setf.s */
+            case 0x1F: f = merced_fp_from_double_mem(v); break;             /* setf.d */
             default: return mhalt(m, "unimpl setf x6=0x%02X", x6);
             }
             f.nat = n2;
@@ -2749,54 +2951,87 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         if (check_load && n3)
             return deliver_fault(m, VEC_NAT,
                                  ISR_NA | ISR_R | UINT64_C(0x10), 0, false);
-        if (!va_translate(m, va, false, false, is_st ? ISR_W : ISR_R,
-                          &pa, &st)) return st;
+        {
+            static const unsigned fsize[4] = { 16, 8, 4, 8 };
+            unsigned fsz = (x6 == 0x1B || x6 == 0x3B) ? 16 : fsize[x6 & 3];
+            if (data_debug_fault(m, va, fsz, is_st ? ISR_W : ISR_R, &st))
+                return st;
+            if (unaligned_fault(m, va, fsz, is_st ? ISR_W : ISR_R, false, &st))
+                return st;
+        }
+        bool fspec = !is_st && x6 <= 0x0F && (((x6 >> 2) & 3) == 1 || ((x6 >> 2) & 3) == 3);
+        if (!va_translate(m, va, false, fspec, is_st ? ISR_W : ISR_R, &pa, &st)) {
+            /* A deferred speculative load completes with a NaTVal */
+            if (!fspec || st != MERCED_OK || m->taken) return st;
+            MercedFpReg nat = {0, 0, 0, 1};
+            fr_write(m, (unsigned)bits(raw, 6, 7), nat);
+            goto fp_base_update;
+        }
         unsigned fmt = x6 & 3;   /* 0=e 1=8 2=s 3=d */
-        /* FP ALAT entries are not retained, matching FP chk.a's existing
-         * conservative miss behavior.  The SDM permits ALAT entries to be
-         * invalidated at any time, so both check-load forms take their
-         * ordinary reload path, including translation faults and updates.
-         * Integer ALAT entries with the same register number are unrelated. */
         if (!is_st && (x6 <= 0x0F || x6 == 0x1B || check_load)) {
+            static const unsigned fsize[4] = { 16, 8, 4, 8 };
+            unsigned fsz = x6 == 0x1B ? 16 : fsize[fmt];
+            unsigned alat_key = ALAT_FP_KEY + fr_phys(m, (unsigned)bits(raw, 6, 7));
+            /* A check load that finds its entry leaves the register alone;
+             * ldf.a and ldf.sa establish the entry a later check consumes,
+             * and any other load removes the register's old one. */
+            if (check_load && alat_check(m, alat_key, pa, fsz, x6 < 0x24))
+                goto fp_load_done;
+            if (!check_load)
+                alat_invalidate_reg(m, alat_key);
             MercedFpReg f = {0, 0, 0, 0};
             if (x6 == 0x1B) {                       /* ldf.fill: spill format */
                 f.sig = phys_read(m, pa, 8);
                 uint64_t se = phys_read(m, pa + 8, 8);
                 f.exp = (uint32_t)(se & 0x1FFFF);
                 f.sign = (uint8_t)((se >> 17) & 1);
+                /* the NaTVal encoding (sign 0, exponent 0x1FFFE, zero
+                 * significand) comes back as a NaTVal */
+                if (!f.sign && f.exp == 0x1FFFE && f.sig == 0)
+                    f.nat = 1;
             } else switch (fmt) {
-            case 0:                                  /* ldfe: 82-bit in 16 bytes */
+            case 0: {                                /* ldfe: 80-bit extended */
                 f.sig = phys_read(m, pa, 8);
-                { uint64_t se = phys_read(m, pa + 8, 8);
-                  f.exp = (uint32_t)(se & 0x1FFFF);
-                  f.sign = (uint8_t)((se >> 17) & 1); }
+                uint32_t hw = (uint32_t)phys_read(m, pa + 8, 2);
+                uint32_t me = hw & 0x7FFFu;
+                f.exp = me == 0x7FFFu ? 0x1FFFFu : me == 0 ? 0 : me + 0xC000u;
+                f.sign = (uint8_t)((hw >> 15) & 1);
                 break;
+            }
             case 1: f.sig = phys_read(m, pa, 8); f.exp = 0x1003E; break; /* ldf8 */
-            case 2: { uint32_t u = (uint32_t)phys_read(m, pa, 4); float fl;
-                      memcpy(&fl, &u, 4); f = d2fp((double)fl); break; }
-            case 3: { uint64_t u = phys_read(m, pa, 8); double d;
-                      memcpy(&d, &u, 8); f = d2fp(d); break; }
+            case 2: f = merced_fp_from_single_mem((uint32_t)phys_read(m, pa, 4)); break;
+            case 3: f = merced_fp_from_double_mem(phys_read(m, pa, 8)); break;
             }
             fr_write(m, (unsigned)bits(raw, 6, 7), f);
+            if ((x6 >= 0x08 && x6 <= 0x0F) || (x6 >= 0x28 && x6 <= 0x2B))
+                alat_set(m, alat_key, pa, fsz);
+        fp_load_done:;
         } else if (is_st) {
             MercedFpReg f = fr_read(m, (unsigned)bits(raw, 13, 7));
             if (x6 == 0x3B) {                        /* stf.spill */
-                phys_write(m, pa, f.sig, 8);
-                phys_write(m, pa + 8, ((uint64_t)f.sign << 17) | f.exp, 8);
+                if (f.nat) {                         /* NaTVal's spill image */
+                    phys_write(m, pa, 0, 8);
+                    phys_write(m, pa + 8, 0x1FFFE, 8);
+                } else {
+                    phys_write(m, pa, f.sig, 8);
+                    phys_write(m, pa + 8, ((uint64_t)f.sign << 17) | f.exp, 8);
+                }
             } else switch (fmt) {
-            case 0:
+            case 0: {                                /* stfe: 80-bit extended */
+                uint32_t me = f.exp == 0x1FFFFu ? 0x7FFFu : f.exp == 0 ? 0
+                            : (f.exp - 0xC000u) & 0x7FFFu;
                 phys_write(m, pa, f.sig, 8);
-                phys_write(m, pa + 8, ((uint64_t)f.sign << 17) | f.exp, 8);
+                phys_write(m, pa + 8, ((uint32_t)f.sign << 15) | me, 2);
                 break;
+            }
             case 1: phys_write(m, pa, f.sig, 8); break;
-            case 2: { float fl = (float)fp2d(f); uint32_t u;
-                      memcpy(&u, &fl, 4); phys_write(m, pa, u, 4); break; }
-            case 3: { double d = fp2d(f); uint64_t u;
-                      memcpy(&u, &d, 8); phys_write(m, pa, u, 8); break; }
+            case 2: phys_write(m, pa, merced_fp_to_single_mem(f), 4); break;
+            case 3: phys_write(m, pa, merced_fp_to_double_mem(f), 8); break;
             }
         } else {
             return mhalt(m, "unimpl M fp-mem x6=0x%02X major %u", x6, major);
         }
+    fp_base_update:
         /* base updates */
         if (major == 7) {
             int stf = is_st;
@@ -2954,20 +3189,8 @@ static bool ami_runtime_ip(const Merced *m, uint64_t ip) {
  * keep interrupts pending across those entries as well as the firmware's
  * own transition. Once the loader installs an IVT, normal delivery resumes. */
 static bool ami_ivt_handoff_pending(const Merced *m) {
-    /* PE utilities can use a preferred base below the 64 MiB shadow limit:
-     * NVRBOOT enters at 0x01042000. Recognize the AMI shell's physical-mode
-     * region/VHPT setup there, while it still exposes bootstrap revision 0.
-     * IVA=0 remains a valid interrupt table for other low-memory code. */
-    bool low_application = m->ip >= UINT64_C(0x00100000) &&
-                           m->ip < UINT64_C(0x04000000) &&
-                           m->ip < m->bus.ram_size &&
-                           m->cpu_revision == 0 &&
-                           ((m->psr >> PSR_CPL_SHIFT) & 3) == 0 &&
-                           !(m->psr & (PSR_IT | PSR_DT | PSR_RT)) &&
-                           m->cr[CR_PTA] == UINT64_C(0x40) &&
-                           m->rr[0] == UINT64_C(0x100030);
     return m->cr[CR_IVA] == 0 &&
-           (low_application || ami_runtime_ip(m, m->ip) ||
+           (ami_runtime_ip(m, m->ip) ||
             (m->ip >= UINT64_C(0x04000000) && m->ip < m->bus.ram_size) ||
             (m->ip & UINT64_C(0x00000fff00000000)) ==
                 UINT64_C(0x00000e0000000000) ||
@@ -3376,6 +3599,9 @@ static MercedStatus rse_store_through(Merced *m, int64_t end) {
         if (!va_translate(m, addr, false, false,
                           ISR_W | ISR_RS, &pa, &st))
             return st;
+        /* On Merced PSR.da and PSR.dd cover one RSE reference, not a whole
+         * flushrs: each spill takes its own access-bit fault. */
+        m->psr &= ~(PSR_DA | PSR_DD);
         uint64_t bit = UINT64_C(1) << ((addr >> 3) & 63);
         uint64_t rnat = (m->ar[AR_RNAT] & ~bit) |
                         (m->nat_stack[idx] ? bit : 0);
@@ -4121,6 +4347,8 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         if (x3 == 0) {
             if (x4 >= 4 && x4 <= 7) {              /* M44 sum/rum/ssm/rsm */
                 if (!qp) return MERCED_OK;
+                MercedStatus pst;
+                if (x4 >= 6 && privileged_fault(m, &pst)) return pst;
                 uint64_t imm = (bits(raw, 36, 1) << 23) | (bits(raw, 31, 2) << 21) |
                                bits(raw, 6, 21);
                 switch (x4) {
@@ -4211,21 +4439,28 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
             }
             case 0x01: return MERCED_OK;            /* nop.m / hint.m */
             case 0x10:                              /* invala */
-                if (qp)
+                if (qp) {
                     memset(m->alat, 0, sizeof(m->alat));
+                    m->alat_valid_mask = 0;
+                }
                 return MERCED_OK;
             case 0x12:                              /* invala.e r */
                 if (qp)
                     alat_invalidate_reg(m, r1);
                 return MERCED_OK;
-            case 0x13: return MERCED_OK;            /* invala.e f (FP ALAT TBD) */
+            case 0x13:                              /* invala.e f */
+                if (qp)
+                    alat_invalidate_reg(m, ALAT_FP_KEY + fr_phys(m, r1));
+                return MERCED_OK;
             case 0x20: return MERCED_OK;            /* fwb */
             case 0x22: case 0x23: return MERCED_OK; /* mf / mf.a */
             case 0x28: {                            /* M30 mov.m ar3=imm8 */
                 if (!qp) return MERCED_OK;
                 unsigned ar3 = (unsigned)bits(raw, 20, 7);
-                m->ar[ar3] = (uint64_t)sext((bits(raw, 36, 1) << 7) |
-                                            bits(raw, 13, 7), 8);
+                uint64_t imm = (uint64_t)sext((bits(raw, 36, 1) << 7) | bits(raw, 13, 7), 8);
+                MercedStatus ast;
+                if (ar_write_blocked(m, ar3, false, imm, 0, &ast)) return ast;
+                m->ar[ar3] = ar_value_for_write(m, ar3, imm);
                 return MERCED_OK;
             }
             case 0x30:                              /* srlz.d */
@@ -4250,27 +4485,21 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
              * forms clear a matching entry.  FP ALAT entries are not yet
              * modeled, so FP checks conservatively fail. */
             unsigned reg = (unsigned)bits(raw, 6, 7);
-            bool hit = x3 < 6 && alat_check_reg(m, reg, x3 & 1);
+            bool hit = alat_check_reg(m, x3 < 6 ? reg : ALAT_FP_KEY + fr_phys(m, reg), x3 & 1);
             if (hit)
                 return MERCED_OK;
             /* M22/M23 use contiguous imm20b in bits 32:13.  Bits 12:6
              * name the checked register, unlike chk.s's split immediate. */
-            int64_t disp = sext((bits(raw, 36, 1) << 20) |
-                                bits(raw, 13, 20), 21) * 16;
-            m->ip = (m->ip & ~0xFull) + (uint64_t)disp;
-            m->taken = 1;
-            return MERCED_OK;
+            return chk_recover(m, x3 < 6 ? 0 : 2,
+                               (bits(raw, 36, 1) << 20) | bits(raw, 13, 20));
         }
         if (x3 == 1 || x3 == 2 || x3 == 3) {
             /* M20 chk.s.m r2,target25 (x3=1); 2/3 are fp/spec variants */
             if (!qp) return MERCED_OK;
             gr_read(m, r2, &n2);
-            if (x3 == 1 && n2) {
-                int64_t disp = sext((bits(raw, 36, 1) << 20) |
-                                    (bits(raw, 20, 13) << 7) | bits(raw, 6, 7), 21) << 4;
-                m->ip = (m->ip & ~0xFull) + (uint64_t)disp;
-                m->taken = 1;
-            }
+            if (x3 == 1 && n2)
+                return chk_recover(m, 1, (bits(raw, 36, 1) << 20) |
+                                   (bits(raw, 20, 13) << 7) | bits(raw, 6, 7));
             return MERCED_OK;
         }
         return mhalt(m, "unimpl M-sys major 0 x3=%u", x3);
@@ -4291,14 +4520,18 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         unsigned sof = (unsigned)bits(raw, 13, 7);
         unsigned sol = (unsigned)bits(raw, 20, 7);
         unsigned sor = (unsigned)bits(raw, 27, 4);
-        if (sof > MERCED_N_STACKED)
-            return mhalt(m, "alloc sof=%u too large", sof);
-        gr_write(m, r1, m->ar[AR_PFS], 0);
+        /* The frame must be consistent and the target a register of the new
+         * frame (and not r0). */
+        if (sof > MERCED_N_STACKED || sol > sof || sor * 8 > sof || r1 == 0 ||
+            (r1 >= 32 && r1 - 32 >= sof))
+            return deliver_fault(m, VEC_GENERAL, 0, 0, false);
+        uint64_t pfs = m->ar[AR_PFS];
         /* alloc replaces sof/sol/sor but preserves the three rotation
          * bases.  Firmware routinely enters leaf arithmetic helpers with
          * a non-zero rrb.pr and relies on alloc leaving it intact. */
         m->cfm = (m->cfm & ~0x3FFFFull) |
                  sof | ((uint64_t)sol << 7) | ((uint64_t)sor << 14);
+        gr_write(m, r1, pfs, 0);
         return rse_spill_excess(m);
     }
     if (x3 == 1 || x3 == 3) {
@@ -4319,12 +4552,9 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
             gr_read(m, r2, &n2);
             failed = n2;
         }
-        if (failed) {
-            int64_t disp = sext((bits(raw, 36, 1) << 20) |
-                                (bits(raw, 20, 13) << 7) | bits(raw, 6, 7), 21) * 16;
-            m->ip = (m->ip & ~UINT64_C(0xF)) + (uint64_t)disp;
-            m->taken = 1;
-        }
+        if (failed)
+            return chk_recover(m, x3 == 3 ? 3 : 1, (bits(raw, 36, 1) << 20) |
+                               (bits(raw, 20, 13) << 7) | bits(raw, 6, 7));
         return MERCED_OK;
     }
     if (x3 != 0)
@@ -4332,25 +4562,64 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
 
     unsigned x6 = (unsigned)bits(raw, 27, 6);
     if (!qp) return MERCED_OK;
+    if (m_sys_x6_privileged(x6)) {
+        MercedStatus pst;
+        if (privileged_fault(m, &pst)) return pst;
+    }
     switch (x6) {
-    case 0x00: xlate_flush(m); m->rr[gr_read(m, r3, &n3) >> 61 & 7] = gr_read(m, r2, &n2);
-               /* rr index is GR[r3] bits 63:61 */
-               return MERCED_OK;
-    case 0x01: m->dbr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
-    case 0x02: m->ibr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
-    case 0x03: xlate_flush(m); m->pkr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
-    case 0x04: m->pmc[gr_read(m, r3, &n3) & 31] = gr_read(m, r2, &n2); return MERCED_OK;
-    case 0x05: m->pmd[gr_read(m, r3, &n3) & 31] = gr_read(m, r2, &n2); return MERCED_OK;
-    case 0x06: {
-        unsigned idx = (unsigned)(gr_read(m, r3, &n3) & 4095);
-        if (idx == MSR_PMI_LATCH) {
-            m->msr[idx] &= ~gr_read(m, r2, &n2);    /* write one to clear */
+    case 0x00: case 0x03: {                         /* rr[r3] = r2, pkr[r3] = r2 */
+        uint64_t idx = gr_read(m, r3, &n3), v = gr_read(m, r2, &n2);
+        if (n2 || n3)
+            return deliver_fault(m, VEC_NAT, UINT64_C(0x10), 0, false);
+        /* A reserved bit, or for an rr a page size the processor does not
+         * implement, is a Reserved Register/Field fault. */
+        bool bad = x6 == 0
+            ? ((v & UINT64_C(0xFFFFFFFF00000002)) ||
+               !((PAL_INSERTABLE_PS_MASK >> ((v >> 2) & 0x3F)) & 1))
+            : (v & UINT64_C(0xFFFFFFFF000000F0)) != 0;
+        if (bad)
+            return deliver_fault(m, VEC_GENERAL, 0x30, 0, false);
+        xlate_flush(m);
+        if (x6 == 0) {
+            m->rr[idx >> 61 & 7] = v;      /* the index is GR[r3] bits 63:61 */
             return MERCED_OK;
         }
-        m->msr[idx] = gr_read(m, r2, &n2);
-        m->msr_written[idx] = 1;
-        m->msr_polls[idx] = 0;
-        m->msr_toggle[idx] = 0;
+        unsigned i = (unsigned)(idx & 15);
+        /* Merced invalidates the older copy of a valid key another register
+         * already holds, and keeps the one being written. */
+        if (v & 1u) {
+            for (unsigned k = 0; k < 16; k++)
+                if (k != i && (m->pkr[k] & 1u) &&
+                    ((m->pkr[k] ^ v) & UINT64_C(0xFFFFFF00)) == 0)
+                    m->pkr[k] &= ~UINT64_C(1);
+        }
+        m->pkr[i] = v;
+        return MERCED_OK;
+    }
+    case 0x01: m->dbr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
+    case 0x02: m->ibr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
+    case 0x04: {
+        unsigned idx = (unsigned)(gr_read(m, r3, &n3) & 31);
+        m->pmc[idx] = pmc_value_for_write(idx, gr_read(m, r2, &n2));
+        if (idx == 0 || (idx >= 4 && idx <= 7))
+            pmu_update(m);
+        return MERCED_OK;
+    }
+    case 0x05: {
+        unsigned idx = (unsigned)(gr_read(m, r3, &n3) & 31);
+        m->pmd[idx] = pmd_value_for_write(idx, gr_read(m, r2, &n2));
+        return MERCED_OK;
+    }
+    case 0x06: {
+        unsigned idx = (unsigned)(gr_read(m, r3, &n3) & 4095);
+        uint64_t v = gr_read(m, r2, &n2);
+        if (idx == MSR_PMI_LATCH) {
+            m->msr[idx] &= ~v;                      /* write one to clear */
+        } else if (m->merced_msrs) {
+            merced_msr_access(m, true, idx, v);
+        } else {
+            m->msr[idx] = v;
+        }
         return MERCED_OK;
     }
     case 0x09: case 0x0A: case 0x0B: {              /* ptc.l/g/ga */
@@ -4411,33 +4680,15 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         uint64_t v;
         if (idx == MSR_PMI_LATCH) {
             v = m->msr[idx] & PMI_VECTORS;
+        } else if (m->merced_msrs) {
+            v = merced_msr_access(m, false, idx, 0);
         } else if (idx == 0x617 && m->clock_ratio_strapped) {
             /* The ratio is hardware strapping; firmware writes do not
              * define it. */
             v = (m->msr[idx] & ~(UINT64_C(0xf) << 22)) |
                 ((uint64_t)m->clock_ratio_code << 22);
-        } else if (m->msr_written[idx]) {
-            v = m->msr[idx];
-            /* command/status handshake: PAL writes a command, then polls
-             * the same register for completion. After many reads with no
-             * intervening write, alternate the complement in so a bit-wait
-             * of either polarity terminates. */
-            if (m->msr_polls[idx] < 0xFFFF)
-                m->msr_polls[idx]++;
-            if (m->msr_polls[idx] > 64) {
-                m->msr_toggle[idx] ^= 1;
-                if (m->msr_toggle[idx]) v = ~v;
-            }
         } else {
-            /* Unwritten status MSR: quiet (0) for one-shot reads - the
-             * SALE-entry wake-reason probes must see no pending events -
-             * but alternate once something polls it repeatedly so
-             * wait-for-set handshakes still terminate. */
-            if (m->msr_polls[idx] < 0xFFFF)
-                m->msr_polls[idx]++;
-            if (m->msr_polls[idx] > 16)
-                m->msr_toggle[idx] ^= 1;
-            v = m->msr_toggle[idx] ? ~0ull : 0;
+            v = m->msr[idx];
         }
         gr_write(m, r1, v, 0);
         return MERCED_OK;
@@ -4595,6 +4846,8 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x22: {                                    /* mov.m r1=ar3 */
         unsigned ar3 = (unsigned)bits(raw, 20, 7);
         uint64_t v = m->ar[ar3];
+        MercedStatus ast;
+        if (ar_read_blocked(m, ar3, false, &v, &ast)) return ast;
         if (ar3 == AR_BSP)
             /* AR.BSP names the base of the current frame.  The end of the
              * dirty partition is BOF+SOF, but exposing that as BSP makes
@@ -4638,12 +4891,9 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     case 0x2A: {                                    /* mov.m ar3=r2 */
         unsigned ar3 = (unsigned)bits(raw, 20, 7);
         uint64_t ar_val = gr_read(m, r2, &n2);
-        /* ar.rsc defines only mode(2)/pl(2)/be(1) in bits 4:0 and loadrs in
-         * bits 29:16 - everything else is reserved and must fault. */
-        if (ar3 == AR_RSC && (ar_val & ~(0x1Full | (0x3FFFull << 16))))
-            return deliver_fault(m, VEC_GENERAL, 0, 0, false);
-        m->ar[ar3] = ar3 == AR_RSC
-                   ? rsc_value_for_write(m, ar_val) : ar_val;
+        MercedStatus ast;
+        if (ar_write_blocked(m, ar3, false, ar_val, n2, &ast)) return ast;
+        m->ar[ar3] = ar_value_for_write(m, ar3, ar_val);
         if (ar3 == AR_BSPSTORE) {
             int64_t bsp_regs = (int64_t)m->bof_total;
             int64_t dirty = bsp_regs > m->rse_flushed_regs
@@ -4672,7 +4922,15 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
     }
     case 0x2C: {                                    /* mov cr3=r2 */
         unsigned cr3 = (unsigned)bits(raw, 20, 7);
-        m->cr[cr3] = gr_read(m, r2, &n2);
+        uint64_t crv = gr_read(m, r2, &n2);
+        if (n2)
+            return deliver_fault(m, VEC_NAT, UINT64_C(0x10), 0, false);
+        /* CR.PTA: size below 15 and the reserved bits fault. */
+        if (cr3 == CR_PTA && (((crv >> 2) & 0x3F) < 15 || (crv & UINT64_C(0x7E02))))
+            return deliver_fault(m, VEC_GENERAL, 0x30, 0, false);
+        m->cr[cr3] = crv;
+        if (cr3 == CR_IVA)
+            m->cr[cr3] &= ~UINT64_C(0x7FFF);        /* 32 KiB aligned */
         if (cr3 == CR_EOI) {                        /* retire highest in-service */
             unsigned isv = in_service_highest(m);
             if (isv)
@@ -4723,7 +4981,13 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         tlb_insert(m, &m->itc[m->itc_next++ % MERCED_N_TC], pte, true);
         return MERCED_OK;
     }
-    case 0x30: return MERCED_OK;                    /* fc / fc.i */
+    case 0x30:                                      /* fc / fc.i */
+        /* A cache-array model holding the line checks it, writes it back
+         * and drops it (merced_cache.c; physical mode -- fc names the line
+         * whatever the attribute of the address used). */
+        if (__builtin_expect(m->cache.observe, 0) && !(m->psr & PSR_DT))
+            merced_cache_fc(m, model_pa(m, gr_read(m, r3, &n3)));
+        return MERCED_OK;
     case 0x31: case 0x32: case 0x33: {             /* probe.*.fault */
         /* Unlike result-producing probe, these forms are faulting hints:
          * if the requested access is not currently translatable they must
@@ -4809,8 +5073,10 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             case 0x0A: {                            /* mov.i ar3=imm8 */
                 if (!qp) return MERCED_OK;
                 unsigned ar3 = (unsigned)bits(raw, 20, 7);
-                m->ar[ar3] = (uint64_t)sext((bits(raw, 36, 1) << 7) |
-                                            bits(raw, 13, 7), 8);
+                uint64_t imm = (uint64_t)sext((bits(raw, 36, 1) << 7) | bits(raw, 13, 7), 8);
+                MercedStatus ast;
+                if (ar_write_blocked(m, ar3, true, imm, 0, &ast)) return ast;
+                m->ar[ar3] = ar_value_for_write(m, ar3, imm);
                 return MERCED_OK;
             }
             case 0x10: case 0x11: case 0x12:
@@ -4848,7 +5114,10 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             case 0x32: {                            /* mov.i r1=ar3 */
                 if (!qp) return MERCED_OK;
                 unsigned ar3 = (unsigned)bits(raw, 20, 7);
-                gr_write(m, r1, m->ar[ar3], 0);
+                uint64_t v = m->ar[ar3];
+                MercedStatus ast;
+                if (ar_read_blocked(m, ar3, true, &v, &ast)) return ast;
+                gr_write(m, r1, v, 0);
                 return MERCED_OK;
             }
             case 0x33: {                            /* mov r1=pr */
@@ -4863,10 +5132,9 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
                 if (!qp) return MERCED_OK;
                 unsigned ar3 = (unsigned)bits(raw, 20, 7);
                 uint64_t ar_val = gr_read(m, r2, &n2);
-                if (ar3 == AR_RSC && (ar_val & ~(0x1Full | (0x3FFFull << 16))))
-                    return deliver_fault(m, VEC_GENERAL, 0, 0, false);
-                m->ar[ar3] = ar3 == AR_RSC
-                           ? rsc_value_for_write(m, ar_val) : ar_val;
+                MercedStatus ast;
+                if (ar_write_blocked(m, ar3, true, ar_val, n2, &ast)) return ast;
+                m->ar[ar3] = ar_value_for_write(m, ar3, ar_val);
                 return MERCED_OK;
             }
             }
@@ -4898,12 +5166,9 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
         if (x3 == 1) {                              /* chk.s.i */
             if (!qp) return MERCED_OK;
             gr_read(m, r2, &n2);
-            if (n2) {
-                int64_t disp = sext((bits(raw, 36, 1) << 20) |
-                                    (bits(raw, 20, 13) << 7) | bits(raw, 6, 7), 21) << 4;
-                m->ip = (m->ip & ~0xFull) + (uint64_t)disp;
-                m->taken = 1;
-            }
+            if (n2)
+                return chk_recover(m, 1, (bits(raw, 36, 1) << 20) |
+                                   (bits(raw, 20, 13) << 7) | bits(raw, 6, 7));
             return MERCED_OK;
         }
         return mhalt(m, "unimpl I-unit major 0 x3=%u", x3);
@@ -5078,6 +5343,51 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             gr_write(m, r1, res, n2 | n3);
             return MERCED_OK;
         }
+        if (x2a == 0 && ((za == 0 && zb == 1) || (za == 1 && zb == 0)) &&
+            ((x2c == 0 && (x2b == 0 || x2b == 2)) ||        /* pshr.u / pshr */
+             (x2c == 1 && x2b == 0))) {                     /* pshl */
+            if (!qp) return MERCED_OK;
+            bool shl = x2c == 1;
+            uint8_t nd, nc;
+            /* pshr takes its data from r3 and its count from r2; pshl the
+             * reverse.  Counts above the lane width empty (or sign-fill) it. */
+            uint64_t data = gr_read(m, shl ? r2 : r3, &nd);
+            uint64_t cnt  = gr_read(m, shl ? r3 : r2, &nc);
+            unsigned lane_bits = za ? 32 : 16;
+            uint64_t lane_mask = (UINT64_C(1) << lane_bits) - 1, res = 0;
+            for (unsigned shift = 0; shift < 64; shift += lane_bits) {
+                uint64_t lane = (data >> shift) & lane_mask, v;
+                if (shl)
+                    v = cnt >= lane_bits ? 0 : (lane << cnt) & lane_mask;
+                else if (x2b == 0)
+                    v = cnt >= lane_bits ? 0 : lane >> cnt;
+                else
+                    v = (uint64_t)(sext(lane, lane_bits) >>
+                                   (cnt >= lane_bits ? lane_bits - 1 : cnt)) & lane_mask;
+                res |= v << shift;
+            }
+            gr_write(m, r1, res, nd | nc);
+            return MERCED_OK;
+        }
+        if (x2a == 1 && x2c == 0 && (x2b == 1 || x2b == 3) &&
+            ((za == 0 && zb == 1) || (za == 1 && zb == 0))) {   /* pshr imm */
+            if (!qp) return MERCED_OK;
+            uint64_t data = gr_read(m, r3, &n3), res = 0;
+            unsigned cnt = (unsigned)bits(raw, 14, 5);
+            unsigned lane_bits = za ? 32 : 16;
+            uint64_t lane_mask = (UINT64_C(1) << lane_bits) - 1;
+            for (unsigned shift = 0; shift < 64; shift += lane_bits) {
+                uint64_t lane = (data >> shift) & lane_mask, v;
+                if (x2b == 1)
+                    v = cnt >= lane_bits ? 0 : lane >> cnt;
+                else
+                    v = (uint64_t)(sext(lane, lane_bits) >>
+                                   (cnt >= lane_bits ? lane_bits - 1 : cnt)) & lane_mask;
+                res |= v << shift;
+            }
+            gr_write(m, r1, res, n3);
+            return MERCED_OK;
+        }
         if (za == 1 && zb == 1) {
             if (!qp) return MERCED_OK;
             uint64_t a, b, res;
@@ -5133,10 +5443,12 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
             #define ELEM(v, i) (((v) >> ((i) * esz * 8)) & emask)
             #define PUT(i, val) (res |= ((uint64_t)(val) & emask) << ((i) * esz * 8))
             if (x2c == 2 && x2b != 3) {              /* mix.r (x2b=0) / mix.l (x2b=2) */
-                unsigned off = (x2b == 0) ? 1 : 0;   /* r takes odd elems, l even */
+                /* mix.r keeps the right (even-numbered) element of each pair,
+                 * mix.l the left one; r2's go to the left of r3's. */
+                unsigned off = (x2b == 0) ? 0 : 1;
                 for (unsigned k = 0; k < n / 2; k++) {
-                    PUT(2 * k,     ELEM(s1, 2 * k + off));
-                    PUT(2 * k + 1, ELEM(s2, 2 * k + off));
+                    PUT(2 * k,     ELEM(s2, 2 * k + off));
+                    PUT(2 * k + 1, ELEM(s1, 2 * k + off));
                 }
             } else if (x2c == 1 && (x2b == 0 || x2b == 2)) {  /* unpack.h/.l */
                 /* x2b=0 encodes .h (select the HIGH/most-significant half of
@@ -5149,15 +5461,16 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
                     PUT(2 * k + 1, ELEM(s1, base + k));
                 }
             } else if (x2c == 0 && (x2b == 0 || x2b == 2)) {  /* pack (sat, 2*esz->esz) */
-                /* pack2: hw->byte; pack4: word->hw. za=1 => pack4, else pack2.
+                /* The mnemonic's size is the source element: pack2 narrows
+                 * halfwords to bytes, pack4 words to halfwords.
                  * x2b=0 unsigned-sat (pack2.uss), x2b=2 signed-sat. */
-                unsigned dbytes = esz;               /* dest element size */
-                unsigned sbytes = esz * 2;           /* src element size */
+                unsigned dbytes = esz / 2;           /* dest element size */
+                unsigned sbytes = esz;               /* src element size */
                 unsigned sn = 8 / sbytes;            /* src elems per reg */
                 uint64_t smask = (1ull << (sbytes * 8)) - 1;
                 for (unsigned k = 0; k < sn; k++) {
                     for (int src = 0; src < 2; src++) {
-                        uint64_t sv = src ? s1 : s2;
+                        uint64_t sv = src ? s2 : s1;       /* r2 low, r3 high */
                         int64_t e = (int64_t)((sv >> (k * sbytes * 8)) & smask);
                         e = sext((uint64_t)e, sbytes * 8);
                         int64_t lim_hi = (1ll << (dbytes * 8 - 1)) - 1;
@@ -5166,7 +5479,7 @@ static MercedStatus exec_i(Merced *m, uint64_t raw, int qp) {
                         else lim_lo = -(1ll << (dbytes * 8 - 1));
                         out = e < lim_lo ? lim_lo : e > lim_hi ? lim_hi : e;
                         unsigned di = k + (src ? sn : 0);
-                        PUT(di, (uint64_t)out);
+                        res |= ((uint64_t)out & ((1ull << (dbytes * 8)) - 1)) << (di * dbytes * 8);
                     }
                 }
             } else if (x2b == 1 && (x2c == 0 || x2c == 1)) {  /* pmin.u/pmax.u (1) or signed (2) */
@@ -5344,7 +5657,13 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
         }
         case 0x04: m->cfm &= 0x3FFFFull; return MERCED_OK;          /* clrrrb */
         case 0x05: m->cfm &= ~(0x3Full << 32); return MERCED_OK;    /* clrrrb.pr */
+        case 0x09:                                  /* implementation-specific:
+                                                     * PAL's rfi into microcode */
         case 0x08: {                                /* rfi */
+            if (qp) {
+                MercedStatus pst;
+                if (privileged_fault(m, &pst)) return pst;
+            }
             uint64_t ipsr = m->cr[CR_IPSR];
             uint64_t iip = m->cr[CR_IIP];
             if ((ipsr & PSR_IS) && !(m->psr & PSR_IS) &&
@@ -5412,8 +5731,13 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
                 return fill_status;
             return rse_spill_excess(m);
         }
-        case 0x0C: m->psr &= ~PSR_BN; return MERCED_OK;             /* bsw.0 */
-        case 0x0D: m->psr |= PSR_BN; return MERCED_OK;              /* bsw.1 */
+        case 0x0C: case 0x0D: {                     /* bsw.0 / bsw.1 */
+            if (!qp) return MERCED_OK;
+            MercedStatus pst;
+            if (privileged_fault(m, &pst)) return pst;
+            if (x6 == 0x0C) m->psr &= ~PSR_BN; else m->psr |= PSR_BN;
+            return MERCED_OK;
+        }
         case 0x10: {                                /* epc */
             /* SDM Vol.3 "epc": PFS.ppl below the current level would let
              * a following br.ret keep the promoted privilege (ar.pfs is
@@ -5443,7 +5767,13 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
             if (btype == 1) {
                 unsigned b = (unsigned)bits(raw, 13, 3);
                 if (m->psr & PSR_DI)
-                    return mhalt(m, "br.ia with disabled ISA transitions");
+                    return deliver_fault(m, VEC_GENERAL, 0x40, 0, false);
+                /* An ISA transition made with translation off or interruption
+                 * collection disabled is undefined (SDM vol. 2, 9.1.2).  The
+                 * processor leaves it untried and execution falls through:
+                 * the stepping microcode hand-offs in PAL_A rely on it. */
+                if (!(m->psr & PSR_IT) || !(m->psr & PSR_DT) || !(m->psr & PSR_IC))
+                    return MERCED_OK;
                 /* Itanium SDM vol. 2, 9.1.2: the target has byte rather
                  * than bundle granularity and is restricted to BR{31:0}.
                  * IA-32 maps CSD/SSD into GR25/GR26 while executing. */
@@ -5518,7 +5848,8 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
     }
     case 7: return MERCED_OK;                       /* brp target25 */
     }
-    return mhalt(m, "unimpl B-unit major 0x%X", major);
+    /* A reserved B-unit opcode is an Illegal Operation fault. */
+    return deliver_fault(m, VEC_GENERAL, 0, 0, false);
 }
 
 /* ── X-unit (uses L slot payload) ────────────────────────────────────────── */
@@ -5566,6 +5897,117 @@ static MercedStatus exec_x(Merced *m, uint64_t raw, uint64_t lraw, int qp) {
 
 /* ── F-unit (minimal) ────────────────────────────────────────────────────── */
 
+/* Floating-point Fault conditions (vector 0x5C00, ISR.code): V invalid
+ * operation, D denormal/unnormal operand, Z divide by zero, SWA software
+ * assist (what this processor reports for a denormal operand). */
+enum { FPF_V = 1u << 0, FPF_D = 1u << 1, FPF_Z = 1u << 2, FPF_SWA = 1u << 3 };
+
+static bool frc_nan(const MercedFpReg *f) { return f->exp == 0x1FFFFu && (f->sig << 1) != 0; }
+static bool frc_snan(const MercedFpReg *f) { return frc_nan(f) && !(f->sig & (UINT64_C(1) << 62)); }
+static bool frc_inf(const MercedFpReg *f) { return f->exp == 0x1FFFFu && f->sig == (UINT64_C(1) << 63); }
+static bool frc_zero(const MercedFpReg *f) { return f->exp == 0 && f->sig == 0; }
+/* Pseudo-NaN and pseudo-infinity (exponent all ones, integer bit clear) are
+ * unsupported encodings: an Invalid Operation. */
+static bool frc_unsupported(const MercedFpReg *f) {
+    return f->exp == 0x1FFFFu && !(f->sig & (UINT64_C(1) << 63));
+}
+/* A non-zero value with its integer bit clear is unnormal; exponent 0 with a
+ * non-zero significand is the usual denormal. */
+static bool frc_denorm_or_unnormal(const MercedFpReg *f) {
+    if (f->exp == 0x1FFFFu || frc_zero(f)) return false;
+    return f->exp == 0 || !(f->sig & (UINT64_C(1) << 63));
+}
+
+/* The faults f3*f4 (+/-) f2 raises from its operands alone. */
+static unsigned fp_fault_fma(const MercedFpReg *a, const MercedFpReg *b,
+                             const MercedFpReg *d, bool neg_prod, bool neg_add) {
+    unsigned f = 0;
+    if (frc_snan(a) || frc_snan(b) || frc_snan(d)) f |= FPF_V;
+    if (frc_unsupported(a) || frc_unsupported(b) || frc_unsupported(d)) f |= FPF_V;
+    if ((frc_inf(a) && frc_zero(b)) || (frc_zero(a) && frc_inf(b)))
+        f |= FPF_V;                                         /* inf * 0 */
+    if ((frc_inf(a) || frc_inf(b)) && frc_inf(d)) {
+        bool psign = (a->sign ^ b->sign) ^ neg_prod;
+        if (psign != (d->sign ^ neg_add)) f |= FPF_V;       /* inf - inf */
+    }
+    if (frc_denorm_or_unnormal(a) || frc_denorm_or_unnormal(b) ||
+        frc_denorm_or_unnormal(d))
+        f |= FPF_D;
+    return f;
+}
+
+/* V for the operations that take their operands as values: any signalling
+ * NaN, and a quiet NaN for the signalling relations and the min/max family. */
+static unsigned fp_fault_operands(const MercedFpReg *x, const MercedFpReg *y,
+                                  bool quiet_nan_too) {
+    unsigned f = 0;
+    if (frc_snan(x) || (y && frc_snan(y))) f |= FPF_V;
+    if (frc_unsupported(x) || (y && frc_unsupported(y))) f |= FPF_V;
+    if (quiet_nan_too && (frc_nan(x) || (y && frc_nan(y)))) f |= FPF_V;
+    if (frc_denorm_or_unnormal(x) || (y && frc_denorm_or_unnormal(y)))
+        f |= FPF_D;
+    return f;
+}
+
+/* The enabled subset of f: the FPSR trap-disable bits vd, dd and zd, and the
+ * status field's td which disables all of them. */
+static unsigned fp_fault_enabled(const Merced *m, uint64_t raw, unsigned f) {
+    if (!f)
+        return 0;
+    uint64_t fpsr = m->ar[AR_FPSR];
+    unsigned sh = 6u + 13u * (unsigned)bits(raw, 34, 2);
+    if ((fpsr >> sh) & (1u << 6))
+        return 0;
+    unsigned out = 0;
+    if ((f & FPF_V) && !(fpsr & 1u)) out |= FPF_V;
+    if ((f & FPF_Z) && !((fpsr >> 2) & 1u)) out |= FPF_Z;
+    /* This processor reports a denormal operand as a software assist. */
+    if ((f & (FPF_D | FPF_SWA)) && !((fpsr >> 1) & 1u)) out |= FPF_SWA;
+    return out;
+}
+
+/* Take the Floating-point Fault if any enabled condition is raised; false
+ * otherwise. */
+static bool fp_fault_check(Merced *m, uint64_t raw, unsigned f, MercedStatus *st) {
+    unsigned code = fp_fault_enabled(m, raw, f);
+    if (!code)
+        return false;
+    *st = deliver_fault(m, VEC_FP_FAULT, code, 0, false);
+    return true;
+}
+
+/* Turn an operation's IEEE status into FPSR flags or, with the trap enabled,
+ * a Floating-point Trap (vector 0x5D00).  A trap reports where execution
+ * resumes, after the instruction; ISR.ei names the instruction itself. */
+static MercedStatus fp_report(Merced *m, uint64_t raw, unsigned status) {
+    if (!status)
+        return MERCED_OK;
+    unsigned sf = (unsigned)bits(raw, 34, 2);
+    unsigned sh = 6 + 13 * sf;
+    uint64_t fpsr = m->ar[AR_FPSR];
+    bool td = ((fpsr >> sh) & (1u << 6)) != 0;
+    uint64_t code = 0;
+    if ((status & MERCED_FP_O) && !td && !((fpsr >> 3) & 1)) code |= 1u << 11;
+    if ((status & MERCED_FP_U) && !td && !((fpsr >> 4) & 1)) code |= 1u << 12;
+    if ((status & MERCED_FP_I) && !td && !((fpsr >> 5) & 1)) code |= 1u << 13;
+    /* FPA rides with a trap already being taken; it never raises one. */
+    if (code && (status & MERCED_FP_FPA)) code |= 1u << 14;
+    if (!code) {
+        uint64_t fl = 0;
+        if (status & MERCED_FP_O) fl |= 1u << 3;
+        if (status & MERCED_FP_U) fl |= 1u << 4;
+        if (status & MERCED_FP_I) fl |= 1u << 5;
+        m->ar[AR_FPSR] |= fl << (sh + 7u);
+        return MERCED_OK;
+    }
+    unsigned slot = (unsigned)(m->ip & 3);
+    m->ip = slot == 2 ? (m->ip & ~UINT64_C(0xF)) + 16 : (m->ip | 0) + 1;
+    MercedStatus st = deliver_fault(m, VEC_FP_TRAP, code | 1u, 0, false);
+    m->cr[CR_ISR] = (m->cr[CR_ISR] & ~(UINT64_C(3) << 41)) |
+                    ((uint64_t)slot << 41);
+    return st;
+}
+
 static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
     /* A predicated-off instruction has no architectural effect, including
      * reserved/unimplemented opcode checks.  Compilers routinely fill an
@@ -5580,6 +6022,36 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
     if (major == 0 || major == 1) {
         unsigned x = (unsigned)bits(raw, 33, 1);
         unsigned x6 = (unsigned)bits(raw, 27, 6);
+        if (!x && major == 1 && x6 >= 0x30 && x6 <= 0x37) {
+            /* fpcmp: each single of the pair against its counterpart, the
+             * outcome a mask of ones or zeros in the matching half of f1. */
+            if (!qp) return MERCED_OK;
+            MercedFpReg a = fr_read(m, f2), b = fr_read(m, f3);
+            uint64_t pair = 0;
+            for (unsigned i = 0; i < 2; i++) {
+                uint32_t ua = (uint32_t)(a.sig >> (32 * i));
+                uint32_t ub = (uint32_t)(b.sig >> (32 * i));
+                float p, q;
+                memcpy(&p, &ua, 4);
+                memcpy(&q, &ub, 4);
+                bool un = isnan(p) || isnan(q), r;
+                switch (x6 & 7) {
+                case 0:  r = !un && p == q; break;          /* eq */
+                case 1:  r = !un && p < q; break;           /* lt */
+                case 2:  r = !un && p <= q; break;          /* le */
+                case 3:  r = un; break;                     /* unord */
+                case 4:  r = un || p != q; break;           /* neq */
+                case 5:  r = un || !(p < q); break;         /* nlt */
+                case 6:  r = un || !(p <= q); break;        /* nle */
+                default: r = !un; break;                    /* ord */
+                }
+                if (r)
+                    pair |= (uint64_t)0xFFFFFFFFu << (32 * i);
+            }
+            MercedFpReg pr = {pair, 0x1003E, 0, (uint8_t)(a.nat | b.nat)};
+            fr_write(m, f1, pr);
+            return MERCED_OK;
+        }
         if (!x) {
             switch (x6) {
             case 0x00: {                            /* break.f */
@@ -5589,21 +6061,37 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
                 return deliver_fault(m, VEC_BREAK, 0, 0, false);
             }
             case 0x01: return MERCED_OK;            /* nop.f / hint.f */
-            case 0x04: {                            /* fsetc */
+            case 0x04: {                            /* fsetc.sf */
                 if (!qp) return MERCED_OK;
+                unsigned shift = 6u + 13u * (unsigned)bits(raw, 34, 2);
                 uint64_t amask = bits(raw, 13, 7), omask = bits(raw, 20, 7);
-                uint64_t sf0 = m->ar[AR_FPSR] >> 6 & 0x1FFF;
-                sf0 = (sf0 & (amask | ~0x7Full)) | omask;
-                m->ar[AR_FPSR] = (m->ar[AR_FPSR] & ~(0x1FFFull << 6)) | (sf0 << 6);
+                uint64_t sf = m->ar[AR_FPSR] >> shift & 0x1FFF;
+                sf = (sf & (amask | ~0x7Full)) | omask;
+                m->ar[AR_FPSR] = (m->ar[AR_FPSR] & ~(0x1FFFull << shift)) | (sf << shift);
                 return MERCED_OK;
             }
-            case 0x05:                              /* fclrf */
-                if (qp) m->ar[AR_FPSR] &= ~(0x3Full << 13);
+            case 0x05:                              /* fclrf.sf */
+                if (qp) m->ar[AR_FPSR] &= ~(0x3Full << (13u + 13u * (unsigned)bits(raw, 34, 2)));
                 return MERCED_OK;
             case 0x08: return MERCED_OK;            /* fchkf */
-            case 0x10: case 0x11: case 0x12: {      /* fmerge.s/ns/se */
+            case 0x10: case 0x11: case 0x12: {      /* fmerge.s/ns/se, fpmerge */
                 if (!qp) return MERCED_OK;
                 MercedFpReg a = fr_read(m, f2), b = fr_read(m, f3), r = b;
+                if (major == 1) {
+                    /* fpmerge: each single of the pair on its own */
+                    uint64_t pair = 0;
+                    for (unsigned i = 0; i < 2; i++) {
+                        uint32_t la = (uint32_t)(a.sig >> (32 * i));
+                        uint32_t lb = (uint32_t)(b.sig >> (32 * i)), v;
+                        if (x6 == 0x10)      v = (lb & 0x7FFFFFFFu) | (la & 0x80000000u);
+                        else if (x6 == 0x11) v = (lb & 0x7FFFFFFFu) | (~la & 0x80000000u);
+                        else                 v = (lb & 0x007FFFFFu) | (la & 0xFF800000u);
+                        pair |= (uint64_t)v << (32 * i);
+                    }
+                    MercedFpReg pr = {pair, 0x1003E, 0, (uint8_t)(a.nat | b.nat)};
+                    fr_write(m, f1, pr);
+                    return MERCED_OK;
+                }
                 if (x6 == 0x10) r.sign = a.sign;
                 else if (x6 == 0x11) r.sign = !a.sign;
                 else { r.sign = a.sign; r.exp = a.exp; }
@@ -5614,41 +6102,127 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
                 /* fmin/fmax/famin/famax.  Equality and unordered comparisons
                  * select f3; this detail is used by NT's ACPI-table scan. */
                 MercedFpReg a = fr_read(m, f2), b = fr_read(m, f3);
+                if (qp && major == 0) {
+                    /* a comparison, so any NaN operand is invalid */
+                    MercedStatus fst;
+                    if (fp_fault_check(m, raw, fp_fault_operands(&a, &b, true), &fst))
+                        return fst;
+                }
                 if (a.nat || b.nat) {
                     MercedFpReg nat = {0, 0, 0, 1};
                     fr_write(m, f1, nat);
                     return MERCED_OK;
                 }
-                long double av = fp2d(a), bv = fp2d(b);
-                if (x6 >= 0x16) {
-                    av = fabsl(av);
-                    bv = fabsl(bv);
+                if (major == 1) {
+                    /* fpmin/fpmax/fpamin/fpamax on the pair of singles */
+                    uint64_t pair = 0;
+                    for (unsigned i = 0; i < 2; i++) {
+                        uint32_t ua = (uint32_t)(a.sig >> (32 * i));
+                        uint32_t ub = (uint32_t)(b.sig >> (32 * i));
+                        float x, y;
+                        memcpy(&x, &ua, 4);
+                        memcpy(&y, &ub, 4);
+                        float cx = x6 >= 0x16 ? fabsf(x) : x;
+                        float cy = x6 >= 0x16 ? fabsf(y) : y;
+                        bool sel_a = (x6 & 1) ? (cx > cy) : (cx < cy);
+                        pair |= (uint64_t)(sel_a ? ua : ub) << (32 * i);
+                    }
+                    MercedFpReg pr = {pair, 0x1003E, 0, 0};
+                    fr_write(m, f1, pr);
+                    return MERCED_OK;
                 }
-                bool take_a = (x6 == 0x15 || x6 == 0x17)
-                            ? av > bv : av < bv;
+                MercedFpReg ca = a, cb = b;
+                if (x6 >= 0x16) {                   /* famin / famax: magnitudes */
+                    ca.sign = 0;
+                    cb.sign = 0;
+                }
+                int cmp = merced_fp_compare(ca, cb);
+                bool take_a = (x6 == 0x15 || x6 == 0x17) ? cmp == 1 : cmp == -1;
                 fr_write(m, f1, take_a ? a : b);
                 return MERCED_OK;
             }
             case 0x18: case 0x19: case 0x1A: case 0x1B: {
-                /* fcvt.fx / fcvt.fxu / fcvt.fx.trunc / fcvt.fxu.trunc */
+                /* fcvt.fx / fcvt.fxu / .trunc: exact, on the register fields */
                 if (!qp) return MERCED_OK;
                 MercedFpReg a = fr_read(m, f2);
                 MercedFpReg r = {0, 0x1003E, 0, a.nat};
-                long double d = fp2d(a);
-                /* only truncating rounding modeled; sf rounding control is
-                 * a refinement for later */
-                if (x6 & 1)
-                    r.sig = (d <= 0) ? 0 : (uint64_t)d;
-                else
-                    r.sig = (uint64_t)(int64_t)d;
+                if (major == 0) {
+                    /* a NaN or infinity has no integer value, nor does a value
+                     * outside the range (integer invalid) */
+                    unsigned flt = fp_fault_operands(&a, NULL, true);
+                    if (frc_inf(&a)) flt |= FPF_V;
+                    bool bad = false;
+                    (void)merced_fp_to_int(a, (x6 & 2) != 0, (x6 & 1) != 0, &bad);
+                    if (bad) flt |= FPF_V;
+                    MercedStatus fst;
+                    if (fp_fault_check(m, raw, flt, &fst)) return fst;
+                }
+                if (major == 1) {
+                    /* fpcvt.fx: the pair of singles as two 32-bit integers */
+                    for (unsigned i = 0; i < 2; i++) {
+                        uint32_t ua = (uint32_t)(a.sig >> (32 * i)), v;
+                        float x;
+                        memcpy(&x, &ua, 4);
+                        float t = (x6 & 2) ? truncf(x) : rintf(x);
+                        v = (x6 & 1) ? (uint32_t)t : (uint32_t)(int32_t)t;
+                        r.sig |= (uint64_t)v << (32 * i);
+                    }
+                    fr_write(m, f1, r);
+                    return MERCED_OK;
+                }
+                r.sig = merced_fp_to_int(a, (x6 & 2) != 0, (x6 & 1) != 0, NULL);
                 fr_write(m, f1, r);
                 return MERCED_OK;
             }
-            case 0x1C: {                            /* fcvt.xf (int → fp) */
+            case 0x1C: {                            /* fcvt.xf (int to fp) */
                 if (!qp) return MERCED_OK;
                 MercedFpReg a = fr_read(m, f2), r;
-                r = d2fp((double)(int64_t)a.sig);
+                r = merced_fp_from_int((int64_t)a.sig);
                 r.nat = a.nat;
+                fr_write(m, f1, r);
+                return MERCED_OK;
+            }
+            case 0x28: {                            /* fpack: two singles */
+                if (!qp) return MERCED_OK;
+                MercedFpReg a = fr_read(m, f2), b = fr_read(m, f3);
+                MercedFpReg r = {0, 0x1003E, 0, (uint8_t)(a.nat | b.nat)};
+                r.sig = ((uint64_t)merced_fp_to_single_bits(a) << 32) |
+                        merced_fp_to_single_bits(b);
+                fr_write(m, f1, r);
+                return MERCED_OK;
+            }
+            case 0x2C: case 0x2D: case 0x2E: case 0x2F: {   /* fand/fandcm/for/fxor */
+                if (!qp) return MERCED_OK;
+                MercedFpReg a = fr_read(m, f2), b = fr_read(m, f3);
+                MercedFpReg r = {0, 0x1003E, 0, (uint8_t)(a.nat | b.nat)};
+                switch (x6) {
+                case 0x2C: r.sig = a.sig & b.sig; break;
+                case 0x2D: r.sig = a.sig & ~b.sig; break;
+                case 0x2E: r.sig = a.sig | b.sig; break;
+                default:   r.sig = a.sig ^ b.sig; break;
+                }
+                fr_write(m, f1, r);
+                return MERCED_OK;
+            }
+            case 0x34: case 0x35: case 0x36: {      /* fswap, .nl, .nr */
+                if (!qp) return MERCED_OK;
+                MercedFpReg a = fr_read(m, f2), b = fr_read(m, f3);
+                MercedFpReg r = {0, 0x1003E, 0, (uint8_t)(a.nat | b.nat)};
+                /* {left, right} = {f3's right, f2's left}, with the left or
+                 * the right half negated for .nl / .nr */
+                uint32_t hi = (uint32_t)b.sig, lo = (uint32_t)(a.sig >> 32);
+                if (x6 == 0x35) hi ^= 0x80000000u;
+                if (x6 == 0x36) lo ^= 0x80000000u;
+                r.sig = ((uint64_t)hi << 32) | lo;
+                fr_write(m, f1, r);
+                return MERCED_OK;
+            }
+            case 0x39: {                            /* fmix.lr */
+                if (!qp) return MERCED_OK;
+                MercedFpReg a = fr_read(m, f2), b = fr_read(m, f3);
+                MercedFpReg r = {0, 0x1003E, 0, (uint8_t)(a.nat | b.nat)};
+                r.sig = (a.sig & UINT64_C(0xFFFFFFFF00000000)) |
+                        (b.sig & UINT64_C(0xFFFFFFFF));
                 fr_write(m, f1, r);
                 return MERCED_OK;
             }
@@ -5682,45 +6256,36 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
         }
         /* x=1: fma-family (F1) handled below via major 8-D; frcpa (F6) here */
         unsigned q = (unsigned)bits(raw, 36, 1);
-        if (!q) {                                   /* frcpa */
-            if (!qp) return MERCED_OK;
-            warn_once(m, WARN_FP_APPROX, "FP ops use double-precision approximation");
-            unsigned p2 = (unsigned)bits(raw, 27, 6);
-            MercedFpReg a = fr_read(m, f2);
-            MercedFpReg b = fr_read(m, f3);
-            long double num = fp2d(a), den = fp2d(b);
-            /* frcpa approximates 1/den only - num (f2) is a source purely for
-             * the architected NaN/zero/inf special-case checks below, never
-             * multiplied in. Compiler-generated Newton-Raphson division
-             * sequences rely on this: they multiply the reciprocal by the
-             * numerator themselves in a later fma. Returning num/den here
-             * (as an earlier version of this code did) silently corrupts
-             * every runtime integer/float division that goes through such a
-             * sequence, since the caller's next step becomes
-             * num*(num/den) = num^2/den instead of num/den. Confirmed
-             * against reference/ski/src/float.c's frcpa()/ieee_recip(). */
-            if (num != 0.0 && den != 0.0) {
-                fr_write(m, f1, fp_recip_estimate(b));
-                pr_write(m, p2, 1);
-            } else if (num == 0.0 && den != 0.0) {
-                /* frcpa completes architecturally trivial cases itself and
-                 * clears the refinement predicate.  In particular, 0/x
-                 * must overwrite f1 with signed zero.  Leaving f1 unchanged
-                 * exposes its stale value to the unpredicated tail of the
-                 * compiler's division sequence; Windows' integer conversion
-                 * helper then turns a zero quotient back into the preceding
-                 * non-zero quotient and loops forever.  See Ski's frcpa():
-                 * ZERO(num) writes a zero result and returns pt=NO. */
-                MercedFpReg zero = {0, 0, (uint8_t)(a.sign ^ b.sign),
-                                    (uint8_t)(a.nat | b.nat)};
-                fr_write(m, f1, zero);
-                pr_write(m, p2, 0);
-            } else {
-                pr_write(m, p2, 0);
-            }
+        /* F6 frcpa (q=0) and F7 frsqrta (q=1): the approximation goes to f1,
+         * a valid-approximation flag to p2. */
+        if (!qp) return MERCED_OK;
+        unsigned p2 = (unsigned)bits(raw, 27, 6);
+        MercedFpReg a = fr_read(m, f2), b = fr_read(m, f3), res;
+        if (a.nat || b.nat) {
+            MercedFpReg nat = {0, 0, 0, 1};
+            fr_write(m, f1, nat);
+            pr_write(m, p2, 0);
             return MERCED_OK;
         }
-        return mhalt(m, "unimpl F-unit major %u x=1 q=1 (frsqrta?)", major);
+        MercedStatus fst;
+        if (q) {
+            /* the square root of a negative number (including -inf) is invalid */
+            unsigned flt = fp_fault_operands(&b, NULL, false);
+            if (b.sign && !frc_zero(&b) && !frc_nan(&b)) flt |= FPF_V;
+            if (fp_fault_check(m, raw, flt, &fst)) return fst;
+        } else {
+            /* 0/0 and inf/inf are invalid; x/0 is a divide by zero */
+            unsigned flt = fp_fault_operands(&a, &b, false);
+            if ((frc_zero(&a) && frc_zero(&b)) || (frc_inf(&a) && frc_inf(&b)))
+                flt |= FPF_V;
+            else if (frc_zero(&b) && !frc_nan(&a))
+                flt |= FPF_Z;
+            if (fp_fault_check(m, raw, flt, &fst)) return fst;
+        }
+        bool valid = q ? merced_fp_frsqrta(b, &res) : merced_fp_frcpa(a, b, &res);
+        fr_write(m, f1, res);
+        pr_write(m, p2, valid);
+        return MERCED_OK;
     }
 
     if (major >= 8 && major <= 0xD) {               /* F1 fma family */
@@ -5730,53 +6295,35 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
             /* fpma (parallel) - unimplemented */
             return mhalt(m, "unimpl F-unit fpma/parallel major %u", major);
         }
-        warn_once(m, WARN_FP_APPROX, "FP ops use double-precision approximation");
         MercedFpReg fa = fr_read(m, f3), fb = fr_read(m, f4), fc = fr_read(m, f2);
-        /* Even major, x=0 is dynamic precision selected by the instruction's
-         * FPSR status field; even major, x=1 is explicitly single precision.
-         * Odd major, x=0 is double precision (odd/x=1 is parallel). */
-        unsigned precision;
-        if (major & 1) {
-            precision = 2;
-        } else if (xbit) {
-            precision = 1;
-        } else {
-            unsigned sf = (unsigned)bits(raw, 34, 2);
-            /* FPSR.sfN.pc occupies bits 8:9 of sf0, with each subsequent
-             * status field starting 13 bits higher. */
-            unsigned pc = (unsigned)((m->ar[AR_FPSR] >> (8 + 13 * sf)) & 3);
-            precision = (pc == 0) ? 1 : (pc == 2 ? 2 : 0);
+        if (fa.nat || fb.nat || fc.nat) {
+            MercedFpReg nat = {0, 0, 0, 1};
+            fr_write(m, f1, nat);
+            return MERCED_OK;
         }
-        bool have_r = false;
-        long double r = 0;
-#if LDBL_MANT_DIG == 64
-        int rsign, re;
-        uint64_t rmant;
-        if (fma_exact(fa, fb, fc, major >= 0xC, major == 0xA || major == 0xB,
-                      &rsign, &rmant, &re)) {
-            /* value = rmant * 2^re, rmant normalized (or zero) */
-            MercedFpReg res = { rmant, rmant ? (uint32_t)(re + 0xFFFF + 63) : 0,
-                                (uint8_t)(rmant ? rsign : 0), 0 };
-            if (precision == 0) {
-                fr_write(m, f1, res);       /* what d2fp(fmal(...)) gives */
-                return MERCED_OK;
-            }
-            have_r = true;
-            r = fp2d(res);
+        MercedStatus fst;
+        if (fp_fault_check(m, raw, fp_fault_fma(&fa, &fb, &fc, major >= 0xC,
+                                                major == 0xA || major == 0xB), &fst))
+            return fst;
+        unsigned sf = (unsigned)bits(raw, 34, 2);
+        unsigned ctl = (unsigned)((m->ar[AR_FPSR] >> (6 + 13 * sf)) & 0x7F);
+        bool wre = (ctl >> 1) & 1u;
+        unsigned dpc = (ctl >> 2) & 3u, rc = (ctl >> 4) & 3u;
+        /* Odd major is double precision, even major with x=1 single, and an
+         * even major with x=0 takes its precision from the status field. */
+        unsigned prec, exp_bits;
+        if (major & 1)    { prec = 53; exp_bits = wre ? 17u : 11u; }
+        else if (xbit)    { prec = 24; exp_bits = wre ? 17u : 8u; }
+        else {
+            prec = dpc == 0 ? 24u : dpc == 2 ? 53u : 64u;   /* 1 is reserved */
+            exp_bits = wre ? 17u : 15u;
         }
-#endif
-        if (!have_r) {
-            long double a = fp2d(fa);
-            long double bmul = fp2d(fb);
-            long double c = fp2d(fc);
-            switch (major) {
-            case 8: case 9:  r = fmal(a, bmul, c); break;    /* fma */
-            case 0xA: case 0xB: r = fmal(a, bmul, -c); break;/* fms */
-            default: r = fmal(-a, bmul, c); break;           /* fnma */
-            }
-        }
-        fr_write(m, f1, fp_result_static(r, precision));
-        return MERCED_OK;
+        unsigned status;
+        MercedFpReg res = merced_fp_fma(fa, fb, fc, major >= 0xC,
+                                        major == 0xA || major == 0xB, prec,
+                                        exp_bits, rc, &status);
+        fr_write(m, f1, res);
+        return fp_report(m, raw, status);
     }
 
     if (major == 0xE) {
@@ -5819,24 +6366,36 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
             return MERCED_OK;
         }
         (void)x2;
-        return mhalt(m, "unimpl F-unit major E x=0 (fselect?)");
+        if (!qp) return MERCED_OK;                  /* F3 fselect f1 = f3, f4, f2 */
+        MercedFpReg a3 = fr_read(m, f3), a4 = fr_read(m, f4), a2 = fr_read(m, f2);
+        MercedFpReg r = {0, 0x1003E, 0, (uint8_t)(a3.nat | a4.nat | a2.nat)};
+        /* The mask is f2: where it has a 1 the bit comes from f3. */
+        r.sig = (a3.sig & a2.sig) | (a4.sig & ~a2.sig);
+        fr_write(m, f1, r);
+        return MERCED_OK;
     }
 
     if (major == 4) {                               /* F4 fcmp */
         if (!qp) return MERCED_OK;
-        warn_once(m, WARN_FP_APPROX, "FP ops use double-precision approximation");
         unsigned rb = (unsigned)bits(raw, 36, 1);
         unsigned ra = (unsigned)bits(raw, 33, 1);
         unsigned ta = (unsigned)bits(raw, 12, 1);
         unsigned p1 = (unsigned)bits(raw, 6, 6);
         unsigned p2 = (unsigned)bits(raw, 27, 6);
-        long double a = fp2d(fr_read(m, f2)), b = fp2d(fr_read(m, f3));
+        MercedFpReg fa = fr_read(m, f2), fb = fr_read(m, f3);
+        /* eq, lt and le are signalling relations: a quiet NaN raises V too;
+         * unord is quiet. */
+        MercedStatus fst;
+        if (fp_fault_check(m, raw,
+                           fp_fault_operands(&fa, &fb, ((ra << 1) | rb) != 3), &fst))
+            return fst;
+        int cmp = merced_fp_compare(fa, fb);
         int res;
         switch ((ra << 1) | rb) {
-        case 0: res = a == b; break;
-        case 1: res = a < b; break;
-        case 2: res = a <= b; break;
-        default: res = (a != a) || (b != b); break; /* unord */
+        case 0: res = cmp == 0; break;
+        case 1: res = cmp == -1; break;
+        case 2: res = cmp == -1 || cmp == 0; break;
+        default: res = cmp == 2; break;                 /* unord */
         }
         set_preds(m, p1, p2, qp, res, ta ? 1 : 0);
         return MERCED_OK;
@@ -5850,11 +6409,22 @@ static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
         uint64_t fclass = (bits(raw, 20, 7) << 2) | bits(raw, 33, 2);
         MercedFpReg a = fr_read(m, f2);
         int res = 0;
-        /* coarse classification: nat / zero / pos / neg */
-        if ((fclass & 0x100) && a.nat) res = 1;              /* @nat */
-        if ((fclass & 0x004) && a.exp == 0 && a.sig == 0) res = 1;   /* zero */
-        if ((fclass & 0x001) && !a.sign) res = 1;            /* @pos */
-        if ((fclass & 0x002) && a.sign) res = 1;             /* @neg */
+        /* The class mask: 0x100 NaTVal, 0x080 quiet NaN, 0x040 signalling
+         * NaN, 0x001 positive, 0x002 negative, 0x004 zero, 0x008 unnormal
+         * (denormals included), 0x010 normal, 0x020 infinity. */
+        if (a.nat) {
+            res = (fclass & 0x100) != 0;
+        } else if (frc_nan(&a)) {
+            res = (frc_snan(&a) ? (fclass & 0x040) : (fclass & 0x080)) != 0;
+        } else {
+            bool sign_ok = ((fclass & 0x001) && !a.sign) || ((fclass & 0x002) && a.sign);
+            bool type_ok = ((fclass & 0x004) && frc_zero(&a)) ||
+                           ((fclass & 0x008) && frc_denorm_or_unnormal(&a)) ||
+                           ((fclass & 0x010) && !frc_zero(&a) && !frc_inf(&a) &&
+                            !frc_denorm_or_unnormal(&a) && !frc_unsupported(&a)) ||
+                           ((fclass & 0x020) && frc_inf(&a));
+            res = sign_ok && type_ok;
+        }
         set_preds(m, p1, p2, qp, res, ta ? 1 : 0);
         return MERCED_OK;
     }
@@ -6272,6 +6842,158 @@ static void tb_decode(MercedTbEntry *tb) {
     tb->slow_slot0 = fill || empty_loop;
 }
 
+/* Whether the cache-array model sees instruction fetches: it observes every
+ * access, or it is following I-cache fills. */
+static inline bool fetch_observed(const Merced *m) {
+    return m->cache.observe || m->cache.ic_track;
+}
+
+/* Whether a bundle must be fetched afresh rather than from the bundle caches
+ * on entry at slot 0: while the model sees fetches (a hit there would not
+ * reach it), and once it stops, a bundle it served (memory's differs). */
+static inline bool fetch_uncached(const Merced *m) {
+    return fetch_observed(m) || m->cache.served;
+}
+
+typedef enum { FETCH_MEMORY, FETCH_SERVED, FETCH_MCA } ModelFetch;
+
+/* The fetch of the bundle at bundle_va / pa through the cache-array model:
+ * lines PAL planted in the I-cache arrays are what a cacheable fetch
+ * executes, whatever memory holds, and the unified L2 and the L3 can hold
+ * code a store left there.  *lo and *hi are memory's bundle on entry and the
+ * model's on FETCH_SERVED; FETCH_MCA means an array error was delivered as a
+ * machine check. */
+static ModelFetch model_fetch(Merced *m, uint64_t bundle_va, uint64_t pa,
+                              uint64_t *lo, uint64_t *hi) {
+    merced_cache_tick(m);               /* fill windows close on time too */
+    bool wb = (bundle_va >> 63) == 0;
+    if (m->psr & PSR_IT) {
+        const MercedTlbEntry *e = itlb_entry(m, bundle_va);
+        wb = !e || ((e->pte >> PTE_MA_SHIFT) & 7) == 0;
+    }
+    const MercedIcResult icr = merced_icache_fetch(m, model_pa(m, pa), wb, lo, hi);
+    if (icr == MERCED_IC_MCA && merced_cache_take_mca(m)) {
+        deliver_mca(m);
+        return FETCH_MCA;
+    }
+    if (icr == MERCED_IC_HIT)
+        return FETCH_SERVED;
+    if (wb && m->cache.observe && merced_cache_fetch(m, model_pa(m, pa), lo, hi))
+        return FETCH_SERVED;
+    return FETCH_MEMORY;
+}
+
+/* Whether a B-unit slot is a branch for the taken-branch and lower-privilege
+ * traps: br.cond/ia/ret and br.call, not rfi, epc, cover and the like. */
+static bool slot_is_branch(uint64_t raw) {
+    unsigned major = (unsigned)bits(raw, 37, 4);
+    if (major == 0) {
+        unsigned x6 = (unsigned)bits(raw, 27, 6);
+        return x6 == 0x20 || x6 == 0x21;
+    }
+    return major == 1 || major == 4 || major == 5;
+}
+
+/* The traps an instruction that has just completed without faulting can
+ * raise (SDM vol. 2, 5.8.3): Lower-Privilege Transfer when a branch lowers the
+ * privilege level with PSR.lp set, Taken Branch with PSR.tb, and Single Step
+ * with PSR.ss, in that priority order.  A trap reports where execution
+ * resumes, so IP moves on to the next instruction first; ISR.ei names the
+ * instruction that completed.  Returns true when a trap was delivered. */
+static bool post_slot_trap(Merced *m, char unit, uint64_t raw, unsigned slot,
+                           uint64_t psr_before, uint64_t bundle_va,
+                           unsigned slot_stop_after) {
+    bool branch = unit == 'B' && m->taken && slot_is_branch(raw);
+    unsigned cpl_before = (unsigned)((psr_before >> PSR_CPL_SHIFT) & 3);
+    unsigned cpl_now = (unsigned)((m->psr >> PSR_CPL_SHIFT) & 3);
+    uint32_t vec = 0;
+    uint64_t code = 0;
+    if (branch && (psr_before & PSR_LP) && cpl_now > cpl_before) {
+        vec = 0x5E00; code = 0x2;
+    } else if (branch && (psr_before & PSR_TB)) {
+        vec = 0x5F00; code = 0x4;
+    } else if ((psr_before & PSR_SS) &&
+               !(unit == 'B' && bits(raw, 37, 4) == 0 &&
+                 (bits(raw, 27, 6) == 0x08 || bits(raw, 27, 6) == 0x09))) {
+        vec = 0x6000; code = 0x8;
+    }
+    if (!vec)
+        return false;
+    if (m->taken) {
+        m->taken = 0;
+    } else {
+        m->group_start = slot_stop_after;
+        if (unit == 'X' || slot == 2)
+            m->ip = bundle_va + 16;
+        else
+            m->ip = bundle_va | (slot + 1);
+    }
+    deliver_fault(m, vec, code, 0, false);
+    m->cr[CR_ISR] = (m->cr[CR_ISR] & ~(UINT64_C(3) << 41)) |
+                    ((uint64_t)slot << 41);
+    return true;
+}
+
+/* The floating-point register partitions an instruction names: bit 0 for
+ * f2-f31, bit 1 for f32-f127 (f0 and f1 are always accessible).  Only
+ * encodings whose register fields are certain are classified. */
+static unsigned fp_bank(unsigned f) { return f >= 32 ? 2u : f >= 2 ? 1u : 0u; }
+
+static unsigned fp_banks_used(char unit, uint64_t raw) {
+    unsigned major = (unsigned)bits(raw, 37, 4);
+    unsigned f1 = (unsigned)bits(raw, 6, 7), f2 = (unsigned)bits(raw, 13, 7);
+    unsigned f3 = (unsigned)bits(raw, 20, 7), f4 = (unsigned)bits(raw, 27, 7);
+    if (unit == 'F') {
+        if (major == 0 || major == 1) {
+            unsigned x = (unsigned)bits(raw, 33, 1);
+            unsigned x6 = (unsigned)bits(raw, 27, 6);
+            if (!x && (x6 == 0x00 || x6 == 0x01 || x6 == 0x04 ||
+                       x6 == 0x05 || x6 == 0x08))
+                return 0;
+            if (x6 >= 0x18 && x6 <= 0x1C && (x || x6 != 0x1C || !x))
+                return fp_bank(f1) | fp_bank(f2);
+            return fp_bank(f1) | fp_bank(f2) | fp_bank(f3);
+        }
+        if (major == 4) return fp_bank(f2) | fp_bank(f3);     /* fcmp */
+        if (major == 5) return fp_bank(f2);                   /* fclass */
+        if (major >= 8)
+            return fp_bank(f1) | fp_bank(f2) | fp_bank(f3) | fp_bank(f4);
+        return 0;
+    }
+    if (unit == 'M') {
+        unsigned x6 = (unsigned)bits(raw, 30, 6), xbit = (unsigned)bits(raw, 27, 1);
+        if (major == 4 && xbit && !bits(raw, 36, 1) && x6 >= 0x1C && x6 <= 0x1F)
+            return fp_bank(f2);                               /* getf */
+        if (major == 6 || major == 7) {
+            if (x6 >= 0x30 && x6 <= 0x3B)                     /* stf */
+                return fp_bank(f2);
+            if (major == 6 && xbit && x6 >= 0x1C && x6 <= 0x1F)
+                return fp_bank(f1);                           /* setf */
+            if (x6 <= 0x0F || x6 == 0x1B || (x6 >= 0x20 && x6 <= 0x27))
+                return fp_bank(f1) | (xbit && major == 6 ? fp_bank(f2) : 0);
+        }
+    }
+    return 0;
+}
+
+/* ISR.code of a Disabled Floating-point Register fault the instruction takes
+ * under the current PSR.dfl/dfh, or 0. */
+static unsigned fp_disabled_code(const Merced *m, char unit, uint64_t raw) {
+    unsigned banks = fp_banks_used(unit, raw), code = 0;
+    if ((banks & 1u) && (m->psr & PSR_DFL)) code |= 1u;
+    if ((banks & 2u) && (m->psr & PSR_DFH)) code |= 2u;
+    return code;
+}
+
+/* PSR.id, da, dd, ia and ed each suppress a fault for one instruction: they
+ * clear once an instruction other than rfi, which installs them, completes. */
+#define PSR_ONE_SHOT (PSR_DA | PSR_DD | PSR_IA | PSR_ED | PSR_ID)
+
+static inline bool slot_is_rfi(char unit, uint64_t raw) {
+    return unit == 'B' && bits(raw, 37, 4) == 0 &&
+           (bits(raw, 27, 6) == 0x08 || bits(raw, 27, 6) == 0x09);
+}
+
 MercedStatus merced_step(Merced *m) {
     if (m->translation_cache)
         ((MercedTranslationCache *)m->translation_cache)->cur_tb = NULL;
@@ -6499,6 +7221,14 @@ MercedStatus merced_step(Merced *m) {
     MercedStatus st;
 
     if (slot > 2) return mhalt(m, "bad IP slot %u", slot);
+    if (__builtin_expect(m->psr & PSR_DB, 0) &&
+        !(m->psr & PSR_IS) && inst_debug_fault(m, bundle_va, &st)) {
+        m->ninsts++;
+        return st;
+    }
+    const bool uncached = fetch_uncached(m);
+    const bool refetch = slot == 0 && uncached;
+    bool served = false;
     uint64_t lo, hi;
     unsigned tmpl;
     uint64_t slots[3];
@@ -6508,7 +7238,7 @@ MercedStatus merced_step(Merced *m) {
     /* Slots 1/2 normally reuse the bundle just consumed by slot 0.  Test
      * this compact CPU-local cache before hashing into the much larger TB
      * table; it keeps the common two-of-three accesses in L1. */
-    if (m->bundle_cache_valid && m->bundle_cache_translation_valid &&
+    if (!refetch && m->bundle_cache_valid && m->bundle_cache_translation_valid &&
         m->bundle_cache_va == bundle_va) {
         /* Slots 1/2 of a sequential bundle have the same fetch translation
          * as slot 0.  Self-modifying stores invalidate this cache in
@@ -6522,7 +7252,7 @@ MercedStatus merced_step(Merced *m) {
         slots[0] = m->bundle_cache_slots[0];
         slots[1] = m->bundle_cache_slots[1];
         slots[2] = m->bundle_cache_slots[2];
-    } else if (tb && tb->valid && tb->va == bundle_va &&
+    } else if (!uncached && tb && tb->valid && tb->va == bundle_va &&
         tb->translation_generation == tc->translation_generation &&
         tb->code_generation == tc->page_generation[tb_page_index(tb->pa)]) {
         pa = tb->pa;
@@ -6542,6 +7272,7 @@ MercedStatus merced_step(Merced *m) {
         m->bundle_cache_slots[0] = slots[0];
         m->bundle_cache_slots[1] = slots[1];
         m->bundle_cache_slots[2] = slots[2];
+        m->cache.served = false;
     } else {
         /* Physical instruction mode is common in PAL/SAL and needs no TLB
          * machinery.  Keep this tiny path in the fetch loop instead of
@@ -6552,7 +7283,7 @@ MercedStatus merced_step(Merced *m) {
         } else if (!va_translate(m, bundle_va, true, false, ISR_X, &pa, &st)) {
             return st;   /* ITLB miss delivered (or halt) */
         }
-        if (m->bundle_cache_valid && m->bundle_cache_va == bundle_va &&
+        if (!refetch && m->bundle_cache_valid && m->bundle_cache_va == bundle_va &&
             m->bundle_cache_pa == pa) {
             lo = m->bundle_cache_lo;
             hi = m->bundle_cache_hi;
@@ -6563,6 +7294,16 @@ MercedStatus merced_step(Merced *m) {
         } else {
             lo = phys_fetch(m, pa, 8);
             hi = phys_fetch(m, pa + 8, 8);
+            if (fetch_observed(m)) {
+                ModelFetch mf = model_fetch(m, bundle_va, pa, &lo, &hi);
+                if (mf == FETCH_MCA) {
+                    m->ninsts++;
+                    m->group_start = 1;
+                    return MERCED_OK;
+                }
+                served = mf == FETCH_SERVED;
+            }
+            m->cache.served = served;
             tmpl = (unsigned)(lo & 0x1F);
             slots[0] = (lo >> 5) & 0x1FFFFFFFFFFull;
             slots[1] = ((lo >> 46) | (hi << 18)) & 0x1FFFFFFFFFFull;
@@ -6578,7 +7319,8 @@ MercedStatus merced_step(Merced *m) {
             m->bundle_cache_slots[2] = slots[2];
         }
         m->bundle_cache_translation_valid = true;
-        if (tb) {
+        /* Not memory's bundle: an entry would outlive the line. */
+        if (tb && !served) {
             tb->va = bundle_va;
             tb->pa = pa;
             tb->lo = lo;
@@ -6613,7 +7355,7 @@ MercedStatus merced_step(Merced *m) {
      * consecutive virtual pages can have unrelated physical mappings and
      * each store can fault.  Leave those loops to normal execution rather
      * than translating just the first address for a physical bulk fill. */
-    if (slot == 0 && !(m->psr & PSR_DT) && m->bus.fill &&
+    if (slot == 0 && !(m->psr & PSR_DT) && m->bus.fill && !m->cache.observe &&
         units[0] == 'M' && units[1] == 'M' &&
         units[2] == 'B' &&
         bits(slots[0], 37, 4) == 5 && bits(slots[1], 37, 4) == 5 &&
@@ -6716,6 +7458,7 @@ MercedStatus merced_step(Merced *m) {
     int qp = pr_read(m, (unsigned)bits(raw, 0, 6));
     m->taken = 0;
     uint64_t faults_before = m->nfaults;
+    uint64_t psr_before = m->psr;
 
     /* Keep the many one-off firmware probes entirely off the normal
      * execution path.  Individually-predictable false branches still add
@@ -6774,7 +7517,11 @@ MercedStatus merced_step(Merced *m) {
 
     }
 
-    if (slot_is_nop(unit, raw)) {
+    unsigned fp_off = (qp && __builtin_expect(m->psr & (PSR_DFL | PSR_DFH), 0))
+                    ? fp_disabled_code(m, unit, raw) : 0;
+    if (fp_off) {
+        st = deliver_fault(m, VEC_DISABLED_FP, fp_off, 0, false);
+    } else if (slot_is_nop(unit, raw)) {
         st = MERCED_OK;
     } else {
         switch (unit) {
@@ -6785,6 +7532,10 @@ MercedStatus merced_step(Merced *m) {
         case 'X': st = exec_x(m, raw, lraw, qp); break;
         default:  st = mhalt(m, "internal: unit %c", unit); break;
         }
+    }
+    if (__builtin_expect(oof_write_pending, 0)) {
+        oof_write_pending = false;
+        st = deliver_fault(m, VEC_GENERAL, 0, 0, false);
     }
 
     if (st != MERCED_OK) {
@@ -6798,11 +7549,30 @@ MercedStatus merced_step(Merced *m) {
         return st;
     }
 
+    /* A cache-array error during this instruction's access (merced_cache.c):
+     * the instruction is abandoned and PALE_CHECK entered with IIP on it. */
+    if (__builtin_expect(m->cache.observe, 0) && merced_cache_take_mca(m))
+        deliver_mca(m);
+
     m->ninsts++;
+    if (__builtin_expect(pmu_count_on, 0) && m->nfaults == faults_before)
+        pmu_retire(m, slot_is_nop(unit, raw), qp, m->slot_stop_after);
     if (!m->external_itc)
         itc_advance(m, m->slot_cycles);
     if (m->nfaults == faults_before)
         m->last_successful_bundle = bundle_va;
+    if (__builtin_expect(m->psr & PSR_ONE_SHOT, 0) &&
+        m->nfaults == faults_before && !slot_is_rfi(unit, raw))
+        m->psr &= ~PSR_ONE_SHOT;
+
+    if (__builtin_expect(psr_before & (PSR_LP | PSR_TB | PSR_SS), 0) &&
+        m->nfaults == faults_before &&
+        post_slot_trap(m, unit, raw, slot, psr_before, bundle_va,
+                       m->slot_stop_after)) {
+        m->group_start = 1;
+        m->taken = 0;
+        return MERCED_OK;
+    }
 
     if (m->taken) {
         /* A taken branch or a delivered fault/interruption both always
@@ -6838,7 +7608,8 @@ void merced_request_exit(Merced *m) {
 static inline bool fast_dtranslate(Merced *m, uint64_t va, uint64_t access,
                                    uint64_t *pa, MercedStatus *st) {
     if (!(mmfault_armed && mmfault_hi) &&
-        !(va >= watch_va_base && va < watch_va_end)) {
+        !(va >= watch_va_base && va < watch_va_end) &&
+        !m->cache.observe) {            /* the cache-array model needs va_translate() */
         if (!(m->psr & PSR_DT)) {
             *st = MERCED_OK;
             *pa = va & MERCED_PHYS_MASK;
@@ -7040,7 +7811,7 @@ static inline MercedStatus fast_op(Merced *m, const MercedTbEntry *tb,
  * the guest identically. */
 static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
     uint64_t ip = m->ip;
-    if ((m->psr & PSR_IS) ||
+    if ((m->psr & (PSR_IS | PSR_DB)) ||
         (ip & UINT64_C(0x1FFFFFFFFFFFFFF0)) == UINT64_C(0x00000000FFF05000))
         return merced_step(m);
     uint64_t bundle_va = ip & ~0xFull;
@@ -7049,6 +7820,10 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
     bool from_bundle_cache = m->bundle_cache_valid &&
                              m->bundle_cache_translation_valid &&
                              m->bundle_cache_va == bundle_va;
+    /* Every fetch the cache-array model sees goes through merced_step(). */
+    if (__builtin_expect(fetch_uncached(m), 0) &&
+        (slot == 0 || !from_bundle_cache))
+        return merced_step(m);
     MercedTbEntry *tb;
     if (from_bundle_cache) {
         tb = tc->cur_tb;            /* checked on an earlier slot? */
@@ -7117,15 +7892,26 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
     int qp = pr_read(m, tb->qpr[slot]);
     m->taken = 0;
     uint64_t faults_before = m->nfaults;
+    uint64_t psr_before = m->psr;
 
     MercedStatus st;
-    if (kind == SLOT_EXEC)
+    unsigned fp_off = (qp && kind == SLOT_EXEC &&
+                       __builtin_expect(m->psr & (PSR_DFL | PSR_DFH), 0))
+                    ? fp_disabled_code(m, bundle_units[tb->tmpl][slot],
+                                       tb->slots[slot]) : 0;
+    if (fp_off)
+        st = deliver_fault(m, VEC_DISABLED_FP, fp_off, 0, false);
+    else if (kind == SLOT_EXEC)
         st = tb->op[slot] == FOP_GENERIC ?
              tb->fn[slot](m, tb->slots[slot], qp) : fast_op(m, tb, slot, qp);
     else if (kind == SLOT_NOP)
         st = MERCED_OK;
     else
         st = exec_x(m, tb->slots[2], tb->slots[1], qp);
+    if (__builtin_expect(oof_write_pending, 0)) {
+        oof_write_pending = false;
+        st = deliver_fault(m, VEC_GENERAL, 0, 0, false);
+    }
     if (st != MERCED_OK) {
         if (st == MERCED_HALT_UNIMPL) {
             char unit = kind == SLOT_X ? 'X' : bundle_units[tb->tmpl][slot];
@@ -7138,11 +7924,30 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
         return st;
     }
 
+    if (__builtin_expect(m->cache.observe, 0) && merced_cache_take_mca(m))
+        deliver_mca(m);
+
     m->ninsts++;
+    if (__builtin_expect(pmu_count_on, 0) && m->nfaults == faults_before)
+        pmu_retire(m, kind == SLOT_NOP, qp, m->slot_stop_after);
     if (!m->external_itc)
         itc_advance(m, m->slot_cycles);
     if (m->nfaults == faults_before)
         m->last_successful_bundle = bundle_va;
+    if (__builtin_expect(m->psr & PSR_ONE_SHOT, 0) &&
+        m->nfaults == faults_before &&
+        !slot_is_rfi(kind == SLOT_X ? 'X' : bundle_units[tb->tmpl][slot],
+                     kind == SLOT_X ? tb->slots[2] : tb->slots[slot]))
+        m->psr &= ~PSR_ONE_SHOT;
+    if (__builtin_expect(psr_before & (PSR_LP | PSR_TB | PSR_SS), 0) &&
+        m->nfaults == faults_before &&
+        post_slot_trap(m, kind == SLOT_X ? 'X' : bundle_units[tb->tmpl][slot],
+                       kind == SLOT_X ? tb->slots[2] : tb->slots[slot], slot,
+                       psr_before, bundle_va, m->slot_stop_after)) {
+        m->group_start = 1;
+        m->taken = 0;
+        return MERCED_OK;
+    }
     if (m->taken) {
         m->group_start = 1;
         m->taken = 0;

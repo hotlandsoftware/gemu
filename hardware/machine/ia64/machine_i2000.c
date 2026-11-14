@@ -235,9 +235,6 @@ struct Ia64I2000State {
     char      flash_file[512];
     uint32_t  flash_image_size;
     bool      flash_loaded;
-    /* Base of the DRAM aperture whose top holds SAL's scratch words; see
-     * i2000_normalize_pa(). */
-    uint64_t  sal_scratch_base;
 
     bool      halted;
     /* Keep the former bool's one-byte snapshot slot. Legacy true requests
@@ -2254,36 +2251,19 @@ static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi) {
 }
 
 /* SAL restores its top-of-RAM scratch words through sign-extended
- * addresses.  Match the active bootstrap aperture, or the installed RAM
- * boundary before the first save has selected one.
- *
- * The plain-address form (...6030/...a030 at the top of a power-of-two
- * aperture) only exists while the firmware runs its bootstrap phases, which
- * end when it first enters a loaded EFI application (CPUID revision 0 -> 6,
- * see the run loop; reset returns it to 0).  Afterwards those are ordinary
- * RAM words: Windows Setup's TXTSETUP.SIF buffer landed on PA 0x7FA030
- * (the top of the 8 MiB bootstrap aperture), its bytes there were diverted
- * to the SAL scratch word, and Setup failed with a .SIF syntax error. */
-static inline bool i2000_sal_scratch_alias_active(const Ia64I2000State *s) {
-    return s->cpu->cpu_revision == 0;
-}
-
+ * addresses; map them onto the top of installed RAM. */
 static inline uint64_t i2000_normalize_pa(Ia64I2000State *s, uint64_t addr) {
     addr &= MERCED_PHYS_MASK;
     if ((addr & UINT64_C(0x000fffff00000000)) ==
         UINT64_C(0x000fffff00000000)) {
-        uint64_t base = s->sal_scratch_base;
-        if (!base)
-            base = (s->ram_size - UINT64_C(0x10000)) & ~UINT64_C(0xffff);
-        addr = base | (addr & UINT64_C(0xffff));
-    } else if (s->sal_scratch_base && i2000_sal_scratch_alias_active(s) &&
-               ((addr & UINT64_C(0xffff)) == UINT64_C(0x6030) ||
-                (addr & UINT64_C(0xffff)) == UINT64_C(0xa030))) {
-        uint64_t aperture_end = (addr & ~UINT64_C(0xffff)) + 0x10000;
-        if (aperture_end && !(aperture_end & (aperture_end - 1)))
-            addr = s->sal_scratch_base | (addr & UINT64_C(0xffff));
+        addr = ((s->ram_size - UINT64_C(0x10000)) & ~UINT64_C(0xffff)) |
+               (addr & UINT64_C(0xffff));
     }
     return addr;
+}
+
+static uint64_t i2000_canonical_pa(void *ud, uint64_t addr) {
+    return i2000_normalize_pa(ud, addr);
 }
 
 /* memcpy() with the access size spelled out, so the common widths compile
@@ -2596,19 +2576,6 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     }
     bool region6 = (addr >> 60) == 0xC;
     addr = i2000_normalize_pa(s, addr);
-    /* SAL first runs in a small bootstrap DRAM aperture and later in the
-     * fully-sized one.  It saves its two restore words at the top of the
-     * currently active aperture, then reloads them through sign-extended
-     * addresses.  Remember the aperture selected by the real save rather
-     * than assuming that it is always the final 2-GiB top. */
-    if (size == 8 && i2000_sal_scratch_alias_active(s) &&
-        ((addr & UINT64_C(0xffff)) == UINT64_C(0x6030) ||
-         (addr & UINT64_C(0xffff)) == UINT64_C(0xa030)) &&
-        addr < s->ram_size) {
-        uint64_t aperture_end = (addr & ~UINT64_C(0xffff)) + 0x10000;
-        if (aperture_end && !(aperture_end & (aperture_end - 1)))
-            s->sal_scratch_base = addr & ~UINT64_C(0xffff);
-    }
     if (i2000_card_claims(s, addr) &&
         ((s->video_enabled &&
           rage128_mem_access(&s->rage128, true, addr, size, &val)) ||
@@ -3181,7 +3148,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 35u
+#define I2000_SNAPSHOT_VERSION 37u
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -4209,7 +4176,6 @@ static void i2000_chipset_init(Ia64I2000State *s) {
 }
 
 static void i2000_devices_reset(Ia64I2000State *s, bool warm) {
-    s->sal_scratch_base = 0;
     s->pci_cfg_addr = 0;
     memset(s->cmd649_cfg, 0, sizeof(s->cmd649_cfg));
     s->uart_rx_head = s->uart_rx_tail = 0;
@@ -4363,6 +4329,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     MercedBus bus = {
         .ud = s, .ram_size = s->ram_size,
         .read = bus_read, .fetch = bus_fetch, .write = bus_write,
+        .canonical = i2000_canonical_pa,
         .fill = i2000_bus_fill
     };
     s->cpu = merced_create(&bus);
@@ -4370,6 +4337,9 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
         ia64_i2000_destroy(s);
         return NULL;
     }
+    /* PAL's MSR command port and cache arrays (merced_msr.c, merced_cache.c). */
+    merced_set_msr_model(s->cpu, true);
+    merced_set_cpu_revision(s->cpu, 6);             /* Merced C0 */
     bool jit = cfg->jit &&
                merced_set_accel(s->cpu, MERCED_ACCEL_JIT) == MERCED_ACCEL_JIT;
     irq_poll_quantum = jit ? JIT_IRQ_POLL_QUANTUM : IRQ_POLL_QUANTUM;
@@ -4739,7 +4709,6 @@ static bool i2000_after_step(Ia64I2000State *s, MercedStatus st) {
             i2000_reset(s, true);
         } else {
             mc146818_clock_restart(&s->rtc);
-            merced_set_cpu_revision(s->cpu, 0);
             i2000_sample_ratio_latch(s);
             merced_reset(s->cpu);
         }
@@ -4776,34 +4745,19 @@ static void i2000_run_slice(Ia64I2000State *s) {
     bool check_exec = gemu_monitor_has_exec_breakpoints(s->monitor);
     bool check_mem = gemu_monitor_has_mem_breakpoints(s->monitor);
     s->mem_watch = check_mem;
-    const uint64_t efi_runtime_size = UINT64_C(0x01000000);
-    const uint64_t efi_app_base = UINT64_C(0x04000000);
-    bool efi_window_valid = s->fw_shadow_enabled &&
-                           s->ram_size > efi_app_base + efi_runtime_size;
-    uint64_t efi_app_end = efi_window_valid
-                        ? s->ram_size - efi_runtime_size : 0;
     for (int i = 0; i < INSTR_PER_FRAME; ) {
         /* Ordinary execution: one interrupt-poll quantum per call into the
          * CPU's fast path.  It stops after a slot that requests a reset
-         * (merced_request_exit()) and, while CPUID still reports revision 0,
-         * when execution reaches a loaded EFI application, so everything
-         * below happens at the same instruction as in the slot-by-slot
-         * loop that follows.  That loop still runs whenever a breakpoint or
-         * watchpoint is set, and finishes a quantum the fast path left. */
-        bool rev0 = s->cpu->cpu_revision == 0;
-        bool efi_handoff = rev0 && efi_window_valid &&
-            s->cpu->ip >= efi_app_base && s->cpu->ip < efi_app_end;
+         * (merced_request_exit()).  The slot-by-slot loop below still runs
+         * whenever a breakpoint or watchpoint is set, and finishes a quantum
+         * the fast path left. */
         if (!check_exec && !check_mem &&
             (i & (irq_poll_quantum - 1)) == 0 &&
-            i + (int)irq_poll_quantum <= INSTR_PER_FRAME &&
-            !efi_handoff) {
+            i + (int)irq_poll_quantum <= INSTR_PER_FRAME) {
             i2000_poll_interrupts(s);
             unsigned n = 0;
             MercedStatus st = merced_run_fast_range(
-                s->cpu, irq_poll_quantum, &n,
-                0, 0,
-                rev0 && efi_window_valid ? efi_app_base : 0,
-                rev0 && efi_window_valid ? efi_app_end : 0);
+                s->cpu, irq_poll_quantum, &n, 0, 0, 0, 0);
             i += (int)n;
             if (!i2000_after_step(s, st))
                 return;
@@ -4819,15 +4773,6 @@ static void i2000_run_slice(Ia64I2000State *s) {
          * the modeled hardware while bounding delivery skew to 15 slots. */
         if ((i & (irq_poll_quantum - 1)) == 0)
             i2000_poll_interrupts(s);
-        /* Revision 0 selects the supported PAL path during AMI startup,
-         * including calls from its runtime image in the top 16 MiB.
-         * Once execution enters an EFI application below that image, expose
-         * Merced C0 for Windows, which rejects pre-B3 silicon.  Older
-         * snapshots placed EFI applications in the synthetic high-DRAM
-         * aperture; keep their original transition as a compatibility
-         * fallback. */
-        if (efi_handoff)
-            merced_set_cpu_revision(s->cpu, 6);
         MercedStatus st = merced_step(s->cpu);
         i++;
         /* A memory watchpoint can be raised from inside the bus callback.
@@ -4849,7 +4794,6 @@ static void i2000_reset(Ia64I2000State *s, bool warm) {
     memcpy(nvram_path, s->nvram_path, sizeof(nvram_path));
     bool nvram_dirty = s->nvram_dirty;
     mc146818_clock_restart(&s->rtc);        /* the RTC keeps running */
-    merced_set_cpu_revision(s->cpu, 0);
     i2000_sample_ratio_latch(s);
     merced_reset(s->cpu);
     if (s->video_enabled)
