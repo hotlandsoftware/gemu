@@ -673,16 +673,17 @@ static int ext_highest_unmasked(Merced *m) {
         return 2;
     if (ext_pending_test(m, 0) && interrupt_unmasked(m, 0))
         return 0;
-    /* Highest vector first, as before, but a byte at a time: this runs on
-     * every instruction while an interrupt waits masked. */
+    /* For vectors 16-255, interrupt_unmasked() is "class above TPR's and
+     * above the highest in-service class", which only gets harder as the
+     * vector drops: the highest pending one decides.  This runs on every
+     * block entry and group boundary while an interrupt waits masked (a
+     * disk interrupt during NT's file copy), so it mustn't rescan the
+     * bitmap - with in_service_highest() per vector - each time. */
     for (int i = 31; i >= 2; i--) {
         unsigned bits = m->external_pending[i];
-        while (bits) {
-            unsigned b = 31u - (unsigned)__builtin_clz(bits);
-            int v = i * 8 + (int)b;
-            if (interrupt_unmasked(m, (uint8_t)v))
-                return v;
-            bits &= ~(1u << b);
+        if (bits) {
+            int v = i * 8 + (int)(31u - (unsigned)__builtin_clz(bits));
+            return interrupt_unmasked(m, (uint8_t)v) ? v : -1;
         }
     }
     return -1;
@@ -2789,8 +2790,16 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
                 return st;
             if (!n3 && !forced && unaligned_fault(m, va, size, ISR_R, false, &st))
                 return st;
+            /* A deferred ld.sa leaves no ALAT entry for its target: the
+             * chk.a / ld.c after it must miss and run the recovery code.
+             * A stale entry from an earlier advanced load into the same
+             * register let the NaT through (NT setupdd.sys stopped with
+             * SYSTEM_SERVICE_EXCEPTION, REG_NAT_CONSUMPTION).  Ski
+             * (LD_SA_EX) invalidates the same way. */
+            bool advanced = x6 >= 0x08 && x6 <= 0x0F;
             if (n3 || forced) {
                 gr_write(m, r1, 0, 1);
+                if (advanced) alat_invalidate_reg(m, r1);
             } else if (!va_translate(m, va, false, spec, ISR_R, &pa, &st)) {
                 /* A delivered fault also returns MERCED_OK, with taken
                  * marking the transfer to its handler.  Only a deferred
@@ -2799,6 +2808,7 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
                  * the handler's retry. */
                 if (st != MERCED_OK || m->taken) return st;
                 gr_write(m, r1, 0, 1);             /* NaT on deferred spec load */
+                if (advanced) alat_invalidate_reg(m, r1);
             } else {
                 bool check = x6 >= 0x20 && x6 <= 0x2B;
                 bool clear = x6 >= 0x20 && x6 <= 0x23;
@@ -2986,6 +2996,8 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
               spec_defers(m, VEC_UNALIGNED)))) {
             MercedFpReg nat = {0, 0, 0, 1};
             fr_write(m, (unsigned)bits(raw, 6, 7), nat);
+            if (x6 >= 0x08)                        /* ldf.sa: see ld.sa */
+                alat_invalidate_reg(m, ALAT_FP_KEY + fr_phys(m, (unsigned)bits(raw, 6, 7)));
             goto fp_base_update;
         }
         {
@@ -3002,6 +3014,8 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
             if (!fspec || st != MERCED_OK || m->taken) return st;
             MercedFpReg nat = {0, 0, 0, 1};
             fr_write(m, (unsigned)bits(raw, 6, 7), nat);
+            if (x6 >= 0x08)                        /* ldf.sa: see ld.sa */
+                alat_invalidate_reg(m, ALAT_FP_KEY + fr_phys(m, (unsigned)bits(raw, 6, 7)));
             goto fp_base_update;
         }
         unsigned fmt = x6 & 3;   /* 0=e 1=8 2=s 3=d */
