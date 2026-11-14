@@ -67,24 +67,35 @@ firmware's handlers, and external interrupts are gated by `PSR.i && (!CFLG.if ||
 
 ## Execution engines (`-accel`)
 
-`-accel jit` (the default) translates IA-64 code into x86-64 host code;
+`-accel jit` (the default) translates IA-64 code into host code;
 `-accel interpreter` runs the original slot-at-a-time interpreter. Both run
 the guest identically, slot for slot: with `GEMU_CPI` and the same
-`GEMU_IRQ_QUANTUM`, the two engines reach bit-identical machine state. The JIT needs
-an x86-64 host and falls back to the interpreter elsewhere. The `generic`
-machine steps the CPU one slot at a time and always interprets.
+`GEMU_IRQ_QUANTUM`, the two engines reach bit-identical machine state. The JIT
+currently has an x86-64 backend and falls back to the interpreter on other
+hosts. The `generic` machine steps the CPU one slot at a time and always
+interprets.
 
-The translator lives in `cpu/ia64/merced_jit.c`, which is included by
-`merced.c`, and uses the emitter in `core/include/gemu/jit_x64.h`. A
-translated block covers up to 16 bundles of one 4 KiB page. Each slot is handled
-one of four ways:
+The JIT is split by guest and by host:
+
+| Path | What |
+|------|------|
+| `cpu/ia64/jit/merced_jit.c` | IA-64 translator: blocks, slot classification, block cache, dispatch. Knows no host. Included by `merced.c` |
+| `jit/jit_backend.h` | Host-neutral code-generation interface the translator emits through |
+| `jit/jit_backend_x64.c` | x86-64 backend: register assignment, calling convention, frames, branches |
+| `jit/jit_x64.h` | x86-64 instruction encoder used by that backend |
+| `jit/jit_mem.c` | Executable memory (POSIX and Windows) |
+
+Another host needs only a new `jit/jit_backend_<host>.c` (plus its encoder); a
+JIT for another guest CPU reuses the backends.
+
+A translated block covers up to 16 bundles of one 4 KiB page. Each slot is
+handled one of three ways:
 
 | Tier | Covers |
 |------|--------|
-| native x86-64 | A-unit ALU and compares, `zxt`/`sxt`, `movl`, `br.cond`, `br.cloop` |
+| native | A-unit ALU and compares, `zxt`/`sxt`, `movl`, `br.cond`, `br.cloop` |
 | native memory | `ld`/`st` with post-increment, through a host TLB into plain RAM |
-| direct call | interpreter handlers with inline bookkeeping: I-unit bit-field ops, F unit, `getf`/`setf` |
-| full helper | system instructions and indirect branches; leaves the block if anything changed |
+| interpreted | everything else, through `fast_slot()`, the interpreter's own per-slot code; the block re-checks its assumptions afterwards and leaves if anything changed |
 
 With the JIT, the i2000 polls platform interrupts every 512 slots instead of 16.
 

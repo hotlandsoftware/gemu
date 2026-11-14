@@ -547,6 +547,7 @@ static uint64_t vhpt_hash_address(Merced *m, uint64_t va);
 static void itc_advance(Merced *m, uint64_t delta) {
     uint64_t old = m->ar[AR_ITC];
     m->ar[AR_ITC] += delta;
+    m->time_base += delta;
     uint64_t deadline = m->cr[CR_ITM];
     /* cr.itm is a one-shot match, not a level-triggered "ITC is beyond
      * ITM" condition.  Once cr.ivr acknowledges the interrupt it must stay
@@ -565,6 +566,10 @@ void merced_set_external_itc(Merced *m, bool enabled) {
 
 void merced_advance_itc(Merced *m, uint64_t ticks) {
     itc_advance(m, ticks);
+}
+
+uint64_t merced_get_time_base(const Merced *m) {
+    return m->time_base;
 }
 
 uint64_t merced_get_itc(const Merced *m) {
@@ -1891,6 +1896,7 @@ void merced_destroy(Merced *m) {
 void merced_reset(Merced *m) {
     MercedBus bus = m->bus;
     uint64_t ninsts = 0;
+    uint64_t time_base = m->time_base;
     uint8_t cpu_revision = m->cpu_revision;
     uint8_t cpu_model = m->cpu_model;
     bool ia32_int10_shim = m->ia32_int10_shim;
@@ -1902,6 +1908,7 @@ void merced_reset(Merced *m) {
     memset(m, 0, sizeof(*m));
     m->bus = bus;
     m->ninsts = ninsts;
+    m->time_base = time_base;
     m->cpu_revision = cpu_revision;
     m->cpu_model = cpu_model;
     m->ia32_int10_shim = ia32_int10_shim;
@@ -2182,14 +2189,19 @@ static MercedStatus chk_recover(Merced *m, unsigned code, uint64_t imm21) {
  * Reference fault when PSR.ac is set; a semaphore's always does. */
 #define DCACHE_LINE 64u
 
-static bool unaligned_fault(Merced *m, uint64_t va, unsigned size,
-                            uint64_t isr_access, bool always, MercedStatus *st) {
+static bool unaligned_needs_fault(const Merced *m, uint64_t va, unsigned size,
+                                  bool always) {
     if (!(va & (size - 1u)))
         return false;
     /* Without PSR.ac only a reference that straddles a data cache line
      * faults; a semaphore always does. */
-    if (!(always || (m->psr & PSR_AC)) &&
-        (va & (DCACHE_LINE - 1u)) + size <= DCACHE_LINE)
+    return always || (m->psr & PSR_AC) ||
+           (va & (DCACHE_LINE - 1u)) + size > DCACHE_LINE;
+}
+
+static bool unaligned_fault(Merced *m, uint64_t va, unsigned size,
+                            uint64_t isr_access, bool always, MercedStatus *st) {
+    if (!unaligned_needs_fault(m, va, size, always))
         return false;
     *st = deliver_fault(m, VEC_UNALIGNED, isr_access, va, true);
     return true;
@@ -2760,11 +2772,24 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
                 return deliver_fault(m, VEC_NAT,
                                      ISR_NA | ISR_R | UINT64_C(0x10),
                                      0, false);
-            if (!n3 && data_debug_fault(m, va, size, ISR_R, &st))
+            /* PSR.ed forces a speculative load to defer: no reference, a
+             * NaT target.  A fault handler sets it to resume past an ld.s
+             * it won't service - NT does for an unaligned ld8.sa in the
+             * configuration manager, and without this the load faulted
+             * again and NT stopped with CONFIG_INITIALIZATION_FAILED. */
+            /* An unaligned speculative load defers like any other of its
+             * faults (spec_defers(): PSR.ic clear, or recovery code on an
+             * ED code page).  NT's configuration manager issues ld8.sa on
+             * registry cells, whose data is 4 mod 8, with PSR.ac set. */
+            bool forced = spec && !n3 &&
+                ((m->psr & PSR_ED) ||
+                 (unaligned_needs_fault(m, va, size, false) &&
+                  spec_defers(m, VEC_UNALIGNED)));
+            if (!n3 && !forced && data_debug_fault(m, va, size, ISR_R, &st))
                 return st;
-            if (!n3 && unaligned_fault(m, va, size, ISR_R, false, &st))
+            if (!n3 && !forced && unaligned_fault(m, va, size, ISR_R, false, &st))
                 return st;
-            if (n3) {
+            if (n3 || forced) {
                 gr_write(m, r1, 0, 1);
             } else if (!va_translate(m, va, false, spec, ISR_R, &pa, &st)) {
                 /* A delivered fault also returns MERCED_OK, with taken
@@ -2951,6 +2976,18 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         if (check_load && n3)
             return deliver_fault(m, VEC_NAT,
                                  ISR_NA | ISR_R | UINT64_C(0x10), 0, false);
+        /* PSR.ed: a speculative ldf.s/ldf.sa defers, as for the integer
+         * loads above. */
+        static const unsigned fspec_size[4] = { 16, 8, 4, 8 };
+        if (!is_st && x6 <= 0x0F && (((x6 >> 2) & 3) == 1 ||
+                                     ((x6 >> 2) & 3) == 3) &&
+            ((m->psr & PSR_ED) ||
+             (!n3 && unaligned_needs_fault(m, va, fspec_size[x6 & 3], false) &&
+              spec_defers(m, VEC_UNALIGNED)))) {
+            MercedFpReg nat = {0, 0, 0, 1};
+            fr_write(m, (unsigned)bits(raw, 6, 7), nat);
+            goto fp_base_update;
+        }
         {
             static const unsigned fsize[4] = { 16, 8, 4, 8 };
             unsigned fsz = (x6 == 0x1B || x6 == 0x3B) ? 16 : fsize[x6 & 3];
@@ -7714,6 +7751,9 @@ static inline MercedStatus fast_op(Merced *m, const MercedTbEntry *tb,
         if (n3)
             return deliver_fault(m, VEC_NAT, ISR_NA | ISR_R | UINT64_C(0x10),
                                  0, false);
+        /* exec_mem()'s checks, in its order */
+        if (data_debug_fault(m, va, x & LDST_SIZE, ISR_R, &st)) return st;
+        if (unaligned_fault(m, va, x & LDST_SIZE, ISR_R, false, &st)) return st;
         /* These are non-speculative loads.  Translation failure transfers
          * control to the fault handler without committing either output. */
         if (!fast_dtranslate(m, va, ISR_R, &pa, &st)) return st;
@@ -7742,6 +7782,8 @@ static inline MercedStatus fast_op(Merced *m, const MercedTbEntry *tb,
         uint64_t v = gr_read_inl(m, r2, &n2);
         if (n2)
             return deliver_fault(m, VEC_NAT, ISR_W | UINT64_C(0x10), 0, false);
+        if (data_debug_fault(m, va, x & LDST_SIZE, ISR_W, &st)) return st;
+        if (unaligned_fault(m, va, x & LDST_SIZE, ISR_W, false, &st)) return st;
         if (!fast_dtranslate(m, va, ISR_W, &pa, &st)) return st;
         phys_write(m, pa, v, x & LDST_SIZE);
         if (x & LDST_INC_IMM)
@@ -7799,6 +7841,90 @@ static inline MercedStatus fast_op(Merced *m, const MercedTbEntry *tb,
         return MERCED_OK;
     }
     return tb->fn[s](m, tb->slots[s], qp);
+}
+
+/* One decoded slot executed as merced_step() executes it, once fetch and
+ * interruption recognition are done: dispatch, the deferred faults and
+ * traps, and the end-of-slot accounting.  m->ip is the slot's IP.  Shared by
+ * fast_step() and the JIT (merced_jit.c), so the two cannot drift apart;
+ * *redirected reports a taken branch, fault or trap. */
+static inline __attribute__((always_inline))
+MercedStatus fast_slot(Merced *m, const MercedTbEntry *tb, unsigned slot,
+                       uint64_t bundle_va, bool *redirected) {
+    unsigned kind = tb->kind[slot];
+    m->slot_stop_after = tb->stop[slot];
+    int qp = pr_read(m, tb->qpr[slot]);
+    m->taken = 0;
+    uint64_t faults_before = m->nfaults;
+    uint64_t psr_before = m->psr;
+
+    MercedStatus st;
+    unsigned fp_off = (qp && kind == SLOT_EXEC &&
+                       __builtin_expect(m->psr & (PSR_DFL | PSR_DFH), 0))
+                    ? fp_disabled_code(m, bundle_units[tb->tmpl][slot],
+                                       tb->slots[slot]) : 0;
+    if (fp_off)
+        st = deliver_fault(m, VEC_DISABLED_FP, fp_off, 0, false);
+    else if (kind == SLOT_EXEC)
+        st = tb->op[slot] == FOP_GENERIC ?
+             tb->fn[slot](m, tb->slots[slot], qp) : fast_op(m, tb, slot, qp);
+    else if (kind == SLOT_NOP)
+        st = MERCED_OK;
+    else
+        st = exec_x(m, tb->slots[2], tb->slots[1], qp);
+    if (__builtin_expect(oof_write_pending, 0)) {
+        oof_write_pending = false;
+        st = deliver_fault(m, VEC_GENERAL, 0, 0, false);
+    }
+    if (st != MERCED_OK) {
+        if (st == MERCED_HALT_UNIMPL) {
+            char unit = kind == SLOT_X ? 'X' : bundle_units[tb->tmpl][slot];
+            uint64_t raw = kind == SLOT_X ? tb->slots[2] : tb->slots[slot];
+            size_t len = strlen(m->halt_msg);
+            snprintf(m->halt_msg + len, sizeof(m->halt_msg) - len,
+                     " [%c-slot %u tmpl %s raw=0x%011" PRIX64 "]",
+                     unit, slot, bundle_units[tb->tmpl], raw);
+        }
+        return st;
+    }
+
+    if (__builtin_expect(m->cache.observe, 0) && merced_cache_take_mca(m))
+        deliver_mca(m);
+
+    m->ninsts++;
+    if (__builtin_expect(pmu_count_on, 0) && m->nfaults == faults_before)
+        pmu_retire(m, kind == SLOT_NOP, qp, m->slot_stop_after);
+    if (!m->external_itc)
+        itc_advance(m, m->slot_cycles);
+    if (m->nfaults == faults_before)
+        m->last_successful_bundle = bundle_va;
+    if (__builtin_expect(m->psr & PSR_ONE_SHOT, 0) &&
+        m->nfaults == faults_before &&
+        !slot_is_rfi(kind == SLOT_X ? 'X' : bundle_units[tb->tmpl][slot],
+                     kind == SLOT_X ? tb->slots[2] : tb->slots[slot]))
+        m->psr &= ~PSR_ONE_SHOT;
+    if (__builtin_expect(psr_before & (PSR_LP | PSR_TB | PSR_SS), 0) &&
+        m->nfaults == faults_before &&
+        post_slot_trap(m, kind == SLOT_X ? 'X' : bundle_units[tb->tmpl][slot],
+                       kind == SLOT_X ? tb->slots[2] : tb->slots[slot], slot,
+                       psr_before, bundle_va, m->slot_stop_after)) {
+        m->group_start = 1;
+        m->taken = 0;
+        *redirected = true;
+        return MERCED_OK;
+    }
+    if (m->taken) {
+        m->group_start = 1;
+        m->taken = 0;
+        *redirected = true;
+        return MERCED_OK;
+    }
+    m->group_start = m->slot_stop_after;
+    if (kind == SLOT_X || slot == 2)
+        m->ip = bundle_va + 16;
+    else
+        m->ip = bundle_va | (slot + 1);
+    return MERCED_OK;
 }
 
 /* The common case of merced_step(), many slots per call.  It handles a slot
@@ -7887,82 +8013,12 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
         m->bundle_cache_slots[2] = tb->slots[2];
         tc->cur_tb = tb;
     }
-    unsigned kind = tb->kind[slot];
-    m->slot_stop_after = tb->stop[slot];
-    int qp = pr_read(m, tb->qpr[slot]);
-    m->taken = 0;
-    uint64_t faults_before = m->nfaults;
-    uint64_t psr_before = m->psr;
-
-    MercedStatus st;
-    unsigned fp_off = (qp && kind == SLOT_EXEC &&
-                       __builtin_expect(m->psr & (PSR_DFL | PSR_DFH), 0))
-                    ? fp_disabled_code(m, bundle_units[tb->tmpl][slot],
-                                       tb->slots[slot]) : 0;
-    if (fp_off)
-        st = deliver_fault(m, VEC_DISABLED_FP, fp_off, 0, false);
-    else if (kind == SLOT_EXEC)
-        st = tb->op[slot] == FOP_GENERIC ?
-             tb->fn[slot](m, tb->slots[slot], qp) : fast_op(m, tb, slot, qp);
-    else if (kind == SLOT_NOP)
-        st = MERCED_OK;
-    else
-        st = exec_x(m, tb->slots[2], tb->slots[1], qp);
-    if (__builtin_expect(oof_write_pending, 0)) {
-        oof_write_pending = false;
-        st = deliver_fault(m, VEC_GENERAL, 0, 0, false);
-    }
-    if (st != MERCED_OK) {
-        if (st == MERCED_HALT_UNIMPL) {
-            char unit = kind == SLOT_X ? 'X' : bundle_units[tb->tmpl][slot];
-            uint64_t raw = kind == SLOT_X ? tb->slots[2] : tb->slots[slot];
-            size_t len = strlen(m->halt_msg);
-            snprintf(m->halt_msg + len, sizeof(m->halt_msg) - len,
-                     " [%c-slot %u tmpl %s raw=0x%011" PRIX64 "]",
-                     unit, slot, bundle_units[tb->tmpl], raw);
-        }
-        return st;
-    }
-
-    if (__builtin_expect(m->cache.observe, 0) && merced_cache_take_mca(m))
-        deliver_mca(m);
-
-    m->ninsts++;
-    if (__builtin_expect(pmu_count_on, 0) && m->nfaults == faults_before)
-        pmu_retire(m, kind == SLOT_NOP, qp, m->slot_stop_after);
-    if (!m->external_itc)
-        itc_advance(m, m->slot_cycles);
-    if (m->nfaults == faults_before)
-        m->last_successful_bundle = bundle_va;
-    if (__builtin_expect(m->psr & PSR_ONE_SHOT, 0) &&
-        m->nfaults == faults_before &&
-        !slot_is_rfi(kind == SLOT_X ? 'X' : bundle_units[tb->tmpl][slot],
-                     kind == SLOT_X ? tb->slots[2] : tb->slots[slot]))
-        m->psr &= ~PSR_ONE_SHOT;
-    if (__builtin_expect(psr_before & (PSR_LP | PSR_TB | PSR_SS), 0) &&
-        m->nfaults == faults_before &&
-        post_slot_trap(m, kind == SLOT_X ? 'X' : bundle_units[tb->tmpl][slot],
-                       kind == SLOT_X ? tb->slots[2] : tb->slots[slot], slot,
-                       psr_before, bundle_va, m->slot_stop_after)) {
-        m->group_start = 1;
-        m->taken = 0;
-        return MERCED_OK;
-    }
-    if (m->taken) {
-        m->group_start = 1;
-        m->taken = 0;
-        return MERCED_OK;
-    }
-    m->group_start = m->slot_stop_after;
-    if (kind == SLOT_X || slot == 2)
-        m->ip = bundle_va + 16;
-    else
-        m->ip = bundle_va | (slot + 1);
-    return MERCED_OK;
+    bool redirected = false;
+    return fast_slot(m, tb, slot, bundle_va, &redirected);
 }
 
 #define MERCED_JIT_INCLUDED
-#include "merced_jit.c"
+#include "jit/merced_jit.c"
 
 /* Like merced_run(), but through fast_step() when no debug facility is
  * active - or through translated code, with -accel jit.  In addition to the

@@ -1,5 +1,5 @@
-/* Executable memory for gemu's JIT backends (see gemu/jit_x64.h). */
-#include "gemu/jit_x64.h"
+/* Executable memory for gemu's JIT backends. */
+#include "jit_mem.h"
 
 #ifdef _WIN32
 #include <windows.h>

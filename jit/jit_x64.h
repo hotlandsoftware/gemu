@@ -5,7 +5,7 @@
 #include <string.h>
 
 /*
- * Minimal x86-64 machine-code emitter for gemu's JIT backends.
+ * Minimal x86-64 machine-code emitter, used by jit_backend_x64.c.
  *
  * Only what the translators need: 64-bit integer moves and ALU operations
  * against registers, immediates and [base + index*scale + disp32] memory
@@ -55,10 +55,6 @@ typedef struct {
     uint8_t *base, *p, *end;
     bool overflow;          /* ran out of room: discard and retry after flush */
 } X64Buf;
-
-/* Executable memory (RWX).  Returns NULL when the host refuses. */
-void *gemu_jit_alloc_exec(size_t size);
-void  gemu_jit_free_exec(void *p, size_t size);
 
 static inline void x64_init(X64Buf *b, void *mem, size_t size) {
     b->base = b->p = (uint8_t *)mem;
@@ -307,6 +303,18 @@ static inline void x64_inc32_m(X64Buf *b, int base, int index, int scale,
 static inline void x64_lea_x(X64Buf *b, int dst, int base, int index,
                              int scale, int32_t disp) {
     x64_op_mem(b, 1, 0x8D, -1, dst, base, index, scale, disp, false);
+}
+
+/* bt r64, imm8 (CF = the bit) */
+static inline void x64_bt_ri(X64Buf *b, int r, uint8_t bit) {
+    x64_op_rr(b, 1, 0x0F, 0xBA, 4, r, false);
+    x64_b(b, bit);
+}
+/* mov dword [mem], imm32 */
+static inline void x64_store32_imm(X64Buf *b, int base, int index, int scale,
+                                   int32_t disp, int32_t imm) {
+    x64_op_mem(b, 0, 0xC7, -1, 0, base, index, scale, disp, false);
+    x64_d(b, (uint32_t)imm);
 }
 
 /* test r8, r8 */

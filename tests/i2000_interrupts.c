@@ -75,20 +75,20 @@ static uint8_t pit_count(Ia64I2000State *s, unsigned channel) {
  * channel 2 reports through port 61h. */
 static void test_pit(void) {
     Ia64I2000State *s = machine();
-    s->cpu->ar[44] = 0;
+    s->cpu->time_base = 0;
     io_port_write(s, 0x43, 0x34, 1);          /* channel 0, mode 2, lo/hi */
     io_port_write(s, 0x40, 0x00, 1);
     io_port_write(s, 0x40, 0x10, 1);          /* count 4096 */
-    s->cpu->ar[44] = itc_for_pit(1000);
+    s->cpu->time_base = itc_for_pit(1000);
     uint8_t high = pit_count(s, 0);
     CHECK(high == 0x0c);                      /* 4096 - 1000 - 1 */
-    s->cpu->ar[44] = itc_for_pit(3000);
+    s->cpu->time_base = itc_for_pit(3000);
     CHECK(pit_count(s, 0) < high);
 
     /* A rising edge at the end of the period latches IRQ0 behind the mask. */
     io_port_write(s, 0x21, 0x01, 1);
     CHECK(!s->pit_irq_pending);
-    s->cpu->ar[44] = itc_for_pit(5000);
+    s->cpu->time_base = itc_for_pit(5000);
     i2000_poll_interrupts(s);
     CHECK(s->pit_irq_pending && !irq(s, 0));
     io_port_write(s, 0x21, 0x00, 1);          /* unmask */
@@ -100,11 +100,11 @@ static void test_pit(void) {
     io_port_write(s, 0x42, 0x00, 1);          /* count 64 */
     io_port_write(s, 0x61, 0x01, 1);          /* gate on */
     CHECK(!(io_port_read(s, 0x61, 1) & 0x20));
-    s->cpu->ar[44] += itc_for_pit(100);
+    s->cpu->time_base += itc_for_pit(100);
     CHECK(io_port_read(s, 0x61, 1) & 0x20);
     /* The refresh toggle alternates about every 15 us. */
     uint8_t first = io_port_read(s, 0x61, 1) & 0x10;
-    s->cpu->ar[44] += itc_for_pit(18);
+    s->cpu->time_base += itc_for_pit(18);
     CHECK((io_port_read(s, 0x61, 1) & 0x10) != first);
     ia64_i2000_destroy(s);
 }
@@ -112,14 +112,14 @@ static void test_rtc(void) {
     Ia64I2000State *s = machine();
     /* The divider starts half a second from an update: UIP rises 16 counts
      * before it and the time advances when the 65-count update ends. */
-    s->cpu->ar[44] = 0;
+    s->cpu->time_base = 0;
     CHECK(!(rtc_read(s, 0x0a) & 0x80));
     uint8_t seconds = rtc_read(s, 0x00);
-    s->cpu->ar[44] = itc_for_oscillator(16384 - 8);
+    s->cpu->time_base = itc_for_oscillator(16384 - 8);
     CHECK(rtc_read(s, 0x0a) & 0x80);
-    s->cpu->ar[44] = itc_for_oscillator(16384 + 30);
+    s->cpu->time_base = itc_for_oscillator(16384 + 30);
     CHECK(rtc_read(s, 0x0a) & 0x80);                 /* mid-update */
-    s->cpu->ar[44] = itc_for_oscillator(16384 + 200);
+    s->cpu->time_base = itc_for_oscillator(16384 + 200);
     CHECK(!(rtc_read(s, 0x0a) & 0x80));
     CHECK(rtc_read(s, 0x00) != seconds);
     /* Register D reports valid RAM; C reads zero with nothing enabled. */
@@ -128,7 +128,7 @@ static void test_rtc(void) {
     /* Periodic interrupt: RS = 6 is 1 ms. IRQ8 stays up, and RTC_STS is set,
      * until register C is read. */
     rtc_write(s, 0x0b, 0x42);                        /* PIE, 24-hour BCD */
-    s->cpu->ar[44] += itc_for_oscillator(200);
+    s->cpu->time_base += itc_for_oscillator(200);
     rtc_write(s, 0x0b, 0x42);                        /* a poll point */
     CHECK(s->rtc_irq);
     CHECK(s->chipset.pm.pm1_sts & 0x0400);
@@ -140,7 +140,7 @@ static void test_rtc(void) {
     rtc_write(s, 0x01, 0xc0);                        /* don't care */
     rtc_write(s, 0x03, 0xc0);
     rtc_write(s, 0x05, 0xc0);
-    s->cpu->ar[44] += itc_for_oscillator(32768);
+    s->cpu->time_base += itc_for_oscillator(32768);
     CHECK(rtc_read(s, 0x0c) & 0xa0);                 /* IRQF and AF */
 
     /* The extended bank needs the upper-128 enable and is separate RAM. */
@@ -157,10 +157,10 @@ static void test_rtc(void) {
     /* The cell keeps its RAM across a processor reset, and the clock runs. */
     rtc_write(s, 0x20, 0x77);
     uint8_t before = rtc_read(s, 0x00);
-    s->cpu->ar[44] = itc_for_oscillator(3 * 32768);
+    s->cpu->time_base = itc_for_oscillator(3 * 32768);
     i2000_reset(s, false);
     CHECK(rtc_read(s, 0x20) == 0x77);
-    s->cpu->ar[44] = itc_for_oscillator(2 * 32768);
+    s->cpu->time_base = itc_for_oscillator(2 * 32768);
     CHECK(rtc_read(s, 0x00) != before);
     ia64_i2000_destroy(s);
 }
@@ -512,7 +512,7 @@ static void test_chipset_snapshot(void) {
     io_port_write(s, 0xa04, 0x400, 2);        /* SCI_EN off on this board */
     CHECK(io_port_read(s, 0xa04, 2) == 0x400);
     CHECK(io_port_read(source, 0xa04, 2) == 0x401);
-    s->cpu->ar[44] += I2000_ITC_HZ / 1000;
+    merced_advance_itc(s->cpu, I2000_ITC_HZ / 1000);   /* 1 ms passes */
     CHECK(io_port_read(s, 0xa08, 4) == 3579);
     CHECK(io_port_read(s, 0x1206, 2) == 43);
     CHECK(io_port_read(source, 0x1206, 2) == 42);

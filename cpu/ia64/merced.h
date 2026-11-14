@@ -328,6 +328,14 @@ struct Merced {
      * delivers a vector, cleared by cr.eoi. */
     uint8_t ext_in_service[32];
 
+    /* The platform's time base: ITC ticks charged so far, by the machine's
+     * clock or per slot (merced_advance_itc(), cycles per slot).  It counts
+     * with ar.itc but ignores software writes to it - PAL's ITC test stores
+     * 0x5555... and 0xAAAA... there - so devices clocked by their own
+     * crystals (PIT, RTC, chipset timers) read this, not the ITC.  Survives
+     * merced_reset(): RESET# doesn't stop the board's clocks. */
+    uint64_t time_base;
+
     /* --- Merced MSR file and cache arrays (merced_msr.c, merced_cache.c) ---
      * Everything here is plain data: a raw copy of the struct (a machine
      * snapshot) carries the whole model, and merced_reset() clears the
@@ -352,6 +360,8 @@ void    merced_flush_translation_cache(Merced *m);
 void    merced_set_external_itc(Merced *m, bool enabled);
 void    merced_advance_itc(Merced *m, uint64_t ticks);
 uint64_t merced_get_itc(const Merced *m);
+/* The platform time base (see Merced.time_base), in ITC ticks. */
+uint64_t merced_get_time_base(const Merced *m);
 
 /* Overrides the stepping Windows/firmware sees in cpuid[3]'s revision
  * field (bits 15:8). Takes effect immediately and persists across

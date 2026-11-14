@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 # ── Source file lists per family ───────────────────────────────────────────────
 
 CORE_SRC = [
-    'core/src/memory.c', 'core/src/tcg.c', 'core/src/jit_mem.c', 'core/src/monitor.c',
+    'core/src/memory.c', 'core/src/tcg.c', 'jit/jit_mem.c', 'jit/jit_backend_x64.c', 'core/src/monitor.c',
     'core/src/monitor_cmds.c', 'core/src/monitor_qmp.c',
     'core/src/monitor_block.c', 'core/src/monitor_symbols.c',
     'core/third_party/cjson/cJSON.c',
@@ -647,7 +647,7 @@ def main():
     data_xml_files = generate_data(build_dir, targets, have_alsa, have_winmidi)
 
     # All sources share a single unified include path - no per-family separation.
-    inc_dirs = ['core/include', 'core/third_party/cjson', 'cpu', 'vga', 'audio', 'crt',
+    inc_dirs = ['core/include', 'core/third_party/cjson', 'cpu', 'jit', 'vga', 'audio', 'crt',
                 'hardware', 'hardware/machine', 'hardware/device', 'window',
                 'hardware/chip8', 'hardware/ia64', 'hardware/mos',
                 'hardware/other', 'hardware/rca', 'hardware/x86', 'hardware/z80',

@@ -629,7 +629,7 @@ static void i2000_pit_out(void *ud, unsigned channel, bool level) {
 
 /* Advance the timer to the present ITC. */
 static void i2000_pit_run(Ia64I2000State *s) {
-    uint64_t now = merced_get_itc(s->cpu);
+    uint64_t now = merced_get_time_base(s->cpu);
     if (now < s->pit_itc_mark) {            /* the ITC was set backwards */
         s->pit_itc_mark = now;
         return;
@@ -652,7 +652,7 @@ static void i2000_pit_reset(Ia64I2000State *s) {
     s->pit.ud = s;
     i8253_reset(&s->pit);
     i8253_set_gate(&s->pit, 2, false);      /* port 61h bit 0 is clear */
-    s->pit_itc_mark = s->cpu ? merced_get_itc(s->cpu) : 0;
+    s->pit_itc_mark = s->cpu ? merced_get_time_base(s->cpu) : 0;
     s->pit_remainder = 0;
     s->pit_clock = 0;
     s->port61 = 0;
@@ -1412,7 +1412,7 @@ static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
  * instruction count. */
 static uint64_t i2000_rtc_clock(void *opaque) {
     Ia64I2000State *s = opaque;
-    return s->cpu ? merced_get_itc(s->cpu) : 0;
+    return s->cpu ? merced_get_time_base(s->cpu) : 0;
 }
 
 /* IRQ8 changed level. An assertion is also the IFB's RTC_STS event. */
@@ -2739,7 +2739,7 @@ static void i2000_nvram_save(Ia64I2000State *s) {
  * advances exactly as fast as the guest does. */
 static uint64_t i2000_rage_clock(void *opaque) {
     Ia64I2000State *s = opaque;
-    return s->cpu ? merced_get_itc(s->cpu) : 0;
+    return s->cpu ? merced_get_time_base(s->cpu) : 0;
 }
 
 static void i2000_rage_irq(void *opaque, bool level) {
@@ -3148,7 +3148,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 37u
+#define I2000_SNAPSHOT_VERSION 38u   /* 38: Merced.time_base */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -3321,10 +3321,10 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
          * to the current run rather than portable snapshot values. */
         s->mouse_wait_rfi_generation = 0;
         s->keyboard_retry_ninsts = s->cpu->ninsts;
-        s->mouse_next_report_itc = merced_get_itc(s->cpu);
+        s->mouse_next_report_itc = merced_get_time_base(s->cpu);
         s->pit.out_changed = i2000_pit_out;
         s->pit.ud = s;
-        s->pit_itc_mark = merced_get_itc(s->cpu);
+        s->pit_itc_mark = merced_get_time_base(s->cpu);
     }
 
     fclose(f);
@@ -4115,7 +4115,7 @@ static void i2000_smbus_init(Ia64I2000State *s) {
 /* Board wiring for the reusable 460GX register model. */
 static uint64_t i2000_chipset_clock(void *opaque) {
     Ia64I2000State *s = opaque;
-    return s->cpu ? merced_get_itc(s->cpu) : 0;
+    return s->cpu ? merced_get_time_base(s->cpu) : 0;
 }
 
 /* The IFB's SMI# is the processor's PMI# pin. The firmware's own PMI handler
@@ -4428,7 +4428,7 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
             unsigned rate = s->mouse_sample_rate ? s->mouse_sample_rate : 100;
             uint64_t interval = I2000_ITC_HZ / rate;
             if (interval < 5000) interval = 5000;
-            s->mouse_next_report_itc = merced_get_itc(s->cpu) + interval;
+            s->mouse_next_report_itc = merced_get_time_base(s->cpu) + interval;
         }
     }
     /* legacy_irq_routed is permanently false (nothing ever sets it) - this
@@ -4854,12 +4854,19 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
     gemu_monitor_start(s->monitor);
     i2000_update_fast_ram(s);
 
-    /* PAL_FREQ_RATIOS advertises a 200 MHz ITC.  Drive it from elapsed
-     * machine time, not interpreted slots: otherwise a firmware 10 ms input
-     * timer takes roughly half a second on a 3.8 Mslot/s host. */
-    merced_set_external_itc(s->cpu, true);
+    /* The ITC follows elapsed host time, so a firmware 10 ms input timer
+     * takes 10 ms however slowly the guest runs.  It also counts within a
+     * frame, as real hardware's does every cycle: the CPU charges the
+     * per-slot cycles (merced_set_cycles_per_slot()), and each frame tops
+     * the platform time base up to host time when the guest is behind it.
+     * PAL's AR self-test writes ar.itc and expects a later read to have
+     * moved on; an ITC that only advanced between frames failed it and
+     * sent C0 firmware into its dead loop. */
+    merced_set_external_itc(s->cpu, false);
     uint64_t itc_last_ns = i2000_monotonic_ns();
     uint64_t itc_fraction = 0;
+    uint64_t itc_target = merced_get_time_base(s->cpu);
+    uint64_t itc_seen = itc_target;
     uint32_t display_keys_held = 0;
 
     /* A benchmark (GEMU_BENCH_NINSTS) runs the ITC off the instruction
@@ -4882,12 +4889,17 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
     while (running) {
         /* loadvm restores this CPU flag too, so reassert machine policy.
          * Paused time must not become one enormous timer jump on resume. */
-        merced_set_external_itc(s->cpu, host_itc);
+        merced_set_external_itc(s->cpu, false);
         uint64_t now_ns = i2000_monotonic_ns();
+        uint64_t time_base = merced_get_time_base(s->cpu);
+        if (time_base < itc_seen)           /* loadvm or reset: re-anchor */
+            itc_target = time_base;
+        itc_seen = time_base;
         if (!host_itc) {
             itc_last_ns = now_ns;
         } else if (gemu_monitor_is_paused(s->monitor) || s->halted) {
             itc_last_ns = now_ns;
+            itc_target = time_base;
         } else {
             /* Exact ticks for the elapsed host time, carrying the remainder
              * (in units of 1/10^9 tick). The span is bounded so the product
@@ -4899,8 +4911,14 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             uint64_t ticks = itc_fraction / UINT64_C(1000000000);
             itc_fraction %= UINT64_C(1000000000);
             itc_last_ns = now_ns;
-            if (ticks)
-                merced_advance_itc(s->cpu, ticks);
+            /* Host time owed beyond what the slots already charged; a guest
+             * running ahead of real time owes nothing and carries no debt. */
+            itc_target += ticks;
+            if (time_base < itc_target)
+                merced_advance_itc(s->cpu, itc_target - time_base);
+            else
+                itc_target = time_base;
+            itc_seen = merced_get_time_base(s->cpu);
         }
         if (s->display) {
             uint32_t keys_held = gemu_display_poll(s->display);
@@ -4972,7 +4990,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                 !ps2_keyboard_has_data(&s->ps2_keyboard) &&
                 s->mouse_wait_rfi_generation == 0 &&
                 s->cpu->ninsts >= s->mouse_retry_ninsts &&
-                (int64_t)(merced_get_itc(s->cpu) -
+                (int64_t)(merced_get_time_base(s->cpu) -
                           s->mouse_next_report_itc) >= 0) {
                 int8_t cdx = (int8_t)(s->mouse_accum_dx < -127 ? -127 :
                                       s->mouse_accum_dx > 127 ? 127 : s->mouse_accum_dx);
