@@ -2949,10 +2949,16 @@ static void i2000_cpu_state(void *ud, char *buf, size_t buf_len) {
 }
 
 
+/* The size of the picture the monitor shows: the card's current mode (kept
+ * out of Ia64I2000State, which snapshots copy raw). */
+static uint32_t i2000_pic_w = 640, i2000_pic_h = 480;
+
 /* The card's native scan-out when its CRTC is programmed for one, otherwise
- * the VGA core's picture, drawn from the origin of the frame buffer. */
+ * the VGA core's picture.  Leaves it in s->fb packed at its own size,
+ * i2000_pic_w x i2000_pic_h, which follows the mode the way a monitor
+ * would; with no signal the last size stays, showing black. */
 static void i2000_render_frame(Ia64I2000State *s) {
-    uint32_t w, h, y0, y1;
+    uint32_t w = 0, h = 0, y0, y1;
     bool shown = false;
     if (s->video_enabled) {
         rage128_tick(&s->rage128);
@@ -2961,20 +2967,24 @@ static void i2000_render_frame(Ia64I2000State *s) {
                 vga_blit_ex(&s->vga, s->fb, FB_W, FB_H, 640, 480, 1, &w, &h,
                             true, &y0, &y1);
     }
-    if (!shown) {
+    if (!shown || !w || !h) {
         memset(s->fb, 0, sizeof(s->fb));
         return;
     }
-    /* Outside the picture the monitor shows nothing. */
-    for (uint32_t y = 0; y < FB_H; y++)
-        for (uint32_t x = (y < h ? w : 0); x < FB_W; x++)
-            s->fb[y * FB_W + x] = 0;
+    if (w > FB_W) w = FB_W;
+    if (h > FB_H) h = FB_H;
+    i2000_pic_w = w;
+    i2000_pic_h = h;
+    /* rows were drawn FB_W apart; pack them (each moves to a lower address) */
+    if (w != FB_W)
+        for (uint32_t y = 1; y < h; y++)
+            memmove(&s->fb[y * w], &s->fb[y * FB_W], w * sizeof(s->fb[0]));
 }
 
 static bool i2000_screendump(void *ud, const char *path) {
     Ia64I2000State *s = ud;
     i2000_render_frame(s);
-    return gemu_screendump_argb(path, s->fb, FB_W, FB_H);
+    return gemu_screendump_argb(path, s->fb, (int)i2000_pic_w, (int)i2000_pic_h);
 }
 
 /* The SDV EFI presentation environment leaves cr.iva at zero and obtains
@@ -5094,7 +5104,10 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                 last_frame_ns = frame_ns;
                 gemu_display_set_paused(s->display, idle);
                 i2000_render_frame(s);
-                gemu_display_render(s->display, s->fb, FB_W, FB_H);
+                gemu_display_set_size(s->display, (int)i2000_pic_w,
+                                      (int)i2000_pic_h, 0, 0);
+                gemu_display_render(s->display, s->fb, (int)i2000_pic_w,
+                                    (int)i2000_pic_h);
             }
         }
         if (idle)

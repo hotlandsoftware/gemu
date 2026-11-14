@@ -135,6 +135,14 @@ void         gemu_display_destroy(GemuDisplay *d);
  * parameters to support machines that switch resolution mid-run (e.g. SCHIP).
  */
 void gemu_display_render(GemuDisplay *d, const uint32_t *argb, int w, int h);
+/*
+ * The picture changed size (a new video mode): frames from now on are w x h,
+ * shown at aspect_w:aspect_h (0, 0 = square pixels).  The window keeps its
+ * whole-number scale, so it grows or shrinks to fit the new picture.  No-op
+ * when nothing changed; call it before rendering the first frame of the new
+ * size.
+ */
+void gemu_display_set_size(GemuDisplay *d, int w, int h, int aspect_w, int aspect_h);
 void gemu_display_render_text(GemuDisplay *d, const char *text, int rows, int cols);
 void gemu_display_set_paused(GemuDisplay *d, bool paused);
 

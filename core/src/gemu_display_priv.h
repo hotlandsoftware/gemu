@@ -28,6 +28,8 @@ struct GemuDisplay {
     char            head_names[GEMU_DISPLAY_MAX_HEADS][48];
     bool            head_detached[GEMU_DISPLAY_MAX_HEADS];  /* in a window of its own */
     int             n_heads, head;
+    /* gemu_display_set_size(): the current picture size (0 = as created) */
+    int             size_w, size_h, size_aspect_w, size_aspect_h;
     char title[128];
 
     /* Window menus (gemu_display_menu.c) */

@@ -148,6 +148,28 @@ void gemu_display_render(GemuDisplay *d, const uint32_t *argb, int w, int h) {
     gemu_display_vnc_frame(d, argb, w, h);
 }
 
+void gemu_display_set_size(GemuDisplay *d, int w, int h, int aspect_w, int aspect_h) {
+    if (!d || w <= 0 || h <= 0) return;
+    if (w == d->size_w && h == d->size_h &&
+        aspect_w == d->size_aspect_w && aspect_h == d->size_aspect_h)
+        return;
+    int scale = d->ui_get_scale ? d->ui_get_scale(d) : 0;
+    d->size_w = w;
+    d->size_h = h;
+    d->size_aspect_w = aspect_w;
+    d->size_aspect_h = aspect_h;
+    if (d->head >= 0 && d->head < d->n_heads) {
+        d->heads[d->head].width = w;
+        d->heads[d->head].height = h;
+        d->heads[d->head].aspect_w = aspect_w;
+        d->heads[d->head].aspect_h = aspect_h;
+    }
+    if (d->do_set_geometry)
+        d->do_set_geometry(d, w, h, aspect_w, aspect_h);
+    if (scale > 0 && d->ui_set_scale)
+        d->ui_set_scale(d, scale);
+}
+
 void gemu_display_render_text(GemuDisplay *d, const char *text, int rows, int cols) {
     if (d && text && d->do_render_text) d->do_render_text(d, text, rows, cols);
 }
