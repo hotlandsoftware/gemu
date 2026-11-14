@@ -61,10 +61,17 @@
 
 #include "jit_backend.h"
 
-#define MJ_MAX_BUNDLES 16
+/* Blocks are short and end at every branch: each entry point (branch
+ * target, return address, resume after an interruption) gets its own block,
+ * so a long block duplicates the code after it once per entry.  At 16
+ * bundles through conditional branches NT's boot filled a 1 GiB code buffer
+ * every ~20 s; 8 bundles ending at branches ran ~45% more guest code than
+ * that (64 MiB) in the same time. */
+#define MJ_MAX_BUNDLES 8
 #define MJ_MAX_SLOTS   (MJ_MAX_BUNDLES * 3)
-#define MJ_CODE_SIZE   (64u << 20)
-#define MJ_HASH_BITS   15
+#define MJ_CODE_SIZE   (256u << 20)    /* address space; pages fill as used */
+#define MJ_HASH_BITS   18
+#define MJ_JMP_CACHE   4096         /* direct-mapped front of the hash */
 #define MJ_HASH_SIZE   (1u << MJ_HASH_BITS)
 
 typedef struct MercedJitBlock MercedJitBlock;
@@ -108,6 +115,9 @@ typedef struct MercedJit {
     MjTlbEntry htlb[2 * MJ_HTLB_SIZE];   /* reads, then writes */
     JitBackend *be;         /* host code buffer (jit/jit_backend.h) */
     MercedJitBlock *hash[MJ_HASH_SIZE];
+    /* The last block entered at each (hashed) IP: most entries hit here
+     * without walking a hash chain.  Cleared with the hash. */
+    MercedJitBlock *jmp_cache[MJ_JMP_CACHE];
     MercedJitBlock *all;
     MercedStatus status;    /* set by mj_slot() when a slot halts */
     /* A flush requested while a block runs (a helper slot can reach
@@ -120,26 +130,54 @@ typedef struct MercedJit {
         uint64_t direct_slots, mem_slow, mem_fill, mem_nofill_xlate,
                  mem_nofill_page;
         uint64_t reverify_ok, reverify_fail, retranslate;
+        uint64_t flush_full, code_bytes, mid_entry;
+        uint64_t why_x[9];      /* is db one-shot lp tb ss pmu observe fetch */
+        uint64_t comp_new, comp_pa, comp_bytes;
     } stats;
+    /* MERCED_JIT_STATS: compiles by block entry (hashed), to tell key
+     * churn from flushes */
+    struct MjCompProf { uint64_t ip, key; uint32_t n, keychanges; } *comp_prof;
     /* MERCED_JIT_STATS: helper calls by unit/major/x6, to show what to
      * translate natively next. */
     uint64_t *helper_profile;
 } MercedJit;
 
-/* CFM fields that select GR/PR physical locations - sor, rrb.gr, rrb.pr
- * (rrb.fr only matters to FP handlers, which read CFM themselves) - and
- * sof, which decides whether a stacked-register write is out of frame. */
-#define MJ_CFM_KEY_MASK (UINT64_C(0x7F) | (UINT64_C(0xF) << 14) | \
-                         (UINT64_C(0x7F) << 18) | (UINT64_C(0x3F) << 32))
+/* A block is specialized on PSR.bn and CFM.sor (which stacked registers
+ * rotate).  sof isn't part of it - at a function's entry it is the caller's
+ * frame, so keying on it compiled one copy per caller; translated code
+ * checks it before writing a stacked register instead (mj_gen_oof_guard()).  The rotation bases rrb.gr and
+ * rrb.pr are read at run time, so a software-pipelined loop - which rotates
+ * them every iteration - keeps one translation; keying on them compiled one
+ * copy per rotation state (100+ for some of NT's loops).  Bases outside the
+ * range rotation keeps them in (rrb.gr < sor * 8, rrb.pr < 48), which only
+ * software writing CFM can produce, are keyed and compiled statically.
+ * (rrb.fr only matters to FP handlers, which read CFM themselves.) */
+#define MJ_CFM_FRAME_MASK  (UINT64_C(0xF) << 14)
+#define MJ_CFM_RRB_MASK    ((UINT64_C(0x7F) << 18) | (UINT64_C(0x3F) << 32))
+#define MJ_KEY_STATIC_RRB  (UINT64_C(1) << 62)
+#define MJ_CFM_KEY_MASK    (MJ_CFM_FRAME_MASK | MJ_CFM_RRB_MASK)
 
 static inline uint64_t mj_key(const Merced *m) {
-    return (m->cfm & MJ_CFM_KEY_MASK) |
-           ((m->psr & PSR_BN) ? UINT64_C(1) << 63 : 0);
+    uint64_t cfm = m->cfm;
+    unsigned sor8 = CFM_SOR(cfm) * 8;
+    bool normal = (sor8 == 0 || CFM_RRB_GR(cfm) < sor8) &&
+                  CFM_RRB_PR(cfm) < 48;
+    uint64_t key = (cfm & MJ_CFM_FRAME_MASK) |
+                   ((m->psr & PSR_BN) ? UINT64_C(1) << 63 : 0);
+    if (!normal)
+        key |= (cfm & MJ_CFM_RRB_MASK) | MJ_KEY_STATIC_RRB;
+    return key;
 }
 
 static inline unsigned mj_hash(uint64_t ip, uint64_t key) {
-    return (unsigned)(((ip >> 4) ^ (ip >> 19) ^ (key >> 14) ^ (key >> 51)) &
-                      (MJ_HASH_SIZE - 1));
+    uint64_t h = (ip ^ (key * UINT64_C(0x9E3779B97F4A7C15))) *
+                 UINT64_C(0xFF51AFD7ED558CCD);
+    return (unsigned)(h >> (64 - MJ_HASH_BITS));
+}
+
+/* Slot IPs differ in the low four bits (slot) and the bundle address. */
+static inline unsigned mj_jmp_index(uint64_t ip) {
+    return (unsigned)(((ip >> 4) ^ (ip >> 16) ^ (ip << 2)) & (MJ_JMP_CACHE - 1));
 }
 
 static inline MercedJit *mj_of(Merced *m) {
@@ -158,6 +196,7 @@ static void mj_free_blocks(MercedJit *j) {
     }
     j->all = NULL;
     memset(j->hash, 0, sizeof(j->hash));
+    memset(j->jmp_cache, 0, sizeof(j->jmp_cache));
 }
 
 /* Drop every translation (code buffer full, or tb_flush()). */
@@ -315,14 +354,10 @@ typedef struct {
     JitBackend *b;
     bool bn;
     unsigned sor8, rrb_gr, rrb_pr, sof;
+    bool dyn_rrb;               /* rotation bases read from CFM at run time */
     unsigned pending;           /* native slots not yet charged to ninsts */
     uint8_t last_stop;          /* stop bit of the slot being translated */
 } MJGen;
-
-static unsigned mj_pr_bit(const MJGen *g, unsigned p) {
-    if (p < 16) return p;
-    return 16 + ((p - 16 + g->rrb_pr) % 48);
-}
 
 static unsigned mj_stacked_index(const MJGen *g, unsigned r) {
     unsigned idx = r - 32;
@@ -331,14 +366,45 @@ static unsigned mj_stacked_index(const MJGen *g, unsigned r) {
     return idx;
 }
 
-/* T5 = physical gr_stack index of stacked register r. */
-static void mj_stacked_phys(MJGen *g, unsigned r) {
-    jit_ld_env(g->b, JIT_T5, MOFF(bof), 4);
-    jit_opi(g->b, JIT_ADD, JIT_T5, JIT_T5, (int64_t)mj_stacked_index(g, r));
-    jit_opi(g->b, JIT_AND, JIT_T5, JIT_T5, MERCED_RSE_CAPACITY - 1);
+/* Does stacked register r rotate under run-time rrb.gr? */
+static bool mj_gr_dyn(const MJGen *g, unsigned r) {
+    return g->dyn_rrb && g->sor8 && r - 32 < g->sor8;
 }
 
-/* val = GR[r]; nat (unless JIT_NREGS) = its NaT bit.  Clobbers T5. */
+/* d = the logical (rotated) stacked index of r, stacked_phys() before the
+ * bof: idx + rrb.gr, wrapped once (both are below sor * 8 here). */
+static void mj_stacked_logical(MJGen *g, unsigned r, JitReg d) {
+    JitBackend *b = g->b;
+    if (!mj_gr_dyn(g, r)) {
+        jit_movi(b, d, mj_stacked_index(g, r));
+        return;
+    }
+    JitLabel inrange = jit_label(b);
+    jit_ld_env(b, d, MOFF(cfm), 8);
+    jit_shri(b, d, d, 18);
+    jit_opi(b, JIT_AND, d, d, 0x7F);
+    jit_opi(b, JIT_ADD, d, d, r - 32);
+    jit_bri(b, JIT_LTU, d, g->sor8, 64, inrange);
+    jit_opi(b, JIT_SUB, d, d, g->sor8);
+    jit_bind(b, inrange);
+}
+
+/* T5 = physical gr_stack index of stacked register r. */
+static void mj_stacked_phys(MJGen *g, unsigned r) {
+    JitBackend *b = g->b;
+    if (mj_gr_dyn(g, r)) {
+        mj_stacked_logical(g, r, JIT_T5);
+        jit_ld_env(b, JIT_T4, MOFF(bof), 4);  /* NB: callers allow T4 too */
+        jit_op(b, JIT_ADD, JIT_T5, JIT_T5, JIT_T4);
+    } else {
+        jit_ld_env(b, JIT_T5, MOFF(bof), 4);
+        jit_opi(b, JIT_ADD, JIT_T5, JIT_T5, (int64_t)mj_stacked_index(g, r));
+    }
+    jit_opi(b, JIT_AND, JIT_T5, JIT_T5, MERCED_RSE_CAPACITY - 1);
+}
+
+/* val = GR[r]; nat (unless JIT_NREGS) = its NaT bit.  Clobbers T5, and T4
+ * for a rotating register. */
 static void mj_gr_read(MJGen *g, unsigned r, JitReg val, JitReg nat) {
     JitBackend *b = g->b;
     bool want_nat = nat != JIT_NREGS;
@@ -375,27 +441,66 @@ static void mj_gr_write(MJGen *g, unsigned r, JitReg val, JitReg nat) {
         else                  jit_st_envi(b, noff, 0, 1);
         return;
     }
-    mj_stacked_phys(g, r);
+    /* T4 = logical index, T5 = physical */
+    mj_stacked_logical(g, r, JIT_T4);
+    jit_ld_env(b, JIT_T5, MOFF(bof), 4);
+    jit_op(b, JIT_ADD, JIT_T5, JIT_T5, JIT_T4);
+    jit_opi(b, JIT_AND, JIT_T5, JIT_T5, MERCED_RSE_CAPACITY - 1);
     jit_st_envx(b, MOFF(gr_stack), JIT_T5, 8, val, 8);
     if (nat != JIT_NREGS) jit_st_envx(b, MOFF(nat_stack), JIT_T5, 1, nat, 1);
     else                  jit_st_envxi(b, MOFF(nat_stack), JIT_T5, 1, 0, 1);
     /* if (bof_total + logical < rse_flushed_regs) rse_flushed_regs = ...; */
     JitLabel skip = jit_label(b);
-    jit_ld_env(b, JIT_T4, MOFF(bof_total), 8);
-    jit_opi(b, JIT_ADD, JIT_T4, JIT_T4, (int64_t)mj_stacked_index(g, r));
+    jit_ld_env(b, JIT_T5, MOFF(bof_total), 8);
+    jit_op(b, JIT_ADD, JIT_T4, JIT_T4, JIT_T5);
     jit_ld_env(b, JIT_T5, MOFF(rse_flushed_regs), 8);
     jit_br(b, JIT_GE, JIT_T4, JIT_T5, 64, skip);
     jit_st_env(b, MOFF(rse_flushed_regs), JIT_T4, 8);
     jit_bind(b, skip);
 }
 
+/* d = the PR bit holding predicate p: 16 + (p - 16 + rrb.pr) mod 48 for a
+ * rotating predicate, read from CFM at run time unless the block is static
+ * (both terms are below 48, so one wrap suffices). */
+static unsigned mj_pr_bit(const MJGen *g, unsigned p) {
+    if (p < 16) return p;
+    return 16 + ((p - 16 + g->rrb_pr) % 48);
+}
+
+static void mj_pr_bitreg(MJGen *g, unsigned p, JitReg d) {
+    JitBackend *b = g->b;
+    if (p < 16 || !g->dyn_rrb) {
+        jit_movi(b, d, mj_pr_bit(g, p));
+        return;
+    }
+    JitLabel inrange = jit_label(b);
+    jit_ld_env(b, d, MOFF(cfm), 8);
+    jit_shri(b, d, d, 32);
+    jit_opi(b, JIT_AND, d, d, 0x3F);
+    jit_opi(b, JIT_ADD, d, d, p - 16);
+    jit_bri(b, JIT_LTU, d, 48, 64, inrange);
+    jit_opi(b, JIT_SUB, d, d, 48);
+    jit_bind(b, inrange);
+    jit_opi(b, JIT_ADD, d, d, 16);
+}
+
+/* Go to `l` when predicate p is false.  Clobbers T4, T5. */
+static void mj_br_pred_false(MJGen *g, unsigned p, JitLabel l) {
+    jit_ld_env(g->b, JIT_T4, MOFF(pr), 8);
+    if (p < 16 || !g->dyn_rrb) {
+        jit_brbit(g->b, JIT_T4, mj_pr_bit(g, p), false, l);
+    } else {
+        mj_pr_bitreg(g, p, JIT_T5);
+        jit_brbitr(g->b, JIT_T4, JIT_T5, false, l);
+    }
+}
+
 /* A label the slot jumps to when its qualifying predicate is false, or -1
- * for p0.  Clobbers T4. */
+ * for p0.  Clobbers T4, T5. */
 static JitLabel mj_skip_unless_qp(MJGen *g, unsigned qp) {
     if (qp == 0) return -1;
     JitLabel skip = jit_label(g->b);
-    jit_ld_env(g->b, JIT_T4, MOFF(pr), 8);
-    jit_brbit(g->b, JIT_T4, mj_pr_bit(g, qp), false, skip);
+    mj_br_pred_false(g, qp, skip);
     return skip;
 }
 
@@ -407,21 +512,21 @@ static void mj_end_skip(MJGen *g, JitLabel skip) {
 static void mj_pr_write_reg(MJGen *g, unsigned p, JitReg src, bool invert) {
     if (p == 0) return;
     JitBackend *b = g->b;
-    unsigned bit = mj_pr_bit(g, p);
+    JitLabel done = jit_label(b);
     jit_ld_env(b, JIT_T4, MOFF(pr), 8);
-    jit_opi(b, JIT_ANDN, JIT_T4, JIT_T4, (int64_t)(UINT64_C(1) << bit));
-    jit_mov(b, JIT_T5, src);
-    if (invert) jit_opi(b, JIT_XOR, JIT_T5, JIT_T5, 1);
-    jit_shli(b, JIT_T5, JIT_T5, bit);
-    jit_op(b, JIT_OR, JIT_T4, JIT_T4, JIT_T5);
+    mj_pr_bitreg(g, p, JIT_T5);
+    jit_bitclr(b, JIT_T4, JIT_T5);
+    jit_bri(b, invert ? JIT_NE : JIT_EQ, src, 0, 64, done);
+    jit_bitset(b, JIT_T4, JIT_T5);
+    jit_bind(b, done);
     jit_st_env(b, MOFF(pr), JIT_T4, 8);
 }
 
 static void mj_pr_clear(MJGen *g, unsigned p) {
     if (p == 0) return;
     jit_ld_env(g->b, JIT_T4, MOFF(pr), 8);
-    jit_opi(g->b, JIT_ANDN, JIT_T4, JIT_T4,
-            (int64_t)(UINT64_C(1) << mj_pr_bit(g, p)));
+    mj_pr_bitreg(g, p, JIT_T5);
+    jit_bitclr(g->b, JIT_T4, JIT_T5);
     jit_st_env(g->b, MOFF(pr), JIT_T4, 8);
 }
 
@@ -531,10 +636,8 @@ static void mj_gen_cmp(MJGen *g, const MercedTbEntry *tb, unsigned s) {
     unsigned bits = (x & CMPF_CMP4) ? 32 : 64;
     JitLabel qp_false = jit_label(b), nat = jit_label(b), done = jit_label(b);
 
-    if (qpr) {
-        jit_ld_env(b, JIT_T4, MOFF(pr), 8);
-        jit_brbit(b, JIT_T4, mj_pr_bit(g, qpr), false, qp_false);
-    }
+    if (qpr)
+        mj_br_pred_false(g, qpr, qp_false);
     mj_gr_read(g, tb->a3[s], JIT_T0, JIT_T1);                 /* b */
     if (x & CMPF_IMM) {
         jit_movi(b, JIT_T2, (uint64_t)(int64_t)tb->imm[s]);   /* a */
@@ -573,61 +676,102 @@ static void mj_gen_movl(MJGen *g, const MercedTbEntry *tb, unsigned s) {
  *   MJ_NATIVE   inline host code;
  *   MJ_MEM      a plain load or store: inline through the host TLB when
  *               it hits, mj_slot_fill() otherwise;
+ *   MJ_FPX      setf.sig / getf.sig: inline unless the FP bank they touch
+ *               is disabled (PSR.dfl/dfh), when mj_slot() raises the fault;
  *   MJ_CALL     mj_slot(): fast_slot(), then the block's re-checks.
- * Native code can't raise the Illegal Operation fault for a write to a
- * stacked register beyond the frame (sof is part of the block key), so such
- * writes go through fast_slot(). */
-typedef enum { MJ_NOP, MJ_NATIVE, MJ_MEM, MJ_CALL } MJHow;
+ * A native slot that writes a stacked register first checks it is inside
+ * the current frame (mj_gen_oof_guard()); otherwise the block ends before
+ * the slot and the interpreter raises the Illegal Operation fault. */
+typedef enum { MJ_NOP, MJ_NATIVE, MJ_MEM, MJ_FPX, MJ_CALL } MJHow;
 
-static inline bool mj_in_frame(unsigned r, unsigned sof) {
-    return r < 32 || r - 32 < sof;
-}
-
-static MJHow mj_classify(const MercedTbEntry *tb, unsigned s, unsigned sof) {
+static MJHow mj_classify(const MercedTbEntry *tb, unsigned s) {
     switch (tb->kind[s]) {
     case SLOT_NOP:
         return MJ_NOP;
     case SLOT_X:
-        return bits(tb->slots[2], 37, 4) == 6 &&
-               mj_in_frame((unsigned)bits(tb->slots[2], 6, 7), sof)
-               ? MJ_NATIVE : MJ_CALL;
+        return bits(tb->slots[2], 37, 4) == 6 ? MJ_NATIVE : MJ_CALL;
     default:
         break;
     }
-    unsigned x = tb->x[s];
-    bool postinc = (x & (LDST_INC_IMM | LDST_INC_REG)) != 0;
     switch (tb->op[s]) {
     case FOP_ADD: case FOP_SUB: case FOP_AND: case FOP_ANDCM:
     case FOP_OR: case FOP_XOR: case FOP_SHLADD:
     case FOP_ADDI: case FOP_SUBI: case FOP_ANDI: case FOP_ANDCMI:
     case FOP_ORI: case FOP_XORI: case FOP_EXT:
-        return mj_in_frame(tb->a1[s], sof) ? MJ_NATIVE : MJ_CALL;
     case FOP_CMP: case FOP_BR_COND: case FOP_BR_CLOOP:
         return MJ_NATIVE;
-    case FOP_LD:
-        return mj_in_frame(tb->a1[s], sof) &&
-               (!postinc || mj_in_frame(tb->a3[s], sof)) ? MJ_MEM : MJ_CALL;
-    case FOP_ST:
-        return !postinc || mj_in_frame(tb->a3[s], sof) ? MJ_MEM : MJ_CALL;
+    case FOP_LD: case FOP_ST:
+        return MJ_MEM;
+    case FOP_SETF_SIG: case FOP_GETF_SIG:
+        return MJ_FPX;
     default:
         return MJ_CALL;
     }
 }
 
-/* Does nothing after this slot ever execute (an unconditional branch)? */
+/* The highest stacked register a natively translated slot writes, or 0. */
+static unsigned mj_stacked_dest(const MercedTbEntry *tb, unsigned s) {
+    unsigned hi = 0, r;
+    bool postinc = (tb->x[s] & (LDST_INC_IMM | LDST_INC_REG)) != 0;
+    if (tb->kind[s] == SLOT_X) {
+        r = (unsigned)bits(tb->slots[2], 6, 7);
+        return r >= 32 ? r : 0;
+    }
+    switch (tb->op[s]) {
+    case FOP_CMP: case FOP_BR_COND: case FOP_BR_CLOOP: case FOP_SETF_SIG:
+        return 0;
+    case FOP_ST:
+        r = postinc ? tb->a3[s] : 0;
+        return r >= 32 ? r : 0;
+    case FOP_LD:
+        hi = tb->a1[s];
+        if (postinc && tb->a3[s] > hi) hi = tb->a3[s];
+        return hi >= 32 ? hi : 0;
+    default:
+        r = tb->a1[s];
+        return r >= 32 ? r : 0;
+    }
+}
+
+/* Does the block end after this slot?  At any branch (see MJ_MAX_BUNDLES). */
 static bool mj_ends_block(const MercedTbEntry *tb, unsigned s) {
-    if (tb->qpr[s] != 0) return false;
     if (tb->kind[s] == SLOT_X)
         return bits(tb->slots[2], 37, 4) >= 0xC;          /* brl */
-    if (tb->kind[s] != SLOT_EXEC) return false;
-    if (bundle_units[tb->tmpl][s] != 'B') return false;
-    return tb->op[s] != FOP_BR_CLOOP;
+    return tb->kind[s] == SLOT_EXEC && bundle_units[tb->tmpl][s] == 'B';
 }
 
 static uint64_t mj_next_ip(const MercedJitSlot *js, const MercedTbEntry *tb) {
     uint64_t bva = js->ip & ~UINT64_C(0xF);
     if (tb->kind[js->slot] == SLOT_X || js->slot == 2) return bva + 16;
     return bva | (js->slot + 1u);
+}
+
+/* Before native slot i writes stacked register r: if r is beyond the
+ * frame, leave the block with slot i not executed (the interpreter raises
+ * the Illegal Operation fault).  Clobbers T4. */
+static void mj_gen_oof_guard(MJGen *g, const MercedJitBlock *blk, unsigned i,
+                             unsigned r) {
+    JitBackend *b = g->b;
+    JitLabel in_frame = jit_label(b);
+    jit_ld_env(b, JIT_T4, MOFF(cfm), 8);
+    jit_opi(b, JIT_AND, JIT_T4, JIT_T4, 0x7F);                  /* sof */
+    jit_bri(b, JIT_GTU, JIT_T4, (int64_t)(r - 32), 64, in_frame);
+    if (i == 0) {
+        jit_reti(b, 0);             /* mj_run() interprets the slot */
+    } else {
+        const MercedJitSlot *prev = &blk->slots[i - 1];
+        const MercedTbEntry *ptb = &blk->tbs[prev->bundle];
+        if (g->pending) {
+            mj_account(g, g->pending);
+            jit_st_envi(b, MOFF(last_successful_bundle),
+                        (int64_t)(prev->ip & ~UINT64_C(0xF)), 8);
+        }
+        jit_st_envi(b, MOFF(slot_stop_after), ptb->stop[prev->slot], 1);
+        jit_st_envi(b, MOFF(group_start), ptb->stop[prev->slot], 1);
+        jit_st_envi(b, MOFF(ip), (int64_t)blk->slots[i].ip, 8);
+        jit_reti(b, i);
+    }
+    jit_bind(b, in_frame);
 }
 
 /* Before a slot that calls into the interpreter: bring the CPU up to date
@@ -870,6 +1014,92 @@ static void mj_gen_mem(MJGen *g, MercedJit *j, const MercedJitBlock *blk,
     jit_bind(b, called);
 }
 
+#define FOFF(field) ((int32_t)offsetof(MercedFpReg, field))
+
+/* T5 = byte offset of FR[f] in m->fr (fr_phys(): f >= 32 rotates by
+ * rrb.fr, below 96 except after software writes CFM - hence two wraps). */
+static void mj_fr_offset(MJGen *g, unsigned f) {
+    JitBackend *b = g->b;
+    if (f < 32) {
+        jit_movi(b, JIT_T5, (uint64_t)f * sizeof(MercedFpReg));
+        return;
+    }
+    JitLabel w1 = jit_label(b), w2 = jit_label(b);
+    jit_ld_env(b, JIT_T5, MOFF(cfm), 8);
+    jit_shri(b, JIT_T5, JIT_T5, 25);
+    jit_opi(b, JIT_AND, JIT_T5, JIT_T5, 0x7F);
+    jit_opi(b, JIT_ADD, JIT_T5, JIT_T5, f - 32);
+    jit_bri(b, JIT_LTU, JIT_T5, 96, 64, w1);
+    jit_opi(b, JIT_SUB, JIT_T5, JIT_T5, 96);
+    jit_bri(b, JIT_LTU, JIT_T5, 96, 64, w2);
+    jit_opi(b, JIT_SUB, JIT_T5, JIT_T5, 96);
+    jit_bind(b, w2);
+    jit_bind(b, w1);
+    jit_opi(b, JIT_ADD, JIT_T5, JIT_T5, 32);
+    jit_muli(b, JIT_T5, JIT_T5, (int32_t)sizeof(MercedFpReg));
+}
+
+/* fast_op()'s FOP_SETF_SIG / FOP_GETF_SIG with fast_slot()'s FP-disabled
+ * check in front: inline, or mj_slot() when the bank is disabled. */
+static void mj_gen_fpx(MJGen *g, const MercedJitBlock *blk, unsigned i) {
+    JitBackend *b = g->b;
+    const MercedJitSlot *js = &blk->slots[i];
+    const MercedTbEntry *tb = &blk->tbs[js->bundle];
+    unsigned s = js->slot;
+    uint64_t bva = js->ip & ~UINT64_C(0xF);
+    unsigned r1 = tb->a1[s], r2 = tb->a2[s];
+    bool setf = tb->op[s] == FOP_SETF_SIG;
+    unsigned banks = fp_banks_used(bundle_units[tb->tmpl][s], tb->slots[s]);
+    uint64_t disable = ((banks & 1u) ? PSR_DFL : 0) | ((banks & 2u) ? PSR_DFH : 0);
+    JitLabel slow = jit_label(b), done = jit_label(b), called = jit_label(b);
+
+    JitLabel skip = mj_skip_unless_qp(g, tb->qpr[s]);
+    if (disable) {
+        jit_ld_env(b, JIT_T4, MOFF(psr), 8);
+        jit_opi(b, JIT_AND, JIT_T4, JIT_T4, (int64_t)disable);
+        jit_bri(b, JIT_NE, JIT_T4, 0, 64, slow);
+    }
+    if (setf) {
+        if (r1 >= 2) {                          /* fr_write() drops f0/f1 */
+            mj_gr_read(g, r2, JIT_T0, JIT_T1);
+            mj_fr_offset(g, r1);
+            jit_st_envx(b, MOFF(fr) + FOFF(sig), JIT_T5, 1, JIT_T0, 8);
+            jit_st_envxi(b, MOFF(fr) + FOFF(exp), JIT_T5, 1, 0x1003E, 4);
+            /* sign = 0, nat = n2, padding = 0: the whole last word */
+            jit_shli(b, JIT_T1, JIT_T1, 8 * (unsigned)(FOFF(nat) - FOFF(sign)));
+            jit_st_envx(b, MOFF(fr) + FOFF(sign), JIT_T5, 1, JIT_T1, 4);
+        }
+    } else {
+        if (r2 == 0) {
+            jit_movi(b, JIT_T0, 0);
+            jit_movi(b, JIT_T1, 0);
+        } else if (r2 == 1) {
+            jit_movi(b, JIT_T0, UINT64_C(0x8000000000000000));
+            jit_movi(b, JIT_T1, 0);
+        } else {
+            mj_fr_offset(g, r2);
+            jit_ld_envx(b, JIT_T0, MOFF(fr) + FOFF(sig), JIT_T5, 1, 8);
+            jit_ld_envx(b, JIT_T1, MOFF(fr) + FOFF(nat), JIT_T5, 1, 1);
+        }
+        mj_gr_write(g, r1, JIT_T0, JIT_T1);
+    }
+    jit_jmp(b, done);
+
+    jit_bind(b, slow);
+    mj_gen_call(g, blk, i, false);
+    jit_jmp(b, called);
+
+    /* ran inline (or the predicate was false): finish as fast_slot() would */
+    jit_bind(b, done);
+    mj_end_skip(g, skip);
+    mj_account(g, 1);
+    jit_st_envi(b, MOFF(last_successful_bundle), (int64_t)bva, 8);
+    jit_st_envi(b, MOFF(slot_stop_after), tb->stop[s], 1);
+    jit_st_envi(b, MOFF(group_start), tb->stop[s], 1);
+    jit_st_envi(b, MOFF(ip), (int64_t)mj_next_ip(js, tb), 8);
+    jit_bind(b, called);
+}
+
 /* Emit the block's host code.  Returns NULL if the code buffer is full. */
 static JitFn mj_codegen(MercedJit *j, MercedJitBlock *blk) {
     MJGen gen, *g = &gen;
@@ -881,6 +1111,7 @@ static JitFn mj_codegen(MercedJit *j, MercedJitBlock *blk) {
     g->rrb_gr = CFM_RRB_GR(cfm);
     g->rrb_pr = CFM_RRB_PR(cfm);
     g->sof = CFM_SOF(cfm);
+    g->dyn_rrb = !(blk->key & MJ_KEY_STATIC_RRB);
     JitBackend *b = g->b;
 
     jit_begin(b);
@@ -890,22 +1121,34 @@ static JitFn mj_codegen(MercedJit *j, MercedJitBlock *blk) {
         unsigned s = js->slot;
         uint64_t bva = js->ip & ~UINT64_C(0xF);
         g->last_stop = tb->stop[s];
-        MJHow how = mj_classify(tb, s, g->sof);
+        MJHow how = mj_classify(tb, s);
+        unsigned oof_r = how == MJ_NOP || how == MJ_CALL ? 0
+                       : mj_stacked_dest(tb, s);
         switch (how) {
         case MJ_NOP:
             j->stats.nop_slots++;
             g->pending++;
             break;
 
+        case MJ_FPX:
+            if (oof_r) mj_gen_oof_guard(g, blk, i, oof_r);
+            mj_gen_sync(g, blk, i);
+            j->stats.direct_slots++;
+            mj_gen_fpx(g, blk, i);
+            g->pending = 0;
+            break;
+
         case MJ_CALL:
         case MJ_MEM:
             /* fast_slot() leaves the CPU fully up to date, and so does
              * mj_gen_mem()'s inline path */
-            mj_gen_sync(g, blk, i);
             if (how == MJ_MEM && mj_direct_mem_ok(j, tb, s)) {
+                if (oof_r) mj_gen_oof_guard(g, blk, i, oof_r);
+                mj_gen_sync(g, blk, i);
                 j->stats.direct_slots++;
                 mj_gen_mem(g, j, blk, i);
             } else {
+                mj_gen_sync(g, blk, i);
                 j->stats.helper_slots++;
                 mj_gen_call(g, blk, i, false);
             }
@@ -914,6 +1157,7 @@ static JitFn mj_codegen(MercedJit *j, MercedJitBlock *blk) {
 
         case MJ_NATIVE:
             j->stats.native_slots++;
+            if (oof_r) mj_gen_oof_guard(g, blk, i, oof_r);
             if (tb->kind[s] == SLOT_X) {
                 mj_gen_movl(g, tb, s);
             } else switch (tb->op[s]) {
@@ -948,7 +1192,7 @@ static JitFn mj_codegen(MercedJit *j, MercedJitBlock *blk) {
         unsigned last = blk->n_slots - 1;
         const MercedJitSlot *js = &blk->slots[last];
         const MercedTbEntry *tb = &blk->tbs[js->bundle];
-        MJHow how = mj_classify(tb, js->slot, g->sof);
+        MJHow how = mj_classify(tb, js->slot);
         bool native_last = how == MJ_NATIVE || how == MJ_NOP;
         if (g->pending || native_last)
             mj_exit(g, last, g->pending, js->ip & ~UINT64_C(0xF), true,
@@ -1031,8 +1275,11 @@ static MercedJitBlock *mj_translate(Merced *m, MercedJit *j, uint64_t ip,
     blk->code_gen = tc->page_generation[tb_page_index(pa_bundle)];
 
     if (ns) {
+        size_t before = jit_backend_used(j->be);
         blk->code = mj_codegen(j, blk);
+        j->stats.code_bytes += jit_backend_used(j->be) - before;
         if (!blk->code) {
+            j->stats.flush_full++;
             /* out of code space: start over with an empty cache */
             free(blk);
             mj_flush(j);
@@ -1040,6 +1287,12 @@ static MercedJitBlock *mj_translate(Merced *m, MercedJit *j, uint64_t ip,
         }
     }
     j->stats.compiled++;
+    if (j->comp_prof) {
+        struct MjCompProf *c = &j->comp_prof[((ip >> 4) ^ (ip >> 20)) & 0xFFFF];
+        if (c->ip != ip) { c->ip = ip; c->key = key; c->n = 0; c->keychanges = 0; }
+        if (c->key != key) { c->keychanges++; c->key = key; }
+        c->n++;
+    }
     blk->all_next = j->all;
     j->all = blk;
     unsigned h = mj_hash(ip, key);
@@ -1049,6 +1302,8 @@ static MercedJitBlock *mj_translate(Merced *m, MercedJit *j, uint64_t ip,
 }
 
 static void mj_unlink(MercedJit *j, MercedJitBlock *blk) {
+    if (j->jmp_cache[mj_jmp_index(blk->va)] == blk)
+        j->jmp_cache[mj_jmp_index(blk->va)] = NULL;
     MercedJitBlock **pp = &j->hash[mj_hash(blk->va, blk->key)];
     while (*pp && *pp != blk) pp = &(*pp)->hash_next;
     if (*pp) *pp = blk->hash_next;
@@ -1081,14 +1336,31 @@ static MJEnter mj_enter(Merced *m, MercedTranslationCache *tc, MercedJit *j,
     uint64_t bva = ip & ~UINT64_C(0xF);
     if (m->psr & PSR_IS) { j->stats.why_is++; return MJ_INTERPRET; }
     if (mj_irq_blocks(m)) { j->stats.why_irq++; return MJ_INTERPRET; }
-    if (mj_extras(m)) { j->stats.why_extras++; return MJ_INTERPRET; }
+    if (mj_extras(m)) {
+        j->stats.why_extras++;
+        if (mj_stats_on) {
+            static const uint64_t bit[6] = { PSR_IS, PSR_DB, PSR_ONE_SHOT,
+                                             PSR_LP, PSR_TB, PSR_SS };
+            for (int k = 0; k < 6; k++)
+                if (m->psr & bit[k]) j->stats.why_x[k]++;
+            if (pmu_count_on) j->stats.why_x[6]++;
+            if (m->cache.observe) j->stats.why_x[7]++;
+            if (fetch_uncached(m)) j->stats.why_x[8]++;
+        }
+        return MJ_INTERPRET;
+    }
     if ((ip & 0xF) > 2 || mj_sal_shim_bundle(bva))
         return MJ_INTERPRET;
 
     uint64_t key = mj_key(m);
-    MercedJitBlock *blk = j->hash[mj_hash(ip, key)];
-    while (blk && !(blk->va == ip && blk->key == key))
-        blk = blk->hash_next;
+    MercedJitBlock **jc = &j->jmp_cache[mj_jmp_index(ip)];
+    MercedJitBlock *blk = *jc;
+    if (!blk || blk->va != ip || blk->key != key) {
+        blk = j->hash[mj_hash(ip, key)];
+        while (blk && !(blk->va == ip && blk->key == key))
+            blk = blk->hash_next;
+        if (blk) *jc = blk;
+    }
     if (blk && blk->n_slots &&
         (blk->n_slots > budget || mj_timer_in_window(m, blk->n_slots)))
         return MJ_INTERPRET;
@@ -1117,7 +1389,11 @@ static MJEnter mj_enter(Merced *m, MercedTranslationCache *tc, MercedJit *j,
             } else {
                 mj_unlink(j, blk);
                 blk = NULL;
+                j->stats.comp_pa++;
             }
+        } else {
+            j->stats.comp_new++;
+            if (ip & 0xF) j->stats.mid_entry++;
         }
         if (!blk) {
             blk = mj_translate(m, j, ip, pa, key);
@@ -1133,6 +1409,7 @@ static MJEnter mj_enter(Merced *m, MercedTranslationCache *tc, MercedJit *j,
             j->stats.reverify_ok++;
         } else {
             j->stats.reverify_fail++;
+            j->stats.comp_bytes++;
             uint64_t pa = blk->pa;
             mj_unlink(j, blk);
             blk = mj_translate(m, j, ip, pa, key);
@@ -1174,8 +1451,12 @@ static MercedStatus mj_run(Merced *m, MercedTranslationCache *tc,
             j->in_block = false;
             if (j->flush_pending)
                 mj_flush(j);
-            n += k;
             st = j->status;
+            if (k == 0) {           /* its first slot is the interpreter's */
+                st = fast_step(m, tc);
+                k = 1;
+            }
+            n += k;
             j->stats.blocks_run++;
             j->stats.slots_jit += k;
         } else if (how == MJ_FETCH_FAULT) {
@@ -1225,10 +1506,36 @@ static void mj_print_stats(void) {
             " budget/timer=%" PRIu64 " untranslatable=%" PRIu64 "\n",
             j->stats.why_is, j->stats.why_irq, j->stats.why_extras,
             j->stats.why_budget, j->stats.why_empty);
+    fprintf(stderr, "merced-jit: compiles: no block=%" PRIu64 " (entering mid-bundle %"
+            PRIu64 ") physical page moved=%" PRIu64 " bytes changed=%" PRIu64 "\n",
+            j->stats.comp_new, j->stats.mid_entry, j->stats.comp_pa,
+            j->stats.comp_bytes);
+    fprintf(stderr, "merced-jit: flushes for a full code buffer=%" PRIu64
+            " code bytes/block=%.0f\n", j->stats.flush_full,
+            j->stats.compiled ? (double)j->stats.code_bytes / j->stats.compiled : 0.0);
     fprintf(stderr, "merced-jit: memory slow path=%" PRIu64 " fills=%" PRIu64
             " not cacheable=%" PRIu64 " not RAM=%" PRIu64 "\n",
             j->stats.mem_slow, j->stats.mem_fill, j->stats.mem_nofill_xlate,
             j->stats.mem_nofill_page);
+    fprintf(stderr, "merced-jit: extras: IS=%" PRIu64 " DB=%" PRIu64 " one-shot=%" PRIu64
+            " LP=%" PRIu64 " TB=%" PRIu64 " SS=%" PRIu64 " PMU=%" PRIu64
+            " observe=%" PRIu64 " fetch-uncached=%" PRIu64 "\n",
+            j->stats.why_x[0], j->stats.why_x[1], j->stats.why_x[2], j->stats.why_x[3],
+            j->stats.why_x[4], j->stats.why_x[5], j->stats.why_x[6], j->stats.why_x[7],
+            j->stats.why_x[8]);
+    if (j->comp_prof) {
+        for (int k = 0; k < 8; k++) {
+            int best = -1;
+            for (int i = 0; i < 65536; i++)
+                if (j->comp_prof[i].n && (best < 0 || j->comp_prof[i].n > j->comp_prof[best].n))
+                    best = i;
+            if (best < 0) break;
+            fprintf(stderr, "merced-jit: compiled %u times (key changed %u): ip=%016" PRIX64
+                    " key=%016" PRIX64 "\n", j->comp_prof[best].n,
+                    j->comp_prof[best].keychanges, j->comp_prof[best].ip, j->comp_prof[best].key);
+            j->comp_prof[best].n = 0;
+        }
+    }
     if (!j->helper_profile) return;
     fprintf(stderr, "merced-jit: top helper-executed encodings "
             "(unit major x6 [fast_op?]):\n");
@@ -1270,6 +1577,7 @@ MercedAccel merced_set_accel(Merced *m, MercedAccel accel) {
             static bool registered;
             mj_stats_jit = j;
             j->helper_profile = calloc(5u << 10, sizeof(uint64_t));
+            j->comp_prof = calloc(65536, sizeof(*j->comp_prof));
             if (!registered) atexit(mj_print_stats);
             registered = true;
         }

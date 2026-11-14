@@ -576,17 +576,29 @@ uint64_t merced_get_itc(const Merced *m) {
     return m->ar[AR_ITC];
 }
 
+/* The highest pending (16-255) and in-service vectors, cached host-side
+ * (MercedTranslationCache) because interrupt recognition asks on every
+ * translated block while an interrupt waits masked.  Every write to the
+ * two bitmaps goes through these. */
+static void irqc_pending_set(Merced *m, unsigned vector);
+static void irqc_invalidate(Merced *m);
+static int irqc_pending_hi(Merced *m);
+static unsigned irqc_in_service_hi(const Merced *m);
+
 static void ext_pending_set(Merced *m, uint8_t vector) {
     uint8_t bit = (uint8_t)(1u << (vector & 7));
     if (!(m->external_pending[vector >> 3] & bit))
         m->ext_pending_count++;
     m->external_pending[vector >> 3] |= bit;
+    irqc_pending_set(m, vector);
 }
 
 static void ext_pending_clear(Merced *m, uint8_t vector) {
     uint8_t bit = (uint8_t)(1u << (vector & 7));
-    if (m->external_pending[vector >> 3] & bit)
+    if (m->external_pending[vector >> 3] & bit) {
         m->ext_pending_count--;
+        irqc_invalidate(m);
+    }
     m->external_pending[vector >> 3] &= (uint8_t)~bit;
 }
 
@@ -627,11 +639,25 @@ void merced_set_tpr(Merced *m, uint64_t tpr) {
  * around ATA identify and never lowers it again, which permanently masks
  * any normal (>=16) vector but must NOT mask ExtINT. */
 /* Highest in-service vector (16-255), or 0 when none is in service. */
-static unsigned in_service_highest(const Merced *m) {
+static unsigned in_service_highest_scan(const Merced *m) {
     for (int i = 31; i >= 2; i--)
         if (m->ext_in_service[i])
             return (unsigned)(i * 8 + 31 - __builtin_clz(m->ext_in_service[i]));
     return 0;
+}
+
+static unsigned in_service_highest(const Merced *m) {
+    return irqc_in_service_hi(m);
+}
+
+/* The highest pending vector 16-255, or -1. */
+static int ext_pending_hi_scan(const Merced *m) {
+    for (int i = 31; i >= 2; i--) {
+        unsigned bits = m->external_pending[i];
+        if (bits)
+            return i * 8 + (int)(31u - (unsigned)__builtin_clz(bits));
+    }
+    return -1;
 }
 
 static bool interrupt_unmasked(Merced *m, uint8_t vector) {
@@ -679,14 +705,8 @@ static int ext_highest_unmasked(Merced *m) {
      * block entry and group boundary while an interrupt waits masked (a
      * disk interrupt during NT's file copy), so it mustn't rescan the
      * bitmap - with in_service_highest() per vector - each time. */
-    for (int i = 31; i >= 2; i--) {
-        unsigned bits = m->external_pending[i];
-        if (bits) {
-            int v = i * 8 + (int)(31u - (unsigned)__builtin_clz(bits));
-            return interrupt_unmasked(m, (uint8_t)v) ? v : -1;
-        }
-    }
-    return -1;
+    int v = irqc_pending_hi(m);
+    return v >= 0 && interrupt_unmasked(m, (uint8_t)v) ? v : -1;
 }
 
 static uint64_t fault_vector_counts[0x5B];
@@ -1711,11 +1731,48 @@ typedef struct {
     /* -accel jit state (merced_jit.c); survives tb_flush(), which empties
      * it instead. */
     struct MercedJit *jit;
+    /* irqc_*(): ext_pending_hi_scan() / in_service_highest_scan(), valid
+     * until a bitmap bit is cleared (tb_flush() clears it too: snapshots) */
+    bool irqc_valid;
+    int16_t irqc_pending_hi;
+    uint16_t irqc_in_service_hi;
 } MercedTranslationCache;
 
 struct MercedJit;
 static void mj_flush(struct MercedJit *j);
 static void mj_destroy(struct MercedJit *j);
+
+static MercedTranslationCache *irqc_fill(const Merced *m) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (tc && !tc->irqc_valid) {
+        tc->irqc_pending_hi = (int16_t)ext_pending_hi_scan(m);
+        tc->irqc_in_service_hi = (uint16_t)in_service_highest_scan(m);
+        tc->irqc_valid = true;
+    }
+    return tc;
+}
+
+static void irqc_pending_set(Merced *m, unsigned vector) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (tc && tc->irqc_valid && vector >= 16 &&
+        (int)vector > tc->irqc_pending_hi)
+        tc->irqc_pending_hi = (int16_t)vector;
+}
+
+static void irqc_invalidate(Merced *m) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (tc) tc->irqc_valid = false;
+}
+
+static int irqc_pending_hi(Merced *m) {
+    MercedTranslationCache *tc = irqc_fill(m);
+    return tc ? tc->irqc_pending_hi : ext_pending_hi_scan(m);
+}
+
+static unsigned irqc_in_service_hi(const Merced *m) {
+    MercedTranslationCache *tc = irqc_fill(m);
+    return tc ? tc->irqc_in_service_hi : in_service_highest_scan(m);
+}
 
 static inline unsigned tb_index(uint64_t va) {
     return (unsigned)(((va >> 4) ^ (va >> 18)) & (MERCED_TB_ENTRIES - 1));
@@ -4930,8 +4987,10 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
             } else {
                 v = 15;
             }
-            if (v >= 16)
+            if (v >= 16) {
                 m->ext_in_service[v >> 3] |= (uint8_t)(1u << (v & 7));
+                irqc_invalidate(m);
+            }
         }
         gr_write(m, r1, v, 0);
         return MERCED_OK;
@@ -4984,8 +5043,10 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
             m->cr[cr3] &= ~UINT64_C(0x7FFF);        /* 32 KiB aligned */
         if (cr3 == CR_EOI) {                        /* retire highest in-service */
             unsigned isv = in_service_highest(m);
-            if (isv)
+            if (isv) {
                 m->ext_in_service[isv >> 3] &= (uint8_t)~(1u << (isv & 7));
+                irqc_invalidate(m);
+            }
         }
         if (cr3 == CR_IVA) {
             static unsigned n;

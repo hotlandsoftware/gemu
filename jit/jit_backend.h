@@ -62,6 +62,7 @@ typedef enum {
 JitBackend *jit_backend_new(size_t bytes);
 void        jit_backend_free(JitBackend *b);
 void        jit_backend_reset(JitBackend *b);
+size_t      jit_backend_used(const JitBackend *b);   /* bytes emitted */
 const char *jit_backend_name(void);
 
 /* ── functions and control flow ───────────────────────────────────────── */
@@ -80,6 +81,9 @@ void     jit_bri(JitBackend *b, JitCond cond, JitReg a, int64_t imm,
 /* if (bit `bit` of a is `set`) goto l */
 void     jit_brbit(JitBackend *b, JitReg a, unsigned bit, bool set,
                    JitLabel l);
+/* The same with the bit number (0-63) in a register. */
+void     jit_brbitr(JitBackend *b, JitReg a, JitReg bit, bool set,
+                    JitLabel l);
 
 /* Return v from the generated function. */
 void     jit_ret(JitBackend *b, JitReg v);
@@ -100,6 +104,9 @@ void jit_muli(JitBackend *b, JitReg d, JitReg a, int32_t imm);
 void jit_not(JitBackend *b, JitReg d, JitReg a);
 void jit_neg(JitBackend *b, JitReg d, JitReg a);
 void jit_ext(JitBackend *b, JitExt ext, JitReg d, JitReg s);
+/* d |= 1 << bit, d &= ~(1 << bit): bit number (0-63) in a register */
+void jit_bitset(JitBackend *b, JitReg d, JitReg bit);
+void jit_bitclr(JitBackend *b, JitReg d, JitReg bit);
 /* d = (a <cond> c) ? 1 : 0 */
 void jit_setcond(JitBackend *b, JitCond cond, JitReg d, JitReg a, JitReg c,
                  unsigned bits);

@@ -68,6 +68,10 @@ void jit_backend_reset(JitBackend *b) {
     x64_init(&b->buf, b->mem, b->size);
 }
 
+size_t jit_backend_used(const JitBackend *b) {
+    return x64_pos(&b->buf);
+}
+
 /* ── labels ───────────────────────────────────────────────────────────── */
 
 JitLabel jit_label(JitBackend *b) {
@@ -147,6 +151,20 @@ void jit_bri(JitBackend *b, JitCond cond, JitReg a, int64_t imm,
 void jit_brbit(JitBackend *b, JitReg a, unsigned bit, bool set, JitLabel l) {
     x64_bt_ri(&b->buf, R(a), (uint8_t)bit);
     fixup(b, l, x64_jcc(&b->buf, set ? X64_CC_B : X64_CC_AE));
+}
+
+/* bt / bts / btr r64, r64: 0F A3 / 0F AB / 0F B3, the index in reg */
+void jit_brbitr(JitBackend *b, JitReg a, JitReg bit, bool set, JitLabel l) {
+    x64_op_rr(&b->buf, 1, 0x0F, 0xA3, R(bit), R(a), false);
+    fixup(b, l, x64_jcc(&b->buf, set ? X64_CC_B : X64_CC_AE));
+}
+
+void jit_bitset(JitBackend *b, JitReg d, JitReg bit) {
+    x64_op_rr(&b->buf, 1, 0x0F, 0xAB, R(bit), R(d), false);
+}
+
+void jit_bitclr(JitBackend *b, JitReg d, JitReg bit) {
+    x64_op_rr(&b->buf, 1, 0x0F, 0xB3, R(bit), R(d), false);
 }
 
 /* ── functions ────────────────────────────────────────────────────────── */
@@ -385,6 +403,7 @@ const char *jit_backend_name(void) { return "none"; }
 JitBackend *jit_backend_new(size_t bytes) { (void)bytes; return NULL; }
 void jit_backend_free(JitBackend *b) { (void)b; }
 void jit_backend_reset(JitBackend *b) { (void)b; }
+size_t jit_backend_used(const JitBackend *b) { (void)b; return 0; }
 
 /* Unreachable without a backend. */
 #define NOHOST(...) { (void)b; abort(); }
@@ -400,6 +419,10 @@ void jit_bri(JitBackend *b, JitCond c, JitReg a, int64_t i, unsigned n, JitLabel
 void jit_brbit(JitBackend *b, JitReg a, unsigned i, bool s, JitLabel l)
     { (void)a; (void)i; (void)s; (void)l; NOHOST() }
 void jit_ret(JitBackend *b, JitReg v) { (void)v; NOHOST() }
+void jit_brbitr(JitBackend *b, JitReg a, JitReg i, bool s, JitLabel l)
+    { (void)a; (void)i; (void)s; (void)l; NOHOST() }
+void jit_bitset(JitBackend *b, JitReg d, JitReg i) { (void)d; (void)i; NOHOST() }
+void jit_bitclr(JitBackend *b, JitReg d, JitReg i) { (void)d; (void)i; NOHOST() }
 void jit_reti(JitBackend *b, uintptr_t v) { (void)v; NOHOST() }
 void jit_call(JitBackend *b, const void *f, uintptr_t x, uintptr_t y)
     { (void)f; (void)x; (void)y; NOHOST() }

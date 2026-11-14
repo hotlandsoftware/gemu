@@ -15,6 +15,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Debug switches are startup configuration, and the ones below sit on the
+ * per-instruction path: one CRT lookup per call site, then a load and a
+ * branch (as in merced.c).  Uncached, getenv() was 10% of a cold boot - four
+ * lookups per IA-32 instruction while the video BIOS ran. */
+#define getenv(name) (__extension__({                                   \
+    static const char *env_value_;                                          \
+    static bool env_done_;                                                  \
+    if (!env_done_) { env_value_ = (getenv)(name); env_done_ = true; }      \
+    env_value_; }))
+
 enum { X_ES, X_CS, X_SS, X_DS, X_FS, X_GS };
 enum { FL_CF = 1u << 0, FL_PF = 1u << 2, FL_AF = 1u << 4,
        FL_ZF = 1u << 6, FL_SF = 1u << 7, FL_IF = 1u << 9,

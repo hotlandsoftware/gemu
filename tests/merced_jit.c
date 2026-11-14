@@ -173,7 +173,7 @@ static uint64_t gen_i(void) {
 static uint64_t gen_m(void) {
     unsigned qp = rqp();
     unsigned base = 2 + rn(2);
-    switch (rn(8)) {
+    switch (rn(10)) {
     case 0: case 1:                             /* ld1-8 (+ reg postinc) */
         return F(4,37,4) | F(rn(4) ? 0 : 1,36,1) | F(rn(4),30,6) |
                F(base,20,7) | F(rsrc(),13,7) | F(rdst(),6,7) | F(qp,0,6);
@@ -191,6 +191,12 @@ static uint64_t gen_m(void) {
                F(imm >> 7,27,1) | F(base,20,7) | F(rsrc(),13,7) |
                F(imm,6,7) | F(qp,0,6);
     }
+    case 6:                                     /* setf.sig f1 = r2 */
+        return F(6,37,4) | F(1,27,1) | F(0x1C,30,6) | F(rsrc(),13,7) |
+               F(rn(128),6,7) | F(qp,0,6);
+    case 7:                                     /* getf.sig r1 = f2 */
+        return F(4,37,4) | F(1,27,1) | F(0x1C,30,6) | F(rn(128),13,7) |
+               F(rdst(),6,7) | F(qp,0,6);
     case 5:
         if (rn(4) == 0)                         /* mov.m ar.ccv = r (helper) */
             return F(1,37,4) | F(0x2A,27,6) | F(32,20,7) | F(rsrc(),13,7) |
@@ -249,9 +255,11 @@ static void gen_program(uint8_t *ram) {
     }
     /* loop back to the start ar.lc more times: re-entered blocks */
     int64_t back = -(int64_t)N_BUNDLES;
+    /* br.cloop, or br.ctop (btype 7), which also rotates the registers and
+     * predicates each iteration, as software-pipelined loops do */
     put_bundle(ram + CODE_BASE + 16 * N_BUNDLES, 0x11, NOP_MI, NOP_MI,
                F(4,37,4) | F((uint64_t)back >> 20,36,1) | F(back,13,20) |
-               F(5,6,3));
+               F(rn(2) ? 7 : 5,6,3));
 }
 
 /* ── state ────────────────────────────────────────────────────────────── */
@@ -278,13 +286,31 @@ static void init_state(Merced *m, uint64_t seed) {
     unsigned sor = rn(13);                             /* sor*8 <= 96 */
     uint64_t rrb_gr = sor ? rn(sor * 8) : 0;
     uint64_t rrb_pr = rn(48);
-    m->cfm = 96 | ((uint64_t)sor << 14) | (rrb_gr << 18) | (rrb_pr << 32);
+    if (rn(8) == 0) {               /* bases rotation never produces */
+        rrb_gr = rn(128);
+        rrb_pr = rn(64);
+    }
+    /* a frame smaller than 96 sometimes, so stacked writes can be out of
+     * frame (Illegal Operation) */
+    unsigned sof = rn(4) ? 96 : sor * 8 + rn(96 - sor * 8 + 1);
+    uint64_t rrb_fr = rn(8) ? rn(96) : rn(128);
+    m->cfm = sof | ((uint64_t)sor << 14) | (rrb_gr << 18) | (rrb_fr << 25) |
+             (rrb_pr << 32);
+    for (unsigned f = 2; f < 128; f++) {        /* some FP state */
+        m->fr[f].sig = rnd();
+        m->fr[f].exp = (uint32_t)(rnd() & 0x1FFFF);
+        m->fr[f].sign = (uint8_t)rn(2);
+        m->fr[f].nat = rn(20) == 0;
+    }
     m->bof = rn(MERCED_RSE_CAPACITY);
     m->bof_total = 100000 + rn(100000);
     m->rse_flushed_regs = (int64_t)(m->bof_total + rn(200));
     /* physical mode, interruption collection on, interrupts off, bank? */
     m->psr = (UINT64_C(1) << 13) | (rn(2) ? UINT64_C(1) << 44 : 0);
+    if (rn(4) == 0) m->psr |= UINT64_C(1) << 18;      /* dfl */
+    if (rn(4) == 0) m->psr |= UINT64_C(1) << 19;      /* dfh */
     m->ar[65] = rn(4);                                 /* ar.lc */
+    m->ar[66] = rn(4);                                 /* ar.ec */
     m->ar[44] = rnd() >> 8;                            /* ar.itc */
     m->cr[1] = rn(2) ? m->ar[44] + 20 + rn(300) : 0;   /* cr.itm */
     m->cr[2] = 0;                                      /* cr.iva */
