@@ -132,6 +132,12 @@ bool romdb_is_zip(const char *path) {
 #endif
 }
 
+/* No ROM in the database comes near this (the largest is the i2000's 4 MiB
+ * flash); anything bigger - a disk image or an ISO sharing the folder - is
+ * skipped without being read, which is what kept a ROM folder holding a
+ * 4 GiB disk image hashing for half a minute. */
+#define ROMDB_MAX_ROM_SIZE (64u << 20)
+
 int romdb_load_dir(const char *dir, const char *machine, RomDbAddFn fn, void *ud) {
 #ifdef HAVE_LIBZIP
     if (romdb_is_zip(dir)) {
@@ -157,6 +163,8 @@ int romdb_load_dir(const char *dir, const char *machine, RomDbAddFn fn, void *ud
 
         struct stat st;
         if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        if ((uint64_t)st.st_size > ROMDB_MAX_ROM_SIZE)
             continue;
 
         uint8_t digest[GEMU_SHA256_DIGEST_LEN];
