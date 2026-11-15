@@ -477,6 +477,42 @@ static void test_vga_ports(void) {
     CHECK(io_r(0x3DA, 1) == 0x00);
 }
 
+/* VGA CRTC display-end writes reach the extended CRTC: the video BIOS's
+ * set-mode path writes CR12 = V_DISP - 1 and only leaves the extended display
+ * (CRTC_EXT_DISP_EN) when CRTC_V_TOTAL_DISP follows. */
+static void test_crtc_shadow(void) {
+    power_on();
+    map_card();
+    reg_w(CRTC_H_TOTAL_DISP, (99u << 16) | 131u);   /* 800 of 1056 */
+    reg_w(CRTC_V_TOTAL_DISP, (599u << 16) | 627u);  /* 600 of 628 */
+
+    /* The ROM's probe, through MM_INDEX/MM_DATA at the I/O BAR. */
+    io_w(IO_BASE + 0x00, 4, CRTC_V_TOTAL_DISP + 2);
+    const unsigned vdisp = (unsigned)io_r(IO_BASE + 0x06, 1);
+    CHECK(vdisp == (599u & 0xFFu));
+    crtc_w(0x12, vdisp - 1);
+    CHECK(io_r(IO_BASE + 0x06, 1) == vdisp - 1);
+
+    /* Mode 12h's display end: 640 x 480 (CR07 bit 1 = V_DISP bit 8). */
+    crtc_w(0x07, 0x3E);
+    crtc_w(0x12, 0xDF);
+    crtc_w(0x01, 0x4F);
+    CHECK(reg_r(CRTC_V_TOTAL_DISP) == ((479u << 16) | 627u));
+    CHECK(reg_r(CRTC_H_TOTAL_DISP) == ((79u << 16) | 131u));
+    crtc_w(0x07, 0x40);                             /* bit 6 = V_DISP bit 9, bit 1 clear */
+    CHECK(reg_r(CRTC_V_TOTAL_DISP) == ((0x2DFu << 16) | 627u));
+
+    /* Index-only writes and the other CRTC registers leave it alone. */
+    io_w(0x3D4, 1, 0x12);
+    crtc_w(0x00, 0x5F);
+    crtc_w(0x06, 0x0B);
+    CHECK(reg_r(CRTC_V_TOTAL_DISP) == ((0x2DFu << 16) | 627u));
+    CHECK(reg_r(CRTC_H_TOTAL_DISP) == ((79u << 16) | 131u));
+    io_w(0x3D4, 1, 0x12);
+    io_w(0x3D5, 1, 0x57);                           /* byte write at the data port */
+    CHECK(((reg_r(CRTC_V_TOTAL_DISP) >> 16) & 0xFFu) == 0x57u);
+}
+
 static void test_legacy_window(void) {
     power_on();
     map_card();
@@ -895,6 +931,7 @@ int main(void) {
     test_rom();
     test_registers();
     test_vga_ports();
+    test_crtc_shadow();
     test_legacy_window();
     test_vga_planar();
     test_aperture();

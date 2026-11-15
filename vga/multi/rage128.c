@@ -735,6 +735,30 @@ static void reg_bar(Rage128 *r, bool write, uint32_t off, unsigned len, bool mem
     }
 }
 
+/* VGA CRTC writes reach the extended CRTC: the display-end fields share their
+ * encoding (H_DISP = CR01, characters - 1; V_DISP = CR12 with CR07 bits 1 and
+ * 6 as bits 8 and 9, lines - 1). The video BIOS depends on it: its set-mode
+ * path (ROM 113-53008-100, int 10h AH=00h) writes CR12 = V_DISP - 1 and
+ * reads CRTC_V_TOTAL_DISP back, and only when the value followed does it
+ * clear CRTC_EXT_DISP_EN to return to the VGA picture - without this a mode
+ * set after a VESA mode (Windows' bugcheck screen) stays invisible. */
+static void crtc_shadow(Rage128 *r, unsigned idx) {
+    const uint8_t *cr = r->vga->crtc;
+    switch (idx) {
+    case 0x01:
+        REG(CRTC_H_TOTAL_DISP) = (REG(CRTC_H_TOTAL_DISP) & ~0x00FF0000u) | ((uint32_t)cr[0x01] << 16);
+        break;
+    case 0x07: case 0x12: {
+        const uint32_t vde = cr[0x12] | ((cr[0x07] & 0x02u) << 7) | ((cr[0x07] & 0x40u) << 3);
+        REG(CRTC_V_TOTAL_DISP) = (REG(CRTC_V_TOTAL_DISP) & ~0x07FF0000u) | (vde << 16);
+        break;
+    }
+    default:
+        return;
+    }
+    r->vga->disp_gen++;
+}
+
 /* Legacy VGA ports 3B0-3DF. */
 static void legacy_io(Rage128 *r, bool write, uint16_t port, unsigned len, uint64_t *val,
                       bool *claimed) {
@@ -762,6 +786,11 @@ static void legacy_io(Rage128 *r, bool write, uint16_t port, unsigned len, uint6
         r->vga->retrace = vga_status1(r);
     }
     *claimed = vga_io(r->vga, write, port, len, val);
+    /* A CRTC data write: 3x5, or a 16-bit write at 3x4 (index, then data). */
+    if (*claimed && write && (port == 0x3B5 || port == 0x3D5 ||
+                              ((port == 0x3B4 || port == 0x3D4) && len >= 2))) {
+        crtc_shadow(r, r->vga->crtc_idx & 0x1Fu);
+    }
 }
 
 /* The 0xA0000-0xBFFFF window, a byte at a time through the VGA core. */

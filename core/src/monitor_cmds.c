@@ -148,7 +148,7 @@ static const MonCmdDef mon_cmds[] = {
     { "iosapic",     NULL,           "",
       "show programmed I/O SAPIC redirection entries", "i2000", NULL, 0 },
     { "key",         NULL,           "<key|text>",
-      "inject a key (up, down, enter, ...) or type text", M_IA64, NULL, 0 },
+      "inject a key (up, down, enter, ctrl-alt-delete, ...) or type text", M_IA64, NULL, 0 },
     { "loadvm",      NULL,           "<file>",
       "restore machine state from file", NULL, NULL, 0 },
     { "mapperdump",  NULL,           "",

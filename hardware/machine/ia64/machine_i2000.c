@@ -2742,10 +2742,14 @@ static uint64_t i2000_rage_clock(void *opaque) {
     return s->cpu ? merced_get_time_base(s->cpu) : 0;
 }
 
+/* The Rage 128 (00:02.0) INTA# is GSI 39: the firmware's PCI0 _PRT routes
+ * device 2 pins A-D to GSIs 39-36 (and device 5's INTA#, the LAN, to 44 -
+ * see i2000_nic_irq()).  GSI 17 was a slot on another bus; Windows connects
+ * the display driver's interrupt where _PRT says. */
 static void i2000_rage_irq(void *opaque, bool level) {
     Ia64I2000State *s = opaque;
     if (level)
-        iosapic_raise_gsi(s, 17);
+        iosapic_raise_gsi(s, 39);
 }
 
 /* The onboard LAN is a bus master: its descriptors and buffers are read and
@@ -3450,19 +3454,77 @@ static const struct { const char *name; uint32_t keysym; } i2000_key_names[] = {
     { "f1", 0xffbe }, { "f2", 0xffbf }, { "f3", 0xffc0 }, { "f4", 0xffc1 },
     { "f5", 0xffc2 }, { "f6", 0xffc3 }, { "f7", 0xffc4 }, { "f8", 0xffc5 },
     { "f9", 0xffc6 }, { "f10", 0xffc7 }, { "f11", 0xffc8 }, { "f12", 0xffc9 },
+    { "menu", 0xff67 },
 };
+
+/* Modifier names for QEMU-style combos ("ctrl-alt-delete", "shift-f10"). */
+static const struct { const char *name; uint32_t keysym; } i2000_mod_names[] = {
+    { "shift", 0xffe1 }, { "shift_r", 0xffe2 }, { "ctrl", 0xffe3 },
+    { "ctrl_r", 0xffe4 }, { "alt", 0xffe9 }, { "alt_r", 0xffea },
+    { "altgr", 0xffea }, { "meta_l", 0xffeb }, { "meta_r", 0xffec },
+    { "win", 0xffeb },
+};
+
+static uint32_t i2000_lookup_key(const char *name, size_t len, bool modifier) {
+    if (modifier) {
+        for (size_t i = 0; i < sizeof(i2000_mod_names) / sizeof(i2000_mod_names[0]); i++)
+            if (strlen(i2000_mod_names[i].name) == len &&
+                strncmp(name, i2000_mod_names[i].name, len) == 0)
+                return i2000_mod_names[i].keysym;
+        return 0;
+    }
+    for (size_t i = 0; i < sizeof(i2000_key_names) / sizeof(i2000_key_names[0]); i++)
+        if (strlen(i2000_key_names[i].name) == len &&
+            strncmp(name, i2000_key_names[i].name, len) == 0)
+            return i2000_key_names[i].keysym;
+    for (size_t i = 0; i < sizeof(i2000_mod_names) / sizeof(i2000_mod_names[0]); i++)
+        if (strlen(i2000_mod_names[i].name) == len &&
+            strncmp(name, i2000_mod_names[i].name, len) == 0)
+            return i2000_mod_names[i].keysym;      /* a lone modifier tap */
+    return len == 1 ? (unsigned char)name[0] : 0;
+}
+
+/* "mod-mod-key": hold the modifiers down on the PS/2 keyboard around a tap
+ * of the key. False (nothing sent) unless every part before the last '-' is
+ * a modifier name and the last part a key name or single character, so text
+ * containing dashes still types literally. */
+static bool i2000_send_combo(Ia64I2000State *s, const char *tok) {
+    uint32_t mods[8];
+    unsigned nmods = 0;
+    const char *p = tok;
+    for (const char *dash; (dash = strchr(p, '-')) && dash[1]; p = dash + 1) {
+        uint32_t m = i2000_lookup_key(p, (size_t)(dash - p), true);
+        if (!m || nmods == sizeof(mods) / sizeof(mods[0]))
+            return false;
+        mods[nmods++] = m;
+    }
+    if (!nmods)
+        return false;
+    uint32_t key = i2000_lookup_key(p, strlen(p), false);
+    if (!key)
+        return false;
+    for (unsigned i = 0; i < nmods; i++)
+        ps2_keyboard_key(&s->ps2_keyboard, mods[i], true);
+    ps2_keyboard_tap(&s->ps2_keyboard, key);
+    for (unsigned i = nmods; i-- > 0; )
+        ps2_keyboard_key(&s->ps2_keyboard, mods[i], false);
+    return true;
+}
 
 /* monitor "sendkey KEY|TEXT ...": named keys (ret, spc, f8, ...) or text */
 static GemuMonCmd i2000_cmd_sendkey(GemuMonitor *mon, const char *args, void *ud) {
     Ia64I2000State *s = ud;
     if (!*args) {
         gemu_monitor_printf(mon, "usage: sendkey <keys|text>...  e.g. sendkey ret, "
-                                 "sendkey fs0: ret\n");
+                                 "sendkey fs0: ret, sendkey ctrl-alt-delete, "
+                                 "sendkey shift-f10\n");
         return GEMU_MON_NONE;
     }
     char buf[256];
     snprintf(buf, sizeof(buf), "%s", args);
     for (char *tok = strtok(buf, " \t"); tok; tok = strtok(NULL, " \t")) {
+        if (i2000_send_combo(s, tok))
+            continue;
         bool named = false;
         for (size_t i = 0; i < sizeof(i2000_key_names) / sizeof(i2000_key_names[0]); i++)
             if (strcmp(tok, i2000_key_names[i].name) == 0) {
@@ -3684,7 +3746,7 @@ static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
     Ia64I2000State *s = ud;
     const char *keyarg = args;
     if (!keyarg[0]) {
-        gemu_monitor_printf(mon, "usage: key <right|left|up|down|enter|tab|esc|text>\n");
+        gemu_monitor_printf(mon, "usage: key <right|left|up|down|enter|tab|esc|mod-key|text>  (mod: shift ctrl alt win)\n");
         return GEMU_MON_NONE;
     }
     /* Monitor-scripted key injection for headless UI testing - the
@@ -3693,6 +3755,10 @@ static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
      * setup's tab bar per its own on-screen instructions) have no
      * other way in. A non-special argument is typed verbatim, which
      * permits commands such as "key map -r" at the EFI shell. */
+    if (!strpbrk(keyarg, " \t") && i2000_send_combo(s, keyarg)) {
+        gemu_monitor_printf(mon, "key %s queued\n", keyarg);
+        return GEMU_MON_NONE;
+    }
     uint32_t special = 0;
     if (!strcmp(keyarg, "right"))     special = 0xff53;
     else if (!strcmp(keyarg, "left")) special = 0xff51;
