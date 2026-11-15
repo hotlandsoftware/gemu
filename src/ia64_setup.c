@@ -7,6 +7,7 @@
 #include <SDL2/SDL.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -71,7 +72,7 @@ static const GemuArgsDef def = {
         "\nIA64 options:\n"
         "  -rom FILE       Load firmware flash image (top-aligned, max 4 MiB)\n"
         "  -rom DIR|ZIP    Scan for known firmware by SHA-256\n"
-        "  -m SIZE         RAM size, K/M/G suffix (default 512M)\n"
+        "  -m SIZE         RAM size in MiB, or with K/M/G suffix (default 512)\n"
         "  -net nic,model=i82559\n"
         "                  Attach the i2000 Intel 82559 NIC (baset alias)\n"
         "  -microprogram F Run an architectural microprogram on a bare core\n"
@@ -105,18 +106,33 @@ static const GemuArgsDef def = {
 
 /* ── Memory size parsing ─────────────────────────────────────────────────── */
 
+/* QEMU semantics: a plain number is MiB; K/M/G/T suffixes (optionally
+ * followed by "B" or "iB", any case) scale it, and "B" alone means bytes. */
 static uint64_t parse_size(const char *s) {
     char *end;
-    uint64_t v = strtoull(s, &end, 0);
-    if      (*end == 'K' || *end == 'k') v <<= 10;
-    else if (*end == 'M' || *end == 'm') v <<= 20;
-    else if (*end == 'G' || *end == 'g') v <<= 30;
-    else if (*end == '\0')               v <<= 10;   /* plain number = KB */
-    if (v < (16ull << 20) || v > I2000_RAM_MAX) {
-        fprintf(stderr, "gemu: -m: invalid size '%s' (16M-2G, with K/M/G suffix)\n", s);
-        return 0;
+    errno = 0;
+    double d = strtod(s, &end);
+    unsigned shift = 20;
+    if (end == s || errno || d < 0) goto bad;
+    switch (*end) {
+    case '\0':          break;
+    case 'B': case 'b': shift = 0;  end++; break;
+    case 'K': case 'k': shift = 10; end++; break;
+    case 'M': case 'm': shift = 20; end++; break;
+    case 'G': case 'g': shift = 30; end++; break;
+    case 'T': case 't': shift = 40; end++; break;
+    default: goto bad;
     }
-    return v;
+    if (shift && (*end == 'i' || *end == 'I')) end++;
+    if (shift && (*end == 'B' || *end == 'b')) end++;
+    if (*end) goto bad;
+    d *= (double)(1ull << shift);
+    if (d < (double)(16ull << 20) || d > (double)I2000_RAM_MAX) goto bad;
+    return (uint64_t)d;
+bad:
+    fprintf(stderr, "gemu: -m: invalid size '%s' (16M-2G; plain number = MiB, "
+            "or K/M/G suffix)\n", s);
+    return 0;
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────────── */

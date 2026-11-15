@@ -137,7 +137,8 @@ Boot firmware with an optional IA-64 installation CD:
   -monitor stdio
 ```
 
-Use `-m 512m` for 512 MiB. The eight DIMM sockets are populated in groups
+Use `-m 512` (or `512M`) for 512 MiB; as in QEMU, a plain number is MiB and
+K/M/G suffixes are accepted. The eight DIMM sockets are populated in groups
 of four matching modules. Supported RAM sizes are one or two power-of-two
 groups of 64, 128, 256, 512, or 1024 MiB, up to 2 GiB total. Unrepresentable
 sizes are rejected rather than silently advertising less RAM.
