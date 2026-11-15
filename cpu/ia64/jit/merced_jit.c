@@ -92,6 +92,7 @@ struct MercedJitBlock {
     JitFn code;             /* returns the number of slots executed */
     MercedTbEntry *tbs;     /* decoded bundles (also the bytes to re-verify) */
     MercedJitSlot *slots;
+    bool stores;            /* has a memory-writing slot (idle detection) */
 };
 
 /* Host TLB entry for direct RAM access (see mj_gen_mem()). */
@@ -140,6 +141,9 @@ typedef struct MercedJit {
     /* MERCED_JIT_STATS: helper calls by unit/major/x6, to show what to
      * translate natively next. */
     uint64_t *helper_profile;
+    /* Idle detection (merced_idle_dirty()): counts executed blocks that may
+     * write memory, interpreted slots and fetch faults. */
+    uint64_t dirty;
 } MercedJit;
 
 /* A block is specialized on PSR.bn and CFM.sor (which stacked registers
@@ -1227,6 +1231,21 @@ static void mj_fetch_bundle(Merced *m, MercedTbEntry *tb, uint64_t va,
     tb->valid = true;
 }
 
+/* Whether an M-unit slot may write memory: integer and FP stores (x6
+ * 30-3B), and the semaphores (CMPXCHG, XCHG, FETCHADD).  Erring towards
+ * "yes" only makes idle detection more conservative. */
+static bool mj_slot_stores(char unit, uint64_t raw) {
+    if (unit != 'M') return false;
+    unsigned major = (unsigned)(raw >> 37) & 0xF, x6 = (unsigned)(raw >> 30) & 0x3F;
+    bool x = (raw >> 27) & 1, mb = (raw >> 36) & 1;
+    if (major < 4) return false;
+    if ((major == 4 || major == 6) && x && !mb)      /* semaphores, getf/setf */
+        return major == 4 && !(x6 >= 0x1C && x6 <= 0x1F);
+    if ((major == 4 || major == 6) && x)              /* ldfp pairs etc.: loads */
+        return false;
+    return x6 >= 0x30;
+}
+
 static MercedJitBlock *mj_translate(Merced *m, MercedJit *j, uint64_t ip,
                                    uint64_t pa_bundle, uint64_t key) {
     MercedTranslationCache *tc = m->translation_cache;
@@ -1271,6 +1290,11 @@ static MercedJitBlock *mj_translate(Merced *m, MercedJit *j, uint64_t ip,
     blk->key = key;
     blk->n_bundles = nb;
     blk->n_slots = ns;
+    for (unsigned i = 0; i < ns; i++) {
+        const MercedTbEntry *tb = &blk->tbs[slots[i].bundle];
+        if (mj_slot_stores(bundle_units[tb->tmpl][slots[i].slot], tb->slots[slots[i].slot]))
+            blk->stores = true;
+    }
     blk->tgen = tc->translation_generation;
     blk->code_gen = tc->page_generation[tb_page_index(pa_bundle)];
 
@@ -1457,13 +1481,16 @@ static MercedStatus mj_run(Merced *m, MercedTranslationCache *tc,
                 k = 1;
             }
             n += k;
+            j->dirty += blk->stores;
             j->stats.blocks_run++;
             j->stats.slots_jit += k;
         } else if (how == MJ_FETCH_FAULT) {
             n++;
+            j->dirty++;
         } else {
             st = fast_step(m, tc);
             n++;
+            j->dirty++;
             j->stats.slots_interp++;
         }
         if (st != MERCED_OK || tc->exit_request ||

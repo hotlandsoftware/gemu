@@ -2374,6 +2374,464 @@ static const Ia32BitTest ia32_bittests[] = {
       0x00010000, 0, false },
 };
 
+/* ---- IA-32 instruction coverage: BCD, ENTER/BOUND, CMOV, descriptors,
+ * privilege, #UD, FBLD/FBSTP, MMX and SSE.  One instruction per run in
+ * 32-bit protected mode: code at 0x1000 (physical), a data page at VA
+ * 0x4000 (PA 0x5000) holding a GDT at 0x4400, IVA 0x8000. */
+enum { FL_TEST_CF = 1, FL_TEST_AF = 0x10, FL_TEST_ZF = 0x40 };
+typedef struct {
+    Ia32CmpxchgFixture f;
+    Merced *cpu;
+} Ia32Run;
+
+static Merced *ia32_setup(Ia32Run *r, const uint8_t *code, unsigned len, unsigned ring) {
+    memset(r, 0, sizeof *r);
+    memcpy(&r->f.ram.memory[0x1000], code, len);
+    MercedBus bus = {.ud = &r->f, .read = ia32_cmpxchg_read,
+                     .write = ia32_cmpxchg_write, .ram_size = sizeof(r->f.ram.memory)};
+    Merced *cpu = merced_create(&bus);
+    if (!cpu) { failures++; return NULL; }
+    cpu->ip = 0x1000;
+    cpu->psr = (UINT64_C(1) << 13) | (UINT64_C(1) << 17) | (UINT64_C(1) << 34) |
+               (UINT64_C(1) << 44) | ((uint64_t)ring << 32);  /* IC DT IS BN, CPL */
+    cpu->ar[24] = 0x202;
+    cpu->ar[27] = (UINT64_C(0x600) << 32) | 1;  /* CR4.OSFXSR|OSXMMEXCPT, CR0.PE */
+    cpu->ar[21] = (UINT64_C(0x1f80) << 32) | 0x37f;  /* MXCSR, FCW */
+    cpu->ar[28] = UINT64_C(0x55550000);              /* x87: all empty */
+    cpu->gr_static[25] = UINT64_C(1) << 62;          /* 32-bit CS */
+    cpu->gr_static[26] = UINT64_C(1) << 62;          /* 32-bit SS */
+    cpu->gr_static[12] = 0x4c00;                     /* ESP */
+    cpu->gr_static[31] = (UINT64_C(0x3f) << 32) | 0x4400;  /* GDTD: 8 entries */
+    cpu->cr[2] = 0x8000;
+    cpu->cr[72] = UINT64_C(1) << 16;
+    cpu->rr[0] = (1 << 8) | (12 << 2);
+    cpu->dtr[0] = (MercedTlbEntry) {
+        .va_start = 0x4000, .va_end = 0x4fff, .pfn_base = 0x5000,
+        .rid = 1, .ps = 12, .valid = 1, .itir = (1 << 8) | (12 << 2),
+        .pte = 0x5461 | (3 << 7),                   /* PL3: ring 3 may use it */
+    };
+    /* GDT[2] = flat writable data, DPL 3; GDT[3] = 32-bit TSS, DPL 0. */
+    rse_test_write(&r->f.ram, 0x5410, 0x0000ffff, 4);
+    rse_test_write(&r->f.ram, 0x5414, 0x00cff300, 4);
+    rse_test_write(&r->f.ram, 0x5418, 0x00000067, 4);
+    rse_test_write(&r->f.ram, 0x541c, 0x00008900, 4);
+    r->cpu = cpu;
+    return cpu;
+}
+static uint32_t ia32_mem32(Ia32Run *r, uint32_t va) { return (uint32_t)rse_test_read(&r->f.ram, va + 0x1000, 4); }
+static void ia32_set_mem32(Ia32Run *r, uint32_t va, uint32_t v) { rse_test_write(&r->f.ram, va + 0x1000, v, 4); }
+static unsigned ia32_checks;
+#define IA_EXPECT(name, actual, expected) do { \
+    uint64_t a_ = (actual), e_ = (expected); ia32_checks++; \
+    if (a_ != e_) { \
+        fprintf(stderr, "IA32 %s %s: %s: got 0x%" PRIx64 ", expected 0x%" PRIx64 "\n", \
+                name, fast ? "fast" : "slow", #actual, a_, e_); failures++; \
+    } \
+} while (0)
+/* Run one instruction; vector is 0 when it completed, else the IVT offset. */
+static uint64_t ia32_go(Ia32Run *r, bool fast) {
+    if (handoff_step(r->cpu, fast) != MERCED_OK) return UINT64_MAX;
+    return r->cpu->ip >= 0x8000 && r->cpu->ip < 0x10000 ? r->cpu->ip - 0x8000 : 0;
+}
+#define EAX gr_static[8]
+#define ECX gr_static[9]
+#define EDX gr_static[10]
+#define EBX gr_static[11]
+#define ESP gr_static[12]
+#define EBP gr_static[13]
+
+static void check_ia32_misc(bool fast) {
+    Ia32Run r;
+    Merced *c;
+    /* DAA: 0x79 + 0x35 = 0xAE -> 0x14 with CF, AF. */
+    c = ia32_setup(&r, (const uint8_t[]){0x27}, 1, 0); c->EAX = 0xae;
+    IA_EXPECT("daa", ia32_go(&r, fast), 0);
+    IA_EXPECT("daa", c->EAX & 0xff, 0x14);
+    IA_EXPECT("daa", c->ar[24] & (FL_TEST_CF | FL_TEST_AF), FL_TEST_CF | FL_TEST_AF);
+    merced_destroy(c);
+    /* AAA: AX 000F -> 0105; AAS: AX 0205 with AF -> 000F. */
+    c = ia32_setup(&r, (const uint8_t[]){0x37}, 1, 0); c->EAX = 0x000f;
+    IA_EXPECT("aaa", ia32_go(&r, fast), 0);
+    IA_EXPECT("aaa", c->EAX & 0xffff, 0x0105);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0x3f}, 1, 0); c->EAX = 0x0205; c->ar[24] |= FL_TEST_AF;
+    IA_EXPECT("aas", ia32_go(&r, fast), 0);
+    IA_EXPECT("aas", c->EAX & 0xffff, 0x000f);
+    IA_EXPECT("aas", c->ar[24] & FL_TEST_CF, FL_TEST_CF);
+    merced_destroy(c);
+    /* AAM 10: 63 -> AH 6 AL 3; AAD 10 back; AAM 0 is #DE. */
+    c = ia32_setup(&r, (const uint8_t[]){0xd4, 10}, 2, 0); c->EAX = 63;
+    IA_EXPECT("aam", ia32_go(&r, fast), 0);
+    IA_EXPECT("aam", c->EAX & 0xffff, 0x0603);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0xd5, 10}, 2, 0); c->EAX = 0x0603;
+    IA_EXPECT("aad", ia32_go(&r, fast), 0);
+    IA_EXPECT("aad", c->EAX & 0xffff, 63);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0xd4, 0}, 2, 0);
+    IA_EXPECT("aam 0", ia32_go(&r, fast), 0x6900);
+    IA_EXPECT("aam 0", c->cr[17] & 0xffffff, 0);
+    IA_EXPECT("aam 0", c->cr[19], 0x1000);
+    merced_destroy(c);
+    /* SALC */
+    c = ia32_setup(&r, (const uint8_t[]){0xd6}, 1, 0); c->ar[24] |= FL_TEST_CF;
+    IA_EXPECT("salc", ia32_go(&r, fast), 0);
+    IA_EXPECT("salc", c->EAX & 0xff, 0xff);
+    merced_destroy(c);
+    /* ENTER 8,0 and ENTER 0,2 */
+    c = ia32_setup(&r, (const uint8_t[]){0xc8, 8, 0, 0}, 4, 0); c->EBP = 0x1234;
+    IA_EXPECT("enter", ia32_go(&r, fast), 0);
+    IA_EXPECT("enter", ia32_mem32(&r, 0x4bfc), 0x1234);
+    IA_EXPECT("enter", c->EBP, 0x4bfc);
+    IA_EXPECT("enter", c->ESP, 0x4bf4);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0xc8, 0, 0, 2}, 4, 0); c->EBP = 0x4900;
+    ia32_set_mem32(&r, 0x48fc, 0xaabbccdd);
+    IA_EXPECT("enter 2", ia32_go(&r, fast), 0);
+    IA_EXPECT("enter 2", ia32_mem32(&r, 0x4bfc), 0x4900);
+    IA_EXPECT("enter 2", ia32_mem32(&r, 0x4bf8), 0xaabbccdd);
+    IA_EXPECT("enter 2", ia32_mem32(&r, 0x4bf4), 0x4bfc);
+    IA_EXPECT("enter 2", c->EBP, 0x4bfc);
+    IA_EXPECT("enter 2", c->ESP, 0x4bf4);
+    merced_destroy(c);
+    /* BOUND eax, [ebx]: inside, then outside (#BR, vector 5). */
+    for (unsigned out = 0; out < 2; out++) {
+        c = ia32_setup(&r, (const uint8_t[]){0x62, 0x03}, 2, 3);
+        c->EBX = 0x4800; c->EAX = out ? 11 : 10;
+        ia32_set_mem32(&r, 0x4800, (uint32_t)-5); ia32_set_mem32(&r, 0x4804, 10);
+        IA_EXPECT("bound", ia32_go(&r, fast), out ? 0x6900 : 0);
+        if (out) IA_EXPECT("bound", c->cr[17] & 0xffffff, 0x50000);
+        merced_destroy(c);
+    }
+    /* CMOVZ eax, ebx */
+    for (unsigned z = 0; z < 2; z++) {
+        c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x44, 0xc3}, 3, 3);
+        c->EAX = 1; c->EBX = 2; if (z) c->ar[24] |= FL_TEST_ZF;
+        IA_EXPECT("cmovz", ia32_go(&r, fast), 0);
+        IA_EXPECT("cmovz", c->EAX, z ? 2 : 1);
+        merced_destroy(c);
+    }
+    /* RDTSC */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x31}, 2, 3);
+    c->ar[44] = UINT64_C(0x123456789a);
+    IA_EXPECT("rdtsc", ia32_go(&r, fast), 0);
+    IA_EXPECT("rdtsc", ((c->EDX & 0xffffffff) << 32 | (c->EAX & 0xffffffff)) >= UINT64_C(0x123456789a), 1);
+    merced_destroy(c);
+}
+
+static void check_ia32_descriptors(bool fast) {
+    Ia32Run r;
+    Merced *c;
+    /* LAR / LSL / VERR / VERW on GDT[2] (flat data, DPL 3) from ring 3. */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x02, 0xc3}, 3, 3); c->EBX = 0x13;
+    IA_EXPECT("lar", ia32_go(&r, fast), 0);
+    IA_EXPECT("lar", c->EAX, 0x00c0f300);
+    IA_EXPECT("lar", c->ar[24] & FL_TEST_ZF, FL_TEST_ZF);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x03, 0xc3}, 3, 3); c->EBX = 0x13;
+    IA_EXPECT("lsl", ia32_go(&r, fast), 0);
+    IA_EXPECT("lsl", c->EAX, 0xffffffff);
+    merced_destroy(c);
+    /* The TSS (DPL 0) is not visible from ring 3; past the limit fails. */
+    for (unsigned s = 0; s < 2; s++) {
+        c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x03, 0xc3}, 3, 3);
+        c->EBX = s ? 0x48 : 0x18; c->EAX = 7; c->ar[24] |= FL_TEST_ZF;
+        IA_EXPECT("lsl invisible", ia32_go(&r, fast), 0);
+        IA_EXPECT("lsl invisible", c->ar[24] & FL_TEST_ZF, 0);
+        IA_EXPECT("lsl invisible", c->EAX, 7);
+        merced_destroy(c);
+    }
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x03, 0xc3}, 3, 0); c->EBX = 0x18;
+    IA_EXPECT("lsl tss", ia32_go(&r, fast), 0);
+    IA_EXPECT("lsl tss", c->EAX, 0x67);
+    merced_destroy(c);
+    for (unsigned w = 0; w < 2; w++) {
+        c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x00, (uint8_t)(w ? 0xeb : 0xe3)}, 3, 3);
+        c->EBX = 0x13;
+        IA_EXPECT("verr/verw", ia32_go(&r, fast), 0);
+        IA_EXPECT("verr/verw", c->ar[24] & FL_TEST_ZF, FL_TEST_ZF);
+        merced_destroy(c);
+    }
+    /* A descriptor read that misses the TLB faults with the interrupted
+     * context's CPL intact (the read itself is made at PL0). */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x02, 0xc3}, 3, 3); c->EBX = 0x13;
+    c->gr_static[31] = (UINT64_C(0x3f) << 32) | 0x6000;   /* unmapped GDT */
+    IA_EXPECT("lar tlb miss", ia32_go(&r, fast) != 0, 1);
+    IA_EXPECT("lar tlb miss", (c->cr[16] >> 32) & 3, 3);
+    IA_EXPECT("lar tlb miss", c->cr[19], 0x1000);
+    merced_destroy(c);
+    /* SLDT eax; SGDT [ebx] */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x00, 0xc0}, 3, 3);
+    c->gr_static[17] = UINT64_C(0x0028) << 32;
+    IA_EXPECT("sldt", ia32_go(&r, fast), 0);
+    IA_EXPECT("sldt", c->EAX, 0x28);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x01, 0x03}, 3, 3); c->EBX = 0x4800;
+    IA_EXPECT("sgdt", ia32_go(&r, fast), 0);
+    IA_EXPECT("sgdt", ia32_mem32(&r, 0x4800), 0x4400003f);
+    IA_EXPECT("sgdt", ia32_mem32(&r, 0x4804) & 0xffff, 0);
+    merced_destroy(c);
+    /* Privileged: MOV EAX,CR0 / CLTS / HLT are #GP(0) in ring 3 and the
+     * instruction intercept in ring 0. */
+    static const struct { uint8_t code[3]; unsigned len; } priv[] = {
+        {{0x0f, 0x20, 0xc0}, 3}, {{0x0f, 0x06}, 2}, {{0xf4}, 1}, {{0x0f, 0x32}, 2},
+    };
+    for (unsigned i = 0; i < 4; i++)
+        for (unsigned ring = 0; ring <= 3; ring += 3) {
+            c = ia32_setup(&r, priv[i].code, priv[i].len, ring);
+            IA_EXPECT("privileged", ia32_go(&r, fast), ring ? 0x6900 : 0x6a00);
+            if (ring) IA_EXPECT("privileged", c->cr[17] & 0xffffff, 0xd0000);
+            merced_destroy(c);
+        }
+    /* #UD: UD2, MOV CR1, LOCK NOP-like misuse, LEA reg, FE /7. */
+    static const struct { uint8_t code[4]; unsigned len; uint64_t iim; } ud[] = {
+        {{0x0f, 0x0b}, 2, 0x0b0f}, {{0x0f, 0x20, 0xc8}, 3, 0xc8200f},
+        {{0xf0, 0x40}, 2, 0}, {{0xf0, 0x01, 0xc3}, 3, 0}, {{0x8d, 0xc0}, 2, 0xc08d},
+        {{0xfe, 0xf8}, 2, 0xf8fe},
+    };
+    for (unsigned i = 0; i < 6; i++) {
+        c = ia32_setup(&r, ud[i].code, ud[i].len, 3);
+        IA_EXPECT("#UD", ia32_go(&r, fast), 0x6a00);
+        IA_EXPECT("#UD", c->cr[19], 0x1000);
+        if (ud[i].iim) IA_EXPECT("#UD", c->cr[24], ud[i].iim);
+        merced_destroy(c);
+    }
+}
+
+static void check_ia32_fbcd(bool fast) {
+    Ia32Run r;
+    Merced *c;
+    /* FBLD [ebx]; FBSTP [ebx+16] - a signed 18-digit round trip. */
+    c = ia32_setup(&r, (const uint8_t[]){0xdf, 0x23}, 2, 3); c->EBX = 0x4800;
+    static const uint8_t bcd[10] = {0x78, 0x56, 0x34, 0x12, 0x90, 0x78, 0x56, 0x34, 0x12, 0x80};
+    for (unsigned i = 0; i < 10; i++) r.f.ram.memory[0x5800 + i] = bcd[i];
+    IA_EXPECT("fbld", ia32_go(&r, fast), 0);
+    memcpy(&r.f.ram.memory[0x1002], (const uint8_t[]){0xdf, 0x73, 0x10}, 3);
+    merced_flush_translation_cache(c);
+    IA_EXPECT("fbstp", ia32_go(&r, fast), 0);
+    for (unsigned i = 0; i < 10; i++)
+        IA_EXPECT("fbstp", r.f.ram.memory[0x5810 + i], bcd[i]);
+    IA_EXPECT("fbstp pops", (c->ar[28] >> 11) & 7, 0);
+    merced_destroy(c);
+}
+
+static void check_ia32_mmx(bool fast) {
+    Ia32Run r;
+    Merced *c;
+    static const struct {
+        const char *name;
+        uint8_t code[5];
+        unsigned len;
+        uint64_t a, b, expect;
+    } ops[] = {
+        {"paddusb", {0x0f, 0xdc, 0xc1}, 3, 0xf0010203f0f0f0f0ull, 0x20010101101f0f00ull, 0xff020304fffffff0ull},
+        {"psubsw", {0x0f, 0xe9, 0xc1}, 3, 0x8000000100027fffull, 0x0001000200030001ull, 0x8000ffffffff7ffeull},
+        {"pmaddwd", {0x0f, 0xf5, 0xc1}, 3, 0x0002000300040005ull, 0x0006000700080009ull, 0x000000210000004dull},
+        {"packsswb", {0x0f, 0x63, 0xc1}, 3, 0x0100ff80007f0001ull, 0x8000fffe00050010ull, 0x80fe05107f807f01ull},
+        {"pcmpeqb", {0x0f, 0x74, 0xc1}, 3, 0x0102030405060708ull, 0x0100030005000700ull, 0xff00ff00ff00ff00ull},
+        {"punpcklbw", {0x0f, 0x60, 0xc1}, 3, 0x0000000011223344ull, 0x00000000aabbccddull, 0xaa11bb22cc33dd44ull},
+        {"psrlq imm", {0x0f, 0x73, 0xd0, 8}, 4, 0x1122334455667788ull, 0, 0x0011223344556677ull},
+        {"psraw imm", {0x0f, 0x71, 0xe0, 20}, 4, 0x80007fff00018001ull, 0, 0xffff00000000ffffull},
+        {"pmulhw", {0x0f, 0xe5, 0xc1}, 3, 0x4000400040004000ull, 0x0004fffc80007fffull, 0x0001ffffe0001fffull},
+        {"pavgb", {0x0f, 0xe0, 0xc1}, 3, 0x00ff0102ff000304ull, 0x01ff0203ff000506ull, 0x01ff0203ff000405ull},
+        {"psadbw", {0x0f, 0xf6, 0xc1}, 3, 0x0000000000000a01ull, 0x0000000000000310ull, 22},
+        {"pshufw", {0x0f, 0x70, 0xc1, 0x1b}, 4, 0, 0x4444333322221111ull, 0x1111222233334444ull},
+        {"pandn", {0x0f, 0xdf, 0xc1}, 3, 0xff00ff00ff00ff00ull, 0x0ff00ff00ff00ff0ull, 0x00f000f000f000f0ull},
+    };
+    for (unsigned i = 0; i < sizeof ops / sizeof ops[0]; i++) {
+        c = ia32_setup(&r, ops[i].code, ops[i].len, 3);
+        c->fr[8] = (MercedFpReg){.sig = ops[i].a, .exp = 0x1ffff, .sign = 1};
+        c->fr[9] = (MercedFpReg){.sig = ops[i].b, .exp = 0x1ffff, .sign = 1};
+        c->ar[28] = (c->ar[28] & ~UINT64_C(0x3800)) | (5 << 11);   /* TOP 5 */
+        IA_EXPECT(ops[i].name, ia32_go(&r, fast), 0);
+        IA_EXPECT(ops[i].name, c->fr[8].sig, ops[i].expect);
+        IA_EXPECT(ops[i].name, c->fr[8].exp, 0x1ffff);
+        IA_EXPECT(ops[i].name, (c->ar[28] >> 11) & 7, 0);           /* TOP 0 */
+        IA_EXPECT(ops[i].name, (c->ar[28] >> 16) & 0xffff, 0);      /* all valid */
+        merced_destroy(c);
+    }
+    /* MOVQ mm0, [ebx]; MOVD [ebx+8], mm0; EMMS empties the tags. */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x6f, 0x03}, 3, 3); c->EBX = 0x4800;
+    ia32_set_mem32(&r, 0x4800, 0x89abcdef); ia32_set_mem32(&r, 0x4804, 0x01234567);
+    IA_EXPECT("movq", ia32_go(&r, fast), 0);
+    IA_EXPECT("movq", c->fr[8].sig, 0x0123456789abcdefull);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x77}, 2, 3);
+    c->ar[28] &= ~UINT64_C(0xffff0000);
+    IA_EXPECT("emms", ia32_go(&r, fast), 0);
+    IA_EXPECT("emms", c->ar[28] & UINT64_C(0x55550000), UINT64_C(0x55550000));
+    merced_destroy(c);
+    /* CR0.EM: MMX is #UD; CR0.TS: #NM. */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0xef, 0xc1}, 3, 3); c->ar[27] |= 4;
+    IA_EXPECT("mmx em", ia32_go(&r, fast), 0x6a00);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0xef, 0xc1}, 3, 3); c->ar[27] |= 8;
+    IA_EXPECT("mmx ts", ia32_go(&r, fast), 0x6900);
+    IA_EXPECT("mmx ts", c->cr[17] & 0xffffff, 0x70000);
+    merced_destroy(c);
+}
+
+static uint32_t f32bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static void set_xmm(Merced *c, unsigned i, uint32_t a, uint32_t b, uint32_t d, uint32_t e) {
+    c->fr[16 + 2 * i] = (MercedFpReg){.sig = a | (uint64_t)b << 32, .exp = 0x1003e};
+    c->fr[17 + 2 * i] = (MercedFpReg){.sig = d | (uint64_t)e << 32, .exp = 0x1003e};
+}
+static uint32_t xmm_lane(Merced *c, unsigned i, unsigned l) {
+    return (uint32_t)(c->fr[16 + 2 * i + l / 2].sig >> (32 * (l & 1)));
+}
+static uint32_t test_mxcsr(Merced *c) {
+    return (uint32_t)((c->ar[21] >> 32) & 0xff80) | (uint32_t)((c->ar[28] >> 32) & 0x3f);
+}
+
+static void check_ia32_sse(bool fast) {
+    Ia32Run r;
+    Merced *c;
+    /* ADDPS / MULSS / DIVPS lanes. */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x58, 0xc1}, 3, 3);
+    set_xmm(c, 0, f32bits(1.5f), f32bits(-2), f32bits(1e30f), f32bits(0.1f));
+    set_xmm(c, 1, f32bits(2.25f), f32bits(2), f32bits(1e30f), f32bits(0.2f));
+    IA_EXPECT("addps", ia32_go(&r, fast), 0);
+    IA_EXPECT("addps", xmm_lane(c, 0, 0), f32bits(3.75f));
+    IA_EXPECT("addps", xmm_lane(c, 0, 1), f32bits(0.0f));
+    IA_EXPECT("addps", xmm_lane(c, 0, 2), f32bits(2e30f));
+    IA_EXPECT("addps", xmm_lane(c, 0, 3), f32bits(0.1f + 0.2f));
+    IA_EXPECT("addps flags", test_mxcsr(c) & 0x3f, 0x20);          /* PE */
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0xf3, 0x0f, 0x59, 0xc1}, 4, 3);
+    set_xmm(c, 0, f32bits(3), 7, 8, 9); set_xmm(c, 1, f32bits(-4), 1, 1, 1);
+    IA_EXPECT("mulss", ia32_go(&r, fast), 0);
+    IA_EXPECT("mulss", xmm_lane(c, 0, 0), f32bits(-12));
+    IA_EXPECT("mulss keeps", xmm_lane(c, 0, 1), 7);
+    merced_destroy(c);
+    /* Masked divide by zero: inf, ZE; unmasked: #XM (vector 19), no write. */
+    for (unsigned unmasked = 0; unmasked < 2; unmasked++) {
+        c = ia32_setup(&r, (const uint8_t[]){0xf3, 0x0f, 0x5e, 0xc1}, 4, 3);
+        if (unmasked) c->ar[21] &= ~(UINT64_C(0x200) << 32);       /* ZM */
+        set_xmm(c, 0, f32bits(1), 0, 0, 0); set_xmm(c, 1, 0, 0, 0, 0);
+        IA_EXPECT("divss 0", ia32_go(&r, fast), unmasked ? 0x6900 : 0);
+        IA_EXPECT("divss 0", xmm_lane(c, 0, 0), unmasked ? f32bits(1) : 0x7f800000);
+        IA_EXPECT("divss 0 flag", test_mxcsr(c) & 4, 4);
+        if (unmasked) IA_EXPECT("divss #XM", c->cr[17] & 0xffffff, 0x130000);
+        merced_destroy(c);
+    }
+    /* SQRTPS of -1 is the default NaN with IE; MINPS returns the second
+     * operand for a NaN. */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x51, 0xc1}, 3, 3);
+    set_xmm(c, 1, f32bits(-1), f32bits(4), 0x7fc00001, 0);
+    IA_EXPECT("sqrtps", ia32_go(&r, fast), 0);
+    IA_EXPECT("sqrtps", xmm_lane(c, 0, 0), 0xffc00000);
+    IA_EXPECT("sqrtps", xmm_lane(c, 0, 1), f32bits(2));
+    IA_EXPECT("sqrtps", xmm_lane(c, 0, 2), 0x7fc00001);
+    IA_EXPECT("sqrtps IE", test_mxcsr(c) & 1, 1);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x5d, 0xc1}, 3, 3);
+    set_xmm(c, 0, 0x7fc00000, f32bits(1), f32bits(-0.0f), f32bits(5));
+    set_xmm(c, 1, f32bits(2), 0x7fc00000, f32bits(0.0f), f32bits(4));
+    IA_EXPECT("minps", ia32_go(&r, fast), 0);
+    IA_EXPECT("minps", xmm_lane(c, 0, 0), f32bits(2));
+    IA_EXPECT("minps", xmm_lane(c, 0, 1), 0x7fc00000);
+    IA_EXPECT("minps", xmm_lane(c, 0, 2), f32bits(0.0f));
+    IA_EXPECT("minps", xmm_lane(c, 0, 3), f32bits(4));
+    merced_destroy(c);
+    /* CVTTSS2SI eax, xmm1: truncation; out of range is 0x80000000 + IE. */
+    for (unsigned big = 0; big < 2; big++) {
+        c = ia32_setup(&r, (const uint8_t[]){0xf3, 0x0f, 0x2c, 0xc1}, 4, 3);
+        set_xmm(c, 1, f32bits(big ? 3e9f : -2.75f), 0, 0, 0);
+        IA_EXPECT("cvttss2si", ia32_go(&r, fast), 0);
+        IA_EXPECT("cvttss2si", c->EAX & 0xffffffff, big ? 0x80000000u : (uint32_t)-2);
+        IA_EXPECT("cvttss2si", test_mxcsr(c) & 0x21, big ? 1 : 0x20);
+        merced_destroy(c);
+    }
+    /* CVTSI2SS xmm0, eax with RC = down. */
+    c = ia32_setup(&r, (const uint8_t[]){0xf3, 0x0f, 0x2a, 0xc0}, 4, 3);
+    c->EAX = 16777217; c->ar[21] |= UINT64_C(0x2000) << 32;
+    IA_EXPECT("cvtsi2ss", ia32_go(&r, fast), 0);
+    IA_EXPECT("cvtsi2ss", xmm_lane(c, 0, 0), f32bits(16777216.0f));
+    merced_destroy(c);
+    /* COMISS: less, equal, unordered. */
+    static const struct { uint32_t a, b, fl; } cmp[] = {
+        {0x3f800000, 0x40000000, 1}, {0x3f800000, 0x3f800000, 0x40}, {0x7fc00000, 0, 0x45},
+    };
+    for (unsigned i = 0; i < 3; i++) {
+        c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x2f, 0xc1}, 3, 3);
+        set_xmm(c, 0, cmp[i].a, 0, 0, 0); set_xmm(c, 1, cmp[i].b, 0, 0, 0);
+        c->ar[24] |= 0x8d4;                     /* OF SF AF PF ZF to be replaced */
+        IA_EXPECT("comiss", ia32_go(&r, fast), 0);
+        IA_EXPECT("comiss", c->ar[24] & 0x8d5, cmp[i].fl);
+        merced_destroy(c);
+    }
+    /* CMPPS LE, SHUFPS, MOVMSKPS */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0xc2, 0xc1, 2}, 4, 3);
+    set_xmm(c, 0, f32bits(1), f32bits(3), 0x7fc00000, f32bits(2));
+    set_xmm(c, 1, f32bits(2), f32bits(2), f32bits(1), f32bits(2));
+    IA_EXPECT("cmpleps", ia32_go(&r, fast), 0);
+    IA_EXPECT("cmpleps", c->fr[16].sig, 0x00000000ffffffffull);
+    IA_EXPECT("cmpleps", c->fr[17].sig, 0xffffffff00000000ull);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0xc6, 0xc1, 0x1b}, 4, 3);
+    set_xmm(c, 0, 10, 11, 12, 13); set_xmm(c, 1, 20, 21, 22, 23);
+    IA_EXPECT("shufps", ia32_go(&r, fast), 0);
+    IA_EXPECT("shufps", c->fr[16].sig, (uint64_t)12 << 32 | 13);
+    IA_EXPECT("shufps", c->fr[17].sig, (uint64_t)20 << 32 | 21);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x50, 0xc1}, 3, 3);
+    set_xmm(c, 1, 0x80000000, 1, 0xbf800000, 0x3f800000);
+    IA_EXPECT("movmskps", ia32_go(&r, fast), 0);
+    IA_EXPECT("movmskps", c->EAX, 5);
+    merced_destroy(c);
+    /* MOVAPS from a misaligned address is #GP(0); MOVUPS is fine. */
+    for (unsigned u = 0; u < 2; u++) {
+        c = ia32_setup(&r, (const uint8_t[]){0x0f, (uint8_t)(u ? 0x10 : 0x28), 0x03}, 3, 3);
+        c->EBX = 0x4804;
+        IA_EXPECT("movaps align", ia32_go(&r, fast), u ? 0 : 0x6900);
+        if (!u) IA_EXPECT("movaps align", c->cr[17] & 0xffffff, 0xd0000);
+        merced_destroy(c);
+    }
+    /* SSE needs CR4.OSFXSR. */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0x57, 0xc0}, 3, 3); c->ar[27] &= ~(UINT64_C(0x200) << 32);
+    IA_EXPECT("osfxsr", ia32_go(&r, fast), 0x6a00);
+    merced_destroy(c);
+    /* LDMXCSR reserved bit is #GP; STMXCSR stores it. */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0xae, 0x13}, 3, 3); c->EBX = 0x4800;
+    ia32_set_mem32(&r, 0x4800, 0x10000);
+    IA_EXPECT("ldmxcsr", ia32_go(&r, fast), 0x6900);
+    merced_destroy(c);
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0xae, 0x1b}, 3, 3); c->EBX = 0x4800;
+    IA_EXPECT("stmxcsr", ia32_go(&r, fast), 0);
+    IA_EXPECT("stmxcsr", ia32_mem32(&r, 0x4800), 0x1f80);
+    merced_destroy(c);
+    /* FXSAVE then FXRSTOR into a cleared machine. */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0xae, 0x03}, 3, 3); c->EBX = 0x4800;
+    set_xmm(c, 5, 1, 2, 3, 4);
+    c->fr[8 + 7] = (MercedFpReg){.sig = 0xc000000000000000ull, .exp = 0x10000};
+    c->ar[28] = (c->ar[28] & ~UINT64_C(0xffff3800)) | (7 << 11) |
+                (UINT64_C(0x1555) << 16);           /* TOP 7, physical 7 full */
+    IA_EXPECT("fxsave", ia32_go(&r, fast), 0);
+    IA_EXPECT("fxsave ftw", r.f.ram.memory[0x5804], 0x80);
+    IA_EXPECT("fxsave mxcsr", ia32_mem32(&r, 0x4818), 0x1f80);
+    IA_EXPECT("fxsave xmm5", ia32_mem32(&r, 0x4800 + 160 + 80 + 12), 4);
+    merced_destroy(c);
+    Ia32Run r2;
+    c = ia32_setup(&r2, (const uint8_t[]){0x0f, 0xae, 0x0b}, 3, 3); c->EBX = 0x4800;
+    memcpy(&r2.f.ram.memory[0x5800], &r.f.ram.memory[0x5800], 512);
+    IA_EXPECT("fxrstor", ia32_go(&r2, fast), 0);
+    IA_EXPECT("fxrstor xmm5", xmm_lane(c, 5, 3), 4);
+    IA_EXPECT("fxrstor top", (c->ar[28] >> 11) & 7, 7);
+    IA_EXPECT("fxrstor st0", c->fr[15].sig, 0xc000000000000000ull);
+    IA_EXPECT("fxrstor tags", (c->ar[28] >> 16) & 0xffff, 0x1555);
+    merced_destroy(c);
+    /* Misaligned FXSAVE is #GP(0). */
+    c = ia32_setup(&r, (const uint8_t[]){0x0f, 0xae, 0x03}, 3, 3); c->EBX = 0x4808;
+    IA_EXPECT("fxsave align", ia32_go(&r, fast), 0x6900);
+    merced_destroy(c);
+}
+#undef EAX
+#undef ECX
+#undef EDX
+#undef EBX
+#undef ESP
+#undef EBP
+
 static void check_ia32_cmpxchg_cross_page(bool fast, unsigned size,
                                          bool equal, bool fault) {
     Ia32CmpxchgFixture f = {0};
@@ -5623,6 +6081,11 @@ int main(void) {
                     check_ia32_cmpxchg_cross_page(fast, size, equal, fault);
         for (unsigned i = 0; i < sizeof(ia32_bittests) / sizeof(ia32_bittests[0]); i++)
             check_ia32_bittest(fast, &ia32_bittests[i]);
+        check_ia32_misc(fast);
+        check_ia32_descriptors(fast);
+        check_ia32_fbcd(fast);
+        check_ia32_mmx(fast);
+        check_ia32_sse(fast);
         for (unsigned size = 1; size <= 4; size *= 2)
             for (unsigned sample = 0; sample < 3; sample++) {
                 for (unsigned form = 0; form < (size == 1 ? 4 : 2); form++)

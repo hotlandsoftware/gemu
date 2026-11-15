@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -117,6 +118,13 @@ uint64_t    gemu_drive_size(const GemuDrive *d);       /* bytes; 0 when empty */
  * a read-only drive, or a host I/O error. */
 bool        gemu_drive_read(GemuDrive *d, uint64_t offset, void *buf, size_t len);
 bool        gemu_drive_write(GemuDrive *d, uint64_t offset, const void *buf, size_t len);
+
+/* Machine snapshots: the medium's identity (size, modification time) and,
+ * for a snapshot=on drive, its in-memory writes.  Loading restores those
+ * writes (switching the drive to snapshot mode if it wasn't, so they never
+ * reach the image) and warns if the image changed since the save. */
+bool        gemu_drive_save_state(GemuDrive *d, FILE *f);
+bool        gemu_drive_load_state(GemuDrive *d, FILE *f);
 
 /* Removable media (cdrom, floppy). */
 bool        gemu_drive_insert(GemuDrive *d, const char *file, char *err, size_t err_len);

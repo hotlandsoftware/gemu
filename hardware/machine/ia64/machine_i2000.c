@@ -3162,7 +3162,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 38u   /* 38: Merced.time_base */
+#define I2000_SNAPSHOT_VERSION 39u   /* 39: drive state (disk identity, -snapshot writes) */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -3214,6 +3214,10 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     memset(&cpu_snap.bus, 0, sizeof(cpu_snap.bus));
     cpu_snap.translation_cache = NULL;
     ok &= fwrite(&cpu_snap, sizeof(cpu_snap), 1, f) == 1;
+    /* The disks as of this moment: -snapshot writes live only in memory, so
+     * without them a restored guest would lose its own disk changes. */
+    ok &= gemu_drive_save_state(s->hda, f);
+    ok &= gemu_drive_save_state(s->cdrom, f);
 
     fclose(f);
     return ok;
@@ -3229,8 +3233,9 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fread(&magic, sizeof(magic), 1, f) == 1;
     ok &= fread(&version, sizeof(version), 1, f) == 1;
     ok &= fread(&ram_size, sizeof(ram_size), 1, f) == 1;
+    /* Version 38 is the same layout without the trailing drive state. */
     if (!ok || magic != I2000_SNAPSHOT_MAGIC ||
-        version != I2000_SNAPSHOT_VERSION || ram_size != s->ram_size) {
+        (version != I2000_SNAPSHOT_VERSION && version != 38) || ram_size != s->ram_size) {
         fclose(f);
         return false;
     }
@@ -3340,6 +3345,13 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->pit.ud = s;
         s->pit_itc_mark = merced_get_time_base(s->cpu);
     }
+    if (ok && version >= 39) {
+        ok &= gemu_drive_load_state(s->hda, f);
+        ok &= gemu_drive_load_state(s->cdrom, f);
+        i2000_drive_info_refresh(s);
+    } else if (ok)
+        fprintf(stderr, "gemu: loadvm: this older state has no disk information; it only"
+                        " works with the disk exactly as it was when it was saved\n");
 
     fclose(f);
     return ok;
@@ -4776,6 +4788,49 @@ static void i2000_bench_check(Ia64I2000State *s) {
 
 /* After a slot (or a run of them): carry out a platform reset the slot
  * requested, or stop on a halt.  Returns false when the slice must end. */
+/* Idle skipping.  Windows idles in a busy loop (KiIdleLoop polls its DPC
+ * queue and next thread; HalProcessorIdle only enables interrupts), so a
+ * waiting guest burns host time at wall-clock speed.  A run slice that wrote
+ * no memory and ended in an architectural state already seen at the end of
+ * another such slice is in a loop that only an interrupt can end; time then
+ * moves straight on to the guest's next timer deadline.  Guest time runs
+ * ahead of the host while it idles, so this is opt-in: GEMU_IDLE_SKIP=1. */
+static void i2000_idle_check(Ia64I2000State *s) {
+    static int enabled = -1;
+    static uint64_t dirty_mark, seen[16];
+    static unsigned n_seen;
+    static uint64_t skips;
+    if (enabled < 0) {
+        const char *e = getenv("GEMU_IDLE_SKIP");
+        enabled = e && strcmp(e, "0") != 0;
+    }
+    if (!enabled) return;
+    Merced *cpu = s->cpu;
+    uint64_t dirty = merced_idle_dirty(cpu);
+    if (dirty != dirty_mark || cpu->ext_pending_count || cpu->timer_pending) {
+        dirty_mark = dirty;
+        n_seen = 0;
+        return;
+    }
+    uint64_t h = merced_state_hash(cpu);
+    bool repeat = false;
+    for (unsigned i = 0; i < n_seen && i < 16; i++) repeat |= seen[i] == h;
+    if (!repeat) {
+        seen[n_seen++ % 16] = h;
+        return;
+    }
+    n_seen = 0;
+    /* The interval timer must be armed, unmasked and still ahead. */
+    uint64_t itm = cpu->cr[1], itv = cpu->cr[72], itc = merced_get_itc(cpu);
+    if (!itm || (itv & (UINT64_C(1) << 16)) || (int64_t)(itm - itc) <= 0) return;
+    uint64_t delta = itm - itc;
+    if (delta > I2000_ITC_HZ) delta = I2000_ITC_HZ;   /* never more than 1 s at once */
+    merced_advance_itc(cpu, delta);
+    if (getenv("GEMU_IDLE_DEBUG") && ++skips % 1000 == 0)
+        fprintf(stderr, "i2000: idle skips %" PRIu64 " (last %" PRIu64 " ticks at %016" PRIX64 ")\n",
+                skips, delta, cpu->ip);
+}
+
 static bool i2000_after_step(Ia64I2000State *s, MercedStatus st) {
     if (s->reset_requested) {
         fprintf(stderr, "i2000: firmware requested a platform reset\n");
@@ -4835,6 +4890,8 @@ static void i2000_run_slice(Ia64I2000State *s) {
             MercedStatus st = merced_run_fast_range(
                 s->cpu, irq_poll_quantum, &n, 0, 0, 0, 0);
             i += (int)n;
+            if (st == MERCED_OK)
+                i2000_idle_check(s);
             if (!i2000_after_step(s, st))
                 return;
             continue;

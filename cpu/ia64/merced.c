@@ -6719,6 +6719,16 @@ MercedStatus merced_ia32_fp_exception(Merced *m, unsigned vector) {
     return deliver_fault(m, 0x6900, (uint64_t)vector << 16, 0, false);
 }
 
+/* An IA-32 fault (#DE 0, #BR 5, #GP 13, #XM 19 ...) to the IA_32_Exception
+ * vector: IIP stays at the faulting instruction, ISR{23:16} is the IA-32
+ * vector and ISR{15:0} the error code (Ski's ia32ExceptionFault). */
+MercedStatus merced_ia32_exception(Merced *m, unsigned vector,
+                                   uint16_t error_code) {
+    return deliver_fault(m, 0x6900,
+                         ((uint64_t)(vector & 0xFF) << 16) | error_code, 0,
+                         false);
+}
+
 MercedStatus merced_ia32_instruction_intercept(Merced *m, uint64_t iim,
                                                 uint16_t code) {
     /* IA-32 system instructions and invalid opcodes are intercepted into
@@ -8094,6 +8104,37 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
 
 #define MERCED_JIT_INCLUDED
 #include "jit/merced_jit.c"
+
+/* ---- Idle detection --------------------------------------------------------
+ * A loop that writes no memory and comes back to the same architectural
+ * state can only change when an interrupt arrives, so the platform may move
+ * time on to the next timer deadline (see the i2000 run loop).  Memory
+ * writes are counted per translated block; anything not run as translated
+ * code counts as a change. */
+uint64_t merced_idle_dirty(Merced *m) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (!tc || !tc->jit || !tc->jit->enabled) return m->ninsts;
+    return tc->jit->dirty;
+}
+
+uint64_t merced_state_hash(Merced *m) {
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+#define MIX(v) (h = (h ^ (uint64_t)(v)) * UINT64_C(0x100000001b3))
+    MIX(m->ip); MIX(m->psr); MIX(m->cfm); MIX(m->pr);
+    for (unsigned r = 1; r < 32 + CFM_SOF(m->cfm); r++) {
+        uint8_t nat;
+        MIX(gr_read(m, r, &nat));
+        MIX(nat);
+    }
+    for (unsigned b = 0; b < MERCED_N_BR; b++) MIX(m->br[b]);
+    static const unsigned ars[] = { AR_RSC, AR_BSPSTORE, AR_RNAT, AR_CCV, AR_UNAT,
+                                    AR_FPSR, AR_PFS, AR_LC, AR_EC };
+    for (unsigned i = 0; i < sizeof ars / sizeof ars[0]; i++) MIX(m->ar[ars[i]]);
+    MIX(m->bof_total);                  /* the RSE position (ar.bsp is derived) */
+    MIX(m->cr[CR_TPR]);
+#undef MIX
+    return h;
+}
 
 /* Like merced_run(), but through fast_step() when no debug facility is
  * active - or through translated code, with -accel jit.  In addition to the

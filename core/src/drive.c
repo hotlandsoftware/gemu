@@ -5,9 +5,11 @@
 #include "gemu/drive.h"
 #include "gemu/monitor.h"
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #  define gemu_fseek _fseeki64
@@ -164,6 +166,83 @@ bool gemu_drive_write(GemuDrive *d, uint64_t off, const void *buf, size_t len) {
         in += n; off += n; len -= n;
     }
     return true;
+}
+
+/* ── Machine snapshots ───────────────────────────────────────────────────── */
+
+/* A saved machine state refers to the disk contents of its moment.  The image
+ * file's size and modification time identify those contents, and with
+ * snapshot=on the in-memory overlay is part of them: without it a restored
+ * guest would find its own writes gone. */
+#define DRIVE_STATE_MAGIC 0x31455441545344ull   /* "DSTATE1" */
+
+static int64_t medium_mtime(const GemuDrive *d) {
+    struct stat st;
+    return d->file[0] && stat(d->file, &st) == 0 ? (int64_t)st.st_mtime : -1;
+}
+
+bool gemu_drive_save_state(GemuDrive *d, FILE *f) {
+    uint64_t magic = DRIVE_STATE_MAGIC, size = d && d->f ? d->size : 0, n = 0;
+    uint8_t overlay = d && d->snap;
+    if (d && d->f && !d->snap) fflush(d->f);
+    int64_t mtime = d && d->f ? medium_mtime(d) : -1;
+    for (size_t i = 0; overlay && i < d->n_snap; i++) n += d->snap[i] != NULL;
+    bool ok = fwrite(&magic, 8, 1, f) == 1 && fwrite(&size, 8, 1, f) == 1 &&
+              fwrite(&mtime, 8, 1, f) == 1 && fwrite(&overlay, 1, 1, f) == 1 &&
+              fwrite(&n, 8, 1, f) == 1;
+    for (size_t i = 0; ok && overlay && i < d->n_snap; i++) {
+        if (!d->snap[i]) continue;
+        uint64_t idx = i;
+        ok = fwrite(&idx, 8, 1, f) == 1 && fwrite(d->snap[i], 1, SNAP_CHUNK, f) == SNAP_CHUNK;
+    }
+    return ok;
+}
+
+bool gemu_drive_load_state(GemuDrive *d, FILE *f) {
+    uint64_t magic = 0, size = 0, n = 0;
+    int64_t mtime = -1;
+    uint8_t overlay = 0;
+    if (fread(&magic, 8, 1, f) != 1 || magic != DRIVE_STATE_MAGIC ||
+        fread(&size, 8, 1, f) != 1 || fread(&mtime, 8, 1, f) != 1 ||
+        fread(&overlay, 1, 1, f) != 1 || fread(&n, 8, 1, f) != 1)
+        return false;
+    const char *name = d ? d->name : "drive";
+    bool usable = d && d->f && d->size == size;
+    if (size && !usable)
+        fprintf(stderr, "gemu: loadvm: %s: the saved state had a %" PRIu64
+                "-byte medium; this one differs - its contents won't match\n", name, size);
+    else if (usable && mtime != medium_mtime(d))
+        fprintf(stderr, "gemu: loadvm: warning: %s: '%s' changed since this state was saved;"
+                " the guest may find a disk it doesn't expect\n", name, d->file);
+    if (usable && n && !d->snap) {
+        /* The saved writes must not land in the image: run this drive in
+         * snapshot mode from here on. */
+        char file[sizeof(d->file)], err[600];
+        snprintf(file, sizeof(file), "%s", d->file);
+        d->snapshot = true;
+        if (!open_medium(d, file, err, sizeof(err))) {
+            fprintf(stderr, "gemu: loadvm: %s: %s\n", name, err);
+            usable = false;
+        } else
+            fprintf(stderr, "gemu: loadvm: %s: the saved state has snapshot-mode writes;"
+                    " '%s' is now in snapshot mode for this run\n", name, file);
+    }
+    if (usable && d->snap)                      /* the saved overlay replaces ours */
+        for (size_t i = 0; i < d->n_snap; i++) { free(d->snap[i]); d->snap[i] = NULL; }
+    uint8_t *chunk = malloc(SNAP_CHUNK);
+    bool ok = chunk != NULL;
+    for (uint64_t k = 0; ok && k < n; k++) {
+        uint64_t idx;
+        ok = fread(&idx, 8, 1, f) == 1 && fread(chunk, 1, SNAP_CHUNK, f) == SNAP_CHUNK;
+        if (ok && usable && idx < d->n_snap) {
+            d->snap[idx] = chunk;
+            chunk = malloc(SNAP_CHUNK);
+            ok = chunk != NULL;
+        }
+    }
+    free(chunk);
+    (void)overlay;
+    return ok;
 }
 
 /* ── Accessors ───────────────────────────────────────────────────────────── */

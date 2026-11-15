@@ -359,6 +359,12 @@ void    merced_flush_translation_cache(Merced *m);
  * interpreted slot for deterministic tests and standalone CPU users. */
 void    merced_set_external_itc(Merced *m, bool enabled);
 void    merced_advance_itc(Merced *m, uint64_t ticks);
+/* Idle detection: a counter that moves whenever execution may have written
+ * memory (or ran outside translated code), and a hash of the architectural
+ * state.  No movement plus a repeated hash means the CPU is in a loop only an
+ * interrupt can end. */
+uint64_t merced_idle_dirty(Merced *m);
+uint64_t merced_state_hash(Merced *m);
 uint64_t merced_get_itc(const Merced *m);
 /* The platform time base (see Merced.time_base), in ITC ticks. */
 uint64_t merced_get_time_base(const Merced *m);
@@ -463,6 +469,8 @@ bool merced_ia32_write_operand(Merced *m, uint64_t va, unsigned size,
 MercedStatus merced_ia32_disabled_transition(Merced *m);
 MercedStatus merced_ia32_disabled_fp(Merced *m);
 MercedStatus merced_ia32_fp_exception(Merced *m, unsigned vector);
+MercedStatus merced_ia32_exception(Merced *m, unsigned vector,
+                                   uint16_t error_code);
 MercedStatus merced_ia32_software_interrupt(Merced *m, unsigned vector,
                                             bool int_n);
 MercedStatus merced_ia32_sysflag_trap(Merced *m, unsigned kind,

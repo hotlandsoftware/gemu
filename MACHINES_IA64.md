@@ -51,6 +51,10 @@ charging n ticks per executed slot, so firmware that polls the ITC for a delay d
 burn real time waiting for it (a cold boot reaches the EFI shell in about half the time
 at `GEMU_CPI=4`). The processor's clock-ratio strap comes from the board's SMBus
 latch. The RTC runs on the same time base, with a real update-in-progress bit.
+`GEMU_IDLE_SKIP=1` (JIT only) skips idle time: when the CPU loops without writing
+memory and keeps returning to the same register state - Windows' idle loop - the ITC
+jumps to the next timer deadline instead of waiting for it in real time. The guest's
+clock then runs ahead of the host's while it idles.
 
 Debug switches: `PM_DEBUG` (power management), `FWH_DEBUG` (firmware hubs),
 `I2C_DEBUG` (bus transactions and absent addresses), `IOSAPIC_DEBUG`.
