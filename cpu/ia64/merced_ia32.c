@@ -2712,6 +2712,58 @@ MercedStatus merced_ia32_step(Merced *m) {
                     setflags(&x, f);
                 }
             }
+        } else if (op2 == 0xa3 || op2 == 0xab || op2 == 0xb3 || op2 == 0xbb ||
+                   op2 == 0xba) {         /* bt/bts/btr/btc r/m, r or imm8 */
+            unsigned prefix_len = x.pc - x.start - 2;
+            uint32_t mr;
+            if (!fetch(&x, 1, &mr)) goto fault;
+            RM rm;
+            if (!decode_rm(&x, mr, &rm)) goto fault;
+            unsigned width = size * 8, kind;   /* 0 bt, 1 bts, 2 btr, 3 btc */
+            int32_t offset;
+            bool reserved = false;
+            if (op2 == 0xba) {
+                uint32_t imm;
+                if (!fetch(&x, 1, &imm)) goto fault;
+                reserved = ((mr >> 3) & 7) < 4;  /* 0F BA /0-/3 are #UD */
+                kind = ((mr >> 3) & 7) - 4;
+                /* An immediate offset selects within the operand only. */
+                offset = (int32_t)(imm & (width - 1));
+            } else {
+                kind = (op2 >> 3) & 3;
+                uint32_t r = xr(&x, (mr >> 3) & 7, size);
+                offset = size == 2 ? (int16_t)r : (int32_t)r;
+            }
+            /* #UD (the IA-32 instruction intercept here): a reserved form,
+             * or LOCK on BT or on a register destination. */
+            if (reserved || (x.locked && (kind == 0 || rm.is_reg))) {
+                uint16_t code;
+                if (!intercept_code(&x, prefix_len, &code)) goto fault;
+                return merced_ia32_instruction_intercept(m,
+                           0x0f | ((uint64_t)op2 << 8) | ((uint64_t)mr << 16), code);
+            }
+            if (!rm.is_reg && op2 != 0xba) {
+                /* A register offset addresses a bit string: it is signed
+                 * and moves the operand by whole words/dwords. */
+                int32_t units = offset >> (size == 2 ? 4 : 5);
+                rm.off += (uint32_t)units * size;
+                if (!x.addr32) rm.off &= 0xffff;
+                rm.addr = sbase(&x, rm.seg) + rm.off;
+            }
+            uint32_t mask = UINT32_C(1) << ((uint32_t)offset & (width - 1)), v;
+            if (kind && !rm.is_reg) {
+                uint64_t value;
+                /* Check write access before anything is modified. */
+                if (!merced_ia32_read_for_write(m, rm.addr, size, &value)) goto fault;
+                v = (uint32_t)value;
+            } else if (!rmread(&x, rm, size, &v)) goto fault;
+            if (kind) {
+                uint32_t nv = kind == 1 ? v | mask : kind == 2 ? v & ~mask : v ^ mask;
+                if (!rmwrite(&x, rm, size, nv)) goto fault;
+            }
+            /* CF is the old bit; ZF is unchanged and OF/SF/AF/PF are
+             * undefined, which this keeps as they were. */
+            setflags(&x, (eflags(&x) & ~FL_CF) | ((v & mask) ? FL_CF : 0));
         } else if(op2==0xaf){                         /* imul r, r/m */
             if(!fetch(&x,1,&q))goto fault;
             uint8_t mr=(uint8_t)q;RM rm;if(!decode_rm(&x,mr,&rm))goto fault;

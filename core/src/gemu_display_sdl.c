@@ -42,6 +42,20 @@ typedef struct {
     struct { SDL_Keycode key; uint32_t bits; } held[SDL_MAX_BINDINGS * 2];
     int n_held;
 
+    /* An Alt the guest saw go down for a host shortcut (Alt+Tab away,
+     * Ctrl+Alt+G, the menu bar) must not reach it as a lone Alt tap: a
+     * Windows guest toggles its keyboard menu mode on Alt down/up with no
+     * other key down in between, and an application in menu mode stops
+     * pumping its own message loop until Esc or a click (Windows Setup
+     * froze at "Installing Devices" that way).  Such an Alt is "tainted";
+     * its release is preceded by a Ctrl (or Shift) tap, which Windows
+     * counts as a key pressed with Alt. */
+    bool        alt_tainted;
+    int         alt_fix;           /* 2: add the dummy key, 1: then release */
+    SDL_Keycode alt_fix_key;
+    uint32_t    alt_fix_bits;
+    Uint32      focus_gained_at;
+
     bool menu_was_open;   /* detect menu close to reload INI */
     const GemuActionDef *action_defs;
     int                  n_actions;
@@ -183,6 +197,37 @@ static uint32_t held_mask(const SdlBackend *b) {
     uint32_t m = 0;
     for (int i = 0; i < b->n_held; i++) m |= b->held[i].bits;
     return m;
+}
+
+static bool is_alt(SDL_Keycode kc) {
+    return kc == SDLK_LALT || kc == SDLK_RALT;
+}
+
+/* The guest currently sees an Alt key down. */
+static bool alt_held(const SdlBackend *b) {
+    for (int i = 0; i < b->n_held; i++)
+        if (is_alt(b->held[i].key) && b->held[i].bits) return true;
+    return false;
+}
+
+/* The window is losing (or has lost) keyboard focus: SDL queues the key
+ * releases it synthesizes for held keys ahead of the FOCUS_LOST event, and
+ * updates the window flags while pumping. */
+static bool losing_focus(SDL_Window *win) {
+    if (!win || !(SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS))
+        return true;
+    SDL_Event pending[32];
+    int n = SDL_PeepEvents(pending, 32, SDL_PEEKEVENT, SDL_WINDOWEVENT, SDL_WINDOWEVENT);
+    for (int i = 0; i < n; i++)
+        if (pending[i].window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+            return true;
+    return false;
+}
+
+/* A host shortcut used the keys held right now: any Alt among them must not
+ * end as a lone tap in the guest. */
+static void taint_alt(SdlBackend *b) {
+    if (alt_held(b)) b->alt_tainted = true;
 }
 
 static void open_first_controller(SdlBackend *b) {
@@ -431,6 +476,7 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
         if (ev.type == SDL_KEYDOWN && b->mouse_captured && ev.key.keysym.sym == SDLK_g &&
             (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_ALT)) {
             sdl_set_mouse_captured(d, b, false);
+            taint_alt(b);
             continue;
         }
 
@@ -439,6 +485,7 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
             (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_ALT) &&
             ev.key.keysym.sym >= SDLK_1 && ev.key.keysym.sym <= SDLK_9) {
             gemu_display_select_head(d, ev.key.keysym.sym - SDLK_1);
+            taint_alt(b);
             continue;
         }
 
@@ -459,9 +506,12 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
                            input_menu_event_opens(b->menu, &ev);
             if (!gemu_menubar_active(b->menubar) && (combo || own_key)) {
                 gemu_menubar_focus(b->menubar);
+                taint_alt(b);
                 continue;
             }
             if (gemu_menubar_handle_event(b->menubar, &ev, win_w, win_h, out_w, out_h)) {
+                if (ev.type == SDL_KEYDOWN)
+                    taint_alt(b);
                 menu_open = b->menu && input_menu_is_open(b->menu);   /* Input > Configure */
                 continue;
             }
@@ -496,6 +546,10 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
                         SDL_SetWindowSize(win, b->want_w, b->want_h);
                 }
             }
+            if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                taint_alt(b);
+            if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+                b->focus_gained_at = SDL_GetTicks() | 1;
             if (ev.window.event == SDL_WINDOWEVENT_CLOSE) {
                 /* Only quit if it's the main (NES) window being closed.
                  * Closing a secondary window (e.g. ROB display) must not
@@ -565,6 +619,11 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
 
             uint32_t bits = key_to_bits(b, kc);
             held_set(b, kc, bits, true);
+            /* Alt still held from an Alt+Tab back into the window (SDL
+             * reports held modifiers on focus), or pressed while unfocused. */
+            if (is_alt(kc) && (losing_focus(win) ||
+                               (b->focus_gained_at && SDL_GetTicks() - b->focus_gained_at < 300)))
+                b->alt_tainted = true;
 
             /* Raw queue: only push special keys here; printable characters
              * come from SDL_TEXTINPUT (which is layout-correct and avoids
@@ -577,7 +636,23 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
 
         case SDL_KEYUP: {
             SDL_Keycode kc = ev.key.keysym.sym;
+            /* SDL releases every held key when the window loses focus. */
+            if (is_alt(kc) && losing_focus(win))
+                taint_alt(b);
+            if (is_alt(kc) && b->alt_tainted && !b->alt_fix && alt_held(b)) {
+                uint32_t held = held_mask(b);
+                uint32_t ctrl = key_to_bits(b, SDLK_LCTRL), shift = key_to_bits(b, SDLK_LSHIFT);
+                uint32_t dummy = ctrl && !(held & ctrl) ? ctrl : shift && !(held & shift) ? shift : 0;
+                if (dummy) {
+                    b->alt_fix = 2;
+                    b->alt_fix_key = kc;
+                    b->alt_fix_bits = dummy;
+                    break;   /* Alt stays down until the dummy key went by */
+                }
+            }
             held_set(b, kc, key_to_bits(b, kc), false);
+            if (!alt_held(b))
+                b->alt_tainted = false;
             break;
         }
 
@@ -627,7 +702,19 @@ static uint32_t sdl_do_poll(GemuDisplay *d) {
     }
 
     redraw_if_idle(b);
-    return held_mask(b) | controller_mask(b);
+    /* A tainted Alt's release, one poll per step so the machine sees each
+     * edge: the dummy key goes down with Alt still held, then both go up. */
+    uint32_t extra = 0;
+    if (b->alt_fix == 2) {
+        extra = b->alt_fix_bits;
+        b->alt_fix = 1;
+    } else if (b->alt_fix == 1) {
+        held_set(b, b->alt_fix_key, 0, false);
+        b->alt_fix = 0;
+        if (!alt_held(b))
+            b->alt_tainted = false;
+    }
+    return held_mask(b) | controller_mask(b) | extra;
 }
 
 static bool sdl_do_is_key_held(GemuDisplay *d, const char *name) {

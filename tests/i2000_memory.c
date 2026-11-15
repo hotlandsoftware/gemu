@@ -2296,6 +2296,84 @@ static void check_ia32_cmpxchg(bool fast, unsigned size, unsigned form,
     merced_destroy(cpu);
 }
 
+/* BT/BTS/BTR/BTC (0F A3/AB/B3/BB, 0F BA /4-/7): a register bit offset is
+ * signed and moves a memory operand by whole words/dwords; an immediate one
+ * selects within the operand.  CF is the old bit, other flags are kept. */
+typedef struct {
+    const char *name;
+    uint8_t code[6];
+    unsigned len;
+    uint32_t ecx, ebx;          /* bit offset / register destination */
+    uint32_t mem_off, mem_in;   /* dword of the page tested, before */
+    uint32_t mem_out, ebx_out;
+    bool cf;
+} Ia32BitTest;
+
+static void check_ia32_bittest(bool fast, const Ia32BitTest *c) {
+    Ia32CmpxchgFixture f = {0};
+    memcpy(&f.ram.memory[0x1000], c->code, c->len);
+    rse_test_write(&f.ram, 0x5000 + c->mem_off, c->mem_in, 4);
+    MercedBus bus = {.ud = &f, .read = ia32_cmpxchg_read,
+                     .write = ia32_cmpxchg_write, .ram_size = sizeof(f.ram.memory)};
+    Merced *cpu = merced_create(&bus);
+    if (!cpu) { failures++; return; }
+    const uint64_t upper = UINT64_C(0xfedcba9800000000);
+    const uint32_t flags = 0xed6;  /* every arithmetic flag but CF, IF, DF */
+    cpu->ip = 0x1000;
+    cpu->psr = (UINT64_C(1) << 13) | (UINT64_C(1) << 17) |
+               (UINT64_C(1) << 34) | (UINT64_C(1) << 44); /* IC, DT, IS, BN */
+    cpu->ar[24] = upper | flags;
+    cpu->gr_static[25] = UINT64_C(1) << 62; /* 32-bit CS */
+    cpu->gr_static[9] = upper | c->ecx;
+    cpu->gr_static[10] = 0x4800;            /* EDX: mid-page base */
+    cpu->gr_static[11] = upper | c->ebx;
+    cpu->cr[72] = UINT64_C(1) << 16;
+    cpu->rr[0] = (1 << 8) | (12 << 2);
+    cpu->dtr[0] = (MercedTlbEntry) {
+        .va_start = 0x4000, .va_end = 0x4fff, .pfn_base = 0x5000,
+        .rid = 1, .ps = 12, .valid = 1, .itir = (1 << 8) | (12 << 2), .pte = 0x5461,
+    };
+#define BT_EXPECT(actual, expected, what) do { \
+    uint64_t a_ = (actual), e_ = (expected); \
+    if (a_ != e_) { \
+        fprintf(stderr, "IA32 %s %s: %s: got 0x%" PRIx64 ", expected 0x%" PRIx64 "\n", \
+                c->name, fast ? "fast" : "slow", what, a_, e_); failures++; \
+    } \
+} while (0)
+    BT_EXPECT(handoff_step(cpu, fast), MERCED_OK, "instruction status");
+    BT_EXPECT(cpu->nfaults, 0, "no fault");
+    BT_EXPECT(cpu->ip, 0x1000 + c->len, "EIP advances");
+    BT_EXPECT(cpu->ar[24], upper | flags | (c->cf ? 1 : 0), "CF = old bit, others kept");
+    BT_EXPECT(rse_test_read(&f.ram, 0x5000 + c->mem_off, 4), c->mem_out, "memory");
+    BT_EXPECT(cpu->gr_static[11], upper | c->ebx_out, "register destination");
+    BT_EXPECT(cpu->gr_static[9], upper | c->ecx, "offset register unchanged");
+#undef BT_EXPECT
+    merced_destroy(cpu);
+}
+
+static const Ia32BitTest ia32_bittests[] = {
+    /* bts [edx],ecx: offset 37 = dword +4, bit 5 */
+    { "bts m32,r32", {0x0f, 0xab, 0x0a}, 3, 37, 0, 0x804, 0x1, 0x21, 0, false },
+    /* negative offset -1 = dword -4, bit 31 (already set) */
+    { "bts m32,r32 neg", {0x0f, 0xab, 0x0a}, 3, UINT32_MAX, 0, 0x7fc, 0x80000000u,
+      0x80000000u, 0, true },
+    /* bt [edx],ecx reads only */
+    { "bt m32,r32", {0x0f, 0xa3, 0x0a}, 3, 64 + 3, 0, 0x808, 0x8, 0x8, 0, true },
+    /* btr / btc memory */
+    { "btr m32,r32", {0x0f, 0xb3, 0x0a}, 3, 2, 0, 0x800, 0x7, 0x3, 0, true },
+    { "btc m32,r32", {0x0f, 0xbb, 0x0a}, 3, 1, 0, 0x800, 0x5, 0x7, 0, false },
+    /* register destination: offset taken modulo 32 */
+    { "bts r32,r32", {0x0f, 0xab, 0xcb}, 3, 33, 0x10, 0, 0, 0, 0x12, false },
+    { "btc r32,r32", {0x0f, 0xbb, 0xcb}, 3, 4, 0x10, 0, 0, 0, 0x00, true },
+    /* 0F BA /5 ib: bts [edx],0x45 - immediate is modulo 32, no displacement */
+    { "bts m32,imm8", {0x0f, 0xba, 0x2a, 0x45}, 4, 0, 0, 0x800, 0x0, 0x20, 0, false },
+    { "bt r32,imm8", {0x0f, 0xba, 0xe3, 0x1f}, 4, 0, 0x80000000u, 0, 0, 0, 0x80000000u, true },
+    { "btr r32,imm8", {0x0f, 0xba, 0xf3, 0x00}, 4, 0, 0x3, 0, 0, 0, 0x2, true },
+    /* 16-bit: offset -16 (cx=0xfff0) = word -2, bit 0 */
+    { "bts m16,r16 neg", {0x66, 0x0f, 0xab, 0x0a}, 4, 0xfff0, 0, 0x7fc, 0x00000000,
+      0x00010000, 0, false },
+};
+
 static void check_ia32_cmpxchg_cross_page(bool fast, unsigned size,
                                          bool equal, bool fault) {
     Ia32CmpxchgFixture f = {0};
@@ -5543,6 +5621,8 @@ int main(void) {
             for (unsigned equal = 0; equal < 2; equal++)
                 for (unsigned fault = 0; fault < 2; fault++)
                     check_ia32_cmpxchg_cross_page(fast, size, equal, fault);
+        for (unsigned i = 0; i < sizeof(ia32_bittests) / sizeof(ia32_bittests[0]); i++)
+            check_ia32_bittest(fast, &ia32_bittests[i]);
         for (unsigned size = 1; size <= 4; size *= 2)
             for (unsigned sample = 0; sample < 3; sample++) {
                 for (unsigned form = 0; form < (size == 1 ? 4 : 2); form++)
