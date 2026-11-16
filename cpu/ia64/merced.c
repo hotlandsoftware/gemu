@@ -2843,9 +2843,13 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
                 ((m->psr & PSR_ED) ||
                  (unaligned_needs_fault(m, va, size, false) &&
                   spec_defers(m, VEC_UNALIGNED)));
-            if (!n3 && !forced && data_debug_fault(m, va, size, ISR_R, &st))
+            /* Faults detected before address translation must still report
+             * control speculation. NT uses ISR.sp to resume a faulting
+             * ld.s/ld.sa with IPSR.ed instead of raising a user exception. */
+            uint64_t access = ISR_R | (spec ? ISR_SP : 0);
+            if (!n3 && !forced && data_debug_fault(m, va, size, access, &st))
                 return st;
-            if (!n3 && !forced && unaligned_fault(m, va, size, ISR_R, false, &st))
+            if (!n3 && !forced && unaligned_fault(m, va, size, access, false, &st))
                 return st;
             /* A deferred ld.sa leaves no ALAT entry for its target: the
              * chk.a / ld.c after it must miss and run the recovery code.
@@ -3038,6 +3042,8 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
          * stores: 0x30-0x33 stfe/stf8/stfs/stfd, 0x3B stf.spill */
         int is_st = (x6 >= 0x30);
         bool check_load = x6 >= 0x20 && x6 <= 0x27;
+        bool fspec = !is_st && x6 <= 0x0F &&
+                     (((x6 >> 2) & 3) == 1 || ((x6 >> 2) & 3) == 3);
         if (!qp) return MERCED_OK;
         uint64_t va = gr_read(m, r3, &n3), pa;
         if (check_load && n3)
@@ -3046,8 +3052,7 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         /* PSR.ed: a speculative ldf.s/ldf.sa defers, as for the integer
          * loads above. */
         static const unsigned fspec_size[4] = { 16, 8, 4, 8 };
-        if (!is_st && x6 <= 0x0F && (((x6 >> 2) & 3) == 1 ||
-                                     ((x6 >> 2) & 3) == 3) &&
+        if (fspec &&
             ((m->psr & PSR_ED) ||
              (!n3 && unaligned_needs_fault(m, va, fspec_size[x6 & 3], false) &&
               spec_defers(m, VEC_UNALIGNED)))) {
@@ -3060,12 +3065,12 @@ static MercedStatus exec_mem(Merced *m, uint64_t raw, int qp) {
         {
             static const unsigned fsize[4] = { 16, 8, 4, 8 };
             unsigned fsz = (x6 == 0x1B || x6 == 0x3B) ? 16 : fsize[x6 & 3];
-            if (data_debug_fault(m, va, fsz, is_st ? ISR_W : ISR_R, &st))
+            uint64_t access = (is_st ? ISR_W : ISR_R) | (fspec ? ISR_SP : 0);
+            if (data_debug_fault(m, va, fsz, access, &st))
                 return st;
-            if (unaligned_fault(m, va, fsz, is_st ? ISR_W : ISR_R, false, &st))
+            if (unaligned_fault(m, va, fsz, access, false, &st))
                 return st;
         }
-        bool fspec = !is_st && x6 <= 0x0F && (((x6 >> 2) & 3) == 1 || ((x6 >> 2) & 3) == 3);
         if (!va_translate(m, va, false, fspec, is_st ? ISR_W : ISR_R, &pa, &st)) {
             /* A deferred speculative load completes with a NaTVal */
             if (!fspec || st != MERCED_OK || m->taken) return st;
@@ -3739,12 +3744,16 @@ static MercedStatus rse_store_through(Merced *m, int64_t end) {
     return MERCED_OK;
 }
 
-static MercedStatus rse_spill_excess(Merced *m) {
-    int64_t bsp = (int64_t)m->bof_total + (int64_t)CFM_SOF(m->cfm);
+static MercedStatus rse_spill_for_frame(Merced *m, unsigned sof) {
+    int64_t bsp = (int64_t)m->bof_total + sof;
     int64_t resident = bsp - m->rse_flushed_regs;
     if (resident <= MERCED_N_STACKED)
         return MERCED_OK;
     return rse_store_through(m, bsp - MERCED_N_STACKED);
+}
+
+static MercedStatus rse_spill_excess(Merced *m) {
+    return rse_spill_for_frame(m, CFM_SOF(m->cfm));
 }
 
 /* flushrs spills the dirty parent frames up to BSP (the current frame's
@@ -4636,6 +4645,13 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         if (sof > MERCED_N_STACKED || sol > sof || sor * 8 > sof || r1 == 0 ||
             (r1 >= 32 && r1 - 32 >= sof))
             return deliver_fault(m, VEC_GENERAL, 0, 0, false);
+        /* Mandatory spills precede the CFM and destination updates (SDM
+         * Vol.3, alloc). A fault must leave the old frame visible to cover;
+         * publishing the larger frame first can preserve more than 96
+         * resident registers and recursively fault in the OS trap entry. */
+        MercedStatus spill_status = rse_spill_for_frame(m, sof);
+        if (spill_status != MERCED_OK || m->taken)
+            return spill_status;
         uint64_t pfs = m->ar[AR_PFS];
         /* alloc replaces sof/sol/sor but preserves the three rotation
          * bases.  Firmware routinely enters leaf arithmetic helpers with
@@ -4643,7 +4659,7 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         m->cfm = (m->cfm & ~0x3FFFFull) |
                  sof | ((uint64_t)sol << 7) | ((uint64_t)sor << 14);
         gr_write(m, r1, pfs, 0);
-        return rse_spill_excess(m);
+        return MERCED_OK;
     }
     if (x3 == 1 || x3 == 3) {
         /* M20 chk.s.m r2,target25 / M21 chk.s f2,target25. The checked
@@ -6124,11 +6140,16 @@ static MercedStatus fp_report(Merced *m, uint64_t raw, unsigned status) {
 }
 
 static MercedStatus exec_f(Merced *m, uint64_t raw, int qp) {
-    /* A predicated-off instruction has no architectural effect, including
-     * reserved/unimplemented opcode checks.  Compilers routinely fill an
-     * F slot with an opcode that is only meaningful on the true path. */
-    if (!qp) return MERCED_OK;
     unsigned major = (unsigned)bits(raw, 37, 4);
+    /* fcmp.unc and fclass.unc clear both destinations even when qp is
+     * false. Do this without reading FP operands or raising FP faults;
+     * all other predicated-off F instructions have no effect. */
+    if (!qp) {
+        if ((major == 4 || major == 5) && bits(raw, 12, 1))
+            set_preds(m, (unsigned)bits(raw, 6, 6),
+                      (unsigned)bits(raw, 27, 6), 0, 0, 1);
+        return MERCED_OK;
+    }
     unsigned f1 = (unsigned)bits(raw, 6, 7);
     unsigned f2 = (unsigned)bits(raw, 13, 7);
     unsigned f3 = (unsigned)bits(raw, 20, 7);

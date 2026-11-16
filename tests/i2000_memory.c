@@ -1291,6 +1291,109 @@ static void check_epc(unsigned scenario, bool fast) {
     merced_destroy(cpu);
 }
 
+typedef struct {
+    __uint128_t bundle;
+    unsigned reads;
+} SpecFaultFixture;
+
+static uint64_t spec_fault_fetch(void *ud, uint64_t addr, unsigned size) {
+    SpecFaultFixture *f = ud;
+    if (addr < 0x1000 || addr >= 0x1010) return 0;
+    uint64_t v = (uint64_t)(f->bundle >> ((addr & 15) * 8));
+    return size == 8 ? v : v & ((UINT64_C(1) << (size * 8)) - 1);
+}
+
+static uint64_t spec_fault_read(void *ud, uint64_t addr, unsigned size) {
+    SpecFaultFixture *f = ud;
+    (void)addr; (void)size;
+    f->reads++;
+    return 0x12345678;
+}
+
+/* XP services.exe faults on RPCRT4's ld4.sa with a 2-mod-4 address. The
+ * handler needs ISR.sp to recognize speculation and resume with IPSR.ed;
+ * otherwise it raises STATUS_DATATYPE_MISALIGNMENT in the service manager.
+ * Cover integer/FP, .s/.sa/ordinary, both postincrements and data debug,
+ * through the interpreter, decode cache and JIT. */
+static void check_spec_fault(unsigned engine, bool fp, unsigned type,
+                             bool immediate, bool debug) {
+    unsigned x6 = (type == 2 ? 3 : type) * 4 + 2; /* ld4/ldfs, .s, .sa */
+    unsigned major = (fp ? 6 : 4) + immediate;
+    uint64_t raw = (uint64_t)major << 37 | (uint64_t)x6 << 30 |
+                   (10 << 20) | (8 << 6);
+    raw |= immediate ? 8 << 13 : (UINT64_C(1) << 36) | (14 << 13);
+    const __uint128_t nop = UINT64_C(0x08000000);
+    SpecFaultFixture fixture = {.bundle = 9 | (nop << 5) |
+        ((__uint128_t)raw << 46) | (nop << 87)};
+    MercedBus bus = {.ud=&fixture, .read=spec_fault_read,
+                    .fetch=spec_fault_fetch, .write=handoff_write};
+    Merced *cpu = merced_create(&bus);
+    if (!cpu) { failures++; return; }
+    if (engine == 2) merced_set_accel(cpu, MERCED_ACCEL_JIT);
+    cpu->ip = 0x1000;
+    cpu->psr = (UINT64_C(1) << 13) | (UINT64_C(1) << 44) | 8;
+    cpu->cr[2] = 0x8000;
+    cpu->cr[72] = UINT64_C(1) << 16;
+    cpu->gr_static[8] = 0x55;
+    cpu->gr_static[10] = 0x2002;
+    cpu->gr_static[14] = 8;
+    cpu->fr[8] = (MercedFpReg){0x55, 0x123, 1, 0};
+    cpu->alat[0].reg = (fp ? 128 : 0) + 8;
+    cpu->alat[0].phys_addr = 0x3000;
+    cpu->alat[0].size = 4;
+    cpu->alat[0].valid = 1;
+    cpu->alat_valid_mask = 1;
+    if (debug) {
+        cpu->psr |= UINT64_C(1) << 24;
+        cpu->dbr[0] = 0x2002;
+        cpu->dbr[1] = (UINT64_C(1) << 63) | (UINT64_C(1) << 56) |
+                      UINT64_C(0x00ffffffffffffff);
+    }
+#define SPEC_EXPECT(actual, expected, what) do { \
+    uint64_t a_ = (actual), e_ = (expected); \
+    if (a_ != e_) { failures++; \
+        fprintf(stderr, "spec fault engine=%u fp=%u type=%u imm=%u debug=%u %s: " \
+                "got %" PRIx64 " expected %" PRIx64 "\n", engine, fp, type, \
+                immediate, debug, what, a_, e_); } \
+} while (0)
+    SPEC_EXPECT(handoff_step(cpu, engine != 0), MERCED_OK, "warmup nop");
+    uint64_t handler = debug ? 0xd900 : 0xda00;
+    if (engine == 2) {
+        /* Allow a translated block to fit; stop before the fault handler
+         * executes. A one-slot budget would force interpreter fallback. */
+        unsigned executed;
+        SPEC_EXPECT(merced_run_fast_range(cpu, 64, &executed, 0, 0,
+                                         handler, handler + 16),
+                    MERCED_OK, "JIT fault delivery");
+        SPEC_EXPECT(executed, 1, "fault ends the translated block");
+    } else {
+        SPEC_EXPECT(handoff_step(cpu, engine != 0), MERCED_OK, "fault delivery");
+    }
+    SPEC_EXPECT(cpu->ip, handler, "handler vector");
+    SPEC_EXPECT((cpu->cr[17] >> 36) & 1, type != 0, "ISR.sp");
+    SPEC_EXPECT((cpu->cr[17] >> 34) & 1, 1, "ISR.r");
+    SPEC_EXPECT((cpu->cr[17] >> 41) & 3, 1, "fault slot");
+    SPEC_EXPECT(cpu->cr[19], 0x1000, "fault bundle");
+    SPEC_EXPECT(cpu->cr[20], 0x2002, "fault address");
+    SPEC_EXPECT(cpu->gr_static[10], 0x2002, "fault preserves base");
+    SPEC_EXPECT(fp ? cpu->fr[8].sig : cpu->gr_static[8], 0x55, "fault preserves target");
+    SPEC_EXPECT(fixture.reads, 0, "fault performs no bus read");
+    /* Model the OS's speculative recovery decision and return state. */
+    cpu->ip = cpu->cr[19] | ((cpu->cr[16] >> 41) & 3);
+    cpu->psr = cpu->cr[16] | (UINT64_C(1) << 43);
+    SPEC_EXPECT(handoff_step(cpu, engine != 0), MERCED_OK, "ED retry");
+    SPEC_EXPECT(cpu->nfaults, type ? 1 : 2, "only speculative retry defers");
+    if (type) {
+        SPEC_EXPECT(fp ? cpu->fr[8].nat : cpu->nat_static[8], 1, "deferred NaT");
+        SPEC_EXPECT(cpu->gr_static[10], 0x200a, "postincrement once on deferral");
+        SPEC_EXPECT(cpu->ip, 0x1002, "deferral completes slot");
+        if (type == 2) SPEC_EXPECT(cpu->alat_valid_mask, 0, "deferred advanced load invalidates ALAT");
+    }
+    SPEC_EXPECT(fixture.reads, 0, "retry performs no bus read");
+#undef SPEC_EXPECT
+    merced_destroy(cpu);
+}
+
 static void test_predicate_expect(uint64_t actual, uint64_t expected,
                                   const char *what, uint64_t raw,
                                   bool qualified, bool nat, bool fast) {
@@ -1367,6 +1470,64 @@ static void check_fp_lanes(unsigned sample, unsigned op, unsigned nat,
     }
     LANE_EXPECT(cpu->nfaults, 0, "FP lane does not consume NaTVal");
 #undef LANE_EXPECT
+    merced_destroy(cpu);
+}
+
+static void check_fp_predicate(unsigned engine, unsigned op, bool unconditional,
+                                bool qualified, bool nonzero) {
+    /* XP's font-scale check chains fcmp.eq.unc p0,p6=f0,f6 with
+     * (p6) fcmp.eq.unc p0,p7=f0,f7. A false p6 must clear stale p7.
+     * Exercise both destinations and the branch consuming the result. */
+    uint64_t raw = ((uint64_t)(op == 4 ? 5 : 4) << 37) |
+                   (UINT64_C(3) << 27) | (6 << 13) |
+                   ((uint64_t)unconditional << 12) | (2 << 6) | 1;
+    if (op == 4) /* fclass.m p2,p3=f6,@pos|@zero */
+        raw |= (UINT64_C(1) << 33) | (1 << 20);
+    else
+        raw |= ((uint64_t)(op & 1) << 36) | ((uint64_t)(op >> 1) << 33);
+    const __uint128_t nop = UINT64_C(0x08000000);
+    const __uint128_t branch = (UINT64_C(4) << 37) | (2 << 13) | 3;
+    TestPredicateFixture fixture = {.bundle = {
+        13 | (nop << 5) | ((__uint128_t)raw << 46) | (nop << 87),
+        17 | (nop << 5) | (nop << 46) | (branch << 87),
+    }};
+    MercedBus bus = {.ud = &fixture, .read = test_predicate_read,
+                     .write = handoff_write};
+    Merced *cpu = merced_create(&bus);
+    if (!cpu) { failures++; return; }
+    if (engine == 2) merced_set_accel(cpu, MERCED_ACCEL_JIT);
+    cpu->ip = 0x1000;
+    cpu->psr = UINT64_C(1) << 13;
+    cpu->cr[72] = UINT64_C(1) << 16;
+    cpu->pr = 1 | ((uint64_t)qualified << 1) | (1 << 2) | (1 << 3);
+    cpu->fr[6] = nonzero ? (MercedFpReg){UINT64_C(1) << 63, 0xffff, 0, 0}
+                         : (MercedFpReg){0};
+    if (!qualified && nonzero) {
+        /* Neither disabled FP nor a signalling NaN may fault when qp=0,
+         * even though the .unc instruction still writes predicates. */
+        cpu->psr |= UINT64_C(1) << 18;
+        cpu->ar[40] = 0;
+        cpu->fr[6] = (MercedFpReg){UINT64_C(0x8000000000000001), 0x1ffff, 0, 0};
+    }
+#define FPC_EXPECT(actual, expected, what) \
+    test_predicate_expect((actual), (expected), (what), raw, qualified, nonzero, engine != 0)
+    if (engine) {
+        unsigned executed = 0;
+        FPC_EXPECT(merced_run_fast(cpu, 6, &executed, 0, 0), MERCED_OK, "FP predicate status");
+        FPC_EXPECT(executed, 6, "FP predicate slots");
+    } else {
+        for (unsigned slot = 0; slot < 6; slot++)
+            FPC_EXPECT(merced_step(cpu), MERCED_OK, "FP predicate status");
+    }
+    bool first = qualified ? ((op == 0 || op == 2 || op == 4) && !nonzero)
+                           : !unconditional;
+    bool second = qualified ? !first : !unconditional;
+    FPC_EXPECT((cpu->pr >> 2) & 1, first, "FP first target p2");
+    FPC_EXPECT((cpu->pr >> 3) & 1, second, "FP second target p3");
+    FPC_EXPECT((cpu->pr >> 1) & 1, qualified, "FP qualifying predicate preserved");
+    FPC_EXPECT(cpu->nfaults, 0, "unqualified FP sources do not fault");
+    FPC_EXPECT(cpu->ip, second ? 0x1030 : 0x1020, "branch consumes FP predicate");
+#undef FPC_EXPECT
     merced_destroy(cpu);
 }
 
@@ -1587,6 +1748,115 @@ static void rse_test_expect(uint64_t actual, uint64_t expected,
             fast ? "fast" : "slow", dirty, rewind, big_endian, fault,
             what, actual, expected);
     failures++;
+}
+
+/* alloc must make room before committing its frame or ar.pfs destination.
+ * Otherwise a spill fault exposes more than 96 resident registers: cover
+ * preserves that oversized frame and rfi faults again in NT's trap entry.
+ * Include a completed spill prefix and an OS cover/map/rfi/retry sequence. */
+static void check_rse_alloc_fault(unsigned engine, bool prefix, bool stacked) {
+    RseFixture fixture = {0};
+    const uint64_t nop = UINT64_C(0x08000000);
+    unsigned dest = stacked ? 51 : 8; /* r51 exists only in the new frame */
+    uint64_t alloc = (UINT64_C(1) << 37) | (UINT64_C(6) << 33) |
+                     (32 << 13) | (24 << 20) | (dest << 6);
+    rse_test_bundle(&fixture, 0x1000, 1, alloc, nop, nop);
+    rse_test_bundle(&fixture, 0x9000, 17, nop, nop, UINT64_C(2) << 27);
+    uint64_t insert = (UINT64_C(1) << 37) | (UINT64_C(0x2e) << 27) | (13 << 13);
+    rse_test_bundle(&fixture, 0x9010, 17, nop, nop, UINT64_C(8) << 27);
+    rse_test_bundle(&fixture, 0xa000, 17, insert, nop, UINT64_C(8) << 27);
+    MercedBus bus = {.ud = &fixture, .read = rse_test_read,
+                     .fetch = rse_test_read, .write = rse_test_write};
+    Merced *cpu = merced_create(&bus);
+    if (!cpu) { failures++; return; }
+    if (engine == 2) merced_set_accel(cpu, MERCED_ACCEL_JIT);
+    cpu->ip = 0x1000;
+    cpu->psr = (UINT64_C(1) << 13) | (UINT64_C(1) << 27) |
+               (UINT64_C(1) << 44); /* IC, RT, BN */
+    cpu->cr[2] = 0x8000;
+    cpu->cr[72] = UINT64_C(1) << 16;
+    cpu->rr[2] = (3 << 8) | (13 << 2);
+    cpu->gr_static[13] = 0x6661; /* map 0x6000-0x7fff writable */
+    cpu->bof = cpu->bof_total = 80;
+    cpu->cfm = 16 | (8 << 7);
+    cpu->rse_flushed_regs = cpu->rse_anchor_regs = 0;
+    cpu->rse_anchor_addr = UINT64_C(0x4000000000000000) |
+                          (prefix ? 0x5fe8 : 0x6000);
+    cpu->ar[64] = 0x1234;
+    cpu->gr_static[8] = 0xbeef;
+    cpu->nat_static[8] = 1;
+    for (unsigned i = 0; i < 112; i++) {
+        cpu->gr_stack[i] = 0xa000 + i;
+        cpu->nat_stack[i] = i & 1;
+    }
+    if (prefix) {
+        cpu->dtr[0] = (MercedTlbEntry){.va_start=UINT64_C(0x4000000000004000),
+            .va_end=UINT64_C(0x4000000000005fff), .pfn_base=0x4000,
+            .rid=3, .ps=13, .valid=1, .itir=13 << 2, .pte=0x4661};
+    }
+#define ALLOC_EXPECT(actual, expected, what) do { \
+    uint64_t a_ = (actual), e_ = (expected); \
+    if (a_ != e_) { failures++; \
+        fprintf(stderr, "RSE alloc engine=%u prefix=%u stacked=%u %s: " \
+                "got %" PRIx64 " expected %" PRIx64 "\n", \
+                engine, prefix, stacked, what, a_, e_); } \
+} while (0)
+    if (engine == 2) {
+        unsigned executed;
+        ALLOC_EXPECT(merced_run_fast_range(cpu, 64, &executed, 0, 0, 0x9000, 0x9010),
+                     MERCED_OK, "alloc JIT fault");
+        ALLOC_EXPECT(executed, 1, "alloc stops at spill fault");
+    } else {
+        ALLOC_EXPECT(handoff_step(cpu, engine != 0), MERCED_OK, "alloc fault");
+    }
+    ALLOC_EXPECT(cpu->ip, 0x9000, "alloc spill fault vector");
+    ALLOC_EXPECT(cpu->cfm, 16 | (8 << 7), "fault preserves old CFM");
+    ALLOC_EXPECT(cpu->bof_total, 80, "fault preserves BOF");
+    ALLOC_EXPECT(stacked ? cpu->gr_stack[99] : cpu->gr_static[8],
+                 stacked ? 0xa063 : 0xbeef, "fault preserves PFS destination");
+    ALLOC_EXPECT(stacked ? cpu->nat_stack[99] : cpu->nat_static[8],
+                 1, "fault preserves destination NaT");
+    ALLOC_EXPECT(cpu->rse_flushed_regs, prefix ? 2 : 0, "completed spill prefix retained");
+    ALLOC_EXPECT(cpu->cr[19], 0x1000, "fault retries alloc");
+    ALLOC_EXPECT(cpu->cr[20], UINT64_C(0x4000000000006000), "missing spill address");
+    ALLOC_EXPECT((cpu->cr[17] >> 33) & 0x11, 0x11, "write/RSE fault");
+    for (unsigned i = 0; i < 3; i++)
+        ALLOC_EXPECT(handoff_step(cpu, engine != 0), MERCED_OK, "handler covers old frame");
+    ALLOC_EXPECT(cpu->cr[23], (UINT64_C(1) << 63) | 16 | (8 << 7), "IFS covers old frame");
+    ALLOC_EXPECT(cpu->bof_total, 96, "handler fits physical register file");
+    uint64_t saved_iip = cpu->cr[19], saved_ipsr = cpu->cr[16];
+    uint64_t saved_ifs = cpu->cr[23], saved_ifa = cpu->cr[20], saved_itir = cpu->cr[21];
+    /* NT first returns into a common kernel trap handler with an empty
+     * current frame. The user backing-store page is still unmapped here.
+     * An oversized dirty partition would immediately fault again at a000. */
+    cpu->cr[19] = 0xa000;
+    cpu->cr[16] = (UINT64_C(1) << 13) | (UINT64_C(1) << 27);
+    cpu->cr[23] = UINT64_C(1) << 63;
+    for (unsigned i = 0; i < 3; i++)
+        ALLOC_EXPECT(handoff_step(cpu, engine != 0), MERCED_OK, "enter common trap handler");
+    ALLOC_EXPECT(cpu->ip, 0xa000, "kernel continuation reached before mapping");
+    ALLOC_EXPECT(cpu->nfaults, 1, "no recursive spill in kernel trap entry");
+    cpu->cr[19] = saved_iip;
+    cpu->cr[16] = saved_ipsr;
+    cpu->cr[23] = saved_ifs;
+    cpu->cr[20] = saved_ifa;
+    cpu->cr[21] = saved_itir;
+    for (unsigned i = 0; i < 3; i++)
+        ALLOC_EXPECT(handoff_step(cpu, engine != 0), MERCED_OK, "handler maps and returns");
+    ALLOC_EXPECT(cpu->ip, 0x1000, "rfi resumes alloc");
+    ALLOC_EXPECT(cpu->nfaults, 1, "no recursive spill in handler");
+    ALLOC_EXPECT(handoff_step(cpu, engine != 0), MERCED_OK, "alloc retry");
+    ALLOC_EXPECT(cpu->cfm, 32 | (24 << 7), "retry commits requested frame");
+    ALLOC_EXPECT(cpu->rse_flushed_regs, 16, "retry makes required room");
+    ALLOC_EXPECT(merced_gr(cpu, dest), 0x1234, "retry saves ar.pfs");
+    ALLOC_EXPECT(stacked ? cpu->nat_stack[99] : cpu->nat_static[8], 0, "retry clears NaT");
+    for (unsigned i = 0; i < 16; i++) {
+        uint64_t addr = rse_test_move(cpu->rse_anchor_addr, i) & UINT64_C(0xffff);
+        ALLOC_EXPECT(rse_test_read(&fixture, addr, 8), 0xa000 + i, "spilled register value");
+    }
+    ALLOC_EXPECT(cpu->nfaults, 1, "retry completes without another fault");
+#undef ALLOC_EXPECT
+    merced_destroy(cpu);
 }
 
 /* An interruption handler may select a different backing store and resume at
@@ -5855,6 +6125,22 @@ static void check_ia32_x87_differential(bool fast) {
 #endif
 
 int main(void) {
+    for (unsigned engine = 0; engine < 3; engine++)
+        for (unsigned op = 0; op < 5; op++)
+            for (unsigned unconditional = 0; unconditional < 2; unconditional++)
+                for (unsigned qualified = 0; qualified < 2; qualified++)
+                    for (unsigned nonzero = 0; nonzero < 2; nonzero++)
+                        check_fp_predicate(engine, op, unconditional, qualified, nonzero);
+    for (unsigned engine = 0; engine < 3; engine++)
+        for (unsigned prefix = 0; prefix < 2; prefix++)
+            for (unsigned stacked = 0; stacked < 2; stacked++)
+                check_rse_alloc_fault(engine, prefix, stacked);
+    for (unsigned engine = 0; engine < 3; engine++)
+        for (unsigned fp = 0; fp < 2; fp++)
+            for (unsigned type = 0; type < 3; type++)
+                for (unsigned immediate = 0; immediate < 2; immediate++)
+                    for (unsigned debug = 0; debug < 2; debug++)
+                        check_spec_fault(engine, fp, type, immediate, debug);
 #if defined(__x86_64__) && defined(__linux__)
     for (unsigned fast = 0; fast < 2; fast++)
         check_ia32_x87_differential(fast);
@@ -6246,9 +6532,12 @@ int main(void) {
     puts("Merced IA32 XADD: widths, aliases, ADD flags, RMW fault retry and invalid LOCK forms passed");
     puts("Merced IA32 transfers: exact REP suffix counts, split elements and guarded fault retries passed");
     puts("Merced integer loads: precise fault restart and speculative deferral passed");
+    puts("Merced speculative faults: 72 alignment/debug cases, ISR.sp and ED recovery passed");
     puts("Merced tbit/tnat: unconditional predicate clearing and guarded branches passed");
+    puts("Merced fcmp/fclass: 120 predicate cases, guarded branches and unqualified fault suppression passed");
     puts("Merced fmix/fsxt: lanes, source order, sign extension, format, NaTVal and predication passed");
     puts("Merced RSE: interrupted contexts, common-IP resumes, automatic fills, RNAT and fault retry passed");
+    puts("Merced RSE alloc: 12 spill-fault cases preserve frames and destinations through kernel entry and retry");
     puts("Merced zero-fill: physical acceleration, discontiguous mappings and fault retry passed");
     puts("Merced mux1: all byte permutations, low-byte broadcast, NaT and predication passed");
     puts("Merced rotating predicates: IRQ save, cover, restore and rfi preserve pipeline stages");
