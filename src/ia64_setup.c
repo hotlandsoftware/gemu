@@ -75,6 +75,8 @@ static const GemuArgsDef def = {
         "  -m SIZE         RAM size in MiB, or with K/M/G suffix (default 512)\n"
         "  -net nic,model=i82559\n"
         "                  Attach the i2000 Intel 82559 NIC (baset alias)\n"
+        "  -soundhw CARD   i2000: cs4281 (onboard/default), ac97, or none\n"
+        "                  Each card requires its matching guest driver\n"
         "  -microprogram F Run an architectural microprogram on a bare core\n"
         "                  and print the resulting state (conformance testing;\n"
         "                  see tools/ia64_conformance.py)\n"
@@ -245,6 +247,8 @@ int ia64_setup(int argc, char *argv[]) {
      * a mouse attached; -nodefaults leaves it off.  (-device mouse is still
      * accepted for existing command lines.) */
     cfg.mouse_enabled = strcmp(alias, "i2000") == 0 && gemu_drive_defaults();
+    cfg.sound = strcmp(alias, "i2000") == 0 && gemu_drive_defaults()
+              ? PCI_AUDIO_CS4281 : PCI_AUDIO_NONE;
 
     RomScanCtx roms = {0};
     const char *firmware_file = NULL;
@@ -261,6 +265,20 @@ int ia64_setup(int argc, char *argv[]) {
             uint64_t sz = parse_size(rem[++i]);
             if (!sz) return 1;
             cfg.ram_size = sz;
+        } else if (strcmp(rem[i], "-soundhw") == 0) {
+            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -soundhw requires an argument\n"); return 1; }
+            const char *hw = rem[++i];
+            if (strcmp(hw, "none") == 0) cfg.sound = PCI_AUDIO_NONE;
+            else if (strcmp(hw, "cs4281") == 0) cfg.sound = PCI_AUDIO_CS4281;
+            else if (strcmp(hw, "ac97") == 0) cfg.sound = PCI_AUDIO_AC97;
+            else {
+                fprintf(stderr, "gemu: unknown -soundhw '%s' (i2000: cs4281, ac97, none; use -soundhw ?)\n", hw);
+                return 1;
+            }
+            if (strcmp(alias, "i2000") != 0 && cfg.sound != PCI_AUDIO_NONE) {
+                fprintf(stderr, "gemu: PCI sound cards are supported by i2000 only\n");
+                return 1;
+            }
         } else if (strcmp(rem[i], "-microprogram") == 0) {
             /* Architectural conformance harness - see src/ia64_selftest.c.
              * Runs bundles on a bare core and exits; no machine is created. */

@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<soundhw name="cs4281" description="Cirrus Logic CS4281 PCI" status="preliminary">
+    <machine name="i2000"/>
+</soundhw>

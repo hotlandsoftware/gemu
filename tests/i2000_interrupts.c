@@ -895,6 +895,60 @@ static void test_reset_snapshot(void) {
     CHECK(fclose(f) == 0);
 }
 
+/* The sound card's PCI decode, RAM DMA and firmware interrupt route must
+ * remain connected after restore. No SDL device is needed for this test. */
+static void test_audio(void) {
+    Ia64I2000State *s = machine();
+    io_port_write(s, PCI_CFG_ADDR, 0x80002000, 4);
+    CHECK(io_port_read(s, PCI_CFG_DATA, 4) == UINT32_MAX);
+    PciAudioWiring w = i2000_audio_wiring(s);
+    pci_audio_init(&s->audio, PCI_AUDIO_CS4281, &w);
+    io_port_write(s, PCI_CFG_ADDR, 0x80002000, 4);
+    CHECK(io_port_read(s, PCI_CFG_DATA, 4) == 0x60051013);
+    io_port_write(s, PCI_CFG_ADDR, 0x80002010, 4);
+    io_port_write(s, PCI_CFG_DATA, 0x90000000, 4);
+    io_port_write(s, PCI_CFG_ADDR, 0x80002004, 4);
+    io_port_write(s, PCI_CFG_DATA, 6, 2);
+    const uint64_t bar = 0x90000000;
+    CHECK(i2000_card_claims(s, bar));
+    bus_write(s, bar + 0x118, 0x100000, 4);
+    bus_write(s, bar + 0x11c, 7, 4);
+    bus_write(s, bar + 0x150, 0x20000018, 4); /* auto-init stereo PCM */
+    bus_write(s, bar + 0x154, 0x30000, 4);
+    bus_write(s, bar + 0x180, 0x81001f00, 4);
+    bus_write(s, bar + 0x0c, 0x7ffbfeff, 4);
+    bus_write(s, bar + 8, 3, 4);
+    route_gsi(s, 45, 0xa0 | I460GX_IOSAPIC_RTE_MASK);
+    s->cpu->time_base += (I2000_ITC_HZ * 4 + 47999) / 48000;
+    i2000_poll_interrupts(s);
+    CHECK(s->audio.dma_bytes == 16 && s->audio.irq_level && !irq(s, 0xa0));
+    CHECK(bus_read(s, bar + 0x114, 4) == 3);
+    CHECK(i2000_save_snapshot(s, "audio.vmstate"));
+    uint8_t bytes[4];
+    CHECK(!i2000_audio_read(s, s->ram_size - 2, bytes, sizeof bytes));
+    CHECK(!i2000_audio_write(s, UINT64_MAX, bytes, sizeof bytes));
+    i2000_reset(s, false);
+    CHECK(s->audio.model == PCI_AUDIO_CS4281 && !s->audio.irq_level);
+    CHECK(i2000_load_snapshot(s, "audio.vmstate"));
+    CHECK(s->audio.wiring.opaque == s && s->audio.irq_level);
+    route_gsi(s, 45, 0xa0);
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0xa0));
+    CHECK(bus_read(s, bar + 0xf0, 4) & 0x20000);
+    CHECK(!s->audio.irq_level);
+    /* Card identity is checked before RAM or device state is touched. */
+    pci_audio_init(&s->audio, PCI_AUDIO_AC97, &w);
+    bus_write(s, 0x100000, 0x12345678, 4);
+    CHECK(!i2000_load_snapshot(s, "audio.vmstate"));
+    CHECK(bus_read(s, 0x100000, 4) == 0x12345678);
+    io_port_write(s, PCI_CFG_ADDR, 0x80002010, 4);
+    io_port_write(s, PCI_CFG_DATA, 0x1001, 4);
+    io_port_write(s, PCI_CFG_ADDR, 0x80002004, 4);
+    io_port_write(s, PCI_CFG_DATA, 5, 2);
+    CHECK(io_port_read(s, 0x107c, 2) == 0x4352);
+    ia64_i2000_destroy(s);
+}
+
 int main(void) {
     test_identify(); test_control(); test_packet_phases(); test_legacy(); test_os_mask();
     test_snapshots();
@@ -906,6 +960,7 @@ int main(void) {
     test_rtc();
     test_cf9_reset();
     test_reset_snapshot();
+    test_audio();
     test_ata();   /* last: registers a global -hda drive */
     printf("i2000 ATAPI interrupt regressions: %u checks passed\n", checks);
     return 0;

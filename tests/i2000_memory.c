@@ -1528,6 +1528,55 @@ static uint64_t rse_test_move(uint64_t addr, int slots) {
     return addr;
 }
 
+/* Read BSPSTORE through guest instructions and compare the address
+ * calculation with the original slot walker. Cover every byte offset,
+ * collection-word anchors, both directions, and address-space wraparound. */
+static void check_rse_addressing(bool fast) {
+    RseFixture fixture = {0};
+    const uint64_t nop = UINT64_C(0x08000000);
+    uint64_t read_store = (UINT64_C(1) << 37) | (UINT64_C(0x22) << 27) |
+                          (18 << 20) | (8 << 6);
+    rse_test_bundle(&fixture, 0x1000, 1, read_store, nop, nop);
+    MercedBus bus = {.ud = &fixture, .read = rse_test_read,
+                     .fetch = rse_test_read, .write = rse_test_write};
+    Merced *cpu = merced_create(&bus);
+    if (!cpu) { failures++; return; }
+    cpu->psr = UINT64_C(1) << 13;
+    cpu->cr[72] = UINT64_C(1) << 16;
+    cpu->ar[16] = 0;
+    cpu->rse_anchor_regs = 0;
+    const uint64_t bases[] = {0, 0x2400, UINT64_MAX - 511};
+    unsigned checked = 0;
+    for (unsigned b = 0; b < sizeof(bases) / sizeof(bases[0]); b++) {
+        for (unsigned offset = 0; offset < 512; offset++) {
+            uint64_t anchor = bases[b] + offset;
+            for (int sample = -132; sample <= 132; sample++) {
+                int delta = sample < -130 ? (sample + 130) * 4096
+                          : sample > 130 ? (sample - 130) * 4096 : sample;
+                cpu->ip = 0x1000;
+                cpu->group_start = 1;
+                cpu->rse_anchor_addr = anchor;
+                cpu->rse_flushed_regs = delta;
+                uint64_t expected = rse_test_move(anchor, delta);
+                MercedStatus st = handoff_step(cpu, fast);
+                if (st != MERCED_OK || cpu->nfaults || cpu->gr_static[8] != expected) {
+                    fprintf(stderr, "RSE address %s anchor=%016" PRIx64
+                            " delta=%d: got=%016" PRIx64 " expected=%016" PRIx64 "\n",
+                            fast ? "fast" : "slow", anchor, delta,
+                            cpu->gr_static[8], expected);
+                    failures++;
+                    merced_destroy(cpu);
+                    return;
+                }
+                checked++;
+            }
+        }
+    }
+    printf("Merced RSE address %s: %u slot-walker comparisons passed\n",
+           fast ? "fast" : "slow", checked);
+    merced_destroy(cpu);
+}
+
 static void rse_test_expect(uint64_t actual, uint64_t expected,
                             const char *what, bool fast, unsigned dirty,
                             bool rewind, bool big_endian, bool fault) {
@@ -6125,6 +6174,7 @@ int main(void) {
                         check_mux1(mode, sample, nat, qualified, fast);
         for (unsigned scenario = 0; scenario < 3; scenario++)
             check_zero_fill(fast, scenario);
+        check_rse_addressing(fast);
         check_rse_interrupted_context(fast, false, false);
         check_rse_interrupted_context(fast, false, true);
         check_rse_interrupted_context(fast, true, true);

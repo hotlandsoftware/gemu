@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--no-build", action="store_true")
     args = parser.parse_args()
     if not args.no_build:
-        subprocess.run(["ninja", "bin/gemu"], cwd=ROOT, check=True)
+        subprocess.run(["ninja", "-j2", "bin/gemu"], cwd=ROOT, check=True)
     link = command_for("bin/gemu")
     machine = next((arg for arg in link if arg.endswith("/machine_i2000.o")), None)
     if machine is None:

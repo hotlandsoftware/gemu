@@ -5,6 +5,7 @@ Run ./configure with IA-64 enabled first.  No ROM or ISO is needed.
 """
 
 from pathlib import Path
+import argparse
 import shlex
 import subprocess
 import tempfile
@@ -21,7 +22,11 @@ def command_for(target):
 
 
 def main():
-    subprocess.run(["ninja", "bin/gemu"], cwd=ROOT, check=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--no-build", action="store_true")
+    args = parser.parse_args()
+    if not args.no_build:
+        subprocess.run(["ninja", "-j2", "bin/gemu"], cwd=ROOT, check=True)
     link = command_for("bin/gemu")
     if not any(arg.endswith("/machine_i2000.o") for arg in link):
         raise SystemExit("Configure GEMU with IA-64 enabled before running this test.")

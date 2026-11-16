@@ -142,28 +142,54 @@ static uint64_t gen_alu(void) {
     }
 }
 
-/* I-unit-only instruction (direct-call path, plus zxt/sxt native) */
+/* I-unit-only instructions, including native bit fields and transfers. */
 static uint64_t gen_i(void) {
     unsigned qp = rqp();
-    switch (rn(7)) {
+    switch (rn(11)) {
     case 0: {                                   /* zxt/sxt */
         static const uint8_t x6[] = { 0x10, 0x11, 0x12, 0x14, 0x15, 0x16 };
         return F(x6[rn(6)],27,6) | F(rsrc(),20,7) | F(rdst(),6,7) | F(qp,0,6);
     }
-    case 1:                                     /* tbit (normal / unc) */
+    case 1:                                     /* tbit/tnat (normal / unc) */
         return F(5,37,4) | F(rpr(),27,6) | F(rsrc(),20,7) | F(rn(64),14,6) |
-               F(rn(2),12,1) | F(rpr(),6,6) | F(qp,0,6);
+               F(rn(2),13,1) | F(rn(2),12,1) | F(rpr(),6,6) | F(qp,0,6);
     case 2:                                     /* extr / extr.u */
         return F(5,37,4) | F(1,34,2) | F(rn(64),27,6) | F(rsrc(),20,7) |
                F(rn(64),14,6) | F(rn(2),13,1) | F(rdst(),6,7) | F(qp,0,6);
-    case 3:                                     /* dep.z */
-        return F(5,37,4) | F(1,34,2) | F(1,33,1) | F(rn(64),27,6) |
-               F(rn(64),20,6) | F(rsrc(),13,7) | F(rdst(),6,7) | F(qp,0,6);
+    case 3:                                     /* dep.z reg / imm8 */
+        return F(5,37,4) | F(rn(2),36,1) | F(1,34,2) | F(1,33,1) |
+               F(rn(64),27,6) | F(rn(2),26,1) | F(rn(64),20,6) |
+               F(rsrc(),13,7) | F(rdst(),6,7) | F(qp,0,6);
     case 4:                                     /* shrp */
         return F(5,37,4) | F(3,34,2) | F(rn(64),27,6) | F(rsrc(),20,7) |
                F(rsrc(),13,7) | F(rdst(),6,7) | F(qp,0,6);
     case 5:                                     /* mov r1 = pr */
         return F(0x33,27,6) | F(rdst(),6,7) | F(qp,0,6);
+    case 6:                                     /* dep r / imm1 */
+        if (rn(2)) {
+            unsigned cpos = rn(64);
+            return F(4,37,4) | F(cpos >> 5,36,1) | F(cpos >> 3,34,2) |
+                   F(cpos >> 2,33,1) | F(cpos,31,2) | F(rn(16),27,4) |
+                   F(rsrc(),20,7) | F(rsrc(),13,7) | F(rdst(),6,7) | F(qp,0,6);
+        }
+        return F(5,37,4) | F(rn(2),36,1) | F(3,34,2) | F(1,33,1) |
+               F(rn(64),27,6) | F(rsrc(),20,7) | F(rn(64),14,6) |
+               F(rdst(),6,7) | F(qp,0,6);
+    case 7:                                     /* mov r = ip / b */
+        return F(rn(2) ? 0x30 : 0x31,27,6) | F(rn(8),13,3) |
+               F(rdst(),6,7) | F(qp,0,6);
+    case 8:                                     /* mov b = r */
+        return F(7,33,3) | F(rsrc(),13,7) | F(rn(8),6,3) | F(qp,0,6);
+    case 9: {                                   /* PFS, LC, EC transfers */
+        unsigned ar = rn(16) ? 64 + rn(3) : rn(128);
+        unsigned kind = rn(3), imm = rn(256);
+        /* Loop bodies must terminate; full-width LC writes are exercised
+         * separately in the single-instruction cases below. */
+        if (ar == 65 && kind != 0) { kind = 2; imm &= 3; }
+        return F(kind == 0 ? 0x32 : kind == 1 ? 0x2A : 0x0A,27,6) |
+               F(kind == 2 ? imm >> 7 : 0,36,1) | F(ar,20,7) |
+               F(kind == 2 ? imm : rsrc(),13,7) | F(rdst(),6,7) | F(qp,0,6);
+    }
     default:
         return gen_alu();
     }
@@ -173,7 +199,7 @@ static uint64_t gen_i(void) {
 static uint64_t gen_m(void) {
     unsigned qp = rqp();
     unsigned base = 2 + rn(2);
-    switch (rn(10)) {
+    switch (rn(11)) {
     case 0: case 1:                             /* ld1-8 (+ reg postinc) */
         return F(4,37,4) | F(rn(4) ? 0 : 1,36,1) | F(rn(4),30,6) |
                F(base,20,7) | F(rsrc(),13,7) | F(rdst(),6,7) | F(qp,0,6);
@@ -197,8 +223,21 @@ static uint64_t gen_m(void) {
     case 7:                                     /* getf.sig r1 = f2 */
         return F(4,37,4) | F(1,27,1) | F(0x1C,30,6) | F(rn(128),13,7) |
                F(rdst(),6,7) | F(qp,0,6);
+    case 10: {                                  /* synchronous barriers */
+        static const uint8_t x6[] = { 0x20, 0x22, 0x23, 0x33 };
+        return F(x6[rn(4)],27,6) | F(qp,0,6);
+    }
+    case 8: {                                   /* CCV, UNAT, FPSR transfers */
+        static const unsigned ars[] = {32, 36, 40};
+        unsigned ar = rn(16) ? ars[rn(3)] : rn(128);
+        unsigned kind = rn(3), imm = rn(256);
+        return F(kind == 2 ? 0 : 1,37,4) |
+               F(kind == 0 ? 0x22 : kind == 1 ? 0x2A : 0x28,27,6) |
+               F(kind == 2 ? imm >> 7 : 0,36,1) | F(ar,20,7) |
+               F(kind == 2 ? imm : rsrc(),13,7) | F(rdst(),6,7) | F(qp,0,6);
+    }
     case 5:
-        if (rn(4) == 0)                         /* mov.m ar.ccv = r (helper) */
+        if (rn(4) == 0)                         /* mov.m ar.ccv = r */
             return F(1,37,4) | F(0x2A,27,6) | F(32,20,7) | F(rsrc(),13,7) |
                    F(qp,0,6);
         return gen_alu();
@@ -281,6 +320,10 @@ static void init_state(Merced *m, uint64_t seed) {
     /* memory base pointers (r2, r3 in both banks): valid, no NaT */
     m->gr_static[2] = DATA_BASE + DATA_SIZE / 4 + rn(DATA_SIZE / 2);
     m->gr_static[3] = DATA_BASE + DATA_SIZE / 4 + rn(DATA_SIZE / 2);
+    if (seed & 1) {                   /* exercise the inline memory path */
+        m->gr_static[2] &= ~UINT64_C(7);
+        m->gr_static[3] &= ~UINT64_C(7);
+    }
     m->nat_static[2] = m->nat_static[3] = 0;
     m->pr = rnd() | 1;
     unsigned sor = rn(13);                             /* sor*8 <= 96 */
@@ -309,6 +352,10 @@ static void init_state(Merced *m, uint64_t seed) {
     m->psr = (UINT64_C(1) << 13) | (rn(2) ? UINT64_C(1) << 44 : 0);
     if (rn(4) == 0) m->psr |= UINT64_C(1) << 18;      /* dfl */
     if (rn(4) == 0) m->psr |= UINT64_C(1) << 19;      /* dfh */
+    m->ar[32] = rnd();                                 /* ar.ccv */
+    m->ar[36] = rnd();                                 /* ar.unat */
+    m->ar[40] = rnd();                                 /* ar.fpsr */
+    m->ar[64] = rnd();                                 /* ar.pfs */
     m->ar[65] = rn(4);                                 /* ar.lc */
     m->ar[66] = rn(4);                                 /* ar.ec */
     m->ar[44] = rnd() >> 8;                            /* ar.itc */
@@ -345,13 +392,21 @@ static void normalize(Merced *m) {
 
 static uint64_t total_slots, total_faulted, total_blocks_end;
 
-static int run_one(uint64_t seed, bool verbose) {
+static int run_one(uint64_t seed, bool verbose, uint64_t instruction, bool m_unit) {
     Mem mem[2];
     Merced *cpu[2];
     MercedStatus st[2];
     uint64_t slots[2];
     for (int e = 0; e < 2; e++) {
         mem[e].ram = fresh_ram(seed);
+        if (instruction) {
+            /* One unpredicated static-register operation: every edge case
+             * executes, with randomized input values and NaT state. */
+            put_bundle(mem[e].ram + CODE_BASE, 0x01,
+                       m_unit ? instruction : NOP_MI,
+                       m_unit ? NOP_MI : instruction, NOP_MI);
+            put_deadloop(mem[e].ram + CODE_BASE + 16);
+        }
         MercedBus bus = { .ud = &mem[e], .ram_size = RAM_SIZE,
                           .read = mem_read, .write = mem_write };
         cpu[e] = merced_create(&bus);
@@ -366,8 +421,10 @@ static int run_one(uint64_t seed, bool verbose) {
         slots[e] = 0;
         do {
             unsigned n = 0;
-            st[e] = merced_run_fast(cpu[e], 64 + (unsigned)(seed % 200), &n,
-                                    0, 0);
+            unsigned budget = !instruction && seed % 4 == 0
+                            ? 1 + (unsigned)(seed % 24)
+                            : 64 + (unsigned)(seed % 200);
+            st[e] = merced_run_fast(cpu[e], budget, &n, 0, 0);
             slots[e] += n;
         } while (st[e] == MERCED_OK && slots[e] < 200000);
     }
@@ -445,7 +502,7 @@ int main(int argc, char **argv) {
     uint64_t first = argc > 2 ? strtoull(argv[2], NULL, 0) : 1;
     unsigned failures = 0;
     for (unsigned i = 0; i < n; i++) {
-        failures += (unsigned)run_one(first + i, false);
+        failures += (unsigned)run_one(first + i, false, 0, false);
         if (failures >= 10) break;
     }
     if (failures) {
@@ -456,5 +513,37 @@ int main(int argc, char **argv) {
            "interpreter (%" PRIu64 " slots; %" PRIu64 " ran to the end, %"
            PRIu64 " took a fault)\n", n, total_slots, total_blocks_end,
            total_faulted);
+    /* All extract positions and widths, including fields extending beyond
+     * bit 63 and the 64-bit no-shift case. Signed extraction must extend
+     * the last bit actually present in the source. */
+    unsigned edge_cases = 0;
+    for (unsigned pos = 0; pos < 64; pos++) {
+        for (unsigned len = 0; len < 64; len++) {
+            for (unsigned sign = 0; sign < 2; sign++) {
+                uint64_t raw = F(5,37,4) | F(1,34,2) | F(len,27,6) |
+                               F(9,20,7) | F(pos,14,6) | F(sign,13,1) | F(8,6,7);
+                if (run_one(first + edge_cases++, false, raw, false)) return 1;
+            }
+        }
+    }
+    printf("merced_jit: %u extract edge cases identical\n", edge_cases);
+    /* Every immediate value and every source/destination GR, including
+     * r0, rotated stacked registers, NaT sources and out-of-frame writes. */
+    static const unsigned ars[] = {32, 36, 40, 64, 65, 66};
+    unsigned ar_cases = 0;
+    for (unsigned a = 0; a < sizeof ars / sizeof ars[0]; a++) {
+        bool m_unit = ars[a] < 64;
+        for (unsigned kind = 0; kind < 3; kind++) {
+            for (unsigned v = 0; v < (kind == 2 ? 256u : 128u); v++) {
+                unsigned x6 = kind == 0 ? (m_unit ? 0x22 : 0x32)
+                            : kind == 1 ? 0x2A : (m_unit ? 0x28 : 0x0A);
+                uint64_t raw = F(m_unit && kind != 2,37,4) | F(x6,27,6) |
+                               F(ars[a],20,7) | F(kind == 2 ? v >> 7 : 0,36,1) |
+                               F(kind == 0 ? 0 : v,13,7) | F(kind == 0 ? v : 0,6,7);
+                if (run_one(first + ar_cases++, false, raw, m_unit)) return 1;
+            }
+        }
+    }
+    printf("merced_jit: %u application-register cases identical\n", ar_cases);
     return 0;
 }

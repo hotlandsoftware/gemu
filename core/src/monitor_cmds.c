@@ -91,6 +91,8 @@ static const MonCmdDef mon_cmds[] = {
     /* name          aliases         params                        help */
     { "atapistate",  NULL,           "",
       "show ATAPI controller state", "i2000", NULL, 0 },
+    { "audio",       NULL,           "",
+      "show PCI audio, DMA and host output state", "i2000", NULL, 0 },
     { "autoreload",  NULL,           "[on | off]",
       "reload the cartridge (and symbols) whenever the file changes", M_A2600, NULL, 0 },
     { "break",       "b",            "<addr>",

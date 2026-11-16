@@ -3645,23 +3645,26 @@ static void tlb_serialize_instruction(Merced *m) {
 /* A NaT collection word occupies backing-store slot 63 of every 64-slot
  * (512-byte) group.  BSPSTORE may point anywhere in a group -- notably,
  * Windows' context switch path restores arbitrary saved BSPSTORE values --
- * so a group-count formula relative to an assumed aligned anchor is not
- * sufficient.  Walk in either direction and skip the actual RNAT slots.
- * The architectural file is only 96 registers, making this inexpensive. */
+ * so the count must include the anchor's position within its 512-byte
+ * group. The anchor can be many frames away: walking from it for every
+ * register spilled or filled made context switches unnecessarily costly. */
 static bool rse_is_rnat_slot(uint64_t addr) {
     return (addr & 0x1F8ull) == 0x1F8ull;
 }
 
 static uint64_t rse_move_regs(uint64_t addr, int64_t regs) {
-    while (regs > 0) {
-        addr += 8;
-        if (rse_is_rnat_slot(addr)) addr += 8;
-        regs--;
+    uint64_t slot = (addr >> 3) & 63;
+    if (regs > 0) {
+        uint64_t n = (uint64_t)regs;
+        /* 63 data slots per group. An anchor on the collection word
+         * itself takes its first step to slot zero of the next group. */
+        uint64_t collections = (slot == 63 ? n - 1 : n + slot) / 63;
+        return addr + (n + collections) * 8;
     }
-    while (regs < 0) {
-        addr -= 8;
-        if (rse_is_rnat_slot(addr)) addr -= 8;
-        regs++;
+    if (regs < 0) {
+        uint64_t n = UINT64_C(0) - (uint64_t)regs;
+        uint64_t collections = (n + 62 - slot) / 63;
+        return addr - (n + collections) * 8;
     }
     return addr;
 }

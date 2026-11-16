@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<soundhw name="ac97" description="Intel 82801AA-compatible AC'97 PCI" status="preliminary">
+    <machine name="i2000"/>
+</soundhw>

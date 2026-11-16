@@ -100,6 +100,7 @@ void jit_op(JitBackend *b, JitOp op, JitReg d, JitReg a, JitReg c);
 void jit_opi(JitBackend *b, JitOp op, JitReg d, JitReg a, int64_t imm);
 void jit_shli(JitBackend *b, JitReg d, JitReg a, unsigned n);
 void jit_shri(JitBackend *b, JitReg d, JitReg a, unsigned n);
+void jit_sari(JitBackend *b, JitReg d, JitReg a, unsigned n);
 void jit_muli(JitBackend *b, JitReg d, JitReg a, int32_t imm);
 void jit_not(JitBackend *b, JitReg d, JitReg a);
 void jit_neg(JitBackend *b, JitReg d, JitReg a);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gemu/display.h"
+#include "audio/pci_audio.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -52,6 +53,7 @@ typedef struct {
     bool            mouse_enabled; /* -device mouse (i2000 only) */
     bool            i82559_enabled; /* -net nic,model=i82559/baset */
     bool            jit;            /* -accel jit (default) vs interpreter */
+    PciAudioModel   sound;          /* -soundhw: onboard CS4281 or alternate */
     /* Option ROMs found by -rom DIR (SHA-256 matched), or NULL. */
     const char     *video_rom;      /* Rage 128 video BIOS */
     const char     *nic_rom;        /* 82559 EFI UNDI driver */

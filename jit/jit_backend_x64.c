@@ -7,7 +7,7 @@
  *   S0 R13  S1 R14                                 (callee-saved)
  *   R11 is the backend's own scratch register.
  *
- * Frame: the prologue pushes RBX, R12, R13 and R14 and reserves 40 bytes,
+ * Frame: the prologue pushes RBX, R13 and R14 and reserves 32 bytes,
  * which keeps RSP 16-byte aligned at calls and provides the Win64 shadow
  * space.  Every jit_ret()/jit_reti() jumps to a shared epilogue.
  */
@@ -177,10 +177,9 @@ void jit_begin(JitBackend *b) {
     while (x64_pos(x) & 15) x64_b(x, 0x90);
     b->entry = x->p;
     x64_push(x, X64_RBX);
-    x64_push(x, X64_R12);
     x64_push(x, X64_R13);
     x64_push(x, X64_R14);
-    x64_alu_ri(x, X64_SUB, X64_RSP, 40);
+    x64_alu_ri(x, X64_SUB, X64_RSP, 32);
     x64_mov_rr(x, ENV, X64_ARG0);
     b->epilogue = jit_label(b);
 }
@@ -188,10 +187,9 @@ void jit_begin(JitBackend *b) {
 JitFn jit_end(JitBackend *b) {
     X64Buf *x = &b->buf;
     jit_bind(b, b->epilogue);
-    x64_alu_ri(x, X64_ADD, X64_RSP, 40);
+    x64_alu_ri(x, X64_ADD, X64_RSP, 32);
     x64_pop(x, X64_R14);
     x64_pop(x, X64_R13);
-    x64_pop(x, X64_R12);
     x64_pop(x, X64_RBX);
     x64_ret(x);
     if (x->overflow || b->oom)
@@ -281,6 +279,11 @@ void jit_shli(JitBackend *b, JitReg d, JitReg a, unsigned n) {
 void jit_shri(JitBackend *b, JitReg d, JitReg a, unsigned n) {
     jit_mov(b, d, a);
     if (n) x64_shr_ri(&b->buf, R(d), (uint8_t)n);
+}
+
+void jit_sari(JitBackend *b, JitReg d, JitReg a, unsigned n) {
+    jit_mov(b, d, a);
+    if (n) x64_sar_ri(&b->buf, R(d), (uint8_t)n);
 }
 
 void jit_muli(JitBackend *b, JitReg d, JitReg a, int32_t imm) {
@@ -434,6 +437,7 @@ void jit_opi(JitBackend *b, JitOp o, JitReg d, JitReg a, int64_t i)
     { (void)o; (void)d; (void)a; (void)i; NOHOST() }
 void jit_shli(JitBackend *b, JitReg d, JitReg a, unsigned n) { (void)d; (void)a; (void)n; NOHOST() }
 void jit_shri(JitBackend *b, JitReg d, JitReg a, unsigned n) { (void)d; (void)a; (void)n; NOHOST() }
+void jit_sari(JitBackend *b, JitReg d, JitReg a, unsigned n) { (void)d; (void)a; (void)n; NOHOST() }
 void jit_muli(JitBackend *b, JitReg d, JitReg a, int32_t i) { (void)d; (void)a; (void)i; NOHOST() }
 void jit_not(JitBackend *b, JitReg d, JitReg a) { (void)d; (void)a; NOHOST() }
 void jit_neg(JitBackend *b, JitReg d, JitReg a) { (void)d; (void)a; NOHOST() }

@@ -17,6 +17,7 @@
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
 #include "gemu/util.h"
+#include "gemu/audio_out.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -203,6 +204,7 @@ _Static_assert(sizeof(i2000_keyboard_keysyms) / sizeof(i2000_keyboard_keysyms[0]
 
 #define RAGE128_PCI_DEV       2u
 #define NIC_PCI_DEV             5u
+#define AUDIO_PCI_DEV           4u
 
 typedef struct {
     uint64_t addr;
@@ -324,6 +326,8 @@ struct Ia64I2000State {
     E100      nic;
     uint8_t  *nic_rom;
     uint32_t  nic_rom_len;
+    PciAudio  audio;
+    GemuAudioOut *audio_out;
 
     MmioLogEnt mmio_log[MMIO_LOG_N];
     int        mmio_log_n;
@@ -1284,6 +1288,8 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
+    if (s->audio.model && bus == 0 && dev == AUDIO_PCI_DEV && fun == 0)
+        return pci_audio_cfg_read(&s->audio, reg, size);
     if (s->video_enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
         fun == 0 && reg + size <= sizeof(s->rage128.cfg))
         return rage128_cfg_read(&s->rage128, reg, size);
@@ -1325,6 +1331,10 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
+    if (s->audio.model && bus == 0 && dev == AUDIO_PCI_DEV && fun == 0) {
+        pci_audio_cfg_write(&s->audio, reg, size, val);
+        return;
+    }
     if (s->video_enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
         fun == 0 && reg + size <= sizeof(s->rage128.cfg)) {
         rage128_cfg_write(&s->rage128, reg, size, (uint32_t)val);
@@ -1527,6 +1537,7 @@ static uint8_t i2000_pic_slave_irr(const Ia64I2000State *s) {
 
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     uint64_t value;
+    if (port <= 0xffff && pci_audio_io_access(&s->audio, false, port, size, &value)) return value;
     if (i460gx_ifb_io_read(&s->chipset, 0, port, size, &value) ||
         i460gx_ifb_io_read(&s->chipset, 2, port, size, &value))
         return value;
@@ -1797,6 +1808,7 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
+    if (port <= 0xffff && pci_audio_io_access(&s->audio, true, port, size, &val)) return;
     if (i460gx_ifb_io_write(&s->chipset, 0, port, val, size) ||
         i460gx_ifb_io_write(&s->chipset, 2, port, val, size))
         return;
@@ -2290,6 +2302,7 @@ static bool i2000_card_claims(const Ia64I2000State *s, uint64_t addr) {
         return rage128_mem_ranges(&s->rage128, &a, &a_size, &b, &b_size);
     if (addr < s->ram_size || addr >= I460GX_IOSAPIC_BASE)
         return false;
+    if (pci_audio_mem_claims(&s->audio, addr)) return true;
     if (s->video_enabled) {
         if (rage128_mem_ranges(&s->rage128, &a, &a_size, &b, &b_size) &&
             (addr - a < a_size || addr - b < b_size))
@@ -2386,7 +2399,8 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         if ((s->video_enabled &&
              rage128_mem_access(&s->rage128, false, addr, size, &v)) ||
             (s->nic_enabled &&
-             e100_mem_access(&s->nic, false, addr, size, &v)))
+             e100_mem_access(&s->nic, false, addr, size, &v)) ||
+            pci_audio_mem_access(&s->audio, false, addr, size, &v))
             return v;
     }
     if (region6 && addr + size <= I2000_FLASH_BASE) {
@@ -2580,7 +2594,8 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
         ((s->video_enabled &&
           rage128_mem_access(&s->rage128, true, addr, size, &val)) ||
          (s->nic_enabled &&
-          e100_mem_access(&s->nic, true, addr, size, &val))))
+          e100_mem_access(&s->nic, true, addr, size, &val)) ||
+         pci_audio_mem_access(&s->audio, true, addr, size, &val)))
         return;
     if (region6 && addr + size <= I2000_FLASH_BASE) {
         uint32_t saved = s->pci_cfg_addr;
@@ -2793,6 +2808,32 @@ static E100Wiring i2000_nic_wiring(Ia64I2000State *s) {
                          .irq = i2000_nic_irq,
                          .dma_read = i2000_nic_dma_read,
                          .dma_write = i2000_nic_dma_write, .opaque = s };
+}
+
+/* PCI0._PRT's workstation branch routes 00:04 INTA# to GSI 45.
+ * The CS4281 is a separate PCI function, not an IFB audio function. */
+static void i2000_audio_irq(void *opaque, bool level) {
+    if (level) iosapic_raise_gsi(opaque, 45);
+}
+static bool i2000_audio_read(void *opaque, uint64_t addr, void *buf, unsigned len) {
+    Ia64I2000State *s = opaque;
+    return addr <= s->ram_size && len <= s->ram_size - addr &&
+           i2000_nic_dma_read(s, addr, buf, len);
+}
+static bool i2000_audio_write(void *opaque, uint64_t addr, const void *buf, unsigned len) {
+    Ia64I2000State *s = opaque;
+    return addr <= s->ram_size && len <= s->ram_size - addr &&
+           i2000_nic_dma_write(s, addr, buf, len);
+}
+static void i2000_audio_output(void *opaque, const float *samples, size_t frames) {
+    Ia64I2000State *s = opaque;
+    gemu_audio_queue(s->audio_out, samples, frames * 2);
+}
+static PciAudioWiring i2000_audio_wiring(Ia64I2000State *s) {
+    return (PciAudioWiring){.opaque = s, .clock = i2000_rage_clock,
+        .clock_hz = I2000_ITC_HZ, .read = i2000_audio_read,
+        .write = i2000_audio_write, .irq = i2000_audio_irq,
+        .output = i2000_audio_output};
 }
 
 static Rage128Wiring i2000_rage_wiring(Ia64I2000State *s) {
@@ -3162,7 +3203,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 39u   /* 39: drive state (disk identity, -snapshot writes) */
+#define I2000_SNAPSHOT_VERSION 40u   /* PCI audio state and card identity in header */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -3173,6 +3214,8 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fwrite(&magic, sizeof(magic), 1, f) == 1;
     ok &= fwrite(&version, sizeof(version), 1, f) == 1;
     ok &= fwrite(&s->ram_size, sizeof(s->ram_size), 1, f) == 1;
+    uint32_t audio_model = s->audio.model;
+    ok &= fwrite(&audio_model, sizeof(audio_model), 1, f) == 1;
     ok &= fwrite(s->ram, 1, s->ram_size, f) == s->ram_size;
     ok &= fwrite(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
     if (s->video_enabled)
@@ -3201,6 +3244,8 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     snap->hda = NULL;
     snap->ata_data = NULL;
     snap->nic_rom = NULL;
+    snap->audio_out = NULL;
+    memset(&snap->audio.wiring, 0, sizeof(snap->audio.wiring));
     memset(&snap->nic.wiring, 0, sizeof(snap->nic.wiring));
     memset(&snap->chipset.config, 0, sizeof(snap->chipset.config));
     memset(&snap->rtc.config, 0, sizeof(snap->rtc.config));
@@ -3233,10 +3278,15 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fread(&magic, sizeof(magic), 1, f) == 1;
     ok &= fread(&version, sizeof(version), 1, f) == 1;
     ok &= fread(&ram_size, sizeof(ram_size), 1, f) == 1;
-    /* Version 38 is the same layout without the trailing drive state. */
     if (!ok || magic != I2000_SNAPSHOT_MAGIC ||
-        (version != I2000_SNAPSHOT_VERSION && version != 38) || ram_size != s->ram_size) {
+        version != I2000_SNAPSHOT_VERSION || ram_size != s->ram_size) {
         fclose(f);
+        return false;
+    }
+    uint32_t audio_model = 0;
+    if (fread(&audio_model, sizeof(audio_model), 1, f) != 1 || audio_model != s->audio.model) {
+        fclose(f);
+        fprintf(stderr, "gemu: snapshot sound card differs from -soundhw selection\n");
         return false;
     }
     ok &= fread(s->ram, 1, s->ram_size, f) == s->ram_size;
@@ -3263,6 +3313,8 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
 
     GemuMonitor *monitor = s->monitor;
     GemuDisplay *display = s->display;
+    GemuAudioOut *audio_out = s->audio_out;
+    bool audio_debug = s->audio.debug;
     /* Drives and host device connections belong to this run, not the save. */
     GemuDrive *cdrom = s->cdrom;
     GemuDrive *hda = s->hda;
@@ -3289,6 +3341,10 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         *s = *loaded;
         s->monitor = monitor;
         s->display = display;
+        s->audio_out = audio_out;
+        s->audio.wiring = i2000_audio_wiring(s);
+        s->audio.debug = audio_debug;
+        gemu_audio_flush(audio_out);
         s->cpu = cpu;
         s->ram = ram;
         s->flash = flash;
@@ -3918,6 +3974,35 @@ static GemuMonCmd i2000_cmd_ntsym(GemuMonitor *mon, const char *args, void *ud) 
     return GEMU_MON_NONE;
 }
 
+static GemuMonCmd i2000_cmd_audio(GemuMonitor *mon, const char *args, void *ud) {
+    Ia64I2000State *s = ud;
+    PciAudio *a = &s->audio;
+    (void)args;
+    gemu_monitor_printf(mon, "audio: %s command=%04x BAR0=%08x BAR1=%08x irq=%u\n",
+        pci_audio_name(a->model), pci_audio_cfg_read(a, 4, 2),
+        pci_audio_cfg_read(a, 0x10, 4), pci_audio_cfg_read(a, 0x14, 4), a->irq_level);
+    gemu_monitor_printf(mon, "  frames=%" PRIu64 " nonzero=%" PRIu64
+        " dma_bytes=%" PRIu64 " interrupts=%" PRIu64
+        " master=%04x pcm=%04x host=%s queued=%u underruns=%u\n",
+        a->frames, a->nonzero_frames, a->dma_bytes, a->interrupts,
+        a->codec[1], a->codec[0x18 / 2], s->audio_out ? "open" : "closed",
+        gemu_audio_queued(s->audio_out), gemu_audio_underruns(s->audio_out));
+    if (a->model == PCI_AUDIO_CS4281) {
+        for (unsigned c = 0; c < 4; c++)
+            gemu_monitor_printf(mon, "  dma%u mode=%08x control=%08x address=%08x count=%08x fifo=%08x\n",
+                c, a->u.cs.reg[(0x150 + c * 8) / 4], a->u.cs.reg[(0x154 + c * 8) / 4],
+                a->u.cs.reg[(0x110 + c * 16) / 4], a->u.cs.reg[(0x114 + c * 16) / 4],
+                a->u.cs.reg[(0x180 + c * 4) / 4]);
+    } else if (a->model == PCI_AUDIO_AC97) {
+        for (unsigned c = 0; c < 3; c++) {
+            IchAudioDma *d = &a->u.ich.dma[c];
+            gemu_monitor_printf(mon, "  dma%u bdl=%08x civ=%u lvi=%u remaining=%u status=%04x control=%02x\n",
+                c, d->bdbar, d->civ, d->lvi, d->remaining, d->status, d->command);
+        }
+    }
+    return GEMU_MON_NONE;
+}
+
 static GemuMonCmd i2000_cmd_iosapic(GemuMonitor *mon, const char *args, void *ud) {
     Ia64I2000State *s = ud;
     (void)args;
@@ -4025,6 +4110,7 @@ static void i2000_monitor_setup(Ia64I2000State *s) {
     gemu_monitor_bind(mon, "atapistate", i2000_cmd_atapistate, s);
     gemu_monitor_bind(mon, "vgareg",     i2000_cmd_vgareg, s);
     gemu_monitor_bind(mon, "iosapic",    i2000_cmd_iosapic, s);
+    gemu_monitor_bind(mon, "audio",      i2000_cmd_audio, s);
     gemu_monitor_bind(mon, "system_powerdown", i2000_cmd_powerdown, s);
     gemu_monitor_bind(mon, "ntsym",      i2000_cmd_ntsym, s);
     gemu_monitor_bind(mon, "vgapeek",    i2000_cmd_vgapeek, s);
@@ -4425,6 +4511,10 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
         ia64_i2000_destroy(s);
         return NULL;
     }
+    PciAudioWiring audio_wiring = i2000_audio_wiring(s);
+    pci_audio_init(&s->audio, cfg->sound, &audio_wiring);
+    if (cfg->sound)
+        s->audio_out = gemu_audio_open_channels(pci_audio_name(cfg->sound), 48000, 2);
     /* PAL's MSR command port and cache arrays (merced_msr.c, merced_cache.c). */
     merced_set_msr_model(s->cpu, true);
     merced_set_cpu_revision(s->cpu, 6);             /* Merced C0 */
@@ -4485,6 +4575,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
 }
 
 void ia64_i2000_destroy(Ia64I2000State *s) {
+    if (s) gemu_audio_close(s->audio_out);
     if (!s)
         return;
     i2000_nvram_save(s);
@@ -4506,6 +4597,10 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
 /* ── Execution ───────────────────────────────────────────────────────────── */
 
 static void i2000_poll_interrupts(Ia64I2000State *s) {
+    if (s->audio.model) {
+        pci_audio_poll(&s->audio);
+        if (s->audio.irq_level) iosapic_raise_gsi(s, 45);
+    }
     if (s->nic_enabled)
         e100_poll(&s->nic);
     if (s->mouse_wait_rfi_generation &&
@@ -4933,6 +5028,8 @@ static void i2000_reset(Ia64I2000State *s, bool warm) {
         rage128_reset(&s->rage128);
     if (s->nic_enabled)
         e100_reset(&s->nic);
+    pci_audio_reset(&s->audio);
+    gemu_audio_flush(s->audio_out);
     memset(&s->mouse_enabled, 0,
            offsetof(Ia64I2000State, chipset) -
            offsetof(Ia64I2000State, mouse_enabled));

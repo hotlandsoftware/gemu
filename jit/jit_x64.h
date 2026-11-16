@@ -268,6 +268,11 @@ static inline void x64_shr_ri(X64Buf *b, int r, uint8_t n) {
     x64_op_rr(b, 1, 0xC1, -1, 5, r, false);
     x64_b(b, n);
 }
+/* sar r64, imm8 */
+static inline void x64_sar_ri(X64Buf *b, int r, uint8_t n) {
+    x64_op_rr(b, 1, 0xC1, -1, 7, r, false);
+    x64_b(b, n);
+}
 /* reg32 <op>= dword [base + index*scale + disp] */
 static inline void x64_alu_rm32(X64Buf *b, int op, int dst, int base,
                                 int index, int scale, int32_t disp) {

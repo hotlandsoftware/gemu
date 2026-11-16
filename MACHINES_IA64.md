@@ -20,6 +20,7 @@
 - Firmware: 4 MiB flash containing PAL, SAL, and EFI
 - Display: ATI Rage 128 GL PCI (00:02.0) driven by its own x86 video BIOS, which runs in the IA-32 core; the card and the VGA core behind it live in `vga/multi/`
 - LAN: Intel 82559 (00:05.0, `-net nic,model=baset`) with the full serial-EEPROM, PHY and command/receive-unit model in `hardware/device/network/e100.c`; no packet transport is attached yet
+- Sound: Cirrus Logic CS4281 PCI controller with an AC'97 codec (00:04.0, `-soundhw cs4281`, enabled by default)
 - Storage: primary-master ATA disk backed by a raw image and secondary-master ATAPI CD-ROM backed by a raw ISO image
 - Legacy devices: PIC/IOSAPIC, PIT, RTC/CMOS, keyboard, mouse, serial, and SMBus support
 - Persistent, firmware-specific flash/NVRAM and full-machine snapshots
@@ -57,7 +58,38 @@ jumps to the next timer deadline instead of waiting for it in real time. The gue
 clock then runs ahead of the host's while it idles.
 
 Debug switches: `PM_DEBUG` (power management), `FWH_DEBUG` (firmware hubs),
-`I2C_DEBUG` (bus transactions and absent addresses), `IOSAPIC_DEBUG`.
+`I2C_DEBUG` (bus transactions and absent addresses), `IOSAPIC_DEBUG`,
+`AUDIO_DEBUG` (sound-controller and codec writes).
+
+### Sound cards
+
+The i2000's onboard sound uses a separate CS4281 PCI controller and an AC'97
+codec. AC'97 describes the codec interface; it does not identify the PCI
+controller as an Intel ICH device. A [real i2000 PCI inventory](https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=488452)
+identifies `1013:6005` at `00:04.0`, subsystem `8086:4253`. The
+[Cirrus CS4281 datasheet](https://www.ibmfiles.com/ibmfiles/peripherals/CS4281.pdf)
+describes its AC'97 codec connection.
+
+| Option | Emulated card |
+|--------|---------------|
+| `-soundhw cs4281` | Onboard Cirrus CS4281, the i2000 default |
+| `-soundhw ac97` | Alternative Intel 82801AA-compatible PCI controller |
+| `-soundhw none` | No sound card |
+| `-soundhw ?` | List available sound hardware |
+
+The selection replaces the default card; one PCI sound card is attached at a
+time. `-nodefaults` leaves audio disabled unless a card is explicitly selected.
+Each controller needs its own guest driver: Windows XP 64-Bit Edition Version
+2003 includes the native Itanium CS4281 driver `cwrwdm.sys`; this does not provide
+an Intel AC97 driver for the alternative card.
+
+Both models implement PCM DMA playback, mixer volume/mute, interrupts and stereo
+SDL output at 48 kHz. Capture returns silence; host microphone input, legacy
+Sound Blaster/FM synthesis and external MIDI are not implemented. The machine
+routes PCI INTA to GSI 45, matching the workstation firmware's ACPI routing.
+The monitor command `audio` reports DMA progress, nonzero output frames, IRQs,
+codec volumes and the host output queue. Audio timing follows the guest ITC;
+instruction-paced clocks or idle skipping can run it faster than real time.
 
 ROMs are found the same way as on the other machines: point `-rom` at a folder (or
 .zip), and the firmware, the Rage 128 video BIOS (`rage128gl_pci_113-53008-100.rom`)
@@ -92,16 +124,24 @@ The JIT is split by guest and by host:
 Another host needs only a new `jit/jit_backend_<host>.c` (plus its encoder); a
 JIT for another guest CPU reuses the backends.
 
-A translated block covers up to 16 bundles of one 4 KiB page. Each slot is
-handled one of three ways:
+A translated block covers up to 8 bundles of one 4 KiB page and ends at a
+branch. Each slot is handled one of three ways:
 
 | Tier | Covers |
 |------|--------|
-| native | A-unit ALU and compares, `zxt`/`sxt`, `movl`, `br.cond`, `br.cloop` |
+| native | A-unit ALU and compares, `zxt`/`sxt`, `movl`, bit-field extracts/deposits, `shrp`, normal/`.unc` `tbit`/`tnat`, transfers from IP/BR/PR and to BR, `br.cond`, `br.cloop`; `setf.sig`/`getf.sig` and transfers to/from PFS/LC/EC/CCV/UNAT/FPSR, with helpers for fault cases |
 | native memory | `ld`/`st` with post-increment, through a host TLB into plain RAM |
 | interpreted | everything else, through `fast_slot()`, the interpreter's own per-slot code; the block re-checks its assumptions afterwards and leaves if anything changed |
 
 With the JIT, the i2000 polls platform interrupts every 512 slots instead of 16.
+When fewer than 24 slots remain partway through a poll quantum, existing
+translations can still run, but new translations wait for the next quantum. This avoids
+filling the code cache with overlapping blocks for interior instruction slots.
+The synchronous single-CPU memory model also lets `fwb`, `mf`, `mf.a`, and
+`sync.i` run without an interpreter call.
+Register-stack spill/fill addressing counts the intervening RNAT words in
+constant time, including unaligned anchors and address wraparound. It still
+performs every backing-store access and preserves fault/retry behavior.
 
 Developer switches:
 
@@ -110,7 +150,8 @@ Developer switches:
   native code.
 - `GEMU_IRQ_QUANTUM=<power of two>` overrides the poll quantum for either engine.
 - `python3 tools/ia64/run_merced_jit_test.py [programs] [first-seed]` runs
-  random programs under both engines and compares their full state.
+  random programs under both engines and compares their full state, then
+  checks all 8,192 signed/unsigned extract position and width combinations.
 
 ## Physical memory map
 
@@ -182,9 +223,11 @@ emulator does not create periodic snapshots. Keep the same `-rom` and
 `-cdrom`/`-drive` arguments when restoring a checkpoint; explicitly configured
 CD media is retained across the restore.
 
-The 460GX separation introduces snapshot format version 31. Earlier snapshots
-are rejected before loading any guest state; cold boot after updating. Disk
-images and persistent NVRAM are separate from this snapshot format change.
+PCI audio introduces snapshot format version 40. Earlier snapshots and
+checkpoints made with a different `-soundhw` selection are rejected before
+loading guest state; cold boot after updating. Audio DMA, codec and interrupt
+state are saved, while the host audio device is rebound and its queue cleared
+on restore. Disk images and persistent NVRAM are separate from this format change.
 
 NVRAM is stored per firmware image under the GEMU configuration directory.
 If firmware state becomes unusable after changing ROMs, remove only the
@@ -351,5 +394,6 @@ python3 tools/ia64/run_rage128_test.py
 python3 tools/ia64/run_e100_test.py
 python3 tools/ia64/run_i2000_memory_test.py
 python3 tools/ia64/run_i2000_interrupt_test.py
+python3 tools/ia64/run_pci_audio_test.py
 python3 tools/ia64/run_i2000_ata_storage_test.py
 ```
