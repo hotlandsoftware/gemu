@@ -668,11 +668,63 @@ static void test_aperture(void) {
 /* 640x480 timings in units where the fake clock counts pixels: XTALIN * N /
  * (M * post) / PIXEL_HZ = 1 with M = N = 4 and no post divider. */
 static void program_raster(void) {
+    reg_w(CRTC_GEN_CNTL, (1u << 24) | (1u << 25)); /* extended CRTC */
     pll_w(0x03, 4);                                 /* PPLL_REF_DIV */
     pll_w(0x04, 4);                                 /* PLL_DIV_0: N = 4, post /1 */
     pll_w(0x08, 3);                                 /* VCLK_ECP_CNTL: VCLK from PPLL */
     reg_w(CRTC_H_TOTAL_DISP, (79u << 16) | 99u);    /* 640 of 800 */
     reg_w(CRTC_V_TOTAL_DISP, (479u << 16) | 524u);  /* 480 of 525 */
+}
+
+static void test_vga_raster(void) {
+    power_on();
+    map_card();
+    /* XP 2002's ATI miniport probes the monitor in VGA text mode and
+     * waits for scanline 402. Extended totals remain zero at this point. */
+    reg_w(CRTC_GEN_CNTL, 1u << 25);
+    io_w(0x3C2, 1, 0x67);                           /* VGA clock select 1 */
+    seq_w(1, 0);                                   /* nine dots per character */
+    crtc_w(0x00, 0x5F);                            /* 100 characters per line */
+    crtc_w(0x01, 0x4F);                            /* 80 visible */
+    crtc_w(0x06, 0xBF);
+    crtc_w(0x07, 0x1F);                            /* 449 total, 400 visible */
+    crtc_w(0x12, 0x8F);
+    pll_w(0x03, 4);
+    pll_w(0x05, 4);                                /* VGA PLL1: one pixel/tick */
+    pll_w(0x07, 8);                                /* extended PLL3: two */
+    pll_w(0x08, 3);
+    reg_w(CLOCK_CNTL_INDEX, 3u << 8);
+    reg_w(CRTC_VLINE_CRNT_VLINE, 37);
+    const uint64_t line = 900, frame_ticks = line * 449;
+    env.ticks = line * 402 + 10;
+    CHECK(reg_r(CRTC_VLINE_CRNT_VLINE) == ((402u << 16) | 37u));
+    CHECK((reg_r(CRTC_STATUS) & 1) == 1);
+    env.ticks = frame_ticks + line * 12;
+    CHECK(reg_r(CRTC_VLINE_CRNT_VLINE) == ((12u << 16) | 37u));
+    CHECK((reg_r(CRTC_STATUS) & 1) == 0);
+    reg_w(GEN_INT_STATUS, 3);
+    reg_w(GEN_INT_CNTL, 1);
+    env.ticks = frame_ticks + line * 400;
+    rage128_tick(&card);
+    CHECK(env.irq && (reg_r(GEN_INT_STATUS) & 1));
+    reg_w(GEN_INT_STATUS, 1);
+    CHECK(!env.irq);
+
+    /* Eight-dot characters and the sequencer's divide-by-two clock. */
+    seq_w(1, 1);
+    env.ticks = 800u * 402u;
+    CHECK((reg_r(CRTC_VLINE_CRNT_VLINE) >> 16) == 402);
+    seq_w(1, 9);
+    env.ticks *= 2;
+    CHECK((reg_r(CRTC_VLINE_CRNT_VLINE) >> 16) == 402);
+
+    /* Both overflow bits of the VGA vertical total are significant. */
+    crtc_w(0x06, 0x58);
+    crtc_w(0x07, 0x21);                            /* 858 scanlines */
+    env.ticks = 1600u * 857u;
+    CHECK((reg_r(CRTC_VLINE_CRNT_VLINE) >> 16) == 857);
+    env.ticks += 1600;
+    CHECK((reg_r(CRTC_VLINE_CRNT_VLINE) >> 16) == 0);
 }
 
 static void test_raster(void) {
@@ -936,6 +988,7 @@ int main(void) {
     test_vga_planar();
     test_aperture();
     test_raster();
+    test_vga_raster();
     test_scanout();
     test_engine();
     test_reset();

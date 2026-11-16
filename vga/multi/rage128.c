@@ -188,7 +188,8 @@ static uint32_t gpio_monid_pins(Rage128 *r) {
 /* ---- raster timing --------------------------------------------------------
  * The pixel clock (RRG 3.4, PLL_DIV_[3:0]): PPllClk = N * PPLL_REF / M with
  * N = PPLL_FBn_DIV of the PLL_DIV_n selected by PPLL_DIV_SEL
- * (CLOCK_CNTL_INDEX 9:8), M = PPLL_REF_DIV, PPLL_REF = XTALIN
+ * (GENMO 3:2 in VGA mode, CLOCK_CNTL_INDEX 9:8 in extended mode),
+ * M = PPLL_REF_DIV, PPLL_REF = XTALIN
  * (PPLL_REF_DIV_SRC 0); VCLK = PPllClk / PPLL_POSTn_DIV (0-7: /1, /2, /4, /8,
  * /3, reserved, /6, /12) with VCLK_SRC_SEL = PPllClk (VCLK_ECP_CNTL). XTALIN
  * is the 29.50 MHz crystal of the reference design. The CRTC (RRG 5):
@@ -203,14 +204,32 @@ typedef struct {
 } Raster;
 
 static bool raster_timing(const Rage128 *r, Raster *t) {
-    const uint32_t h = REG(CRTC_H_TOTAL_DISP), v = REG(CRTC_V_TOTAL_DISP);
-    t->htot = ((h & 0x1FFu) + 1) * 8;
-    t->hdisp = (((h >> 16) & 0xFFu) + 1) * 8;
-    t->vtot = (v & 0x7FFu) + 1;
-    t->vdisp = ((v >> 16) & 0x7FFu) + 1;
+    const bool extended = (REG(CRTC_GEN_CNTL) & (1u << 24)) != 0;
+    unsigned clock_select, clock_div = 1;
+    if (extended) {
+        const uint32_t h = REG(CRTC_H_TOTAL_DISP), v = REG(CRTC_V_TOTAL_DISP);
+        t->htot = ((h & 0x1FFu) + 1) * 8;
+        t->hdisp = (((h >> 16) & 0xFFu) + 1) * 8;
+        t->vtot = (v & 0x7FFu) + 1;
+        t->vdisp = ((v >> 16) & 0x7FFu) + 1;
+        clock_select = (REG(CLOCK_CNTL_INDEX) >> 8) & 3u;
+    } else {
+        /* RRG ch. 5: VGA totals are characters minus five / lines minus
+         * two, with vertical overflow in CR07. The native driver polls
+         * CRTC_CRNT_VLINE even while the VGA CRTC supplies the timing. */
+        const uint8_t *cr = r->vga->crtc;
+        const unsigned dots = (r->vga->seq[1] & 1u) ? 8 : 9;
+        t->htot = (cr[0x00] + 5u) * dots;
+        t->hdisp = (cr[0x01] + 1u) * dots;
+        t->vtot = (cr[0x06] | ((cr[0x07] & 1u) << 8) |
+                   ((cr[0x07] & 0x20u) << 4)) + 2u;
+        t->vdisp = (cr[0x12] | ((cr[0x07] & 2u) << 7) |
+                    ((cr[0x07] & 0x40u) << 3)) + 1u;
+        clock_select = (r->vga->misc >> 2) & 3u;
+        clock_div = (r->vga->seq[1] & 8u) ? 2 : 1;
+    }
     if ((r->pll[VCLK_ECP_CNTL] & 3u) != 3u) {
-        /* VCLK_SRC_SEL 0 = CPUCLK: the VGA clock path. Only the PLL-driven
-         * extended mode's raster is modelled. */
+        /* External PCICLK/PCLK/BYTE_CLK sources are not modelled. */
         return false;
     }
     if ((r->pll[PPLL_REF_DIV] >> 16) & 3u) {
@@ -220,13 +239,13 @@ static bool raster_timing(const Rage128 *r, Raster *t) {
     }
     static const unsigned post[8] = { 1, 2, 4, 8, 3, 0, 6, 12 };
     const uint32_t m = r->pll[PPLL_REF_DIV] & 0x3FFu;
-    const uint32_t div = r->pll[PLL_DIV_0 + ((REG(CLOCK_CNTL_INDEX) >> 8) & 3u)];
+    const uint32_t div = r->pll[PLL_DIV_0 + clock_select];
     const uint32_t n = div & 0x7FFu, p = post[(div >> 16) & 7u];
     if (m < 2 || n < 4 || !p) {
         return false;  /* "divider stops operating" / reserved */
     }
     t->num = (uint64_t)XTALIN_HZ * n;
-    t->den = (uint64_t)m * p * r->wiring.clock_hz;
+    t->den = (uint64_t)m * p * clock_div * r->wiring.clock_hz;
     return t->htot && t->vtot;
 }
 
