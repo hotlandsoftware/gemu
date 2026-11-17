@@ -51,7 +51,7 @@ typedef struct {
     bool            no_shutdown;
     bool            menu_disabled; /* machine XML's menu="disabled" */
     bool            mouse_enabled; /* -device mouse (i2000 only) */
-    bool            i82559_enabled; /* -net nic,model=i82559/baset */
+    struct GemuNic *nic;            /* the onboard 82559 LAN (gemu/net.h), NULL = -nic none */
     bool            jit;            /* -accel jit (default) vs interpreter */
     PciAudioModel   sound;          /* -soundhw: onboard CS4281 or alternate */
     /* Option ROMs found by -rom DIR (SHA-256 matched), or NULL. */

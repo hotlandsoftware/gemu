@@ -14,6 +14,7 @@
 #include "input/ps2_keyboard.h"
 #include "gemu/gemu_display.h"
 #include "gemu/drive.h"
+#include "gemu/net.h"
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
 #include "gemu/util.h"
@@ -2803,11 +2804,33 @@ static void i2000_nic_irq(void *opaque, bool level) {
         iosapic_raise_gsi(opaque, 44);
 }
 
+/* The host side of the LAN (gemu/net.h).  File-static: Ia64I2000State is
+ * snapshotted raw. */
+static GemuNic *i2000_net;
+
+static bool i2000_nic_tx(void *opaque, const uint8_t *frame, size_t len) {
+    (void)opaque;
+    return i2000_net ? gemu_nic_send(i2000_net, frame, len) : true;
+}
+
+static size_t i2000_nic_rx(void *opaque, uint8_t *frame, size_t cap) {
+    (void)opaque;
+    return i2000_net ? gemu_nic_recv(i2000_net, frame, cap) : 0;
+}
+
+/* Monitor "set_link": plug or unplug the cable. */
+static void i2000_nic_link(void *opaque, bool up) {
+    Ia64I2000State *s = opaque;
+    if (s->nic_enabled)
+        e100_set_link(&s->nic, up);
+}
+
 static E100Wiring i2000_nic_wiring(Ia64I2000State *s) {
     return (E100Wiring){ .clock = i2000_rage_clock, .clock_hz = I2000_ITC_HZ,
                          .irq = i2000_nic_irq,
                          .dma_read = i2000_nic_dma_read,
-                         .dma_write = i2000_nic_dma_write, .opaque = s };
+                         .dma_write = i2000_nic_dma_write,
+                         .tx = i2000_nic_tx, .rx = i2000_nic_rx, .opaque = s };
 }
 
 /* PCI0._PRT's workstation branch routes 00:04 INTA# to GSI 45.
@@ -3419,6 +3442,11 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
             E100Wiring wiring = i2000_nic_wiring(s);
             e100_rebind(&s->nic, &wiring);
             e100_set_rom(&s->nic, s->nic_rom, s->nic_rom_len);
+            /* The cable is this run's (set_link), not the snapshot's. */
+            e100_set_link(&s->nic, !i2000_net || gemu_nic_link_up(i2000_net));
+            if (!i2000_net)
+                fprintf(stderr, "gemu: note: the snapshot has the onboard LAN but "
+                        "this run has -nic none; it sees no network\n");
         }
         if (s->video_enabled) {
             Rage128Wiring wiring = i2000_rage_wiring(s);
@@ -4506,7 +4534,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
             fprintf(stderr, "Rage 128 video BIOS not found - point -rom at"
                     "folder holding it\n");
     }
-    if (cfg->i82559_enabled) {
+    if (cfg->nic) {
         /* The SDV EFI expects the integrated 82559 to supply an EFI UNDI
          * driver through its PCI expansion ROM.  Merely exposing the PCI
          * function leaves Boot Manager's network-device cleanup on a broken
@@ -4527,14 +4555,17 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
                 free(rom);
             }
         }
-        if (!s->nic_rom)
-            fprintf(stderr, "i2000: warning: no LAN EFI UNDI ROM "
-                    "(efi-eepro100.rom); point -rom at the folder holding "
-                    "it\n");
+        /* Without one, the production firmware (bios117c/bios130) still
+         * drives the 82559 with its own built-in UNDI; src/ia64_setup.c
+         * warns for the SDV build, which has none. */
         s->nic_enabled = true;
+        i2000_net = cfg->nic;
         E100Config nic_cfg = { .boot_rom = s->nic_rom != NULL };
+        gemu_nic_mac(cfg->nic, nic_cfg.mac);
         E100Wiring wiring = i2000_nic_wiring(s);
         e100_init(&s->nic, &nic_cfg, &wiring);
+        e100_set_link(&s->nic, gemu_nic_link_up(cfg->nic));
+        gemu_nic_set_link_cb(cfg->nic, i2000_nic_link, s);
         if (s->nic_rom)
             e100_set_rom(&s->nic, s->nic_rom, s->nic_rom_len);
     }
@@ -4628,6 +4659,11 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
     gemu_display_destroy(s->display);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     merced_destroy(s->cpu);
+    if (i2000_net) {
+        gemu_nic_set_link_cb(i2000_net, NULL, NULL);
+        i2000_net = NULL;
+    }
+    gemu_net_shutdown();
     free(s->nic_rom);
     free(s->atapi_data);
     free(s->ata_data);

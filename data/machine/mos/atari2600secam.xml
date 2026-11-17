@@ -2,4 +2,5 @@
 <machine name="atari2600secam" family="mos" description="Atari 2600 Video Computer System (1983) (SECAM)"
          alias="atari2600" tv="secam" status="working">
     <device name="cx40"/>
+    <description description="SECAM verison of Atari 2600"/>
 </machine>

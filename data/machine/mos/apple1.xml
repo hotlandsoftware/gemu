@@ -8,4 +8,9 @@
     <rom name="apple-a4.4"  region="video-prom" addr="0x0300" sha256="97823e77042574e1ae0d9211e094444176a028e6fbcd83732a6ad998535d4acc"/>
     <rom name="s2513.d2"    region="chargen"    addr="0x0000" sha256="b0d8828d90f126edc08b1b251c955db832b8da68d2c202be588100ae87f691f1"/>
     <rom name="cffaromv1.1.bin" region="cffa"   addr="0x9000" sha256="ada5c4c1a918b924a708eb1ac4ac726d3a712f395ff177a6945e1585b7b2dae8"/>
+    <description description="The machine that started it at all. 
+    The story goes like this: Steve Wozniak (working at HP) wanted to build a computer. He couldn't afford the very expensive Intel 8080 CPU (which the Altair 8800 and IMSAI 8080 used), so he decided to use the Motorola 6800.
+    That also proved too expensive, so he built the computer around the MOS 6502 (which was deliberately compatible with the Motorola 6800). This PC was easier to use than the Altair since it had a keyboard and could display characters on a television.
+    Steve Jobs - whom had worked with Wozniak on Breakout at Atari - was interested in this machine, and together they formed the Apple Computer Company and tried to sell the machine.
+    This PC sold in July 1976 for $666.66 since Wozniak liked repeating digits. It sold about 175 of its 200 produced units."/>
 </machine>

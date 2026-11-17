@@ -1,9 +1,12 @@
 <?xml version="1.0"?>
 <machine name="atari400" family="mos" description="Atari 400 (1979) (OS rev B)"
-         cpu="6502" tv="ntsc" ram="48K" status="imperfect">
+         cpu="6502" tv="ntsc" ram="16K" status="imperfect">
     <device name="keyboard"/>
     <device name="atari810"/>
     <rom name="co12399b.rom" region="maincpu" addr="0xD800" sha256="b1f7774bad07e02e03ef53ece3c29a5b7546fe967a42a73d0a4f65ce6248bde7"/>
     <rom name="co12499b.rom" region="maincpu" addr="0xE000" sha256="7bb438a6f6f1d113acf314a9726aec4115869a87a22c0b03a472d4f71f1e5892"/>
     <rom name="co14599b.rom" region="maincpu" addr="0xF000" sha256="dbc3e97f9e9bbfd7632895f29584f0137aea4dc95f2430f04c8060fff5a6ca3b"/>
+    <description description="The Atari 400 and 800 were the first home computers to use custom coprocessors and the first to use 'sprites' and special video interruptions 
+        like display lists, features that would be implemented many years later on the Amiga. It also offered high graphic resolution, color, and sound capabilities - more than what other machines could do at the time.
+        The Atari 400 and 800 are internally identical - the 400 is the low-cost machine with 16K of RAM, vs the 800's 48KB of RAM. The 400 has one cartridge port (vs 2 for the 800) and has a membrane keyboard (800 has a typewriter-style keyboard)."/>
 </machine>

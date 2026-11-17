@@ -1,4 +1,5 @@
 #include "gemu/args.h"
+#include "gemu/net.h"
 #include "gemu/gemu.h"
 #include "gemu/gemu_display.h"
 #include "gemu/vnc.h"
@@ -53,6 +54,14 @@ static void print_usage(const GemuArgsDef *def) {
         printf("  %-14s Floppies (= -drive file=FILE,index=0..1,if=floppy)\n", "-fda/-fdb FILE");
         printf("  %-14s Discard all disk writes on exit (snapshot=on everywhere)\n", "-snapshot");
         printf("  %-14s Leave out the machine's default drives (QEMU syntax)\n", "-nodefaults");
+    }
+    if (def->net_devices) {
+        printf("  %-14s Network adapter + backend, QEMU syntax: TYPE[,model=M][,mac=ADDR]\n"
+               "  %-14s [,hostfwd=...]; TYPE user|tap; -nic none = no adapters\n", "-nic SPEC", "");
+        printf("  %-14s Host backend: user,id=ID[,net=,hostfwd=,restrict=,...] |\n"
+               "  %-14s tap,id=ID,ifname=NAME,script=no (attach: -device MODEL,netdev=ID)\n",
+               "-netdev SPEC", "");
+        printf("  %-14s Legacy hub: nic[,model=,macaddr=,vlan=] | user[,vlan=] | none\n", "-net SPEC");
     }
     printf("  %-14s Pause/halt instead of exiting on monitor shutdown\n", "-no-shutdown");
     printf("  %-14s Name the VM: window title becomes \"GEMU (NAME)\"\n", "-name NAME");
@@ -413,6 +422,27 @@ bool gemu_args_parse(int argc, char **argv,
                 if (!gemu_drive_add(argv[++i])) return false;
                 continue;
             }
+        }
+
+        /* ── Networking (QEMU's -netdev / -nic / -net) ── */
+        if (strcmp(a, "-netdev") == 0 || strcmp(a, "-nic") == 0 ||
+            strcmp(a, "-net") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: %s requires an argument\n", def->prog, a);
+                return false;
+            }
+            const char *spec = argv[++i];
+            bool none = strcmp(a, "-netdev") != 0 && strcmp(spec, "none") == 0;
+            if (!def->net_devices && !none) {
+                fprintf(stderr, "%s: %s: this machine has no network adapters "
+                        "(only -nic none applies)\n", def->prog, a);
+                return false;
+            }
+            bool ok = a[4] == 'd' ? gemu_net_parse_netdev(spec)
+                    : a[3] == 'c' ? gemu_net_parse_nic(spec)
+                    : gemu_net_parse_net(spec);
+            if (!ok) return false;
+            continue;
         }
 
         /* ── -name NAME | -name guest=NAME[,...] (QEMU syntax) ── */

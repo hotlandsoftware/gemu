@@ -6,4 +6,5 @@
     <rom name="ns1.bin"             region="gfx1"    addr="0x0000" sha256="ed09619e45bb61580addadaadc0532fe92d9852df8b014b391460e0e629a19dd"/>
     <rom name="ns0.bin"             region="gfx0"    addr="0x0000" sha256="4ee47bf9a3803e2d98d82a74aef8c507db386bd236fe81a7a0aee5012b243cd8"/>
     <rom name="pal16r4a-7mezzo.bin" region="plds"    addr="0x0000" sha256="2e5f790fb4282543b14500b8a9eb4e92e1455517c5b398be45554b0dee97be0e"/>
+    <description description="Popular Italian card game. Runs on Magic Fly Poker Hardware. There doesn't seem to be much information about this board"/>
 </machine>

@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<device name="i82559" description="Intel PRO/100 PCI Network Card" status="working">
+    <machine name="i2000"/>
+</device>

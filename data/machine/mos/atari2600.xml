@@ -1,5 +1,7 @@
 <?xml version="1.0"?>
-<machine name="atari2600" family="mos" description="Atari 2600 Video Computer System (1977) (NTSC)"
+<machine name="atari2600" family="mos" description="Atari 2600/Video Computer System (1977) (NTSC)"
          cpu="6507" soundhw="tia" tv="ntsc" status="working">
     <device name="cx40"/>
+    <description description="The Atari 2600 was one of the first popular home video game consoles, released on October 14, 1977.
+    It was originally named the Atari VCS (Video Computer System) until 1982, when it was renamed following the release of the Atari 5200."/>
 </machine>

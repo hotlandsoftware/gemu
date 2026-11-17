@@ -186,6 +186,10 @@ typedef struct E100 {
     /* Last-frame bookkeeping for the dump (SDM Table 50). */
     uint16_t last_tx_status, last_rx_status, last_rx_len;
     uint32_t last_tx_fcs, last_rx_fcs;
+
+    /* No cable (the host's "set_link off"): the PHY finds no link partner.
+     * Lives in what was tail padding, so older raw dumps load as plugged. */
+    bool cable_out;
 } E100;
 
 /* Power-on (PCI RST# with a cold EEPROM): the EEPROM image is built from
@@ -230,6 +234,10 @@ bool e100_rom_range(const E100 *n, uint64_t *base, uint64_t *size);
  * (dynamic-TBD polling, a pause, bus mastering disabled). Also done by every
  * CSR access. Cheap when idle. */
 void e100_poll(E100 *n);
+
+/* Plug (true) or unplug the cable.  Unplugging drops the link at once;
+ * plugging it back starts auto-negotiation as a fresh partner would. */
+void e100_set_link(E100 *n, bool up);
 
 /* Level of the INTA# output. */
 bool e100_irq(const E100 *n);

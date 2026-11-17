@@ -19,7 +19,7 @@
 - RAM: 2 GiB by default; smaller matched DIMM populations are supported
 - Firmware: 4 MiB flash containing PAL, SAL, and EFI
 - Display: ATI Rage 128 GL PCI (00:02.0) driven by its own x86 video BIOS, which runs in the IA-32 core; the card and the VGA core behind it live in `vga/multi/`
-- LAN: Intel 82559 (00:05.0, `-net nic,model=baset`) with the full serial-EEPROM, PHY and command/receive-unit model in `hardware/device/network/e100.c`; no packet transport is attached yet
+- LAN: Intel 82559 (00:05.0) with the full serial-EEPROM, PHY and command/receive-unit model in `hardware/device/network/e100.c`; attached by default on user-mode networking (see Networking below)
 - Sound: Cirrus Logic CS4281 PCI controller with an AC'97 codec (00:04.0, `-soundhw cs4281`, enabled by default)
 - Storage: primary-master ATA disk backed by a raw image and secondary-master ATAPI CD-ROM backed by a raw ISO image
 - Legacy devices: PIC/IOSAPIC, PIT, RTC/CMOS, keyboard, mouse, serial, and SMBus support
@@ -92,14 +92,39 @@ codec volumes and the host output queue. Audio timing follows the guest ITC;
 instruction-paced clocks or idle skipping can run it faster than real time.
 
 ROMs are found the same way as on the other machines: point `-rom` at a folder (or
-.zip), and the firmware, the Rage 128 video BIOS (`rage128gl_pci_113-53008-100.rom`)
-and the LAN's EFI UNDI driver (an IA-64 build of QEMU's `efi-eepro100.rom`, region
-`nic` in `data/machine/ia64/i2000.xml`) are picked out by SHA-256.
+.zip), and the firmware and the Rage 128 video BIOS (`rage128gl_pci_113-53008-100.rom`)
+are picked out by SHA-256. The production firmware (bios117c/bios130) has its own
+82559 network driver, so the LAN needs no extra ROM. QEMU's stock
+`efi-eepro100.rom` holds only x86 drivers and is not used; only the SDV EFI build would
+need an IA-64 UNDI ROM, and none is known.
 `-rom` may be repeated. A file names the firmware explicitly, which matters when the
 folder holds more than one image; otherwise the first by file name is used. The IA-32 core
 follows the Itanium System Environment for interruptions: `INT n`, `IRET`, and
 `CLI`/`STI`/`POPF` (with CFLG.ii) go through the native interruption vectors and the
 firmware's handlers, and external interrupts are gated by `PSR.i && (!CFLG.if || EFLAG.if)`.
+
+## Networking
+
+Networking follows QEMU. The i2000's onboard 82559 is attached by default, on a
+user-mode (libslirp) NAT: the guest gets 10.0.2.15 by DHCP, the gateway is
+10.0.2.2 and DNS is 10.0.2.3. `-nic none` (or `-nodefaults`) leaves the LAN out.
+
+```sh
+-nic none                                         # no network adapter
+-nic user,hostfwd=tcp::3389-:3389                 # default adapter + port forward
+-netdev user,id=n0 -device i82559,netdev=n0,mac=52:54:00:12:34:56
+-netdev tap,id=n0,ifname=tap0,script=no -device i82559,netdev=n0   # Linux
+-net nic,model=i82559 -net user                   # legacy hub syntax
+-nic model=help                                   # list adapter models
+```
+
+`user` takes QEMU's `net=`, `host=`, `dhcpstart=`, `dns=`, `hostfwd=`, `restrict=`,
+`ipv4=`, `ipv6=`, `hostname=`, `domainname=`, `dnssearch=`, `tftp=` and `bootfile=`.
+`tap` takes `ifname=` or `fd=`; gemu runs no interface scripts, so create the
+interface first (`ip tuntap add tap0 mode tap user $USER`) and pass `script=no`.
+In the monitor, `info network` lists adapters and backends, and
+`set_link i82559.0 off` unplugs the cable (Windows reports it disconnected) until
+`set_link i82559.0 on`. Machines without an adapter model accept only `-nic none`.
 
 ## Execution engines (`-accel`)
 

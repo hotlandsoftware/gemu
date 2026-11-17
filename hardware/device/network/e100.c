@@ -401,7 +401,7 @@ static void phy_link_drop(E100 *n)
 static void phy_start_link(E100 *n, bool from_up)
 {
     n->phy_wait = false;
-    if (n->phy_lp || (n->bmcr & BMCR_PDOWN)) { return; }
+    if (n->phy_lp || (n->bmcr & BMCR_PDOWN) || n->cable_out) { return; }
     n->phy_wait = true;
     n->phy_left = ((n->bmcr & BMCR_ANEN) ? AN_TICKS : FORCED_TICKS) +
                   (from_up ? BREAK_TICKS : 0);
@@ -412,6 +412,15 @@ static void phy_restart(E100 *n)
     const bool was_up = n->link;
     phy_link_drop(n);
     phy_start_link(n, was_up);
+}
+
+void e100_set_link(E100 *n, bool up)
+{
+    if (up == !n->cable_out) { return; }
+    n->cable_out = !up;
+    if (up) { phy_start_link(n, false); }
+    else    { phy_link_drop(n); }
+    update_irq(n);
 }
 
 static void phy_link_establish(E100 *n)

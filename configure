@@ -37,7 +37,7 @@ CORE_SRC = [
     'core/src/monitor_block.c', 'core/src/monitor_symbols.c',
     'core/third_party/cjson/cJSON.c',
     'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/args.c',
-    'core/src/sha256.c', 'core/src/screendump.c', 'core/src/util.c',
+    'core/src/sha256.c', 'core/src/screendump.c', 'core/src/net.c', 'core/src/util.c',
     'core/src/gemu_display_term.c', 'core/src/drive.c', 'core/src/audio_out.c', 'core/src/netplay.c', 'core/src/netplay_kaillera.c', 'core/src/netplay_lists.c', 'core/src/netplay_dialog_sdl.c',
     'core/src/gemu_display.c', 'core/src/gemu_display_sdl.c',
     'core/src/gemu_display_vnc.c', 'core/src/gemu_display_menu.c',
@@ -342,7 +342,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
 
     # ── Parse device XMLs ─────────────────────────────────────────────────────
     devices = []
-    for path in _xml_files('data/device/*.xml'):
+    for path in _xml_files('data/device/**/*.xml'):
         root = ET.parse(path).getroot()
         name  = root.get('name')
         desc  = root.get('description', '')
@@ -357,7 +357,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         devices.append({'name': name, 'desc': desc, 'machines': mlist, 'status': status})
     devices.sort(key=lambda d: d['name'])
 
-    lines = ['// Auto-generated from data/device/*.xml - do not edit\n']
+    lines = ['// Auto-generated from data/device/**/*.xml - do not edit\n']
     for d in devices:
         desc = _with_status(d['desc'], d['status']).replace('"', '\\"')
         mstr = ', '.join(d['machines'])
@@ -427,7 +427,7 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         with open(os.path.join(gen_dir, f'vgas_{fam}.inc'), 'w', encoding='utf-8') as f:
             f.writelines(flines)
 
-    return _xml_files('data/machine/**/*.xml', 'data/device/*.xml',
+    return _xml_files('data/machine/**/*.xml', 'data/device/**/*.xml',
                       'data/soundhw/*.xml', 'data/chargen/*.xml',
                       'data/vga/*.xml')
 
@@ -513,6 +513,18 @@ def main():
         libzip_libs   = lf or ['-lzip']
     else:
         print('  (libzip not found - -rom cannot point directly at a .zip)')
+
+    have_slirp   = False
+    slirp_cflags = []
+    slirp_libs   = []
+    cf = pkg('slirp', '--cflags', *pkg_flags)
+    lf = pkg('slirp', '--libs',   *pkg_flags)
+    if check('libslirp (-netdev user)', lf):
+        have_slirp   = True
+        slirp_cflags = cf or []
+        slirp_libs   = lf or ['-lslirp']
+    else:
+        print('  (libslirp not found - no user-mode networking, -netdev user)')
 
     have_sdl_image  = False
     sdl_image_cflags = []
@@ -674,6 +686,7 @@ def main():
     if have_lua:     defs_list.append('HAVE_LUA')
     if have_sdl_image: defs_list.append('HAVE_SDL_IMAGE')
     if have_libzip:    defs_list.append('HAVE_LIBZIP')
+    if have_slirp:     defs_list.append('HAVE_SLIRP')
     if have_crypto:    defs_list.append('HAVE_CRYPTO')
     defs = ' '.join(f'-D{d}' for d in defs_list)
 
@@ -683,12 +696,14 @@ def main():
     if have_lua:  cflags_parts += lua_cflags
     if have_sdl_image: cflags_parts += sdl_image_cflags
     if have_libzip:    cflags_parts += libzip_cflags
+    if have_slirp:     cflags_parts += slirp_cflags
     if defs:      cflags_parts.append(defs)
     unified_cflags = ' '.join(cflags_parts)
 
     ld_parts = [base_ldflags] + sdl2_libs + crypto_libs + ['-lm']
     if have_sdl_image: ld_parts += sdl_image_libs
     if have_libzip:    ld_parts += libzip_libs
+    if have_slirp:     ld_parts += slirp_libs
     if want_gtk:  ld_parts += gtk_libs + epoxy_libs
     if have_caca: ld_parts += caca_libs
     elif have_curses: ld_parts += curses_flags
@@ -850,6 +865,7 @@ def main():
     print(f'  SDL2      : {"yes" if args.sdl else "no"}')
     print(f'  Window icon: {"yes (SDL2_image)" if have_sdl_image else "no"}')
     print(f'  -rom *.zip  : {"yes (libzip)" if have_libzip else "no"}')
+    print(f'  -netdev user: {"yes (libslirp)" if have_slirp else "no"}')
     print(f'  GTK 3     : {"yes" if want_gtk else "no"}')
     print(f'  libcaca   : {"yes (enhanced terminal)" if have_caca else "no"}')
     print(f'  ncursesw  : {"yes" if have_curses else ("n/a (libcaca used)" if have_caca else "no")}')

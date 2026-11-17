@@ -733,6 +733,28 @@ static void test_phy(void) {
     CHECK(!env.irq);
 }
 
+/* The host's "set_link off/on": the cable is pulled and plugged back. */
+static void test_cable(void) {
+    power_on();
+    map_card();
+    advance_ms(975);
+    CHECK(phy_r(1) == 0x782D);                          /* link up */
+    e100_set_link(&nic, false);
+    CHECK(phy_r(1) == 0x7809);                          /* dropped (latched low) */
+    advance_ms(5000);
+    CHECK((phy_r(1) & 0x24) == 0);                      /* no partner: stays down */
+    CHECK((csr_r(CSR_GSTS, 1) & 1) == 0);
+    phy_w(0, 0x1200);                                   /* a restart cannot find one either */
+    advance_ms(5000);
+    CHECK((phy_r(1) & 4) == 0);
+    e100_set_link(&nic, true);
+    advance_ms(973);
+    CHECK((phy_r(1) & 4) == 0);
+    advance_ms(2);                                      /* a fresh auto-negotiation */
+    CHECK(phy_r(1) == 0x782D);
+    CHECK(csr_r(CSR_GSTS, 1) == 0x07);
+}
+
 /* ---- the SCB: interrupts, Command Unit, Receive Unit ------------------------------ */
 
 static void scb(unsigned cmd) {
@@ -1217,6 +1239,7 @@ int main(void) {
     test_eeprom_read();
     test_eeprom_write();
     test_phy();
+    test_cable();
     test_interrupts();
     test_command_unit();
     test_receive_unit();

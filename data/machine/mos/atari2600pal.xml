@@ -2,4 +2,5 @@
 <machine name="atari2600pal" family="mos" description="Atari 2600 Video Computer System (1978) (PAL)"
          alias="atari2600" tv="pal" status="working">
     <device name="cx40"/>
+    <description description="PAL verison of Atari 2600"/>
 </machine>

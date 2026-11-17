@@ -18,6 +18,7 @@
 #include "gemu/gemu_display.h"
 #include "gemu/vnc.h"
 
+#include "gemu/net.h"
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -86,6 +87,7 @@ static GemuMonCmd cmd_poke(GemuMonitor *, const char *);
 static GemuMonCmd cmd_memsave(GemuMonitor *, const char *);
 static GemuMonCmd cmd_set_password(GemuMonitor *, const char *);
 static GemuMonCmd cmd_expire_password(GemuMonitor *, const char *);
+static GemuMonCmd cmd_set_link(GemuMonitor *, const char *);
 
 static const MonCmdDef mon_cmds[] = {
     /* name          aliases         params                        help */
@@ -208,6 +210,9 @@ static const MonCmdDef mon_cmds[] = {
       "list or set the car's sensors and switches", M_LAGONDA, NULL, 0 },
     { "service",     NULL,           "",
       "press the service button", M_VS, NULL, 0 },
+    { "set_link",    NULL,           "<name> on|off",
+      "plug or unplug a network adapter's cable (name from 'info network')",
+      NULL, cmd_set_link, 0 },
     { "set_password", NULL,          "vnc <password>",
       "set the VNC password (needs -vnc ...,password=on)", NULL, cmd_set_password, 0 },
     { "step",        "s",            "[count]",
@@ -564,6 +569,27 @@ static void info_media_status(GemuMonitor *mon) {
     if (!any) mon_printf(mon, "No media status available.\n");
 }
 
+static void net_print(void *ud, const char *line) {
+    mon_printf((GemuMonitor *)ud, "%s", line);
+}
+
+static void info_network(GemuMonitor *mon) {
+    gemu_net_info(net_print, mon);
+}
+
+static GemuMonCmd cmd_set_link(GemuMonitor *mon, const char *args) {
+    char name[64], state[8];
+    const char *p = take_token(args, name, sizeof(name));
+    if (!p || !take_token(p, state, sizeof(state)) ||
+        (strcasecmp(state, "on") != 0 && strcasecmp(state, "off") != 0)) {
+        mon_printf(mon, "usage: set_link <name> on|off\n");
+        return GEMU_MON_NONE;
+    }
+    if (!gemu_net_set_link(name, strcasecmp(state, "on") == 0))
+        mon_printf(mon, "set_link: no network adapter or netdev '%s' (see 'info network')\n", name);
+    return GEMU_MON_NONE;
+}
+
 static const MonInfoDef info_cmds[] = {
     { "block",       NULL,        "list block devices",          info_block },
     { "breakpoints", "bp",        "list breakpoints and watchpoints", info_breakpoints },
@@ -571,6 +597,7 @@ static const MonInfoDef info_cmds[] = {
     { "machine",     NULL,        "show the emulated machine",   info_machine },
     { "media",       NULL,        "show media device status",    info_media_status },
     { "name",        NULL,        "show the VM name given with -name", info_name },
+    { "network",     NULL,        "show network adapters and backends", info_network },
     { "roms",        NULL,        "list loaded ROM images",      info_roms },
     { "status",      NULL,        "show whether emulation is running", info_status },
     { "vnc",         NULL,        "show the VNC server and its clients", info_vnc },

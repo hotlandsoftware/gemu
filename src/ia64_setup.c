@@ -4,6 +4,8 @@
 #include "gemu/args.h"
 #include "gemu/drive.h"
 #include "gemu/monitor.h"
+#include "gemu/net.h"
+#include "gemu/sha256.h"
 #include <SDL2/SDL.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -68,13 +70,15 @@ static const GemuArgsDef def = {
     ,
     .block_devices    = true,
     .block_default_if = GEMU_DRIVE_IF_IDE,
+    .net_devices      = true,
     .extra_help =
         "\nIA64 options:\n"
         "  -rom FILE       Load firmware flash image (top-aligned, max 4 MiB)\n"
         "  -rom DIR|ZIP    Scan for known firmware by SHA-256\n"
         "  -m SIZE         RAM size in MiB, or with K/M/G suffix (default 512)\n"
-        "  -net nic,model=i82559\n"
-        "                  Attach the i2000 Intel 82559 NIC (baset alias)\n"
+        "  -device i82559,netdev=ID\n"
+        "                  i2000: the onboard Intel 82559 LAN (attached by\n"
+        "                  default on user-mode networking; -nic none removes it)\n"
         "  -soundhw CARD   i2000: cs4281 (onboard/default), ac97, or none\n"
         "                  Each card requires its matching guest driver\n"
         "  -microprogram F Run an architectural microprogram on a bare core\n"
@@ -284,18 +288,6 @@ int ia64_setup(int argc, char *argv[]) {
              * Runs bundles on a bare core and exits; no machine is created. */
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -microprogram requires an argument\n"); return 1; }
             return ia64_selftest_main(rem[++i]);
-        } else if (strcmp(rem[i], "-net") == 0) {
-            if (i + 1 >= nrem) { fprintf(stderr, "gemu: -net requires an argument\n"); return 1; }
-            const char *net = rem[++i];
-            if (strcmp(alias, "i2000") != 0 ||
-                (strcmp(net, "nic,model=i82559") != 0 &&
-                 strcmp(net, "nic,model=baset") != 0)) {
-                fprintf(stderr,
-                        "gemu: -net currently supports only "
-                        "'nic,model=i82559' (or 'baset') on i2000\n");
-                return 1;
-            }
-            cfg.i82559_enabled = true;
         } else if (strcmp(rem[i], "-serial") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -serial requires an argument\n"); return 1; }
             const char *spec = rem[++i];
@@ -307,7 +299,11 @@ int ia64_setup(int argc, char *argv[]) {
         } else if (strcmp(rem[i], "-device") == 0) {
             if (i + 1 >= nrem) { fprintf(stderr, "gemu: -device requires an argument\n"); return 1; }
             const char *dev = rem[++i];
-            if (strcmp(dev, "mouse") == 0) {
+            char model[32];
+            if (gemu_net_device_model(dev, model, sizeof(model)) &&
+                strcmp(model, "i82559") == 0) {
+                if (!gemu_net_parse_device(dev)) return 1;
+            } else if (strcmp(dev, "mouse") == 0) {
                 if (strcmp(alias, "i2000") != 0) {
                     fprintf(stderr, "gemu: -device mouse is supported by i2000 only\n");
                     return 1;
@@ -348,6 +344,46 @@ int ia64_setup(int argc, char *argv[]) {
     }
     cfg.video_rom = roms.video_rom;
     cfg.nic_rom = roms.nic_rom;
+
+    /* Networking, QEMU-style: the i2000's onboard 82559 is its one adapter
+     * and its default (on a user-mode backend); -nic none / -nodefaults
+     * leave it out. */
+    {
+        static const GemuDevDesc i2000_nics[] = {
+            { "i82559", "Intel 82559 PRO/100 (the onboard LAN)" },
+        };
+        bool has_nics = strcmp(alias, "i2000") == 0;
+        GemuNic **nics;
+        int n_nics;
+        if (!gemu_net_resolve(has_nics ? i2000_nics : NULL, has_nics ? 1 : 0,
+                              gemu_drive_defaults() ? "i82559" : NULL,
+                              &nics, &n_nics))
+            return 1;
+        if (n_nics > 1) {
+            fprintf(stderr, "gemu: %s has one network adapter (the onboard "
+                    "i82559); %d were asked for\n", alias, n_nics);
+            return 1;
+        }
+        cfg.nic = n_nics ? nics[0] : NULL;
+    }
+
+    /* The production firmware has its own 82559 UNDI driver; only the SDV
+     * build needs one from the NIC's expansion ROM (an IA-64 build, which
+     * QEMU's stock efi-eepro100.rom is not: it carries x86 drivers only). */
+    if (cfg.nic && !cfg.nic_rom && rom_arg) {
+        static const char sdv_sha256[] =
+            "3a2ab2ecfd1b700ab6328fbc13c2b3d37111b1f1fdda17544dd1374c52aa5983";
+        uint8_t digest[GEMU_SHA256_DIGEST_LEN];
+        char hex[65];
+        if (gemu_sha256_file(rom_arg, digest)) {
+            gemu_sha256_hex(digest, hex);
+            if (strcmp(hex, sdv_sha256) == 0)
+                fprintf(stderr, "gemu: i2000: warning: this SDV EFI build has no "
+                        "built-in network driver and no IA-64 UNDI ROM was found; "
+                        "EFI network boot may fail (Windows' own driver is "
+                        "unaffected)\n");
+        }
+    }
 
     if (serial_spec && strcmp(alias, "generic-ia64") != 0) {
         fprintf(stderr, "gemu: -serial is only supported by the generic machine\n");

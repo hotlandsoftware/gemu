@@ -56,6 +56,10 @@ typedef struct {
     bool               block_devices;
     int                block_default_if; /* GemuDriveInterface */
     bool               block_own_images; /* machines load the files (gemu_drive_set_own_images) */
+    /* QEMU-style networking (gemu/net.h): -netdev, -nic, -net.  Families
+     * without network adapter models leave it false; they still accept
+     * -nic none / -net none. */
+    bool               net_devices;
 } GemuArgsDef;
 
 /*
