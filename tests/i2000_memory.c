@@ -1394,6 +1394,102 @@ static void check_spec_fault(unsigned engine, bool fp, unsigned type,
     merced_destroy(cpu);
 }
 
+/* A decoded bundle or JIT block can outlive the ITC entry used to fetch it.
+ * Keep its exception-deferral attribute too: XP 2002's RPCRT4 uses ld8.s
+ * on byte fields, and losing ITLB.ed raises an exception in lsass.exe. */
+static uint64_t cached_code_ed_fetch(void *ud, uint64_t addr, unsigned size) {
+    if (addr >= 0x2000 && addr < 0x2010) {
+        const __uint128_t insert = (UINT64_C(1) << 37) |
+                                  (UINT64_C(0x2f) << 27) | (15 << 13);
+        const __uint128_t serialize = UINT64_C(0x31) << 27;
+        const __uint128_t nop = UINT64_C(0x08000000);
+        __uint128_t bundle = 0x0b | (insert << 5) | (serialize << 46) | (nop << 87);
+        uint64_t v = (uint64_t)(bundle >> ((addr & 15) * 8));
+        return size == 8 ? v : v & ((UINT64_C(1) << (size * 8)) - 1);
+    }
+    return spec_fault_fetch(ud, addr, size);
+}
+
+static void check_cached_code_ed(unsigned engine, bool ed, bool fp) {
+    const __uint128_t nop = UINT64_C(0x08000000);
+    const __uint128_t load = ((uint64_t)(fp ? 6 : 4) << 37) |
+        (UINT64_C(7) << 30) | (10 << 20) | (8 << 6);
+    const __uint128_t branch = (UINT64_C(4) << 37) | (0x100 << 13);
+    SpecFaultFixture fixture = {.bundle = 0x11 | (load << 5) |
+                                          (nop << 46) | (branch << 87)};
+    MercedBus bus = {.ud=&fixture, .read=spec_fault_read,
+                    .fetch=cached_code_ed_fetch, .write=handoff_write};
+    Merced *cpu = merced_create(&bus);
+    if (!cpu) { failures++; return; }
+    if (engine == 2) merced_set_accel(cpu, MERCED_ACCEL_JIT);
+    cpu->ip = 0x1000;
+    cpu->psr = (UINT64_C(1) << 13) | (UINT64_C(1) << 44) |
+               (UINT64_C(1) << 36) | 8;
+    cpu->cr[2] = 0x8000;
+    cpu->cr[72] = UINT64_C(1) << 16;
+    cpu->rr[0] = (5 << 8) | (12 << 2);
+    cpu->itc[0] = (MercedTlbEntry){
+        .va_start=0x1000, .va_end=0x1fff, .pfn_base=0x1000,
+        .rid=5, .ps=12, .valid=1, .itir=12 << 2,
+        .pte=0x1000 | 1 | (1 << 5) | (3 << 9) | ((uint64_t)ed << 52),
+    };
+    cpu->itr[0] = (MercedTlbEntry){
+        .va_start=0x2000, .va_end=0x2fff, .pfn_base=0x2000,
+        .rid=5, .ps=12, .valid=1, .itir=12 << 2,
+        .pte=0x2000 | 1 | (1 << 5) | (3 << 9),
+    };
+    uint64_t psr = cpu->psr;
+    for (unsigned phase = 0; phase < 5; phase++) {
+        if (phase == 2 && !ed) continue; /* preceding fault serialized fetch */
+        bool current_ed = phase == 3 ? !ed : ed;
+        cpu->psr = psr;
+        if (phase >= 3) {
+            /* Change ED without changing the physical page. itc.i/srlz.i
+             * must refresh it even when the old JIT block is reused. */
+            cpu->ip = 0x2000;
+            cpu->cr[20] = 0x1000;
+            cpu->cr[21] = 12 << 2;
+            cpu->itc_next = 0;
+            cpu->gr_static[15] = 0x1000 | 1 | (1 << 5) | (3 << 9) |
+                                  ((uint64_t)current_ed << 52);
+            if (handoff_step(cpu, engine != 0) != MERCED_OK ||
+                handoff_step(cpu, engine != 0) != MERCED_OK || cpu->ip != 0x2002) {
+                fprintf(stderr, "cached code ED: translation replacement failed\n");
+                failures++;
+                break;
+            }
+        }
+        cpu->ip = 0x1000;
+        cpu->gr_static[10] = phase ? 0x3001 : 0x3000;
+        if (phase == 1) cpu->itc[0].valid = 0; /* simulate capacity eviction */
+        if (phase == 2) cpu->bundle_cache_valid = false;
+        unsigned reads = fixture.reads;
+        uint64_t faults = cpu->nfaults;
+        MercedStatus status = MERCED_OK;
+        if (engine) {
+            unsigned executed;
+            status = merced_run_fast_range(cpu, 64, &executed, 0, 0,
+                                           0x2000, 0xe000);
+        } else {
+            for (unsigned slot = 0; slot < 3 && cpu->ip < 0x2000; slot++)
+                status = merced_step(cpu);
+        }
+        bool defer = phase && current_ed;
+        bool fault = phase && !current_ed;
+        if (status != MERCED_OK || cpu->ip != (fault ? 0xda00 : 0x2000) ||
+            cpu->nfaults - faults != fault || fixture.reads - reads != !phase ||
+            (!fault && (fp ? cpu->fr[8].nat : cpu->nat_static[8]) != defer)) {
+            fprintf(stderr, "cached code ED engine=%u ed=%u fp=%u phase=%u: "
+                    "ip=%" PRIx64 " faults=%" PRIu64 " nat=%u reads=%u\n",
+                    engine, ed, fp, phase, cpu->ip, cpu->nfaults,
+                    fp ? cpu->fr[8].nat : cpu->nat_static[8], fixture.reads - reads);
+            failures++;
+            break;
+        }
+    }
+    merced_destroy(cpu);
+}
+
 static void test_predicate_expect(uint64_t actual, uint64_t expected,
                                   const char *what, uint64_t raw,
                                   bool qualified, bool nat, bool fast) {
@@ -6125,6 +6221,10 @@ static void check_ia32_x87_differential(bool fast) {
 #endif
 
 int main(void) {
+    for (unsigned engine = 0; engine < 3; engine++)
+        for (unsigned ed = 0; ed < 2; ed++)
+            for (unsigned fp = 0; fp < 2; fp++)
+                check_cached_code_ed(engine, ed, fp);
     for (unsigned engine = 0; engine < 3; engine++)
         for (unsigned op = 0; op < 5; op++)
             for (unsigned unconditional = 0; unconditional < 2; unconditional++)

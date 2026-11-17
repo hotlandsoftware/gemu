@@ -1306,21 +1306,10 @@ static uint64_t spec_dcr_mask(uint32_t vec) {
     }
 }
 
-/* The ED bit of the page holding the currently executing bundle.  It only
- * has meaning when instruction translation is on. */
-static bool code_page_ed(Merced *m) {
-    unsigned vrn;
-    uint32_t rid;
-    const MercedTlbEntry *e;
-    if (!(m->psr & PSR_IT))
-        return false;
-    vrn = (unsigned)(m->ip >> 61);
-    rid = (uint32_t)((m->rr[vrn] >> 8) & 0xFFFFFFull);
-    e = tlb_search(m->itr, MERCED_N_ITR, rid, m->ip & ~0xFull, &m->itr_hint);
-    if (!e)
-        e = tlb_search(m->itc, MERCED_N_TC, rid, m->ip & ~0xFull, &m->itc_hint);
-    return e && (e->pte & (1ull << 52));
-}
+/* Fetch caches retain ED alongside the physical instruction address: their
+ * translation can remain usable after the originating ITC entry is evicted. */
+static bool code_page_ed(Merced *m);
+static void code_page_ed_set(Merced *m, bool ed);
 
 /* Whether a control-speculative (ld.s) reference defers this fault - taking
  * a NaT instead of an interruption - or actually raises it.
@@ -1351,9 +1340,7 @@ static bool spec_defers(Merced *m, uint32_t vec) {
  * deferred-exception path.  NT maps the PFN initialization loop this way;
  * omitting ED made its VHPT handler treat the fault as an ordinary miss and
  * retry the same store forever.  NaT-page consumption is the architectural
- * exception and forces ED clear (va_translate_ex()).  Only worked out when a
- * fault is delivered: it scans the instruction TLB, and every load and
- * store goes through va_translate_ex(). */
+ * exception and forces ED clear (va_translate_ex()). */
 static uint64_t code_ed_isr(Merced *m, bool ifetch) {
     return (!ifetch && code_page_ed(m)) ? ISR_ED : 0;
 }
@@ -1361,6 +1348,7 @@ static uint64_t code_ed_isr(Merced *m, bool ifetch) {
 static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
                             uint64_t isr_access, bool force,
                             uint64_t *pa, MercedStatus *st) {
+    if (ifetch) code_page_ed_set(m, false);
     /* The debug helpers (symbolization, disassembly, pointer following) probe
      * translations with spec=true and no access type.  Those must never
      * perturb the guest, so they defer unconditionally; only a real
@@ -1523,6 +1511,7 @@ static bool va_translate_ex(Merced *m, uint64_t va, bool ifetch, bool spec,
         }
     }
     *pa = (e->pfn_base + (lookup_va - e->va_start)) & MERCED_PHYS_MASK;
+    if (ifetch) code_page_ed_set(m, (e->pte & (UINT64_C(1) << 52)) != 0);
     if (observed && !ifetch)
         m->cache.access_uc = ((e->pte >> PTE_MA_SHIFT) & 7) != 0;   /* ma 0 = WB */
     if (cacheable) xlate_store(m, va, kind, *pa);
@@ -1657,7 +1646,7 @@ static void watch_init(void) {
 typedef struct {
     uint64_t va, pa, lo, hi, slots[3];
     uint32_t translation_generation, code_generation;
-    uint8_t tmpl, valid;
+    uint8_t tmpl, valid, code_ed;
     /* Decoded once when the entry is filled (a pure function of the bundle
      * bits), for merced_run_fast(): per slot, the handler merced_step()'s
      * unit dispatch would reach (none for nops; X-unit slots go to
@@ -1714,6 +1703,7 @@ typedef struct {
     uint64_t rr;
     uint64_t pa_page;
     uint32_t generation;
+    bool code_ed;
 } MercedXlateEntry;
 
 typedef struct {
@@ -1722,6 +1712,9 @@ typedef struct {
     uint32_t translation_generation;
     MercedXlateEntry xlate[MERCED_XLATE_ENTRIES];
     uint32_t xlate_generation;
+    /* Attribute of the currently executing fetch and of the CPU's bundle
+     * cache. Host-only, like the decoded/JIT translations that retain it. */
+    bool fetch_ed, bundle_ed;
     /* merced_request_exit(): stop merced_run_fast() after this slot. */
     bool exit_request;
     /* The TB entry fast_step() last checked against the bundle cache.  It
@@ -1737,6 +1730,16 @@ typedef struct {
     int16_t irqc_pending_hi;
     uint16_t irqc_in_service_hi;
 } MercedTranslationCache;
+
+static bool code_page_ed(Merced *m) {
+    const MercedTranslationCache *tc = m->translation_cache;
+    return (m->psr & PSR_IT) && tc && tc->fetch_ed;
+}
+
+static void code_page_ed_set(Merced *m, bool ed) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (tc) tc->fetch_ed = ed;
+}
 
 struct MercedJit;
 static void mj_flush(struct MercedJit *j);
@@ -1792,6 +1795,7 @@ static void tb_flush(Merced *m) {
     mj_flush(jit);
     tc->translation_generation = 1;
     tc->xlate_generation = 1;
+    m->bundle_cache_translation_valid = false;
 }
 
 /* Drop every soft-TLB entry: a TLB entry, PKR or region register changed. */
@@ -1848,6 +1852,7 @@ static bool xlate_lookup(Merced *m, uint64_t va, uint64_t kind, uint64_t *pa) {
         x->psr_key == (m->psr & XLATE_PSR_KEY) &&
         x->rr == m->rr[va >> 61]) {
         *pa = x->pa_page | (va & 0xFFF);
+        if (kind & 1) tc->fetch_ed = x->code_ed;
         return true;
     }
     return false;
@@ -1862,6 +1867,7 @@ static void xlate_store(Merced *m, uint64_t va, uint64_t kind, uint64_t pa) {
     x->psr_key = m->psr & XLATE_PSR_KEY;
     x->rr = m->rr[va >> 61];
     x->pa_page = pa & ~UINT64_C(0xFFF);
+    x->code_ed = (kind & 1) && tc->fetch_ed;
 }
 
 void merced_flush_translation_cache(Merced *m) { tb_flush(m); }
@@ -7380,6 +7386,7 @@ MercedStatus merced_step(Merced *m) {
     uint64_t slots[3];
     MercedTranslationCache *tc = translation_cache_on
                                ? m->translation_cache : NULL;
+    MercedTranslationCache *edtc = m->translation_cache;
     MercedTbEntry *tb = tc ? &tc->entry[tb_index(bundle_va)] : NULL;
     /* Slots 1/2 normally reuse the bundle just consumed by slot 0.  Test
      * this compact CPU-local cache before hashing into the much larger TB
@@ -7392,6 +7399,7 @@ MercedStatus merced_step(Merced *m) {
          * tlb_serialize_instruction(), so no translation-affecting change
          * can leave this PA live past its architectural visibility point. */
         pa = m->bundle_cache_pa;
+        edtc->fetch_ed = edtc->bundle_ed;
         lo = m->bundle_cache_lo;
         hi = m->bundle_cache_hi;
         tmpl = m->bundle_cache_tmpl;
@@ -7402,6 +7410,7 @@ MercedStatus merced_step(Merced *m) {
         tb->translation_generation == tc->translation_generation &&
         tb->code_generation == tc->page_generation[tb_page_index(tb->pa)]) {
         pa = tb->pa;
+        edtc->fetch_ed = edtc->bundle_ed = tb->code_ed;
         lo = tb->lo;
         hi = tb->hi;
         tmpl = tb->tmpl;
@@ -7426,6 +7435,7 @@ MercedStatus merced_step(Merced *m) {
          * bundle (or after each serialization point). */
         if (!(m->psr & PSR_IT)) {
             pa = bundle_va & MERCED_PHYS_MASK;
+            edtc->fetch_ed = false;
         } else if (!va_translate(m, bundle_va, true, false, ISR_X, &pa, &st)) {
             return st;   /* ITLB miss delivered (or halt) */
         }
@@ -7465,10 +7475,12 @@ MercedStatus merced_step(Merced *m) {
             m->bundle_cache_slots[2] = slots[2];
         }
         m->bundle_cache_translation_valid = true;
+        edtc->bundle_ed = edtc->fetch_ed;
         /* Not memory's bundle: an entry would outlive the line. */
         if (tb && !served) {
             tb->va = bundle_va;
             tb->pa = pa;
+            tb->code_ed = edtc->fetch_ed;
             tb->lo = lo;
             tb->hi = hi;
             tb->slots[0] = slots[0];
@@ -8110,6 +8122,7 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
     }
 
     if (!from_bundle_cache) {
+        tc->bundle_ed = tb->code_ed;
         m->bundle_cache_valid = true;
         m->bundle_cache_translation_valid = true;
         m->bundle_cache_va = bundle_va;
@@ -8122,6 +8135,7 @@ static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
         m->bundle_cache_slots[2] = tb->slots[2];
         tc->cur_tb = tb;
     }
+    tc->fetch_ed = tc->bundle_ed;
     bool redirected = false;
     return fast_slot(m, tb, slot, bundle_va, &redirected);
 }

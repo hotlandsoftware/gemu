@@ -54,6 +54,24 @@ typedef struct {
     void *opaque;
 } Rage128Wiring;
 
+/* Host memory transactions for the CCE bus master. Passed to each poll so
+ * no additional host pointers enter the saved device state. */
+typedef struct {
+    bool (*read)(void *opaque, uint64_t addr, void *buf, unsigned len);
+    bool (*write)(void *opaque, uint64_t addr, const void *buf, unsigned len);
+    void *opaque;
+} Rage128Dma;
+
+typedef struct {
+    uint32_t fifo[192];
+    uint32_t head, count;
+    uint32_t packet[16385];          /* header + maximum 14-bit COUNT body */
+    uint32_t have, need;
+    uint32_t microcode[256][2];
+    uint32_t mode24;
+    uint64_t reserved;
+} Rage128Cce;
+
 typedef struct Rage128 {
     Rage128Wiring wiring;             /* HOST POINTERS: clock, irq, opaque */
     Vga *vga;                         /* HOST POINTER, borrowed */
@@ -70,6 +88,7 @@ typedef struct Rage128 {
      * and GEN_INT_STATUS CRTC_VBLANK_INT / CRTC_VLINE_INT were last cleared. */
     uint64_t vblank_save_clear, int_vblank_clear, int_vline_clear;
     bool irq_out;                     /* INTA# as last reported */
+    _Alignas(8) Rage128Cce cce;        /* appended; i2000 can import v40 states */
 } Rage128;
 
 /* Power-on. `vga` is borrowed and must already be initialised with
@@ -110,6 +129,9 @@ bool rage128_rom_range(const Rage128 *r, uint64_t *base, uint64_t *size);
 /* Bring INTA# up to date with the raster (VBLANK/VLINE interrupts). Call
  * periodically; cheap when no interrupt is enabled. */
 void rage128_tick(Rage128 *r);
+/* Fetch and execute a bounded amount of CCE work, including while headless.
+ * DMA prefetch runs independently of the microengine's FREERUN control. */
+void rage128_cce_tick(Rage128 *r, const Rage128Dma *dma);
 
 /* Native (extended) CRTC scan-out into an ARGB8888 frame buffer with the
  * hardware cursor; false while the CRTC shows the VGA core's picture (the

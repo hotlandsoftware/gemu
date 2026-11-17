@@ -18,7 +18,8 @@
  *    clock; the DAC load-sense comparators; GPIO_MONID's pads;
  *  - legacy VGA ports 3B0-3DF and the 0xA0000 window, served by the VGA core;
  *  - native CRTC scan-out with the hardware cursor; the 2D engine
- *    (rage128_gui.c).
+ *    (rage128_gui.c); standard CCE packets and PCI GART bus mastering
+ *    (rage128_cce.c).
  * A register whose behaviour is not modelled is named the first time it is
  * accessed (r128_unimpl), never silently stored. */
 #include "rage128_internal.h"
@@ -127,6 +128,11 @@ static void reset_regs(Rage128 *r) {
         r->pll[rage128_pll_regs[k].offset & 63] = rage128_pll_regs[k].reset;
     }
     r128_gui_reset(r);
+    memset(&r->cce, 0, sizeof r->cce);
+    /* The high-level CCE supplies the standard packet decoder at reset.
+     * Firmware-initialized drivers can select a FIFO mode directly; drivers
+     * uploading microcode can explicitly stop/start it through MICRO_CNTL. */
+    REG(0x7fc) = 1u << 30;
 }
 
 /* ---- registers ------------------------------------------------------------ */
@@ -504,6 +510,9 @@ static uint32_t reg_read32(Rage128 *r, uint32_t off) {
         return cfg_mirror(r, off);
     }
     uint32_t gv;
+    if (r128_cce_read(r, off, &gv)) {
+        return gv;
+    }
     if (r128_gui_read(r, off, &gv)) {
         return gv;
     }
@@ -570,11 +579,14 @@ static uint32_t reg_read32(Rage128 *r, uint32_t off) {
     }
 }
 
-static void reg_write32(Rage128 *r, uint32_t off, uint32_t v, uint32_t mask) {
+void r128_reg_write(Rage128 *r, uint32_t off, uint32_t v, uint32_t mask) {
     if (off >= 0xF00 && off < 0x1000) {
         return;  /* read-only mirror */
     }
     r->vga->disp_gen++;
+    if (r128_cce_write(r, off, v, mask)) {
+        return;
+    }
     if (r128_gui_write(r, off, v, mask)) {
         return;
     }
@@ -590,7 +602,7 @@ static void reg_write32(Rage128 *r, uint32_t off, uint32_t v, uint32_t mask) {
             fb_access(r, a, 4, true, (old & ~mask) | (v & mask));
             return;
         }
-        reg_write32(r, idx & (RAGE128_REG_APER_SIZE - 4), v, mask);
+        r128_reg_write(r, idx & (RAGE128_REG_APER_SIZE - 4), v, mask);
         return;
     }
     case GPIO_MONID:
@@ -688,7 +700,7 @@ static uint32_t reg_access(Rage128 *r, uint32_t off, unsigned size, bool write, 
     }
     const uint32_t mask = (size == 4 ? 0xFFFFFFFFu : (1u << (8 * size)) - 1) << sh;
     if (write) {
-        reg_write32(r, dw, v << sh, mask);
+        r128_reg_write(r, dw, v << sh, mask);
         return 0;
     }
     return (reg_read32(r, dw) & mask) >> sh;

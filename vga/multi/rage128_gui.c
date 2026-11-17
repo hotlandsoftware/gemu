@@ -22,9 +22,10 @@
  *     composite registers and DP_GUI_MASTER_CNTL's defaults (RRG 7.5);
  *   - status: each operation completes at once; GUI_STAT shows an idle
  *     engine with 64 free FIFO entries.
- * Reported when used: other datatypes (24 bpp, YUV, 3D), colour compare, the
+ *   - source/destination colour keys; RGB CCE scaling and additive alpha blending.
+ * Reported when used: other datatypes (24 bpp, YUV, 3D), the
  * auxiliary scissors, trapezoids, sub-pixel coordinates, tiling, the CCE
- * command processor and the 3D registers (0x1800 up). */
+ * custom microcode and the 3D registers (0x1800 up). */
 #include "rage128_internal.h"
 
 #include <stdio.h>
@@ -42,7 +43,8 @@ enum {
     SRC_X_Y = 0x1590, DST_X_Y = 0x1594, DST_WIDTH_HEIGHT = 0x1598,
     DST_WIDTH_X_INCY = 0x159C, DST_HEIGHT_Y = 0x15A0, DST_X_SUB = 0x15A4,
     DST_Y_SUB = 0x15A8, SRC_OFFSET = 0x15AC, SRC_PITCH = 0x15B0,
-    DST_HEIGHT_WIDTH_BW = 0x15B4, CLR_CMP_CNTL = 0x15C0, CLR_CMP_MSK = 0x15CC,
+    DST_HEIGHT_WIDTH_BW = 0x15B4, CLR_CMP_CNTL = 0x15C0,
+    CLR_CMP_CLR_SRC = 0x15C4, CLR_CMP_CLR_DST = 0x15C8, CLR_CMP_MSK = 0x15CC,
     DP_SRC_FRGD_CLR = 0x15D8, DP_SRC_BKGD_CLR = 0x15DC, DST_BRES_ERR = 0x1628,
     DST_BRES_INC = 0x162C, DST_BRES_DEC = 0x1630, DST_BRES_LNTH = 0x1634,
     SC_LEFT = 0x1640, SC_RIGHT = 0x1644, SC_TOP = 0x1648, SC_BOTTOM = 0x164C,
@@ -88,8 +90,15 @@ static unsigned datatype_bpp(unsigned t) {
     }
 }
 
-static uint32_t rd_px(const Rage128 *r, uint32_t a, unsigned bpp) {
-    if (a + bpp > r128_vram_bytes(r)) {
+/* Keep signed surface coordinates through address calculation. In particular,
+ * -4 must not become UINT32_MAX-3 and wrap a 32-bit end-address check to zero. */
+static bool valid_pixel(const Rage128 *r, int64_t a, unsigned bpp) {
+    return a >= 0 && (uint64_t)a <= r128_vram_bytes(r) &&
+           bpp <= r128_vram_bytes(r) - (uint64_t)a;
+}
+
+static uint32_t rd_px(const Rage128 *r, int64_t a, unsigned bpp) {
+    if (!valid_pixel(r, a, bpp)) {
         return 0;
     }
     uint32_t v = 0;
@@ -99,8 +108,8 @@ static uint32_t rd_px(const Rage128 *r, uint32_t a, unsigned bpp) {
     return v;
 }
 
-static void wr_px(Rage128 *r, uint32_t a, unsigned bpp, uint32_t v) {
-    if (a + bpp > r128_vram_bytes(r)) {
+static void wr_px(Rage128 *r, int64_t a, unsigned bpp, uint32_t v) {
+    if (!valid_pixel(r, a, bpp)) {
         return;
     }
     for (unsigned k = 0; k < bpp; k++) {
@@ -151,9 +160,6 @@ static bool setup(Rage128 *r, Op *o) {
     }
     if ((R(DST_PITCH) >> 17) & 3u) {
         unknown("pitch-adj", "DST_PITCH_ADJ");
-    }
-    if (R(CLR_CMP_CNTL) & 0x707u) {
-        unknown("clr-cmp", "colour compare");
     }
     if (R(AUX_SC_CNTL) & 0x15u) {
         unknown("aux-sc", "auxiliary scissors");
@@ -215,6 +221,16 @@ static bool rop_uses_source(unsigned rop) {
     return ((rop >> 2) ^ rop) & 0x33u;
 }
 
+static bool compare(unsigned fn, uint32_t value, uint32_t ref, uint32_t mask) {
+    switch (fn) {
+    case 0: return true;
+    case 1: return false;
+    case 4: return (value & mask) == (ref & mask);
+    case 5: return (value & mask) != (ref & mask);
+    default: return true;
+    }
+}
+
 /* Draw one pixel with source value s (valid unless src_skip). */
 static void pixel(Rage128 *r, const Op *o, int x, int y, uint32_t s, bool src_skip) {
     if (x < o->sc_l || x > o->sc_r || y < o->sc_t || y > o->sc_b || x < 0 || y < 0) {
@@ -228,11 +244,93 @@ static void pixel(Rage128 *r, const Op *o, int x, int y, uint32_t s, bool src_sk
     if (pskip) {
         return;
     }
-    const uint32_t a = o->dst_base + (uint32_t)y * o->dst_pitch + (uint32_t)x * o->bpp;
+    const int64_t a = o->dst_base + (int64_t)y * o->dst_pitch + (int64_t)x * o->bpp;
     const uint32_t d = rd_px(r, a, o->bpp);
+    const uint32_t cmp = R(CLR_CMP_CNTL), mask = R(CLR_CMP_MSK);
+    unsigned select = (cmp >> 24) & 3;
+    unsigned dst_fn = (cmp >> 8) & 7;
+    if (dst_fn == 4 || dst_fn == 5) dst_fn ^= 1; /* destination match preserves */
+    if ((select == 0 || select == 2) &&
+        !compare(dst_fn, d, R(CLR_CMP_CLR_DST), mask)) return;
+    if ((select == 1 || select == 2) &&
+        !compare(cmp & 7, s, R(CLR_CMP_CLR_SRC), mask)) return;
+    if ((select == 1 || select == 2) && (cmp & 7) == 7 &&
+        (s & mask) == (R(CLR_CMP_CLR_SRC) & mask)) s ^= R(DP_SRC_FRGD_CLR);
     uint32_t v = rop3(o->rop, p, s, d);
     v = (d & ~o->mask) | (v & o->mask);
     wr_px(r, a, o->bpp, v);
+}
+
+static uint32_t unpack_rgb(uint32_t v, unsigned type) {
+    if (type == 6) return v;
+    unsigned red = (v >> (type == 4 ? 11 : 10)) & 31;
+    unsigned green = (v >> 5) & (type == 4 ? 63 : 31), blue = v & 31;
+    unsigned a = type == 4 || (v & 0x8000) ? 255 : 0;
+    red = (red << 3) | (red >> 2); blue = (blue << 3) | (blue >> 2);
+    green = type == 4 ? (green << 2) | (green >> 4) : (green << 3) | (green >> 2);
+    return a << 24 | red << 16 | green << 8 | blue;
+}
+
+static uint32_t pack_rgb(uint32_t v, unsigned type) {
+    if (type == 6) return v;
+    return type == 4 ? ((v >> 8) & 0xf800) | ((v >> 5) & 0x7e0) | ((v >> 3) & 31) :
+           ((v >> 16) & 0x8000) | ((v >> 9) & 0x7c00) | ((v >> 6) & 0x3e0) | ((v >> 3) & 31);
+}
+
+static unsigned blend_factor(unsigned factor, uint32_t src, uint32_t dst, unsigned ch) {
+    switch (factor) {
+    case 0: return 0;
+    case 1: return 255;
+    case 2: return (src >> ch) & 255;
+    case 3: return 255 - ((src >> ch) & 255);
+    case 4: return src >> 24;
+    case 5: return 255 - (src >> 24);
+    case 6: return dst >> 24;
+    case 7: return 255 - (dst >> 24);
+    case 8: return (dst >> ch) & 255;
+    case 9: return 255 - ((dst >> ch) & 255);
+    default: return 0;
+    }
+}
+
+/* SDK-G04000 F.13: RGB nearest-sample scaling and additive alpha blending.
+ * Other texture-combine, fog and tiled operations remain explicit limits. */
+bool r128_gui_scale(Rage128 *r, const uint32_t *p, bool apply) {
+    unsigned type = p[3] & 15, sf = (p[0] >> 16) & 15, df = (p[0] >> 20) & 15;
+    if ((type != 3 && type != 4 && type != 6) || (p[2] & 0x3c00f) ||
+        (p[1] & ((1u << 7) | (1u << 10))) || (p[4] & 0xc0000000) ||
+        (p[5] & 0x1e0000) || (p[5] >> 30) == 3 ||
+        ((p[1] & (1u << 9)) && (sf > 9 || df > 9 || (p[0] & 0x3000))))
+        return false;
+    if (!apply) return true;
+    Op o;
+    if (!setup(r, &o) || (o.dst_type != 3 && o.dst_type != 4 && o.dst_type != 6))
+        return false;
+    unsigned bpp = datatype_bpp(type), pitch = ((p[5] & 511) * 8) << (p[5] >> 30);
+    int x0 = s14(p[9] >> 16), y0 = s14(p[9]);
+    unsigned w = p[10] & 0x3fff, h = (p[10] >> 16) & 0x3fff;
+    for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) {
+        int dx = x0 + (int)x, dy = y0 + (int)y;
+        if (dx < 0 || dy < 0 || dx < o.sc_l || dx > o.sc_r || dy < o.sc_t || dy > o.sc_b)
+            continue;
+        uint64_t sx = ((uint64_t)x * (p[7] & 0xffff0)) >> 16;
+        uint64_t sy = ((uint64_t)y * (p[8] & 0xffff0)) >> 16;
+        uint64_t sa = (p[4] & 0x3ffffff) + (sy * pitch + sx) * bpp;
+        if (sa + bpp > r128_vram_bytes(r)) continue;
+        uint32_t color = unpack_rgb(rd_px(r, (uint32_t)sa, bpp), type);
+        if (p[1] & (1u << 9)) {
+            int64_t da = o.dst_base + (int64_t)dy * o.dst_pitch + (int64_t)dx * o.bpp;
+            uint32_t dst = unpack_rgb(rd_px(r, da, o.bpp), o.dst_type), out = 0;
+            for (unsigned ch = 0; ch < 32; ch += 8) {
+                unsigned v = (((color >> ch) & 255) * blend_factor(sf, color, dst, ch) +
+                              ((dst >> ch) & 255) * blend_factor(df, color, dst, ch) + 127) / 255;
+                out |= (v > 255 ? 255 : v) << ch;
+            }
+            color = out;
+        }
+        pixel(r, &o, dx, dy, pack_rgb(color, o.dst_type), false);
+    }
+    return true;
 }
 
 /* A mono source bit expanded (DP_SRC_DATATYPE 0: frgd/bkgd, 1: frgd/leave). */
@@ -276,14 +374,14 @@ static void rectangle(Rage128 *r, int w, int h) {
             bool skip = false;
             if (need_src) {
                 if (o.src_type == 3) {
-                    s = rd_px(r, o.src_base + (uint32_t)sy * o.src_pitch + (uint32_t)sx * o.bpp,
+                    s = rd_px(r, o.src_base + (int64_t)sy * o.src_pitch + (int64_t)sx * o.bpp,
                               o.bpp);
                 } else {
                     /* A mono source in memory: a bit per pixel, pitch in
                      * pixels x 8 (RRG: a multiple of 64 pixels). */
                     const uint32_t bpitch = (R(SRC_PITCH) & 0x3FFu) * 8 / 8;
-                    const uint8_t byte = r->vga->vram[(o.src_base + (uint32_t)sy * bpitch +
-                                                       (uint32_t)sx / 8) % r128_vram_bytes(r)];
+                    const uint8_t byte = rd_px(r, o.src_base + (int64_t)sy * bpitch +
+                                                 (sx - (sx & 7)) / 8, 1);
                     const bool bit = o.lsb_first ? (byte >> (sx & 7)) & 1u
                                                  : (byte >> (7 - (sx & 7))) & 1u;
                     s = mono(r, &o, bit, &skip);

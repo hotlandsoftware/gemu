@@ -93,6 +93,7 @@ struct MercedJitBlock {
     MercedTbEntry *tbs;     /* decoded bundles (also the bytes to re-verify) */
     MercedJitSlot *slots;
     bool stores;            /* has a memory-writing slot (idle detection) */
+    bool code_ed;           /* ITLB.ed of this block's instruction page */
 };
 
 /* Host TLB entry for direct RAM access (see mj_gen_mem()). */
@@ -1501,6 +1502,7 @@ static MercedJitBlock *mj_translate(Merced *m, MercedJit *j, uint64_t ip,
     blk->va = ip;
     blk->pa = pa_bundle;
     blk->key = key;
+    blk->code_ed = tc->fetch_ed;
     blk->n_bundles = nb;
     blk->n_slots = ns;
     for (unsigned i = 0; i < ns; i++) {
@@ -1616,13 +1618,16 @@ static MJEnter mj_enter(Merced *m, MercedTranslationCache *tc, MercedJit *j,
         if (m->bundle_cache_valid && m->bundle_cache_translation_valid &&
             m->bundle_cache_va == bva) {
             pa = m->bundle_cache_pa;
+            tc->fetch_ed = tc->bundle_ed;
         } else if (tbe->valid && tbe->va == bva &&
                    tbe->translation_generation == tc->translation_generation &&
                    tbe->code_generation ==
                        tc->page_generation[tb_page_index(tbe->pa)]) {
             pa = tbe->pa;
+            tc->fetch_ed = tbe->code_ed;
         } else if (!(m->psr & PSR_IT)) {
             pa = bva & MERCED_PHYS_MASK;
+            tc->fetch_ed = false;
         } else if (!va_translate(m, bva, true, false, ISR_X, &pa, st)) {
             return MJ_FETCH_FAULT;
         }
@@ -1630,6 +1635,7 @@ static MJEnter mj_enter(Merced *m, MercedTranslationCache *tc, MercedJit *j,
             j->stats.retranslate++;
             if (blk->pa == pa) {
                 blk->tgen = tc->translation_generation;
+                blk->code_ed = tc->fetch_ed;
             } else {
                 mj_unlink(j, blk);
                 blk = NULL;
@@ -1645,6 +1651,7 @@ static MJEnter mj_enter(Merced *m, MercedTranslationCache *tc, MercedJit *j,
         }
     }
 
+    tc->fetch_ed = blk->code_ed;
     /* Code bytes */
     uint32_t cg = tc->page_generation[tb_page_index(blk->pa)];
     if (blk->code_gen != cg) {

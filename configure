@@ -88,6 +88,7 @@ FAMILY_SRC = {
         'vga/multi/input_menu.c',
         'vga/multi/rage128.c',
         'vga/multi/rage128_gui.c',
+        'vga/multi/rage128_cce.c',
         'vga/multi/rage128_regs.c',
         'vga/multi/vga.c',
         'vga/multi/vga_ibm.c',

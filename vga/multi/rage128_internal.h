@@ -1,7 +1,6 @@
 #pragma once
 
-/* Shared by rage128.c (bus interface, registers, display) and rage128_gui.c
- * (the 2D drawing engine). Nothing else includes it. */
+/* Shared by the Rage 128 bus/display, GUI and CCE implementations. */
 
 #include "rage128.h"
 #include "rage128_regs.h"
@@ -19,6 +18,11 @@ void r128_unimpl(const char *key, const char *fmt, ...)
 bool r128_gui_write(Rage128 *r, uint32_t off, uint32_t v, uint32_t mask);
 bool r128_gui_read(Rage128 *r, uint32_t off, uint32_t *v);
 void r128_gui_reset(Rage128 *r);
+bool r128_gui_scale(Rage128 *r, const uint32_t *params, bool apply);
+
+bool r128_cce_read(Rage128 *r, uint32_t off, uint32_t *v);
+bool r128_cce_write(Rage128 *r, uint32_t off, uint32_t v, uint32_t mask);
+void r128_reg_write(Rage128 *r, uint32_t off, uint32_t v, uint32_t mask);
 
 static inline uint32_t r128_vram_bytes(const Rage128 *r) {
     return (uint32_t)r->vga->vram_size;

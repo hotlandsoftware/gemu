@@ -977,6 +977,325 @@ static void test_reset(void) {
     CHECK(rage128_cfg_read(&copy, 0x00, 4) == 0x52461002u);
 }
 
+static uint8_t dma_ram[0x10000];
+static unsigned dma_reads, dma_writes;
+
+static bool dma_read(void *opaque, uint64_t addr, void *out, unsigned len) {
+    (void)opaque;
+    if (addr >= sizeof dma_ram || len > sizeof dma_ram - addr) return false;
+    memcpy(out, dma_ram + addr, len);
+    dma_reads++;
+    return true;
+}
+
+static bool dma_write(void *opaque, uint64_t addr, const void *in, unsigned len) {
+    (void)opaque;
+    if (addr >= sizeof dma_ram || len > sizeof dma_ram - addr) return false;
+    memcpy(dma_ram + addr, in, len);
+    dma_writes++;
+    return true;
+}
+
+static void dma_put(unsigned addr, uint32_t v) {
+    for (unsigned i = 0; i < 4; i++) dma_ram[addr + i] = v >> (i * 8);
+}
+
+static void cce_poll(void) {
+    const Rage128Dma dma = {dma_read, dma_write, NULL};
+    rage128_cce_tick(&card, &dma);
+}
+
+static void cce_start(void) {
+    power_on();
+    map_card();
+    memset(dma_ram, 0, sizeof dma_ram);
+    dma_reads = dma_writes = 0;
+    /* Noncontiguous physical pages, accessed through the PCI GART. */
+    dma_put(0x1000, 0x4000);
+    dma_put(0x1004, 0x8000);
+    reg_w(0x17c, 0x1000);
+    reg_w(0x030, 0);
+    CHECK(reg_r(0x7fc) == (1u << 30)); /* high-level decoder ready at reset */
+    reg_w(0x7fc, 0); /* hold the microengine while exercising DMA prefetch */
+    reg_w(0x704, 0x2800000a); /* 8 KiB, 192-word DMA FIFO, no writeback */
+}
+
+static void test_cce(void) {
+    cce_start();
+    for (unsigned i = 0; i < 256; i++) dma_put(0x4000 + i * 4, 0x80000000);
+    reg_w(0x714, 64);
+    cce_poll();
+    CHECK(dma_reads == 0 && reg_r(0x710) == 0); /* PCI bus master off */
+    cfg_w(4, 2, 7);
+    reg_w(0x030, 1u << 6);
+    cce_poll();
+    CHECK(dma_reads == 0); /* BUS_MASTER_DIS also gates DMA */
+    reg_w(0x030, 0);
+    reg_w(0x700, 0x02000000); /* AGP-space alias of the PCI GART ring */
+    cce_poll();
+    CHECK(reg_r(0x710) == 64); /* XP primes NOPs with the microengine stopped */
+    CHECK(card.cce.count == 64 && reg_r(0x7b8) == 128);
+    CHECK(dma_writes == 0);
+    reg_w(0x714, 256);
+    cce_poll();
+    CHECK(reg_r(0x710) == 192 && card.cce.count == 192); /* bounded FIFO */
+    reg_w(0x7fc, 1u << 30);
+    cce_poll();
+    CHECK(reg_r(0x710) == 256 && reg_r(0x7b8) == 192);
+
+    /* Ring wrap crosses a GART page and resumes a split type-0 packet.
+     * No register writes occur until all of that packet has arrived. */
+    reg_w(0x710, 2047);
+    reg_w(0x714, 0);
+    dma_put(0x8ffc, (1u << 16) | (BIOS_0_SCRATCH / 4));
+    cce_poll();
+    CHECK(reg_r(0x710) == 0 && card.cce.have == 1);
+    CHECK(reg_r(BIOS_0_SCRATCH) == 0);
+    static Rage128 saved;
+    saved = card; /* the partial packet survives a raw snapshot/rebind */
+    rage128_reset(&card);
+    card = saved;
+    rage128_rebind(&card, &vga, &wiring);
+    dma_put(0x4000, 0x11223344);
+    dma_put(0x4004, 0x55667788);
+    reg_w(0x70c, 0x2000);
+    reg_w(0x704, 0x2000000a); /* enable physical read-pointer writeback */
+    reg_w(0x714, 2);
+    cce_poll();
+    CHECK(reg_r(BIOS_0_SCRATCH) == 0x11223344);
+    CHECK(reg_r(BIOS_0_SCRATCH + 4) == 0x55667788);
+    CHECK(dma_ram[0x2000] == 2 && dma_ram[0x2001] == 0 && dma_writes == 2);
+
+    /* Type-1 writes two unrelated registers; type-0 ONE_REG_WR repeatedly
+     * targets the same register instead of spilling to its neighbour. */
+    dma_put(0x4008, 0x40000000 | (BIOS_0_SCRATCH / 4) |
+                          ((BIOS_0_SCRATCH + 12) / 4 << 11));
+    dma_put(0x400c, 0xaabbccdd);
+    dma_put(0x4010, 0xeeff0011);
+    dma_put(0x4014, (1u << 16) | 0x8000 | (BIOS_0_SCRATCH / 4));
+    dma_put(0x4018, 0x1234);
+    dma_put(0x401c, 0x5678);
+    reg_w(0x714, 8);
+    cce_poll();
+    CHECK(reg_r(BIOS_0_SCRATCH) == 0x5678);
+    CHECK(reg_r(BIOS_0_SCRATCH + 4) == 0x55667788);
+    CHECK(reg_r(BIOS_0_SCRATCH + 12) == 0xeeff0011);
+
+    /* A bad GART entry cannot acknowledge unfetched commands. */
+    dma_put(0x1000, 0xfffff000);
+    reg_w(0x714, 9);
+    cce_poll();
+    CHECK(reg_r(0x710) == 8);
+    /* PIO uses the same packet parser, without requiring bus mastering. */
+    reg_w(0x704, 0x10000000);
+    cfg_w(4, 2, 3);
+    reg_w(0x1000, BIOS_0_SCRATCH / 4);
+    reg_w(0x1004, 0xabcdef01);
+    cce_poll();
+    CHECK(reg_r(BIOS_0_SCRATCH) == 0xabcdef01);
+    reg_w(0x7d4, 5);
+    reg_w(0x7dc, 0x12345678);
+    reg_w(0x7e0, 0x9abcdef0);
+    reg_w(0x7d8, 5);
+    CHECK(reg_r(0x7dc) == 0x12345678 && reg_r(0x7e0) == 0x9abcdef0);
+    CHECK(reg_r(0x7d4) == 6);
+    reg_w(0x1000, BIOS_0_SCRATCH / 4);
+    reg_w(0x0f0, 1);
+    CHECK(card.cce.have == 0 && card.cce.count == 0);
+}
+
+static void submit(unsigned op, const uint32_t *words, unsigned n) {
+    reg_w(0x1000, 0xc0000000 | ((n - 1) << 16) | (op << 8));
+    for (unsigned i = 0; i < n; i++) reg_w(0x1004, words[i]);
+    cce_poll();
+}
+#define SUBMIT(op, ...) do { const uint32_t words[] = {__VA_ARGS__}; \
+    submit(op, words, sizeof words / sizeof words[0]); } while (0)
+
+static void test_cce_drawing(void) {
+    cce_start();
+    reg_w(0x704, 0x10000000);
+    reg_w(0x7fc, 1u << 30);
+    memset(vram, 0, sizeof vram);
+    reg_w(DEFAULT_OFFSET, 0);
+    reg_w(DEFAULT_PITCH, 2); /* 16 pixels */
+    reg_w(DEFAULT_SC_BOTTOM_RIGHT, 0x000f000f);
+    const uint32_t fill = 0x70f002d0; /* 8bpp, solid PATCOPY, defaults */
+    SUBMIT(0x9a, fill, 0x5a, 0x00020003, 0x00040002);
+    CHECK(vram[3 * 16 + 2] == 0x5a && vram[4 * 16 + 5] == 0x5a);
+    CHECK(vram[3 * 16 + 1] == 0 && vram[5 * 16 + 2] == 0);
+    SUBMIT(0x91, fill, 0x7b, 0x00060008, 0x0008000a);
+    CHECK(vram[6 * 16 + 8] == 0x7b && vram[7 * 16 + 9] == 0x7b);
+    CHECK(vram[8 * 16 + 8] == 0);
+    /* Copy overlaps its source in both axes. */
+    for (unsigned y = 0; y < 3; y++) for (unsigned x = 0; x < 4; x++)
+        vram[y * 16 + x] = 1 + y * 4 + x;
+    const uint32_t copy = 0x72cc32f0;
+    SUBMIT(0x9b, copy, 0, 0x00010001, 0x00040003);
+    for (unsigned y = 0; y < 3; y++) for (unsigned x = 0; x < 4; x++)
+        CHECK(vram[(y + 1) * 16 + x + 1] == 1 + y * 4 + x);
+    SUBMIT(0x28, copy, 0x00010001, 0x00040007, 0x00040003);
+    for (unsigned y = 0; y < 3; y++) for (unsigned x = 0; x < 4; x++)
+        CHECK(vram[(y + 7) * 16 + x + 4] == 1 + y * 4 + x);
+    /* Text setup can be sent without a bitmap, then reused by NEXTCHAR. */
+    SUBMIT(0x94, 0x73cc02f0, 0xe1, 0x19);
+    SUBMIT(0x19, 0x000a0000, 0x00010008, 0x000000a5);
+    CHECK(vram[10 * 16] == 0xe1 && vram[10 * 16 + 1] == 0x19);
+    CHECK(vram[10 * 16 + 7] == 0xe1);
+    CHECK(!card.host.active);
+    /* Color-keyed source pixels leave the destination intact. */
+    vram[0] = 1; vram[1] = 2; vram[32] = vram[33] = 9;
+    SUBMIT(0x9c, copy, 0x01000005, 1, 0, 0, 0x00020000, 0x00010002);
+    CHECK(vram[32] == 9 && vram[33] == 2);
+    /* Nearest-sample 2x RGB scaling. */
+    uint32_t colors[] = {0xff123456, 0xffabcdef};
+    memcpy(vram + 0x1000, colors, sizeof colors);
+    SUBMIT(0x96, 0x7acc36f0, 0x100, 0, 0x02180840, 6, 0x1000, 1,
+           0, 0x8000, 0x10000, 0, 0x00010004);
+    uint32_t out[4]; memcpy(out, vram, sizeof out);
+    CHECK(out[0] == colors[0] && out[1] == colors[0]);
+    CHECK(out[2] == colors[1] && out[3] == colors[1]);
+    /* Half-transparent red over opaque blue, additive SRCALPHA/INVSRCALPHA. */
+    colors[0] = 0x80ff0000; memcpy(vram + 0x1000, colors, 4);
+    colors[1] = 0xff0000ff; memcpy(vram, colors + 1, 4);
+    SUBMIT(0x96, 0x7acc36f0, 0x00540100, 0x200, 0x02180840, 6, 0x1000, 1,
+           0, 0x10000, 0x10000, 0, 0x00010001);
+    memcpy(out, vram, 4);
+    CHECK((out[0] & 0xffffff) == 0x80007f);
+    CHECK(reg_r(0x7b8) == 192);
+    /* A truncated second rectangle must not draw even the first one. */
+    uint8_t before = vram[200];
+    SUBMIT(0x9a, fill, 0xff, 0x0008000c, 0x00010001, 0);
+    CHECK(vram[200] == before);
+    CHECK(card.cce.have && (reg_r(0x7b8) & 0x80000000));
+    reg_w(0x0f0, 1);
+}
+
+static void test_cce_copy_directions(void) {
+    /* Overlapping copies need all four traversal combinations. In particular,
+     * copying up/left used to send 3 to the composite direction register,
+     * whose direction bits are at 31 and 15, and walk backwards instead. */
+    for (unsigned op = 0; op < 2; op++) for (unsigned dir = 0; dir < 4; dir++) {
+        cce_start();
+        reg_w(0x704, 0x10000000);
+        reg_w(0x7fc, 1u << 30);
+        reg_w(DEFAULT_OFFSET, 0);
+        reg_w(DEFAULT_PITCH, 2);
+        reg_w(DEFAULT_SC_BOTTOM_RIGHT, 0x000f000f);
+        uint8_t expected[16 * 16];
+        for (unsigned i = 0; i < sizeof expected; i++) vram[i] = expected[i] = i;
+        unsigned sx = 3, sy = 3, dx = dir & 1 ? 2 : 4, dy = dir & 2 ? 2 : 4;
+        for (unsigned y = 0; y < 4; y++) for (unsigned x = 0; x < 5; x++)
+            expected[(dy + y) * 16 + dx + x] = vram[(sy + y) * 16 + sx + x];
+        SUBMIT(op ? 0x28 : 0x9b, 0x72cc32f0,
+               sx << 16 | sy, dx << 16 | dy, 5u << 16 | 4u);
+        CHECK((reg_r(0x16c0) & 3) == dir);
+        CHECK(memcmp(vram, expected, sizeof expected) == 0);
+        CHECK(reg_r(0x7b8) == 192);
+    }
+
+    /* Exact packet from the XP mouse-over crash: copy a 417x110 rectangle
+     * from (111,146) to (106,144) in a 640-pixel, 32bpp surface at 0x8000.
+     * XP's 0x28 builder packs X/width in the HIGH half, just like 0x9b;
+     * swapping halves misplaced window contents even after fixing direction. */
+    cce_start();
+    reg_w(0x704, 0x10000000);
+    reg_w(0x7fc, 1u << 30);
+    reg_w(DEFAULT_OFFSET, 0x8000);
+    reg_w(DEFAULT_PITCH, 80);
+    reg_w(DEFAULT_SC_BOTTOM_RIGHT, 0x1fff1fff);
+    static uint32_t expected[640 * 530];
+    for (unsigned i = 0; i < sizeof expected / sizeof *expected; i++)
+        expected[i] = 0xff000000u | i;
+    memcpy(vram + 0x8000, expected, sizeof expected);
+    for (unsigned y = 0; y < 110; y++)
+        memmove(expected + (144 + y) * 640 + 106,
+                expected + (146 + y) * 640 + 111, 417 * sizeof *expected);
+    SUBMIT(0x28, 0x72cc36f0, 0x006f0092, 0x006a0090, 0x01a1006e);
+    CHECK(memcmp(vram + 0x8000, expected, sizeof expected) == 0);
+    CHECK(reg_r(0x7b8) == 192);
+}
+
+static void test_engine_source_bounds(void) {
+    /* A source before VRAM must not wrap its end address to zero and pass
+     * the bounds check. Also cover a pixel straddling the end of VRAM. */
+    const unsigned types[] = {2, 4, 6}, bytes[] = {1, 2, 4};
+    for (unsigned t = 0; t < 3; t++) {
+        power_on();
+        map_card();
+        reg_w(DEFAULT_OFFSET, 0);
+        reg_w(DEFAULT_PITCH, 2);
+        reg_w(DEFAULT_SC_BOTTOM_RIGHT, 0x000f000f);
+        reg_w(DP_GUI_MASTER_CNTL, 0x72cc30f0 | types[t] << 8);
+        const unsigned bpp = bytes[t], dest = 16 * bpp;
+        memset(vram, 0x5a, 32 * bpp);
+        reg_w(0x1434, 0x00003fff); /* source (-1,0): invalid, then valid */
+        reg_w(DST_Y_X, 0x00010000);
+        reg_w(DST_WIDTH_HEIGHT, 0x00020001);
+        for (unsigned k = 0; k < bpp; k++) {
+            CHECK(vram[dest + k] == 0);
+            CHECK(vram[dest + bpp + k] == 0x5a);
+        }
+        /* A negative coordinate can still name VRAM when the surface has
+         * a nonzero base; preserve that valid signed address arithmetic. */
+        reg_w(0x15ac, 16);
+        reg_w(DST_Y_X, 0x00010000);
+        reg_w(DST_WIDTH_HEIGHT, 0x00010001);
+        CHECK(vram[dest] == 0x5a);
+        size_t original_size = vga.vram_size;
+        vga.vram_size = 0x1000 + bpp - 1;
+        reg_w(0x15ac, 0x1000);
+        reg_w(0x1434, 0);
+        reg_w(DST_WIDTH_HEIGHT, 0x00010001);
+        CHECK(vram[dest] == 0);
+        vga.vram_size = original_size;
+    }
+}
+
+static void test_cce_polyline(void) {
+    cce_start();
+    reg_w(0x704, 0x10000000);
+    reg_w(0x7fc, 1u << 30);
+    reg_w(DEFAULT_OFFSET, 0);
+    reg_w(DEFAULT_PITCH, 2);
+    reg_w(DEFAULT_SC_BOTTOM_RIGHT, 0x000f000f);
+    memset(vram, 0, 256);
+    /* A closed XOR polyline must draw each corner exactly once. */
+    SUBMIT(0x95, 0x705a32d0, 0xff,
+           0x00010001, 0x00010005, 0x00050005, 0x00050001, 0x00010001);
+    for (unsigned y = 0; y < 16; y++) for (unsigned x = 0; x < 16; x++) {
+        bool edge = ((x == 1 || x == 5) && y >= 1 && y <= 5) ||
+                    ((y == 1 || y == 5) && x >= 1 && x <= 5);
+        CHECK(vram[y * 16 + x] == (edge ? 255 : 0));
+    }
+    const int dx[] = {1,1,0,-1,-1,-1,0,1}, dy[] = {0,1,1,1,0,-1,-1,-1};
+    for (unsigned d = 0; d < 8; d++) {
+        memset(vram, 0, 256);
+        uint8_t expected[256] = {0};
+        for (int i = 0; i < 4; i++) expected[(8 + i * dy[d]) * 16 + 8 + i * dx[d]] = 0x5a;
+        SUBMIT(0x95, 0x70f032d0, 0x5a, 0x00080008,
+               (unsigned)(8 + 4 * dy[d]) << 16 | (unsigned)(8 + 4 * dx[d]));
+        CHECK(memcmp(vram, expected, sizeof expected) == 0);
+    }
+    /* Task Manager's actual graph-grid command: a clipped vertical line
+     * in an offscreen 32bpp surface, using explicit pitch and scissors. */
+    const unsigned base = 0xf7e8u << 5, pitch = 32 * 8 * 4;
+    memset(vram + base, 0, pitch * 60);
+    SUBMIT(0x95, 0x72f036da, 0x0400f7e8, 0x00000009, 0x00390009,
+           0x00008040, 0x00000009, 0x003a0009);
+    for (unsigned y = 0; y < 60; y++) {
+        uint32_t v; memcpy(&v, vram + base + y * pitch + 9 * 4, sizeof v);
+        CHECK(v == (y < 58 ? 0x8040u : 0));
+    }
+    CHECK(reg_r(0x7b8) == 192);
+    /* Missing the second vertex cannot consume or apply new settings. */
+    uint32_t color = reg_r(DP_BRUSH_FRGD_CLR);
+    SUBMIT(0x95, 0x70f032d0, 0x66, 0x00010001);
+    CHECK(reg_r(DP_BRUSH_FRGD_CLR) == color);
+    CHECK(card.cce.have && (reg_r(0x7b8) & 0x80000000));
+    reg_w(0x0f0, 1);
+}
+
 int main(void) {
     test_config();
     test_bars();
@@ -992,6 +1311,11 @@ int main(void) {
     test_scanout();
     test_engine();
     test_reset();
+    test_cce();
+    test_cce_drawing();
+    test_cce_copy_directions();
+    test_engine_source_bounds();
+    test_cce_polyline();
     printf("rage128: %u checks passed\n", checks);
     return 0;
 }

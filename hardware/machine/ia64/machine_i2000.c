@@ -2842,6 +2842,34 @@ static Rage128Wiring i2000_rage_wiring(Ia64I2000State *s) {
                             .irq = i2000_rage_irq, .opaque = s };
 }
 
+/* Graphics DMA addresses are PCI physical addresses, not CPU region/SAL
+ * aliases. Restrict the bus master to RAM; an invalid GART entry must not
+ * recursively access the card's own MMIO registers. */
+static bool i2000_rage_dma_read(void *opaque, uint64_t addr, void *buf, unsigned len) {
+    Ia64I2000State *s = opaque;
+    if (addr >= s->ram_size || len > s->ram_size - addr ||
+        i2000_card_claims(s, addr)) return false;
+    memcpy(buf, s->ram + addr, len);
+    return true;
+}
+
+static bool i2000_rage_dma_write(void *opaque, uint64_t addr, const void *buf,
+                                  unsigned len) {
+    Ia64I2000State *s = opaque;
+    if (addr >= s->ram_size || len > s->ram_size - addr ||
+        i2000_card_claims(s, addr)) return false;
+    const uint8_t *p = buf;
+    for (unsigned i = 0; i < len; i++)
+        merced_bus_write(s->cpu, addr + i, p[i], 1);
+    return true;
+}
+
+static void i2000_rage_dma_poll(Ia64I2000State *s) {
+    if (!s->video_enabled) return;
+    const Rage128Dma dma = {i2000_rage_dma_read, i2000_rage_dma_write, s};
+    rage128_cce_tick(&s->rage128, &dma);
+}
+
 /* Install the card's video BIOS image (a PCI expansion ROM, at most 128 KiB). */
 bool ia64_i2000_load_video_rom(Ia64I2000State *s, const char *path) {
     if (!s->video_enabled)
@@ -3203,7 +3231,13 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 40u   /* PCI audio state and card identity in header */
+#define I2000_SNAPSHOT_VERSION 41u   /* Rage 128 CCE FIFO and packet state */
+
+/* Version 40 ends Rage128 just before cce. Its following machine fields
+ * keep their relative layout because the inserted state is 8-byte aligned. */
+_Static_assert(sizeof(Rage128Cce) % 8 == 0, "CCE snapshot insertion alignment");
+_Static_assert(offsetof(Rage128, cce) + sizeof(Rage128Cce) == sizeof(Rage128),
+               "CCE must remain the final Rage128 field for v40 imports");
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -3279,7 +3313,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fread(&version, sizeof(version), 1, f) == 1;
     ok &= fread(&ram_size, sizeof(ram_size), 1, f) == 1;
     if (!ok || magic != I2000_SNAPSHOT_MAGIC ||
-        version != I2000_SNAPSHOT_VERSION || ram_size != s->ram_size) {
+        (version != 40 && version != I2000_SNAPSHOT_VERSION) || ram_size != s->ram_size) {
         fclose(f);
         return false;
     }
@@ -3332,9 +3366,21 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     uint32_t video_rom_len = s->video_rom_len;
     uint8_t *atapi_data = s->atapi_data;
     uint8_t *ata_data = s->ata_data;
-    Ia64I2000State *loaded = malloc(sizeof(*loaded));
+    Ia64I2000State *loaded = calloc(1, sizeof(*loaded));
     if (!loaded) { fclose(f); return false; }
-    ok &= fread(loaded, sizeof(*loaded), 1, f) == 1;
+    if (version == 40) {
+        size_t prefix = offsetof(Ia64I2000State, rage128) + offsetof(Rage128, cce);
+        size_t tail = prefix + sizeof(Rage128Cce);
+        ok &= fread(loaded, 1, prefix, f) == prefix;
+        ok &= fread((uint8_t *)loaded + tail, 1, sizeof(*loaded) - tail, f) ==
+              sizeof(*loaded) - tail;
+        /* v40 had no CCE interpreter or its reset defaults. Supply the
+         * standard decoder just as a fresh reset does in the new model. */
+        if (!loaded->rage128.regs[0x7fc / 4])
+            loaded->rage128.regs[0x7fc / 4] = 1u << 30;
+    } else {
+        ok &= fread(loaded, sizeof(*loaded), 1, f) == 1;
+    }
     if (ok) {
         char nvram_path[sizeof(s->nvram_path)];
         snprintf(nvram_path, sizeof(nvram_path), "%s", s->nvram_path);
@@ -5291,6 +5337,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
 
         if (!gemu_monitor_is_paused(s->monitor)) {
             i2000_run_slice(s);
+            i2000_rage_dma_poll(s);
             i2000_bench_check(s);
             i460gx_pm_poll(&s->chipset);
             mc146818_poll(&s->rtc);

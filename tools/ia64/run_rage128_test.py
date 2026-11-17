@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL_OBJECTS = ("rage128.o", "rage128_gui.o", "rage128_regs.o", "vga.o",
+MODEL_OBJECTS = ("rage128.o", "rage128_gui.o", "rage128_cce.o", "rage128_regs.o", "vga.o",
                  "vgafont16.o")
 
 
@@ -29,7 +29,7 @@ def main():
                      arg.rsplit("/", 1)[1] in MODEL_OBJECTS]
     if len({arg.rsplit("/", 1)[1] for arg in model_objects}) != len(MODEL_OBJECTS):
         raise SystemExit("Configure GEMU with IA-64 enabled first.")
-    subprocess.run(["ninja", *model_objects], cwd=ROOT, check=True)
+    subprocess.run(["ninja", "-j2", *model_objects], cwd=ROOT, check=True)
     rage = next(arg for arg in model_objects if arg.endswith("/rage128.o"))
     with tempfile.TemporaryDirectory(prefix="rage128-", dir=ROOT / "build") as tmp:
         work = Path(tmp)
