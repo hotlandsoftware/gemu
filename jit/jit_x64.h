@@ -392,6 +392,12 @@ static inline void x64_call_abs(X64Buf *b, const void *fn) {
     x64_b(b, 0xFF); x64_b(b, 0xD0);
 }
 
+/* jmp *r */
+static inline void x64_jmp_r(X64Buf *b, int r) {
+    x64_rex(b, 0, -1, -1, r, false);
+    x64_b(b, 0xFF); x64_b(b, (uint8_t)(0xE0 | (r & 7)));
+}
+
 static inline void x64_push(X64Buf *b, int r) {
     x64_rex(b, 0, -1, -1, r, false);
     x64_b(b, (uint8_t)(0x50 + (r & 7)));

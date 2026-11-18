@@ -2358,9 +2358,22 @@ static void i2000_update_fast_ram(Ia64I2000State *s) {
 /* An access wholly inside the plain-RAM span. The two scratch offsets are
  * excluded because SAL's top-of-aperture words there are tracked and
  * re-addressed by i2000_normalize_pa(). */
+/* Below I2000_FAST_RAM_BASE only the legacy VGA window decodes to a device
+ * (i2000_card_claims()); the rest of the first megabyte is RAM, which NT
+ * uses heavily. */
+static inline bool i2000_low_vga(const Ia64I2000State *s, uint64_t addr,
+                                 uint64_t end) {
+    return s->video_enabled && addr < 0xC0000 && end > 0xA0000;
+}
+
 static inline bool i2000_plain_ram(const Ia64I2000State *s, uint64_t addr,
                                    unsigned size) {
-    return addr >= I2000_FAST_RAM_BASE && addr < s->fast_ram_end &&
+    if (addr < I2000_FAST_RAM_BASE)
+        return addr + size <= I2000_FAST_RAM_BASE &&
+               !i2000_low_vga(s, addr, addr + size) && !s->mem_watch &&
+               (addr & UINT64_C(0xffff)) != UINT64_C(0x6030) &&
+               (addr & UINT64_C(0xffff)) != UINT64_C(0xa030);
+    return addr < s->fast_ram_end &&
            size <= s->fast_ram_end - addr && !s->mem_watch &&
            (addr & UINT64_C(0xffff)) != UINT64_C(0x6030) &&
            (addr & UINT64_C(0xffff)) != UINT64_C(0xa030);
@@ -2371,8 +2384,9 @@ static inline bool i2000_plain_ram(const Ia64I2000State *s, uint64_t addr,
 static uint8_t *i2000_direct_page(void *ud, uint64_t pa_page,
                                   uint16_t *slow_off) {
     Ia64I2000State *s = ud;
-    if (pa_page < I2000_FAST_RAM_BASE || s->mem_watch ||
-        pa_page + 0x1000 > s->fast_ram_end)
+    if (s->mem_watch || pa_page + 0x1000 > s->fast_ram_end ||
+        (pa_page < I2000_FAST_RAM_BASE &&
+         i2000_low_vga(s, pa_page, pa_page + 0x1000)))
         return NULL;
     unsigned off16 = (unsigned)(pa_page & 0xF000);
     *slow_off = (off16 == 0x6000 || off16 == 0xA000) ? 0x030 : 0xFFFF;
@@ -4972,21 +4986,90 @@ static void i2000_bench_check(Ia64I2000State *s) {
  * another such slice is in a loop that only an interrupt can end; time then
  * moves straight on to the guest's next timer deadline.  Guest time runs
  * ahead of the host while it idles, so this is opt-in: GEMU_IDLE_SKIP=1. */
+/* GEMU_PROFILE=1: once per host second, the slot rate and how many poll
+ * quanta were spent in an idle loop (as i2000_idle_check() detects one). */
+static int i2000_profile_on = -1;
+static uint64_t prof_quanta, prof_idle;
+
+/* Guest IP histogram, 64 KiB buckets, sampled once per poll quantum. */
+#define PROF_HIST 4096
+static struct { uint64_t key, n; } prof_hist[PROF_HIST];
+
+static void i2000_profile_sample(uint64_t ip) {
+    uint64_t key = (ip >> 16) | 1;
+    unsigned h = (unsigned)((key * UINT64_C(0x9E3779B97F4A7C15)) >> 52);
+    for (unsigned k = 0; k < PROF_HIST; k++, h = (h + 1) & (PROF_HIST - 1)) {
+        if (prof_hist[h].key == key) { prof_hist[h].n++; return; }
+        if (!prof_hist[h].key) { prof_hist[h].key = key; prof_hist[h].n = 1; return; }
+    }
+}
+
+static void i2000_profile_dump(double t) {
+    uint64_t total = 0;
+    for (unsigned i = 0; i < PROF_HIST; i++) total += prof_hist[i].n;
+    if (!total) return;
+    fprintf(stderr, "profile-ip: t=%6.1f", t);
+    for (int k = 0; k < 6; k++) {
+        unsigned best = 0;
+        for (unsigned i = 1; i < PROF_HIST; i++)
+            if (prof_hist[i].n > prof_hist[best].n) best = i;
+        if (!prof_hist[best].n) break;
+        fprintf(stderr, " %012" PRIX64 "xxxx:%.0f%%", prof_hist[best].key >> 0 & ~UINT64_C(1),
+                100.0 * (double)prof_hist[best].n / (double)total);
+        prof_hist[best].n = 0;
+    }
+    fprintf(stderr, "\n");
+    memset(prof_hist, 0, sizeof(prof_hist));
+}
+
+static void i2000_profile_tick(Ia64I2000State *s) {
+    static uint64_t last_ns, last_insts;
+    static unsigned ticks;
+    uint64_t now = i2000_monotonic_ns();
+    if (!last_ns) { last_ns = now; last_insts = s->cpu->ninsts; return; }
+    if (now - last_ns < UINT64_C(1000000000)) return;
+    static uint64_t start_ns;
+    if (!start_ns) start_ns = last_ns;
+    double dt = (double)(now - last_ns) / 1e9;
+    fprintf(stderr, "profile: t=%6.1f %7.2f Mslots/s idle %5.1f%% ip=%016" PRIX64 "\n",
+            (double)(now - start_ns) / 1e9,
+            (double)(s->cpu->ninsts - last_insts) / dt / 1e6,
+            prof_quanta ? 100.0 * (double)prof_idle / (double)prof_quanta : 0.0,
+            s->cpu->ip);
+    if (++ticks % 10 == 0)
+        i2000_profile_dump((double)(now - start_ns) / 1e9);
+    last_ns = now;
+    last_insts = s->cpu->ninsts;
+    prof_quanta = prof_idle = 0;
+}
+
 static void i2000_idle_check(Ia64I2000State *s) {
     static int enabled = -1;
     static uint64_t dirty_mark, seen[16];
     static unsigned n_seen;
     static uint64_t skips;
+    static bool last_idle;
     if (enabled < 0) {
         const char *e = getenv("GEMU_IDLE_SKIP");
         enabled = e && strcmp(e, "0") != 0;
+        e = getenv("GEMU_PROFILE");
+        i2000_profile_on = e && strcmp(e, "0") != 0;
     }
-    if (!enabled) return;
+    if (!enabled && !i2000_profile_on) return;
     Merced *cpu = s->cpu;
+    if (i2000_profile_on) {
+        /* Windows Server 2003 IA-64's KiIdleLoop (ntoskrnl 5.2.3790). */
+        prof_quanta++;
+        i2000_profile_sample(cpu->ip);
+        prof_idle += cpu->ip >= UINT64_C(0xE000000083009500) &&
+                     cpu->ip <  UINT64_C(0xE000000083009800);
+        i2000_profile_tick(s);
+    }
     uint64_t dirty = merced_idle_dirty(cpu);
     if (dirty != dirty_mark || cpu->ext_pending_count || cpu->timer_pending) {
         dirty_mark = dirty;
         n_seen = 0;
+        last_idle = false;
         return;
     }
     uint64_t h = merced_state_hash(cpu);
@@ -4997,6 +5080,8 @@ static void i2000_idle_check(Ia64I2000State *s) {
         return;
     }
     n_seen = 0;
+    last_idle = true;
+    if (!enabled) return;
     /* The interval timer must be armed, unmasked and still ahead. */
     uint64_t itm = cpu->cr[1], itv = cpu->cr[72], itc = merced_get_itc(cpu);
     if (!itm || (itv & (UINT64_C(1) << 16)) || (int64_t)(itm - itc) <= 0) return;

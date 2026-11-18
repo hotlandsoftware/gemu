@@ -155,8 +155,16 @@ branch. Each slot is handled one of three ways:
 | Tier | Covers |
 |------|--------|
 | native | A-unit ALU and compares, `zxt`/`sxt`, `movl`, bit-field extracts/deposits, `shrp`, normal/`.unc` `tbit`/`tnat`, transfers from IP/BR/PR and to BR, `br.cond`, `br.cloop`; `setf.sig`/`getf.sig` and transfers to/from PFS/LC/EC/CCV/UNAT/FPSR, with helpers for fault cases |
-| native memory | `ld`/`st` with post-increment, through a host TLB into plain RAM |
-| interpreted | everything else, through `fast_slot()`, the interpreter's own per-slot code; the block re-checks its assumptions afterwards and leaves if anything changed |
+| native memory | `ld`/`st` with post-increment, `ld.s`, `ld.a`, `ld.sa`, `ld.c.clr`/`.nc`/`.clr.acq` and `stf.spill`/`ldf.fill`, through a host TLB into plain RAM; ALAT bookkeeping (stores against advanced loads, entries made and checked) goes through small C helpers |
+| interpreted | everything else, through `fast_slot()`, the interpreter's own per-slot code; the block re-checks its assumptions afterwards and leaves if anything changed (F-unit slots skip the re-checks: they cannot change anything a block is admitted under) |
+
+Blocks chain: a block that leaves through a taken `br.cond`/`br.cloop` or by
+falling into the next bundle continues straight in the block translated there,
+without returning to the dispatcher, when that block is in the jump cache, fits
+the remaining slot budget and timer deadline, and its translation and code
+generations are current. `fc`, `fwb`, `mf`, `mf.a` and `sync.i` cost nothing
+in translated code. `PSR.db` (which Windows always sets) only sends execution to
+the interpreter while some IBR/DBR pair is actually armed.
 
 With the JIT, the i2000 polls platform interrupts every 512 slots instead of 16.
 When fewer than 24 slots remain partway through a poll quantum, existing
@@ -174,9 +182,15 @@ Developer switches:
   instructions most often left to helpers. Those are the next candidates for
   native code.
 - `GEMU_IRQ_QUANTUM=<power of two>` overrides the poll quantum for either engine.
+- `GEMU_PROFILE=1` (i2000) prints the slot rate and the share of time in
+  Windows' idle loop every second, and the busiest guest code regions every ten;
+  the monitor's `ntsym <va>` names the module behind one.
 - `python3 tools/ia64/run_merced_jit_test.py [programs] [first-seed]` runs
-  random programs under both engines and compares their full state, then
-  checks all 8,192 signed/unsigned extract position and width combinations.
+  random programs under the JIT and under `merced_step()` and compares their
+  full state, then runs every `stf.spill`/`ldf.fill` form, ALAT-heavy
+  programs, block-chaining loops under random budgets and timer deadlines, all
+  8,192 signed/unsigned extract position and width combinations, and the
+  application-register transfers.
 
 ## Physical memory map
 

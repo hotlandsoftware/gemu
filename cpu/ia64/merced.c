@@ -1729,6 +1729,9 @@ typedef struct {
     bool irqc_valid;
     int16_t irqc_pending_hi;
     uint16_t irqc_in_service_hi;
+    /* debug_regs_armed(): 0 = not known (recompute), 1 = no, 2 = yes.
+     * Cleared by mov dbr/ibr and by tb_flush() (snapshot loads). */
+    uint8_t debug_armed;
 } MercedTranslationCache;
 
 static bool code_page_ed(Merced *m) {
@@ -2405,6 +2408,28 @@ static void pmu_retire(Merced *m, bool is_nop, int qp, unsigned stop_after) {
         pmu_count(m, PMU_EV_NOPS, 1);
     if (stop_after)
         pmu_count(m, PMU_EV_STOPS, 1);
+}
+
+/* PSR.db only matters while some breakpoint pair is armed: an IBR with its
+ * execute enable (bit 63) or a DBR with read/write enables (bits 63:62).
+ * Windows runs with PSR.db set and every pair disarmed; the fast paths
+ * (fast_step(), translated blocks) skip the debug checks only then. */
+static inline bool debug_regs_armed(const Merced *m) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (tc && tc->debug_armed)
+        return tc->debug_armed == 2;
+    uint64_t i = 0, d = 0;
+    for (unsigned k = 1; k < 16; k += 2) {
+        i |= m->ibr[k];
+        d |= m->dbr[k];
+    }
+    bool armed = (i >> 63) || (d >> 62);
+    if (tc) tc->debug_armed = armed ? 2 : 1;
+    return armed;
+}
+
+static inline bool debug_active(const Merced *m) {
+    return (m->psr & PSR_DB) && debug_regs_armed(m);
 }
 
 /* Data and instruction breakpoints (SDM vol. 2, 7.1).  DBR/IBR come in pairs:
@@ -4729,8 +4754,13 @@ static MercedStatus exec_m_sys(Merced *m, uint64_t raw, int qp) {
         m->pkr[i] = v;
         return MERCED_OK;
     }
-    case 0x01: m->dbr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
-    case 0x02: m->ibr[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2); return MERCED_OK;
+    case 0x01: case 0x02: {                         /* mov dbr[] / ibr[] = r2 */
+        uint64_t *regs = x6 == 0x01 ? m->dbr : m->ibr;
+        regs[gr_read(m, r3, &n3) & 15] = gr_read(m, r2, &n2);
+        MercedTranslationCache *tc = m->translation_cache;
+        if (tc) tc->debug_armed = 0;
+        return MERCED_OK;
+    }
     case 0x04: {
         unsigned idx = (unsigned)(gr_read(m, r3, &n3) & 31);
         m->pmc[idx] = pmc_value_for_write(idx, gr_read(m, r2, &n2));
@@ -8058,7 +8088,7 @@ MercedStatus fast_slot(Merced *m, const MercedTbEntry *tb, unsigned slot,
  * the guest identically. */
 static inline MercedStatus fast_step(Merced *m, MercedTranslationCache *tc) {
     uint64_t ip = m->ip;
-    if ((m->psr & (PSR_IS | PSR_DB)) ||
+    if ((m->psr & PSR_IS) || debug_active(m) ||
         (ip & UINT64_C(0x1FFFFFFFFFFFFFF0)) == UINT64_C(0x00000000FFF05000))
         return merced_step(m);
     uint64_t bundle_va = ip & ~0xFull;

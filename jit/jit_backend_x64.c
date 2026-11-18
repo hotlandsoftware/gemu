@@ -37,6 +37,7 @@ struct JitBackend {
     X64Buf buf;
     uint8_t *entry;
     JitLabel epilogue;
+    size_t body_off;                /* prologue length: the same for every function */
     size_t *label_pos;              /* SIZE_MAX until bound */
     unsigned n_labels, cap_labels;
     Fixup *fixups;
@@ -181,7 +182,17 @@ void jit_begin(JitBackend *b) {
     x64_push(x, X64_R14);
     x64_alu_ri(x, X64_SUB, X64_RSP, 32);
     x64_mov_rr(x, ENV, X64_ARG0);
+    b->body_off = (size_t)(x->p - b->entry);
     b->epilogue = jit_label(b);
+}
+
+/* Every function's frame is identical (jit_begin()), so another function's
+ * body can run in this one's frame: skip its prologue, and its epilogue
+ * returns for both. */
+void jit_jmp_body(JitBackend *b, JitReg fn) {
+    X64Buf *x = &b->buf;
+    x64_alu_ri(x, X64_ADD, R(fn), (int32_t)b->body_off);
+    x64_jmp_r(x, R(fn));
 }
 
 JitFn jit_end(JitBackend *b) {
@@ -415,6 +426,7 @@ JitFn jit_end(JitBackend *b) NOHOST()
 JitLabel jit_label(JitBackend *b) NOHOST()
 void jit_bind(JitBackend *b, JitLabel l) { (void)l; NOHOST() }
 void jit_jmp(JitBackend *b, JitLabel l) { (void)l; NOHOST() }
+void jit_jmp_body(JitBackend *b, JitReg fn) { (void)fn; NOHOST() }
 void jit_br(JitBackend *b, JitCond c, JitReg a, JitReg r, unsigned n, JitLabel l)
     { (void)c; (void)a; (void)r; (void)n; (void)l; NOHOST() }
 void jit_bri(JitBackend *b, JitCond c, JitReg a, int64_t i, unsigned n, JitLabel l)

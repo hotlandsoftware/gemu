@@ -89,6 +89,11 @@ void     jit_brbitr(JitBackend *b, JitReg a, JitReg bit, bool set,
 void     jit_ret(JitBackend *b, JitReg v);
 void     jit_reti(JitBackend *b, uintptr_t v);
 
+/* Continue in the body of another function this backend emitted (a JitFn
+ * in register fn, clobbered), in the current frame: its return returns
+ * from this function. */
+void     jit_jmp_body(JitBackend *b, JitReg fn);
+
 /* T0 = fn(env, a1, a2) */
 void     jit_call(JitBackend *b, const void *fn, uintptr_t a1, uintptr_t a2);
 

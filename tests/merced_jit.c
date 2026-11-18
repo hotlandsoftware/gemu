@@ -60,6 +60,9 @@ static uint64_t rnd(void) {
     return rng_state * UINT64_C(2685821657736338717);
 }
 static unsigned rn(unsigned n) { return (unsigned)(rnd() % n); }
+static bool chain_mode;      /* gen_chain_program() instead of random code */
+static bool alat_mode;       /* destinations mostly r40/r41: ld.a, writes, ld.c */
+static uint64_t prime_raw;   /* instruction mode: an M slot run first (fills the host TLB) */
 
 /* ── encoders ─────────────────────────────────────────────────────────── */
 #define F(v, lo, w) ((((uint64_t)(v)) & ((UINT64_C(1) << (w)) - 1)) << (lo))
@@ -89,6 +92,7 @@ static unsigned rsrc(void) {
     }
 }
 static unsigned rdst(void) {
+    if (alat_mode && rn(2)) return 40 + rn(2);
     unsigned r;
     do r = rsrc(); while (r == 2 || r == 3);
     return r;
@@ -198,8 +202,54 @@ static uint64_t gen_i(void) {
 /* M-unit instruction */
 static uint64_t gen_m(void) {
     unsigned qp = rqp();
-    unsigned base = 2 + rn(2);
-    switch (rn(11)) {
+    unsigned base = alat_mode ? 3 : 2 + rn(2);
+    unsigned pick = rn(16);
+    if (alat_mode && rn(2)) pick = 11 + rn(2);
+    switch (pick) {
+    case 14: case 15: {                         /* stf.spill / ldf.fill */
+        bool st = pick == 14;
+        unsigned fr = rn(128), x6 = st ? 0x3B : 0x1B;
+        switch (rn(3)) {
+        case 0:
+            return F(6,37,4) | F(x6,30,6) | F(base,20,7) |
+                   (st ? F(fr,13,7) : F(fr,6,7)) | F(qp,0,6);
+        case 1:                                 /* register postincrement */
+            return F(6,37,4) | F(1,36,1) | F(x6,30,6) | F(base,20,7) |
+                   (st ? F(fr,13,7) | F(rsrc(),6,7) : F(rsrc(),13,7) | F(fr,6,7)) |
+                   F(qp,0,6);
+        default: {                              /* immediate postincrement */
+            unsigned imm = 16 * rn(32);         /* mostly stays aligned */
+            return F(7,37,4) | F(imm >> 8,36,1) | F(x6,30,6) |
+                   F(imm >> 7,27,1) | F(base,20,7) |
+                   (st ? F(fr,13,7) | F(imm,6,7) : F(imm,13,7) | F(fr,6,7)) |
+                   F(qp,0,6);
+        }
+        }
+    }
+    case 13:                                    /* fc */
+        return F(1,37,4) | F(0x30,27,6) | F(base,20,7) | F(qp,0,6);
+    case 11:                                    /* ld.s, ld.a, ld.sa: ALAT entries */
+    case 12: {                                  /* ld.c.clr / .nc / .clr.acq */
+        static const uint8_t x6s[] = { 0x04, 0x08, 0x0C, 0x20, 0x24, 0x28 };
+        unsigned x6 = x6s[rn(6)] + rn(4);
+        if (alat_mode)                          /* same address, r2 never moves */
+            return F(4,37,4) | F(x6,30,6) | F(2,20,7) | F(40 + rn(2),6,7) |
+                   F(qp,0,6);
+        switch (rn(3)) {
+        case 0:                                 /* no update */
+            return F(4,37,4) | F(x6,30,6) | F(base,20,7) | F(rdst(),6,7) |
+                   F(qp,0,6);
+        case 1:                                 /* register postincrement */
+            return F(4,37,4) | F(1,36,1) | F(x6,30,6) | F(base,20,7) |
+                   F(rsrc(),13,7) | F(rdst(),6,7) | F(qp,0,6);
+        default: {                              /* immediate postincrement */
+            unsigned imm = rn(512);
+            return F(5,37,4) | F(imm >> 8,36,1) | F(x6,30,6) |
+                   F(imm >> 7,27,1) | F(base,20,7) | F(imm,13,7) |
+                   F(rdst(),6,7) | F(qp,0,6);
+        }
+        }
+    }
     case 0: case 1:                             /* ld1-8 (+ reg postinc) */
         return F(4,37,4) | F(rn(4) ? 0 : 1,36,1) | F(rn(4),30,6) |
                F(base,20,7) | F(rsrc(),13,7) | F(rdst(),6,7) | F(qp,0,6);
@@ -246,6 +296,29 @@ static uint64_t gen_m(void) {
     }
 }
 
+/* F-unit instruction: the multiply-adds NT uses for integer multiply and
+ * divide (fma/fms/fnma, xma.l/h/hu) and fmerge. Any FR, so writes to f0/f1
+ * and disabled FP banks fault too. */
+static uint64_t gen_f(void) {
+    unsigned qp = rqp();
+    unsigned f1 = rn(128), f2 = rn(128), f3 = rn(128), f4 = rn(128);
+    switch (rn(4)) {
+    case 0: case 1: {                           /* fma/fms/fnma (.s/.d), sf */
+        static const unsigned maj[] = { 8, 9, 0xA, 0xB, 0xC, 0xD };
+        return F(maj[rn(6)],37,4) | F(rn(2),36,1) | F(rn(4),34,2) |
+               F(f4,27,7) | F(f3,20,7) | F(f2,13,7) | F(f1,6,7) | F(qp,0,6);
+    }
+    case 2: {                                   /* xma.l / xma.h / xma.hu */
+        static const unsigned x2[] = { 0, 3, 2 };
+        return F(0xE,37,4) | F(1,36,1) | F(x2[rn(3)],34,2) |
+               F(f4,27,7) | F(f3,20,7) | F(f2,13,7) | F(f1,6,7) | F(qp,0,6);
+    }
+    default:                                    /* fmerge.s / .ns / .se */
+        return F(0,37,4) | F(0x10 + rn(3),27,6) | F(f3,20,7) | F(f2,13,7) |
+               F(f1,6,7) | F(qp,0,6);
+    }
+}
+
 static uint64_t gen_b(unsigned at, unsigned n_bundles) {
     unsigned qp = rn(16) ? 1 + rn(63) : 0;    /* rarely unconditional */
     unsigned target = at + 1 + rn(n_bundles + 1 - at); /* forward, or past
@@ -264,8 +337,8 @@ static uint64_t gen_b(unsigned at, unsigned n_bundles) {
 
 static void gen_program(uint8_t *ram) {
     static const uint8_t tmpls[] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
-                                     0x08, 0x09, 0x0A, 0x0B, 0x10, 0x11,
-                                     0x18, 0x19 };
+                                     0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                                     0x0E, 0x0F, 0x10, 0x11, 0x18, 0x19 };
     for (unsigned i = 0; i < N_BUNDLES; i++) {
         uint8_t *at = ram + CODE_BASE + 16 * i;
         unsigned t = tmpls[rn(sizeof tmpls)];
@@ -281,12 +354,14 @@ static void gen_program(uint8_t *ram) {
             static const char *units[] = { [0x00] = "MII", [0x01] = "MII",
                 [0x02] = "MII", [0x03] = "MII", [0x08] = "MMI",
                 [0x09] = "MMI", [0x0A] = "MMI", [0x0B] = "MMI",
+                [0x0C] = "MFI", [0x0D] = "MFI", [0x0E] = "MMF", [0x0F] = "MMF",
                 [0x10] = "MIB", [0x11] = "MIB", [0x18] = "MMB",
                 [0x19] = "MMB" };
             for (unsigned k = 0; k < 3; k++) {
                 char u = units[t][k];
                 s[k] = rn(6) == 0 ? (u == 'B' ? NOP_B : NOP_MI)
                      : u == 'M' ? gen_m() : u == 'I' ? gen_i()
+                     : u == 'F' ? gen_f()
                      : gen_b(i, N_BUNDLES);
             }
         }
@@ -352,6 +427,7 @@ static void init_state(Merced *m, uint64_t seed) {
     m->psr = (UINT64_C(1) << 13) | (rn(2) ? UINT64_C(1) << 44 : 0);
     if (rn(4) == 0) m->psr |= UINT64_C(1) << 18;      /* dfl */
     if (rn(4) == 0) m->psr |= UINT64_C(1) << 19;      /* dfh */
+    if (rn(8) == 0) m->psr |= UINT64_C(1) << 43;      /* ed: speculative loads defer */
     m->ar[32] = rnd();                                 /* ar.ccv */
     m->ar[36] = rnd();                                 /* ar.unat */
     m->ar[40] = rnd();                                 /* ar.fpsr */
@@ -361,8 +437,64 @@ static void init_state(Merced *m, uint64_t seed) {
     m->ar[44] = rnd() >> 8;                            /* ar.itc */
     m->cr[1] = rn(2) ? m->ar[44] + 20 + rn(300) : 0;   /* cr.itm */
     m->cr[2] = 0;                                      /* cr.iva */
+    /* Debug breakpoints: PSR.db with every pair disarmed (as Windows runs)
+     * must not change anything; armed pairs must fault identically. */
+    if (rn(4) == 0) {
+        m->psr |= UINT64_C(1) << 24;                   /* db */
+        switch (rn(4)) {
+        case 0:                                        /* DBR on a data word */
+            m->dbr[0] = DATA_BASE + 8 * rn(DATA_SIZE / 8);
+            m->dbr[1] = (UINT64_C(1) << 63 | UINT64_C(1) << 62) * rn(2) +
+                        (rn(2) ? UINT64_C(1) << 63 : UINT64_C(1) << 62) +
+                        (UINT64_C(0xF) << 56) + UINT64_C(0x00FFFFFFFFFFFFF8);
+            break;
+        case 1:                                        /* IBR on a bundle */
+            m->ibr[0] = CODE_BASE + 16 * rn(8);
+            m->ibr[1] = (UINT64_C(1) << 63) | (UINT64_C(0xF) << 56) |
+                        UINT64_C(0x00FFFFFFFFFFFFF0);
+            break;
+        default:                                       /* disarmed */
+            m->dbr[0] = DATA_BASE;
+            m->dbr[1] = UINT64_C(0xF) << 56;
+            break;
+        }
+    }
+    if (chain_mode) {
+        m->ar[65] = 500 + rn(3000);                    /* thousands of iterations */
+        m->cr[1] = rn(2) ? m->ar[44] + rn(5000) : 0;   /* a deadline mid-run */
+    }
     m->ip = CODE_BASE;
     m->group_start = 1;
+}
+
+/* Block chaining (mj_gen_chain()): a loop through several blocks, entered
+ * thousands of times, so blocks continue straight into each other through
+ * taken branches, not-taken fall-through and the 8-bundle block limit,
+ * under random budgets and timer deadlines. */
+
+static uint64_t a4_adds(unsigned r1, int imm, unsigned r3) {
+    unsigned u = (unsigned)imm & 0x3FFF;
+    return F(8,37,4) | F(u >> 13,36,1) | F(2,34,2) | F(u >> 7,27,6) |
+           F(r3,20,7) | F(u,13,7) | F(r1,6,7);
+}
+
+static void gen_chain_program(uint8_t *ram) {
+    uint8_t *c = ram + CODE_BASE;
+    const uint64_t xor12 = F(8,37,4) | F(0xB,29,4) | F(3,27,2) | F(12,20,7) |
+                           F(1,13,7) | F(12,6,7);          /* xor r12 = 1, r12 */
+    const uint64_t cmpeq = F(0xE,37,4) | F(2,34,2) | F(7,27,6) | F(12,20,7) |
+                           F(6,6,6);                       /* cmp.eq p6,p7 = 0, r12 */
+    put_bundle(c + 0x00, 0x00, a4_adds(8, 1, 8), xor12, cmpeq);
+    /* (p6) br.cond +2 bundles: taken every other iteration */
+    put_bundle(c + 0x10, 0x10, a4_adds(9, 7, 9), NOP_MI,
+               F(4,37,4) | F(2,13,20) | F(6,0,6));
+    put_bundle(c + 0x20, 0x00, a4_adds(10, -1, 10), a4_adds(11, 3, 11), NOP_MI);
+    for (unsigned k = 3; k < 11; k++)                      /* a full 8-bundle block */
+        put_bundle(c + 16 * k, 0x00, a4_adds(11, (int)k, 11),
+                   a4_adds(13, (int)k, 13), a4_adds(14, 1, 14));
+    int64_t back = -11;                                    /* br.cloop to bundle 0 */
+    put_bundle(c + 16 * 11, 0x10, a4_adds(9, 1, 9), NOP_MI,
+               F(4,37,4) | F((uint64_t)back >> 20,36,1) | F(back,13,20) | F(5,6,3));
 }
 
 static uint8_t *fresh_ram(uint64_t seed) {
@@ -374,7 +506,8 @@ static uint8_t *fresh_ram(uint64_t seed) {
         uint64_t v = rnd();
         memcpy(ram + DATA_BASE + a, &v, 8);
     }
-    gen_program(ram);
+    if (chain_mode) gen_chain_program(ram);
+    else gen_program(ram);
     return ram;
 }
 
@@ -402,9 +535,13 @@ static int run_one(uint64_t seed, bool verbose, uint64_t instruction, bool m_uni
         if (instruction) {
             /* One unpredicated static-register operation: every edge case
              * executes, with randomized input values and NaT state. */
-            put_bundle(mem[e].ram + CODE_BASE, 0x01,
-                       m_unit ? instruction : NOP_MI,
-                       m_unit ? NOP_MI : instruction, NOP_MI);
+            if (prime_raw && m_unit)
+                put_bundle(mem[e].ram + CODE_BASE, 0x09, prime_raw, instruction,
+                           NOP_MI);
+            else
+                put_bundle(mem[e].ram + CODE_BASE, 0x01,
+                           m_unit ? instruction : NOP_MI,
+                           m_unit ? NOP_MI : instruction, NOP_MI);
             put_deadloop(mem[e].ram + CODE_BASE + 16);
         }
         MercedBus bus = { .ud = &mem[e], .ram_size = RAM_SIZE,
@@ -424,7 +561,15 @@ static int run_one(uint64_t seed, bool verbose, uint64_t instruction, bool m_uni
             unsigned budget = !instruction && seed % 4 == 0
                             ? 1 + (unsigned)(seed % 24)
                             : 64 + (unsigned)(seed % 200);
-            st[e] = merced_run_fast(cpu[e], budget, &n, 0, 0);
+            if (e == 0) {               /* the reference: merced_step() itself */
+                st[e] = MERCED_OK;
+                while (n < budget && st[e] == MERCED_OK) {
+                    st[e] = merced_step(cpu[e]);
+                    n++;
+                }
+            } else {
+                st[e] = merced_run_fast(cpu[e], budget, &n, 0, 0);
+            }
             slots[e] += n;
         } while (st[e] == MERCED_OK && slots[e] < 200000);
     }
@@ -509,6 +654,52 @@ int main(int argc, char **argv) {
         fprintf(stderr, "merced_jit: %u of %u programs differ\n", failures, n);
         return 1;
     }
+    /* stf.spill / ldf.fill in each addressing form, one at a time from
+     * random state (FR values and NaTVals, disabled banks, alignment) */
+    {
+        static const char *names[6] = { "stf.spill", "stf.spill reg-inc",
+            "stf.spill imm-inc", "ldf.fill", "ldf.fill reg-inc", "ldf.fill imm-inc" };
+        for (unsigned form = 0; form < 6; form++) {
+            for (unsigned k = 0; k < 300; k++) {
+                bool st = form < 3;
+                unsigned fr = 2 + k % 126, x6 = st ? 0x3B : 0x1B, v = form % 3;
+                uint64_t raw;
+                if (v == 0)
+                    raw = F(6,37,4) | F(x6,30,6) | F(2,20,7) |
+                          (st ? F(fr,13,7) : F(fr,6,7));
+                else if (v == 1)
+                    raw = F(6,37,4) | F(1,36,1) | F(x6,30,6) | F(2,20,7) |
+                          (st ? F(fr,13,7) | F(9,6,7) : F(9,13,7) | F(fr,6,7));
+                else
+                    raw = F(7,37,4) | F(x6,30,6) | F(2,20,7) | F(1,27,1) |
+                          (st ? F(fr,13,7) | F(0x10,6,7) : F(0x10,13,7) | F(fr,6,7));
+                /* every other case primes the page with st8 [r2] = r0 or
+                 * ld8 r10 = [r2], so the access runs inline */
+                prime_raw = k & 1 ? 0 : st ? F(4,37,4) | F(0x33,30,6) | F(2,20,7)
+                                           : F(4,37,4) | F(0x03,30,6) | F(2,20,7) |
+                                             F(10,6,7);
+                int bad1 = run_one(first + 300000 + 1000 * form + k, false, raw, true);
+                prime_raw = 0;
+                if (bad1) {
+                    fprintf(stderr, "merced_jit: %s differs\n", names[form]);
+                    return 1;
+                }
+            }
+        }
+        printf("merced_jit: 1800 stf.spill / ldf.fill cases identical\n");
+    }
+    alat_mode = true;
+    for (unsigned i = 0; i < 1000; i++)
+        if (run_one(first + 200000 + i, false, 0, false)) return 1;
+    alat_mode = false;
+    printf("merced_jit: 1000 ALAT-heavy programs identical\n");
+    chain_mode = true;
+    uint64_t before = total_slots;
+    for (unsigned i = 0; i < 300; i++)
+        if (run_one(first + 100000 + i, false, 0, false)) return 1;
+    chain_mode = false;
+    printf("merced_jit: 300 block-chaining loops identical (%" PRIu64 " slots)\n",
+           total_slots - before);
     printf("merced_jit: %u random programs identical under jit and "
            "interpreter (%" PRIu64 " slots; %" PRIu64 " ran to the end, %"
            PRIu64 " took a fault)\n", n, total_slots, total_blocks_end,
