@@ -172,6 +172,9 @@ bool i460gx_ifb_io_write(I460GX *s, unsigned fun, uint64_t port,
 /* Decode an unmasked GSI. ExtINT requires the board's legacy PIC vector;
  * otherwise vector is the programmed fixed SAPIC vector. */
 bool i460gx_interrupt(I460GX *s, unsigned gsi, uint8_t *vector, bool *extint);
+/* Whether redirection entry `gsi` is level-triggered (bit 15); an
+ * edge-triggered entry delivers once per rising edge of its input. */
+bool i460gx_gsi_level(const I460GX *s, unsigned gsi);
 
 /* Power management inputs and time. i460gx_pm_poll() advances the PM timers
  * to the board clock and re-evaluates SMI#, SCI and wake events; call it

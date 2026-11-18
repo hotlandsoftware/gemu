@@ -1427,8 +1427,15 @@ static uint64_t i2000_rtc_clock(void *opaque) {
 }
 
 /* IRQ8 changed level. An assertion is also the IFB's RTC_STS event. */
+/* An edge-triggered IRQ8 entry gets one interrupt per rising edge; this is
+ * set by the edge and cleared once it has been sent.  File-static, as
+ * Ia64I2000State is snapshotted raw. */
+static bool i2000_rtc_edge_pending;
+
 static void i2000_rtc_irq(void *opaque, bool level) {
     Ia64I2000State *s = opaque;
+    if (level && !s->rtc_irq)
+        i2000_rtc_edge_pending = true;
     s->rtc_irq = level;
     if (level)
         i460gx_pm_rtc_alarm(&s->chipset);
@@ -4809,15 +4816,24 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
             s->sci_retry_ninsts = s->cpu->ninsts + SCI_REPRESENT_INSTS;
         }
     }
-    /* IRQ8 is level-triggered: present it through its I/O SAPIC entry again
-     * after each acknowledgement until the guest reads register C. */
+    /* IRQ8 stays asserted until the guest reads register C.  Through a
+     * level-triggered I/O SAPIC entry (Windows) it is presented again after
+     * each acknowledgement while it does; an edge-triggered entry (HelenOS
+     * programs the legacy lines that way) sees one interrupt per rising
+     * edge, so a guest that never reads register C gets exactly one. */
     if (s->rtc_irq && s->cpu->ninsts >= s->rtc_retry_ninsts) {
         uint8_t vector;
         bool extint;
-        if (i460gx_interrupt(&s->chipset, 8, &vector, &extint) && !extint &&
-            !merced_external_pending(s->cpu, vector)) {
-            iosapic_raise_gsi(s, 8);
-            s->rtc_retry_ninsts = s->cpu->ninsts + SCI_REPRESENT_INSTS;
+        if (i460gx_interrupt(&s->chipset, 8, &vector, &extint) && !extint) {
+            if (i460gx_gsi_level(&s->chipset, 8)) {
+                if (!merced_external_pending(s->cpu, vector)) {
+                    iosapic_raise_gsi(s, 8);
+                    s->rtc_retry_ninsts = s->cpu->ninsts + SCI_REPRESENT_INSTS;
+                }
+            } else if (i2000_rtc_edge_pending) {
+                iosapic_raise_gsi(s, 8);
+                i2000_rtc_edge_pending = false;
+            }
         }
     }
     /* Primary IDE (the -hda disk) uses GSI14; see ata_deliver_irq(). */

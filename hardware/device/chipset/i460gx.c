@@ -202,6 +202,10 @@ bool i460gx_interrupt(I460GX *s, unsigned gsi, uint8_t *vector, bool *extint) {
     return true;
 }
 
+bool i460gx_gsi_level(const I460GX *s, unsigned gsi) {
+    return gsi < 64 && ((s->iosapic_rte[gsi] >> 15) & 1);
+}
+
 void i460gx_init(I460GX *s, const I460GXConfig *config) {
     I460GXConfig cfg = *config;
     memset(s, 0, sizeof(*s));

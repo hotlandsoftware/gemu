@@ -15,6 +15,6 @@ tools/*.pyc
 *.log
 build-win/
 bin-win/
-.work-ia64/
+bin-gtk/
 __pycache__/
 /ItaniumTest*-preserved-*.img

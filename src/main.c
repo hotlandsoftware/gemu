@@ -1,6 +1,9 @@
 #include "gemu/gemu.h"
 #include "gemu/args.h"
 #include "gemu/monitor.h"
+#ifdef GEMU_GTK
+#include "gemu/machine_manager.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,6 +139,14 @@ int main(int argc, char *argv[]) {
     _putenv("SDL_NO_SIGNAL_HANDLERS=1");
 #else
     setenv("SDL_NO_SIGNAL_HANDLERS", "1", 1);
+#endif
+
+    /* No arguments at all: in a graphical session, open the Machine Manager
+     * (it starts machines as their own gemu processes); otherwise, or in
+     * builds without GTK, the usage text below says how to write one. */
+#ifdef GEMU_GTK
+    if (argc == 1 && gemu_machine_manager_run(prog))
+        return 0;
 #endif
 
     /* Global -device ? and -soundhw ? - list across all families without -M */
