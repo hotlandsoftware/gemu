@@ -9,6 +9,7 @@
 #include "monitor_priv.h"
 #include "gemu/vnc.h"
 #include "gemu/util.h"
+#include "gemu/screendump.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -814,6 +815,9 @@ void gemu_monitor_install_signal_handlers(void) {
 
 GemuMonCmd gemu_monitor_poll(GemuMonitor *mon) {
     if (!mon) return GEMU_MON_NONE;
+    /* the Machine Manager's preview: on the emulator thread, like screendump */
+    if (mon->screendump_cb && gemu_preview_due())
+        mon->screendump_cb(mon->screendump_ud, GEMU_PREVIEW_PATH);
     if (quit_signal && !quit_reported) {
         quit_reported = true;   /* once; a second signal force-exits */
         return GEMU_MON_QUIT;

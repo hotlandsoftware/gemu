@@ -2,6 +2,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 /* ── PPM ─────────────────────────────────────────────────────────────────── */
 
@@ -133,7 +139,126 @@ static bool gemu_screendump_png(const char *path, const uint8_t *rgb, int w, int
 
 /* ── Dispatcher ──────────────────────────────────────────────────────────── */
 
+/* ── Live preview (see screendump.h) ─────────────────────────────────────── */
+
+#ifndef _WIN32
+static int             preview_fd = -2;          /* -2 = not looked yet, -1 = none */
+static pthread_t       preview_thread;
+static pthread_mutex_t preview_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  preview_cond = PTHREAD_COND_INITIALIZER;
+static uint8_t        *preview_frame;            /* the next frame to send, NULL = none */
+static size_t          preview_len;
+static struct timespec preview_next;
+
+static void *preview_writer(void *arg) {
+    (void)arg;
+    /* a closed pipe fails the write (EPIPE) instead of killing the machine */
+    sigset_t pipe_sig;
+    sigemptyset(&pipe_sig);
+    sigaddset(&pipe_sig, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe_sig, NULL);
+    for (;;) {
+        pthread_mutex_lock(&preview_lock);
+        while (!preview_frame) pthread_cond_wait(&preview_cond, &preview_lock);
+        uint8_t *f = preview_frame;
+        size_t len = preview_len;
+        preview_frame = NULL;
+        pthread_mutex_unlock(&preview_lock);
+        for (size_t off = 0; off < len; ) {
+            ssize_t n = write(preview_fd, f + off, len - off);
+            if (n <= 0) { free(f); close(preview_fd); return NULL; }   /* manager gone */
+            off += (size_t)n;
+        }
+        free(f);
+    }
+}
+
+bool gemu_preview_enabled(void) {
+    if (preview_fd == -2) {
+        const char *v = getenv("GEMU_PREVIEW_FD");
+        char *end;
+        long fd = v ? strtol(v, &end, 10) : -1;
+        preview_fd = v && *v && !*end && fd >= 0 ? (int)fd : -1;
+        /* don't hand the pipe to anything this process starts */
+        unsetenv("GEMU_PREVIEW_FD");
+        if (preview_fd >= 0 && pthread_create(&preview_thread, NULL, preview_writer, NULL) != 0)
+            preview_fd = -1;
+        if (preview_fd >= 0) {
+            pthread_detach(preview_thread);
+            clock_gettime(CLOCK_MONOTONIC, &preview_next);
+            preview_next.tv_sec += 1;                 /* the first one soon after start */
+        }
+    }
+    return preview_fd >= 0;
+}
+
+bool gemu_preview_due(void) {
+    if (!gemu_preview_enabled()) return false;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec < preview_next.tv_sec ||
+        (now.tv_sec == preview_next.tv_sec && now.tv_nsec < preview_next.tv_nsec))
+        return false;
+    preview_next = now;
+    preview_next.tv_sec += GEMU_PREVIEW_INTERVAL_MS / 1000;
+    preview_next.tv_nsec += (long)(GEMU_PREVIEW_INTERVAL_MS % 1000) * 1000000L;
+    if (preview_next.tv_nsec >= 1000000000L) { preview_next.tv_sec++; preview_next.tv_nsec -= 1000000000L; }
+    return true;
+}
+
+static void put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+/* Scale to fit the preview box (averaging the source pixels each covers)
+ * and queue it for the writer, replacing one it hasn't sent yet. */
+static bool preview_send(const uint8_t *rgb, int w, int h) {
+    if (!gemu_preview_enabled() || w <= 0 || h <= 0) return false;
+    double s = 1.0;
+    if (w > GEMU_PREVIEW_MAX_W) s = (double)GEMU_PREVIEW_MAX_W / w;
+    if (h * s > GEMU_PREVIEW_MAX_H) s = (double)GEMU_PREVIEW_MAX_H / h;
+    int dw = (int)(w * s + 0.5), dh = (int)(h * s + 0.5);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    size_t len = 16 + (size_t)dw * dh * 3;
+    uint8_t *f = malloc(len);
+    if (!f) return false;
+    memcpy(f, GEMU_PREVIEW_MAGIC, 8);
+    put32(f + 8, (uint32_t)dw);
+    put32(f + 12, (uint32_t)dh);
+    uint8_t *o = f + 16;
+    for (int y = 0; y < dh; y++) {
+        int y0 = (int)((long)y * h / dh), y1 = (int)((long)(y + 1) * h / dh);
+        if (y1 <= y0) y1 = y0 + 1;
+        for (int x = 0; x < dw; x++) {
+            int x0 = (int)((long)x * w / dw), x1 = (int)((long)(x + 1) * w / dw);
+            if (x1 <= x0) x1 = x0 + 1;
+            unsigned sum[3] = { 0, 0, 0 }, n = 0;
+            for (int yy = y0; yy < y1; yy++)
+                for (int xx = x0; xx < x1; xx++) {
+                    const uint8_t *p = rgb + ((size_t)yy * w + xx) * 3;
+                    sum[0] += p[0]; sum[1] += p[1]; sum[2] += p[2];
+                    n++;
+                }
+            for (int c = 0; c < 3; c++) *o++ = (uint8_t)(sum[c] / n);
+        }
+    }
+    pthread_mutex_lock(&preview_lock);
+    free(preview_frame);
+    preview_frame = f;
+    preview_len = len;
+    pthread_cond_signal(&preview_cond);
+    pthread_mutex_unlock(&preview_lock);
+    return true;
+}
+#else
+bool gemu_preview_enabled(void) { return false; }
+bool gemu_preview_due(void) { return false; }
+static bool preview_send(const uint8_t *rgb, int w, int h) { (void)rgb; (void)w; (void)h; return false; }
+#endif
+
 bool gemu_screendump(const char *path, const uint8_t *rgb, int w, int h) {
+    if (strcmp(path, GEMU_PREVIEW_PATH) == 0) return preview_send(rgb, w, h);
     const char *dot = strrchr(path, '.');
     if (dot && strcmp(dot, ".png") == 0)
         return gemu_screendump_png(path, rgb, w, h);

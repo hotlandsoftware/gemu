@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<machine name="ibm5150" family="x86" description="IBM PC 5150 (1981)"
+<machine name="ibm5150" media="fda,fdb,hda:ibm-fixed-disk,hdb:ibm-fixed-disk" ram-min="16K" ram-max="640K" family="x86" description="IBM PC 5150 (1981)"
         cpu="8088" vga="cga" ram="64K" status="imperfect">
     <rom name="BIOS_IBM5150_16AUG82_5000024_U33.bin" region="bios"  addr="0x0000"
          sha256="8aa2c24a4d342b77624cba34f4881ffee125e941900c45a186cf1c8af249cd1a"/>
@@ -16,4 +16,8 @@
          sha256="309c51a1bc41348bebc581e209d6e28a0b3327f6ad2cef6b5ba7cfd21e39fbc3"/>
     <rom name="59X7291_reduced_for_2732_or_27C32.bin" region="fixed-disk-59x7291" addr="0x0000"
          sha256="067a7fd9315aed963bb6b5641c2530fb651bd25c3bbe14762295dd1795c5dfd8"/>
+    <!-- -M ibm5150,NAME=VALUE: DIP switches, worked out from the setup unless given -->
+    <feature name="floppy"   description="Diskette drives installed (SW1-1)" values="on,off"/>
+    <feature name="floppies" description="Number of diskette drives (SW1-7/8)" values="1,2,3,4"/>
+    <feature name="display"  description="Display type (SW1-5/6)" values="none,cga40,cga80,mono"/>
 </machine>

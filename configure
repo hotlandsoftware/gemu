@@ -297,29 +297,62 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
     with open(os.path.join(gen_dir, 'machines.inc'), 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
-    # manager_machines.inc - what the GTK Machine Manager shows per machine:
-    # name, family, description, status, alias, the long <description> text
-    # and the default devices.
+    # manager_machines.inc - what the GTK Machine Manager shows and offers per
+    # machine: name, family, description, status, alias, the long
+    # <description> text, default devices, cpu, ram (default, min, max: a
+    # ram-max makes the size settable), sound hardware, chipset and media.
+    # media="slot[:device],..." lists the drives the machine takes (slots
+    # are the manager's: cartridge, tape, fda, fdb, hda, hdb, cdrom, rom,
+    # cpm, program); ":device" is the -device the drive needs.  An alias
+    # without its own media/ram-min/ram-max/chipset/<feature>s has its
+    # canonical machine's.
+    #
+    # manager_features.inc - the -M NAME,OPTS feature switches: <feature
+    # name= description= [values="a,b"]/>.  Without values it is on/off,
+    # on by default, and off is passed as "-NAME"; with values the choice
+    # is passed as NAME=VALUE (left out: the machine works it out).
     def cesc(s):
         return (s.replace('\\', '\\\\').replace('"', '\\"')
                  .replace('\r', '').replace('\n', '\\n'))
-    def long_desc(path):
-        el = ET.parse(path).getroot().find('description')
-        text = el.get('description', '') if el is not None else ''
-        return ' '.join(text.split())
-    long_by_name = {}
+    mgr = {}
     for path in _xml_files('data/machine/**/*.xml'):
-        long_by_name[ET.parse(path).getroot().get('name')] = long_desc(path)
+        root = ET.parse(path).getroot()
+        el = root.find('description')
+        text = el.get('description', '') if el is not None else ''
+        mgr[root.get('name')] = {
+            'long':     ' '.join(text.split()),
+            'media':    root.get('media'),
+            'ram-min':  root.get('ram-min'),
+            'ram-max':  root.get('ram-max'),
+            'chipset':  root.get('chipset'),
+            'features': [(f.get('name', ''), f.get('description', ''), f.get('values', ''))
+                         for f in root.findall('feature')],
+        }
+    def mgr_get(m, key, default=''):
+        own = mgr.get(m['name'], {}).get(key)
+        if own is None and m['alias']:
+            own = mgr.get(m['alias'], {}).get(key)
+        return default if own is None else own
     mlines = ['// Auto-generated from data/machine/*.xml - do not edit\n']
+    flines = ['// Auto-generated from data/machine/*.xml - do not edit\n']
     for m in machines:
         if m['family'] not in active:
             continue
+        ram = m['ram'] or (name_to_m.get(m['alias'], {}).get('ram', '') if m['alias'] else '')
         mlines.append(
             f'    {{ "{cesc(m["name"])}", "{m["family"]}", "{cesc(m["desc"])}", '
-            f'"{m["status"]}", "{m["alias"]}", "{cesc(long_by_name.get(m["name"], ""))}", '
-            f'"{m["devices"]}" }},\n')
+            f'"{m["status"]}", "{m["alias"]}", "{cesc(mgr.get(m["name"], {}).get("long", ""))}", '
+            f'"{m["devices"]}", "{m["cpu"]}", "{ram}", "{mgr_get(m, "ram-min")}", '
+            f'"{mgr_get(m, "ram-max")}", "{m["soundhw"]}", "{cesc(mgr_get(m, "chipset"))}", '
+            f'"{mgr_get(m, "media")}" }},\n')
+        feats = mgr.get(m['name'], {}).get('features') or \
+                (mgr.get(m['alias'], {}).get('features', []) if m['alias'] else [])
+        for fname, fdesc, fvalues in feats:
+            flines.append(f'    {{ "{m["name"]}", "{cesc(fname)}", "{cesc(fdesc)}", "{cesc(fvalues)}" }},\n')
     with open(os.path.join(gen_dir, 'manager_machines.inc'), 'w', encoding='utf-8') as f:
         f.writelines(mlines)
+    with open(os.path.join(gen_dir, 'manager_features.inc'), 'w', encoding='utf-8') as f:
+        f.writelines(flines)
 
     # machines_<family>.inc - GemuDevDesc {name, desc} rows for each family's
     # -M validation/listing table (keeps setup .c files free of hand-copied
@@ -388,6 +421,17 @@ def generate_data(build_dir, targets, have_alsa, have_winmidi=False):
         mstr = ', '.join(d['machines'])
         lines.append(f'    {{ "{d["name"]}", "{desc}", "{mstr}" }},\n')
     with open(os.path.join(gen_dir, 'devices.inc'), 'w', encoding='utf-8') as f:
+        f.writelines(lines)
+
+    # manager_devices.inc - each device's category, the data/device folder it
+    # is in (input, display, data, network, other), for the Machine Manager.
+    lines = ['// Auto-generated from data/device/**/*.xml - do not edit\n']
+    for path in _xml_files('data/device/**/*.xml'):
+        cat = os.path.basename(os.path.dirname(path))
+        name = ET.parse(path).getroot().get('name')
+        if any(d['name'] == name for d in devices):
+            lines.append(f'    {{ "{name}", "{cat}" }},\n')
+    with open(os.path.join(gen_dir, 'manager_devices.inc'), 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
     # ── Parse soundhw XMLs ────────────────────────────────────────────────────

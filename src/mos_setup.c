@@ -563,15 +563,20 @@ int mos_setup(int argc, char *argv[]) {
                 if (!sz) return 1;
                 cfg.mem_size = sz;
             }
-            /* Atari 2600: a -device controller replaces the default joystick */
-            bool a2600_user_ctrl = false;
-            for (int r = 0; r + 1 < nrem; r++)
-                if (strcmp(rem[r], "-device") == 0 &&
-                    (!strcmp(rem[r + 1], "cx40") || !strcmp(rem[r + 1], "cx10") ||
-                     !strcmp(rem[r + 1], "cx30")))
-                    a2600_user_ctrl = true;
-            if (!(cfg.machine == MOS_MACHINE_ATARI2600 && a2600_user_ctrl) &&
-                !attach_default_devices(&cfg, &want_vt100, md->devices))
+            /* A -device for a controller port replaces the default
+             * controller(s): the 2600's joystick, the NES/UM6578 pad. */
+            static const char *const a2600_ctrls[] = { "cx40", "cx10", "cx30", NULL };
+            static const char *const nes_ctrls[] = {
+                "nes-controller", "zapper", "famicom-keyboard", "rob", "rob-famicom",
+                "famicom-mic", "mouse", "subor-mouse", NULL };
+            const char *const *ctrls =
+                cfg.machine == MOS_MACHINE_ATARI2600 ? a2600_ctrls :
+                cfg.machine == MOS_MACHINE_NES || cfg.machine == MOS_MACHINE_UM6578 ? nes_ctrls : NULL;
+            bool user_ctrl = false;
+            for (int r = 0; ctrls && r + 1 < nrem; r++)
+                for (int c = 0; strcmp(rem[r], "-device") == 0 && ctrls[c]; c++)
+                    if (strcmp(rem[r + 1], ctrls[c]) == 0) user_ctrl = true;
+            if (!user_ctrl && !attach_default_devices(&cfg, &want_vt100, md->devices))
                 return 1;
             break;
         }

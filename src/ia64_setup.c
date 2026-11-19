@@ -79,6 +79,8 @@ static const GemuArgsDef def = {
         "  -device i82559,netdev=ID\n"
         "                  i2000: the onboard Intel 82559 LAN (attached by\n"
         "                  default on user-mode networking; -nic none removes it)\n"
+        "  -device none    i2000: leave out the default PS/2 mouse (-device mouse\n"
+        "                  after it puts one back); disks and network stay\n"
         "  -soundhw CARD   i2000: cs4281 (onboard/default), ac97, or none\n"
         "                  Each card requires its matching guest driver\n"
         "  -microprogram F Run an architectural microprogram on a bare core\n"
@@ -248,8 +250,8 @@ int ia64_setup(int argc, char *argv[]) {
     }
 
     /* The i2000 has a PS/2 mouse port, so like a real machine it comes with
-     * a mouse attached; -nodefaults leaves it off.  (-device mouse is still
-     * accepted for existing command lines.) */
+     * a mouse attached; -device none (or -nodefaults) leaves it off, and
+     * -device mouse puts it back. */
     cfg.mouse_enabled = strcmp(alias, "i2000") == 0 && gemu_drive_defaults();
     cfg.sound = strcmp(alias, "i2000") == 0 && gemu_drive_defaults()
               ? PCI_AUDIO_CS4281 : PCI_AUDIO_NONE;
@@ -303,6 +305,9 @@ int ia64_setup(int argc, char *argv[]) {
             if (gemu_net_device_model(dev, model, sizeof(model)) &&
                 strcmp(model, "i82559") == 0) {
                 if (!gemu_net_parse_device(dev)) return 1;
+            } else if (strcmp(dev, "none") == 0) {
+                /* no default devices (as on the other families): the mouse */
+                cfg.mouse_enabled = false;
             } else if (strcmp(dev, "mouse") == 0) {
                 if (strcmp(alias, "i2000") != 0) {
                     fprintf(stderr, "gemu: -device mouse is supported by i2000 only\n");
