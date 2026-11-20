@@ -8,7 +8,7 @@ Usage:
 
 Options:
   --target-list=LIST   comma-separated families to include (default: all)
-                       valid families: chip8, ia64, mitsu, mos, rca
+                       valid families: chip8, ia64, mitsu, mos, other, rca, x86, z80
   --enable-gtk         build GTK3 UI (default: no)
   --disable-sdl        do not link SDL2 (rarely useful)
   --disable-ttf        skip SDL2_ttf
@@ -100,6 +100,11 @@ FAMILY_SRC = {
     'mitsu': [
         'hardware/machine/other/machine_tvgame6.c',
         'src/mitsu_setup.c',
+    ],
+    'other': [
+        'cpu/other/ssem.c',
+        'hardware/machine/other/machine_baby.c',
+        'src/other_setup.c',
     ],
     'mos': [
         'cpu/mos/mos6502.c', 'cpu/mos/mos6502_dis.c',
@@ -206,8 +211,8 @@ def die(msg):
 
 # ── Data-file generation ───────────────────────────────────────────────────────
 
-FAMILY_SETUP  = {'mos': 'mos_setup', 'rca': 'rca_setup', 'chip8': 'chip8_setup', 'mitsu': 'mitsu_setup', 'ia64': 'ia64_setup', 'x86': 'x86_setup', 'z80': 'z80_setup'}
-FAMILY_DEFINE = {'mos': 'HAVE_MOS',  'rca': 'HAVE_RCA',  'chip8': 'HAVE_CHIP8', 'mitsu': 'HAVE_MITSU',  'ia64': 'HAVE_IA64',  'x86': 'HAVE_X86', 'z80': 'HAVE_Z80'}
+FAMILY_SETUP  = {'mos': 'mos_setup', 'rca': 'rca_setup', 'chip8': 'chip8_setup', 'mitsu': 'mitsu_setup', 'other': 'other_setup', 'ia64': 'ia64_setup', 'x86': 'x86_setup', 'z80': 'z80_setup'}
+FAMILY_DEFINE = {'mos': 'HAVE_MOS',  'rca': 'HAVE_RCA',  'chip8': 'HAVE_CHIP8', 'mitsu': 'HAVE_MITSU', 'other': 'HAVE_OTHER',  'ia64': 'HAVE_IA64',  'x86': 'HAVE_X86', 'z80': 'HAVE_Z80'}
 
 def _xml_files(*patterns):
     paths = []
@@ -740,7 +745,7 @@ def main():
                 'hardware/machine/mos', 'hardware/machine/other',
                 'hardware/machine/rca', 'hardware/machine/x86', 'hardware/machine/z80',
                 'vga/ia64', 'vga/mos', 'vga/rca', 'vga/multi', 'vga/x86',
-                'cpu/chip8', 'cpu/ia64', 'cpu/mos', 'cpu/rca', 'cpu/x86', 'cpu/z80',
+                'cpu/chip8', 'cpu/ia64', 'cpu/mos', 'cpu/other', 'cpu/rca', 'cpu/x86', 'cpu/z80',
                 'src', build_dir]
     inc_flags = ' '.join(f'-I{d}' for d in inc_dirs)
 

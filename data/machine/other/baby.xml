@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<machine name="baby" family="other" description="Manchester Baby (SSEM) (1948)"
+        cpu="ssem" status="preliminary">
+    <description description="The Manchester Small-Scale Experimental Machine, nicknamed Baby, was the first electronic stored-program computer. Built at the Victoria University of Manchester by Frederic C. Williams, Tom Kilburn and Geoff Tootill, it ran its first program on 21 June 1948. Its 32 words of 32 bits were held on a Williams-Kilburn cathode-ray tube."/>
+</machine>

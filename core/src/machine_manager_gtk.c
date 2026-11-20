@@ -115,6 +115,7 @@ static const FamilyInfo families[] = {
     { "rca",   "RCA COSMAC",    true,  false, 1u << 10 },
     { "chip8", "CHIP-8",        false, false, 1u << 10 },
     { "mitsu", "Mitsubishi",    false, false, 1u << 10 },
+    { "other", "Other",         false, false, 1u << 10 },
 };
 #define N_FAMILIES ((int)(sizeof families / sizeof *families))
 
@@ -131,6 +132,7 @@ static const struct { const char *family, *id, *desc; } cpus[] = {
     { "z80",   "z80",     "Zilog Z80" },
     { "rca",   "cdp1802", "RCA CDP1802 COSMAC" },
     { "chip8", "chip8",   "CHIP-8 interpreter" },
+    { "other", "ssem",    "Manchester SSEM (Baby)" },
 };
 #define N_CPUS ((int)(sizeof cpus / sizeof *cpus))
 #define MAX_CPU_COUNT 4                          /* the i2000 is a 4-way board */

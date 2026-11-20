@@ -20,6 +20,9 @@ int mitsu_setup(int argc, char *argv[]);
 #ifdef HAVE_MOS
 int mos_setup(int argc, char *argv[]);
 #endif
+#ifdef HAVE_OTHER
+int other_setup(int argc, char *argv[]);
+#endif
 #ifdef HAVE_RCA
 int rca_setup(int argc, char *argv[]);
 #endif
@@ -203,6 +206,9 @@ int main(int argc, char *argv[]) {
 #endif
 #ifdef HAVE_MOS
     if (strcmp(base, "gemu-mos") == 0)   return mos_setup(argc, argv);
+#endif
+#ifdef HAVE_OTHER
+    if (strcmp(base, "gemu-other") == 0) return other_setup(argc, argv);
 #endif
 #ifdef HAVE_RCA
     if (strcmp(base, "gemu-rca") == 0)   return rca_setup(argc, argv);
