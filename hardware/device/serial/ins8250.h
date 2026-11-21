@@ -11,7 +11,7 @@
  *   +3  LCR   +4  MCR: DTR, RTS, OUT1, OUT2, loopback
  *   +5  LSR: DR, OE, PE, FE, BI, THRE, TEMT
  *   +6  MSR: delta CTS/DSR/RI/DCD, then CTS, DSR, RI, DCD
- *   +7  no register on the 8250 (the 16450 added a scratch register there)
+ *   +7  no register on the 8250; the 16450's scratch register (model)
  *
  * The adapter routes the interrupt through OUT2.  Characters move at the
  * rate the divisor and LCR give (1.8432 MHz crystal, x16 clock): a byte
@@ -19,13 +19,20 @@
  * is asked for its next byte each time the receiver is free, so a byte
  * the program doesn't read in time is overrun as on the chip.  Bytes pass
  * whatever the format; framing and parity errors aren't modelled.
+ *
+ * With clock_hz 0 every character takes one clock, whatever the divisor and
+ * format: a machine that ticks on each register access moves bytes as fast
+ * as the program polls for them.
  */
 #include <stdbool.h>
 #include <stdint.h>
 
+typedef enum { INS8250_8250, INS8250_16450 } Ins8250Model;
+
 typedef struct Ins8250 {
     /* Wiring, set before ins8250_reset() */
-    uint32_t clock_hz;                          /* what ins8250_tick() counts */
+    Ins8250Model model;                         /* the 16450 adds +7, scratch */
+    uint32_t clock_hz;                          /* what ins8250_tick() counts; 0: characters */
     void (*set_irq)(void *ud, bool level);
     void *ud;
     /* The device on the port: NULL members for none */
@@ -33,9 +40,10 @@ typedef struct Ins8250 {
     void (*dev_lines)(void *dev, bool dtr, bool rts);   /* the MCR outputs changed */
     bool (*dev_rx)(void *dev, uint8_t *b);      /* the device's next byte, if it has one */
     void *dev;
+    uint8_t modem_in;   /* the device's CTS, DSR, RI, DCD: MSR bits 4-7 */
 
     /* Registers */
-    uint8_t  rbr, thr, ier, lcr, mcr, lsr, msr;
+    uint8_t  rbr, thr, ier, lcr, mcr, lsr, msr, scr;
     uint16_t divisor;
     bool     thre_int;      /* THR-empty interrupt pending (cleared by reading IIR) */
 

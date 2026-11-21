@@ -1,0 +1,23 @@
+{
+    // Build output, ROM/disk images and emulator snapshots: gigabytes that
+    // nothing in the editor needs to watch or search.
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/build/**": true,
+        "**/build-*/**": true,
+        "**/bin/**": true,
+        "**/bin-*/**": true,
+        "**/snapshots/**": true,
+        "**/roms/**": true
+    },
+    "search.exclude": {
+        "**/build/**": true,
+        "**/build-*/**": true,
+        "**/bin/**": true,
+        "**/bin-*/**": true,
+        "**/snapshots/**": true,
+        "**/roms/**": true
+    },
+    // Never follow symlinks out of the tree (a Wine prefix's z: is /).
+    "search.followSymlinks": false
+}

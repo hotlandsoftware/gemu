@@ -21,7 +21,9 @@ SDL_VER=2.30.9
 TTF_VER=2.22.0
 DEPS=build-win/deps
 SYSROOT=$DEPS/$HOST
-WINEPREFIX_DIR=build-win/wineprefix
+# Outside the source tree: a Wine prefix's z: drive links to /, which file
+# watchers and searches in the tree would follow across the whole disk.
+WINEPREFIX_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/gemu/wineprefix
 
 fetch() {   # fetch NAME URL: unpack a MinGW devel package into the sysroot
     [ -f "$DEPS/.$1" ] && return
@@ -77,7 +79,8 @@ run)
     [ -f bin-win/gemu.exe ] || build
     command -v wine >/dev/null || { echo "build-windows: wine not found" >&2; exit 1; }
     # a prefix of its own, so nothing touches ~/.wine; no Mono/Gecko prompts
-    export WINEPREFIX="$(pwd)/$WINEPREFIX_DIR" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG=-all
+    mkdir -p "$(dirname "$WINEPREFIX_DIR")"
+    export WINEPREFIX="$WINEPREFIX_DIR" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG=-all
     exec wine bin-win/gemu.exe "$@"
     ;;
 ""|build)

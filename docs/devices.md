@@ -47,4 +47,4 @@ ninja tests            # build them without running
 Each test runs headless in its own temporary directory, so it can create scratch files with relative paths. It should print a one-line summary and exit non-zero on failure. `ninja check` runs in CI.
 
 # Existing machines
-Some machines still have devices built into them (the i2000's PICs, IDE and keyboard controller; the NES mappers; the KIM-1's RRIOTs). These are being moved out step by step. When you change one of them, prefer moving it out first over adding to it.
+Some machines still have devices built into them (the i2000's IDE and keyboard controller; the NES mappers; the KIM-1's RRIOTs). These are being moved out step by step. When you change one of them, prefer moving it out first over adding to it.

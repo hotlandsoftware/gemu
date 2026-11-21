@@ -1,10 +1,14 @@
 #include "i2000.h"
 #include "merced.h"
 #include "chipset/i460gx.h"
+#include "controller/i8259.h"
 #include "i2c/at24.h"
 #include "i2c/i2c.h"
 #include "i2c/itanium_cart.h"
 #include "i2c/lm87.h"
+#include "serial/ins8250.h"
+#include "storage/ata_disk.h"
+#include "storage/ide.h"
 #include "timer/i8253.h"
 #include "timer/mc146818.h"
 #include "input_menu.h"
@@ -263,9 +267,10 @@ struct Ia64I2000State {
     uint64_t  pit_remainder;     /* leftover ITC ticks x 1193182 */
     uint64_t  pit_clock;         /* PIT clocks since reset */
     uint8_t   port61;
-    uint8_t   pic_master_mask, pic_slave_mask;
-    uint8_t   pic_master_base, pic_slave_base;
-    uint8_t   pic_master_icw, pic_slave_icw;
+    /* The IFB's 8259 pair.  Its lines come from the devices' legacy
+     * interrupt state (i2000_pic_sync()); its INT reaches the processor as
+     * an ExtINT, and the INTA cycles are the read of I2000_LEGACY_ACK_ADDR. */
+    I8259Pair pic;
     uint8_t   kbc_command_byte;
     uint8_t   kbc_pending_write; /* 0=keyboard data, 1=command byte, 2=output port, 3=aux */
     uint8_t   kbc_out[8];
@@ -302,15 +307,13 @@ struct Ia64I2000State {
     GemuDrive *hda;      /* ide0-hd0; file/size below are informational */
     char      hda_file[512];
     uint64_t  hda_size;
-    uint8_t   ata_error, ata_features, ata_count;
-    uint8_t   ata_lba_low, ata_lba_mid, ata_lba_high, ata_device;
-    uint8_t   ata_status;
-    uint8_t  *ata_data;
-    size_t    ata_data_len, ata_data_pos;
-    bool      ata_data_is_write;
-    uint32_t  ata_write_lba;
-    uint8_t   uart_ier, uart_lcr, uart_mcr, uart_scr, uart_dll, uart_dlm;
-    uint8_t   uart_rx[256], uart_rx_head, uart_rx_tail;
+    /* The primary IDE channel (the CMD-649's): the -hda disk as device 0. */
+    IdeChannel ide_primary;
+    AtaDisk   hd;
+    /* COM1, the firmware's serial console: a 16450 whose terminal is the
+     * host (output to the console window and stdout, input from con_rx). */
+    Ins8250   uart;
+    uint8_t   con_rx[256], con_rx_head, con_rx_tail;
 
     /* The SDV's display card: a Rage 128 with the VGA core behind it. The
      * frame buffer and the video BIOS image are host-owned buffers, saved
@@ -399,8 +402,6 @@ struct Ia64I2000State {
     uint64_t keyboard_retry_ninsts;
     /* secondary IDE interrupt latch. ATAPI is on slave-PIC IRQ15. */
     bool atapi_irq_pending;
-    /* in-service state established by the legacy acknowledge cycle. */
-    uint8_t pic_master_isr, pic_slave_isr;
     /* command completion is not visible in the same CPU instant as
      * the command-register write. AtaPim arms its waiter after submission. */
     uint64_t atapi_irq_ready_ninsts;
@@ -414,9 +415,6 @@ struct Ia64I2000State {
     uint8_t atapi_ready_status;
     bool atapi_status_pending;
     bool atapi_ready_irq;
-    /* OCW3 read-register selection for each legacy 8259. False is
-     * IRR (the reset/default selection), true is ISR. */
-    bool pic_master_read_isr, pic_slave_read_isr;
     /* device interrupt output and ATA/ATAPI completion semantics. */
     uint8_t atapi_device_control;
     bool atapi_irq_asserted;
@@ -429,14 +427,8 @@ struct Ia64I2000State {
      * an INTRQ latch (normal Status read acknowledges, Alternate Status
      * doesn't, nIEN masks the output) delivered through GSI14, and PIO
      * transfers in DRQ blocks of one sector, or SET MULTIPLE sectors. */
-    bool ata_irq_pending, ata_irq_asserted;
-    uint8_t ata_device_control;
-    uint8_t ata_multiple;        /* SET MULTIPLE block size, 0 = disabled */
-    uint8_t ata_xfer_cmd;        /* data command in progress, 0 = none */
-    uint8_t ata_block_sectors;   /* sectors in the current DRQ block */
-    uint32_t ata_xfer_lba;       /* first sector of the current block */
-    uint32_t ata_xfer_remaining; /* sectors left, current block included */
-    uint64_t ata_irq_ready_ninsts;
+    /* The disk's interrupt epoch last delivered (ata_deliver_irq()). */
+    uint32_t ata_irq_delivered;
     /* the firmware's legacy IRQ14 (slave PIC input 6) for the disk,
      * latched until its ExtINT acknowledge like the CD's IRQ15. */
     bool ata_legacy_irq_latched;
@@ -465,6 +457,7 @@ static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
                      unsigned size, bool is_write);
 static void i2000_reset(Ia64I2000State *s, bool warm);
 static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi);
+static void i2000_pic_raise(Ia64I2000State *s);
 
 static int32_t mouse_accumulate_axis(int32_t pending, int delta) {
     if (!delta)
@@ -628,8 +621,7 @@ static void i2000_pit_out(void *ud, unsigned channel, bool level) {
         return;
     iosapic_raise_gsi(s, 0);
     s->pit_irq_pending = true;
-    if (!(s->pic_master_mask & 1))
-        merced_raise_external(s->cpu, 0);
+    i2000_pic_raise(s);
 }
 
 /* Advance the timer to the present ITC. */
@@ -904,67 +896,21 @@ static void atapi_reply(Ia64I2000State *s) {
     }
 }
 
-static void ata_set_data(Ia64I2000State *s, const void *data, size_t len) {
-    free(s->ata_data);
-    s->ata_data = NULL;
-    s->ata_data_len = s->ata_data_pos = 0;
-    s->ata_data_is_write = false;
-    if (len) {
-        s->ata_data = malloc(len);
-        if (!s->ata_data) {
-            s->ata_error = 0x04; /* ABRT */
-            s->ata_status = 0x41;
-            return;
-        }
-        if (data) memcpy(s->ata_data, data, len);
-        else memset(s->ata_data, 0, len);
-        s->ata_data_len = len;
-    }
-    s->ata_status = len ? 0x58 : 0x50; /* DRDY|DSC|DRQ or DRDY|DSC */
+static uint64_t i2000_now_ninsts(void *ctx) {
+    return ((Ia64I2000State *)ctx)->cpu->ninsts;
 }
 
-#define ATA_HEADS 16u
-#define ATA_SPT   63u
-#define ATA_MAX_MULTIPLE 16u
-
-static uint32_t ata_total_sectors(const Ia64I2000State *s) {
-    uint64_t n = gemu_drive_size(s->hda) / 512;
-    return n > 0x0FFFFFFFu ? 0x0FFFFFFFu : (uint32_t)n;   /* LBA28 */
-}
-
-/* The selected device's address: 28-bit LBA when the device register's
- * LBA bit (0x40) is set, otherwise CHS in the fixed IDENTIFY geometry. */
-static bool ata_address(const Ia64I2000State *s, uint32_t *lba) {
-    if (s->ata_device & 0x40) {
-        *lba = (uint32_t)s->ata_lba_low | ((uint32_t)s->ata_lba_mid << 8) |
-               ((uint32_t)s->ata_lba_high << 16) |
-               ((uint32_t)(s->ata_device & 0x0F) << 24);
-        return true;
-    }
-    uint32_t cyl = (uint32_t)s->ata_lba_mid | ((uint32_t)s->ata_lba_high << 8);
-    uint32_t head = s->ata_device & 0x0F, sector = s->ata_lba_low;
-    if (!sector || sector > ATA_SPT || head >= ATA_HEADS)
-        return false;
-    *lba = (cyl * ATA_HEADS + head) * ATA_SPT + sector - 1;
-    return true;
-}
-
-/* Raise INTRQ after the device's (modelled) response latency. */
-static void ata_raise_irq(Ia64I2000State *s) {
-    s->ata_irq_pending = true;
-    s->ata_irq_asserted = false;
-    s->ata_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
-}
-
-static void ata_clear_irq(Ia64I2000State *s) {
-    s->ata_irq_pending = false;
-    s->ata_irq_asserted = false;
-}
-
-/* Until the response latency elapses the disk is busy: Status reads BSY and
- * no interrupt is visible, as on a real drive between command and DRQ. */
-static bool ata_busy(const Ia64I2000State *s) {
-    return s->ata_irq_pending && s->cpu->ninsts < s->ata_irq_ready_ninsts;
+/* The disk's wiring: the -hda drive, busy for ATAPI_IRQ_LATENCY_NINSTS
+ * instructions after each command.  Also after a state load, which brings
+ * the device's state but not its host pointers. */
+static void i2000_ide_wire(Ia64I2000State *s) {
+    AtaDiskConfig cfg = {
+        .drive = s->hda, .now = i2000_now_ninsts, .ctx = s,
+        .latency = ATAPI_IRQ_LATENCY_NINSTS, .debug = getenv("ATA_DEBUG") != NULL,
+    };
+    ata_disk_rewire(&s->hd, &cfg);
+    s->ide_primary.dev[0] = s->hda ? &s->hd.ide : NULL;
+    s->ide_primary.dev[1] = NULL;
 }
 
 /* Whether the 8259 pair would pass legacy ISA IRQ n to the CPU: its own
@@ -973,9 +919,9 @@ static bool ata_busy(const Ia64I2000State *s) {
  * IRQ15 it never enabled left its CD driver timing out every read). */
 static bool i2000_pic_irq_open(const Ia64I2000State *s, unsigned irq) {
     if (irq < 8)
-        return !(s->pic_master_mask & (1u << irq));
-    return !(s->pic_slave_mask & (1u << (irq - 8))) &&
-           !(s->pic_master_mask & 0x04);
+        return !(s->pic.master.imr & (1u << irq));
+    return !(s->pic.slave.imr & (1u << (irq - 8))) &&
+           !(s->pic.master.imr & 0x04);
 }
 
 /* Drive INTRQ out once the disk is ready: the OS's fixed GSI14 vector, or -
@@ -985,13 +931,13 @@ static bool i2000_pic_irq_open(const Ia64I2000State *s, unsigned irq) {
  * IDENTIFY; without it, it gave up on the disk and the Boot Manager never
  * saw it.)  nIEN, SRST and selecting the absent slave lower INTRQ. */
 static void ata_deliver_irq(Ia64I2000State *s) {
-    if (!s->ata_irq_pending || s->ata_irq_asserted || ata_busy(s) ||
-        (s->ata_device_control & 6) || (s->ata_device & 0x10))
+    uint32_t epoch = ata_disk_irq_epoch(&s->hd);
+    if (!ide_intrq(&s->ide_primary) || s->ata_irq_delivered == epoch)
         return;
     uint64_t rte = s->chipset.iosapic_rte[14];
     if (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) <= 1) {
         iosapic_raise_gsi(s, 14);
-        s->ata_irq_asserted = true;
+        s->ata_irq_delivered = epoch;
     } else if (rte == I460GX_IOSAPIC_RTE_MASK ||
                (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) == 7)) {
         if ((s->cpu->cr[2] == 0 || (s->cpu->psr & (UINT64_C(1) << 34)) ||
@@ -1005,7 +951,7 @@ static void ata_deliver_irq(Ia64I2000State *s) {
              * (no partitions, so the Windows boot entry was "Not Found"),
              * and later a READ MULTIPLE block inside FPSWA.EFI ("Device
              * Error"). */
-            s->ata_irq_asserted = true;
+            s->ata_irq_delivered = epoch;
             /* The SDV's "BIOS CallBacks" disk path runs the IA-32 BIOS's
              * INT 13h with cr.iva zero, where GEMU delivers no external
              * interrupts (see i2000_efi_bios_key()).  That code polls the
@@ -1015,248 +961,10 @@ static void ata_deliver_irq(Ia64I2000State *s) {
              * each, a multi-minute firmware boot). */
             s->ram[0x48E] = 0xFF;
         } else if (i2000_pic_irq_open(s, 14)) {
-            s->ata_irq_asserted = true;
+            s->ata_irq_delivered = epoch;
             s->ata_legacy_irq_latched = true;
-            merced_raise_external(s->cpu, 0);
+            i2000_pic_raise(s);
         }   /* masked: stays pending until unmasked or acknowledged */
-    }
-}
-
-/* End a command: final status/error, no data phase, completion interrupt. */
-static void ata_finish(Ia64I2000State *s, uint8_t status, uint8_t error) {
-    ata_set_data(s, NULL, 0);
-    s->ata_status = status;
-    s->ata_error = error;
-    s->ata_xfer_cmd = 0;
-    s->ata_xfer_remaining = 0;
-    ata_raise_irq(s);
-}
-
-static void ata_abort(Ia64I2000State *s) { ata_finish(s, 0x51, 0x04); }
-
-static unsigned ata_block_size(const Ia64I2000State *s) {
-    unsigned n = (s->ata_xfer_cmd == 0xC4 || s->ata_xfer_cmd == 0xC5)
-               ? s->ata_multiple : 1;
-    return n < s->ata_xfer_remaining ? n : s->ata_xfer_remaining;
-}
-
-/* PIO data-in: present the next block with DRQ and interrupt for it. */
-static void ata_read_block(Ia64I2000State *s) {
-    unsigned n = ata_block_size(s);
-    size_t len = (size_t)n * 512;
-    uint8_t *buf = malloc(len);
-    if (!buf || !gemu_drive_read(s->hda, (uint64_t)s->ata_xfer_lba * 512,
-                                 buf, len)) {
-        free(buf);
-        ata_finish(s, 0x51, 0x40);           /* ERR, UNC */
-        return;
-    }
-    ata_set_data(s, buf, len);
-    free(buf);
-    s->ata_block_sectors = (uint8_t)n;
-    ata_raise_irq(s);
-}
-
-/* PIO data-out: ask for the next block.  The first block of a command is
- * requested without an interrupt; later ones interrupt (ATA PIO out). */
-static void ata_write_block(Ia64I2000State *s, bool irq) {
-    unsigned n = ata_block_size(s);
-    ata_set_data(s, NULL, (size_t)n * 512);
-    s->ata_data_is_write = true;
-    s->ata_block_sectors = (uint8_t)n;
-    if (irq)
-        ata_raise_irq(s);
-}
-
-/* The host has read the whole current data-in block. */
-static void ata_data_in_done(Ia64I2000State *s) {
-    if (getenv("ATA_DEBUG"))
-        fprintf(stderr, "i2000: ATA data-in block read lba=%u sectors=%u "
-                "ninsts=%" PRIu64 "\n", s->ata_xfer_lba, s->ata_block_sectors,
-                s->cpu->ninsts);
-    if (s->ata_xfer_cmd == 0x20 || s->ata_xfer_cmd == 0x21 ||
-        s->ata_xfer_cmd == 0xC4) {
-        s->ata_xfer_lba += s->ata_block_sectors;
-        s->ata_xfer_remaining -= s->ata_block_sectors;
-        if (s->ata_xfer_remaining) {
-            ata_read_block(s);
-            return;
-        }
-    }
-    ata_set_data(s, NULL, 0);                 /* no interrupt at the end */
-    s->ata_xfer_cmd = 0;
-}
-
-/* The host has written the whole current data-out block. */
-static void ata_data_out_done(Ia64I2000State *s) {
-    if (!gemu_drive_write(s->hda, (uint64_t)s->ata_xfer_lba * 512,
-                          s->ata_data, s->ata_data_len)) {
-        ata_finish(s, 0x51, 0x10);            /* ERR, IDNF */
-        return;
-    }
-    s->ata_xfer_lba += s->ata_block_sectors;
-    s->ata_xfer_remaining -= s->ata_block_sectors;
-    if (s->ata_xfer_remaining)
-        ata_write_block(s, true);
-    else
-        ata_finish(s, 0x50, 0);
-}
-
-/* Fills a byte-swapped ASCII field the way ATA IDENTIFY DEVICE strings are
- * conventionally packed: each pair of bytes holds one 16-bit word with the
- * two characters swapped relative to normal reading order. */
-static void ata_id_string(uint8_t *id, unsigned byte_off, unsigned len,
-                          const char *text) {
-    char buf[40];
-    size_t tlen = strlen(text);
-    memset(buf, ' ', sizeof(buf));
-    memcpy(buf, text, tlen < sizeof(buf) ? tlen : sizeof(buf));
-    for (unsigned i = 0; i < len; i += 2) {
-        id[byte_off + i]     = (uint8_t)buf[i + 1];
-        id[byte_off + i + 1] = (uint8_t)buf[i];
-    }
-}
-
-static void ata_id_word(uint8_t *id, unsigned word, uint16_t v) {
-    id[word * 2] = (uint8_t)v;
-    id[word * 2 + 1] = (uint8_t)(v >> 8);
-}
-
-/* A PIO-only LBA28 ATA-4 disk.  No DMA is advertised (words 49 bit 8, 63
- * and 88 clear): the CMD-649 bus-master engine isn't modelled, so the IDE
- * driver must stay on PIO. */
-static void ata_identify(Ia64I2000State *s) {
-    uint8_t id[512] = {0};
-    uint32_t sectors = ata_total_sectors(s);
-    uint32_t cyls = sectors / (ATA_HEADS * ATA_SPT);
-    if (cyls > 16383) cyls = 16383;
-    uint32_t chs_sectors = cyls * ATA_HEADS * ATA_SPT;
-
-    ata_id_word(id, 0, 0x0040);                 /* fixed device */
-    ata_id_word(id, 1, (uint16_t)cyls);
-    ata_id_word(id, 3, ATA_HEADS);
-    ata_id_word(id, 6, ATA_SPT);
-    ata_id_string(id, 20, 20, "GEMU-HDA0001");  /* words 10-19: serial */
-    ata_id_string(id, 46, 8, "1.0");            /* words 23-26: firmware */
-    ata_id_string(id, 54, 40, "GEMU VIRTUAL HDD"); /* words 27-46: model */
-    ata_id_word(id, 47, 0x8000 | ATA_MAX_MULTIPLE);
-    ata_id_word(id, 49, 0x0200);                /* LBA */
-    ata_id_word(id, 51, 0x0200);                /* PIO timing mode 2 */
-    ata_id_word(id, 53, 0x0003);                /* words 54-58, 64-70 valid */
-    ata_id_word(id, 54, (uint16_t)cyls);
-    ata_id_word(id, 55, ATA_HEADS);
-    ata_id_word(id, 56, ATA_SPT);
-    ata_id_word(id, 57, (uint16_t)chs_sectors);
-    ata_id_word(id, 58, (uint16_t)(chs_sectors >> 16));
-    if (s->ata_multiple)
-        ata_id_word(id, 59, 0x0100 | s->ata_multiple);
-    ata_id_word(id, 60, (uint16_t)sectors);
-    ata_id_word(id, 61, (uint16_t)(sectors >> 16));
-    ata_id_word(id, 64, 0x0003);                /* PIO modes 3 and 4 */
-    for (unsigned w = 65; w <= 68; w++)
-        ata_id_word(id, w, 120);                /* cycle times, ns */
-    ata_id_word(id, 80, 0x001E);                /* ATA-1..ATA-4 */
-    ata_id_word(id, 82, 0x4000);                /* NOP */
-    ata_id_word(id, 83, 0x4000);                /* (word valid) */
-    ata_id_word(id, 84, 0x4000);
-    ata_id_word(id, 85, 0x4000);
-    ata_id_word(id, 86, 0x0000);
-    ata_id_word(id, 87, 0x4000);
-    ata_set_data(s, id, sizeof(id));
-    s->ata_xfer_cmd = 0xEC;
-    ata_raise_irq(s);
-}
-
-/* Starts a READ/WRITE (MULTIPLE) or VERIFY command over the task-file
- * address and count; false (after aborting) if the range is invalid. */
-static bool ata_start_xfer(Ia64I2000State *s, uint8_t cmd) {
-    uint32_t lba;
-    uint32_t count = s->ata_count ? s->ata_count : 256;
-    if (!ata_address(s, &lba) || (uint64_t)lba + count > ata_total_sectors(s)) {
-        ata_finish(s, 0x51, 0x10);            /* ERR, IDNF */
-        return false;
-    }
-    s->ata_xfer_cmd = cmd;
-    s->ata_xfer_lba = lba;
-    s->ata_xfer_remaining = count;
-    return true;
-}
-
-/* Executes an ATA command written to the primary channel's command
- * register (port 0x1F7) for the master disk.  Every command completes with
- * the interrupt behaviour Windows' IDE driver waits for. */
-static void ata_command(Ia64I2000State *s, uint8_t cmd) {
-    if (getenv("ATA_DEBUG"))
-        fprintf(stderr, "i2000: ATA command %#04x device=%#04x lba=%u:%u:%u "
-                "count=%u features=%#04x ninsts=%" PRIu64 "\n", cmd,
-                s->ata_device, s->ata_lba_high, s->ata_lba_mid, s->ata_lba_low,
-                s->ata_count, s->ata_features, s->cpu->ninsts);
-    if (getenv("ATA_DEBUG") && s->ata_data_len &&
-        s->ata_data_pos < s->ata_data_len)
-        fprintf(stderr, "i2000: ATA command %#04x abandons %zu unread "
-                "data bytes\n", cmd, (size_t)(s->ata_data_len - s->ata_data_pos));
-    s->ata_error = 0;
-    ata_clear_irq(s);
-    switch (cmd) {
-    case 0xEC:                                       /* IDENTIFY DEVICE */
-        ata_identify(s);
-        break;
-    case 0x20: case 0x21:                            /* READ SECTORS */
-    case 0xC4:                                       /* READ MULTIPLE */
-        if (cmd == 0xC4 && !s->ata_multiple) { ata_abort(s); break; }
-        if (ata_start_xfer(s, cmd))
-            ata_read_block(s);
-        break;
-    case 0x30: case 0x31:                            /* WRITE SECTORS */
-    case 0xC5:                                       /* WRITE MULTIPLE */
-        if (cmd == 0xC5 && !s->ata_multiple) { ata_abort(s); break; }
-        if (ata_start_xfer(s, cmd))
-            ata_write_block(s, false);
-        break;
-    case 0x40: case 0x41:                            /* READ VERIFY SECTORS */
-        if (ata_start_xfer(s, cmd))
-            ata_finish(s, 0x50, 0);
-        break;
-    case 0xC6: {                                     /* SET MULTIPLE MODE */
-        unsigned n = s->ata_count;
-        if (n > ATA_MAX_MULTIPLE || (n & (n - 1))) { ata_abort(s); break; }
-        s->ata_multiple = (uint8_t)n;
-        ata_finish(s, 0x50, 0);
-        break;
-    }
-    case 0xEF:                                       /* SET FEATURES */
-        /* Transfer mode 0x03: PIO (count 0x00-0x0F) only; DMA modes abort
-         * since no DMA was advertised.  Cache and other feature toggles are
-         * accepted as no-ops. */
-        if (s->ata_features == 0x03 && s->ata_count >= 0x10) { ata_abort(s); break; }
-        ata_finish(s, 0x50, 0);
-        break;
-    case 0x90:                                       /* EXECUTE DIAGNOSTIC */
-        ata_finish(s, 0x50, 0x01);                  /* device 0 passed */
-        s->ata_count = s->ata_lba_low = 1;
-        s->ata_lba_mid = s->ata_lba_high = 0;
-        break;
-    case 0xE5:                                       /* CHECK POWER MODE */
-        s->ata_count = 0xFF;                        /* active/idle */
-        ata_finish(s, 0x50, 0);
-        break;
-    case 0x91:                       /* INITIALIZE DEVICE PARAMETERS */
-    case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
-    case 0x16: case 0x17: case 0x18: case 0x19: case 0x1A: case 0x1B:
-    case 0x1C: case 0x1D: case 0x1E: case 0x1F:     /* RECALIBRATE */
-    case 0x70:                                       /* SEEK */
-    case 0x00:                                       /* NOP */
-    case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE6:  /* power */
-    case 0xE7: case 0xEA:                            /* FLUSH CACHE (EXT) */
-        ata_finish(s, 0x50, 0);
-        break;
-    default:
-        /* Includes IDENTIFY PACKET DEVICE (A1) and PACKET (A0): aborting
-         * those is how drivers tell an ATA disk from an ATAPI device. */
-        if (getenv("ATA_DEBUG"))
-            fprintf(stderr, "i2000: ATA unsupported command %#04x\n", cmd);
-        ata_abort(s);
-        break;
     }
 }
 
@@ -1393,6 +1101,50 @@ static void con_putc(Ia64I2000State *s, char c) {
     s->console[s->con_row][s->con_col] = 0;
 }
 
+/* COM1's terminal.  Characters the firmware sends go to the console; host
+ * keystrokes queue in con_rx and are offered once the receive register is
+ * empty, so typing faster than the firmware polls never overruns.  With
+ * clock_hz 0 a character takes one tick, and the UART is ticked at every
+ * register access and interrupt poll: bytes move as fast as they're polled,
+ * as on the old inline port.  No IRQ4 yet (A8). */
+static void i2000_uart_tx(void *dev, uint8_t b) {
+    Ia64I2000State *s = dev;
+    con_putc(s, (char)b);
+    fputc(b, stdout);
+    fflush(stdout);
+}
+static bool i2000_uart_rx(void *dev, uint8_t *b) {
+    Ia64I2000State *s = dev;
+    if ((s->uart.lsr & 0x01) || s->con_rx_head == s->con_rx_tail)
+        return false;
+    *b = s->con_rx[s->con_rx_head++];
+    return true;
+}
+static void i2000_uart_wire(Ia64I2000State *s) {
+    s->uart.model = INS8250_16450;
+    s->uart.clock_hz = 0;                    /* one tick per character */
+    s->uart.set_irq = NULL;
+    s->uart.ud = s;
+    s->uart.dev_tx = i2000_uart_tx;
+    s->uart.dev_lines = NULL;
+    s->uart.dev_rx = i2000_uart_rx;
+    s->uart.dev = s;
+    s->uart.modem_in = 0xB0;                 /* CTS, DSR, DCD */
+}
+static void i2000_uart_reset(Ia64I2000State *s) {
+    i2000_uart_wire(s);
+    ins8250_reset(&s->uart);
+    s->con_rx_head = s->con_rx_tail = 0;
+}
+/* A host character for the serial console (dropped if 255 are waiting). */
+static void i2000_con_rx(Ia64I2000State *s, uint8_t c) {
+    uint8_t next = (uint8_t)(s->con_rx_tail + 1);
+    if (next != s->con_rx_head) {
+        s->con_rx[s->con_rx_tail] = c;
+        s->con_rx_tail = next;
+    }
+}
+
 /* ── Physical bus ────────────────────────────────────────────────────────── */
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -1526,21 +1278,41 @@ static void i2000_rtc_initialise(Ia64I2000State *s) {
  * reports a raised line whether or not IMR masks it - AMI's IA-32 BIOS
  * waits for IRQ14/15 by polling IRR with interrupts off, and EFI keeps
  * IRQ15 masked while it does. */
-static bool i2000_ata_intrq_line(const Ia64I2000State *s) {
-    return s->ata_irq_pending && !ata_busy(s) &&
-           !(s->ata_device_control & 6) && !(s->ata_device & 0x10);
-}
 static bool i2000_atapi_intrq_line(const Ia64I2000State *s) {
     return s->atapi_irq_pending && !(s->atapi_device_control & 6) &&
            !(s->atapi_device & 0x10) &&
            s->cpu->ninsts >= s->atapi_irq_ready_ninsts;
 }
-static uint8_t i2000_pic_slave_irr(const Ia64I2000State *s) {
-    uint8_t irr = 0;
-    if (s->mouse_irq_pending) irr |= 0x10;
-    if (s->ata_legacy_irq_latched || i2000_ata_intrq_line(s)) irr |= 0x40;
-    if (s->atapi_legacy_irq_latched || i2000_atapi_intrq_line(s)) irr |= 0x80;
-    return irr;
+/* The 8259 pair's input lines, from the devices' legacy interrupt state.
+ * The PIT, keyboard and mouse flags are set only on their legacy (ExtINT)
+ * paths and cleared by the acknowledge; IRQ12 also drops while the mouse
+ * waits out its post-acknowledge delay, so its retry is a new edge.  The
+ * IDE lines are INTRQ, or a request the PIC has taken (the latch) that
+ * outlives a Status read until acknowledged.  The RTC's IRQ8 reaches the
+ * processor only through the I/O SAPIC. */
+static void i2000_pic_sync(Ia64I2000State *s) {
+    I8259Pair *p = &s->pic;
+    i8259_pair_set_irq(p, 0, s->pit_irq_pending);
+    i8259_pair_set_irq(p, 1, s->keyboard_irq_pending);
+    i8259_pair_set_irq(p, 12, s->mouse_irq_pending &&
+                              s->mouse_wait_rfi_generation == 0 &&
+                              s->cpu->ninsts >= s->mouse_retry_ninsts);
+    i8259_pair_set_irq(p, 14, s->ata_legacy_irq_latched || ide_intrq(&s->ide_primary));
+    i8259_pair_set_irq(p, 15, s->atapi_legacy_irq_latched || i2000_atapi_intrq_line(s));
+}
+/* A device's legacy path asks for the processor: offer the pair's INT as an
+ * ExtINT (vector 0) if it is asserting one. */
+static void i2000_pic_raise(Ia64I2000State *s) {
+    i2000_pic_sync(s);
+    if (i8259_pair_intr(&s->pic))
+        merced_raise_external(s->cpu, 0);
+}
+/* The pair as the board resets it: everything masked, and the vector bases
+ * the firmware's legacy thunk uses until it programs ICW2 itself. */
+static void i2000_pic_reset(Ia64I2000State *s) {
+    i8259_pair_reset(&s->pic);
+    s->pic.master.vector_base = 0x08;
+    s->pic.slave.vector_base = 0x70;
 }
 
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
@@ -1632,50 +1404,20 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     if (port >= PCI_CFG_DATA && port < PCI_CFG_DATA + 4)
         return pci_cfg_read(s, (unsigned)(port - PCI_CFG_DATA), size);
     if (port >= COM1_PORT && port < COM1_PORT + 8) {
-        switch (port - COM1_PORT) {
-        case 0:
-            if (s->uart_lcr & 0x80) return s->uart_dll;
-            if (s->uart_rx_head != s->uart_rx_tail) {
-                uint8_t v = s->uart_rx[s->uart_rx_head++];
-                return v;
-            }
-            return 0;
-        case 1: return (s->uart_lcr & 0x80) ? s->uart_dlm : s->uart_ier;
-        case 2: return ((s->uart_ier & 1) && s->uart_rx_head != s->uart_rx_tail)
-                     ? 0x04 : 0x01;                /* RX data / no interrupt */
-        case 3: return s->uart_lcr;
-        case 4: return s->uart_mcr;
-        case 5: return 0x60 | (s->uart_rx_head != s->uart_rx_tail ? 1 : 0);
-        case 6: return 0xB0;                        /* MSR: CTS|DSR|DCD */
-        case 7: return s->uart_scr;
-        }
+        ins8250_tick(&s->uart, 1);
+        return ins8250_read(&s->uart, (unsigned)(port - COM1_PORT));
     }
-    if (port == 0x20 && size == 1) {
-        uint8_t irr = 0;
-        if (s->pit_irq_pending) irr |= 0x01;
-        if (s->keyboard_irq_pending) irr |= 0x02;
-        /* IRQ2 is the slave's INT output: its unmasked requests only. */
-        if (s->mouse_irq_pending || s->atapi_legacy_irq_latched ||
-            s->ata_legacy_irq_latched ||
-            (i2000_pic_slave_irr(s) & (uint8_t)~s->pic_slave_mask)) irr |= 0x04;
+    if ((port == 0x20 || port == 0xA0) && size == 1) {
+        uint8_t v;
+        i2000_pic_sync(s);
+        i8259_pair_io_read(&s->pic, (uint16_t)port, &v);
         if (getenv("ATA_IRQ_TRACE"))
-            fprintf(stderr, "i2000: PIC master %s read -> %#04x ninsts=%" PRIu64 "\n",
-                    s->pic_master_read_isr ? "ISR" : "IRR",
-                    s->pic_master_read_isr ? s->pic_master_isr : irr,
-                    s->cpu->ninsts);
-        return s->pic_master_read_isr ? s->pic_master_isr : irr;
+            fprintf(stderr, "i2000: PIC %s read -> %#04x ninsts=%" PRIu64 "\n",
+                    port == 0x20 ? "master" : "slave", v, s->cpu->ninsts);
+        return v;
     }
-    if (port == 0xA0 && size == 1) {
-        uint8_t irr = i2000_pic_slave_irr(s);
-        if (getenv("ATA_IRQ_TRACE"))
-            fprintf(stderr, "i2000: PIC slave %s read -> %#04x ninsts=%" PRIu64 "\n",
-                    s->pic_slave_read_isr ? "ISR" : "IRR",
-                    s->pic_slave_read_isr ? s->pic_slave_isr : irr,
-                    s->cpu->ninsts);
-        return s->pic_slave_read_isr ? s->pic_slave_isr : irr;
-    }
-    if (port == 0x21) return s->pic_master_mask;
-    if (port == 0xA1) return s->pic_slave_mask;
+    if (port == 0x21) return s->pic.master.imr;
+    if (port == 0xA1) return s->pic.slave.imr;
     if (port >= 0x40 && port <= 0x43 && size == 1) {
         i2000_pit_run(s);
         return i8253_io_read(&s->pit, port);
@@ -1749,49 +1491,12 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         return result;
     }
     if (s->hda && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
-        unsigned reg = port == 0x3F6 ? 7 : (unsigned)(port - 0x1F0);
-        /* Only the master disk exists.  With device 1 selected, the master
-         * answers its Status/Alternate Status as 0 (no device), and the
-         * data port is idle - otherwise drivers find a phantom slave. */
-        if (s->ata_device & 0x10)
-            return reg == 6 ? s->ata_device : 0;
-        if (reg == 0) {
-            uint64_t v = 0;
-            for (unsigned i = 0; i < size; i++) {
-                if (s->ata_data_pos < s->ata_data_len)
-                    v |= (uint64_t)s->ata_data[s->ata_data_pos++] << (i * 8);
-            }
-            if (!s->ata_data_is_write && s->ata_data_len &&
-                s->ata_data_pos >= s->ata_data_len && (s->ata_status & 0x08))
-                ata_data_in_done(s);
-            return v;
-        }
-        if (reg == 7) {
-            if (ata_busy(s))
-                return 0x80;     /* BSY: no DRQ/interrupt yet */
-            /* A ready interrupt reaches the PIC/SAPIC before the read that
-             * acknowledges it can lower the device's INTRQ. */
+        unsigned reg = port == 0x3F6 ? 8 : (unsigned)(port - 0x1F0);
+        /* A ready interrupt reaches the PIC/SAPIC before the Status read
+         * that acknowledges it can lower INTRQ. */
+        if (reg >= 7)
             ata_deliver_irq(s);
-            if (port == 0x1F7)
-                ata_clear_irq(s);    /* a normal Status read acknowledges */
-        }
-        switch (reg) {
-        case 1: return s->ata_error;
-        case 2: return s->ata_count;
-        case 3: return s->ata_lba_low;
-        case 4: return s->ata_lba_mid;
-        case 5: return s->ata_lba_high;
-        case 6: return s->ata_device;
-        case 7:
-            if (getenv("ATA_DEBUG")) {
-                static unsigned n;
-                if (n++ < 64)
-                    fprintf(stderr, "i2000: ATA status read (port=%#x) -> "
-                            "%#04x ninsts=%" PRIu64 "\n", (unsigned)port,
-                            s->ata_status, s->cpu->ninsts);
-            }
-            return s->ata_status;
-        }
+        return ide_read(&s->ide_primary, reg, size);
     }
     /* CMD-649 primary/secondary channels, with no ATA devices attached.
      * A floating ATA bus reports status zero; returning the generic unmapped
@@ -1828,65 +1533,23 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         return;
     if (i460gx_ifb_io_write(&s->chipset, 3, port, val, size))
         return;
-    if (port == 0x21 && size == 1) {
-        if (s->pic_master_icw) {
-            if (s->pic_master_icw == 1)
-                s->pic_master_base = (uint8_t)val & 0xF8;
-            if (++s->pic_master_icw > 3)
-                s->pic_master_icw = 0;
-            return;
-        }
-        if (getenv("PIC_DEBUG") && val != s->pic_master_mask)
-            fprintf(stderr, "i2000: PIC master mask %#04x -> %#04x "
+    if (port == 0x20 || port == 0x21 || port == 0xA0 || port == 0xA1) {
+        I8259 *chip = port < 0xA0 ? &s->pic.master : &s->pic.slave;
+        bool mask_write = (port & 1) && chip->icw_step == 0;
+        if (getenv("PIC_DEBUG") && mask_write && val != chip->imr)
+            fprintf(stderr, "i2000: PIC %s mask %#04x -> %#04x "
                     "(base=%#04x) ninsts=%" PRIu64 "\n",
-                    s->pic_master_mask, (unsigned)val, s->pic_master_base,
-                    s->cpu->ninsts);
-        s->pic_master_mask = (uint8_t)val;
-        if (!(s->pic_master_mask & 1) && s->pit_irq_pending)
-            merced_raise_external(s->cpu, 0);
-        return;
-    }
-    if (port == 0xA1 && size == 1) {
-        if (s->pic_slave_icw) {
-            if (s->pic_slave_icw == 1)
-                s->pic_slave_base = (uint8_t)val & 0xF8;
-            if (++s->pic_slave_icw > 3)
-                s->pic_slave_icw = 0;
-            return;
-        }
-        if (getenv("PIC_DEBUG") && val != s->pic_slave_mask)
-            fprintf(stderr, "i2000: PIC slave mask %#04x -> %#04x "
-                    "(base=%#04x) ninsts=%" PRIu64 "\n",
-                    s->pic_slave_mask, (unsigned)val, s->pic_slave_base,
-                    s->cpu->ninsts);
-        s->pic_slave_mask = (uint8_t)val;
-        return;
-    }
-    if (port == 0x20 || port == 0xA0) {
-        if (getenv("MOUSE_DEBUG"))
+                    port < 0xA0 ? "master" : "slave", chip->imr,
+                    (unsigned)(uint8_t)val, chip->vector_base, s->cpu->ninsts);
+        if (getenv("MOUSE_DEBUG") && !(port & 1))
             fprintf(stderr, "MOUSE_DEBUG: PIC cmd port=%#02x val=%#02x "
                     "ninsts=%" PRIu64 "\n", (unsigned)port, (unsigned)val,
                     s->cpu->ninsts);
-        if ((val & 0x10) != 0) {
-            if (port == 0x20)
-                s->pic_master_icw = 1;
-            else
-                s->pic_slave_icw = 1;
-        }
-        if ((val & 0x20) != 0) { /* OCW2 non-specific EOI */
-            uint8_t *isr = port == 0x20 ? &s->pic_master_isr
-                                        : &s->pic_slave_isr;
-            for (int bit = 7; bit >= 0; bit--)
-                if (*isr & (1u << bit)) { *isr &= ~(1u << bit); break; }
-        }
-        /* OCW3 RR=1 selects which register a subsequent command-port read
-         * returns; RIS=0 chooses IRR (0x0A), RIS=1 chooses ISR (0x0B). */
-        if ((val & 0x18) == 0x08 && (val & 0x02)) {
-            bool *read_isr = port == 0x20 ? &s->pic_master_read_isr
-                                          : &s->pic_slave_read_isr;
-            *read_isr = (val & 0x01) != 0;
-        }
-        /* Other commands are OCWs. */
+        i2000_pic_sync(s);
+        i8259_pair_io_write(&s->pic, (uint16_t)port, (uint8_t)val);
+        /* Unmasking the master can expose a waiting request (the timer's). */
+        if (mask_write && port == 0x21)
+            i2000_pic_raise(s);
         return;
     }
     if (port == 0x64 && size == 1) {               /* 8042 command */
@@ -2123,78 +1786,14 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         }
     }
     if (s->hda && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
-        unsigned reg = port == 0x3F6 ? 8 : (unsigned)(port - 0x1F0);
-        if (reg == 0) {
-            if (s->ata_device & 0x10)
-                return;
-            for (unsigned i = 0; i < size; i++) {
-                if (s->ata_data_pos < s->ata_data_len)
-                    s->ata_data[s->ata_data_pos++] = (uint8_t)(val >> (i * 8));
-            }
-            if (s->ata_data_is_write && s->ata_data_len &&
-                s->ata_data_pos >= s->ata_data_len)
-                ata_data_out_done(s);
-            return;
-        }
-        switch (reg) {
-        case 1: s->ata_features = (uint8_t)val; return;
-        case 2: s->ata_count = (uint8_t)val; return;
-        case 3: s->ata_lba_low = (uint8_t)val; return;
-        case 4: s->ata_lba_mid = (uint8_t)val; return;
-        case 5: s->ata_lba_high = (uint8_t)val; return;
-        case 6: s->ata_device = (uint8_t)val; return;
-        case 7:
-            if (!(s->ata_device & 0x10))   /* no device 1 to execute it */
-                ata_command(s, (uint8_t)val);
-            return;
-        case 8: { /* device control: nIEN, SRST */
-            if (getenv("ATA_DEBUG"))
-                fprintf(stderr, "i2000: ATA device control <- %#04x "
-                        "ninsts=%" PRIu64 "\n", (unsigned)val,
-                        s->cpu->ninsts);
-            uint8_t old_control = s->ata_device_control;
-            s->ata_device_control = (uint8_t)val;
-            if (val & 2)
-                s->ata_irq_asserted = false;       /* nIEN lowers INTRQ */
-            /* Reset happens on SRST transitions only, so rewriting nIEN with
-             * SRST clear doesn't reset the disk mid-command. */
-            if ((old_control ^ val) & 4) {
-                ata_clear_irq(s);
-                ata_set_data(s, NULL, 0);
-                s->ata_xfer_cmd = 0;
-                s->ata_xfer_remaining = 0;
-                if (val & 4) {
-                    s->ata_status = 0x80;
-                } else {
-                    s->ata_status = 0x50;
-                    s->ata_error = 0x01;
-                    s->ata_count = 1;
-                    s->ata_lba_low = 1;
-                    s->ata_lba_mid = s->ata_lba_high = 0;
-                    s->ata_device = 0;             /* back to device 0 */
-                }
-            }
-            return;
-        }
-        }
+        ide_write(&s->ide_primary, port == 0x3F6 ? 8 : (unsigned)(port - 0x1F0),
+                  val, size);
+        return;
     }
     if (port >= COM1_PORT && port < COM1_PORT + 8) {
-        switch (port - COM1_PORT) {
-        case 0:
-            if (s->uart_lcr & 0x80) { s->uart_dll = (uint8_t)val; return; }
-            con_putc(s, (char)val);
-            fputc((int)val, stdout);
-            fflush(stdout);
-            return;
-        case 1:
-            if (s->uart_lcr & 0x80) s->uart_dlm = (uint8_t)val;
-            else s->uart_ier = (uint8_t)val;
-            return;
-        case 3: s->uart_lcr = (uint8_t)val; return;
-        case 4: s->uart_mcr = (uint8_t)val; return;
-        case 7: s->uart_scr = (uint8_t)val; return;
-        default: return;                            /* FCR etc. */
-        }
+        ins8250_tick(&s->uart, 1);
+        ins8250_write(&s->uart, (unsigned)(port - COM1_PORT), (uint8_t)val);
+        return;
     }
     if (size == 1 && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6 ||
                       (port >= 0x170 && port <= 0x177) || port == 0x376)) {
@@ -2246,7 +1845,7 @@ static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi) {
             fprintf(stderr, "i2000: iosapic_raise_gsi(%u) rte=%016" PRIX64
                     " masked=%d picmask=%02x tpr=%02" PRIX64
                     " ninsts=%" PRIu64 "\n", gsi, rte,
-                    !!(rte & I460GX_IOSAPIC_RTE_MASK), s->pic_master_mask,
+                    !!(rte & I460GX_IOSAPIC_RTE_MASK), s->pic.master.imr,
                     s->cpu->cr[66] & 0xff, s->cpu->ninsts);
     }
     uint8_t vector;
@@ -2258,8 +1857,8 @@ static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi) {
          * which supplies the vector via the legacy PIC's own base. */
         if (getenv("IOSAPIC_DEBUG"))
             fprintf(stderr, "i2000: iosapic delivering ExtINT vector=%#x "
-                    "ninsts=%" PRIu64 "\n", s->pic_master_base, s->cpu->ninsts);
-        merced_raise_external(s->cpu, s->pic_master_base);
+                    "ninsts=%" PRIu64 "\n", s->pic.master.vector_base, s->cpu->ninsts);
+        merced_raise_external(s->cpu, s->pic.master.vector_base);
         return;
     }
     /* Fixed SAPIC mode (000/001, the LSB is a redirection hint this model
@@ -2443,16 +2042,10 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     /* Legacy ExtINT acknowledge: IA-64 has no INTA pin, so SAL substitutes
      * a memory-mapped byte read to learn which 8259-relative IRQ won
      * arbitration - the same information a real INTA cycle would return
-     * on the data bus (ICW2 base + IRQ number). IRQ0 (the PIT) and, once
-     * -device mouse attaches one, IRQ12 (the aux/mouse device), and IRQ15
-     * (secondary IDE) all share this single ack address on real
-     * hardware's single physical INTA-replacement cycle, so whichever one
-     * is actually pending decides what gets returned - PIT wins if both
-     * happen to be pending at once, matching real 8259 priority (IRQ0
-     * outranks any slave-cascaded IRQ). A slave-originated vector is
-     * reported relative to the slave's own programmed base (ICW2), not
-     * the master's - real hardware's second INTA cycle addresses the
-     * slave chip directly. */
+     * on the data bus (ICW2 base + IRQ number).  The 8259 pair arbitrates
+     * (IRQ0 outranks the slave's IRQs on IRQ2) and marks the winner in
+     * service; the device behind it then does what its acknowledge
+     * implies. */
     if (addr == I2000_LEGACY_ACK_ADDR && size == 1) {
         /* This MMIO read replaces the pair of INTA bus cycles on IA-64.
          * It therefore acknowledges the local-SAPIC ExtINT request as well
@@ -2464,7 +2057,11 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
             fprintf(stderr, "MOUSE_DEBUG: ack read pit_pending=%d "
                     "mouse_pending=%d ninsts=%" PRIu64 "\n",
                     s->pit_irq_pending, s->mouse_irq_pending, s->cpu->ninsts);
-        if (s->pit_irq_pending) {
+        i2000_pic_sync(s);
+        int irq;
+        uint8_t vector = i8259_pair_ack(&s->pic, &irq);
+        switch (irq) {
+        case 0:
             s->pit_irq_pending = false;
             /* merced_ack_external() just cleared the ONE shared CPU-level
              * pending bit for vector 0, which both IRQ0 and IRQ12 share.
@@ -2474,9 +2071,8 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
              * deadline (already scheduled by whichever aux_queue_byte()/ack
              * call set it) and let i2000_poll_interrupts() fire it once
              * that deadline passes. */
-            return s->pic_master_base;
-        }
-        if (s->keyboard_irq_pending) {
+            break;
+        case 1:
             s->keyboard_irq_pending = false;
             /* The SDV thunk performs several native/IA-32 rfi transitions
              * while servicing one byte, so the global rfi counter cannot
@@ -2486,9 +2082,8 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
              * cr.ipsr. */
             s->keyboard_retry_ninsts =
                 s->cpu->ninsts + KEYBOARD_RETRY_DELAY_INSTS;
-            return (uint64_t)(s->pic_master_base + 1); /* IRQ1 */
-        }
-        if (s->mouse_irq_pending) {
+            break;
+        case 12:
             /* Real 8042 aux OBF is level-triggered: IRQ12 stays asserted as
              * long as unread aux data remains, re-firing for each
              * subsequent byte of a multi-byte packet rather than once per
@@ -2521,28 +2116,26 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
             if (s->aux_out_pos >= s->aux_out_len) {
                 s->mouse_irq_pending = false;
             }
-            return (uint64_t)(s->pic_slave_base + 4); /* IRQ12 = slave IRQ4 */
-        }
-        if (s->ata_legacy_irq_latched) {   /* IRQ14 outranks IRQ15 */
+            break;
+        case 14:
+            if (!s->ata_legacy_irq_latched)
+                break;
             s->ata_legacy_irq_latched = false;
-            ata_clear_irq(s);
-            s->pic_master_isr |= 0x04; /* IRQ2 cascade */
-            s->pic_slave_isr |= 0x40;  /* IRQ14 */
+            ata_disk_clear_irq(&s->hd);
             if (getenv("ATA_DEBUG"))
                 fprintf(stderr, "i2000: ATA IRQ14 acknowledged vector=%#04x "
                         "ninsts=%" PRIu64 "\n",
-                        (unsigned)(s->pic_slave_base + 6), s->cpu->ninsts);
-            return (uint64_t)(s->pic_slave_base + 6); /* IRQ14 = slave IRQ6 */
-        }
-        if (s->atapi_legacy_irq_latched) {
+                        (unsigned)vector, s->cpu->ninsts);
+            break;
+        case 15:
+            if (!s->atapi_legacy_irq_latched)
+                break;
             s->atapi_legacy_irq_latched = false;
             atapi_clear_irq(s);
-            s->pic_master_isr |= 0x04; /* IRQ2 cascade */
-            s->pic_slave_isr |= 0x80;  /* IRQ15 */
             if (atapi_debug_enabled()) {
                 fprintf(stderr, "i2000: ATAPI IRQ15 acknowledged vector=%#04x "
                         "ip=%016" PRIx64 " itc=%" PRIu64 " ninsts=%" PRIu64 "\n",
-                        (unsigned)(s->pic_slave_base + 7), s->cpu->ip,
+                        (unsigned)vector, s->cpu->ip,
                         merced_get_itc(s->cpu), s->cpu->ninsts);
                 if (getenv("ATA_IRQ_TRACE")) {
                     fprintf(stderr, "i2000: ATAPI IRQ15 ack call history:\n");
@@ -2550,9 +2143,12 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
                     s->cpu->trace_n = 4000;
                 }
             }
-            return (uint64_t)(s->pic_slave_base + 7); /* IRQ15 = slave IRQ7 */
+            break;
+        default:   /* -1: spurious, IRQ7's vector */
+            break;
         }
-        return s->pic_master_base; /* spurious/unattributed: old behavior */
+        i2000_pic_sync(s);
+        return vector;
     }
     {
         /* The firmware window and the hubs' register space are the IFB's
@@ -3261,6 +2857,8 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
         }
     }
     gemu_drive_set_change_cb(s->cdrom, i2000_cdrom_changed, s);
+    ata_disk_init(&s->hd, &(AtaDiskConfig){0});
+    i2000_ide_wire(s);
     i2000_drive_info_refresh(s);
     if (atapi_debug_enabled() && gemu_drive_inserted(s->cdrom))
         fprintf(stderr, "i2000: ATAPI media attached '%s' bytes=%" PRIu64
@@ -3275,7 +2873,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 41u   /* Rage 128 CCE FIFO and packet state */
+#define I2000_SNAPSHOT_VERSION 44u   /* the -hda disk as an AtaDisk */
 
 /* Version 40 ends Rage128 just before cce. Its following machine fields
  * keep their relative layout because the inserted state is 8-byte aligned. */
@@ -3302,10 +2900,6 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fwrite(&atapi_len, sizeof(atapi_len), 1, f) == 1;
     if (atapi_len)
         ok &= fwrite(s->atapi_data, 1, atapi_len, f) == atapi_len;
-    uint64_t ata_len = (uint64_t)s->ata_data_len;
-    ok &= fwrite(&ata_len, sizeof(ata_len), 1, f) == 1;
-    if (ata_len)
-        ok &= fwrite(s->ata_data, 1, ata_len, f) == ata_len;
 
     Ia64I2000State *snap = malloc(sizeof(*snap));
     if (!snap) { fclose(f); return false; }
@@ -3320,7 +2914,9 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     snap->cdrom = NULL;
     snap->atapi_data = NULL;
     snap->hda = NULL;
-    snap->ata_data = NULL;
+    memset(&snap->hd.cfg, 0, sizeof(snap->hd.cfg));
+    memset(&snap->hd.ide, 0, sizeof(snap->hd.ide));
+    memset(snap->ide_primary.dev, 0, sizeof(snap->ide_primary.dev));
     snap->nic_rom = NULL;
     snap->audio_out = NULL;
     memset(&snap->audio.wiring, 0, sizeof(snap->audio.wiring));
@@ -3361,7 +2957,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fread(&version, sizeof(version), 1, f) == 1;
     ok &= fread(&ram_size, sizeof(ram_size), 1, f) == 1;
     if (!ok || magic != I2000_SNAPSHOT_MAGIC ||
-        (version != 40 && version != I2000_SNAPSHOT_VERSION) || ram_size != s->ram_size) {
+        version != I2000_SNAPSHOT_VERSION || ram_size != s->ram_size) {
         fclose(f);
         return false;
     }
@@ -3384,14 +2980,6 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         if (!s->atapi_data) { fclose(f); return false; }
         ok &= fread(s->atapi_data, 1, atapi_len, f) == atapi_len;
     }
-    uint64_t ata_len = 0;
-    ok &= fread(&ata_len, sizeof(ata_len), 1, f) == 1;
-    free(s->ata_data);
-    s->ata_data = ata_len ? malloc((size_t)ata_len) : NULL;
-    if (ata_len) {
-        if (!s->ata_data) { fclose(f); return false; }
-        ok &= fread(s->ata_data, 1, ata_len, f) == ata_len;
-    }
 
     GemuMonitor *monitor = s->monitor;
     GemuDisplay *display = s->display;
@@ -3413,7 +3001,6 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     uint8_t *video_rom = s->video_rom;
     uint32_t video_rom_len = s->video_rom_len;
     uint8_t *atapi_data = s->atapi_data;
-    uint8_t *ata_data = s->ata_data;
     Ia64I2000State *loaded = calloc(1, sizeof(*loaded));
     /* Merced is ~2 MB: on the heap, as Windows threads have a 1 MiB stack. */
     Merced *loaded_cpu = malloc(sizeof(*loaded_cpu));
@@ -3423,19 +3010,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         fclose(f);
         return false;
     }
-    if (version == 40) {
-        size_t prefix = offsetof(Ia64I2000State, rage128) + offsetof(Rage128, cce);
-        size_t tail = prefix + sizeof(Rage128Cce);
-        ok &= fread(loaded, 1, prefix, f) == prefix;
-        ok &= fread((uint8_t *)loaded + tail, 1, sizeof(*loaded) - tail, f) ==
-              sizeof(*loaded) - tail;
-        /* v40 had no CCE interpreter or its reset defaults. Supply the
-         * standard decoder just as a fresh reset does in the new model. */
-        if (!loaded->rage128.regs[0x7fc / 4])
-            loaded->rage128.regs[0x7fc / 4] = 1u << 30;
-    } else {
-        ok &= fread(loaded, sizeof(*loaded), 1, f) == 1;
-    }
+    ok &= fread(loaded, sizeof(*loaded), 1, f) == 1;
     if (ok) {
         char nvram_path[sizeof(s->nvram_path)];
         snprintf(nvram_path, sizeof(nvram_path), "%s", s->nvram_path);
@@ -3461,9 +3036,9 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
          * Subsequent guest flash writes mark it dirty normally. */
         s->nvram_dirty = false;
         s->atapi_data = atapi_data;
-        s->ata_data = ata_data;
         s->cdrom = cdrom;
         s->hda = hda;
+        i2000_ide_wire(s);
         i2000_drive_info_refresh(s);
         i2000_update_fast_ram(s);
         /* A halt checkpoint can be resumed to test the faulting operation. */
@@ -3504,6 +3079,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->mouse_next_report_itc = merced_get_time_base(s->cpu);
         s->pit.out_changed = i2000_pit_out;
         s->pit.ud = s;
+        i2000_uart_wire(s);
         s->pit_itc_mark = merced_get_time_base(s->cpu);
     }
     free(loaded_cpu);
@@ -3592,7 +3168,7 @@ static GemuMonCmd i2000_cmd_input(GemuMonitor *mon, const char *args, void *ud) 
                (unsigned)s->pit.ch[c].count, s->pit.ch[c].out,
                s->pit.ch[c].gate);
     gemu_monitor_printf(mon, "IRQ0: pending=%u mask=%02X\n",
-           s->pit_irq_pending, s->pic_master_mask);
+           s->pit_irq_pending, s->pic.master.imr);
     if (ps2_keyboard_has_data(&s->ps2_keyboard)) {
         gemu_monitor_printf(mon, "keyboard bytes:");
         for (unsigned i = s->ps2_keyboard.queue_pos;
@@ -3607,11 +3183,7 @@ static GemuMonCmd i2000_cmd_input(GemuMonitor *mon, const char *args, void *ud) 
  * EFI BIOS key buffer for ASCII (the same paths window input takes). */
 static void i2000_type_key(Ia64I2000State *s, uint32_t keysym) {
     if (keysym <= 0x7F) {
-        uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
-        if (next != s->uart_rx_head) {
-            s->uart_rx[s->uart_rx_tail] = (uint8_t)keysym;
-            s->uart_rx_tail = next;
-        }
+        i2000_con_rx(s, (uint8_t)keysym);
         i2000_efi_bios_key(s, (uint8_t)keysym);
     } else {
         i2000_efi_bios_ext_key(s, keysym);
@@ -3828,7 +3400,7 @@ static GemuMonCmd i2000_cmd_mousestate(GemuMonitor *mon, const char *args,
     fprintf(stderr, "i2000: iosapic_rte[12]=%016" PRIX64 " masked=%d "
             "pic_master_mask=%02x pic_slave_mask=%02x\n",
             s->chipset.iosapic_rte[12], !!(s->chipset.iosapic_rte[12] & I460GX_IOSAPIC_RTE_MASK),
-            s->pic_master_mask, s->pic_slave_mask);
+            s->pic.master.imr, s->pic.slave.imr);
     fflush(stderr);
     return GEMU_MON_NONE;
 }
@@ -3899,9 +3471,9 @@ static GemuMonCmd i2000_cmd_mousekick(GemuMonitor *mon, const char *args,
      * recovering a stuck backlog from an old snapshot saved before
      * mouse_irq_pending existed, not part of the real device model. */
     if (s->aux_out_pos < s->aux_out_len &&
-        !(s->pic_slave_mask & 0x10) && !(s->pic_master_mask & 0x04)) {
+        !(s->pic.slave.imr & 0x10) && !(s->pic.master.imr & 0x04)) {
         s->mouse_irq_pending = true;
-        merced_raise_external(s->cpu, 0);
+        i2000_pic_raise(s);
         gemu_monitor_printf(mon, "mousekick: re-raised (aux_out_pos=%u "
                             "aux_out_len=%u)\n",
                             s->aux_out_pos, s->aux_out_len);
@@ -3909,8 +3481,8 @@ static GemuMonCmd i2000_cmd_mousekick(GemuMonitor *mon, const char *args,
         gemu_monitor_printf(mon, "mousekick: nothing to do (aux_out_pos=%u "
                             "aux_out_len=%u pic_slave_mask=%02x "
                             "pic_master_mask=%02x)\n",
-                            s->aux_out_pos, s->aux_out_len, s->pic_slave_mask,
-                            s->pic_master_mask);
+                            s->aux_out_pos, s->aux_out_len, s->pic.slave.imr,
+                            s->pic.master.imr);
     }
     return GEMU_MON_NONE;
 }
@@ -3952,11 +3524,7 @@ static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
          * the same or `key` appears to succeed while the shell sees
          * nothing. */
         if (special <= 0x7f) {
-            uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
-            if (next != s->uart_rx_head) {
-                s->uart_rx[s->uart_rx_tail] = (uint8_t)special;
-                s->uart_rx_tail = next;
-            }
+            i2000_con_rx(s, (uint8_t)special);
             i2000_efi_bios_key(s, (uint8_t)special);
         }
         gemu_monitor_printf(mon, "key %s queued\n", keyarg);
@@ -3967,11 +3535,7 @@ static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
             if (*p < 0x20 || *p > 0x7e)
                 continue;
             ps2_keyboard_tap(&s->ps2_keyboard, *p);
-            uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
-            if (next != s->uart_rx_head) {
-                s->uart_rx[s->uart_rx_tail] = *p;
-                s->uart_rx_tail = next;
-            }
+            i2000_con_rx(s, *p);
             i2000_efi_bios_key(s, *p);
             queued++;
         }
@@ -4123,7 +3687,7 @@ static GemuMonCmd i2000_cmd_iosapic(GemuMonitor *mon, const char *args, void *ud
                             (rte & (UINT64_C(1) << 13)) ? " low" : " high");
     }
     gemu_monitor_printf(mon, "pic masks master=%02x slave=%02x kbd_data=%d gsi1_asserted=%d\n",
-                        s->pic_master_mask, s->pic_slave_mask,
+                        s->pic.master.imr, s->pic.slave.imr,
                         s->kbc_out_pos < s->kbc_out_len ||
                         ps2_keyboard_has_data(&s->ps2_keyboard),
                         s->keyboard_gsi_asserted);
@@ -4458,7 +4022,7 @@ static void i2000_chipset_init(Ia64I2000State *s) {
 static void i2000_devices_reset(Ia64I2000State *s, bool warm) {
     s->pci_cfg_addr = 0;
     memset(s->cmd649_cfg, 0, sizeof(s->cmd649_cfg));
-    s->uart_rx_head = s->uart_rx_tail = 0;
+    i2000_uart_reset(s);
     mc146818_core_reset(&s->rtc);
     i2000_pit_reset(s);
     s->atapi_error = s->atapi_features = 0;
@@ -4482,25 +4046,9 @@ static void i2000_devices_reset(Ia64I2000State *s, bool warm) {
     free(s->atapi_data);
     s->atapi_data = NULL;
     s->atapi_data_len = s->atapi_data_pos = 0;
-    s->ata_error = s->ata_features = 0;
-    s->ata_count = 1;
-    s->ata_lba_low = 1;
-    s->ata_lba_mid = s->ata_lba_high = 0;
-    s->ata_device = 0;
-    s->ata_status = s->hda ? 0x50 : 0;
-    s->ata_data_is_write = false;
-    s->ata_device_control = 0;
-    /* Multiple mode is on at power-up (IDENTIFY word 59), as on typical
-     * drives: the firmware's disk driver issues READ MULTIPLE without a
-     * SET MULTIPLE first. */
-    s->ata_multiple = ATA_MAX_MULTIPLE;
-    s->ata_xfer_cmd = 0;
-    s->ata_xfer_remaining = 0;
+    ata_disk_reset(&s->hd);
+    ide_reset(&s->ide_primary);
     s->ata_legacy_irq_latched = false;
-    ata_clear_irq(s);
-    free(s->ata_data);
-    s->ata_data = NULL;
-    s->ata_data_len = s->ata_data_pos = 0;
 
     /* The IDE model advertises a CMD Technology PCI-649 at 00:03.1. */
     s->cmd649_cfg[0x00] = 0x95; s->cmd649_cfg[0x01] = 0x10; /* 1095 */
@@ -4536,8 +4084,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     if (!s)
         return NULL;
 
-    s->pic_master_mask = 0xFF;
-    s->pic_slave_mask = 0xFF;
+    i2000_pic_reset(s);
     s->mouse_enabled = cfg->mouse_enabled;
 
     s->ram_size = cfg->ram_size;
@@ -4698,7 +4245,6 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
     gemu_net_shutdown();
     free(s->nic_rom);
     free(s->atapi_data);
-    free(s->ata_data);
     /* The drive table owns the drives; just stop them calling back here. */
     gemu_drive_set_change_cb(s->cdrom, NULL, NULL);
     free(s->video_rom);
@@ -4711,6 +4257,7 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
 /* ── Execution ───────────────────────────────────────────────────────────── */
 
 static void i2000_poll_interrupts(Ia64I2000State *s) {
+    ins8250_tick(&s->uart, 1);
     if (s->audio.model) {
         pci_audio_poll(&s->audio);
         if (s->audio.irq_level) iosapic_raise_gsi(s, 45);
@@ -4768,11 +4315,11 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
                (kbd_rte == I460GX_IOSAPIC_RTE_MASK ||
                 (!(kbd_rte & I460GX_IOSAPIC_RTE_MASK) && ((kbd_rte >> 8) & 7) == 7)) &&
                s->cpu->ninsts >= s->keyboard_retry_ninsts &&
-               !(s->pic_master_mask & 0x02)) {
+               !(s->pic.master.imr & 0x02)) {
         /* The firmware's reset-RTE (or explicit ExtINT) legacy path.  An OS
          * that masks its own GSI1 vector must not get IRQ1 via the PIC. */
         s->keyboard_irq_pending = true;
-        merced_raise_external(s->cpu, 0);
+        i2000_pic_raise(s);
     }
     /* The single place that actually raises vector 0 on mouse's behalf -
      * covers both a brand new packet (aux_queue_byte() only queues bytes,
@@ -4811,9 +4358,9 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
     } else if (s->aux_out_pos < s->aux_out_len &&
         s->cpu->ninsts >= s->mouse_retry_ninsts &&
         s->mouse_wait_rfi_generation == 0 &&
-        !(s->pic_slave_mask & 0x10) && !(s->pic_master_mask & 0x04)) {
+        !(s->pic.slave.imr & 0x10) && !(s->pic.master.imr & 0x04)) {
         s->mouse_irq_pending = true;
-        merced_raise_external(s->cpu, 0);
+        i2000_pic_raise(s);
     }
     /* SCI is level-triggered: present it through its I/O SAPIC entry again
      * after each acknowledgement until the handler clears the source. */
@@ -4849,7 +4396,7 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
     }
     /* Primary IDE (the -hda disk) uses GSI14; see ata_deliver_irq(). */
     if (s->ata_legacy_irq_latched)
-        merced_raise_external(s->cpu, 0);
+        i2000_pic_raise(s);
     ata_deliver_irq(s);
     /* Secondary IDE uses GSI15. Windows installs a fixed SAPIC vector;
      * firmware leaves that entry masked and uses its legacy ExtINT thunk.
@@ -4871,7 +4418,7 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * replacement cycle acknowledges it. Keep that ownership separately
      * from the device's INTRQ latch. */
     if (s->atapi_legacy_irq_latched)
-        merced_raise_external(s->cpu, 0);
+        i2000_pic_raise(s);
     if (s->atapi_irq_pending &&
         !(s->atapi_device_control & 6) && !(s->atapi_device & 0x10) &&
         s->cpu->ninsts >= s->atapi_irq_ready_ninsts) {
@@ -4889,7 +4436,7 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
              * polls the CD. */
             if (i2000_pic_irq_open(s, 15)) {
                 s->atapi_legacy_irq_latched = true;
-                merced_raise_external(s->cpu, 0);
+                i2000_pic_raise(s);
             }
         }
     }
@@ -5241,11 +4788,7 @@ static void i2000_reset(Ia64I2000State *s, bool warm) {
     s->fw_shadow_enabled = false;
     s->post_code = 0;
     s->legacy_irq_routed = false;
-    s->pic_master_mask = s->pic_slave_mask = 0xFF;
-    s->pic_master_base = 0x08;
-    s->pic_slave_base = 0x70;
-    s->pic_master_icw = s->pic_slave_icw = 0;
-    s->pic_master_isr = s->pic_slave_isr = 0;
+    i2000_pic_reset(s);
     i2000_devices_reset(s, warm);
     s->mmio_log_n = 0;
     memset(s->mmio_log, 0, sizeof(s->mmio_log));

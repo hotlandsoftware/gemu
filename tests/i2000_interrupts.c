@@ -845,6 +845,7 @@ static void test_ata(void) {
     CHECK(io_port_read(s, 0x1F7, 1) == 0x50 && io_port_read(s, 0x1F1, 1) == 1);
     CHECK(io_port_read(s, 0x1F2, 1) == 1 && io_port_read(s, 0x1F3, 1) == 1);
     CHECK(io_port_read(s, 0x1F4, 1) == 0 && io_port_read(s, 0x1F5, 1) == 0);
+    CHECK(io_port_read(s, 0x1F6, 1) == 0);
     ata_wait(s);
     CHECK(!irq(s, 0x70));
 
@@ -1053,7 +1054,40 @@ static void test_audio(void) {
     ia64_i2000_destroy(s);
 }
 
+/* COM1 as the firmware's serial driver finds and uses it: a scratch
+ * register to detect the port, CTS/DSR/DCD from the console, transmit always
+ * ready, and typed keys arriving one per read without overrun. */
+static void test_serial(void) {
+    Ia64I2000State *s = machine();
+    io_port_write(s, 0x3FF, 0x5a, 1);
+    CHECK(io_port_read(s, 0x3FF, 1) == 0x5a);
+    CHECK((io_port_read(s, 0x3FE, 1) & 0xB0) == 0xB0);
+    io_port_write(s, 0x3FB, 0x83, 1);                 /* DLAB: 115200 */
+    io_port_write(s, 0x3F8, 1, 1);
+    io_port_write(s, 0x3F9, 0, 1);
+    io_port_write(s, 0x3FB, 0x03, 1);
+    io_port_write(s, 0x3FB, 0x83, 1);
+    CHECK(io_port_read(s, 0x3F8, 1) == 1);            /* divisor read back */
+    io_port_write(s, 0x3FB, 0x03, 1);
+    for (unsigned i = 0; i < 3; i++) {
+        CHECK(io_port_read(s, 0x3FD, 1) & 0x20);      /* THR empty */
+        io_port_write(s, 0x3F8, '.', 1);
+    }
+    const char *typed = "dir";
+    for (const char *p = typed; *p; p++) i2000_type_key(s, (uint8_t)*p);
+    for (const char *p = typed; *p; p++) {
+        unsigned polls = 0;
+        while (!(io_port_read(s, 0x3FD, 1) & 0x01)) CHECK(++polls < 10);
+        CHECK(!(io_port_read(s, 0x3FD, 1) & 0x02));   /* no overrun */
+        CHECK(io_port_read(s, 0x3F8, 1) == (uint8_t)*p);
+    }
+    for (unsigned i = 0; i < 4; i++) i2000_poll_interrupts(s);
+    CHECK(!(io_port_read(s, 0x3FD, 1) & 0x01));       /* all read */
+    ia64_i2000_destroy(s);
+}
+
 int main(void) {
+    test_serial();
     test_identify(); test_control(); test_packet_phases(); test_legacy(); test_os_mask();
     test_snapshots();
     test_chipset_snapshot();

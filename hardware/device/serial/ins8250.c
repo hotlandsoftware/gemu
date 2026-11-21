@@ -17,6 +17,7 @@
 
 /* One character's time: start bit, 5-8 data bits, parity, 1/1.5/2 stops. */
 static uint32_t char_clocks(const Ins8250 *u) {
+    if (!u->clock_hz) return 1;
     unsigned data = 5 + (u->lcr & 3);
     unsigned half_bits = 2 * (1 + data + ((u->lcr & 0x08) ? 1 : 0));
     half_bits += (u->lcr & 0x04) ? (data == 5 ? 3 : 4) : 2;
@@ -38,11 +39,12 @@ static void update_irq(Ins8250 *u) {
     if (u->set_irq) u->set_irq(u->ud, pending(u) >= 0 && (u->mcr & MCR_OUT2));
 }
 
-/* The modem inputs: from the outputs in loopback, otherwise none (the
- * devices here don't drive CTS, DSR, RI or DCD). */
+/* The modem inputs: from the outputs in loopback, otherwise what the device
+ * drives. */
 static void update_msr(Ins8250 *u) {
-    uint8_t in = 0;
+    uint8_t in = u->modem_in & 0xF0;
     if (u->mcr & MCR_LOOP) {
+        in = 0;
         if (u->mcr & MCR_RTS)  in |= 0x10;
         if (u->mcr & MCR_DTR)  in |= 0x20;
         if (u->mcr & MCR_OUT1) in |= 0x40;
@@ -66,6 +68,7 @@ static void lines_changed(Ins8250 *u) {
 void ins8250_reset(Ins8250 *u) {
     u->rbr = u->thr = 0;
     u->ier = u->lcr = u->mcr = 0;
+    u->scr = 0;
     u->lsr = LSR_THRE | LSR_TEMT;
     u->msr = 0;
     u->divisor = 0;
@@ -122,7 +125,7 @@ uint8_t ins8250_read(Ins8250 *u, unsigned reg) {
         u->msr &= 0xF0;
         break;
     case 7:
-        return 0xFF;
+        return u->model == INS8250_16450 ? u->scr : 0xFF;
     }
     update_irq(u);
     return v;
@@ -154,8 +157,11 @@ void ins8250_write(Ins8250 *u, unsigned reg, uint8_t val) {
         if ((old ^ u->mcr) & (MCR_DTR | MCR_RTS | MCR_LOOP)) lines_changed(u);
         break;
     }
+    case 7:
+        u->scr = val;
+        return;
     default:
-        return;     /* LSR, MSR (factory test) and +7 */
+        return;     /* LSR, MSR (factory test) */
     }
     update_irq(u);
 }
