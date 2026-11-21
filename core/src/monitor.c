@@ -52,11 +52,16 @@
 #define CONSOLE_WAIT_MS 2000
 
 static char  default_monitor_spec[256] = "stdio";
+static bool  start_paused;      /* -S */
 static char  machine_name[64];
 static FILE *qmp_stdio_out;
 static bool  qmp_stdio_redirected;
 
 /* ── Transport helpers ───────────────────────────────────────────────────── */
+
+void gemu_monitor_set_start_paused(bool paused) {
+    start_paused = paused;
+}
 
 void gemu_monitor_set_default(const char *spec) {
     snprintf(default_monitor_spec, sizeof(default_monitor_spec), "%s",
@@ -605,6 +610,7 @@ GemuMonitor *gemu_monitor_create(void) {
     pthread_cond_init(&mon->done_cond, NULL);
     mon->listen_fd = INVALID_SOCK;
     mon->client_fd = INVALID_SOCK;
+    mon->paused = start_paused;
     parse_monitor_spec(mon, default_monitor_spec);
     return mon;
 }

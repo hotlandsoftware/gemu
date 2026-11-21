@@ -3554,6 +3554,53 @@ static void nes_step_insn(NesState *s) {
     nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
 }
 
+/* Show the PPU's picture: at the end of every frame, and after a monitor
+ * "step" (mid-frame: the lines drawn so far over the last frame's), so the
+ * window and screendump follow single-stepping while paused.
+ *
+ * -device crt: re-derive the frame from the PPU's raw hue+luma values
+ * (ppu.pixels[], not the already-quantized pixels_argb) through a genuine
+ * NTSC composite encode+decode into crt_argb. Independent of s->display so
+ * screendump still gets a decoded frame on headless "-display none" runs.
+ * Note this means anything drawn as an emulator-only overlay straight into
+ * pixels_argb (e.g. the Lua gui.* API) won't appear in CRT mode — correctly
+ * so, since it was never part of the real signal.  end_of_frame advances
+ * the subcarrier phase (dot crawl); a redraw after a step must not, or
+ * stepping would change every later frame. */
+static void nes_present_frame(NesState *s, const MosConfig *cfg, bool end_of_frame) {
+    if (cfg->crt_type != MOS_CRT_NONE && s->crt_argb && s->crt_decoded_argb) {
+        NesNtscEncodeSpec enc_spec = {
+            .oversample = NES_NTSC_OVERSAMPLE,
+            .emphasis   = (uint8_t)(s->ppu.ppumask & 0xE0u),
+        };
+        nes_ntsc_encode(&enc_spec, s->ppu.pixels, RP2C02_WIDTH, RP2C02_HEIGHT,
+                        s->crt_dot_counter, s->crt_signal);
+        if (end_of_frame)
+            s->crt_dot_counter += (uint64_t)RP2C02_WIDTH * RP2C02_HEIGHT;
+
+        NtscDecodeSpec dec_spec = {
+            .samples_per_line = RP2C02_WIDTH * NES_NTSC_OVERSAMPLE,
+            .lines            = RP2C02_HEIGHT,
+            .subcarrier_cycles_per_sample =
+                nes_ntsc_subcarrier_cycles_per_sample(NES_NTSC_OVERSAMPLE),
+            .out_width        = NES_CRT_WIDTH,
+            .comb_filter      = cfg->crt_type == MOS_CRT_COMB,
+        };
+        ntsc_decode(&dec_spec, s->crt_signal, s->crt_decoded_argb);
+        crt_tube_apply(crt_tube_profile_generic(), s->crt_decoded_argb,
+                       s->crt_argb, NES_CRT_WIDTH, NES_CRT_HEIGHT);
+    }
+
+    /* PPU already builds pixels_argb. */
+    if (s->display && cfg->crt_type != MOS_CRT_NONE && s->crt_argb) {
+        gemu_display_render(s->display, s->crt_argb,
+                            NES_CRT_WIDTH, NES_CRT_HEIGHT);
+    } else if (s->display) {
+        gemu_display_render(s->display, s->ppu.pixels_argb,
+                            RP2C02_WIDTH, RP2C02_HEIGHT);
+    }
+}
+
 void nes_run(NesState *s, const MosConfig *cfg) {
     gemu_monitor_start(s->monitor);
 
@@ -3582,6 +3629,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
                     nes_step_insn(s);
                 nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);   /* show the monitor the whole state */
                 nes_sync_apu_to_cpu(s, s->cpu.cycle_count);
+                nes_present_frame(s, cfg, false);              /* and the window */
             }
         }
         if (quit) break;
@@ -3627,45 +3675,7 @@ void nes_run(NesState *s, const MosConfig *cfg) {
             nes_lua_run_frame(s->lua, s->ppu.pixels_argb, RP2C02_WIDTH, RP2C02_HEIGHT);
 #endif
 
-            /* -device crt: re-derive the frame from the PPU's raw hue+luma
-             * values (ppu.pixels[], not the already-quantized pixels_argb)
-             * through a genuine NTSC composite encode+decode into
-             * crt_argb. Independent of s->display so screendump still
-             * gets a decoded frame on headless "-display none" runs. Note
-             * this means anything drawn as an emulator-only overlay
-             * straight into pixels_argb (e.g. the Lua gui.* API above)
-             * won't appear in CRT mode — correctly so, since it was never
-             * part of the real signal. */
-            if (cfg->crt_type != MOS_CRT_NONE && s->crt_argb && s->crt_decoded_argb) {
-                NesNtscEncodeSpec enc_spec = {
-                    .oversample = NES_NTSC_OVERSAMPLE,
-                    .emphasis   = (uint8_t)(s->ppu.ppumask & 0xE0u),
-                };
-                nes_ntsc_encode(&enc_spec, s->ppu.pixels, RP2C02_WIDTH, RP2C02_HEIGHT,
-                                s->crt_dot_counter, s->crt_signal);
-                s->crt_dot_counter += (uint64_t)RP2C02_WIDTH * RP2C02_HEIGHT;
-
-                NtscDecodeSpec dec_spec = {
-                    .samples_per_line = RP2C02_WIDTH * NES_NTSC_OVERSAMPLE,
-                    .lines            = RP2C02_HEIGHT,
-                    .subcarrier_cycles_per_sample =
-                        nes_ntsc_subcarrier_cycles_per_sample(NES_NTSC_OVERSAMPLE),
-                    .out_width        = NES_CRT_WIDTH,
-                    .comb_filter      = cfg->crt_type == MOS_CRT_COMB,
-                };
-                ntsc_decode(&dec_spec, s->crt_signal, s->crt_decoded_argb);
-                crt_tube_apply(crt_tube_profile_generic(), s->crt_decoded_argb,
-                               s->crt_argb, NES_CRT_WIDTH, NES_CRT_HEIGHT);
-            }
-
-            /* Render completed frame (PPU already builds pixels_argb). */
-            if (s->display && cfg->crt_type != MOS_CRT_NONE && s->crt_argb) {
-                gemu_display_render(s->display, s->crt_argb,
-                                    NES_CRT_WIDTH, NES_CRT_HEIGHT);
-            } else if (s->display) {
-                gemu_display_render(s->display, s->ppu.pixels_argb,
-                                    RP2C02_WIDTH, RP2C02_HEIGHT);
-            }
+            nes_present_frame(s, cfg, true);
 #ifdef HAVE_ROB
             if (s->cfg->n_ports > 1 && nes_device_is_rob(s->cfg->ports[1])) {
                 rob_frame(&s->rob, s->ppu.pixels_argb, RP2C02_WIDTH, RP2C02_HEIGHT);

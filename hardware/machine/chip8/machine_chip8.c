@@ -183,6 +183,17 @@ static const GemuActionDef chip8_actions[CHIP8_NUM_KEYS] = {
 
 /* ── Run loop ─────────────────────────────────────────────────────────────── */
 
+/* Show the screen if the program drew since the last time (running, or
+ * stepped from the monitor while paused). */
+static void chip8_present(Chip8State *s, const Chip8Config *cfg,
+                          GemuDisplay *display, uint32_t *argb) {
+    if (!s->draw_flag) return;
+    for (int i = 0; i < CHIP8_DISPLAY_W * CHIP8_DISPLAY_H; i++)
+        argb[i] = s->vram[i] ? cfg->fg_argb : cfg->bg_argb;
+    gemu_display_render(display, argb, CHIP8_DISPLAY_W, CHIP8_DISPLAY_H);
+    s->draw_flag = false;
+}
+
 void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
     /* Headless: nobody sees the screen (-display none without -vnc), e.g. a
      * silent bench.  With -vnc, gemu_display_create() returns a headless
@@ -282,6 +293,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
         gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));
 
         if (gemu_monitor_is_paused(s->monitor)) {
+            chip8_present(s, cfg, display, argb);
             chip8_sleep_frame();
             continue;
         }
@@ -313,12 +325,7 @@ void chip8_machine_run(Chip8State *s, const Chip8Config *cfg) {
         if (s->sound > 0) s->sound--;
 
         /* Render */
-        if (s->draw_flag) {
-            for (int i = 0; i < CHIP8_DISPLAY_W * CHIP8_DISPLAY_H; i++)
-                argb[i] = s->vram[i] ? cfg->fg_argb : cfg->bg_argb;
-            gemu_display_render(display, argb, CHIP8_DISPLAY_W, CHIP8_DISPLAY_H);
-            s->draw_flag = false;
-        }
+        chip8_present(s, cfg, display, argb);
 
         chip8_sleep_frame();
     }

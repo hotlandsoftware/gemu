@@ -64,6 +64,7 @@ static void print_usage(const GemuArgsDef *def) {
         printf("  %-14s Legacy hub: nic[,model=,macaddr=,vlan=] | user[,vlan=] | none\n", "-net SPEC");
     }
     printf("  %-14s Pause/halt instead of exiting on monitor shutdown\n", "-no-shutdown");
+    printf("  %-14s Start paused; \"cont\" runs, \"step N\" runs N instructions\n", "-S");
     printf("  %-14s Name the VM: window title becomes \"GEMU (NAME)\"\n", "-name NAME");
     printf("  %-14s Monitor: stdio | none | telnet:HOST:PORT,server,nowait\n",
            "-monitor SPEC");
@@ -374,6 +375,10 @@ bool gemu_args_parse(int argc, char **argv,
 
         if (strcmp(a, "-no-shutdown") == 0) {
             out->no_shutdown = true;
+            continue;
+        }
+        if (strcmp(a, "-S") == 0) {
+            gemu_monitor_set_start_paused(true);
             continue;
         }
 

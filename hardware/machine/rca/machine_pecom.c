@@ -447,6 +447,19 @@ static void pecom_poll_keys(RcaPecom32State *s, GemuDisplay *display) {
 
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
+/* Draw the CDP1869 picture if video RAM or registers changed since the last
+ * time (running, or stepped from the monitor while paused). */
+static void pecom_present(RcaPecom32State *s, GemuDisplay *display, uint32_t *argb) {
+    if (!s->vis.dirty) return;
+    cdp1869_render(&s->vis);
+    if (display) {
+        int n = CDP1869_VISIBLE_W * CDP1869_VISIBLE_H;
+        for (int i = 0; i < n; i++)
+            argb[i] = pecom_palette[s->vis.bitmap[i] & 7u];
+        gemu_display_render(display, argb, CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
+    }
+}
+
 void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
     GemuDisplay *display = NULL;
     if (gemu_display_wanted(cfg->display_type)) {
@@ -521,16 +534,9 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
             s->vis.non_display = true;
             s->cpu.EF[0] = !s->key_ctrl;
 
-            if (s->vis.dirty) {
-                cdp1869_render(&s->vis);
-                if (display) {
-                    int n = CDP1869_VISIBLE_W * CDP1869_VISIBLE_H;
-                    for (int i = 0; i < n; i++)
-                        argb[i] = pecom_palette[s->vis.bitmap[i] & 7u];
-                    gemu_display_render(display, argb,
-                                        CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
-                }
-            }
+            pecom_present(s, display, argb);
+        } else {
+            pecom_present(s, display, argb);   /* show monitor steps */
         }
 
         struct timespec t1;

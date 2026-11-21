@@ -59,6 +59,9 @@ void         gemu_monitor_destroy(GemuMonitor *mon);
  * monitors.  Supported forms: stdio, none, telnet:HOST:PORT,server,nowait,
  * gmp:HOST:PORT, gmp-stdio. */
 void         gemu_monitor_set_default(const char *spec);
+/* -S: monitors created from now on start paused, as QEMU's -S, so the machine
+ * runs nothing until "cont" (or exactly "step N" instructions). */
+void         gemu_monitor_set_start_paused(bool paused);
 
 /* Make SIGINT/SIGTERM quit the emulator through gemu_monitor_poll() (call
  * once at startup, before SDL is initialized). */

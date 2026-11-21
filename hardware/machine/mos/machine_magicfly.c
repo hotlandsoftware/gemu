@@ -518,6 +518,7 @@ void magicfly_run(MagicflyState *s, const MosConfig *cfg) {
             } else if (cmd == GEMU_MON_STEP) {
                 for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
                     magicfly_step_insn(s);
+                magicfly_render(s);    /* the window follows stepping */
             }
         }
         if (quit) break;

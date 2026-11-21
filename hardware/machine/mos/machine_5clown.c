@@ -520,6 +520,7 @@ void fiveclown_run(FiveClownState *s, const MosConfig *cfg) {
                 /* Steps the main CPU; the sound CPU only runs whole frames. */
                 for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
                     mos6502_step(&s->cpu);
+                fiveclown_render(s);   /* the window follows stepping */
             }
         }
         if (quit) break;

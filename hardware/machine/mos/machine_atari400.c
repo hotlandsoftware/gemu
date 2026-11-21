@@ -793,6 +793,7 @@ void atari400_run(Atari400State *s, const MosConfig *cfg) {
                     mos6502_step(&s->cpu);
                     s->wsync = false;
                 }
+                antic_render_frame(&s->antic);   /* the window follows stepping */
             }
         }
         if (quit) break;

@@ -529,6 +529,23 @@ static void destroyer_apply_held(RcaDestroyerState *s, uint32_t held) {
     }
 }
 
+/* Draw the (rotated) CDP1869 picture: every frame while running, and every
+ * pass while paused so monitor steps show. */
+static void destroyer_present(RcaDestroyerState *s, const RcaConfig *cfg,
+                              GemuDisplay *display, uint32_t *argb) {
+    if (!display) return;
+    if (cfg->vga == RCA_VGA_CDP1869) {
+        cdp1869_render(&s->vis);
+        destroyer_rotate_bitmap(s);
+        for (int i = 0; i < DESTROYER_ROTATED_W * DESTROYER_ROTATED_H; i++)
+            argb[i] = destroyer_palette[s->rotated_bitmap[i]];
+        gemu_display_render(display, argb, DESTROYER_ROTATED_W, DESTROYER_ROTATED_H);
+    } else if (cfg->vga == RCA_VGA_CDP1861) {
+        memset(argb, 0, sizeof(uint32_t) * (size_t)(CDP1861_DISPLAY_W * CDP1861_DISPLAY_H));
+        gemu_display_render(display, argb, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
+    }
+}
+
 void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
     int fw = (cfg->vga == RCA_VGA_CDP1869) ? DESTROYER_ROTATED_W : CDP1861_DISPLAY_W;
     int fh = (cfg->vga == RCA_VGA_CDP1869) ? DESTROYER_ROTATED_H : CDP1861_DISPLAY_H;
@@ -597,20 +614,9 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
             s->vis.non_display = true;
             s->cpu.EF[0] = true;
 
-            if (display) {
-                if (cfg->vga == RCA_VGA_CDP1869) {
-                    cdp1869_render(&s->vis);
-                    destroyer_rotate_bitmap(s);
-                    for (int i = 0; i < DESTROYER_ROTATED_W * DESTROYER_ROTATED_H; i++)
-                        argb[i] = destroyer_palette[s->rotated_bitmap[i]];
-                    gemu_display_render(display, argb,
-                                        DESTROYER_ROTATED_W, DESTROYER_ROTATED_H);
-                } else if (cfg->vga == RCA_VGA_CDP1861) {
-                    memset(argb, 0, sizeof(uint32_t) * (size_t)(CDP1861_DISPLAY_W * CDP1861_DISPLAY_H));
-                    gemu_display_render(display, argb,
-                                        CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
-                }
-            }
+            destroyer_present(s, cfg, display, argb);
+        } else {
+            destroyer_present(s, cfg, display, argb);   /* show monitor steps */
         }
 
         if (s->coin1_latch > 0) s->coin1_latch--;

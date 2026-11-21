@@ -532,6 +532,24 @@ void rca_vip_destroy(RcaVipState *s) {
 
 /* ── Run loop ─────────────────────────────────────────────────────────────── */
 
+/* Draw the VIP's screen: the VP-590/CDP1869 picture every time, the
+ * CDP1861's when it has drawn since the last time. */
+static void vip_present(RcaVipState *s, const RcaConfig *cfg,
+                        GemuDisplay *display, uint32_t *argb) {
+    if (!display) return;
+    if (cfg->vga == RCA_VGA_CDP1869) {
+        cdp1869_render(&s->vis);
+        for (int i = 0; i < CDP1869_VISIBLE_W * CDP1869_VISIBLE_H; i++)
+            argb[i] = vip_vis_palette[s->vis.bitmap[i] & 7];
+        gemu_display_render(display, argb, CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
+    } else if (s->draw_flag) {
+        for (int i = 0; i < CDP1861_DISPLAY_W * CDP1861_DISPLAY_H; i++)
+            argb[i] = s->vram[i] ? 0xFFFFFFFFu : 0xFF100080u;
+        gemu_display_render(display, argb, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
+        s->draw_flag = false;
+    }
+}
+
 void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
     vip_install_crash_handlers(s);
 
@@ -599,7 +617,11 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
         if (quit) break;
         gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));
 
-        if (gemu_monitor_is_paused(s->monitor)) { gemu_sleep_ms(frame_ms); continue; }
+        if (gemu_monitor_is_paused(s->monitor)) {
+            vip_present(s, cfg, display, argb);   /* show monitor steps */
+            gemu_sleep_ms(frame_ms);
+            continue;
+        }
 
         /* ── Execute one frame worth of machine cycles ── */
         for (int i = 0; i < mcycles_per_frame; i++) {
@@ -613,20 +635,7 @@ void rca_machine_run(RcaVipState *s, const RcaConfig *cfg) {
             cdp1802_step(&s->cpu);
         }
 
-        /* ── Render ── */
-        if (display) {
-            if (cfg->vga == RCA_VGA_CDP1869) {
-                cdp1869_render(&s->vis);
-                for (int i = 0; i < CDP1869_VISIBLE_W * CDP1869_VISIBLE_H; i++)
-                    argb[i] = vip_vis_palette[s->vis.bitmap[i] & 7];
-                gemu_display_render(display, argb, CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
-            } else if (s->draw_flag) {
-                for (int i = 0; i < CDP1861_DISPLAY_W * CDP1861_DISPLAY_H; i++)
-                    argb[i] = s->vram[i] ? 0xFFFFFFFFu : 0xFF100080u;
-                gemu_display_render(display, argb, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
-                s->draw_flag = false;
-            }
-        }
+        vip_present(s, cfg, display, argb);
 
         gemu_sleep_ms(frame_ms);
     }

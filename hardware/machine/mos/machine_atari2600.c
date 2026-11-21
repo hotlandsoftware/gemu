@@ -659,6 +659,13 @@ static void handle_input(Atari2600State *s) {
     update_tia_inputs(s);
 }
 
+/* The TIA finished a frame: hand it to the debugger's statistics. */
+static void a26_end_frame(Atari2600State *s) {
+    s->tia.frame_ready = false;
+    a26_debug_frame_done(s, s->cpu.cycle_count - s->frame_start_cycle);
+    s->frame_start_cycle = s->cpu.cycle_count;
+}
+
 void atari2600_run(Atari2600State *s, const MosConfig *cfg) {
     gemu_monitor_start(s->monitor);
     double carry_ms = 0;
@@ -684,8 +691,16 @@ void atari2600_run(Atari2600State *s, const MosConfig *cfg) {
             } else if (cmd == GEMU_MON_RESET) {
                 a26_power_on(s);
             } else if (cmd == GEMU_MON_STEP) {
-                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--) a26_bus_step(s);
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--) {
+                    a26_bus_step(s);
+                    if (s->tia.frame_ready) a26_end_frame(s);
+                }
                 a26_bus_sync(s);
+                if (s->tia.frame_ready) a26_end_frame(s);
+                /* Show the last whole frame, as a running machine would;
+                 * the loop below presents fb even while paused. */
+                update_window(s);
+                build_frame(s);
             }
         }
         if (quit) break;
@@ -708,11 +723,7 @@ void atari2600_run(Atari2600State *s, const MosConfig *cfg) {
             }
             a26_bus_sync(s);   /* the picture and debugger see where the beam is */
             frame_cycles = s->cpu.cycle_count - start;
-            if (s->tia.frame_ready) {
-                s->tia.frame_ready = false;
-                a26_debug_frame_done(s, s->cpu.cycle_count - s->frame_start_cycle);
-                s->frame_start_cycle = s->cpu.cycle_count;
-            }
+            if (s->tia.frame_ready) a26_end_frame(s);
             tia_sound_flush(&s->tia.sound);
             update_window(s);
             build_frame(s);
