@@ -28,6 +28,9 @@ jobs:
       - name: Build
         run: ninja
 
+      - name: Unit tests
+        run: ninja check
+
       - name: Package
         run: tar czf gemu-linux-x86_64.tar.gz -C bin gemu gemu-chip8 gemu-mos gemu-rca gemu-ia64 gemu-x86 gemu-mitsu gemu-other gemu-z80
 
@@ -62,6 +65,11 @@ jobs:
 
       - name: Build
         run: ninja
+
+      # Built to catch Windows-only compile errors; not run yet (the i2000
+      # snapshot code overflows the 1 MiB Windows stack in i2000_interrupts).
+      - name: Build unit tests
+        run: ninja tests
 
       - name: Gather runtime DLLs
         run: |
@@ -112,6 +120,11 @@ jobs:
 
       - name: Build
         run: ninja
+
+      # Built to catch Windows-only compile errors; not run yet (the i2000
+      # snapshot code overflows the 1 MiB Windows stack in i2000_interrupts).
+      - name: Build unit tests
+        run: ninja tests
 
       - name: Gather runtime DLLs
         # msys2's ldd is 64-bit and cannot trace i686 PE binaries, so walk

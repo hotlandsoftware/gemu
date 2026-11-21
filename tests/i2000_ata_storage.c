@@ -1,8 +1,16 @@
 /* ROM-free ATA PIO storage regressions on a sparse 4 GiB disk.
- * Run: python3 tools/ia64/run_i2000_ata_storage_test.py
+ * Run: ninja check-i2000_ata_storage (or tools/ia64/run_i2000_ata_storage_test.py)
  * Exercise actual port traffic and independently inspect disk bytes. */
 #include "../hardware/machine/ia64/machine_i2000.c"
 #include <unistd.h>
+#ifdef _WIN32   /* MinGW's off_t is 32 bits: the 4 GiB disk needs 64-bit calls */
+#include <io.h>
+#define test_seek(f, off)    _fseeki64((f), (__int64)(off), SEEK_SET)
+#define test_resize(f, size) _chsize_s(_fileno(f), (__int64)(size))
+#else
+#define test_seek(f, off)    fseeko((f), (off_t)(off), SEEK_SET)
+#define test_resize(f, size) ftruncate(fileno(f), (off_t)(size))
+#endif
 
 static unsigned checks, transfers;
 #define CHECK(expr) do { checks++; if (!(expr)) { \
@@ -92,7 +100,7 @@ static void roundtrip(Ia64I2000State *s, uint32_t lba, unsigned count,
     complete(s, 0x50);
     FILE *backing = fopen("ata-storage.img", "rb");
     CHECK(backing);
-    CHECK(fseeko(backing, (off_t)lba * 512, SEEK_SET) == 0);
+    CHECK(test_seek(backing, (uint64_t)lba * 512) == 0);
     CHECK(fread(actual, 1, len, backing) == len);
     CHECK(fclose(backing) == 0);
     CHECK(memcmp(actual, expected, len) == 0);
@@ -120,7 +128,7 @@ static void roundtrip(Ia64I2000State *s, uint32_t lba, unsigned count,
 
 int main(void) {
     FILE *f = fopen("ata-storage.img", "w+b");
-    CHECK(f && ftruncate(fileno(f), (off_t)SECTORS * 512) == 0);
+    CHECK(f && test_resize(f, (uint64_t)SECTORS * 512) == 0);
     CHECK(fclose(f) == 0);
     CHECK(gemu_drive_add_legacy(GEMU_DRIVE_IF_IDE, 0, GEMU_DRIVE_MEDIA_DISK,
                                "ata-storage.img"));

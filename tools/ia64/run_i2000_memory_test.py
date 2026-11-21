@@ -1,55 +1,22 @@
 #!/usr/bin/env python3
 """Build and run the i2000 memory test using the configured GEMU toolchain.
 
-Run ./configure with IA-64 enabled first.  No ROM or ISO is needed.
+Builds and runs the `i2000_memory` unit test (see TESTS in configure).  Same as
+`ninja check-i2000_memory`, but prints the test's own output.  `ninja check` runs
+every configured test.
+
+    python3 tools/ia64/run_i2000_memory_test.py [--no-build]
 """
-
 from pathlib import Path
-import argparse
-import shlex
-import subprocess
-import tempfile
+import sys
 
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def command_for(target):
-    output = subprocess.check_output(
-        ["ninja", "-t", "commands", target], cwd=ROOT, text=True
-    )
-    return shlex.split(output.strip().splitlines()[-1])
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--no-build", action="store_true")
-    args = parser.parse_args()
-    if not args.no_build:
-        subprocess.run(["ninja", "-j2", "bin/gemu"], cwd=ROOT, check=True)
-    link = command_for("bin/gemu")
-    if not any(arg.endswith("/machine_i2000.o") for arg in link):
-        raise SystemExit("Configure GEMU with IA-64 enabled before running this test.")
-    main_object = next(arg for arg in link if arg.endswith("/src/main.o"))
-    compile_command = command_for(main_object)
-
-    with tempfile.TemporaryDirectory(prefix="i2000-memory-", dir=ROOT / "build") as tmp:
-        work = Path(tmp)
-        test_object = str(work / "i2000_memory.o")
-        executable = str(work / "i2000_memory")
-        substitutions = {
-            main_object: test_object,
-            main_object + ".d": test_object + ".d",
-            "src/main.c": "tests/i2000_memory.c",
-            "bin/gemu": executable,
-        }
-        compile_command = [substitutions.get(arg, arg) for arg in compile_command]
-        link = [substitutions.get(arg, arg) for arg in link]
-        subprocess.run(compile_command, cwd=ROOT, check=True)
-        subprocess.run(link, cwd=ROOT, check=True)
-        (work / "snapshots").touch()
-        subprocess.run([executable], cwd=work, check=True)
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from run_tests import run_named  # noqa: E402
 
 if __name__ == "__main__":
-    main()
+    args = sys.argv[1:]
+    build = "--no-build" not in args
+    args = [a for a in args if a != "--no-build"]
+    if args:
+        raise SystemExit("usage: run_i2000_memory_test.py [--no-build]")
+    sys.exit(run_named("i2000_memory", (), build))

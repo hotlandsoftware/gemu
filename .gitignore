@@ -6,7 +6,6 @@ roms/
 build.ninja*.log
 build.ninja
 reference/
-.reference-qemu-ia64/
 snapshots/
 .claude/
 tools/*.pyc
@@ -17,4 +16,4 @@ build-win/
 bin-win/
 bin-gtk/
 __pycache__/
-/ItaniumTest*-preserved-*.img
+.work

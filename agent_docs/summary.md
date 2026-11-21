@@ -17,6 +17,10 @@ ninja
 `bin/gemu-chip8`, `bin/gemu-mos`, `bin/gemu-rca` are symlinks to `bin/gemu`
 for backward compatibility.
 
+`ninja check` builds and runs the unit tests (listed in `TESTS` in
+`configure`, run by `tools/run_tests.py`); `ninja check-NAME` runs one.  Run
+it before committing changes to anything a test covers.
+
 ---
 
 ## Machines
@@ -73,7 +77,9 @@ hardware/   Machine glue, devices, ROM databases
   machine/  Machine implementations grouped by CPU family; NES cheats and Lua
             support live beside the NES machine in machine/mos/
   device/   Reusable hardware grouped into chipset/, controller/, input/,
-            network/, serial/, storage/, terminal/, and timer/
+            network/, serial/, storage/, terminal/, and timer/.  New hardware
+            goes here (or vga/multi/ for video) as a self-contained device,
+            never as fields in a machine's state struct: see docs/devices.md
   romdb.c   Shared ROM database support
 window/     Host tool windows: hex editors (GTK/SDL/Win32), cheats, NES pins,
             and the ROB visualizer; these are separate from hardware models

@@ -427,12 +427,11 @@ Build and run these ROM-independent checks with:
 
 ```sh
 ./configure --target-list=ia64 --build-dir=build/ia64 --bindir=bin
-ninja
-python3 tools/ia64/run_i460gx_test.py
-python3 tools/ia64/run_rage128_test.py
-python3 tools/ia64/run_e100_test.py
-python3 tools/ia64/run_i2000_memory_test.py
-python3 tools/ia64/run_i2000_interrupt_test.py
-python3 tools/ia64/run_pci_audio_test.py
-python3 tools/ia64/run_i2000_ata_storage_test.py
+ninja check
 ```
+
+`ninja check` builds and runs all of them (`i460gx`, `rage128`, `e100`,
+`pci_audio`, `audio_out`, `i2000_memory`, `i2000_interrupts`,
+`i2000_ata_storage`, `merced_jit`, `merced_msr`); `ninja check-NAME` runs one.
+The `tools/ia64/run_*_test.py` scripts still work and print a test's full
+output; `run_merced_jit_test.py` passes its arguments on.

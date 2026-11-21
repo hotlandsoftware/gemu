@@ -2,67 +2,22 @@
 """Build/run the Intel 82559 (e100) model and the PCI ROM helpers without a
 machine or CPU.
 
-Configure GEMU first so that build.ninja holds the compiler flags. No ROM or
-disk image is needed; the model links against libc only, which catches
-accidental CPU or machine dependencies.
+Builds and runs the `e100` unit test (see TESTS in configure).  Same as
+`ninja check-e100`, but prints the test's own output.  `ninja check` runs
+every configured test.
+
+    python3 tools/ia64/run_e100_test.py [--no-build]
 """
 from pathlib import Path
-import shlex
-import subprocess
-import tempfile
+import sys
 
-ROOT = Path(__file__).resolve().parents[2]
-# Any configured object gives the compiler flags and include paths.
-FLAGS_SOURCE = "vga/multi/rage128.c"
-SOURCES = (
-    "hardware/device/network/e100.c",
-    "hardware/device/network/pci_rom.c",
-    "tests/e100.c",
-)
-
-
-def command_for(target):
-    output = subprocess.check_output(
-        ["ninja", "-t", "commands", target], cwd=ROOT, text=True
-    )
-    return shlex.split(output.strip().splitlines()[-1])
-
-
-def reference_object():
-    targets = subprocess.check_output(
-        ["ninja", "-t", "targets", "all"], cwd=ROOT, text=True
-    )
-    for line in targets.splitlines():
-        target = line.split(":", 1)[0]
-        if target.endswith("/" + FLAGS_SOURCE[:-2] + ".o"):
-            return target
-    raise SystemExit("Configure GEMU with IA-64 enabled before running this test.")
-
-
-def main():
-    reference, reference_source = reference_object(), FLAGS_SOURCE
-    base = command_for(reference)
-    link = command_for("bin/gemu")
-    with tempfile.TemporaryDirectory(prefix="e100-", dir=ROOT / "build") as tmp:
-        work = Path(tmp)
-        objects = []
-        for source in SOURCES:
-            obj = str(work / (source.replace("/", "_") + ".o"))
-            substitutions = {
-                reference: obj, reference + ".d": obj + ".d",
-                reference_source: source,
-            }
-            subprocess.run([substitutions.get(arg, arg) for arg in base],
-                           cwd=ROOT, check=True)
-            objects.append(obj)
-        # Keep the configured linker flags but none of the emulator objects.
-        exe = str(work / "e100_test")
-        link = [exe if arg == "bin/gemu" else arg
-                for arg in link if not arg.endswith(".o")]
-        link[link.index(exe) + 1:link.index(exe) + 1] = objects
-        subprocess.run(link, cwd=ROOT, check=True)
-        subprocess.run([exe], cwd=work, check=True)
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from run_tests import run_named  # noqa: E402
 
 if __name__ == "__main__":
-    main()
+    args = sys.argv[1:]
+    build = "--no-build" not in args
+    args = [a for a in args if a != "--no-build"]
+    if args:
+        raise SystemExit("usage: run_e100_test.py [--no-build]")
+    sys.exit(run_named("e100", (), build))

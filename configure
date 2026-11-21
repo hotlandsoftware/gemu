@@ -187,6 +187,48 @@ FAMILY_SRC_LUA = {
     'mos': ['hardware/machine/mos/nes_lua.c'],
 }
 
+# ── Unit tests (ninja tests / ninja check) ────────────────────────────────────
+# Each test builds to <build-dir>/tests/<name> and is run by tools/run_tests.py
+# in a fresh temporary directory.  A test is configured when its family is in
+# --target-list (family None: always).  Two kinds:
+#   'device'  - the test plus `links`: the configured objects of those sources
+#               only, no machine or CPU (catches accidental dependencies)
+#   'program' - the whole emulator, minus the objects of the sources in
+#               `replaces` (main.c always; a machine the test #includes)
+# `cflags` is added to the configured flags; `needs` lists features
+# (currently 'sdl') the test cannot build without.
+I460GX_TEST_LINKS = [
+    'hardware/device/chipset/i460gx.c', 'hardware/device/chipset/i460gx_fwh.c',
+    'hardware/device/chipset/i460gx_pci.c', 'hardware/device/chipset/i460gx_pm.c',
+    'hardware/device/chipset/i460gx_smbus.c', 'hardware/device/i2c/at24.c',
+    'hardware/device/i2c/i2c.c', 'hardware/device/i2c/itanium_cart.c',
+    'hardware/device/i2c/lm87.c', 'hardware/device/storage/fwh82802.c',
+]
+TESTS = [
+    dict(name='audio_out', family=None, kind='device', src='tests/audio_out.c',
+         links=[], cflags='-Werror', needs=['sdl']),
+    dict(name='e100', family='ia64', kind='device', src='tests/e100.c',
+         links=['hardware/device/network/e100.c', 'hardware/device/network/pci_rom.c']),
+    dict(name='i460gx', family='ia64', kind='device', src='tests/i460gx.c',
+         links=I460GX_TEST_LINKS),
+    dict(name='pci_audio', family='ia64', kind='device', src='tests/pci_audio.c',
+         links=['hardware/device/audio/pci_audio.c', 'hardware/device/audio/cs4281.c',
+                'hardware/device/audio/ich_ac97.c'], cflags='-Werror'),
+    dict(name='rage128', family='ia64', kind='device', src='tests/rage128.c',
+         links=['vga/multi/rage128.c', 'vga/multi/rage128_gui.c',
+                'vga/multi/rage128_cce.c', 'vga/multi/rage128_regs.c',
+                'vga/multi/vga.c', 'vga/multi/vgafont16.c']),
+    dict(name='i2000_ata_storage', family='ia64', kind='program',
+         src='tests/i2000_ata_storage.c',
+         replaces=['hardware/machine/ia64/machine_i2000.c']),
+    dict(name='i2000_interrupts', family='ia64', kind='program',
+         src='tests/i2000_interrupts.c',
+         replaces=['hardware/machine/ia64/machine_i2000.c']),
+    dict(name='i2000_memory', family='ia64', kind='program', src='tests/i2000_memory.c'),
+    dict(name='merced_jit', family='ia64', kind='program', src='tests/merced_jit.c'),
+    dict(name='merced_msr', family='ia64', kind='program', src='tests/merced_msr.c'),
+]
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def run(cmd):
@@ -911,6 +953,48 @@ def main():
                      f'{build_dir}/cpu/z80/z80.o {build_dir}/core/third_party/cjson/cJSON.o')
         lines.append(f'  LDFLAGS = -lz')
         lines.append(f'build z80-sst: phony {bin_dir}/z80-sst')
+
+    # Unit tests (see TESTS): ninja tests builds them, ninja check runs them
+    # all, ninja check-NAME runs one.  The check edges have no output file, so
+    # they always run.
+    exe_suffix = '.exe' if cross_windows or on_windows else ''
+    main_obj = f'{build_dir}/src/main.o'
+    obj_of = {src: f'{build_dir}/{src[:-2]}.o' for src in srcs}
+    features = {'sdl': args.sdl}
+    # Windows builds compile with -Dmain=SDL_main; tests keep a plain main().
+    test_cflags = ' -Umain -DSDL_MAIN_HANDLED' if '-Dmain=SDL_main' in unified_cflags else ''
+    test_exes = []
+    lines.append('')
+    lines.append('# Run unit tests (tools/run_tests.py), output straight to the terminal.')
+    lines.append('rule run_tests')
+    lines.append(f'  command = python3 tools/run_tests.py --work {build_dir}/tests/run $in')
+    lines.append('  description = CHECK')
+    lines.append('  pool = console')
+    for t in TESTS:
+        if t['family'] is not None and t['family'] not in targets:
+            continue
+        if not all(features.get(n, False) for n in t.get('needs', [])):
+            continue
+        name = t['name']
+        test_obj = f'{build_dir}/tests/{name}.o'
+        exe = f'{build_dir}/tests/{name}{exe_suffix}'
+        lines.append(f'build {test_obj}: cc {t["src"]}')
+        lines.append(f'  CFLAGS = {unified_cflags}{test_cflags} {t.get("cflags", "")}'.rstrip())
+        if t['kind'] == 'device':
+            missing = [s for s in t['links'] if s not in obj_of]
+            if missing:
+                die(f'test {name}: {", ".join(missing)} not in the configured sources')
+            objs = [test_obj] + [obj_of[s] for s in t['links']]
+        else:
+            drop = {main_obj} | {obj_of[s] for s in t.get('replaces', [])}
+            objs = [test_obj] + [o for o in all_objs if o not in drop]
+        lines.append(f'build {exe}: link {" ".join(objs)}')
+        lines.append(f'  LDFLAGS = {ldflags}')
+        lines.append(f'build test-{name}: phony {exe}')
+        lines.append(f'build check-{name}: run_tests {exe}')
+        test_exes.append(exe)
+    lines.append(f'build tests: phony {" ".join(test_exes)}')
+    lines.append(f'build check: run_tests {" ".join(test_exes)}')
     lines.append('')
     lines.append(f'default {binary}')
     lines.append('')
