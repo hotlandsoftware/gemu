@@ -85,6 +85,7 @@ FAMILY_SRC = {
         'hardware/device/network/pci_rom.c',
         'hardware/device/serial/ins8250.c',
         'hardware/device/storage/ata_disk.c',
+        'hardware/device/storage/atapi_cdrom.c',
         'hardware/device/storage/fwh82802.c',
         'hardware/device/storage/ide.c',
         'hardware/device/timer/i8253.c',

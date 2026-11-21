@@ -302,6 +302,27 @@ static void test_control(void) {
     CHECK(io_port_read(s, 0x174, 1) == 0x14 && io_port_read(s, 0x175, 1) == 0xeb);
     ia64_i2000_destroy(s);
 }
+/* The firmware probes the absent secondary slave with IDENTIFY DEVICE.  The
+ * slave floats, and coming back to the master finds the CD idle with its
+ * signature and no interrupt left over to complete its next command. */
+static void test_slave_probe(void) {
+    Ia64I2000State *s = machine();
+    identify(s);
+    CHECK(irq15_requested(s));
+    io_port_write(s, 0x176, 0xB0, 1);                 /* select device 1 */
+    CHECK(!irq15_requested(s));
+    io_port_write(s, 0x177, 0xEC, 1);                 /* IDENTIFY: ignored */
+    ready(s);
+    CHECK(io_port_read(s, 0x177, 1) == 0 && io_port_read(s, 0x376, 1) == 0);
+    CHECK(io_port_read(s, 0x176, 1) == 0xB0 && io_port_read(s, 0x174, 1) == 0);
+    io_port_write(s, 0x176, 0xA0, 1);                 /* back to the CD */
+    CHECK(io_port_read(s, 0x376, 1) == 0x40 && io_port_read(s, 0x171, 1) == 0);
+    CHECK(io_port_read(s, 0x172, 1) == 1 && io_port_read(s, 0x173, 1) == 1);
+    CHECK(io_port_read(s, 0x174, 1) == 0x14 && io_port_read(s, 0x175, 1) == 0xeb);
+    ready(s);
+    CHECK(!irq15_requested(s) && !irq(s, 0));
+    ia64_i2000_destroy(s);
+}
 static void test_packet_phases(void) {
     Ia64I2000State *s = machine();
     route(s, 0x60);
@@ -1088,7 +1109,7 @@ static void test_serial(void) {
 
 int main(void) {
     test_serial();
-    test_identify(); test_control(); test_packet_phases(); test_legacy(); test_os_mask();
+    test_identify(); test_control(); test_slave_probe(); test_packet_phases(); test_legacy(); test_os_mask();
     test_snapshots();
     test_chipset_snapshot();
     test_keyboard();

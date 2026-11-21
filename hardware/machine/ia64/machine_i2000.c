@@ -8,6 +8,7 @@
 #include "i2c/lm87.h"
 #include "serial/ins8250.h"
 #include "storage/ata_disk.h"
+#include "storage/atapi_cdrom.h"
 #include "storage/ide.h"
 #include "timer/i8253.h"
 #include "timer/mc146818.h"
@@ -294,12 +295,10 @@ struct Ia64I2000State {
     GemuDrive *cdrom;
     char      cdrom_file[512];
     uint64_t  cdrom_size;
-    uint8_t   atapi_error, atapi_features, atapi_count;
-    uint8_t   atapi_lba_low, atapi_lba_mid, atapi_lba_high, atapi_device;
-    uint8_t   atapi_status, atapi_packet[12];
-    unsigned  atapi_packet_pos;
-    uint8_t  *atapi_data;
-    size_t    atapi_data_len, atapi_data_pos;
+    /* The secondary IDE channel: the CD-ROM drive as device 0, present
+     * whether or not -cdrom gave it a medium. */
+    IdeChannel ide_secondary;
+    AtapiCdrom cd;
     /* CMD-649 primary channel: a real ATA (not ATAPI) hard disk, backed by
      * -hda's raw 512-byte-sector image. Single device (master) only, always
      * responding regardless of the drive-select bit - same simplification
@@ -400,25 +399,8 @@ struct Ia64I2000State {
     /* reusable PS/2 keyboard device behind this machine's 8042. */
     Ps2Keyboard ps2_keyboard;
     uint64_t keyboard_retry_ninsts;
-    /* secondary IDE interrupt latch. ATAPI is on slave-PIC IRQ15. */
-    bool atapi_irq_pending;
-    /* command completion is not visible in the same CPU instant as
-     * the command-register write. AtaPim arms its waiter after submission. */
-    uint64_t atapi_irq_ready_ninsts;
-    /* ATAPI PIO transfers are split at the host-programmed byte limit
-     * and interrupt once per data phase. */
-    uint32_t atapi_byte_limit;
-    size_t atapi_phase_end;
-    /* ATA command execution has a real BSY interval.  AtaPim first
-     * waits for BSY to assert, then waits for it to clear before using DRQ. */
-    uint64_t atapi_status_ready_ninsts;
-    uint8_t atapi_ready_status;
-    bool atapi_status_pending;
-    bool atapi_ready_irq;
-    /* device interrupt output and ATA/ATAPI completion semantics. */
-    uint8_t atapi_device_control;
-    bool atapi_irq_asserted;
-    bool atapi_packet_command;
+    /* The CD's interrupt epoch last delivered through GSI15. */
+    uint32_t atapi_irq_delivered;
     bool atapi_legacy_irq_latched;
     /* keyboard IRQ1 output edge for an OS-programmed fixed GSI1
      * vector; cleared by each 8042 data-port read. */
@@ -679,229 +661,12 @@ static bool atapi_debug_enabled(void) {
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
-static const char *atapi_packet_name(uint8_t opcode) {
-    switch (opcode) {
-    case 0x00: return "TEST UNIT READY";
-    case 0x03: return "REQUEST SENSE";
-    case 0x12: return "INQUIRY";
-    case 0x1B: return "START STOP UNIT";
-    case 0x1E: return "PREVENT/ALLOW MEDIUM REMOVAL";
-    case 0x25: return "READ CAPACITY";
-    case 0x28: return "READ(10)";
-    case 0x43: return "READ TOC";
-    case 0xA8: return "READ(12)";
-    default:   return "unknown";
-    }
-}
-
-/* Device INTRQ remains latched until a normal Status read. The output
- * latch separately prevents one asserted edge from being delivered again
- * after the CPU accepts its SAPIC vector. */
-static void atapi_clear_irq(Ia64I2000State *s) {
-    s->atapi_irq_pending = false;
-    s->atapi_irq_asserted = false;
-}
-
-static void atapi_latch_irq(Ia64I2000State *s) {
-    s->atapi_irq_pending = true;
-    s->atapi_irq_asserted = false;
-}
-
-static void atapi_defer_ready(Ia64I2000State *s, bool raise_irq) {
-    s->atapi_ready_status = s->atapi_status;
-    s->atapi_status = 0x80; /* BSY */
-    s->atapi_status_pending = true;
-    s->atapi_ready_irq = raise_irq;
-    s->atapi_status_ready_ninsts =
-        s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
-    /* The completion interrupt belongs to the ready transition, not to the
-     * command-register write while the device is still busy. */
-    atapi_clear_irq(s);
-}
-
-static void atapi_begin_data_phase(Ia64I2000State *s) {
-    size_t remaining = s->atapi_data_len - s->atapi_data_pos;
-    size_t phase = remaining;
-    uint32_t limit = s->atapi_byte_limit ? s->atapi_byte_limit : 65536u;
-    if (phase > limit)
-        phase = limit;
-    /* ATAPI PIO byte counts are even except for a final odd byte. */
-    if (phase > 1 && (phase & 1) && phase < remaining)
-        phase--;
-    s->atapi_phase_end = s->atapi_data_pos + phase;
-    s->atapi_count = 0x02; /* data phase: CoD=0, I/O=device-to-host */
-    s->atapi_lba_mid = (uint8_t)phase;
-    s->atapi_lba_high = (uint8_t)(phase >> 8);
-    s->atapi_status = 0x48; /* DRDY|DRQ */
-    atapi_latch_irq(s);
-    s->atapi_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
-}
-
-static void atapi_set_data(Ia64I2000State *s, const void *data, size_t len) {
-    free(s->atapi_data);
-    s->atapi_data = NULL;
-    s->atapi_data_len = s->atapi_data_pos = 0;
-    s->atapi_phase_end = 0;
-    if (len) {
-        s->atapi_data = malloc(len);
-        if (!s->atapi_data) {
-            s->atapi_error = 0x04;
-            s->atapi_status = 0x41;
-            return;
-        }
-        memcpy(s->atapi_data, data, len);
-        s->atapi_data_len = len;
-    }
-    if (len) {
-        atapi_begin_data_phase(s);
-    } else {
-        s->atapi_phase_end = 0;
-        s->atapi_count = 0x03; /* command complete: CoD=1, I/O=1 */
-        s->atapi_lba_mid = s->atapi_lba_high = 0;
-        s->atapi_status = 0x40;
-        atapi_latch_irq(s);
-        s->atapi_irq_ready_ninsts =
-            s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
-    }
-    if (atapi_debug_enabled())
-        fprintf(stderr, "i2000: ATAPI response bytes=%zu status=%#04x "
-                "reason=%#04x\n", len, s->atapi_status, s->atapi_count);
-}
-
-static void atapi_no_medium(Ia64I2000State *s) {
-    free(s->atapi_data);
-    s->atapi_data = NULL;
-    s->atapi_data_len = s->atapi_data_pos = 0;
-    s->atapi_phase_end = 0;
-    s->atapi_count = 0x03; /* command completion, I/O to host */
-    s->atapi_error = 0x20; /* sense key: NOT READY */
-    s->atapi_status = 0x41; /* DRDY|ERR */
-    atapi_latch_irq(s);
-    s->atapi_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
-    if (atapi_debug_enabled())
-        fprintf(stderr, "i2000: ATAPI no medium status=%#04x error=%#04x\n",
-                s->atapi_status, s->atapi_error);
-}
-
-static void atapi_reply(Ia64I2000State *s) {
-    const uint8_t *p = s->atapi_packet;
-    uint8_t reply[64] = {0};
-    uint32_t blocks = (uint32_t)(gemu_drive_size(s->cdrom) / 2048);
-    bool medium = gemu_drive_inserted(s->cdrom);
-    if (atapi_debug_enabled()) {
-        unsigned byte_limit = (unsigned)s->atapi_lba_mid |
-                              ((unsigned)s->atapi_lba_high << 8);
-        fprintf(stderr, "i2000: ATAPI packet %-28s opcode=%#04x "
-                "host-byte-limit=%u bytes=", atapi_packet_name(p[0]), p[0],
-                byte_limit ? byte_limit : 65536u);
-        for (unsigned i = 0; i < sizeof(s->atapi_packet); i++)
-            fprintf(stderr, "%s%02x", i ? " " : "", p[i]);
-        fputc('\n', stderr);
-    }
-    switch (p[0]) {
-    case 0x00: /* TEST UNIT READY */
-        if (!medium) {
-            atapi_no_medium(s);
-            break;
-        }
-        atapi_set_data(s, NULL, 0);
-        break;
-    case 0x1B: /* START STOP UNIT */
-    case 0x1E: /* PREVENT/ALLOW MEDIUM REMOVAL */
-        atapi_set_data(s, NULL, 0);
-        break;
-    case 0x03: /* REQUEST SENSE */
-        reply[0] = 0x70;
-        if (!medium) {
-            reply[2] = 0x02; /* NOT READY */
-            reply[12] = 0x3a; /* medium not present */
-        }
-        reply[7] = 10;
-        atapi_set_data(s, reply, p[4] < 18 ? p[4] : 18);
-        break;
-    case 0x12: { /* INQUIRY */
-        reply[0] = 0x05; reply[1] = 0x80; reply[2] = 0x00;
-        reply[3] = 0x21; reply[4] = 31;
-        memcpy(reply + 8, "GEMU    ", 8);
-        memcpy(reply + 16, "ATAPI CD-ROM    ", 16);
-        memcpy(reply + 32, "1.0 ", 4);
-        size_t n = p[4] < 36 ? p[4] : 36;
-        atapi_set_data(s, reply, n);
-        break;
-    }
-    case 0x25: /* READ CAPACITY */
-        if (!medium) {
-            atapi_no_medium(s);
-            break;
-        }
-        if (blocks) blocks--;
-        reply[0] = blocks >> 24; reply[1] = blocks >> 16;
-        reply[2] = blocks >> 8;  reply[3] = blocks;
-        reply[6] = 0x08;
-        atapi_set_data(s, reply, 8);
-        break;
-    case 0x43: { /* READ TOC: one data track, lead-out */
-        if (!medium) {
-            atapi_no_medium(s);
-            break;
-        }
-        reply[1] = 0x12; reply[2] = 1; reply[3] = 1;
-        reply[5] = 0x14; reply[6] = 1;
-        reply[13] = 0x14; reply[14] = 0xAA;
-        reply[16] = blocks >> 24; reply[17] = blocks >> 16;
-        reply[18] = blocks >> 8; reply[19] = blocks;
-        size_t alloc = ((size_t)p[7] << 8) | p[8];
-        atapi_set_data(s, reply, alloc < 20 ? alloc : 20);
-        break;
-    }
-    case 0x28: /* READ(10) */
-    case 0xA8: { /* READ(12) */
-        uint32_t lba = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16) |
-                       ((uint32_t)p[4] << 8) | p[5];
-        uint32_t count = p[0] == 0x28 ? ((uint32_t)p[7] << 8) | p[8] :
-                         ((uint32_t)p[6] << 24) | ((uint32_t)p[7] << 16) |
-                         ((uint32_t)p[8] << 8) | p[9];
-        size_t len = (size_t)count * 2048;
-        if (atapi_debug_enabled())
-            fprintf(stderr, "i2000: ATAPI %s lba=%" PRIu32
-                    " sectors=%" PRIu32 " bytes=%zu image-blocks=%" PRIu32
-                    "\n", atapi_packet_name(p[0]), lba, count, len, blocks);
-        uint8_t *buf = len ? malloc(len) : NULL;
-        if ((len && !buf) || lba >= blocks || count > blocks - lba ||
-            (len && !gemu_drive_read(s->cdrom, (uint64_t)lba * 2048, buf, len))) {
-            free(buf); s->atapi_error = 0x50; s->atapi_status = 0x41;
-            s->atapi_count = 0x03;
-            atapi_latch_irq(s);
-            s->atapi_irq_ready_ninsts =
-                s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
-            if (atapi_debug_enabled())
-                fprintf(stderr, "i2000: ATAPI read failed lba=%" PRIu32
-                        " sectors=%" PRIu32 " status=%#04x error=%#04x\n",
-                        lba, count, s->atapi_status, s->atapi_error);
-        } else {
-            atapi_set_data(s, buf, len);
-            free(buf);
-        }
-        break;
-    }
-    default:
-        fprintf(stderr, "i2000: ATAPI unsupported packet command %02X\n", p[0]);
-        s->atapi_error = 0x50;
-        s->atapi_status = 0x41;
-        s->atapi_count = 0x03;
-        atapi_latch_irq(s);
-        s->atapi_irq_ready_ninsts =
-            s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
-        break;
-    }
-}
-
 static uint64_t i2000_now_ninsts(void *ctx) {
     return ((Ia64I2000State *)ctx)->cpu->ninsts;
 }
 
-/* The disk's wiring: the -hda drive, busy for ATAPI_IRQ_LATENCY_NINSTS
- * instructions after each command.  Also after a state load, which brings
+/* The IDE devices' wiring: the -hda disk and the -cdrom drive, each busy
+ * for ATAPI_IRQ_LATENCY_NINSTS instructions after a command.  Also after a state load, which brings
  * the device's state but not its host pointers. */
 static void i2000_ide_wire(Ia64I2000State *s) {
     AtaDiskConfig cfg = {
@@ -911,6 +676,13 @@ static void i2000_ide_wire(Ia64I2000State *s) {
     ata_disk_rewire(&s->hd, &cfg);
     s->ide_primary.dev[0] = s->hda ? &s->hd.ide : NULL;
     s->ide_primary.dev[1] = NULL;
+    AtapiCdromConfig cd_cfg = {
+        .drive = s->cdrom, .now = i2000_now_ninsts, .ctx = s,
+        .latency = ATAPI_IRQ_LATENCY_NINSTS, .debug = atapi_debug_enabled(),
+    };
+    atapi_cdrom_rewire(&s->cd, &cd_cfg);
+    s->ide_secondary.dev[0] = &s->cd.ide;
+    s->ide_secondary.dev[1] = NULL;
 }
 
 /* Whether the 8259 pair would pass legacy ISA IRQ n to the CPU: its own
@@ -1278,11 +1050,6 @@ static void i2000_rtc_initialise(Ia64I2000State *s) {
  * reports a raised line whether or not IMR masks it - AMI's IA-32 BIOS
  * waits for IRQ14/15 by polling IRR with interrupts off, and EFI keeps
  * IRQ15 masked while it does. */
-static bool i2000_atapi_intrq_line(const Ia64I2000State *s) {
-    return s->atapi_irq_pending && !(s->atapi_device_control & 6) &&
-           !(s->atapi_device & 0x10) &&
-           s->cpu->ninsts >= s->atapi_irq_ready_ninsts;
-}
 /* The 8259 pair's input lines, from the devices' legacy interrupt state.
  * The PIT, keyboard and mouse flags are set only on their legacy (ExtINT)
  * paths and cleared by the acknowledge; IRQ12 also drops while the mouse
@@ -1298,7 +1065,7 @@ static void i2000_pic_sync(Ia64I2000State *s) {
                               s->mouse_wait_rfi_generation == 0 &&
                               s->cpu->ninsts >= s->mouse_retry_ninsts);
     i8259_pair_set_irq(p, 14, s->ata_legacy_irq_latched || ide_intrq(&s->ide_primary));
-    i8259_pair_set_irq(p, 15, s->atapi_legacy_irq_latched || i2000_atapi_intrq_line(s));
+    i8259_pair_set_irq(p, 15, s->atapi_legacy_irq_latched || ide_intrq(&s->ide_secondary));
 }
 /* A device's legacy path asks for the processor: offer the pair's INT as an
  * ExtINT (vector 0) if it is asserting one. */
@@ -1424,72 +1191,9 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     }
     if (port == 0x61 && size == 1)
         return i2000_port61_read(s);
-    if ((port >= 0x170 && port <= 0x177) || port == 0x376) {
-        unsigned reg = port == 0x376 ? 7 : (unsigned)(port - 0x170);
-        /* Only the secondary-channel master exists.  The firmware probes
-         * the slave with IDENTIFY DEVICE; an absent ATA target floats the
-         * task file instead of borrowing the master's ATAPI state/IRQ. */
-        if ((s->atapi_device & 0x10) != 0)
-            return reg == 6 ? s->atapi_device : 0;
-        if (reg == 0) {
-            uint64_t v = 0;
-            size_t pos_before = s->atapi_data_pos;
-            for (unsigned i = 0; i < size; i++) {
-                if (s->atapi_data_pos < s->atapi_data_len &&
-                    s->atapi_data_pos < s->atapi_phase_end)
-                    v |= (uint64_t)s->atapi_data[s->atapi_data_pos++] << (i * 8);
-            }
-            if (getenv("ATA_DATA_TRACE"))
-                fprintf(stderr, "i2000: ATAPI data read size=%u pos=%zu/%zu "
-                        "-> %#04" PRIx64 " ip=%016" PRIx64 " ninsts=%"
-                        PRIu64 "\n", size, pos_before, s->atapi_data_len, v,
-                        s->cpu->ip, s->cpu->ninsts);
-            if (s->atapi_data_pos >= s->atapi_phase_end &&
-                s->atapi_status & 0x08) {
-                if (s->atapi_data_pos < s->atapi_data_len) {
-                    atapi_begin_data_phase(s);
-                    if (atapi_debug_enabled())
-                        fprintf(stderr, "i2000: ATAPI next PIO phase pos=%zu "
-                                "end=%zu total=%zu\n", s->atapi_data_pos,
-                                s->atapi_phase_end, s->atapi_data_len);
-                } else {
-                    s->atapi_status = 0x40;
-                    /* PACKET has a separate command-complete interrupt.
-                     * IDENTIFY PACKET is an ATA PIO-data-in command: its
-                     * only interrupt announced the 512-byte response. */
-                    if (s->atapi_packet_command) {
-                        s->atapi_count = 0x03; /* CoD=1, I/O=1 */
-                        s->atapi_lba_mid = s->atapi_lba_high = 0;
-                        atapi_latch_irq(s);
-                        s->atapi_irq_ready_ninsts =
-                            s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
-                    }
-                    if (atapi_debug_enabled())
-                        fprintf(stderr, "i2000: ATAPI PIO complete bytes=%zu "
-                                "status=%#04x reason=%#04x\n",
-                                s->atapi_data_len, s->atapi_status,
-                                s->atapi_count);
-                }
-            }
-            return v;
-        }
-        uint64_t result;
-        switch (reg) {
-        case 1: result = s->atapi_error; break;
-        case 2: result = s->atapi_count; break;
-        case 3: result = s->atapi_lba_low; break;
-        case 4: result = s->atapi_lba_mid; break;
-        case 5: result = s->atapi_lba_high; break;
-        case 6: result = s->atapi_device; break;
-        case 7:
-            result = s->atapi_status;
-            if (port == 0x177)
-                atapi_clear_irq(s); /* Alternate Status does not acknowledge. */
-            break;
-        default: result = 0; break;
-        }
-        return result;
-    }
+    if ((port >= 0x170 && port <= 0x177) || port == 0x376)
+        return ide_read(&s->ide_secondary,
+                        port == 0x376 ? 8 : (unsigned)(port - 0x170), size);
     if (s->hda && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
         unsigned reg = port == 0x3F6 ? 8 : (unsigned)(port - 0x1F0);
         /* A ready interrupt reaches the PIC/SAPIC before the Status read
@@ -1640,150 +1344,9 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         return;
     }
     if ((port >= 0x170 && port <= 0x177) || port == 0x376) {
-        unsigned reg = port == 0x376 ? 8 : (unsigned)(port - 0x170);
-        if (reg == 0) {
-            unsigned old_pos = s->atapi_packet_pos;
-            for (unsigned i = 0; i < size && s->atapi_packet_pos < 12; i++)
-                s->atapi_packet[s->atapi_packet_pos++] = (uint8_t)(val >> (i * 8));
-            if (old_pos < 12 && s->atapi_packet_pos == 12) {
-                atapi_reply(s);
-                /* The SDV's legacy EFI thunk checks the data phase
-                 * synchronously after writing the final PACKET word.  A0
-                 * itself must assert BSY (AtaPim explicitly waits for that
-                 * edge), but inserting another artificial BSY interval
-                 * here makes the thunk abandon PIO before its data read.
-                 * atapi_reply()/atapi_set_data() already expose DRQ and
-                 * schedule the normal data-ready IRQ. */
-            }
-            return;
-        }
-        switch (reg) {
-        case 1: s->atapi_features = (uint8_t)val; return;
-        case 2: s->atapi_count = (uint8_t)val; return;
-        case 3: s->atapi_lba_low = (uint8_t)val; return;
-        case 4: s->atapi_lba_mid = (uint8_t)val; return;
-        case 5: s->atapi_lba_high = (uint8_t)val; return;
-        case 6: {
-            bool was_slave = (s->atapi_device & 0x10) != 0;
-            s->atapi_device = (uint8_t)val;
-            bool is_slave = (s->atapi_device & 0x10) != 0;
-            if (is_slave != was_slave) {
-                /* This model has no secondary slave.  Do not let a failed
-                 * slave probe leave an interrupt that can complete the
-                 * master's next PACKET request prematurely. */
-                atapi_clear_irq(s);
-                s->atapi_status_pending = false;
-                if (!is_slave) {
-                    s->atapi_error = 0;
-                    s->atapi_status = 0x40;
-                    s->atapi_count = 1;
-                    s->atapi_lba_low = 1;
-                    s->atapi_lba_mid = 0x14;
-                    s->atapi_lba_high = 0xeb;
-                }
-            }
-            return;
-        }
-        case 7:
-            if (s->atapi_device & 0x10) {
-                if (atapi_debug_enabled())
-                    fprintf(stderr, "i2000: ignored ATA command=%#04x for "
-                            "absent secondary slave\n",
-                            (unsigned)(uint8_t)val);
-                return;
-            }
-            /* A new command supersedes any unacknowledged completion from
-             * the previous one. The command below will latch IRQ15 again
-             * when its data or completion phase becomes available. */
-            atapi_clear_irq(s);
-            s->atapi_status_pending = false;
-            s->atapi_error = 0;
-            s->atapi_packet_command = (uint8_t)val == 0xa0;
-            if (atapi_debug_enabled())
-                fprintf(stderr, "i2000: ATAPI ATA command=%#04x device=%#04x "
-                        "features=%#04x byte-limit=%u itc=%" PRIu64
-                        " ninsts=%" PRIu64 "\n", (unsigned)(uint8_t)val,
-                        s->atapi_device, s->atapi_features,
-                        (unsigned)s->atapi_lba_mid |
-                        ((unsigned)s->atapi_lba_high << 8),
-                        merced_get_itc(s->cpu), s->cpu->ninsts);
-            if ((uint8_t)val == 0xA0) { /* PACKET */
-                unsigned limit = (unsigned)s->atapi_lba_mid |
-                                 ((unsigned)s->atapi_lba_high << 8);
-                s->atapi_byte_limit = limit ? limit : 65536u;
-                s->atapi_packet_pos = 0;
-                memset(s->atapi_packet, 0, sizeof(s->atapi_packet));
-                s->atapi_count = 0x01;
-                s->atapi_status = 0x48;
-                atapi_defer_ready(s, false);
-            } else if ((uint8_t)val == 0xA1) { /* IDENTIFY PACKET DEVICE */
-                uint8_t id[512] = {0};
-                uint8_t saved_count = s->atapi_count;
-                uint8_t saved_lba_low = s->atapi_lba_low;
-                uint8_t saved_lba_mid = s->atapi_lba_mid;
-                uint8_t saved_lba_high = s->atapi_lba_high;
-                id[0] = 0xC0; id[1] = 0x85;       /* removable ATAPI CD-ROM */
-                id[98] = 0x00; id[99] = 0x02;     /* LBA supported */
-                char model[40];
-                memset(model, ' ', sizeof(model));
-                memcpy(model, "GEMU ATAPI CD-ROM", 17);
-                for (unsigned i = 0; i < 40; i += 2) {
-                    id[54 + i] = model[i + 1]; id[55 + i] = model[i];
-                }
-                s->atapi_byte_limit = sizeof(id);
-                atapi_set_data(s, id, sizeof(id));
-                /* IDENTIFY PACKET is an ATA PIO-data command, not an ATAPI
-                 * PACKET data phase.  Sector Count is therefore not an
-                 * interrupt-reason register here, and Cylinder Low/High
-                 * are not a transfer byte count. Preserve the task-file
-                 * signature/inputs that were present when A1 was issued. */
-                s->atapi_count = saved_count;
-                s->atapi_lba_low = saved_lba_low;
-                s->atapi_lba_mid = saved_lba_mid;
-                s->atapi_lba_high = saved_lba_high;
-                atapi_defer_ready(s, true);
-            } else if ((uint8_t)val == 0x08) { /* DEVICE RESET */
-                s->atapi_status = 0x40;
-                s->atapi_count = 1; s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB;
-            } else {
-                s->atapi_error = 0x04; s->atapi_status = 0x41;
-                atapi_latch_irq(s);
-                s->atapi_irq_ready_ninsts = s->cpu->ninsts + ATAPI_IRQ_LATENCY_NINSTS;
-                if (atapi_debug_enabled())
-                    fprintf(stderr, "i2000: ATAPI unsupported ATA command=%#04x "
-                            "status=%#04x error=%#04x\n",
-                            (unsigned)(uint8_t)val, s->atapi_status,
-                            s->atapi_error);
-            }
-            return;
-        case 8: /* device control / software reset */
-            if (atapi_debug_enabled())
-                fprintf(stderr, "i2000: ATAPI device-control=%#04x (%s reset)\n",
-                        (unsigned)(uint8_t)val,
-                        (val & 4) ? "assert" : "deassert");
-            {
-                uint8_t old_control = s->atapi_device_control;
-                s->atapi_device_control = (uint8_t)val;
-                if (val & 2)
-                    s->atapi_irq_asserted = false; /* nIEN lowers the output. */
-                if ((old_control ^ val) & 4) {
-                    atapi_clear_irq(s);
-                    s->atapi_status_pending = false;
-                    s->atapi_packet_pos = 0;
-                    s->atapi_packet_command = false;
-                    s->atapi_data_pos = s->atapi_data_len;
-                    if (val & 4) {
-                        s->atapi_status = 0x80;
-                    } else {
-                        s->atapi_status = 0x40;
-                        s->atapi_count = s->atapi_lba_low = 1;
-                        s->atapi_lba_mid = 0x14;
-                        s->atapi_lba_high = 0xeb;
-                    }
-                }
-            }
-            return;
-        }
+        ide_write(&s->ide_secondary, port == 0x376 ? 8 : (unsigned)(port - 0x170),
+                  val, size);
+        return;
     }
     if (s->hda && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
         ide_write(&s->ide_primary, port == 0x3F6 ? 8 : (unsigned)(port - 0x1F0),
@@ -2131,7 +1694,7 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
             if (!s->atapi_legacy_irq_latched)
                 break;
             s->atapi_legacy_irq_latched = false;
-            atapi_clear_irq(s);
+            atapi_cdrom_clear_irq(&s->cd);
             if (atapi_debug_enabled()) {
                 fprintf(stderr, "i2000: ATAPI IRQ15 acknowledged vector=%#04x "
                         "ip=%016" PRIx64 " itc=%" PRIu64 " ninsts=%" PRIu64 "\n",
@@ -2858,6 +2421,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
     }
     gemu_drive_set_change_cb(s->cdrom, i2000_cdrom_changed, s);
     ata_disk_init(&s->hd, &(AtaDiskConfig){0});
+    atapi_cdrom_init(&s->cd, &(AtapiCdromConfig){0});
     i2000_ide_wire(s);
     i2000_drive_info_refresh(s);
     if (atapi_debug_enabled() && gemu_drive_inserted(s->cdrom))
@@ -2873,7 +2437,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 44u   /* the -hda disk as an AtaDisk */
+#define I2000_SNAPSHOT_VERSION 45u   /* the CD-ROM as an AtapiCdrom */
 
 /* Version 40 ends Rage128 just before cce. Its following machine fields
  * keep their relative layout because the inserted state is 8-byte aligned. */
@@ -2896,10 +2460,10 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fwrite(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
     if (s->video_enabled)
         ok &= fwrite(s->vram, 1, RAGE128_VRAM_SIZE, f) == RAGE128_VRAM_SIZE;
-    uint64_t atapi_len = (uint64_t)s->atapi_data_len;
+    uint64_t atapi_len = (uint64_t)s->cd.data_len;
     ok &= fwrite(&atapi_len, sizeof(atapi_len), 1, f) == 1;
     if (atapi_len)
-        ok &= fwrite(s->atapi_data, 1, atapi_len, f) == atapi_len;
+        ok &= fwrite(s->cd.data, 1, atapi_len, f) == atapi_len;
 
     Ia64I2000State *snap = malloc(sizeof(*snap));
     if (!snap) { fclose(f); return false; }
@@ -2912,7 +2476,10 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     snap->vram = NULL;
     snap->video_rom = NULL;
     snap->cdrom = NULL;
-    snap->atapi_data = NULL;
+    snap->cd.data = NULL;
+    memset(&snap->cd.cfg, 0, sizeof(snap->cd.cfg));
+    memset(&snap->cd.ide, 0, sizeof(snap->cd.ide));
+    memset(snap->ide_secondary.dev, 0, sizeof(snap->ide_secondary.dev));
     snap->hda = NULL;
     memset(&snap->hd.cfg, 0, sizeof(snap->hd.cfg));
     memset(&snap->hd.ide, 0, sizeof(snap->hd.ide));
@@ -2974,11 +2541,11 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
 
     uint64_t atapi_len = 0;
     ok &= fread(&atapi_len, sizeof(atapi_len), 1, f) == 1;
-    free(s->atapi_data);
-    s->atapi_data = atapi_len ? malloc((size_t)atapi_len) : NULL;
+    atapi_cdrom_free(&s->cd);
+    s->cd.data = atapi_len ? malloc((size_t)atapi_len) : NULL;
     if (atapi_len) {
-        if (!s->atapi_data) { fclose(f); return false; }
-        ok &= fread(s->atapi_data, 1, atapi_len, f) == atapi_len;
+        if (!s->cd.data) { fclose(f); return false; }
+        ok &= fread(s->cd.data, 1, atapi_len, f) == atapi_len;
     }
 
     GemuMonitor *monitor = s->monitor;
@@ -3000,7 +2567,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     uint8_t *vram = s->vram;
     uint8_t *video_rom = s->video_rom;
     uint32_t video_rom_len = s->video_rom_len;
-    uint8_t *atapi_data = s->atapi_data;
+    uint8_t *atapi_data = s->cd.data;
     Ia64I2000State *loaded = calloc(1, sizeof(*loaded));
     /* Merced is ~2 MB: on the heap, as Windows threads have a 1 MiB stack. */
     Merced *loaded_cpu = malloc(sizeof(*loaded_cpu));
@@ -3035,7 +2602,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         /* Restore must not implicitly overwrite persistent machine NVRAM.
          * Subsequent guest flash writes mark it dirty normally. */
         s->nvram_dirty = false;
-        s->atapi_data = atapi_data;
+        s->cd.data = atapi_data;
         s->cdrom = cdrom;
         s->hda = hda;
         i2000_ide_wire(s);
@@ -3615,19 +3182,19 @@ static GemuMonCmd i2000_cmd_atapistate(GemuMonitor *mon, const char *args,
                                        void *ud) {
     Ia64I2000State *s = ud;
     (void)args;
+    const AtapiCdrom *d = &s->cd;
     gemu_monitor_printf(mon, "atapi: status=%#04x error=%#04x count=%#04x "
-           "device=%#04x control=%#04x irq_pending=%u irq_asserted=%u "
+           "device=%#04x control=%#04x irq_pending=%u irq_delivered=%u "
            "irq_ready=%" PRIu64 " status_pending=%u "
            "status_ready=%" PRIu64 " ready_status=%#04x ready_irq=%u "
            "data=%" PRIu64 "/%" PRIu64 " phase_end=%" PRIu64
            " ninsts=%" PRIu64 "\n",
-           s->atapi_status, s->atapi_error, s->atapi_count,
-           s->atapi_device, s->atapi_device_control,
-           s->atapi_irq_pending, s->atapi_irq_asserted,
-           s->atapi_irq_ready_ninsts, s->atapi_status_pending,
-           s->atapi_status_ready_ninsts, s->atapi_ready_status,
-           s->atapi_ready_irq, (uint64_t)s->atapi_data_pos,
-           (uint64_t)s->atapi_data_len, (uint64_t)s->atapi_phase_end,
+           d->status, d->error, d->count, d->device, d->control,
+           d->irq_pending, s->atapi_irq_delivered == d->irq_epoch,
+           d->irq_ready_at, d->status_pending,
+           d->status_ready_at, d->ready_status,
+           d->ready_irq, (uint64_t)d->data_pos,
+           (uint64_t)d->data_len, (uint64_t)d->phase_end,
            s->cpu->ninsts);
     return GEMU_MON_NONE;
 }
@@ -4025,27 +3592,9 @@ static void i2000_devices_reset(Ia64I2000State *s, bool warm) {
     i2000_uart_reset(s);
     mc146818_core_reset(&s->rtc);
     i2000_pit_reset(s);
-    s->atapi_error = s->atapi_features = 0;
-    s->atapi_count = 1;
-    s->atapi_lba_low = 1;
-    s->atapi_lba_mid = 0x14;
-    s->atapi_lba_high = 0xEB;
-    s->atapi_device = 0xA0;
-    /* The secondary-master ATAPI drive exists even with its tray empty.
-     * Media presence affects SCSI packet results, not ATA device presence. */
-    s->atapi_status = 0x40;
-    s->atapi_packet_pos = 0;
-    s->atapi_device_control = 0;
-    s->atapi_packet_command = false;
+    atapi_cdrom_reset(&s->cd);
+    ide_reset(&s->ide_secondary);
     s->atapi_legacy_irq_latched = false;
-    s->atapi_byte_limit = 65536u;
-    s->atapi_phase_end = 0;
-    atapi_clear_irq(s);
-    s->atapi_status_pending = false;
-    s->atapi_ready_irq = false;
-    free(s->atapi_data);
-    s->atapi_data = NULL;
-    s->atapi_data_len = s->atapi_data_pos = 0;
     ata_disk_reset(&s->hd);
     ide_reset(&s->ide_primary);
     s->ata_legacy_irq_latched = false;
@@ -4244,7 +3793,7 @@ void ia64_i2000_destroy(Ia64I2000State *s) {
     }
     gemu_net_shutdown();
     free(s->nic_rom);
-    free(s->atapi_data);
+    atapi_cdrom_free(&s->cd);
     /* The drive table owns the drives; just stop them calling back here. */
     gemu_drive_set_change_cb(s->cdrom, NULL, NULL);
     free(s->video_rom);
@@ -4401,32 +3950,19 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
     /* Secondary IDE uses GSI15. Windows installs a fixed SAPIC vector;
      * firmware leaves that entry masked and uses its legacy ExtINT thunk.
      * Device-control nIEN masks the output without discarding completion. */
-    if (s->atapi_status_pending &&
-        s->cpu->ninsts >= s->atapi_status_ready_ninsts) {
-        s->atapi_status_pending = false;
-        s->atapi_status = s->atapi_ready_status;
-        if (s->atapi_ready_irq) {
-            atapi_latch_irq(s);
-            s->atapi_irq_ready_ninsts = s->cpu->ninsts;
-        }
-        if (atapi_debug_enabled())
-            fprintf(stderr, "i2000: ATAPI BSY cleared status=%#04x "
-                    "reason=%#04x ninsts=%" PRIu64 "\n",
-                    s->atapi_status, s->atapi_count, s->cpu->ninsts);
-    }
+    atapi_cdrom_poll(&s->cd);
     /* A PIC edge survives a device Status read until the legacy INTA
      * replacement cycle acknowledges it. Keep that ownership separately
      * from the device's INTRQ latch. */
     if (s->atapi_legacy_irq_latched)
         i2000_pic_raise(s);
-    if (s->atapi_irq_pending &&
-        !(s->atapi_device_control & 6) && !(s->atapi_device & 0x10) &&
-        s->cpu->ninsts >= s->atapi_irq_ready_ninsts) {
+    if (ide_intrq(&s->ide_secondary)) {
         uint64_t rte = s->chipset.iosapic_rte[15];
+        uint32_t epoch = atapi_cdrom_irq_epoch(&s->cd);
         if (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) <= 1) {
-            if (!s->atapi_irq_asserted) {
+            if (s->atapi_irq_delivered != epoch) {
                 iosapic_raise_gsi(s, 15);
-                s->atapi_irq_asserted = true;
+                s->atapi_irq_delivered = epoch;
             }
         } else if (rte == I460GX_IOSAPIC_RTE_MASK ||
                    (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) == 7)) {

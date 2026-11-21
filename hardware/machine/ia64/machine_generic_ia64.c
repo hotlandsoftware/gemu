@@ -7,6 +7,9 @@
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
 #include "gemu/util.h"
+#include "serial/ins8250.h"
+#include "storage/atapi_cdrom.h"
+#include "storage/ide.h"
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -112,26 +115,12 @@ struct Ia64GenericState {
     uint8_t  qemu_vga_cfg[256];
     uint8_t  qemu_nvram[GENERIC_QEMU_NVRAM_SIZE];
 
-    uint8_t   atapi_error, atapi_features, atapi_count;
-    uint8_t   atapi_lba_low, atapi_lba_mid, atapi_lba_high, atapi_device;
-    uint8_t   atapi_status, atapi_packet[12];
-    /* ATA IRQ14 is a level, not a fire-and-forget edge.  Keep the line
-     * asserted until the guest reads the command/status register so an
-     * interrupt raised while the I/O SAPIC entry is masked is not lost. */
-    uint8_t   ide_irq_asserted;
-    unsigned  atapi_packet_pos;
-    uint8_t  *atapi_data;
-    size_t    atapi_data_len, atapi_data_pos;
-    /* ATAPI PIO transfers larger than the driver's declared "byte count
-     * limit" (written to 1F4/1F5 before the PACKET command) must be split
-     * across multiple DRQ blocks, each announced by its own byte count in
-     * 1F4/1F5 and its own BSY->DRQ/interrupt handshake - a real firmware
-     * ISO9660 driver (as opposed to our own, which never requests more
-     * than one block's worth) depends on this. atapi_byte_limit is
-     * captured when the PACKET command is issued; atapi_block_end is the
-     * data offset the *current* DRQ block ends at. */
-    uint32_t  atapi_byte_limit;
-    size_t    atapi_block_end;
+    /* The primary IDE channel: the -cdrom drive as device 0 (when there is
+     * one), on IRQ14.  ide_irq_delivered is the CD's interrupt epoch last
+     * raised (generic_ide_update()). */
+    IdeChannel ide;
+    AtapiCdrom cd;
+    uint32_t  ide_irq_delivered;
 
     /* ide0-hd0 (-hda) from the drive table: a raw disk image behind the
      * custom sector window (see GENERIC_HDD_IO_BASE). */
@@ -196,7 +185,9 @@ struct Ia64GenericState {
      *    backend uses). */
     bool     serial_enabled;
     GenericSerialBackend serial_backend;
-    uint8_t  uart_ier, uart_lcr, uart_mcr, uart_scr, uart_dll, uart_dlm;
+    Ins8250  uart;            /* COM1, a 16450 */
+    /* The terminal's side: bytes from the backend (or the monitor's key
+     * command) waiting for the UART's receiver. */
     uint8_t  uart_rx[256];
     uint8_t  uart_rx_head, uart_rx_tail;
 #ifndef _WIN32
@@ -300,112 +291,47 @@ static void generic_raise_irq(Ia64GenericState *s, unsigned irq) {
         merced_raise_external(s->cpu, vector);
 }
 
-static void generic_set_ide_irq(Ia64GenericState *s, bool asserted) {
-    s->ide_irq_asserted = asserted;
-    if (asserted)
+static uint64_t generic_now(void *ctx) {
+    return ((Ia64GenericState *)ctx)->cpu->ninsts;
+}
+
+/* IRQ14 follows the CD's INTRQ: each new interrupt is raised once, as soon
+ * as it is visible (the drive has no latency here). */
+static void generic_ide_update(Ia64GenericState *s) {
+    atapi_cdrom_poll(&s->cd);
+    if (!ide_intrq(&s->ide))
+        return;
+    uint32_t epoch = atapi_cdrom_irq_epoch(&s->cd);
+    if (epoch != s->ide_irq_delivered) {
+        s->ide_irq_delivered = epoch;
         generic_raise_irq(s, 14);
-}
-
-static void atapi_set_data(Ia64GenericState *s, const void *data, size_t len) {
-    free(s->atapi_data);
-    s->atapi_data = NULL;
-    s->atapi_data_len = s->atapi_data_pos = 0;
-    if (len) {
-        s->atapi_data = malloc(len);
-        if (!s->atapi_data) {
-            s->atapi_error = 0x04;
-            s->atapi_status = 0x41;
-            return;
-        }
-        memcpy(s->atapi_data, data, len);
-        s->atapi_data_len = len;
-    }
-    /* First DRQ block: capped at the driver's declared byte-count limit
-     * (0 = no limit set, i.e. the native-ATA IDENTIFY path). */
-    size_t block_len = len;
-    if (s->atapi_byte_limit != 0 && (size_t)s->atapi_byte_limit < block_len)
-        block_len = s->atapi_byte_limit;
-    s->atapi_block_end = block_len;
-    s->atapi_count = 0x02;
-    s->atapi_lba_mid = (uint8_t)block_len;
-    s->atapi_lba_high = (uint8_t)(block_len >> 8);
-    s->atapi_status = len ? 0x48 : 0x40;
-    generic_set_ide_irq(s, true);
-}
-
-static void atapi_reply(Ia64GenericState *s) {
-    const uint8_t *p = s->atapi_packet;
-    uint8_t reply[64] = {0};
-    uint32_t blocks = (uint32_t)(gemu_drive_size(s->cdrom) / GENERIC_CDROM_SECTOR_SIZE);
-    bool medium = gemu_drive_inserted(s->cdrom);
-    switch (p[0]) {
-    case 0x00: /* TEST UNIT READY */
-        atapi_set_data(s, NULL, 0);
-        if (!medium) {           /* empty tray: CHECK CONDITION, NOT READY */
-            s->atapi_error = 0x20;
-            s->atapi_status = 0x41;
-        }
-        break;
-    case 0x1B: case 0x1E:
-        atapi_set_data(s, NULL, 0);
-        break;
-    case 0x03:
-        reply[0] = 0x70; reply[7] = 10;
-        if (!medium) {
-            reply[2] = 0x02;     /* NOT READY */
-            reply[12] = 0x3a;    /* medium not present */
-        }
-        atapi_set_data(s, reply, p[4] < 18 ? p[4] : 18);
-        break;
-    case 0x12: {
-        reply[0] = 0x05; reply[1] = 0x80; reply[3] = 0x21; reply[4] = 31;
-        memcpy(reply + 8, "GEMU    ", 8);
-        memcpy(reply + 16, "ATAPI CD-ROM    ", 16);
-        memcpy(reply + 32, "1.0 ", 4);
-        atapi_set_data(s, reply, p[4] < 36 ? p[4] : 36);
-        break;
-    }
-    case 0x25:
-        if (blocks) blocks--;
-        reply[0] = blocks >> 24; reply[1] = blocks >> 16;
-        reply[2] = blocks >> 8; reply[3] = blocks; reply[6] = 8;
-        atapi_set_data(s, reply, 8);
-        break;
-    case 0x43: {
-        reply[1] = 0x12; reply[2] = 1; reply[3] = 1;
-        reply[5] = 0x14; reply[6] = 1; reply[13] = 0x14; reply[14] = 0xAA;
-        reply[16] = blocks >> 24; reply[17] = blocks >> 16;
-        reply[18] = blocks >> 8; reply[19] = blocks;
-        size_t alloc = ((size_t)p[7] << 8) | p[8];
-        atapi_set_data(s, reply, alloc < 20 ? alloc : 20);
-        break;
-    }
-    case 0x28: case 0xA8: {
-        uint32_t lba = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16) |
-                       ((uint32_t)p[4] << 8) | p[5];
-        uint32_t count = p[0] == 0x28 ? ((uint32_t)p[7] << 8) | p[8] :
-                         ((uint32_t)p[6] << 24) | ((uint32_t)p[7] << 16) |
-                         ((uint32_t)p[8] << 8) | p[9];
-        size_t len = (size_t)count * GENERIC_CDROM_SECTOR_SIZE;
-        uint8_t *buf = len ? malloc(len) : NULL;
-        if ((len && !buf) || lba >= blocks || count > blocks - lba ||
-            (len && !gemu_drive_read(s->cdrom, (uint64_t)lba * GENERIC_CDROM_SECTOR_SIZE,
-                                     buf, len))) {
-            free(buf); s->atapi_error = 0x50; s->atapi_status = 0x41;
-        } else {
-            atapi_set_data(s, buf, len);
-            free(buf);
-        }
-        break;
-    }
-    default:
-        fprintf(stderr, "generic: ATAPI unsupported packet command %02X\n", p[0]);
-        s->atapi_error = 0x50; s->atapi_status = 0x41;
-        break;
     }
 }
 
 static void generic_serial_tx(Ia64GenericState *s, uint8_t byte);
+
+/* COM1's terminal: output to the -serial backend; input from uart_rx,
+ * offered only while the receive register is empty so nothing typed or
+ * sent is overrun.  With clock_hz 0 a character takes one tick, and the
+ * UART is ticked at every register access and serial poll. */
+static void generic_uart_tx(void *dev, uint8_t b) {
+    generic_serial_tx(dev, b);
+}
+static bool generic_uart_rx(void *dev, uint8_t *b) {
+    Ia64GenericState *s = dev;
+    if ((s->uart.lsr & 0x01) || s->uart_rx_head == s->uart_rx_tail)
+        return false;
+    *b = s->uart_rx[s->uart_rx_head++];
+    return true;
+}
+static void generic_uart_init(Ia64GenericState *s) {
+    s->uart = (Ins8250){
+        .model = INS8250_16450, .clock_hz = 0,
+        .dev_tx = generic_uart_tx, .dev_rx = generic_uart_rx, .dev = s,
+        .modem_in = 0xB0,                      /* CTS, DSR, DCD */
+    };
+    ins8250_reset(&s->uart);
+}
 
 /* IA-64 HAL never uses IN/OUT; it reaches "legacy" I/O ports by computing a
  * memory address within a platform-supplied I/O-space window using the
@@ -526,96 +452,13 @@ static uint64_t legacy_io_read(Ia64GenericState *s, unsigned port, unsigned size
         return size_mask(size);
     }
     if (s->cdrom && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
-        unsigned reg = port == 0x3F6 ? 7 : port - 0x1F0;
-        if (reg == 0) {
-            uint64_t v = 0;
-            for (unsigned i = 0; i < size; i++)
-                if (s->atapi_data_pos < s->atapi_block_end)
-                    v |= (uint64_t)s->atapi_data[s->atapi_data_pos++] << (i * 8);
-            if (s->atapi_data_pos >= s->atapi_block_end && (s->atapi_status & 8)) {
-                if (s->atapi_data_pos < s->atapi_data_len) {
-                    /* More data than fit in one DRQ block: announce the next
-                     * block's size and re-arm, instead of ending the
-                     * transfer - real ATAPI PIO delivers large responses
-                     * (e.g. a multi-sector CD-ROM READ) as a sequence of
-                     * driver-bounded blocks, each with its own interrupt. */
-                    size_t remaining = s->atapi_data_len - s->atapi_data_pos;
-                    size_t block_len = s->atapi_byte_limit != 0 &&
-                                        (size_t)s->atapi_byte_limit < remaining
-                                            ? s->atapi_byte_limit : remaining;
-                    s->atapi_block_end = s->atapi_data_pos + block_len;
-                    s->atapi_lba_mid = (uint8_t)block_len;
-                    s->atapi_lba_high = (uint8_t)(block_len >> 8);
-                } else {
-                    s->atapi_status = 0x40; s->atapi_count = 3;
-                }
-                generic_set_ide_irq(s, true);
-            }
-            return v;
-        }
-        switch (reg) {
-        case 1: return s->atapi_error; case 2: return s->atapi_count;
-        case 3: return s->atapi_lba_low; case 4: return s->atapi_lba_mid;
-        case 5: return s->atapi_lba_high; case 6: return s->atapi_device;
-        case 7: {
-            uint8_t status = s->atapi_status;
-            /* Reading the primary status register acknowledges INTRQ.
-             * The alternate-status register (3f6) deliberately does not. */
-            if (port == 0x1F7)
-                generic_set_ide_irq(s, false);
-            return status;
-        }
-        }
+        uint64_t v = ide_read(&s->ide, port == 0x3F6 ? 8 : port - 0x1F0, size);
+        generic_ide_update(s);
+        return v;
     }
     if (s->serial_enabled && port >= GENERIC_COM1_PORT && port < GENERIC_COM1_PORT + 8) {
-        switch (port - GENERIC_COM1_PORT) {
-        case 0:
-            if (s->uart_lcr & 0x80) return s->uart_dll;
-            if (s->uart_rx_head != s->uart_rx_tail) {
-                uint8_t byte = s->uart_rx[s->uart_rx_head++];
-                if (getenv("GENERIC_DEBUG_UARTRX")) {
-                    fprintf(stderr,
-                            "generic: uart RBR consume byte=0x%02x ip=%016"
-                            PRIx64 " ninsts=%" PRIu64 "\n",
-                            byte, s->cpu->ip, s->cpu->ninsts);
-                    merced_dump_trace(s->cpu, 64, stderr);
-                }
-                return byte;
-            }
-            return 0;
-        case 1: return (s->uart_lcr & 0x80) ? s->uart_dlm : s->uart_ier;
-        case 2: return ((s->uart_ier & 1) && s->uart_rx_head != s->uart_rx_tail)
-                     ? 0x04 : 0x01;                /* RX data / no interrupt */
-        case 3: return s->uart_lcr;
-        case 4: return s->uart_mcr;
-        case 5: {
-            uint8_t lsr = 0x60 | (s->uart_rx_head != s->uart_rx_tail ? 1 : 0);
-            if (getenv("GENERIC_DEBUG_UARTRX")) {
-                static uint8_t last_head = 0xFF, last_tail = 0xFF;
-                static unsigned n;
-                if ((s->uart_rx_head != last_head ||
-                     s->uart_rx_tail != last_tail) && n++ < 200) {
-                    fprintf(stderr, "generic: uart LSR read -> 0x%02x "
-                            "head=%u tail=%u (edge)\n", lsr, s->uart_rx_head,
-                            s->uart_rx_tail);
-                    last_head = s->uart_rx_head;
-                    last_tail = s->uart_rx_tail;
-                }
-            }
-            return lsr;
-        }
-        case 6:
-            if (s->uart_mcr & 0x10) {
-                /* Loopback: modem status mirrors the control bits (RTS->CTS,
-                 * DTR->DSR, OUT1->RI, OUT2->DCD) - the standard 16550 wiring
-                 * a UART presence/self-test probe checks */
-                return (uint8_t)(((s->uart_mcr & 0x0C) << 4) |
-                                 ((s->uart_mcr & 0x02) << 3) |
-                                 ((s->uart_mcr & 0x01) << 5));
-            }
-            return 0xB0;                             /* MSR: CTS|DSR|DCD */
-        case 7: return s->uart_scr;
-        }
+        ins8250_tick(&s->uart, 1);
+        return ins8250_read(&s->uart, port - GENERIC_COM1_PORT);
     }
     if (port == 0x1F7 || port == 0x3F6) return 0;
     return size_mask(size);
@@ -653,77 +496,14 @@ static void legacy_io_write(Ia64GenericState *s, unsigned port, uint64_t val, un
         return;
     }
     if (s->cdrom && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
-        unsigned reg = port == 0x3F6 ? 8 : port - 0x1F0;
-        if (reg == 0) {
-            for (unsigned i = 0; i < size && s->atapi_packet_pos < 12; i++)
-                s->atapi_packet[s->atapi_packet_pos++] = (uint8_t)(val >> (i * 8));
-            if (s->atapi_packet_pos == 12) atapi_reply(s);
-            return;
-        }
-        switch (reg) {
-        case 1: s->atapi_features = (uint8_t)val; return;
-        case 2: s->atapi_count = (uint8_t)val; return;
-        case 3: s->atapi_lba_low = (uint8_t)val; return;
-        case 4: s->atapi_lba_mid = (uint8_t)val; return;
-        case 5: s->atapi_lba_high = (uint8_t)val; return;
-        case 6: s->atapi_device = (uint8_t)val; return;
-        case 7:
-            generic_set_ide_irq(s, false);
-            s->atapi_error = 0;
-            if ((uint8_t)val == 0xA0) {
-                /* 1F4/1F5 hold the driver's declared max DRQ block size for
-                 * this command - capture it now, before atapi_set_data()
-                 * (called once the 12-byte CDB finishes arriving) overwrites
-                 * those same registers with the response's own byte count. */
-                s->atapi_byte_limit = ((uint32_t)s->atapi_lba_high << 8) | s->atapi_lba_mid;
-                s->atapi_packet_pos = 0; memset(s->atapi_packet, 0, 12);
-                s->atapi_count = 1; s->atapi_status = 0x48;
-            } else if ((uint8_t)val == 0xA1) {
-                uint8_t id[512] = {0}; id[0] = 0xC0; id[1] = 0x85;
-                id[98] = 0; id[99] = 2;
-                const char model[40] = "GEMU ATAPI CD-ROM                       ";
-                for (unsigned i = 0; i < 40; i += 2) { id[54+i] = model[i+1]; id[55+i] = model[i]; }
-                s->atapi_byte_limit = 0;   /* native ATA IDENTIFY: fixed 512B, one block */
-                atapi_set_data(s, id, sizeof(id));
-            } else if ((uint8_t)val == 8) {
-                s->atapi_status = 0x40; s->atapi_count = 1;
-                s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB;
-            } else { s->atapi_error = 4; s->atapi_status = 0x41; }
-            return;
-        case 8:
-            if (val & 4) s->atapi_status = 0x80;
-            else { s->atapi_status = 0x40; s->atapi_count = 1;
-                   s->atapi_lba_mid = 0x14; s->atapi_lba_high = 0xEB; }
-            return;
-        }
+        ide_write(&s->ide, port == 0x3F6 ? 8 : port - 0x1F0, val, size);
+        generic_ide_update(s);
+        return;
     }
     if (s->serial_enabled && port >= GENERIC_COM1_PORT && port < GENERIC_COM1_PORT + 8) {
-        switch (port - GENERIC_COM1_PORT) {
-        case 0:
-            if (s->uart_lcr & 0x80) { s->uart_dll = (uint8_t)val; return; }
-            if (s->uart_mcr & 0x10) {
-                /* Loopback: the transmitted byte becomes the next received
-                 * byte instead of going out the real transport - the UART
-                 * presence self-test a serial detection routine runs before
-                 * trusting a port exists. Matches qemu's serial_xmit(): it
-                 * calls serial_receive1() here instead of writing the chr
-                 * backend when MCR_LOOP is set. */
-                uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
-                if (next != s->uart_rx_head)
-                    s->uart_rx[s->uart_rx_tail++] = (uint8_t)val;
-                return;
-            }
-            generic_serial_tx(s, (uint8_t)val);
-            return;
-        case 1:
-            if (s->uart_lcr & 0x80) s->uart_dlm = (uint8_t)val;
-            else s->uart_ier = (uint8_t)val;
-            return;
-        case 3: s->uart_lcr = (uint8_t)val; return;
-        case 4: s->uart_mcr = (uint8_t)val; return;
-        case 7: s->uart_scr = (uint8_t)val; return;
-        default: return;                            /* FCR etc. */
-        }
+        ins8250_tick(&s->uart, 1);
+        ins8250_write(&s->uart, port - GENERIC_COM1_PORT, (uint8_t)val);
+        return;
     }
 }
 
@@ -844,7 +624,7 @@ static bool generic_serial_open_tcp(Ia64GenericState *s, const char *host, int p
 /* Parses "stdio" or "tcp:HOST:PORT" and brings the corresponding backend
  * up. Returns false (with a message already printed) on a bad spec. */
 static bool generic_serial_configure(Ia64GenericState *s, const char *spec) {
-    s->uart_lcr = 0x03;   /* 8N1, matches real BIOS/HAL COM1 defaults */
+    s->uart.lcr = 0x03;   /* 8N1, matches real BIOS/HAL COM1 defaults */
     if (strcmp(spec, "stdio") == 0) {
         s->serial_backend = GENERIC_SERIAL_STDIO;
         s->serial_enabled = generic_serial_open_stdio(s);
@@ -897,10 +677,11 @@ static void generic_serial_disable(Ia64GenericState *s) {
 static void generic_serial_poll(Ia64GenericState *s) {
     if (!s->serial_enabled)
         return;
+    ins8250_tick(&s->uart, 1);
     /* While in loopback self-test, RX must reflect only looped-back TX
      * bytes - draining the real transport here too would corrupt the test
      * with whatever the debugger/host happens to send during it. */
-    if (s->uart_mcr & 0x10)
+    if (s->uart.mcr & 0x10)
         return;
     uint8_t buf[64];
     if (s->serial_backend == GENERIC_SERIAL_STDIO) {
@@ -1555,7 +1336,7 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
             /* A level may already be active when NT unmasks/reprograms its
              * redirection entry.  Real I/O SAPIC hardware presents it
              * immediately; the old edge-only model silently discarded it. */
-            if (reg == 0x10 + 14 * 2 && s->ide_irq_asserted)
+            if (reg == 0x10 + 14 * 2 && ide_intrq(&s->ide))
                 generic_raise_irq(s, 14);
         }
         return;
@@ -1978,6 +1759,8 @@ static void generic_report_halt(Ia64GenericState *s) {
 
 Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
     Ia64GenericState *s = calloc(1, sizeof(*s));
+    if (s)
+        generic_uart_init(s);
     if (!s)
         return NULL;
 
@@ -2032,12 +1815,12 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
         s->ide_cfg[0x0B] = 0x01;
         s->ide_cfg[0x0E] = 0x00;
         s->ide_cfg[0x3C] = 14; s->ide_cfg[0x3D] = 1;
-        s->atapi_count = 1;
-        s->atapi_lba_low = 1;
-        s->atapi_lba_mid = 0x14;
-        s->atapi_lba_high = 0xEB;
-        s->atapi_device = 0xA0;
-        s->atapi_status = 0x40;
+        atapi_cdrom_init(&s->cd, &(AtapiCdromConfig){
+            .drive = s->cdrom, .now = generic_now, .ctx = s, .latency = 0,
+            .debug = getenv("IDE_DEBUG") != NULL,
+        });
+        s->ide.dev[0] = &s->cd.ide;
+        ide_reset(&s->ide);
     }
 
     s->serial_listen_fd = GENERIC_INVALID_SOCK;
@@ -2076,7 +1859,7 @@ void ia64_generic_destroy(Ia64GenericState *s) {
     if (s->cpu) merced_destroy(s->cpu);
     /* The drive table owns the drives; just stop them calling back here. */
     gemu_drive_set_change_cb(s->cdrom, NULL, NULL);
-    free(s->atapi_data);
+    atapi_cdrom_free(&s->cd);
     free(s->ram);
     free(s);
 }
