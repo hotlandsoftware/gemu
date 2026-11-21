@@ -35,6 +35,10 @@ void ps2_keyboard_init(Ps2Keyboard *kbd) {
     defaults(kbd);
 }
 
+unsigned ps2_keyboard_room(const Ps2Keyboard *kbd) {
+    return (unsigned)sizeof(kbd->queue) - (unsigned)(kbd->queue_len - kbd->queue_pos);
+}
+
 bool ps2_keyboard_has_data(const Ps2Keyboard *kbd) {
     return kbd->queue_pos < kbd->queue_len;
 }

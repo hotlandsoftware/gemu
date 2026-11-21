@@ -73,17 +73,6 @@ typedef enum {
     GENERIC_SERIAL_TCP,
 } GenericSerialBackend;
 
-#define KBD_ACTION_UP    GEMU_ACTION(0)
-#define KBD_ACTION_DOWN  GEMU_ACTION(1)
-#define KBD_ACTION_ENTER GEMU_ACTION(2)
-#define KBD_FIFO_SIZE 16
-
-static const GemuActionDef generic_kbd_actions[] = {
-    { "Up",    KBD_ACTION_UP,    "Up"     },
-    { "Down",  KBD_ACTION_DOWN,  "Down"   },
-    { "Enter", KBD_ACTION_ENTER, "Return" },
-};
-
 struct Ia64GenericState {
     GemuMonitor   *monitor;
     GemuDisplay   *display;
@@ -103,8 +92,6 @@ struct Ia64GenericState {
     VgaIbm    vga;
     uint32_t  fb[FB_W * FB_H];
 
-    uint8_t  kbd_fifo[KBD_FIFO_SIZE];
-    int      kbd_head, kbd_tail;
 
     uint32_t iosapic_select;
     uint32_t iosapic_redir[48];      /* 24 redirection entries, low/high */
@@ -507,14 +494,6 @@ static void legacy_io_write(Ia64GenericState *s, unsigned port, uint64_t val, un
     }
 }
 
-static void kbd_push(Ia64GenericState *s, uint8_t code) {
-    int next = (s->kbd_tail + 1) % KBD_FIFO_SIZE;
-    if (next == s->kbd_head)
-        return;   /* drop if full */
-    s->kbd_fifo[s->kbd_tail] = code;
-    s->kbd_tail = next;
-}
-
 static void uart_rx_push(Ia64GenericState *s, uint8_t byte) {
     uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
     if (next != s->uart_rx_head)
@@ -522,14 +501,6 @@ static void uart_rx_push(Ia64GenericState *s, uint8_t byte) {
     if (getenv("GENERIC_DEBUG_UARTRX"))
         fprintf(stderr, "generic: uart_rx_push byte=0x%02x head=%u tail=%u\n",
                 byte, s->uart_rx_head, s->uart_rx_tail);
-}
-
-static uint8_t kbd_pop(Ia64GenericState *s) {
-    if (s->kbd_head == s->kbd_tail)
-        return 0;
-    uint8_t code = s->kbd_fifo[s->kbd_head];
-    s->kbd_head = (s->kbd_head + 1) % KBD_FIFO_SIZE;
-    return code;
 }
 
 static void generic_sock_set_nonblocking(generic_sock_t fd) {
@@ -1196,14 +1167,6 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
                     (uint16_t)(0x3B0 + (addr - GENERIC_VGA_IO_BASE) + i)) << (i * 8);
         return v;
     }
-    if (addr >= GENERIC_KBD_IO_BASE && addr + size <= GENERIC_KBD_IO_BASE + GENERIC_KBD_IO_SIZE) {
-        uint32_t off = (uint32_t)(addr - GENERIC_KBD_IO_BASE);
-        if (off == 0)
-            return s->kbd_head != s->kbd_tail;
-        if (off == 4)
-            return kbd_pop(s);
-        return 0;
-    }
     if (addr >= GENERIC_HDD_IO_BASE &&
         addr + size <= GENERIC_HDD_IO_BASE + GENERIC_HDD_IO_SIZE) {
         uint32_t off = (uint32_t)(addr - GENERIC_HDD_IO_BASE);
@@ -1594,23 +1557,14 @@ static GemuMonCmd generic_cmd_calls(GemuMonitor *mon, const char *args, void *ud
 static GemuMonCmd generic_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
     Ia64GenericState *s = ud;
     const char *arg = args;
-    if (s->qemu_firmware) {
-        if (strcmp(arg, "enter") == 0) uart_rx_push(s, '\r');
-        else if (strcmp(arg, "space") == 0) uart_rx_push(s, ' ');
-        else if (strcmp(arg, "escape") == 0) uart_rx_push(s, 0x1b);
-        else if (arg[0] != '\0' && arg[1] == '\0')
-            uart_rx_push(s, (uint8_t)arg[0]);
-        else
-            gemu_monitor_printf(mon, "usage: key <character|space|enter|escape>\n");
-    } else if (strcmp(arg, "up") == 0) {
-        kbd_push(s, GENERIC_KBD_KEY_UP);
-    } else if (strcmp(arg, "down") == 0) {
-        kbd_push(s, GENERIC_KBD_KEY_DOWN);
-    } else if (strcmp(arg, "enter") == 0) {
-        kbd_push(s, GENERIC_KBD_KEY_ENTER);
-    } else {
-        gemu_monitor_printf(mon, "usage: key <up|down|enter>\n");
-    }
+    /* The console is COM1 (see the run loop's raw-key feed). */
+    if (strcmp(arg, "enter") == 0) uart_rx_push(s, '\r');
+    else if (strcmp(arg, "space") == 0) uart_rx_push(s, ' ');
+    else if (strcmp(arg, "escape") == 0) uart_rx_push(s, 0x1b);
+    else if (arg[0] != '\0' && arg[1] == '\0')
+        uart_rx_push(s, (uint8_t)arg[0]);
+    else
+        gemu_monitor_printf(mon, "usage: key <character|space|enter|escape>\n");
     return GEMU_MON_NONE;
 }
 
@@ -1838,8 +1792,6 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
             .scale = cfg->display_scale,
             .ini_section = "generic",
             .no_menu = cfg->menu_disabled,
-            .actions = generic_kbd_actions,
-            .n_actions = (int)(sizeof generic_kbd_actions / sizeof *generic_kbd_actions),
         };
         s->display = gemu_display_create(cfg->display_type, &dc);
         if (!s->display) {
@@ -1960,24 +1912,13 @@ void ia64_generic_run(Ia64GenericState *s, const GenericConfig *cfg) {
 
         if (s->display) {
             gemu_display_poll(s->display);
-            uint32_t pressed = gemu_display_last_pressed(s->display);
-            if (pressed & KBD_ACTION_UP) kbd_push(s, GENERIC_KBD_KEY_UP);
-            if (pressed & KBD_ACTION_DOWN) kbd_push(s, GENERIC_KBD_KEY_DOWN);
-            if (pressed & KBD_ACTION_ENTER) kbd_push(s, GENERIC_KBD_KEY_ENTER);
-            if (s->qemu_firmware) {
-                /* This firmware's ConIn is its own UART (GENERIC_QEMU_UART_BASE),
-                 * not our custom kbd controller - feed the display's raw
-                 * Unicode key queue into the same UART RX ring COM1 uses,
-                 * so real typing (and Delete/Escape for the boot hotkey
-                 * window, both already mapped by the raw queue) reaches it. */
-                uint32_t cp;
-                while ((cp = gemu_display_pop_raw_key(s->display)) != 0) {
-                    if (cp <= 0x7F) {
-                        uint8_t next = (uint8_t)(s->uart_rx_tail + 1);
-                        if (next != s->uart_rx_head)
-                            s->uart_rx[s->uart_rx_tail++] = (uint8_t)cp;
-                    }
-                }
+            /* The console is COM1 (the firmware's UART at
+             * GENERIC_QEMU_UART_BASE is the same port): the window's typing,
+             * Delete and Escape included, goes into its receive queue. */
+            uint32_t cp;
+            while ((cp = gemu_display_pop_raw_key(s->display)) != 0) {
+                if (cp <= 0x7F)
+                    uart_rx_push(s, (uint8_t)cp);
             }
             gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor) || s->halted);
             generic_render_frame(s);

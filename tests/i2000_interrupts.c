@@ -59,6 +59,13 @@ static void route_gsi(Ia64I2000State *s, unsigned gsi, uint32_t rte) {
     bus_write(s, I460GX_IOSAPIC_BASE + 0x10, rte, 4);
 }
 
+/* Monitor keys are paced in guest time (one tap per 20 ms): let the clock
+ * move on before each, as the tests type faster than that. */
+static void type_key(Ia64I2000State *s, uint32_t keysym) {
+    s->cpu->time_base += I2000_ITC_HZ;
+    i2000_type_key(s, keysym);
+}
+
 /* 8042. */
 static bool kbc_output_full(Ia64I2000State *s) { return io_port_read(s, 0x64, 1) & 1; }
 static uint8_t kbc_read_command_byte(Ia64I2000State *s) {
@@ -416,7 +423,7 @@ static void test_os_mask(void) {
 static void test_keyboard(void) {
     Ia64I2000State *s = machine();
     route_gsi(s, 1, 0x80);
-    i2000_type_key(s, 'a');            /* make + break scancodes */
+    type_key(s, 'a');            /* make + break scancodes */
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x80) && !irq(s, 0));
     merced_ack_external(s->cpu, 0x80);
@@ -433,7 +440,7 @@ static void test_keyboard(void) {
     CHECK(!irq(s, 0x80) && !irq(s, 0));
     io_port_write(s, 0x21, 0xf8, 1);   /* PIC IRQ1 open, as Windows leaves it */
     route_gsi(s, 1, 0x80 | I460GX_IOSAPIC_RTE_MASK);
-    i2000_type_key(s, 'b');
+    type_key(s, 'b');
     s->cpu->ninsts += 1000000;
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x80) && !irq(s, 0)); /* masked OS vector: no fallback */
@@ -443,20 +450,21 @@ static void test_keyboard(void) {
     /* Function keys (Setup's F8=I agree) reach the 8042 as set-1 codes. */
     while (kbc_output_full(s))
         io_port_read(s, 0x60, 1);
-    i2000_type_key(s, 0xffc5);         /* F8 */
+    type_key(s, 0xffc5);         /* F8 */
     CHECK(io_port_read(s, 0x60, 1) == 0x42 && io_port_read(s, 0x60, 1) == 0xC2);
-    i2000_type_key(s, 0xffc9);         /* F12 */
+    type_key(s, 0xffc9);         /* F12 */
     CHECK(io_port_read(s, 0x60, 1) == 0x58 && io_port_read(s, 0x60, 1) == 0xD8);
     /* Modifiers are real held keys: Setup's Shift+F10 opens a console. */
+    s->cpu->time_base += I2000_ITC_HZ;
     CHECK(i2000_send_combo(s, "shift-f10"));
     CHECK(io_port_read(s, 0x60, 1) == 0x2A && io_port_read(s, 0x60, 1) == 0x44 &&
           io_port_read(s, 0x60, 1) == 0xC4 && io_port_read(s, 0x60, 1) == 0xAA);
-    i2000_type_key(s, 0xffe4);         /* Right Ctrl */
+    type_key(s, 0xffe4);         /* Right Ctrl */
     CHECK(io_port_read(s, 0x60, 1) == 0xE0 && io_port_read(s, 0x60, 1) == 0x1D &&
           io_port_read(s, 0x60, 1) == 0xE0 && io_port_read(s, 0x60, 1) == 0x9D);
     /* An edge raised before a save is not raised again after the load, in
      * a board that never saw it; the next byte still gets its own edge. */
-    i2000_type_key(s, 'b');
+    type_key(s, 'b');
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x80));
     CHECK(i2000_save_snapshot(s, "kbd.vmstate"));
@@ -493,7 +501,7 @@ static void test_mouse(void) {
     merced_ack_external(s->cpu, 0x90);
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x90));              /* acceptance is not a new edge */
-    i2000_type_key(s, 'a');            /* queued behind the aux bytes */
+    type_key(s, 'a');            /* queued behind the aux bytes */
     CHECK(io_port_read(s, 0x60, 1) == 0xfa);
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x90));               /* next aux byte: fresh edge */
@@ -511,6 +519,61 @@ static void test_mouse(void) {
     s->cpu->ninsts += 1000000;
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x90) && !irq(s, 0)); /* masked OS vector: no fallback */
+    ia64_i2000_destroy(s);
+}
+/* Monitor text longer than the PS/2 keyboard's 64-byte queue: every key
+ * arrives, fed in as the guest drains the queue, one per 20 ms. */
+static void test_key_backlog(void) {
+    Ia64I2000State *s = machine();
+    while (kbc_output_full(s)) io_port_read(s, 0x60, 1);
+    const char *text = "abcdefghijklmnopqrstuvwxyz";
+    for (unsigned i = 0; i < 100; i++) i2000_type_key(s, (uint8_t)text[i % 26]);
+    unsigned makes = 0, polls = 0;
+    while (polls < 2000) {
+        if (kbc_output_full(s)) {
+            if (!(io_port_read(s, 0x60, 1) & 0x80)) makes++;
+        } else {
+            s->cpu->time_base += I2000_ITC_HZ / 50;
+            i2000_poll_interrupts(s);
+            polls++;
+            if (!kbc_output_full(s)) break;
+        }
+    }
+    CHECK(makes == 100);
+    ia64_i2000_destroy(s);
+}
+/* Monitor mouse events wait their turn: a press and a release sent back to
+ * back are two reports, and a long move is split into <=127-count steps
+ * without the overflow bits. */
+static uint8_t mouse_packet(Ia64I2000State *s, int8_t *dx, int8_t *dy) {
+    i2000_mouse_pace(s);
+    CHECK((io_port_read(s, 0x64, 1) & 0x21) == 0x21);
+    uint8_t flags = (uint8_t)io_port_read(s, 0x60, 1);
+    *dx = (int8_t)io_port_read(s, 0x60, 1);
+    *dy = (int8_t)io_port_read(s, 0x60, 1);
+    return flags;
+}
+static void test_mouse_events(void) {
+    Ia64I2000State *s = machine_with(true);
+    mouse_command(s, 0xf4);
+    CHECK(io_port_read(s, 0x60, 1) == 0xfa);
+    CHECK(i2000_mouse_event(s, 0, 0, true, false));
+    CHECK(i2000_mouse_event(s, 0, 0, false, false));
+    CHECK(i2000_mouse_event(s, 300, -10, false, false));
+    int8_t dx, dy;
+    CHECK(mouse_packet(s, &dx, &dy) == 0x09 && dx == 0 && dy == 0);   /* press */
+    CHECK(mouse_packet(s, &dx, &dy) == 0x08 && dx == 0 && dy == 0);   /* release */
+    CHECK(mouse_packet(s, &dx, &dy) == 0x08 && dx == 127 && dy == 10);
+    CHECK(mouse_packet(s, &dx, &dy) == 0x08 && dx == 127 && dy == 0);
+    CHECK(mouse_packet(s, &dx, &dy) == 0x08 && dx == 46 && dy == 0);
+    i2000_mouse_pace(s);
+    CHECK(!(io_port_read(s, 0x64, 1) & 1));                            /* done */
+    /* A guest reset of the mouse drops what the host hadn't sent. */
+    CHECK(i2000_mouse_event(s, 50, 0, false, false));
+    mouse_command(s, 0xff);
+    for (unsigned i = 0; i < 3; i++) io_port_read(s, 0x60, 1);
+    mouse_command(s, 0xf4);
+    CHECK(io_port_read(s, 0x60, 1) == 0xfa);
     ia64_i2000_destroy(s);
 }
 /* An unsupported version must be rejected from its header, without reading
@@ -628,7 +691,7 @@ static void test_chipset_snapshot(void) {
     CHECK(io_port_read(s, 0xa08, 4) == 3579);
     CHECK(io_port_read(s, 0x1206, 2) == 43);
     CHECK(io_port_read(source, 0x1206, 2) == 42);
-    i2000_type_key(s, 'a');
+    type_key(s, 'a');
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x80) && !irq(source, 0x80));
     ia64_i2000_destroy(s);
@@ -1095,7 +1158,7 @@ static void test_serial(void) {
         io_port_write(s, 0x3F8, '.', 1);
     }
     const char *typed = "dir";
-    for (const char *p = typed; *p; p++) i2000_type_key(s, (uint8_t)*p);
+    for (const char *p = typed; *p; p++) type_key(s, (uint8_t)*p);
     for (const char *p = typed; *p; p++) {
         unsigned polls = 0;
         while (!(io_port_read(s, 0x3FD, 1) & 0x01)) CHECK(++polls < 10);
@@ -1114,6 +1177,8 @@ int main(void) {
     test_chipset_snapshot();
     test_keyboard();
     test_mouse();
+    test_key_backlog();
+    test_mouse_events();
     test_gpio_straps();
     test_pit();
     test_rtc();

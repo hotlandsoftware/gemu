@@ -9,6 +9,7 @@
 #include "serial/ins8250.h"
 #include "storage/ata_disk.h"
 #include "storage/atapi_cdrom.h"
+#include "storage/cmd649.h"
 #include "storage/ide.h"
 #include "timer/i8253.h"
 #include "timer/mc146818.h"
@@ -16,7 +17,9 @@
 #include "rage128.h"
 #include "network/e100.h"
 #include "network/pci_rom.h"
+#include "input/i8042.h"
 #include "input/ps2_keyboard.h"
+#include "input/ps2_mouse.h"
 #include "gemu/gemu_display.h"
 #include "gemu/drive.h"
 #include "gemu/net.h"
@@ -272,10 +275,12 @@ struct Ia64I2000State {
      * interrupt state (i2000_pic_sync()); its INT reaches the processor as
      * an ExtINT, and the INTA cycles are the read of I2000_LEGACY_ACK_ADDR. */
     I8259Pair pic;
-    uint8_t   kbc_command_byte;
-    uint8_t   kbc_pending_write; /* 0=keyboard data, 1=command byte, 2=output port, 3=aux */
-    uint8_t   kbc_out[8];
-    uint8_t   kbc_out_pos, kbc_out_len;
+    /* The IFB's 8042 with ps2_keyboard on its keyboard port and, with
+     * -device mouse, ps2_mouse on its aux port (i2000_kbc_wire()).  Neither
+     * the controller nor the mouse is in the bulk reset below. */
+    I8042     kbc;
+    Ps2Mouse  mouse;
+    uint32_t  mouse_resets_seen;   /* mouse.resets the host side has acted on */
     uint32_t  pci_cfg_addr;
     /* Memory card A's row-0 I2C segment holds one SPD EEPROM per populated
      * socket. The IFB SMBus segment is separate: it carries the processor
@@ -286,7 +291,7 @@ struct Ia64I2000State {
     ItaniumCartRom cart_pirom, cart_scratch;
     Lm87      hardware_monitor;
     uint8_t   ratio_latch;
-    uint8_t   cmd649_cfg[256];
+    Cmd649    cmd649;            /* 00:03.1, owning the two IDE channels */
     /* ide1-cd0 from the drive table (NULL = no drive configured; present
      * but !gemu_drive_inserted() = empty tray).  A pointer replacing the
      * old FILE *. The
@@ -335,20 +340,17 @@ struct Ia64I2000State {
     MmioLogEnt mmio_log[MMIO_LOG_N];
     int        mmio_log_n;
 
-    /* PS/2 mouse (-device mouse), routed through the
-     * existing 8042 aux-device path (kbc_pending_write==3, port 0xD4/0x60)
-     * that was previously always a no-op. Kept in its own queue rather than
-     * sharing kbc_out[] because the 0x60/0x64 write handlers unconditionally
-     * clear kbc_out on every keyboard-channel command, which would wipe an
-     * in-flight mouse ACK/packet. */
+    /* -device mouse: whether ps2_mouse is on the 8042's aux port.  First
+     * field of the bulk reset (i2000_reset()), which keeps it. */
     bool     mouse_enabled;
-    bool     mouse_streaming;
-    uint8_t  aux_out[16];
-    uint8_t  aux_out_pos, aux_out_len;
-    bool     mouse_prev_left, mouse_prev_right;
-    uint8_t  mouse_param_cmd;   /* 0xE8 or 0xF3 awaiting its 1 param byte, 0=none */
-    uint8_t  mouse_resolution, mouse_sample_rate;
-    bool     mouse_scaling_2to1;
+    /* Monitor input waiting for room: keys for the PS/2 keyboard's queue
+     * (keysym | action << 24; 0 tap, 1 press, 2 release) and mouse events
+     * for the next free report (see the run loop). */
+    uint32_t key_backlog[256];
+    uint8_t  key_backlog_head, key_backlog_tail;
+    uint64_t key_next_itc;      /* earliest ITC for the next backlog tap */
+    struct { int16_t dx, dy; bool left, right; } mouse_events[64];
+    uint8_t  mouse_events_head, mouse_events_tail;
     /* Legacy-ExtINT ack disambiguation (see the comment on
      * I2000_LEGACY_ACK_ADDR's read handler): this firmware never touches
      * an I/O SAPIC RTE for the mouse either (confirmed live), so IRQ12
@@ -454,144 +456,60 @@ static int32_t mouse_accumulate_axis(int32_t pending, int delta) {
     return (int32_t)next;
 }
 
-static void aux_queue_byte(Ia64I2000State *s, uint8_t byte) {
-    /* Mirrors kbc_queue_byte(), but for the separate PS/2 aux (mouse)
-     * output buffer - see the field comment on aux_out[] for why this
-     * can't just share kbc_out[]. Unlike the keyboard (which this
-     * firmware polls OBF for, so no interrupt is needed), its mouse
-     * driver is interrupt-driven - confirmed empirically: without this,
-     * queued packets just piled up in aux_out[] forever, never read out,
-     * because the guest was sitting in an interrupt wait that never
-     * fired. This firmware never configures an I/O SAPIC RTE for the
-     * mouse either (same as the PIT/IRQ0 case documented in
-     * i2000_poll_interrupts()) - it stays in legacy-8259-compatible mode
-     * the whole time, so IRQ12 has to be delivered the same way: ExtINT
-     * (vector 0), gated by the slave PIC's IRQ12 mask bit (0x10) and the
-     * master's cascade line (IRQ2, 0x04). */
-    if (s->aux_out_pos) {
-        memmove(s->aux_out, s->aux_out + s->aux_out_pos,
-                s->aux_out_len - s->aux_out_pos);
-        s->aux_out_len -= s->aux_out_pos;
-        s->aux_out_pos = 0;
-    }
-    if (s->aux_out_len < sizeof(s->aux_out))
-        s->aux_out[s->aux_out_len++] = byte;
-    /* Deliberately does NOT raise here. This used to raise unconditionally
-     * on every push, reasoning that merced_raise_external() just OR's a
-     * single shared per-vector bit and is therefore idempotent/harmless to
-     * call redundantly. That's true at the bit level, but it misses a real
-     * race one level up: if a NEW packet arrives (via a fresh host mouse
-     * event) while the guest is still mid-ISR servicing an EARLIER byte -
-     * interrupts briefly re-enabled before that ISR's own cleanup/rfi has
-     * finished, the same "IRQ0 handler's STI immediately re-enter[ing]"
-     * class of risk the ack-arbitration comment below already describes for
-     * PIT - this raise could hand the CPU a second, unwanted ExtINT
-     * delivery right then, clobbering the first invocation's not-yet-
-     * consumed cr.ipsr/cr.iip. Confirmed live: a realistic mouse-movement
-     * test (8 packets, 0.3s apart, at the actual BIOS Configuration Manager
-     * GUI, not just a synthetic burst) corrupted cr.iip to a near-null
-     * 0x180 and halted the guest in a dead loop trying to execute there -
-     * matching the user's own original report of the emulator freezing
-     * entirely on real mouse movement early in boot.
-     *
-     * i2000_poll_interrupts() is the single place that actually raises
-     * vector 0 on mouse's behalf now (both for this fresh-packet case and
-     * for the ack handler's same-packet retry case below), gated on
-     * mouse_retry_ninsts - which this function does NOT touch, so an
-     * in-progress cooldown from the previous packet's drain naturally
-     * carries over and delays this new byte's delivery too. Nothing
-     * "unraises" here even when a cooldown is active: the byte is queued
-     * now, and poll_interrupts will pick it up as soon as it's safe to. */
+/* The 8042's wiring, also after a state load. */
+static void i2000_kbc_wire(Ia64I2000State *s) {
+    s->kbc.kbd = &s->ps2_keyboard;
+    s->kbc.aux = s->mouse_enabled ? &s->mouse : NULL;
 }
 
-/* PS/2 mouse command handler, reached from the 8042's aux-write routing
- * (0x64<-0xD4 then 0x60<-cmd) once a real mouse is attached via
- * -device mouse. Modeled on the standard PS/2 mouse command set - see
- * hardware/machine/mos/machine_um6578.c's um6578_mouse_device_command()
- * for the sibling implementation this was cross-checked against. */
-static void mouse_device_command(Ia64I2000State *s, uint8_t cmd) {
-    if (s->mouse_param_cmd) {
-        /* Second byte of a two-byte command: the value itself. */
-        if (s->mouse_param_cmd == 0xE8)
-            s->mouse_resolution = cmd;
-        else if (s->mouse_param_cmd == 0xF3)
-            s->mouse_sample_rate = cmd;
-        s->mouse_param_cmd = 0;
-        aux_queue_byte(s, 0xFA);
+/* The guest reset the mouse: drop host motion and buttons not yet sent. */
+static void i2000_mouse_check_reset(Ia64I2000State *s) {
+    if (s->mouse.resets == s->mouse_resets_seen)
         return;
+    s->mouse_resets_seen = s->mouse.resets;
+    s->mouse_host_left = s->mouse_host_right = false;
+    s->mouse_accum_dx = s->mouse_accum_dy = 0;
+}
+
+/* Monitor keys go to the PS/2 keyboard as a fast typist would press them:
+ * at most one tap per I2000_KEY_TAP_ITC of guest time, and only when its
+ * queue has room.  Faster than that, Windows' keyboard class driver
+ * (100 events) overflows and drops the rest of a long line.  Presses and
+ * releases of modifiers aren't paced, so a combination stays together. */
+#define I2000_KEY_TAP_ITC (I2000_ITC_HZ / 50)
+static void i2000_kbd_feed(Ia64I2000State *s) {
+    while (s->key_backlog_head != s->key_backlog_tail &&
+           ps2_keyboard_room(&s->ps2_keyboard) >= 12) {
+        uint32_t e = s->key_backlog[s->key_backlog_head];
+        uint32_t keysym = e & 0xFFFFFFu;
+        uint64_t now = merced_get_time_base(s->cpu);
+        if ((e >> 24) == 0 && now < s->key_next_itc)
+            break;
+        s->key_backlog_head++;
+        if (getenv("KEY_DEBUG"))
+            fprintf(stderr, "i2000: key feed %#x action=%u room=%u itc=%" PRIu64
+                    " ninsts=%" PRIu64 "\n", keysym, e >> 24,
+                    ps2_keyboard_room(&s->ps2_keyboard), now, s->cpu->ninsts);
+        switch (e >> 24) {
+        case 1: ps2_keyboard_key(&s->ps2_keyboard, keysym, true); break;
+        case 2: ps2_keyboard_key(&s->ps2_keyboard, keysym, false); break;
+        default:
+            ps2_keyboard_tap(&s->ps2_keyboard, keysym);
+            s->key_next_itc = now + I2000_KEY_TAP_ITC;
+            break;
+        }
     }
-    switch (cmd) {
-    case 0xFF: /* reset */
-        aux_queue_byte(s, 0xFA);
-        aux_queue_byte(s, 0xAA);
-        aux_queue_byte(s, 0x00);
-        s->mouse_streaming = false;
-        s->mouse_resolution = 2;
-        s->mouse_sample_rate = 100;
-        s->mouse_scaling_2to1 = false;
-        s->mouse_prev_left = s->mouse_prev_right = false;
-        s->mouse_host_left = s->mouse_host_right = false;
-        s->mouse_accum_dx = s->mouse_accum_dy = 0;
-        break;
-    case 0xF6: /* set defaults */
-        aux_queue_byte(s, 0xFA);
-        s->mouse_streaming = false;
-        s->mouse_resolution = 2;
-        s->mouse_sample_rate = 100;
-        s->mouse_scaling_2to1 = false;
-        break;
-    case 0xF4: /* enable data reporting */
-        aux_queue_byte(s, 0xFA);
-        s->mouse_streaming = true;
-        break;
-    case 0xF5: /* disable data reporting */
-        aux_queue_byte(s, 0xFA);
-        s->mouse_streaming = false;
-        break;
-    case 0xE6: /* set scaling 1:1 */
-        aux_queue_byte(s, 0xFA);
-        s->mouse_scaling_2to1 = false;
-        break;
-    case 0xE7: /* set scaling 2:1 */
-        aux_queue_byte(s, 0xFA);
-        s->mouse_scaling_2to1 = true;
-        break;
-    case 0xE8: /* set resolution: one param byte follows */
-        aux_queue_byte(s, 0xFA);
-        s->mouse_param_cmd = 0xE8;
-        break;
-    case 0xF3: /* set sample rate: one param byte follows */
-        aux_queue_byte(s, 0xFA);
-        s->mouse_param_cmd = 0xF3;
-        break;
-    case 0xF2: /* get device ID */
-        aux_queue_byte(s, 0xFA);
-        aux_queue_byte(s, 0x00); /* standard PS/2 mouse, no wheel */
-        break;
-    case 0xE9: /* status request */
-        aux_queue_byte(s, 0xFA);
-        aux_queue_byte(s, (uint8_t)((s->mouse_scaling_2to1 ? 0x10 : 0) |
-                                     (s->mouse_streaming ? 0x20 : 0) |
-                                     (s->mouse_prev_left ? 0x01 : 0) |
-                                     (s->mouse_prev_right ? 0x04 : 0)));
-        aux_queue_byte(s, s->mouse_resolution);
-        aux_queue_byte(s, s->mouse_sample_rate);
-        break;
-    case 0xEB: /* read data (remote/poll mode): ACK + one packet, all-zero
-                * delta since this stub doesn't track a separate polled
-                * sample - streaming mode is what actually drives the
-                * cursor and is what every BIOS/OS driver uses in practice. */
-        aux_queue_byte(s, 0xFA);
-        aux_queue_byte(s, (uint8_t)(0x08 | (s->mouse_prev_left ? 0x01 : 0) |
-                                     (s->mouse_prev_right ? 0x02 : 0)));
-        aux_queue_byte(s, 0x00);
-        aux_queue_byte(s, 0x00);
-        break;
-    default: /* forgiving default: ACK anything unrecognized rather than
-              * wedge the guest's init state machine on a vendor probe. */
-        aux_queue_byte(s, 0xFA);
-        break;
+}
+static void i2000_kbd_queue(Ia64I2000State *s, uint32_t keysym, unsigned action) {
+    uint8_t next = (uint8_t)(s->key_backlog_tail + 1);
+    if (next == s->key_backlog_head) {
+        if (getenv("KEY_DEBUG"))
+            fprintf(stderr, "i2000: key backlog full, dropped %#x\n", keysym);
+        return;                             /* 255 waiting: drop */
     }
+    s->key_backlog[s->key_backlog_tail] = (keysym & 0xFFFFFFu) | (uint32_t)action << 24;
+    s->key_backlog_tail = next;
+    i2000_kbd_feed(s);
 }
 
 /* The system timer's output is IRQ0: each rising edge of channel 0 latches
@@ -683,6 +601,10 @@ static void i2000_ide_wire(Ia64I2000State *s) {
     atapi_cdrom_rewire(&s->cd, &cd_cfg);
     s->ide_secondary.dev[0] = &s->cd.ide;
     s->ide_secondary.dev[1] = NULL;
+    /* The primary channel exists only with a disk on it; without one its
+     * ports are left to the floating-bus answers in io_port_read(). */
+    s->cmd649.channel[0] = s->hda ? &s->ide_primary : NULL;
+    s->cmd649.channel[1] = &s->ide_secondary;
 }
 
 /* Whether the 8259 pair would pass legacy ISA IRQ n to the CPU: its own
@@ -740,27 +662,6 @@ static void ata_deliver_irq(Ia64I2000State *s) {
     }
 }
 
-/* PCI IDE has four task-file/control I/O windows and one 16-byte bus-master
- * window. Preserve their hardwired type/alignment bits on byte and dword
- * accesses, including the all-ones sizing probe used by EFI and the OS. */
-static uint8_t cmd649_cfg_read8(Ia64I2000State *s, unsigned reg) {
-    if (reg >= 0x24 && reg < 0x28)
-        return 0; /* BAR5 is unimplemented. */
-    if (reg >= 0x10 && reg < 0x24) {
-        static const uint32_t masks[5] = {
-            UINT32_C(0xfffffff8), UINT32_C(0xfffffffc),
-            UINT32_C(0xfffffff8), UINT32_C(0xfffffffc),
-            UINT32_C(0xfffffff0),
-        };
-        unsigned bar = (reg - 0x10) / 4;
-        uint32_t value;
-        memcpy(&value, &s->cmd649_cfg[0x10 + bar * 4], sizeof(value));
-        value = (value & masks[bar]) | 1;
-        return (uint8_t)(value >> ((reg & 3) * 8));
-    }
-    return s->cmd649_cfg[reg];
-}
-
 static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     uint32_t a = s->pci_cfg_addr;
     if (!(a & 0x80000000u) || lane + size > 4)
@@ -779,18 +680,8 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
         return e100_cfg_read(&s->nic, reg, size);
     }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
-        reg + size <= sizeof(s->cmd649_cfg)) {
-        uint64_t v = 0;
-        for (unsigned i = 0; i < size; i++)
-            v |= (uint64_t)cmd649_cfg_read8(s, reg + i) << (i * 8);
-        if (atapi_debug_enabled() && reg < 4) {
-            static unsigned identity_reads;
-            if (identity_reads++ < 16)
-                fprintf(stderr, "i2000: ATAPI controller PCI identity read "
-                        "reg=%#x size=%u -> %#" PRIx64 "\n", reg, size, v);
-        }
-        return v;
-    }
+        reg + size <= sizeof(s->cmd649.cfg))
+        return cmd649_cfg_read(&s->cmd649, reg, size);
 
     uint64_t value;
     if (i460gx_pci_read(&s->chipset, bus, dev, fun, reg, size, &value))
@@ -829,19 +720,8 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
         return;
     }
     if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
-        reg + size <= sizeof(s->cmd649_cfg)) {
-        /* Identity, revision/class and header type are read-only.  BAR
-         * address bits are writable, but their type/alignment bits are not. */
-        for (unsigned i = 0; i < size; i++) {
-            unsigned off = reg + i;
-            if (off >= 0x24 && off < 0x28)
-                continue;
-            if (off >= 4 && !(off >= 8 && off < 16)) {
-                s->cmd649_cfg[off] = (uint8_t)(val >> (i * 8));
-                if (off >= 0x10 && off < 0x24)
-                    s->cmd649_cfg[off] = cmd649_cfg_read8(s, off);
-            }
-        }
+        reg + size <= sizeof(s->cmd649.cfg)) {
+        cmd649_cfg_write(&s->cmd649, reg, size, (uint32_t)val);
         return;
     }
     if (i460gx_pci_write(&s->chipset, bus, dev, fun, reg, val, size))
@@ -1101,64 +981,20 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
          * a new one if another byte is waiting. */
         s->keyboard_gsi_asserted = false;
         s->mouse_gsi_asserted = false;
-        /* A real 8042 has one ordered output buffer.  Our keyboard and aux
-         * queues are separate, so preserve a mouse packet already exposed
-         * through AUX/IRQ12: letting a later keyboard/controller byte jump
-         * ahead here substitutes it for a packet byte and destroys PS/2
-         * framing (random X/Y sign reversals are the visible result). */
-        if (s->aux_out_pos >= s->aux_out_len &&
-            s->kbc_out_pos < s->kbc_out_len) {
-            uint8_t v = s->kbc_out[s->kbc_out_pos++];
-            if (s->kbc_out_pos == s->kbc_out_len)
-                s->kbc_out_pos = s->kbc_out_len = 0;
-            return v;
-        }
-        if (s->aux_out_pos >= s->aux_out_len &&
-            ps2_keyboard_has_data(&s->ps2_keyboard))
-            return ps2_keyboard_read(&s->ps2_keyboard);
-        if (s->aux_out_pos < s->aux_out_len) {
-            uint8_t v = s->aux_out[s->aux_out_pos++];
-            if (getenv("MOUSE_DEBUG"))
-                fprintf(stderr, "MOUSE_DEBUG: port60 read popped %02x "
-                        "pos=%u len=%u ninsts=%" PRIu64 "\n", v,
-                        s->aux_out_pos, s->aux_out_len, s->cpu->ninsts);
-            if (s->aux_out_pos == s->aux_out_len)
-                s->aux_out_pos = s->aux_out_len = 0;
-            /* Do NOT re-raise here. This firmware's ISR reads port 0x60
-             * BEFORE the legacy-ack address, all within the same dispatch
-             * cycle - a re-raise issued right here gets immediately
-             * consumed by that same cycle's own ack read (which
-             * unconditionally clears mouse_irq_pending), never surviving
-             * long enough to trigger a fresh ExtINT for the next byte.
-             * Confirmed live: aux_out kept growing to its 16-byte cap with
-             * aux_out_pos stuck at 0/1 forever under a rapid packet burst,
-             * because each "re-raise" here was cancelled microseconds
-             * later by the same ISR entry's own ack read. The level-
-             * triggered re-fire instead happens in the ack handler below,
-             * which runs *after* this read and can see whether data still
-             * remains. */
-            return v;
-        }
-        return 0;
+        uint8_t v = i8042_read_data(&s->kbc);
+        if (getenv("MOUSE_DEBUG"))
+            fprintf(stderr, "MOUSE_DEBUG: port60 read -> %02x ninsts=%" PRIu64 "\n",
+                    v, s->cpu->ninsts);
+        /* No re-raise here for a remaining mouse byte: the firmware's ISR
+         * reads 60h before its legacy acknowledge, which would cancel it.
+         * The acknowledge handler schedules the next byte's interrupt. */
+        return v;
     }
     if (port == 0x64 && size == 1) {               /* 8042 status */
-        /* Commands are consumed synchronously, so IBF (bit 1) is clear.
-         * OBF reflects queued controller/keyboard response bytes; bit 5
-         * (0x20) tells the firmware the byte port 0x60 will return next
-         * came from the aux/mouse device rather than the keyboard - only
-         * meaningful once a byte is actually queued there, so this is
-         * automatically inert when no mouse is attached (aux_out_len can
-         * never become nonzero without -device mouse). Keyboard bytes win
-         * priority when both queues happen to be nonempty. */
-        bool aux_next = s->aux_out_pos < s->aux_out_len;
-        uint8_t st64 = ((s->kbc_out_len || s->aux_out_len ||
-                         ps2_keyboard_has_data(&s->ps2_keyboard)) ? 0x01 : 0) |
-                       (aux_next ? 0x20 : 0) | 0x04; /* system flag */
+        uint8_t st64 = i8042_read_status(&s->kbc);
         if (getenv("MOUSE_DEBUG"))
-            fprintf(stderr, "MOUSE_DEBUG: port64 status read -> %02x "
-                    "kbc_len=%u aux_len=%u aux_pos=%u ninsts=%" PRIu64 "\n",
-                    st64, s->kbc_out_len, s->aux_out_len, s->aux_out_pos,
-                    s->cpu->ninsts);
+            fprintf(stderr, "MOUSE_DEBUG: port64 status read -> %02x ninsts=%"
+                    PRIu64 "\n", st64, s->cpu->ninsts);
         return st64;
     }
     if (port >= 0x70 && port <= 0x77 && size == 1) {
@@ -1191,16 +1027,13 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     }
     if (port == 0x61 && size == 1)
         return i2000_port61_read(s);
-    if ((port >= 0x170 && port <= 0x177) || port == 0x376)
-        return ide_read(&s->ide_secondary,
-                        port == 0x376 ? 8 : (unsigned)(port - 0x170), size);
-    if (s->hda && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
-        unsigned reg = port == 0x3F6 ? 8 : (unsigned)(port - 0x1F0);
-        /* A ready interrupt reaches the PIC/SAPIC before the Status read
-         * that acknowledges it can lower INTRQ. */
-        if (reg >= 7)
+    unsigned ide_ch, ide_reg;
+    if (port <= 0xFFFF && cmd649_decode(&s->cmd649, (uint16_t)port, &ide_ch, &ide_reg)) {
+        /* A ready disk interrupt reaches the PIC/SAPIC before the Status
+         * read that acknowledges it can lower INTRQ. */
+        if (ide_ch == 0 && ide_reg >= 7)
             ata_deliver_irq(s);
-        return ide_read(&s->ide_primary, reg, size);
+        return ide_read(s->cmd649.channel[ide_ch], ide_reg, size);
     }
     /* CMD-649 primary/secondary channels, with no ATA devices attached.
      * A floating ATA bus reports status zero; returning the generic unmapped
@@ -1257,53 +1090,12 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         return;
     }
     if (port == 0x64 && size == 1) {               /* 8042 command */
-        uint8_t cmd = (uint8_t)val;
-        s->kbc_out_pos = s->kbc_out_len = 0;
-        switch (cmd) {
-        case 0x20: /* read command byte */
-            s->kbc_out[0] = s->kbc_command_byte;
-            s->kbc_out_len = 1;
-            break;
-        case 0x60: s->kbc_pending_write = 1; break;
-        case 0xAA: /* controller self-test */
-            s->kbc_out[0] = 0x55; s->kbc_out_len = 1;
-            break;
-        case 0xAB: /* keyboard interface test */
-            s->kbc_out[0] = 0x00; s->kbc_out_len = 1;
-            break;
-        case 0xA9: /* auxiliary interface test */
-            s->kbc_out[0] = s->mouse_enabled ? 0x00 : 0x01;
-            s->kbc_out_len = 1;
-            break;
-        case 0xAD: s->kbc_command_byte |= 0x10; break;
-        case 0xAE: s->kbc_command_byte &= (uint8_t)~0x10; break;
-        case 0xA7: s->kbc_command_byte |= 0x20; break;
-        case 0xA8: s->kbc_command_byte &= (uint8_t)~0x20; break;
-        case 0xD0: /* read output port: reset deasserted, A20 enabled */
-            s->kbc_out[0] = 0x03; s->kbc_out_len = 1;
-            break;
-        case 0xD1: s->kbc_pending_write = 2; break;
-        case 0xD4: s->kbc_pending_write = 3; break;
-        default: break;
-        }
+        i8042_write_command(&s->kbc, (uint8_t)val);
         return;
     }
     if (port == 0x60 && size == 1) {               /* 8042/keyboard data */
-        uint8_t data = (uint8_t)val;
-        s->kbc_out_pos = s->kbc_out_len = 0;
-        if (s->kbc_pending_write == 1) {
-            s->kbc_command_byte = data;
-        } else if (s->kbc_pending_write == 3) {
-            /* 0xD4-routed byte: forward to the real PS/2 mouse command
-             * handler if -device mouse attached one; otherwise consume the
-             * byte but leave OBF clear so the firmware's mouse probe times
-             * out and does not instantiate a phantom mouse driver. */
-            if (s->mouse_enabled)
-                mouse_device_command(s, data);
-        } else if (s->kbc_pending_write == 0) {
-            ps2_keyboard_command(&s->ps2_keyboard, data);
-        }
-        s->kbc_pending_write = 0;
+        i8042_write_data(&s->kbc, (uint8_t)val);
+        i2000_mouse_check_reset(s);
         return;
     }
     if (port >= 0x70 && port <= 0x77 && size == 1) {
@@ -1343,16 +1135,8 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         i2000_port61_write(s, (uint8_t)val);
         return;
     }
-    if ((port >= 0x170 && port <= 0x177) || port == 0x376) {
-        ide_write(&s->ide_secondary, port == 0x376 ? 8 : (unsigned)(port - 0x170),
-                  val, size);
+    if (port <= 0xFFFF && cmd649_io_write(&s->cmd649, (uint16_t)port, size, val))
         return;
-    }
-    if (s->hda && ((port >= 0x1F0 && port <= 0x1F7) || port == 0x3F6)) {
-        ide_write(&s->ide_primary, port == 0x3F6 ? 8 : (unsigned)(port - 0x1F0),
-                  val, size);
-        return;
-    }
     if (port >= COM1_PORT && port < COM1_PORT + 8) {
         ins8250_tick(&s->uart, 1);
         ins8250_write(&s->uart, (unsigned)(port - COM1_PORT), (uint8_t)val);
@@ -1676,7 +1460,7 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
              * own known-safe 100000-instruction tick granularity. */
             s->mouse_wait_rfi_generation = merced_rfi_generation() + 1;
             s->mouse_retry_ninsts = UINT64_MAX;
-            if (s->aux_out_pos >= s->aux_out_len) {
+            if (!i8042_aux_pending(&s->kbc)) {
                 s->mouse_irq_pending = false;
             }
             break;
@@ -2437,7 +2221,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 45u   /* the CD-ROM as an AtapiCdrom */
+#define I2000_SNAPSHOT_VERSION 47u   /* the 8042 and mouse as devices */
 
 /* Version 40 ends Rage128 just before cce. Its following machine fields
  * keep their relative layout because the inserted state is 8-byte aligned. */
@@ -2480,6 +2264,9 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     memset(&snap->cd.cfg, 0, sizeof(snap->cd.cfg));
     memset(&snap->cd.ide, 0, sizeof(snap->cd.ide));
     memset(snap->ide_secondary.dev, 0, sizeof(snap->ide_secondary.dev));
+    memset(snap->cmd649.channel, 0, sizeof(snap->cmd649.channel));
+    snap->kbc.kbd = NULL;
+    snap->kbc.aux = NULL;
     snap->hda = NULL;
     memset(&snap->hd.cfg, 0, sizeof(snap->hd.cfg));
     memset(&snap->hd.ide, 0, sizeof(snap->hd.ide));
@@ -2647,6 +2434,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->pit.out_changed = i2000_pit_out;
         s->pit.ud = s;
         i2000_uart_wire(s);
+        i2000_kbc_wire(s);
         s->pit_itc_mark = merced_get_time_base(s->cpu);
     }
     free(loaded_cpu);
@@ -2719,11 +2507,15 @@ static bool i2000_mon_write(void *ud, uint64_t addr, uint8_t val) {
 static GemuMonCmd i2000_cmd_input(GemuMonitor *mon, const char *args, void *ud) {
     Ia64I2000State *s = ud;
     (void)args;
+    gemu_monitor_printf(mon, "key backlog: %u waiting, next tap at itc %" PRIu64
+           " (now %" PRIu64 ")\n",
+           (unsigned)(uint8_t)(s->key_backlog_tail - s->key_backlog_head),
+           s->key_next_itc, merced_get_time_base(s->cpu));
     gemu_monitor_printf(mon, "8042: command=%02X out=%u/%u aux=%u/%u "
            "kbd=%u/%u irq1=%u retry=%" PRIu64 " ninsts=%" PRIu64 "\n",
-           s->kbc_command_byte,
-           s->kbc_out_pos, s->kbc_out_len,
-           s->aux_out_pos, s->aux_out_len,
+           s->kbc.command_byte,
+           s->kbc.out_pos, s->kbc.out_len,
+           s->mouse.out_pos, s->mouse.out_len,
            s->ps2_keyboard.queue_pos, s->ps2_keyboard.queue_len,
            s->keyboard_irq_pending, s->keyboard_retry_ninsts,
            s->cpu->ninsts);
@@ -2755,7 +2547,7 @@ static void i2000_type_key(Ia64I2000State *s, uint32_t keysym) {
     } else {
         i2000_efi_bios_ext_key(s, keysym);
     }
-    ps2_keyboard_tap(&s->ps2_keyboard, keysym);
+    i2000_kbd_queue(s, keysym, 0);
 }
 
 /* QEMU key names (sendkey), as X11 keysyms or ASCII. */
@@ -2817,10 +2609,10 @@ static bool i2000_send_combo(Ia64I2000State *s, const char *tok) {
     if (!key)
         return false;
     for (unsigned i = 0; i < nmods; i++)
-        ps2_keyboard_key(&s->ps2_keyboard, mods[i], true);
-    ps2_keyboard_tap(&s->ps2_keyboard, key);
+        i2000_kbd_queue(s, mods[i], 1);
+    i2000_kbd_queue(s, key, 0);
     for (unsigned i = nmods; i-- > 0; )
-        ps2_keyboard_key(&s->ps2_keyboard, mods[i], false);
+        i2000_kbd_queue(s, mods[i], 2);
     return true;
 }
 
@@ -2959,17 +2751,69 @@ static GemuMonCmd i2000_cmd_mousestate(GemuMonitor *mon, const char *args,
             "mouse_accum=(%d,%d) mouse_resolution=%u "
             "mouse_sample_rate=%u kbc_out_len=%u "
             "kbc_pending_write=%u\n",
-            s->mouse_enabled, s->mouse_streaming, s->kbc_command_byte,
-            s->aux_out_len, s->aux_out_pos, s->mouse_param_cmd,
-            s->mouse_prev_left, s->mouse_prev_right,
-            s->mouse_accum_dx, s->mouse_accum_dy, s->mouse_resolution,
-            s->mouse_sample_rate, s->kbc_out_len, s->kbc_pending_write);
+            s->mouse_enabled, s->mouse.streaming, s->kbc.command_byte,
+            s->mouse.out_len, s->mouse.out_pos, s->mouse.param_cmd,
+            s->mouse.left, s->mouse.right,
+            s->mouse_accum_dx, s->mouse_accum_dy, s->mouse.resolution,
+            s->mouse.sample_rate, s->kbc.out_len, s->kbc.pending_write);
     fprintf(stderr, "i2000: iosapic_rte[12]=%016" PRIX64 " masked=%d "
             "pic_master_mask=%02x pic_slave_mask=%02x\n",
             s->chipset.iosapic_rte[12], !!(s->chipset.iosapic_rte[12] & I460GX_IOSAPIC_RTE_MASK),
             s->pic.master.imr, s->pic.slave.imr);
     fflush(stderr);
     return GEMU_MON_NONE;
+}
+
+/* Send the next mouse report when the last one has been taken: host motion
+ * from the accumulator (in <=127-count steps), or the next monitor event. */
+static void i2000_mouse_pace(Ia64I2000State *s) {
+    /* Only one PS/2 report is in flight at a time.  Motion that
+     * arrives meanwhile stays in the bounded accumulator above, and
+     * is drained in <=127-count chunks after the real PIC EOI
+     * handshake completes. */
+    bool ready = s->mouse.streaming && i8042_empty(&s->kbc) &&
+                 s->mouse_wait_rfi_generation == 0 &&
+                 s->cpu->ninsts >= s->mouse_retry_ninsts &&
+                 (int64_t)(merced_get_time_base(s->cpu) -
+                           s->mouse_next_report_itc) >= 0;
+    bool idle = !s->mouse_accum_dx && !s->mouse_accum_dy &&
+                s->mouse_host_left == s->mouse.left &&
+                s->mouse_host_right == s->mouse.right;
+    if (ready && idle && s->mouse_events_head != s->mouse_events_tail) {
+        /* The next monitor mousemove event; its y is screen-down. */
+        unsigned e = s->mouse_events_head;
+        s->mouse_events_head = (uint8_t)((e + 1) % 64);
+        s->mouse_accum_dx = s->mouse_events[e].dx;
+        s->mouse_accum_dy = -s->mouse_events[e].dy;
+        s->mouse_host_left = s->mouse_events[e].left;
+        s->mouse_host_right = s->mouse_events[e].right;
+        idle = false;
+    }
+    if (ready && !idle) {
+        int cdx = s->mouse_accum_dx < -127 ? -127 :
+                  s->mouse_accum_dx > 127 ? 127 : s->mouse_accum_dx;
+        int cdy = s->mouse_accum_dy < -127 ? -127 :
+                  s->mouse_accum_dy > 127 ? 127 : s->mouse_accum_dy;
+        ps2_mouse_report(&s->mouse, cdx, cdy, s->mouse_host_left,
+                         s->mouse_host_right, NULL, NULL);
+        s->mouse_accum_dx -= cdx;
+        s->mouse_accum_dy -= cdy;
+    }
+}
+
+/* A monitor mousemove event (dy screen-down); false if 63 are waiting. */
+static bool i2000_mouse_event(Ia64I2000State *s, int dx, int dy, bool left, bool right) {
+    uint8_t next = (uint8_t)((s->mouse_events_tail + 1) % 64);
+    if (next == s->mouse_events_head)
+        return false;
+    dx = dx < -32767 ? -32767 : dx > 32767 ? 32767 : dx;
+    dy = dy < -32767 ? -32767 : dy > 32767 ? 32767 : dy;
+    s->mouse_events[s->mouse_events_tail].dx = (int16_t)dx;
+    s->mouse_events[s->mouse_events_tail].dy = (int16_t)dy;
+    s->mouse_events[s->mouse_events_tail].left = left;
+    s->mouse_events[s->mouse_events_tail].right = right;
+    s->mouse_events_tail = next;
+    return true;
 }
 
 /* monitor "mousemove DX DY [left|right]" */
@@ -2982,45 +2826,21 @@ static GemuMonCmd i2000_cmd_mousemove(GemuMonitor *mon, const char *args,
         gemu_monitor_printf(mon, "usage: mousemove <dx> <dy> [left] [right]\n");
         return GEMU_MON_NONE;
     }
-    /* Synthetic PS/2 packet injection for headless testing - see
-     * um6578's own "mousemove"/"mouse" monitor commands for the
-     * sibling feature. Goes through the exact same aux_queue_byte()/
-     * ExtINT path a real host mouse event would, so this exercises
-     * the full pipeline (packet build, IRQ delivery, ack) without
-     * needing a live display. */
+    /* Synthetic mouse input for headless testing.  Each event waits its
+     * turn behind the report in flight and goes out through the same
+     * pacing as the window's pointer (see the run loop), so a press and
+     * release sent back to back are both seen. */
     if (!s->mouse_enabled) {
         gemu_monitor_printf(mon, "mousemove: no mouse attached (started with -nodefaults)\n");
-    } else if (!s->mouse_streaming) {
+    } else if (!s->mouse.streaming) {
         gemu_monitor_printf(mon, "mousemove: mouse attached but guest hasn't "
-                            "enabled streaming yet (mouse_streaming=0)\n");
-    } else if (s->aux_out_len != 0 ||
-               s->cpu->ninsts < s->mouse_retry_ninsts) {
-        /* Matches the real per-frame polling path's backpressure
-         * guard (ia64_i2000_run()) - real host mouse motion never
-         * queues a new packet while the previous one is still even
-         * partially undrained or its cooldown hasn't elapsed,
-         * letting the guest fully finish with one report before
-         * being offered the next. */
-        gemu_monitor_printf(mon, "mousemove: previous packet not yet "
-                            "drained/cooled down (aux_out_len=%u), dropped\n",
-                            s->aux_out_len);
+                            "enabled streaming yet\n");
+    } else if (!i2000_mouse_event(s, mdx, mdy, strcmp(mbtn, "left") == 0,
+                                  strcmp(mbtn, "right") == 0)) {
+        gemu_monitor_printf(mon, "mousemove: 63 events already waiting, dropped\n");
     } else {
         bool left = strcmp(mbtn, "left") == 0;
         bool right = strcmp(mbtn, "right") == 0;
-        int dy = -mdy;
-        bool x_overflow = mdx < -127 || mdx > 127;
-        bool y_overflow = dy < -127 || dy > 127;
-        int8_t cdx = (int8_t)(mdx < -127 ? -127 : mdx > 127 ? 127 : mdx);
-        int8_t cdy = (int8_t)(dy < -127 ? -127 : dy > 127 ? 127 : dy);
-        uint8_t flags = (uint8_t)((left ? 0x01 : 0) | (right ? 0x02 : 0) |
-                                  0x08 |
-                                  (cdx < 0 ? 0x10 : 0) | (cdy < 0 ? 0x20 : 0) |
-                                  (x_overflow ? 0x40 : 0) | (y_overflow ? 0x80 : 0));
-        aux_queue_byte(s, flags);
-        aux_queue_byte(s, (uint8_t)cdx);
-        aux_queue_byte(s, (uint8_t)cdy);
-        s->mouse_prev_left = left;
-        s->mouse_prev_right = right;
         gemu_monitor_printf(mon, "mousemove: dx=%d dy=%d left=%d right=%d queued\n",
                             mdx, mdy, left, right);
     }
@@ -3037,18 +2857,16 @@ static GemuMonCmd i2000_cmd_mousekick(GemuMonitor *mon, const char *args,
      * aux_queue_byte()/the 0x60 read handler normally require. For
      * recovering a stuck backlog from an old snapshot saved before
      * mouse_irq_pending existed, not part of the real device model. */
-    if (s->aux_out_pos < s->aux_out_len &&
+    if (i8042_aux_pending(&s->kbc) &&
         !(s->pic.slave.imr & 0x10) && !(s->pic.master.imr & 0x04)) {
         s->mouse_irq_pending = true;
         i2000_pic_raise(s);
-        gemu_monitor_printf(mon, "mousekick: re-raised (aux_out_pos=%u "
-                            "aux_out_len=%u)\n",
-                            s->aux_out_pos, s->aux_out_len);
+        gemu_monitor_printf(mon, "mousekick: re-raised (aux=%u/%u)\n",
+                            s->mouse.out_pos, s->mouse.out_len);
     } else {
-        gemu_monitor_printf(mon, "mousekick: nothing to do (aux_out_pos=%u "
-                            "aux_out_len=%u pic_slave_mask=%02x "
-                            "pic_master_mask=%02x)\n",
-                            s->aux_out_pos, s->aux_out_len, s->pic.slave.imr,
+        gemu_monitor_printf(mon, "mousekick: nothing to do (aux=%u/%u "
+                            "pic_slave_mask=%02x pic_master_mask=%02x)\n",
+                            s->mouse.out_pos, s->mouse.out_len, s->pic.slave.imr,
                             s->pic.master.imr);
     }
     return GEMU_MON_NONE;
@@ -3081,7 +2899,7 @@ static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
     else if (!strcmp(keyarg, "tab"))   special = '\t';
     else if (!strcmp(keyarg, "esc"))   special = 0x1b;
     if (special) {
-        ps2_keyboard_tap(&s->ps2_keyboard, special);
+        i2000_kbd_queue(s, special, 0);
         if (special > 0x7f)
             i2000_efi_bios_ext_key(s, special);
         /* EFI's built-in shell uses the polled serial console in
@@ -3101,7 +2919,7 @@ static GemuMonCmd i2000_cmd_key(GemuMonitor *mon, const char *args, void *ud) {
              *p; p++) {
             if (*p < 0x20 || *p > 0x7e)
                 continue;
-            ps2_keyboard_tap(&s->ps2_keyboard, *p);
+            i2000_kbd_queue(s, *p, 0);
             i2000_con_rx(s, *p);
             i2000_efi_bios_key(s, *p);
             queued++;
@@ -3255,8 +3073,7 @@ static GemuMonCmd i2000_cmd_iosapic(GemuMonitor *mon, const char *args, void *ud
     }
     gemu_monitor_printf(mon, "pic masks master=%02x slave=%02x kbd_data=%d gsi1_asserted=%d\n",
                         s->pic.master.imr, s->pic.slave.imr,
-                        s->kbc_out_pos < s->kbc_out_len ||
-                        ps2_keyboard_has_data(&s->ps2_keyboard),
+                        i8042_kbd_pending(&s->kbc),
                         s->keyboard_gsi_asserted);
     gemu_monitor_printf(mon, "cpu psr.i=%u psr.ic=%u psr.is=%u eflags.if=%u cflg=%" PRIX64
                         " iva=%016" PRIX64 " tpr=%016" PRIX64
@@ -3588,7 +3405,6 @@ static void i2000_chipset_init(Ia64I2000State *s) {
 
 static void i2000_devices_reset(Ia64I2000State *s, bool warm) {
     s->pci_cfg_addr = 0;
-    memset(s->cmd649_cfg, 0, sizeof(s->cmd649_cfg));
     i2000_uart_reset(s);
     mc146818_core_reset(&s->rtc);
     i2000_pit_reset(s);
@@ -3599,22 +3415,7 @@ static void i2000_devices_reset(Ia64I2000State *s, bool warm) {
     ide_reset(&s->ide_primary);
     s->ata_legacy_irq_latched = false;
 
-    /* The IDE model advertises a CMD Technology PCI-649 at 00:03.1. */
-    s->cmd649_cfg[0x00] = 0x95; s->cmd649_cfg[0x01] = 0x10; /* 1095 */
-    s->cmd649_cfg[0x02] = 0x49; s->cmd649_cfg[0x03] = 0x06; /* 0649 */
-    s->cmd649_cfg[0x08] = 0x02;                    /* revision */
-    s->cmd649_cfg[0x09] = 0x8A;                    /* native/legacy IDE */
-    s->cmd649_cfg[0x0A] = 0x01;                    /* IDE subclass */
-    s->cmd649_cfg[0x0B] = 0x01;                    /* mass storage */
-    s->cmd649_cfg[0x0E] = 0x00;                    /* normal header */
-    for (unsigned bar = 0; bar < 5; bar++)
-        s->cmd649_cfg[0x10 + bar * 4] = 1;         /* I/O BAR, unassigned */
-    s->cmd649_cfg[0x3C] = 15;                      /* secondary IDE IRQ15 */
-    s->cmd649_cfg[0x3D] = 0x01;                    /* INTA */
-    /* CNTRL's primary/secondary enable bits describe the two channels
-     * exposed at the legacy taskfile ports. CmdIde checks these bits
-     * before creating channel devices; zero hid the boot CD entirely. */
-    s->cmd649_cfg[0x51] = 0x0c;
+    cmd649_reset(&s->cmd649);
     spd_init(s);
     if (warm)
         i460gx_warm_reset(&s->chipset);
@@ -3698,6 +3499,9 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
             e100_set_rom(&s->nic, s->nic_rom, s->nic_rom_len);
     }
     ps2_keyboard_init(&s->ps2_keyboard);
+    ps2_mouse_init(&s->mouse);
+    i8042_init(&s->kbc, NULL, NULL);
+    i2000_kbc_wire(s);
     if (!i2000_claim_drives(s)) {
         ia64_i2000_destroy(s);
         return NULL;
@@ -3817,8 +3621,8 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
         merced_rfi_generation() >= s->mouse_wait_rfi_generation) {
         s->mouse_wait_rfi_generation = 0;
         s->mouse_retry_ninsts = s->cpu->ninsts + MOUSE_RETRY_DELAY_INSTS;
-        if (s->aux_out_pos >= s->aux_out_len) {
-            unsigned rate = s->mouse_sample_rate ? s->mouse_sample_rate : 100;
+        if (!i8042_aux_pending(&s->kbc)) {
+            unsigned rate = s->mouse.sample_rate ? s->mouse.sample_rate : 100;
             uint64_t interval = I2000_ITC_HZ / rate;
             if (interval < 5000) interval = 5000;
             s->mouse_next_report_itc = merced_get_time_base(s->cpu) + interval;
@@ -3846,8 +3650,8 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * CdbPim blocked with an unread 8042 byte. Keep the latch asserted until
      * the firmware performs its ExtINT acknowledge; if more bytes remain,
      * the next poll naturally reasserts it. */
-    bool kbd_data = s->kbc_out_pos < s->kbc_out_len ||
-                    ps2_keyboard_has_data(&s->ps2_keyboard);
+    i2000_kbd_feed(s);
+    bool kbd_data = i8042_kbd_pending(&s->kbc);
     uint64_t kbd_rte = s->chipset.iosapic_rte[1];
     bool kbd_fixed = !(kbd_rte & I460GX_IOSAPIC_RTE_MASK) &&
                      ((kbd_rte >> 8) & 7) <= 1;
@@ -3899,12 +3703,12 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
          * first aux byte (e.g. the mouse's reset reply) was never signalled
          * and, sitting first in the shared output buffer, also starved the
          * keyboard.  The 8042 only drives IRQ12 with command-byte INT2 set. */
-        if (s->aux_out_pos < s->aux_out_len && (s->kbc_command_byte & 0x02) &&
+        if (i8042_aux_pending(&s->kbc) && i8042_aux_irq_enabled(&s->kbc) &&
             !s->mouse_gsi_asserted) {
             iosapic_raise_gsi(s, 12);
             s->mouse_gsi_asserted = true;
         }
-    } else if (s->aux_out_pos < s->aux_out_len &&
+    } else if (i8042_aux_pending(&s->kbc) &&
         s->cpu->ninsts >= s->mouse_retry_ninsts &&
         s->mouse_wait_rfi_generation == 0 &&
         !(s->pic.slave.imr & 0x10) && !(s->pic.master.imr & 0x04)) {
@@ -4314,6 +4118,8 @@ static void i2000_reset(Ia64I2000State *s, bool warm) {
     s->nvram_dirty = nvram_dirty;
     i2000_update_fast_ram(s);
     ps2_keyboard_init(&s->ps2_keyboard);
+    ps2_mouse_init(&s->mouse);
+    s->mouse_resets_seen = 0;
     /* mouse_enabled is a CLI-configured setting (-device mouse), not
      * protocol state - a reset should clear the aux device's transient
      * state (queue, streaming flag, etc, all zeroed by the memset above)
@@ -4463,7 +4269,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
 
         if (s->mouse_enabled) {
             int rel_x = 0, rel_y = 0;
-            bool left = s->mouse_prev_left, right = s->mouse_prev_right;
+            bool left = s->mouse.left, right = s->mouse.right;
             bool have_pointer = false;
             if (s->display) {
                 GemuPointerState p = gemu_display_get_pointer(s->display);
@@ -4471,7 +4277,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                 left = p.button; right = p.right_button;
                 have_pointer = true;
             }
-            if (have_pointer && s->mouse_streaming) {
+            if (have_pointer && s->mouse.streaming) {
                 s->mouse_accum_dx =
                     mouse_accumulate_axis(s->mouse_accum_dx, rel_x);
                 /* SDL/VNC positive Y is down; PS/2 positive Y is up. */
@@ -4480,37 +4286,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                 s->mouse_host_left = left;
                 s->mouse_host_right = right;
             }
-            if (s->mouse_streaming &&
-                (s->mouse_accum_dx || s->mouse_accum_dy ||
-                 s->mouse_host_left != s->mouse_prev_left ||
-                 s->mouse_host_right != s->mouse_prev_right) &&
-                /* Only one PS/2 report is in flight at a time. Motion that
-                 * arrives meanwhile stays in the bounded accumulator above,
-                 * and is drained in <=127-count chunks after the real PIC
-                 * EOI handshake completes. */
-                s->aux_out_len == 0 &&
-                s->kbc_out_len == 0 &&
-                !ps2_keyboard_has_data(&s->ps2_keyboard) &&
-                s->mouse_wait_rfi_generation == 0 &&
-                s->cpu->ninsts >= s->mouse_retry_ninsts &&
-                (int64_t)(merced_get_time_base(s->cpu) -
-                          s->mouse_next_report_itc) >= 0) {
-                int8_t cdx = (int8_t)(s->mouse_accum_dx < -127 ? -127 :
-                                      s->mouse_accum_dx > 127 ? 127 : s->mouse_accum_dx);
-                int8_t cdy = (int8_t)(s->mouse_accum_dy < -127 ? -127 :
-                                      s->mouse_accum_dy > 127 ? 127 : s->mouse_accum_dy);
-                uint8_t flags = (uint8_t)((s->mouse_host_left ? 0x01 : 0) |
-                                          (s->mouse_host_right ? 0x02 : 0) |
-                                          0x08 |
-                                          (cdx < 0 ? 0x10 : 0) | (cdy < 0 ? 0x20 : 0));
-                aux_queue_byte(s, flags);
-                aux_queue_byte(s, (uint8_t)cdx);
-                aux_queue_byte(s, (uint8_t)cdy);
-                s->mouse_accum_dx -= cdx;
-                s->mouse_accum_dy -= cdy;
-                s->mouse_prev_left = s->mouse_host_left;
-                s->mouse_prev_right = s->mouse_host_right;
-            }
+            i2000_mouse_pace(s);
         }
 
         /* Monitor commands run inside gemu_monitor_poll(); snapshot I/O

@@ -19,6 +19,9 @@ typedef struct Ps2Keyboard {
 void ps2_keyboard_init(Ps2Keyboard *kbd);
 void ps2_keyboard_command(Ps2Keyboard *kbd, uint8_t command);
 bool ps2_keyboard_has_data(const Ps2Keyboard *kbd);
+/* Free bytes in the output queue: a host feeding keys can wait for room
+ * rather than lose them when the queue is full. */
+unsigned ps2_keyboard_room(const Ps2Keyboard *kbd);
 uint8_t ps2_keyboard_read(Ps2Keyboard *kbd);
 
 /* Host key symbols use the X11/RFB values for non-ASCII keys.  ASCII

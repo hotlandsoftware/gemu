@@ -28,10 +28,6 @@
  *                      | GENERIC_VGA_IO_BASE      |
  *   0x00000000C0000030 +--------------------------+
  *                      | open bus                 |
- *   0x00000000C0001000 +--------------------------+
- *                      | keyboard controller      | see GENERIC_KBD_IO_BASE
- *   0x00000000C0001008 +--------------------------+
- *                      | open bus                 |
  *   0x00000000C0002000 +--------------------------+
  *                      | CD-ROM controller        | see GENERIC_CDROM_IO_BASE
  *   0x00000000C0002010 +--------------------------+
@@ -104,18 +100,6 @@
  * every port we implement (COM1, ATAPI, PCI config) once sparse-encoded,
  * matching reference/qemu-system-ia64's IA64_PCI_IO_SIZE convention. */
 #define GENERIC_LEGACY_IO_SPARSE_SIZE 0x1000000ull
-
-/* Keyboard controller: two byte registers.
- *   +0x0  STATUS (read-only)  bit 0 = a key code is waiting
- *   +0x4  DATA   (read-only)  pop the next key code (0 if none waiting);
- *                             1 = Up, 2 = Down, 3 = Enter
- * Arrow/Enter presses are the only things the boot manager needs to
- * navigate menus, so those are the only codes that exist. */
-#define GENERIC_KBD_IO_BASE   0x00000000C0001000ull
-#define GENERIC_KBD_IO_SIZE   0x8u
-#define GENERIC_KBD_KEY_UP    1u
-#define GENERIC_KBD_KEY_DOWN  2u
-#define GENERIC_KBD_KEY_ENTER 3u
 
 /* CD-ROM controller: sector-at-a-time raw block access, plus a
  * file-by-path interface for the embedded El Torito EFI boot image
