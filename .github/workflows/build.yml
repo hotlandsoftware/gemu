@@ -66,10 +66,8 @@ jobs:
       - name: Build
         run: ninja
 
-      # Built to catch Windows-only compile errors; not run yet (the i2000
-      # snapshot code overflows the 1 MiB Windows stack in i2000_interrupts).
-      - name: Build unit tests
-        run: ninja tests
+      - name: Unit tests
+        run: ninja check
 
       - name: Gather runtime DLLs
         run: |
@@ -121,10 +119,8 @@ jobs:
       - name: Build
         run: ninja
 
-      # Built to catch Windows-only compile errors; not run yet (the i2000
-      # snapshot code overflows the 1 MiB Windows stack in i2000_interrupts).
-      - name: Build unit tests
-        run: ninja tests
+      - name: Unit tests
+        run: ninja check
 
       - name: Gather runtime DLLs
         # msys2's ldd is 64-bit and cannot trace i686 PE binaries, so walk

@@ -3333,10 +3333,14 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     ok &= fwrite(snap, sizeof(*snap), 1, f) == 1;
     free(snap);
 
-    Merced cpu_snap = *s->cpu;
-    memset(&cpu_snap.bus, 0, sizeof(cpu_snap.bus));
-    cpu_snap.translation_cache = NULL;
-    ok &= fwrite(&cpu_snap, sizeof(cpu_snap), 1, f) == 1;
+    /* Merced is ~2 MB: on the heap, as Windows threads have a 1 MiB stack. */
+    Merced *cpu_snap = malloc(sizeof(*cpu_snap));
+    if (!cpu_snap) { fclose(f); return false; }
+    *cpu_snap = *s->cpu;
+    memset(&cpu_snap->bus, 0, sizeof(cpu_snap->bus));
+    cpu_snap->translation_cache = NULL;
+    ok &= fwrite(cpu_snap, sizeof(*cpu_snap), 1, f) == 1;
+    free(cpu_snap);
     /* The disks as of this moment: -snapshot writes live only in memory, so
      * without them a restored guest would lose its own disk changes. */
     ok &= gemu_drive_save_state(s->hda, f);
@@ -3411,7 +3415,14 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     uint8_t *atapi_data = s->atapi_data;
     uint8_t *ata_data = s->ata_data;
     Ia64I2000State *loaded = calloc(1, sizeof(*loaded));
-    if (!loaded) { fclose(f); return false; }
+    /* Merced is ~2 MB: on the heap, as Windows threads have a 1 MiB stack. */
+    Merced *loaded_cpu = malloc(sizeof(*loaded_cpu));
+    if (!loaded || !loaded_cpu) {
+        free(loaded);
+        free(loaded_cpu);
+        fclose(f);
+        return false;
+    }
     if (version == 40) {
         size_t prefix = offsetof(Ia64I2000State, rage128) + offsetof(Rage128, cce);
         size_t tail = prefix + sizeof(Rage128Cce);
@@ -3480,10 +3491,9 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
 
     MercedBus bus = s->cpu->bus;
     void *translation_cache = s->cpu->translation_cache;
-    Merced loaded_cpu;
-    ok &= fread(&loaded_cpu, sizeof(loaded_cpu), 1, f) == 1;
+    ok &= fread(loaded_cpu, sizeof(*loaded_cpu), 1, f) == 1;
     if (ok) {
-        *s->cpu = loaded_cpu;
+        *s->cpu = *loaded_cpu;
         s->cpu->bus = bus;
         s->cpu->translation_cache = translation_cache;
         merced_flush_translation_cache(s->cpu);
@@ -3496,6 +3506,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->pit.ud = s;
         s->pit_itc_mark = merced_get_time_base(s->cpu);
     }
+    free(loaded_cpu);
     if (ok && version >= 39) {
         ok &= gemu_drive_load_state(s->hda, f);
         ok &= gemu_drive_load_state(s->cdrom, f);
