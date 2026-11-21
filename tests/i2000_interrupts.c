@@ -9,15 +9,79 @@ static unsigned checks;
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); exit(1); \
 } } while (0)
 
-static Ia64I2000State *machine(void) {
+/* The checks below observe devices only as the guest can: I/O ports, MMIO,
+ * the CPU's pending vectors and snapshots.  They don't read the machine's
+ * device fields, so they keep working as devices move out of the machine. */
+static Ia64I2000State *machine_with(bool mouse) {
     Ia64Config cfg = {.ram_size = UINT64_C(64) << 20,
-                     .display_type = GEMU_DISPLAY_NONE};
+                     .display_type = GEMU_DISPLAY_NONE,
+                     .mouse_enabled = mouse};
     Ia64I2000State *s = ia64_i2000_create(&cfg);
     CHECK(s);
     return s;
 }
+static Ia64I2000State *machine(void) { return machine_with(false); }
 static bool irq(Ia64I2000State *s, unsigned vector) {
     return (s->cpu->external_pending[vector >> 3] >> (vector & 7)) & 1;
+}
+/* Comfortably past the IDE devices' interrupt latency (2000 instructions). */
+#define IDE_SETTLE_NINSTS UINT64_C(20000)
+/* IDENTIFY DEVICE word 47: the largest READ/WRITE MULTIPLE block. */
+#define ATA_DISK_MAX_MULTIPLE 16u
+
+/* 8259 pair.  OCW3 selects the IRR, then the command port reads it. */
+static uint8_t pic_irr(Ia64I2000State *s, unsigned port) {
+    io_port_write(s, port, 0x0A, 1);
+    return (uint8_t)io_port_read(s, port, 1);
+}
+/* The IDE interrupt requests (IRQ14 primary, IRQ15 secondary). */
+static bool irq14_requested(Ia64I2000State *s) { return pic_irr(s, 0xA0) & 0x40; }
+static bool irq15_requested(Ia64I2000State *s) { return pic_irr(s, 0xA0) & 0x80; }
+/* Master IRQ2: the slave's output. */
+static bool cascade_requested(Ia64I2000State *s) { return pic_irr(s, 0x20) & 0x04; }
+/* Initialise the pair as EFI does (ICW1-4), then set the masks. */
+#define PIC_SLAVE_BASE 0x70u
+static void pic_init(Ia64I2000State *s, uint8_t master_mask, uint8_t slave_mask) {
+    io_port_write(s, 0x20, 0x11, 1);
+    io_port_write(s, 0x21, 0x08, 1);
+    io_port_write(s, 0x21, 0x04, 1);
+    io_port_write(s, 0x21, 0x01, 1);
+    io_port_write(s, 0xA0, 0x11, 1);
+    io_port_write(s, 0xA1, PIC_SLAVE_BASE, 1);
+    io_port_write(s, 0xA1, 0x02, 1);
+    io_port_write(s, 0xA1, 0x01, 1);
+    io_port_write(s, 0x21, master_mask, 1);
+    io_port_write(s, 0xA1, slave_mask, 1);
+}
+
+static void route_gsi(Ia64I2000State *s, unsigned gsi, uint32_t rte) {
+    bus_write(s, I460GX_IOSAPIC_BASE, 0x10 + 2 * gsi, 4);
+    bus_write(s, I460GX_IOSAPIC_BASE + 0x10, rte, 4);
+}
+
+/* 8042. */
+static bool kbc_output_full(Ia64I2000State *s) { return io_port_read(s, 0x64, 1) & 1; }
+static uint8_t kbc_read_command_byte(Ia64I2000State *s) {
+    io_port_write(s, 0x64, 0x20, 1);
+    return (uint8_t)io_port_read(s, 0x60, 1);
+}
+static void kbc_write_command_byte(Ia64I2000State *s, uint8_t value) {
+    io_port_write(s, 0x64, 0x60, 1);
+    io_port_write(s, 0x60, value, 1);
+}
+static void mouse_command(Ia64I2000State *s, uint8_t cmd) {
+    io_port_write(s, 0x64, 0xD4, 1);
+    io_port_write(s, 0x60, cmd, 1);
+}
+/* Status request: ACK, then status (bit 5: reporting on), resolution, rate. */
+static bool mouse_streaming(Ia64I2000State *s) {
+    mouse_command(s, 0xe9);
+    CHECK(io_port_read(s, 0x60, 1) == 0xfa);
+    uint8_t status = (uint8_t)io_port_read(s, 0x60, 1);
+    io_port_read(s, 0x60, 1);
+    io_port_read(s, 0x60, 1);
+    CHECK(!kbc_output_full(s));
+    return status & 0x20;
 }
 static void test_gpio_straps(void) {
     Ia64I2000State *s = machine();
@@ -87,10 +151,10 @@ static void test_pit(void) {
 
     /* A rising edge at the end of the period latches IRQ0 behind the mask. */
     io_port_write(s, 0x21, 0x01, 1);
-    CHECK(!s->pit_irq_pending);
+    CHECK(!(pic_irr(s, 0x20) & 0x01));
     s->cpu->time_base = itc_for_pit(5000);
     i2000_poll_interrupts(s);
-    CHECK(s->pit_irq_pending && !irq(s, 0));
+    CHECK((pic_irr(s, 0x20) & 0x01) && !irq(s, 0));
     io_port_write(s, 0x21, 0x00, 1);          /* unmask */
     CHECK(irq(s, 0));
 
@@ -126,14 +190,25 @@ static void test_rtc(void) {
     CHECK(rtc_read(s, 0x0d) & 0x80);
 
     /* Periodic interrupt: RS = 6 is 1 ms. IRQ8 stays up, and RTC_STS is set,
-     * until register C is read. */
+     * until register C is read.  Through a level-triggered GSI8 (as Windows
+     * programs it) the interrupt is presented again while the line is up. */
+    route_gsi(s, 8, 0x50 | 1u << 15);
     rtc_write(s, 0x0b, 0x42);                        /* PIE, 24-hour BCD */
     s->cpu->time_base += itc_for_oscillator(200);
     rtc_write(s, 0x0b, 0x42);                        /* a poll point */
-    CHECK(s->rtc_irq);
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x50));
+    merced_ack_external(s->cpu, 0x50);
+    s->cpu->ninsts += 100000;
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x50));                             /* still asserted */
     CHECK(s->chipset.pm.pm1_sts & 0x0400);
     CHECK(rtc_read(s, 0x0c) & 0xc0);
-    CHECK(!s->rtc_irq && rtc_read(s, 0x0c) == 0);
+    CHECK(rtc_read(s, 0x0c) == 0);
+    merced_ack_external(s->cpu, 0x50);
+    s->cpu->ninsts += 100000;
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0x50));                            /* reading C lowered it */
 
     /* Alarm: seconds, minutes and hours matching raise AF at the update. */
     rtc_write(s, 0x0b, 0x22);                        /* AIE, 24-hour */
@@ -169,7 +244,7 @@ static void route(Ia64I2000State *s, unsigned vector) {
     bus_write(s, I460GX_IOSAPIC_BASE + 0x10, vector, 4);
 }
 static void ready(Ia64I2000State *s) {
-    s->cpu->ninsts += ATAPI_IRQ_LATENCY_NINSTS;
+    s->cpu->ninsts += IDE_SETTLE_NINSTS;
     i2000_poll_interrupts(s);
 }
 static void identify(Ia64I2000State *s) {
@@ -183,19 +258,19 @@ static void test_identify(void) {
     route(s, 0x60);
     identify(s);
     CHECK(irq(s, 0x60) && !irq(s, 0));
-    CHECK(s->atapi_irq_pending && s->atapi_irq_asserted);
+    CHECK(irq15_requested(s));
     merced_ack_external(s->cpu, 0x60);
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x60)); /* CPU acceptance must not produce another edge. */
     CHECK(io_port_read(s, 0x376, 1) == 0x48);
-    CHECK(s->atapi_irq_pending); /* Alternate Status does not acknowledge. */
+    CHECK(irq15_requested(s)); /* Alternate Status does not acknowledge. */
     CHECK(io_port_read(s, 0x177, 1) == 0x48);
-    CHECK(!s->atapi_irq_pending && !s->atapi_irq_asserted);
+    CHECK(!irq15_requested(s));
     CHECK(io_port_read(s, 0x170, 2) == 0x85c0);
     for (unsigned i = 1; i < 256; i++) io_port_read(s, 0x170, 2);
     CHECK(io_port_read(s, 0x376, 1) == 0x40);
     ready(s);
-    CHECK(!irq(s, 0x60) && !s->atapi_irq_pending);
+    CHECK(!irq(s, 0x60) && !irq15_requested(s));
     ia64_i2000_destroy(s);
 }
 static void test_control(void) {
@@ -204,24 +279,27 @@ static void test_control(void) {
     io_port_write(s, 0x376, 2, 1); /* nIEN */
     identify(s);
     CHECK(!irq(s, 0x60) && !irq(s, 0));
-    CHECK(s->atapi_irq_pending && !s->atapi_irq_asserted);
-    CHECK(s->atapi_status == 0x48 && s->atapi_data_pos == 0);
+    CHECK(!irq15_requested(s));           /* nIEN floats INTRQ */
+    CHECK(io_port_read(s, 0x376, 1) == 0x48);
     io_port_write(s, 0x376, 0, 1);
-    CHECK(s->atapi_status == 0x48 && s->atapi_irq_pending);
+    CHECK(io_port_read(s, 0x376, 1) == 0x48 && irq15_requested(s));
     i2000_poll_interrupts(s);
-    CHECK(irq(s, 0x60));
+    CHECK(irq(s, 0x60));                  /* held back, not lost */
     merced_ack_external(s->cpu, 0x60);
     io_port_read(s, 0x177, 1);
-    io_port_read(s, 0x170, 2);
+    CHECK(io_port_read(s, 0x170, 2) == 0x85c0);  /* nothing was read yet */
+    /* Toggling nIEN without SRST keeps the transfer where it was. */
     io_port_write(s, 0x376, 2, 1);
     io_port_write(s, 0x376, 0, 1);
-    CHECK(s->atapi_status == 0x48 && s->atapi_data_pos == 2);
-    CHECK(!s->atapi_irq_pending);
+    CHECK(io_port_read(s, 0x376, 1) == 0x48 && !irq15_requested(s));
+    uint16_t word = 0;
+    for (unsigned i = 1; i <= 27; i++) word = (uint16_t)io_port_read(s, 0x170, 2);
+    CHECK(word == 0x4745);                /* word 27: model "GE..." */
     io_port_write(s, 0x376, 4, 1);
-    CHECK(s->atapi_status == 0x80 && !s->atapi_irq_pending);
+    CHECK(io_port_read(s, 0x376, 1) == 0x80 && !irq15_requested(s));
     io_port_write(s, 0x376, 0, 1);
-    CHECK(s->atapi_status == 0x40 && s->atapi_count == 1);
-    CHECK(s->atapi_lba_mid == 0x14 && s->atapi_lba_high == 0xeb);
+    CHECK(io_port_read(s, 0x376, 1) == 0x40 && io_port_read(s, 0x172, 1) == 1);
+    CHECK(io_port_read(s, 0x174, 1) == 0x14 && io_port_read(s, 0x175, 1) == 0xeb);
     ia64_i2000_destroy(s);
 }
 static void test_packet_phases(void) {
@@ -231,7 +309,7 @@ static void test_packet_phases(void) {
     io_port_write(s, 0x175, 0, 1);
     io_port_write(s, 0x177, 0xa0, 1);
     ready(s);
-    CHECK(s->atapi_status == 0x48 && !irq(s, 0x60));
+    CHECK(io_port_read(s, 0x376, 1) == 0x48 && !irq(s, 0x60));
     const uint8_t packet[12] = {0x12, 0, 0, 0, 36}; /* INQUIRY, no media needed. */
     for (unsigned i = 0; i < 12; i += 2)
         io_port_write(s, 0x170, packet[i] | packet[i + 1] << 8, 2);
@@ -242,10 +320,14 @@ static void test_packet_phases(void) {
         merced_ack_external(s->cpu, 0x60);
         CHECK(io_port_read(s, 0x177, 1) == 0x48);
         if (remaining == 36) {
+            /* A software reset in between throws the transfer away; the
+             * restored device must carry on with the PACKET command. */
             CHECK(i2000_save_snapshot(s, "packet.vmstate"));
-            s->atapi_packet_command = false;
+            io_port_write(s, 0x376, 4, 1);
+            io_port_write(s, 0x376, 0, 1);
+            CHECK(io_port_read(s, 0x376, 1) == 0x40);
             CHECK(i2000_load_snapshot(s, "packet.vmstate"));
-            CHECK(s->atapi_packet_command && !s->atapi_irq_pending);
+            CHECK(io_port_read(s, 0x376, 1) == 0x48 && !irq15_requested(s));
         }
         unsigned phase = remaining < 8 ? remaining : 8;
         CHECK(io_port_read(s, 0x174, 1) == phase);
@@ -267,27 +349,29 @@ static void test_legacy(void) {
      * deliver it.  AMI's IA-32 BIOS polls IRR this way with IRQ15 masked
      * while EFI reads the CD; the master's IRQ2 cascade stays clear. */
     identify(s);
-    CHECK(!irq(s, 0) && !irq(s, 0x60) && !s->atapi_legacy_irq_latched);
-    CHECK((io_port_read(s, 0xA0, 1) & 0x80) && !(io_port_read(s, 0x20, 1) & 0x04));
+    CHECK(!irq(s, 0) && !irq(s, 0x60));
+    CHECK(irq15_requested(s) && !cascade_requested(s));
     CHECK(io_port_read(s, 0x177, 1) == 0x48);  /* Status read lowers INTRQ */
-    CHECK(!(io_port_read(s, 0xA0, 1) & 0x80));
+    CHECK(!irq15_requested(s));
     for (unsigned i = 0; i < 256; i++) io_port_read(s, 0x170, 2);
     ready(s);
     /* Unmasked (slave IRQ7, master cascade IRQ2): the firmware's reset-RTE
      * ExtINT path delivers it. */
-    io_port_write(s, 0x21, 0xFB, 1);
-    io_port_write(s, 0xA1, 0x7F, 1);
+    pic_init(s, 0xFB, 0x7F);
     identify(s);
     CHECK(irq(s, 0) && !irq(s, 0x60));
-    CHECK(io_port_read(s, 0x177, 1) == 0x48);
-    CHECK(!s->atapi_irq_pending && s->atapi_legacy_irq_latched);
-    CHECK(i2000_save_snapshot(s, "legacy.vmstate"));
-    s->atapi_legacy_irq_latched = false;
-    CHECK(i2000_load_snapshot(s, "legacy.vmstate"));
-    CHECK(!s->atapi_irq_pending && s->atapi_legacy_irq_latched);
     /* The PIC still owns IRQ15 after the device's INTRQ is cleared. */
-    CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == s->pic_slave_base + 7u);
-    CHECK(!s->atapi_irq_pending && !irq(s, 0));
+    CHECK(io_port_read(s, 0x177, 1) == 0x48);
+    CHECK(irq15_requested(s));
+    /* That request is saved: acknowledging it after the save drops it, and
+     * loading brings it back. */
+    CHECK(i2000_save_snapshot(s, "legacy.vmstate"));
+    CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == PIC_SLAVE_BASE + 7u);
+    CHECK(!irq15_requested(s));
+    CHECK(i2000_load_snapshot(s, "legacy.vmstate"));
+    CHECK(irq15_requested(s));
+    CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == PIC_SLAVE_BASE + 7u);
+    CHECK(!irq15_requested(s) && !irq(s, 0));
     ready(s);
     CHECK(!irq(s, 0));
     ia64_i2000_destroy(s);
@@ -297,15 +381,11 @@ static void test_os_mask(void) {
     route(s, 0x60 | I460GX_IOSAPIC_RTE_MASK);
     identify(s);
     CHECK(!irq(s, 0x60) && !irq(s, 0));
-    CHECK(s->atapi_irq_pending && !s->atapi_irq_asserted);
+    CHECK(irq15_requested(s));
     route(s, 0x60);
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x60) && !irq(s, 0));
     ia64_i2000_destroy(s);
-}
-static void route_gsi(Ia64I2000State *s, unsigned gsi, uint32_t rte) {
-    bus_write(s, I460GX_IOSAPIC_BASE, 0x10 + 2 * gsi, 4);
-    bus_write(s, I460GX_IOSAPIC_BASE + 0x10, rte, 4);
 }
 /* Windows' i8042 driver takes IRQ1 through the fixed vector it programs in
  * GSI1 (0x80 in XP Setup).  One edge per byte the 8042 makes available:
@@ -317,21 +397,20 @@ static void test_keyboard(void) {
     route_gsi(s, 1, 0x80);
     i2000_type_key(s, 'a');            /* make + break scancodes */
     i2000_poll_interrupts(s);
-    CHECK(irq(s, 0x80) && !irq(s, 0) && s->keyboard_gsi_asserted);
+    CHECK(irq(s, 0x80) && !irq(s, 0));
     merced_ack_external(s->cpu, 0x80);
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x80));              /* acceptance is not a new edge */
-    io_port_read(s, 0x60, 1);
-    CHECK(!s->keyboard_gsi_asserted);
+    CHECK(io_port_read(s, 0x60, 1) == 0x1e);
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x80));               /* second byte: fresh edge */
     merced_ack_external(s->cpu, 0x80);
-    for (unsigned i = 0; i < 8 && (s->kbc_out_pos < s->kbc_out_len ||
-                                   ps2_keyboard_has_data(&s->ps2_keyboard)); i++)
+    for (unsigned i = 0; i < 8 && kbc_output_full(s); i++)
         io_port_read(s, 0x60, 1);
+    CHECK(!kbc_output_full(s));
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x80) && !irq(s, 0));
-    s->pic_master_mask = 0xf8;         /* PIC IRQ1 open, as Windows leaves it */
+    io_port_write(s, 0x21, 0xf8, 1);   /* PIC IRQ1 open, as Windows leaves it */
     route_gsi(s, 1, 0x80 | I460GX_IOSAPIC_RTE_MASK);
     i2000_type_key(s, 'b');
     s->cpu->ninsts += 1000000;
@@ -341,27 +420,36 @@ static void test_keyboard(void) {
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x80));
     /* Function keys (Setup's F8=I agree) reach the 8042 as set-1 codes. */
-    while (s->kbc_out_pos < s->kbc_out_len || ps2_keyboard_has_data(&s->ps2_keyboard))
+    while (kbc_output_full(s))
         io_port_read(s, 0x60, 1);
     i2000_type_key(s, 0xffc5);         /* F8 */
     CHECK(io_port_read(s, 0x60, 1) == 0x42 && io_port_read(s, 0x60, 1) == 0xC2);
     i2000_type_key(s, 0xffc9);         /* F12 */
     CHECK(io_port_read(s, 0x60, 1) == 0x58 && io_port_read(s, 0x60, 1) == 0xD8);
     /* Modifiers are real held keys: Setup's Shift+F10 opens a console. */
-    ps2_keyboard_key(&s->ps2_keyboard, 0xffe1, true);   /* Left Shift */
-    ps2_keyboard_tap(&s->ps2_keyboard, 0xffc7);          /* F10 */
-    ps2_keyboard_key(&s->ps2_keyboard, 0xffe1, false);
+    CHECK(i2000_send_combo(s, "shift-f10"));
     CHECK(io_port_read(s, 0x60, 1) == 0x2A && io_port_read(s, 0x60, 1) == 0x44 &&
           io_port_read(s, 0x60, 1) == 0xC4 && io_port_read(s, 0x60, 1) == 0xAA);
-    ps2_keyboard_tap(&s->ps2_keyboard, 0xffe4);          /* Right Ctrl */
+    i2000_type_key(s, 0xffe4);         /* Right Ctrl */
     CHECK(io_port_read(s, 0x60, 1) == 0xE0 && io_port_read(s, 0x60, 1) == 0x1D &&
           io_port_read(s, 0x60, 1) == 0xE0 && io_port_read(s, 0x60, 1) == 0x9D);
+    /* An edge raised before a save is not raised again after the load, in
+     * a board that never saw it; the next byte still gets its own edge. */
     i2000_type_key(s, 'b');
     i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x80));
     CHECK(i2000_save_snapshot(s, "kbd.vmstate"));
-    s->keyboard_gsi_asserted = false;
-    CHECK(i2000_load_snapshot(s, "kbd.vmstate"));
-    CHECK(s->keyboard_gsi_asserted);
+    Ia64I2000State *t = machine();
+    CHECK(i2000_load_snapshot(t, "kbd.vmstate"));
+    CHECK(irq(t, 0x80));
+    merced_ack_external(t->cpu, 0x80);
+    i2000_poll_interrupts(t);
+    CHECK(!irq(t, 0x80));
+    CHECK(io_port_read(t, 0x60, 1) == 0x30);   /* 'b' make */
+    i2000_poll_interrupts(t);
+    CHECK(irq(t, 0x80));
+    CHECK(io_port_read(t, 0x60, 1) == 0xB0);   /* 'b' break */
+    ia64_i2000_destroy(t);
     ia64_i2000_destroy(s);
 }
 /* Windows routes the 8042's aux output (IRQ12) through GSI12 too.  Without
@@ -369,23 +457,23 @@ static void test_keyboard(void) {
  * starves the keyboard as well.  Like IRQ1: one edge per byte, re-armed by a
  * data-port read; and the 8042 only drives IRQ12 with command-byte INT2. */
 static void test_mouse(void) {
-    Ia64I2000State *s = machine();
+    Ia64I2000State *s = machine_with(true);
     route_gsi(s, 1, 0x80);
     route_gsi(s, 12, 0x90);
-    s->kbc_command_byte &= (uint8_t)~0x02;
-    aux_queue_byte(s, 0xfa);           /* reset reply: ACK, AA, 00 */
-    aux_queue_byte(s, 0xaa);
-    aux_queue_byte(s, 0x00);
+    uint8_t command_byte = kbc_read_command_byte(s);
+    kbc_write_command_byte(s, command_byte & (uint8_t)~0x02);
+    mouse_command(s, 0xff);            /* reset reply: ACK, AA, 00 */
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x90) && !irq(s, 0)); /* INT2 off: polled, no IRQ12 */
-    s->kbc_command_byte |= 0x02;
+    CHECK((io_port_read(s, 0x64, 1) & 0x21) == 0x21);  /* aux byte waiting */
+    kbc_write_command_byte(s, command_byte | 0x02);
     i2000_poll_interrupts(s);
-    CHECK(irq(s, 0x90) && s->mouse_gsi_asserted);
+    CHECK(irq(s, 0x90));
     merced_ack_external(s->cpu, 0x90);
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x90));              /* acceptance is not a new edge */
     i2000_type_key(s, 'a');            /* queued behind the aux bytes */
-    CHECK(io_port_read(s, 0x60, 1) == 0xfa && !s->mouse_gsi_asserted);
+    CHECK(io_port_read(s, 0x60, 1) == 0xfa);
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x90));               /* next aux byte: fresh edge */
     merced_ack_external(s->cpu, 0x90);
@@ -397,7 +485,8 @@ static void test_mouse(void) {
     CHECK(irq(s, 0x80));               /* the keyboard byte is reachable */
     CHECK(io_port_read(s, 0x60, 1) == 0x1e);
     route_gsi(s, 12, 0x90 | I460GX_IOSAPIC_RTE_MASK);
-    aux_queue_byte(s, 0x08);
+    mouse_command(s, 0xf5);            /* its ACK is an aux byte */
+    CHECK(io_port_read(s, 0x64, 1) & 0x20);
     s->cpu->ninsts += 1000000;
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x90) && !irq(s, 0)); /* masked OS vector: no fallback */
@@ -422,27 +511,26 @@ static void test_snapshots(void) {
     merced_ack_external(s->cpu, 0x60);
     s->cpu->gr_static[8] = UINT64_C(0x123456789abcdef0);
     CHECK(i2000_save_snapshot(s, "irq-current.vmstate"));
-    atapi_clear_irq(s);
+    CHECK(io_port_read(s, 0x177, 1) == 0x48 && !irq15_requested(s));
     CHECK(i2000_load_snapshot(s, "irq-current.vmstate"));
-    CHECK(s->atapi_irq_pending && s->atapi_irq_asserted);
+    CHECK(irq15_requested(s));
     i2000_poll_interrupts(s);
-    CHECK(!irq(s, 0x60));
+    CHECK(!irq(s, 0x60));     /* the restored edge was already delivered */
     io_port_read(s, 0x177, 1);
     CHECK(i2000_save_snapshot(s, "irq-current.vmstate"));
     CHECK(i2000_load_snapshot(s, "irq-current.vmstate"));
-    CHECK(!s->atapi_irq_pending); /* Acknowledged DRQ must not be rearmed. */
+    CHECK(!irq15_requested(s)); /* Acknowledged DRQ must not be rearmed. */
     io_port_write(s, 0x376, 2, 1);
     identify(s);
     CHECK(i2000_save_snapshot(s, "irq-current.vmstate"));
     io_port_write(s, 0x376, 0, 1);
     CHECK(i2000_load_snapshot(s, "irq-current.vmstate"));
-    CHECK(s->atapi_device_control == 2 && !s->atapi_packet_command);
-    CHECK(s->atapi_irq_pending && !s->atapi_irq_asserted);
+    CHECK(!irq15_requested(s));  /* nIEN is restored ... */
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x60));
     io_port_write(s, 0x376, 0, 1);
     i2000_poll_interrupts(s);
-    CHECK(irq(s, 0x60));
+    CHECK(irq(s, 0x60));         /* ... and so is the held-back interrupt */
     for (unsigned version = 9; version < I2000_SNAPSHOT_VERSION; version++) {
         old_snapshot(version, s->ram_size);
         s->ram[0x1234] = 0x5a;
@@ -451,13 +539,16 @@ static void test_snapshots(void) {
         CHECK(s->ram[0x1234] == 0x5a);
         CHECK(s->chipset.sac_ccsr == 0x12345678);
         CHECK(s->cpu->gr_static[8] == UINT64_C(0x123456789abcdef0));
-        CHECK(s->atapi_irq_pending && s->atapi_irq_asserted);
+        CHECK(irq15_requested(s));
         CHECK(irq(s, 0x60));
     }
     /* Rejected input did not overwrite the valid checkpoint. */
     CHECK(i2000_load_snapshot(s, "irq-current.vmstate"));
-    CHECK(s->atapi_device_control == 2 && !s->atapi_irq_asserted);
+    CHECK(!irq15_requested(s) && !irq(s, 0x60));
     CHECK(s->cpu->gr_static[8] == UINT64_C(0x123456789abcdef0));
+    io_port_write(s, 0x376, 0, 1);
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0x60));
     ia64_i2000_destroy(s);
 }
 static void pci_write(Ia64I2000State *s, unsigned bus, unsigned dev,
@@ -524,7 +615,7 @@ static void test_chipset_snapshot(void) {
 }
 /* Primary-channel ATA disk, as Windows' IDE driver uses it (GSI14). */
 static void ata_wait(Ia64I2000State *s) {
-    s->cpu->ninsts += ATAPI_IRQ_LATENCY_NINSTS;
+    s->cpu->ninsts += IDE_SETTLE_NINSTS;
     i2000_poll_interrupts(s);
 }
 static void ata_task(Ia64I2000State *s, uint8_t device, uint32_t lba,
@@ -542,11 +633,11 @@ static uint8_t ata_take_irq(Ia64I2000State *s) {
     ata_wait(s);
     CHECK(irq(s, 0x70));
     merced_ack_external(s->cpu, 0x70);
-    CHECK(s->ata_irq_pending);
+    CHECK(irq14_requested(s));
     uint8_t alt = (uint8_t)io_port_read(s, 0x3F6, 1);
-    CHECK(s->ata_irq_pending);               /* Alternate Status doesn't ack */
+    CHECK(irq14_requested(s));               /* Alternate Status doesn't ack */
     uint8_t st = (uint8_t)io_port_read(s, 0x1F7, 1);
-    CHECK(st == alt && !s->ata_irq_pending);
+    CHECK(st == alt && !irq14_requested(s));
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x70));
     return st;
@@ -591,10 +682,11 @@ static void test_ata(void) {
     s->cpu->cr[2] = 0;
     s->ram[0x48E] = 0;
     ata_task(s, 0xE0, 0, 1, 0x20);
-    CHECK(io_port_read(s, 0x1F7, 1) == 0x80 && s->ata_irq_pending);
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x80);
     ata_wait(s);
-    CHECK(s->ram[0x48E] == 0xFF && !s->ata_legacy_irq_latched && !irq(s, 0));
-    CHECK(io_port_read(s, 0x1F7, 1) == 0x58);
+    CHECK(s->ram[0x48E] == 0xFF && !irq(s, 0));
+    /* No PIC request outlives the Status read. */
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x58 && !irq14_requested(s));
     ata_read_sector(s, 0);
     /* Inside an IA-32 BIOS callback (PSR.is), even with a firmware IVA:
      * EFI enters those with PSR.i clear, so the BIOS's IRQ14 handler can't
@@ -604,8 +696,8 @@ static void test_ata(void) {
     s->ram[0x48E] = 0;
     ata_task(s, 0xE0, 1, 1, 0x20);
     ata_wait(s);
-    CHECK(s->ram[0x48E] == 0xFF && !s->ata_legacy_irq_latched && !irq(s, 0));
-    CHECK(io_port_read(s, 0x1F7, 1) == 0x58);
+    CHECK(s->ram[0x48E] == 0xFF && !irq(s, 0));
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x58 && !irq14_requested(s));
     ata_read_sector(s, 1);
     s->cpu->psr &= ~(UINT64_C(1) << 34);
     /* With a firmware IVA but IRQ14 still masked (reset PIC), the request
@@ -614,30 +706,28 @@ static void test_ata(void) {
     s->ram[0x48E] = 0;
     ata_task(s, 0xE0, 2, 1, 0x20);
     ata_wait(s);
-    CHECK(!irq(s, 0) && !s->ata_legacy_irq_latched &&
-          (io_port_read(s, 0xA0, 1) & 0x40));
-    CHECK(io_port_read(s, 0x1F7, 1) == 0x58 && !(io_port_read(s, 0xA0, 1) & 0x40));
+    CHECK(!irq(s, 0) && irq14_requested(s) && !cascade_requested(s));
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x58 && !irq14_requested(s));
     ata_read_sector(s, 2);
     /* Unmasked as EFI leaves it (slave IRQ6, master cascade IRQ2), the
      * legacy IRQ14 latch survives the Status read and is acknowledged as
      * slave PIC input 6. */
-    io_port_write(s, 0x21, 0xFB, 1);
-    io_port_write(s, 0xA1, 0xBF, 1);
+    pic_init(s, 0xFB, 0xBF);
     s->cpu->psr |= UINT64_C(1) << 14;              /* native code, PSR.i on */
     s->ram[0x48E] = 0;
     ata_task(s, 0xE0, 3, 1, 0x20);
-    s->cpu->ninsts += ATAPI_IRQ_LATENCY_NINSTS;
+    s->cpu->ninsts += IDE_SETTLE_NINSTS;
     CHECK(io_port_read(s, 0x1F7, 1) == 0x58);      /* delivers, then acks */
-    CHECK(s->ata_legacy_irq_latched && irq(s, 0) && !s->ata_irq_pending);
-    CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == s->pic_slave_base + 6u);
-    CHECK(!s->ata_legacy_irq_latched && s->ram[0x48E] == 0);
+    CHECK(irq14_requested(s) && irq(s, 0));
+    CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == PIC_SLAVE_BASE + 6u);
+    CHECK(!irq14_requested(s) && s->ram[0x48E] == 0);
     ata_read_sector(s, 3);
     /* Native code with PSR.i clear can't take it either: BIOS flag. */
     s->cpu->psr &= ~(UINT64_C(1) << 14);
     ata_task(s, 0xE0, 4, 1, 0x20);
     ata_wait(s);
-    CHECK(s->ram[0x48E] == 0xFF && !s->ata_legacy_irq_latched && !irq(s, 0));
-    CHECK(io_port_read(s, 0x1F7, 1) == 0x58);
+    CHECK(s->ram[0x48E] == 0xFF && !irq(s, 0));
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x58 && !irq14_requested(s));
     ata_read_sector(s, 4);
     s->cpu->cr[2] = 0;
     route_gsi(s, 14, 0x70);
@@ -649,7 +739,7 @@ static void test_ata(void) {
     for (unsigned i = 0; i < 256; i++) id[i] = (uint16_t)io_port_read(s, 0x1F0, 2);
     CHECK(id[0] == 0x0040 && (id[49] & 0x0200) && !(id[49] & 0x0100));
     CHECK(id[60] == sectors && id[61] == 0 && id[63] == 0 && id[88] == 0);
-    CHECK((id[47] & 0xFF) == ATA_MAX_MULTIPLE);
+    CHECK((id[47] & 0xFF) == ATA_DISK_MAX_MULTIPLE);
     CHECK(io_port_read(s, 0x1F7, 1) == 0x50);
     ata_wait(s);
     CHECK(!irq(s, 0x70));                    /* no interrupt after data-in */
@@ -659,9 +749,9 @@ static void test_ata(void) {
     CHECK(io_port_read(s, 0x1F7, 1) == 0 && io_port_read(s, 0x3F6, 1) == 0);
     io_port_write(s, 0x1F7, 0xEC, 1);
     ata_wait(s);
-    CHECK(!irq(s, 0x70) && !s->ata_irq_pending);
+    CHECK(!irq(s, 0x70));
     io_port_write(s, 0x1F6, 0xE0, 1);
-    CHECK(io_port_read(s, 0x1F7, 1) == 0x50);
+    CHECK(!irq14_requested(s) && io_port_read(s, 0x1F7, 1) == 0x50);
 
     /* An ATA disk aborts IDENTIFY PACKET DEVICE. */
     ata_task(s, 0xE0, 0, 0, 0xA1);
@@ -679,15 +769,15 @@ static void test_ata(void) {
 
     /* Multiple mode is on at power-up (firmware relies on it); disabled,
      * READ MULTIPLE aborts.  Then blocks of the SET MULTIPLE count. */
-    CHECK(s->ata_multiple == ATA_MAX_MULTIPLE && (id[59] & 0x1FF) == 0x100 + ATA_MAX_MULTIPLE);
+    CHECK((id[59] & 0x1FF) == 0x100 + ATA_DISK_MAX_MULTIPLE);
     ata_task(s, 0xE0, 0, 0, 0xC6);
-    CHECK(ata_take_irq(s) == 0x50 && s->ata_multiple == 0);
+    CHECK(ata_take_irq(s) == 0x50);
     ata_task(s, 0xE0, 0, 3, 0xC4);
     CHECK(ata_take_irq(s) == 0x51);
     ata_task(s, 0xE0, 0, 3, 0xC6);          /* 3 is not a power of two */
     CHECK(ata_take_irq(s) == 0x51);
     ata_task(s, 0xE0, 0, 2, 0xC6);
-    CHECK(ata_take_irq(s) == 0x50 && s->ata_multiple == 2);
+    CHECK(ata_take_irq(s) == 0x50);
     ata_task(s, 0xE0, 10, 5, 0xC4);
     for (uint32_t n = 10; n < 15;) {
         CHECK(ata_take_irq(s) == 0x58);
@@ -701,7 +791,7 @@ static void test_ata(void) {
     ata_task(s, 0xE0, 20, 2, 0x30);
     CHECK(io_port_read(s, 0x3F6, 1) == 0x58);
     ata_wait(s);
-    CHECK(!irq(s, 0x70) && !s->ata_irq_pending);
+    CHECK(!irq(s, 0x70) && !irq14_requested(s));
     ata_write_sector(s, 0x1000);
     CHECK(ata_take_irq(s) == 0x58);
     ata_write_sector(s, 0x1001);
@@ -741,7 +831,7 @@ static void test_ata(void) {
     io_port_write(s, 0x3F6, 2, 1);
     ata_task(s, 0xE0, 0, 1, 0x40);          /* READ VERIFY */
     ata_wait(s);
-    CHECK(!irq(s, 0x70) && s->ata_irq_pending);
+    CHECK(!irq(s, 0x70) && !irq14_requested(s));
     io_port_write(s, 0x3F6, 0, 1);
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x70));
@@ -758,14 +848,22 @@ static void test_ata(void) {
     ata_wait(s);
     CHECK(!irq(s, 0x70));
 
-    /* Current snapshot round trip preserves an outstanding ATA command. */
+    /* Current snapshot round trip preserves an outstanding ATA command and
+     * the multiple-mode block size; a software reset in between is undone. */
     ata_task(s, 0xE0, 0, 1, 0x40);
     s->cpu->gr_static[8] = UINT64_C(0x0fedcba987654321);
     CHECK(i2000_save_snapshot(s, "irq-current.vmstate"));
-    ata_clear_irq(s);
+    io_port_write(s, 0x3F6, 4, 1);
+    io_port_write(s, 0x3F6, 0, 1);
     CHECK(i2000_load_snapshot(s, "irq-current.vmstate"));
-    CHECK(s->ata_irq_pending && s->ata_multiple == 2);
     CHECK(s->cpu->gr_static[8] == UINT64_C(0x0fedcba987654321));
+    CHECK(ata_take_irq(s) == 0x50);
+    ata_task(s, 0xE0, 40, 3, 0xC4);          /* READ MULTIPLE, blocks of 2 */
+    CHECK(ata_take_irq(s) == 0x58);
+    ata_read_sector(s, 40); ata_read_sector(s, 41);
+    CHECK(ata_take_irq(s) == 0x58);
+    ata_read_sector(s, 42);
+    CHECK(io_port_read(s, 0x1F7, 1) == 0x50);
     ia64_i2000_destroy(s);
 }
 static void test_cf9_reset(void) {
@@ -785,7 +883,7 @@ static void test_cf9_reset(void) {
         route_gsi(s, 14, 0x70);
         route_gsi(s, 15, 0x60);
         identify(s);
-        CHECK(s->atapi_data && s->atapi_irq_pending);
+        CHECK(io_port_read(s, 0x376, 1) == 0x48 && irq15_requested(s));
         io_port_write(s, 0x376, 2, 1); /* IDE nIEN */
         bus_write(s, 0x100000, UINT64_C(0x0123456789abcdef), 8);
 
@@ -798,12 +896,14 @@ static void test_cf9_reset(void) {
         CHECK(s->chipset.chipset_cfg[0][0][0x44] == 0x80 &&
               s->chipset.chipset_cfg[0][0][0x45] == 6);
         CHECK(s->fw_shadow_enabled && s->cpu->ip == IA64_RESET_VECTOR);
-        CHECK(s->chipset.chipset_bus == 0xff && s->cmd649_cfg[0x10] == 1);
+        CHECK(s->chipset.chipset_bus == 0xff);
+        io_port_write(s, PCI_CFG_ADDR, UINT32_C(0x80001910), 4);
+        CHECK(io_port_read(s, PCI_CFG_DATA, 4) == 1);   /* IDE BAR reset */
         for (unsigned i = 0; i < 64; i++) CHECK(s->chipset.iosapic_rte[i] == I460GX_IOSAPIC_RTE_MASK);
-        CHECK(!s->atapi_data && !s->atapi_status_pending);
-        CHECK(!s->atapi_irq_pending && !s->atapi_device_control);
-        CHECK(s->atapi_status == 0x40 && s->atapi_lba_mid == 0x14 &&
-              s->atapi_lba_high == 0xeb);
+        /* The CD is idle with its signature, no request, nIEN clear (the
+         * IDENTIFY below interrupts). */
+        CHECK(io_port_read(s, 0x376, 1) == 0x40 && !irq15_requested(s));
+        CHECK(io_port_read(s, 0x174, 1) == 0x14 && io_port_read(s, 0x175, 1) == 0xeb);
         CHECK(bus_read(s, 0x100000, 8) == UINT64_C(0x0123456789abcdef));
         io_port_write(s, 0x177, 0xa1, 1);
         ready(s);
@@ -829,7 +929,7 @@ static void test_cf9_reset(void) {
 /* A reset clears device state, but must retain host-owned buffers and the
  * pending flash overlay, and RAM contents survive a monitor reset. */
 static void test_reset_snapshot(void) {
-    Ia64I2000State *s = machine();
+    Ia64I2000State *s = machine_with(true);   /* -device mouse */
     const uint64_t high = 0x100000;
     const uint64_t tail = 0x1000000;
     const uint64_t first_value = UINT64_C(0x0123456789abcdef);
@@ -837,13 +937,17 @@ static void test_reset_snapshot(void) {
     bus_write(s, high, first_value, 8);
     bus_write(s, tail, last_value, 8);
     snprintf(s->nvram_path, sizeof(s->nvram_path), "reset-nvram.bin");
-    s->mouse_enabled = true;
 
     for (unsigned reset = 0; reset < 2; reset++) {
-        s->mouse_streaming = true;
+        mouse_command(s, 0xf4);            /* enable data reporting */
+        CHECK(io_port_read(s, 0x60, 1) == 0xfa);
+        CHECK(mouse_streaming(s));
         i2000_reset(s, false);             /* monitor/display reset */
         CHECK(strcmp(s->nvram_path, "reset-nvram.bin") == 0);
-        CHECK(s->mouse_enabled && !s->mouse_streaming);
+        /* The mouse stays attached; the reset turned reporting off. */
+        io_port_write(s, 0x64, 0xa9, 1);   /* aux interface test */
+        CHECK(io_port_read(s, 0x60, 1) == 0x00);
+        CHECK(!mouse_streaming(s));
         CHECK(bus_read(s, high, 8) == first_value);
         CHECK(bus_read(s, tail, 8) == last_value);
 
