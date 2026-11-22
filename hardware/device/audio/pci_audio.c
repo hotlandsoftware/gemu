@@ -1,6 +1,7 @@
 /* Shared PCI/AC'97 plumbing. Controllers run from the machine clock; SDL
  * never reads guest RAM or mutates DMA/interrupt state. */
 #include "pci_audio.h"
+#include "bus/pci.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -224,3 +225,28 @@ bool pci_audio_io_access(PciAudio *s, bool write, uint16_t port, unsigned size, 
     }
     return true;
 }
+
+static bool pci_present_op(const void *d) {
+    return ((const PciAudio *)d)->model != PCI_AUDIO_NONE;
+}
+static uint32_t pci_cfg_read_op(const void *d, unsigned reg, unsigned size) {
+    return pci_audio_cfg_read((PciAudio *)d, reg, size);
+}
+static void pci_cfg_write_op(void *d, unsigned reg, unsigned size, uint32_t val) {
+    pci_audio_cfg_write(d, reg, size, val);
+}
+static bool pci_mem_claims_op(const void *d, uint64_t addr) {
+    return pci_audio_mem_claims(d, addr);
+}
+static bool pci_mem_access_op(void *d, bool write, uint64_t addr, unsigned size, uint64_t *val) {
+    return pci_audio_mem_access(d, write, addr, size, val);
+}
+static bool pci_io_access_op(void *d, bool write, uint16_t port, unsigned size, uint64_t *val) {
+    return pci_audio_io_access(d, write, port, size, val);
+}
+const PciFunctionOps pci_audio_pci_ops = {
+    .name = "PCI audio", .present = pci_present_op,
+    .cfg_read = pci_cfg_read_op, .cfg_write = pci_cfg_write_op,
+    .mem_claims = pci_mem_claims_op, .mem_access = pci_mem_access_op,
+    .io_access = pci_io_access_op,
+};

@@ -16,6 +16,7 @@
  * Behaviour that is not modelled is named once on stderr (unimpl), never
  * silently accepted. */
 #include "e100.h"
+#include "bus/pci.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -2189,3 +2190,38 @@ void e100_poll(E100 *n)
     rx_drain(n);
     update_irq(n);
 }
+
+bool e100_mem_claims(const E100 *n, uint64_t addr)
+{
+    uint64_t csr, csr_size, flash, flash_size, rom, rom_size;
+    if (e100_mem_ranges(n, &csr, &csr_size, &flash, &flash_size) &&
+        (addr - csr < csr_size || addr - flash < flash_size))
+        return true;
+    return e100_rom_range(n, &rom, &rom_size) && addr - rom < rom_size;
+}
+
+static uint32_t pci_cfg_read_op(const void *d, unsigned reg, unsigned size)
+{
+    return e100_cfg_read(d, reg, size);
+}
+static void pci_cfg_write_op(void *d, unsigned reg, unsigned size, uint32_t val)
+{
+    e100_cfg_write(d, reg, size, val);
+}
+static bool pci_mem_claims_op(const void *d, uint64_t addr)
+{
+    return e100_mem_claims(d, addr);
+}
+static bool pci_mem_access_op(void *d, bool write, uint64_t addr, unsigned size, uint64_t *val)
+{
+    return e100_mem_access(d, write, addr, size, val);
+}
+static bool pci_io_access_op(void *d, bool write, uint16_t port, unsigned size, uint64_t *val)
+{
+    return e100_io_access(d, write, port, size, val);
+}
+const PciFunctionOps e100_pci_ops = {
+    .name = "82559", .cfg_read = pci_cfg_read_op, .cfg_write = pci_cfg_write_op,
+    .mem_claims = pci_mem_claims_op, .mem_access = pci_mem_access_op,
+    .io_access = pci_io_access_op,
+};

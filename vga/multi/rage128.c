@@ -23,6 +23,7 @@
  * A register whose behaviour is not modelled is named the first time it is
  * accessed (r128_unimpl), never silently stored. */
 #include "rage128_internal.h"
+#include "bus/pci.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -1209,3 +1210,34 @@ bool rage128_scanout(Rage128 *r, uint32_t *fb, uint32_t fb_w, uint32_t fb_h,
     *y1 = dh;
     return true;
 }
+
+bool rage128_mem_claims(const Rage128 *r, uint64_t addr) {
+    uint64_t fb, fb_size, regs, regs_size, rom, rom_size;
+    bool mem = rage128_mem_ranges(r, &fb, &fb_size, &regs, &regs_size);
+    if (addr >= 0xA0000 && addr < 0xC0000)
+        return mem;                            /* legacy VGA window */
+    if (mem && (addr - fb < fb_size || addr - regs < regs_size))
+        return true;
+    return rage128_rom_range(r, &rom, &rom_size) && addr - rom < rom_size;
+}
+
+static uint32_t pci_cfg_read_op(const void *d, unsigned reg, unsigned size) {
+    return rage128_cfg_read(d, reg, size);
+}
+static void pci_cfg_write_op(void *d, unsigned reg, unsigned size, uint32_t val) {
+    rage128_cfg_write(d, reg, size, val);
+}
+static bool pci_mem_claims_op(const void *d, uint64_t addr) {
+    return rage128_mem_claims(d, addr);
+}
+static bool pci_mem_access_op(void *d, bool write, uint64_t addr, unsigned size, uint64_t *val) {
+    return rage128_mem_access(d, write, addr, size, val);
+}
+static bool pci_io_access_op(void *d, bool write, uint16_t port, unsigned size, uint64_t *val) {
+    return rage128_io_access(d, write, port, size, val);
+}
+const PciFunctionOps rage128_pci_ops = {
+    .name = "Rage 128", .cfg_read = pci_cfg_read_op, .cfg_write = pci_cfg_write_op,
+    .mem_claims = pci_mem_claims_op, .mem_access = pci_mem_access_op,
+    .io_access = pci_io_access_op,
+};

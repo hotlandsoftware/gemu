@@ -56,6 +56,9 @@ void pci_audio_poll(PciAudio *);
 uint32_t pci_audio_cfg_read(PciAudio *, unsigned reg, unsigned size);
 void pci_audio_cfg_write(PciAudio *, unsigned reg, unsigned size, uint32_t);
 bool pci_audio_mem_claims(const PciAudio *, uint64_t addr);
+/* The card's PCI function, present while a model is selected (bus/pci.h). */
+struct PciFunctionOps;
+extern const struct PciFunctionOps pci_audio_pci_ops;
 bool pci_audio_mem_access(PciAudio *, bool write, uint64_t, unsigned, uint64_t *);
 bool pci_audio_io_access(PciAudio *, bool write, uint16_t, unsigned, uint64_t *);
 const char *pci_audio_name(PciAudioModel);

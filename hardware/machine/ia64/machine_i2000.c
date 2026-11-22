@@ -1,5 +1,6 @@
 #include "i2000.h"
 #include "merced.h"
+#include "bus/pci.h"
 #include "chipset/i460gx.h"
 #include "controller/i8259.h"
 #include "i2c/at24.h"
@@ -292,6 +293,9 @@ struct Ia64I2000State {
     Lm87      hardware_monitor;
     uint8_t   ratio_latch;
     Cmd649    cmd649;            /* 00:03.1, owning the two IDE channels */
+    /* Bus 0's add-in functions (i2000_pci_wire()); the IFB's own functions
+     * and the chipset's buses are answered by i460gx_pci_read/write(). */
+    PciBus    pci;
     /* ide1-cd0 from the drive table (NULL = no drive configured; present
      * but !gemu_drive_inserted() = empty tray).  A pointer replacing the
      * old FILE *. The
@@ -670,18 +674,9 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
-    if (s->audio.model && bus == 0 && dev == AUDIO_PCI_DEV && fun == 0)
-        return pci_audio_cfg_read(&s->audio, reg, size);
-    if (s->video_enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
-        fun == 0 && reg + size <= sizeof(s->rage128.cfg))
-        return rage128_cfg_read(&s->rage128, reg, size);
-    if (s->nic_enabled && bus == 0 && dev == NIC_PCI_DEV && fun == 0 &&
-        reg + size <= 256) {
-        return e100_cfg_read(&s->nic, reg, size);
-    }
-    if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
-        reg + size <= sizeof(s->cmd649.cfg))
-        return cmd649_cfg_read(&s->cmd649, reg, size);
+    uint32_t card;
+    if (pci_bus_cfg_read(&s->pci, bus, dev, fun, reg, size, &card))
+        return card;
 
     uint64_t value;
     if (i460gx_pci_read(&s->chipset, bus, dev, fun, reg, size, &value))
@@ -703,25 +698,8 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
     unsigned dev = (a >> 11) & 0x1F;
     unsigned fun = (a >> 8) & 7;
     unsigned reg = (a & 0xFC) + lane;
-    if (s->audio.model && bus == 0 && dev == AUDIO_PCI_DEV && fun == 0) {
-        pci_audio_cfg_write(&s->audio, reg, size, val);
-        return;
-    }
-    if (s->video_enabled && bus == 0 && dev == RAGE128_PCI_DEV &&
-        fun == 0 && reg + size <= sizeof(s->rage128.cfg)) {
-        rage128_cfg_write(&s->rage128, reg, size, (uint32_t)val);
-        i2000_update_fast_ram(s);
-        return;
-    }
-    if (s->nic_enabled && bus == 0 && dev == NIC_PCI_DEV && fun == 0 &&
-        reg + size <= 256) {
-        e100_cfg_write(&s->nic, reg, size, (uint32_t)val);
-        i2000_update_fast_ram(s);
-        return;
-    }
-    if (bus == 0 && dev == CMD649_PCI_DEV && fun == CMD649_PCI_FUN &&
-        reg + size <= sizeof(s->cmd649.cfg)) {
-        cmd649_cfg_write(&s->cmd649, reg, size, (uint32_t)val);
+    if (pci_bus_cfg_write(&s->pci, bus, dev, fun, reg, size, (uint32_t)val)) {
+        i2000_update_fast_ram(s);              /* a BAR may have moved */
         return;
     }
     if (i460gx_pci_write(&s->chipset, bus, dev, fun, reg, val, size))
@@ -964,15 +942,10 @@ static void i2000_pic_reset(Ia64I2000State *s) {
 
 static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     uint64_t value;
-    if (port <= 0xffff && pci_audio_io_access(&s->audio, false, port, size, &value)) return value;
     if (i460gx_ifb_io_read(&s->chipset, 0, port, size, &value) ||
         i460gx_ifb_io_read(&s->chipset, 2, port, size, &value))
         return value;
-    if (s->video_enabled && port <= 0xFFFF &&
-        rage128_io_access(&s->rage128, false, (uint16_t)port, size, &value))
-        return value;
-    if (s->nic_enabled && port <= 0xFFFF &&
-        e100_io_access(&s->nic, false, (uint16_t)port, size, &value))
+    if (port <= 0xFFFF && pci_bus_io_access(&s->pci, false, (uint16_t)port, size, &value))
         return value;
     if (i460gx_ifb_io_read(&s->chipset, 3, port, size, &value))
         return value;
@@ -1058,15 +1031,10 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
 
 static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
                           unsigned size) {
-    if (port <= 0xffff && pci_audio_io_access(&s->audio, true, port, size, &val)) return;
     if (i460gx_ifb_io_write(&s->chipset, 0, port, val, size) ||
         i460gx_ifb_io_write(&s->chipset, 2, port, val, size))
         return;
-    if (s->video_enabled && port <= 0xFFFF &&
-        rage128_io_access(&s->rage128, true, (uint16_t)port, size, &val))
-        return;
-    if (s->nic_enabled && port <= 0xFFFF &&
-        e100_io_access(&s->nic, true, (uint16_t)port, size, &val))
+    if (port <= 0xFFFF && pci_bus_io_access(&s->pci, true, (uint16_t)port, size, &val))
         return;
     if (i460gx_ifb_io_write(&s->chipset, 3, port, val, size))
         return;
@@ -1244,68 +1212,41 @@ static inline void i2000_ram_copy(const void *src, void *dst, unsigned size) {
     }
 }
 
-/* Whether a PCI card decodes `addr` as memory: the display's legacy VGA
- * window, and the frame buffer, register, flash and ROM BARs of the display
- * and the LAN. DRAM has priority over a BAR: until firmware places one above
- * memory (a BAR left at its power-on zero, or placed over RAM), it decodes
- * nothing. The chipset's own space (I/O and local SAPICs, flash) at the top
- * of the 4 GiB map has priority too. */
+/* Whether a PCI card decodes `addr` as memory.  The legacy VGA window goes to
+ * the display card.  Otherwise DRAM has priority over a BAR: until firmware
+ * places one above memory (a BAR left at its power-on zero, or placed over
+ * RAM), it decodes nothing.  The chipset's own space (I/O and local SAPICs,
+ * flash) at the top of the 4 GiB map has priority too. */
 static bool i2000_card_claims(const Ia64I2000State *s, uint64_t addr) {
-    uint64_t a, a_size, b, b_size, rom, rom_size;
-    if (s->video_enabled && addr >= 0xA0000 && addr < 0xC0000)
-        return rage128_mem_ranges(&s->rage128, &a, &a_size, &b, &b_size);
+    if (addr >= 0xA0000 && addr < 0xC0000)
+        return pci_bus_mem_claims(&s->pci, addr);
     if (addr < s->ram_size || addr >= I460GX_IOSAPIC_BASE)
         return false;
-    if (pci_audio_mem_claims(&s->audio, addr)) return true;
-    if (s->video_enabled) {
-        if (rage128_mem_ranges(&s->rage128, &a, &a_size, &b, &b_size) &&
-            (addr - a < a_size || addr - b < b_size))
-            return true;
-        if (rage128_rom_range(&s->rage128, &rom, &rom_size) &&
-            addr - rom < rom_size)
-            return true;
-    }
-    if (s->nic_enabled) {
-        if (e100_mem_ranges(&s->nic, &a, &a_size, &b, &b_size) &&
-            (addr - a < a_size || addr - b < b_size))
-            return true;
-        if (e100_rom_range(&s->nic, &rom, &rom_size) &&
-            addr - rom < rom_size)
-            return true;
-    }
-    return false;
+    return pci_bus_mem_claims(&s->pci, addr);
 }
 
-/* Recompute the span of RAM that no device decodes. Devices take priority
- * over RAM in the bus decode, so the span ends at the lowest base address of
- * a PCI window that could fall in RAM. Call whenever such a BAR may have
- * changed. */
+/* The span of RAM no device decodes.  Since a BAR inside RAM decodes
+ * nothing (i2000_card_claims()), that's all of RAM above the first
+ * megabyte, whatever the cards' BARs say.  Called after config writes, as
+ * the JIT's direct pages must be refreshed if this ever changes. */
 #define I2000_FAST_RAM_BASE UINT64_C(0x100000)
 
 static void i2000_update_fast_ram(Ia64I2000State *s) {
-    uint64_t end = s->ram_size;
-    uint64_t a, a_size, b, b_size, rom, rom_size;
-    if (s->video_enabled) {
-        if (rage128_mem_ranges(&s->rage128, &a, &a_size, &b, &b_size)) {
-            if (a_size && a >= s->ram_size && a < end) end = a;
-            if (b_size && b >= s->ram_size && b < end) end = b;
-        }
-        if (rage128_rom_range(&s->rage128, &rom, &rom_size) &&
-            rom >= s->ram_size && rom < end)
-            end = rom;
-    }
-    if (s->nic_enabled) {
-        if (e100_mem_ranges(&s->nic, &a, &a_size, &b, &b_size)) {
-            if (a_size && a >= s->ram_size && a < end) end = a;
-            if (b_size && b >= s->ram_size && b < end) end = b;
-        }
-        if (e100_rom_range(&s->nic, &rom, &rom_size) &&
-            rom >= s->ram_size && rom < end)
-            end = rom;
-    }
-    s->fast_ram_end = end;
+    s->fast_ram_end = s->ram_size;
     if (s->cpu)
         merced_direct_ram_changed(s->cpu);
+}
+
+/* Bus 0's add-in functions.  Also after a state load, which brings the
+ * cards' state but not these pointers. */
+static void i2000_pci_wire(Ia64I2000State *s) {
+    pci_bus_init(&s->pci);
+    if (s->video_enabled)
+        pci_bus_add(&s->pci, 0, RAGE128_PCI_DEV, 0, &rage128_pci_ops, &s->rage128);
+    pci_bus_add(&s->pci, 0, CMD649_PCI_DEV, CMD649_PCI_FUN, &cmd649_pci_ops, &s->cmd649);
+    pci_bus_add(&s->pci, 0, AUDIO_PCI_DEV, 0, &pci_audio_pci_ops, &s->audio);
+    if (s->nic_enabled)
+        pci_bus_add(&s->pci, 0, NIC_PCI_DEV, 0, &e100_pci_ops, &s->nic);
 }
 
 /* An access wholly inside the plain-RAM span. The two scratch offsets are
@@ -1364,11 +1305,7 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
     addr = i2000_normalize_pa(s, addr);
     if (i2000_card_claims(s, addr)) {
         uint64_t v;
-        if ((s->video_enabled &&
-             rage128_mem_access(&s->rage128, false, addr, size, &v)) ||
-            (s->nic_enabled &&
-             e100_mem_access(&s->nic, false, addr, size, &v)) ||
-            pci_audio_mem_access(&s->audio, false, addr, size, &v))
+        if (pci_bus_mem_access(&s->pci, false, addr, size, &v))
             return v;
     }
     if (region6 && addr + size <= I2000_FLASH_BASE) {
@@ -1556,11 +1493,7 @@ static void bus_write(void *ud, uint64_t addr, uint64_t val, unsigned size) {
     bool region6 = (addr >> 60) == 0xC;
     addr = i2000_normalize_pa(s, addr);
     if (i2000_card_claims(s, addr) &&
-        ((s->video_enabled &&
-          rage128_mem_access(&s->rage128, true, addr, size, &val)) ||
-         (s->nic_enabled &&
-          e100_mem_access(&s->nic, true, addr, size, &val)) ||
-         pci_audio_mem_access(&s->audio, true, addr, size, &val)))
+        pci_bus_mem_access(&s->pci, true, addr, size, &val))
         return;
     if (region6 && addr + size <= I2000_FLASH_BASE) {
         uint32_t saved = s->pci_cfg_addr;
@@ -2221,7 +2154,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 47u   /* the 8042 and mouse as devices */
+#define I2000_SNAPSHOT_VERSION 48u   /* bus 0's functions on a PciBus */
 
 /* Version 40 ends Rage128 just before cce. Its following machine fields
  * keep their relative layout because the inserted state is 8-byte aligned. */
@@ -2265,6 +2198,7 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     memset(&snap->cd.ide, 0, sizeof(snap->cd.ide));
     memset(snap->ide_secondary.dev, 0, sizeof(snap->ide_secondary.dev));
     memset(snap->cmd649.channel, 0, sizeof(snap->cmd649.channel));
+    memset(&snap->pci, 0, sizeof(snap->pci));
     snap->kbc.kbd = NULL;
     snap->kbc.aux = NULL;
     snap->hda = NULL;
@@ -2435,6 +2369,7 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         s->pit.ud = s;
         i2000_uart_wire(s);
         i2000_kbc_wire(s);
+        i2000_pci_wire(s);
         s->pit_itc_mark = merced_get_time_base(s->cpu);
     }
     free(loaded_cpu);
@@ -3522,6 +3457,7 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     }
     PciAudioWiring audio_wiring = i2000_audio_wiring(s);
     pci_audio_init(&s->audio, cfg->sound, &audio_wiring);
+    i2000_pci_wire(s);
     if (cfg->sound)
         s->audio_out = gemu_audio_open_channels(pci_audio_name(cfg->sound), 48000, 2);
     /* PAL's MSR command port and cache arrays (merced_msr.c, merced_cache.c). */

@@ -125,6 +125,13 @@ bool rage128_mem_ranges(const Rage128 *r, uint64_t *fb_base, uint64_t *fb_size,
                         uint64_t *reg_base, uint64_t *reg_size);
 /* The same for the expansion ROM window; false unless it is enabled. */
 bool rage128_rom_range(const Rage128 *r, uint64_t *base, uint64_t *size);
+/* Whether the card decodes a memory address: its frame buffer, register and
+ * ROM BARs, and the legacy VGA window (A0000h-BFFFFh) while memory space is
+ * enabled. */
+bool rage128_mem_claims(const Rage128 *r, uint64_t addr);
+/* The card's PCI function: config space, memory and I/O (bus/pci.h). */
+struct PciFunctionOps;
+extern const struct PciFunctionOps rage128_pci_ops;
 
 /* Bring INTA# up to date with the raster (VBLANK/VLINE interrupts). Call
  * periodically; cheap when no interrupt is enabled. */

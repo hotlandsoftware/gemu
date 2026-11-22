@@ -29,6 +29,10 @@ void     cmd649_init(Cmd649 *c, IdeChannel *primary, IdeChannel *secondary);
 void     cmd649_reset(Cmd649 *c);
 uint32_t cmd649_cfg_read(const Cmd649 *c, unsigned reg, unsigned size);
 void     cmd649_cfg_write(Cmd649 *c, unsigned reg, unsigned size, uint32_t val);
+/* The function's config space on a PCI bus (bus/pci.h); its I/O is the
+ * legacy decode below, which the machine routes itself. */
+struct PciFunctionOps;
+extern const struct PciFunctionOps cmd649_pci_ops;
 
 /* Which channel and register (ide.h numbering) a legacy port is, or false
  * if the controller doesn't decode it. */

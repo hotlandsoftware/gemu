@@ -1,6 +1,5 @@
 <?xml version="1.0"?>
-<machine name="generic-ia64" media="hda,cdrom" ram-min="64M" ram-max="4G" family="ia64" description="Generic Itanium-compatible PC"
+<machine name="generic-ia64" media="cdrom" ram-min="64M" ram-max="4G" family="ia64" description="Generic Itanium-compatible PC"
         cpu="merced" ram="2G" status="preliminary" menu="disabled">
-    <rom name="GEMU_EFI.bin" addr="0x0000" sha256="2e6e13f599d13eaf4b30a4bfd2327dcc26b3b73df6c90f0ce2a38a98e6e3dda7"/>
     <description description="A generic Itanium-compatible computer, not based on any particular model. This machine is compatible with GEMU's custom EFI as well the custom EFI in syunnPC's qemu-system-ia64 fork (ia64-firmware.bin)."/>
 </machine>

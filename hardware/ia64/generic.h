@@ -28,21 +28,6 @@
  *                      | GENERIC_VGA_IO_BASE      |
  *   0x00000000C0000030 +--------------------------+
  *                      | open bus                 |
- *   0x00000000C0002000 +--------------------------+
- *                      | CD-ROM controller        | see GENERIC_CDROM_IO_BASE
- *   0x00000000C0002010 +--------------------------+
- *                      | open bus                 |
- *   0x00000000C0003000 +--------------------------+
- *                      | CD-ROM path buffer,      | see GENERIC_CDROM_PATH_BASE
- *                      | write-only, 128 bytes    |
- *   0x00000000C0003080 +--------------------------+
- *                      | open bus                 |
- *   0x00000000C0100000 +--------------------------+
- *                      | CD-ROM sector/chunk      | last sector or file
- *                      | buffer, read-only,       | chunk read by the
- *                      | 2048 bytes               | CD-ROM controller
- *   0x00000000C0100800 +--------------------------+
- *                      | open bus                 |
  *   0x00000000FFF00000 +--------------------------+
  *                      | firmware ROM (1 MiB,     |
  *                      | top-aligned so its last  |
@@ -100,81 +85,6 @@
  * every port we implement (COM1, ATAPI, PCI config) once sparse-encoded,
  * matching reference/qemu-system-ia64's IA64_PCI_IO_SIZE convention. */
 #define GENERIC_LEGACY_IO_SPARSE_SIZE 0x1000000ull
-
-/* CD-ROM controller: sector-at-a-time raw block access, plus a
- * file-by-path interface for the embedded El Torito EFI boot image
- * (see cdrom_open_file() in machine_generic_ia64.c - it's a FAT12 floppy
- * image, standard for Microsoft's IA-64 EFI install media of this era;
- * ISO 9660 + El Torito + FAT12 parsing all happen host-side in C, same
- * "our own firmware is the only client" reasoning as the rest of this
- * device: real EFI abstracts filesystem access behind a protocol too,
- * rather than making every OS loader speak FAT itself).
- *   +0x0  STATUS    (read-only)   bit 0 = media present
- *   +0x4  LBA       (write, 4B LE) sector number for CMD_READ_SECTOR
- *   +0x8  CMD       (write-only)  1 = read 2048 bytes at LBA into the
- *                                     buffer window (raw ISO sector)
- *                                 2 = open the file whose path was
- *                                     written to GENERIC_CDROM_PATH_BASE
- *                                     (null-terminated, e.g. "SETUPLDR.EFI")
- *                                 3 = read the next chunk (up to 2048
- *                                     bytes) of the file opened by CMD 2
- *                                     into the buffer window
- *   +0xC  RESULT    (read-only)   0 = last command ok, 1 = error
- *   +0x10 FILE_SIZE  (read-only, 4B) total size of the file opened by
- *                                    the last successful CMD 2
- *   +0x14 CHUNK_SIZE (read-only, 4B) valid byte count in the buffer
- *                                    window after the last CMD 3 (less
- *                                    than 2048 only for the final chunk)
- *   +0x18 PE_SRC     (write, 4B)   RAM address of an already-loaded raw
- *                                  PE32+/IA-64 file, for CMD 4
- *   +0x1C PE_DST     (write, 4B)   RAM address to place the PE image's
- *                                  sections at (firmware passes the
- *                                  image's own preferred ImageBase here,
- *                                  so no relocation is needed - see
- *                                  cdrom_load_pe_image() for why that's
- *                                  a safe simplification)
- *   +0x20 PE_ENTRY_RVA (read-only, 4B) RVA of the entry-point plabel,
- *                                      valid after a successful CMD 4
- * CMD 4 = parse the PE headers/section table at PE_SRC (already-loaded
- * raw file bytes) and copy each section to PE_DST + VirtualAddress,
- * zero-padding out to VirtualSize. This is "LoadImage()"-ish section
- * placement, not disk access, but it's the same kind of file-format
- * mechanics as the FAT12 work above, and far more reliable done once in
- * tested C than as a hand-unrolled assembly loop (see the whole point of
- * this device's design in the block comment above hardware/ia64/generic.h).
- * The result of the last READ/OPEN/chunk-read is memory-mapped
- * read-only at GENERIC_CDROM_BUF_BASE. */
-/* Hard disk: a raw, read-write image in 512-byte sectors (create one with
- * `qemu-img create -f raw disk.img 5G`, or just truncate(1) a file).  Same
- * "our own firmware is the only client" reasoning as the CD-ROM above - this
- * is deliberately not an ATA/ATAPI task-file register set, so an OS driver
- * will NOT find it; it exists so the firmware can read and write a disk.
- *   +0x0  STATUS  (ro)        bit 0 = an image is attached
- *   +0x4  LBA     (wo, 4B)    512-byte sector number for the next command
- *   +0x8  CMD     (wo)        1 = read that sector into the buffer window
- *                             2 = write the buffer window to that sector
- *   +0xC  RESULT  (ro)        0 = last command ok, 1 = error
- *   +0x10 SECTORS (ro, 4B)    image size in 512-byte sectors
- * The sector buffer is mapped read-write at GENERIC_HDD_BUF_BASE. */
-#define GENERIC_HDD_IO_BASE         0x00000000C0004000ull
-#define GENERIC_HDD_IO_SIZE         0x14u
-#define GENERIC_HDD_CMD_READ        1u
-#define GENERIC_HDD_CMD_WRITE       2u
-#define GENERIC_HDD_BUF_BASE        0x00000000C0005000ull
-#define GENERIC_HDD_SECTOR_SIZE     512u
-
-#define GENERIC_CDROM_IO_BASE       0x00000000C0002000ull
-#define GENERIC_CDROM_IO_SIZE       0x2Cu
-#define GENERIC_CDROM_CMD_READ      1u
-#define GENERIC_CDROM_CMD_OPEN      2u
-#define GENERIC_CDROM_CMD_READ_NEXT 3u
-#define GENERIC_CDROM_CMD_LOAD_PE   4u
-#define GENERIC_CDROM_CMD_READ_DMA  5u
-#define GENERIC_CDROM_BUF_BASE      0x00000000C0100000ull
-#define GENERIC_CDROM_BUF_SIZE      0x800u                        /* 2048 */
-#define GENERIC_CDROM_SECTOR_SIZE   2048u
-#define GENERIC_CDROM_PATH_BASE     0x00000000C0003000ull
-#define GENERIC_CDROM_PATH_SIZE     0x80u                          /* 128 */
 
 typedef struct {
     uint64_t        ram_size;

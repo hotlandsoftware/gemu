@@ -227,6 +227,11 @@ bool e100_mem_ranges(const E100 *n, uint64_t *csr_base, uint64_t *csr_size,
                      uint64_t *flash_base, uint64_t *flash_size);
 /* The same for the expansion ROM window; false unless it is enabled. */
 bool e100_rom_range(const E100 *n, uint64_t *base, uint64_t *size);
+/* Whether the card decodes a memory address: its CSR, flash and ROM BARs. */
+bool e100_mem_claims(const E100 *n, uint64_t addr);
+/* The card's PCI function: config space, memory and I/O (bus/pci.h). */
+struct PciFunctionOps;
+extern const struct PciFunctionOps e100_pci_ops;
 
 /* Bring the device up to date with wiring.clock: PHY link and auto-negotiation
  * timing, delayed CNA interrupts, flow-control pause timers, receiving from

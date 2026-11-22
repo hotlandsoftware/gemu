@@ -1,5 +1,6 @@
 /* CMD PCI-649 IDE controller: see cmd649.h. */
 #include "storage/cmd649.h"
+#include "bus/pci.h"
 #include <string.h>
 
 /* The BARs' fixed bits: I/O space (bit 0) and their sizes - 8 bytes for a
@@ -99,3 +100,13 @@ bool cmd649_io_write(Cmd649 *c, uint16_t port, unsigned size, uint64_t val) {
     ide_write(c->channel[ch], reg, val, size);
     return true;
 }
+
+static uint32_t pci_cfg_read_op(const void *d, unsigned reg, unsigned size) {
+    return cmd649_cfg_read(d, reg, size);
+}
+static void pci_cfg_write_op(void *d, unsigned reg, unsigned size, uint32_t val) {
+    cmd649_cfg_write(d, reg, size, val);
+}
+const PciFunctionOps cmd649_pci_ops = {
+    .name = "CMD PCI-649", .cfg_read = pci_cfg_read_op, .cfg_write = pci_cfg_write_op,
+};
