@@ -224,6 +224,41 @@ typedef struct {
     uint8_t  size;
 } MmioLogEnt;
 
+/* The board's interrupt lines: each device's output, where it reaches the
+ * 8259 pair (an IRQ, or -1 for none) and the I/O SAPIC (a GSI).  The GSIs
+ * of the PCI functions are where the firmware's PCI0._PRT puts them: 00:02
+ * INTA# (the Rage 128) at 39, 00:05 INTA# (the LAN) at 44, and, in its
+ * workstation branch, 00:04 INTA# (the CS4281) at 45.  The SCI's line is
+ * the chipset's choice at run time, so it isn't in the table. */
+typedef enum {
+    I2000_IRQ_PIT, I2000_IRQ_KBD, I2000_IRQ_RTC, I2000_IRQ_MOUSE,
+    I2000_IRQ_ATA, I2000_IRQ_ATAPI, I2000_IRQ_RAGE, I2000_IRQ_NIC,
+    I2000_IRQ_AUDIO, I2000_IRQS
+} I2000Irq;
+
+static const struct { const char *name; int8_t pic; uint8_t gsi; }
+i2000_irq_lines[I2000_IRQS] = {
+    [I2000_IRQ_PIT]   = { "timer",     0,  0 },
+    [I2000_IRQ_KBD]   = { "keyboard",  1,  1 },
+    [I2000_IRQ_RTC]   = { "rtc",      -1,  8 },
+    [I2000_IRQ_MOUSE] = { "mouse",    12, 12 },
+    [I2000_IRQ_ATA]   = { "ide0",     14, 14 },
+    [I2000_IRQ_ATAPI] = { "ide1",     15, 15 },
+    [I2000_IRQ_RAGE]  = { "rage128",  -1, 39 },
+    [I2000_IRQ_NIC]   = { "lan",      -1, 44 },
+    [I2000_IRQ_AUDIO] = { "audio",    -1, 45 },
+};
+
+/* A line's delivery state.  legacy: the request its legacy path latched
+ * into the 8259 pair, held until the INTA acknowledge.  sent/sent_valid:
+ * the edge last raised through its fixed I/O SAPIC vector, so one edge
+ * isn't raised twice (see i2000_irq_sapic_edge()). */
+typedef struct {
+    bool     legacy;
+    bool     sent_valid;
+    uint32_t sent;
+} I2000IrqState;
+
 struct Ia64I2000State {
     GemuMonitor *monitor;
     GemuDisplay *display;
@@ -355,14 +390,14 @@ struct Ia64I2000State {
     uint64_t key_next_itc;      /* earliest ITC for the next backlog tap */
     struct { int16_t dx, dy; bool left, right; } mouse_events[64];
     uint8_t  mouse_events_head, mouse_events_tail;
-    /* Legacy-ExtINT ack disambiguation (see the comment on
-     * I2000_LEGACY_ACK_ADDR's read handler): this firmware never touches
-     * an I/O SAPIC RTE for the mouse either (confirmed live), so IRQ12
-     * must be delivered the same legacy-8259/ExtINT way as the PIT's
-     * IRQ0 - which means the single shared ack address needs to know
-     * which of the two actually caused the pending ExtINT. */
-    bool     pit_irq_pending;
-    bool     mouse_irq_pending;
+    /* Interrupt delivery, per line (i2000_irq_lines[]). */
+    I2000IrqState irq[I2000_IRQS];
+    /* Bumped by each 8042 data-port read: the keyboard and mouse SAPIC edges
+     * (one per byte made available) are keyed on it. */
+    uint32_t kbc_data_reads;
+    /* An edge-triggered GSI8 gets one interrupt per rising edge of IRQ8:
+     * set by the edge, cleared once sent. */
+    bool     rtc_edge_pending;
     /* deferred multi-byte mouse-packet retry (see the ack handler's
      * mouse branch). Re-raising vector 0 synchronously, from within the same
      * legacy-ack dispatch that's still servicing the CURRENT byte, risks
@@ -400,30 +435,9 @@ struct Ia64I2000State {
     /* persistent writable flash overlay (the ROM itself stays clean). */
     char nvram_path[512];
     bool nvram_dirty;
-    /* legacy IRQ1 latch for queued 8042 keyboard/controller output. */
-    bool keyboard_irq_pending;
     /* reusable PS/2 keyboard device behind this machine's 8042. */
     Ps2Keyboard ps2_keyboard;
     uint64_t keyboard_retry_ninsts;
-    /* The CD's interrupt epoch last delivered through GSI15. */
-    uint32_t atapi_irq_delivered;
-    bool atapi_legacy_irq_latched;
-    /* keyboard IRQ1 output edge for an OS-programmed fixed GSI1
-     * vector; cleared by each 8042 data-port read. */
-    bool keyboard_gsi_asserted;
-    /* the primary-channel ATA disk as Windows' IDE driver drives it:
-     * an INTRQ latch (normal Status read acknowledges, Alternate Status
-     * doesn't, nIEN masks the output) delivered through GSI14, and PIO
-     * transfers in DRQ blocks of one sector, or SET MULTIPLE sectors. */
-    /* The disk's interrupt epoch last delivered (ata_deliver_irq()). */
-    uint32_t ata_irq_delivered;
-    /* the firmware's legacy IRQ14 (slave PIC input 6) for the disk,
-     * latched until its ExtINT acknowledge like the CD's IRQ15. */
-    bool ata_legacy_irq_latched;
-    /* aux IRQ12 output edge for an OS-programmed fixed GSI12 vector;
-     * cleared by each 8042 data-port read. Occupies what was padding
-     * before `chipset`, so the snapshot layout is unchanged. */
-    bool mouse_gsi_asserted;
 
     /* IFB power-management wiring. SCI is a level on the legacy line the IFB
      * routes it to; it reaches the CPU through that line's I/O SAPIC entry
@@ -446,6 +460,55 @@ static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
 static void i2000_reset(Ia64I2000State *s, bool warm);
 static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi);
 static void i2000_pic_raise(Ia64I2000State *s);
+
+/* Where a line's interrupt goes now, from its I/O SAPIC entry: the OS's
+ * fixed vector (delivery mode fixed or lowest priority); the firmware's
+ * legacy path through the 8259 pair (the entry still at its masked reset
+ * value, or ExtINT); or nowhere - an OS that masks its own vector must
+ * not get the interrupt through the legacy path instead. */
+typedef enum { I2000_ROUTE_NONE, I2000_ROUTE_SAPIC, I2000_ROUTE_LEGACY } I2000Route;
+static I2000Route i2000_route(const Ia64I2000State *s, I2000Irq line) {
+    uint64_t rte = s->chipset.iosapic_rte[i2000_irq_lines[line].gsi];
+    bool masked = (rte & I460GX_IOSAPIC_RTE_MASK) != 0;
+    unsigned mode = (unsigned)(rte >> 8) & 7;
+    if (!masked && mode <= 1)
+        return I2000_ROUTE_SAPIC;
+    if (rte == I460GX_IOSAPIC_RTE_MASK || (!masked && mode == 7))
+        return I2000_ROUTE_LEGACY;
+    return I2000_ROUTE_NONE;
+}
+
+/* Raise a line's GSI, whatever its entry says (iosapic_raise_gsi() applies
+ * it): the PCI functions' interrupts, one call per assertion. */
+static void i2000_irq_gsi(Ia64I2000State *s, I2000Irq line) {
+    iosapic_raise_gsi(s, i2000_irq_lines[line].gsi);
+}
+
+/* Raise a line's GSI once for each new `edge`: a value its source changes
+ * when it has a new interrupt to give (an IDE device's interrupt epoch,
+ * the 8042's data-port reads).  CPU acceptance isn't a new edge. */
+static void i2000_irq_sapic_edge(Ia64I2000State *s, I2000Irq line, uint32_t edge) {
+    I2000IrqState *q = &s->irq[line];
+    if (q->sent_valid && q->sent == edge)
+        return;
+    q->sent = edge;
+    q->sent_valid = true;
+    i2000_irq_gsi(s, line);
+}
+/* Take note of an edge without raising it (it went another way). */
+static void i2000_irq_edge_taken(Ia64I2000State *s, I2000Irq line, uint32_t edge) {
+    s->irq[line].sent = edge;
+    s->irq[line].sent_valid = true;
+}
+static bool i2000_irq_edge_sent(const Ia64I2000State *s, I2000Irq line, uint32_t edge) {
+    return s->irq[line].sent_valid && s->irq[line].sent == edge;
+}
+
+/* Latch a line's request into the 8259 pair (its legacy path). */
+static void i2000_irq_legacy(Ia64I2000State *s, I2000Irq line) {
+    s->irq[line].legacy = true;
+    i2000_pic_raise(s);
+}
 
 static int32_t mouse_accumulate_axis(int32_t pending, int delta) {
     if (!delta)
@@ -523,9 +586,8 @@ static void i2000_pit_out(void *ud, unsigned channel, bool level) {
     Ia64I2000State *s = ud;
     if (channel != 0 || !level)
         return;
-    iosapic_raise_gsi(s, 0);
-    s->pit_irq_pending = true;
-    i2000_pic_raise(s);
+    i2000_irq_gsi(s, I2000_IRQ_PIT);
+    i2000_irq_legacy(s, I2000_IRQ_PIT);
 }
 
 /* Advance the timer to the present ITC. */
@@ -630,14 +692,12 @@ static bool i2000_pic_irq_open(const Ia64I2000State *s, unsigned irq) {
  * saw it.)  nIEN, SRST and selecting the absent slave lower INTRQ. */
 static void ata_deliver_irq(Ia64I2000State *s) {
     uint32_t epoch = ata_disk_irq_epoch(&s->hd);
-    if (!ide_intrq(&s->ide_primary) || s->ata_irq_delivered == epoch)
+    if (!ide_intrq(&s->ide_primary) || i2000_irq_edge_sent(s, I2000_IRQ_ATA, epoch))
         return;
-    uint64_t rte = s->chipset.iosapic_rte[14];
-    if (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) <= 1) {
-        iosapic_raise_gsi(s, 14);
-        s->ata_irq_delivered = epoch;
-    } else if (rte == I460GX_IOSAPIC_RTE_MASK ||
-               (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) == 7)) {
+    I2000Route route = i2000_route(s, I2000_IRQ_ATA);
+    if (route == I2000_ROUTE_SAPIC) {
+        i2000_irq_sapic_edge(s, I2000_IRQ_ATA, epoch);
+    } else if (route == I2000_ROUTE_LEGACY) {
         if ((s->cpu->cr[2] == 0 || (s->cpu->psr & (UINT64_C(1) << 34)) ||
              !(s->cpu->psr & (UINT64_C(1) << 14))) &&
             s->ram_size > 0x48E) {
@@ -649,7 +709,7 @@ static void ata_deliver_irq(Ia64I2000State *s) {
              * (no partitions, so the Windows boot entry was "Not Found"),
              * and later a READ MULTIPLE block inside FPSWA.EFI ("Device
              * Error"). */
-            s->ata_irq_delivered = epoch;
+            i2000_irq_edge_taken(s, I2000_IRQ_ATA, epoch);
             /* The SDV's "BIOS CallBacks" disk path runs the IA-32 BIOS's
              * INT 13h with cr.iva zero, where GEMU delivers no external
              * interrupts (see i2000_efi_bios_key()).  That code polls the
@@ -659,9 +719,8 @@ static void ata_deliver_irq(Ia64I2000State *s) {
              * each, a multi-minute firmware boot). */
             s->ram[0x48E] = 0xFF;
         } else if (i2000_pic_irq_open(s, 14)) {
-            s->ata_irq_delivered = epoch;
-            s->ata_legacy_irq_latched = true;
-            i2000_pic_raise(s);
+            i2000_irq_edge_taken(s, I2000_IRQ_ATA, epoch);
+            i2000_irq_legacy(s, I2000_IRQ_ATA);
         }   /* masked: stays pending until unmasked or acknowledged */
     }
 }
@@ -809,15 +868,10 @@ static uint64_t i2000_rtc_clock(void *opaque) {
 }
 
 /* IRQ8 changed level. An assertion is also the IFB's RTC_STS event. */
-/* An edge-triggered IRQ8 entry gets one interrupt per rising edge; this is
- * set by the edge and cleared once it has been sent.  File-static, as
- * Ia64I2000State is snapshotted raw. */
-static bool i2000_rtc_edge_pending;
-
 static void i2000_rtc_irq(void *opaque, bool level) {
     Ia64I2000State *s = opaque;
     if (level && !s->rtc_irq)
-        i2000_rtc_edge_pending = true;
+        s->rtc_edge_pending = true;
     s->rtc_irq = level;
     if (level)
         i460gx_pm_rtc_alarm(&s->chipset);
@@ -916,14 +970,20 @@ static void i2000_rtc_initialise(Ia64I2000State *s) {
  * outlives a Status read until acknowledged.  The RTC's IRQ8 reaches the
  * processor only through the I/O SAPIC. */
 static void i2000_pic_sync(Ia64I2000State *s) {
-    I8259Pair *p = &s->pic;
-    i8259_pair_set_irq(p, 0, s->pit_irq_pending);
-    i8259_pair_set_irq(p, 1, s->keyboard_irq_pending);
-    i8259_pair_set_irq(p, 12, s->mouse_irq_pending &&
-                              s->mouse_wait_rfi_generation == 0 &&
-                              s->cpu->ninsts >= s->mouse_retry_ninsts);
-    i8259_pair_set_irq(p, 14, s->ata_legacy_irq_latched || ide_intrq(&s->ide_primary));
-    i8259_pair_set_irq(p, 15, s->atapi_legacy_irq_latched || ide_intrq(&s->ide_secondary));
+    for (unsigned line = 0; line < I2000_IRQS; line++) {
+        int irq = i2000_irq_lines[line].pic;
+        if (irq < 0)
+            continue;
+        bool level = s->irq[line].legacy;
+        if (line == I2000_IRQ_MOUSE)
+            level = level && s->mouse_wait_rfi_generation == 0 &&
+                    s->cpu->ninsts >= s->mouse_retry_ninsts;
+        else if (line == I2000_IRQ_ATA)
+            level = level || ide_intrq(&s->ide_primary);
+        else if (line == I2000_IRQ_ATAPI)
+            level = level || ide_intrq(&s->ide_secondary);
+        i8259_pair_set_irq(&s->pic, (unsigned)irq, level);
+    }
 }
 /* A device's legacy path asks for the processor: offer the pair's INT as an
  * ExtINT (vector 0) if it is asserting one. */
@@ -952,8 +1012,7 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
     if (port == 0x60 && size == 1) {               /* 8042 data */
         /* Consuming a byte ends the current IRQ1 edge; the next poll raises
          * a new one if another byte is waiting. */
-        s->keyboard_gsi_asserted = false;
-        s->mouse_gsi_asserted = false;
+        s->kbc_data_reads++;
         uint8_t v = i8042_read_data(&s->kbc);
         if (getenv("MOUSE_DEBUG"))
             fprintf(stderr, "MOUSE_DEBUG: port60 read -> %02x ninsts=%" PRIu64 "\n",
@@ -1340,24 +1399,25 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
         if (getenv("MOUSE_DEBUG"))
             fprintf(stderr, "MOUSE_DEBUG: ack read pit_pending=%d "
                     "mouse_pending=%d ninsts=%" PRIu64 "\n",
-                    s->pit_irq_pending, s->mouse_irq_pending, s->cpu->ninsts);
+                    s->irq[I2000_IRQ_PIT].legacy, s->irq[I2000_IRQ_MOUSE].legacy,
+                    s->cpu->ninsts);
         i2000_pic_sync(s);
         int irq;
         uint8_t vector = i8259_pair_ack(&s->pic, &irq);
         switch (irq) {
         case 0:
-            s->pit_irq_pending = false;
+            s->irq[I2000_IRQ_PIT].legacy = false;
             /* merced_ack_external() just cleared the ONE shared CPU-level
              * pending bit for vector 0, which both IRQ0 and IRQ12 share.
              * If IRQ12 is also still latched, don't re-raise synchronously
              * here - see the mouse branch below for why that corrupts the
-             * guest ISR. Just leave mouse_irq_pending set with its retry
+             * guest ISR. Just leave the mouse's legacy latch set with its retry
              * deadline (already scheduled by whichever aux_queue_byte()/ack
              * call set it) and let i2000_poll_interrupts() fire it once
              * that deadline passes. */
             break;
         case 1:
-            s->keyboard_irq_pending = false;
+            s->irq[I2000_IRQ_KBD].legacy = false;
             /* The SDV thunk performs several native/IA-32 rfi transitions
              * while servicing one byte, so the global rfi counter cannot
              * identify completion of this particular IRQ1.  Keep the next
@@ -1397,14 +1457,13 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
              * own known-safe 100000-instruction tick granularity. */
             s->mouse_wait_rfi_generation = merced_rfi_generation() + 1;
             s->mouse_retry_ninsts = UINT64_MAX;
-            if (!i8042_aux_pending(&s->kbc)) {
-                s->mouse_irq_pending = false;
-            }
+            if (!i8042_aux_pending(&s->kbc))
+                s->irq[I2000_IRQ_MOUSE].legacy = false;
             break;
         case 14:
-            if (!s->ata_legacy_irq_latched)
+            if (!s->irq[I2000_IRQ_ATA].legacy)
                 break;
-            s->ata_legacy_irq_latched = false;
+            s->irq[I2000_IRQ_ATA].legacy = false;
             ata_disk_clear_irq(&s->hd);
             if (getenv("ATA_DEBUG"))
                 fprintf(stderr, "i2000: ATA IRQ14 acknowledged vector=%#04x "
@@ -1412,9 +1471,9 @@ static uint64_t bus_read(void *ud, uint64_t addr, unsigned size) {
                         (unsigned)vector, s->cpu->ninsts);
             break;
         case 15:
-            if (!s->atapi_legacy_irq_latched)
+            if (!s->irq[I2000_IRQ_ATAPI].legacy)
                 break;
-            s->atapi_legacy_irq_latched = false;
+            s->irq[I2000_IRQ_ATAPI].legacy = false;
             atapi_cdrom_clear_irq(&s->cd);
             if (atapi_debug_enabled()) {
                 fprintf(stderr, "i2000: ATAPI IRQ15 acknowledged vector=%#04x "
@@ -1662,7 +1721,7 @@ static uint64_t i2000_rage_clock(void *opaque) {
 static void i2000_rage_irq(void *opaque, bool level) {
     Ia64I2000State *s = opaque;
     if (level)
-        iosapic_raise_gsi(s, 39);
+        i2000_irq_gsi(s, I2000_IRQ_RAGE);
 }
 
 /* The onboard LAN is a bus master: its descriptors and buffers are read and
@@ -1698,7 +1757,7 @@ static bool i2000_nic_dma_write(void *opaque, uint64_t addr, const void *buf,
 
 static void i2000_nic_irq(void *opaque, bool level) {
     if (level)
-        iosapic_raise_gsi(opaque, 44);
+        i2000_irq_gsi(opaque, I2000_IRQ_NIC);
 }
 
 /* The host side of the LAN (gemu/net.h).  File-static: Ia64I2000State is
@@ -1733,7 +1792,7 @@ static E100Wiring i2000_nic_wiring(Ia64I2000State *s) {
 /* PCI0._PRT's workstation branch routes 00:04 INTA# to GSI 45.
  * The CS4281 is a separate PCI function, not an IFB audio function. */
 static void i2000_audio_irq(void *opaque, bool level) {
-    if (level) iosapic_raise_gsi(opaque, 45);
+    if (level) i2000_irq_gsi(opaque, I2000_IRQ_AUDIO);
 }
 static bool i2000_audio_read(void *opaque, uint64_t addr, void *buf, unsigned len) {
     Ia64I2000State *s = opaque;
@@ -2154,7 +2213,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 48u   /* bus 0's functions on a PciBus */
+#define I2000_SNAPSHOT_VERSION 49u   /* interrupt lines as I2000IrqState */
 
 /* Version 40 ends Rage128 just before cce. Its following machine fields
  * keep their relative layout because the inserted state is 8-byte aligned. */
@@ -2446,30 +2505,13 @@ static GemuMonCmd i2000_cmd_input(GemuMonitor *mon, const char *args, void *ud) 
            " (now %" PRIu64 ")\n",
            (unsigned)(uint8_t)(s->key_backlog_tail - s->key_backlog_head),
            s->key_next_itc, merced_get_time_base(s->cpu));
-    gemu_monitor_printf(mon, "8042: command=%02X out=%u/%u aux=%u/%u "
-           "kbd=%u/%u irq1=%u retry=%" PRIu64 " ninsts=%" PRIu64 "\n",
-           s->kbc.command_byte,
-           s->kbc.out_pos, s->kbc.out_len,
-           s->mouse.out_pos, s->mouse.out_len,
-           s->ps2_keyboard.queue_pos, s->ps2_keyboard.queue_len,
-           s->keyboard_irq_pending, s->keyboard_retry_ninsts,
-           s->cpu->ninsts);
+    i8042_monitor_print(mon, &s->kbc);
+    gemu_monitor_printf(mon, "irq1: legacy=%u retry=%" PRIu64 " ninsts=%" PRIu64 "\n",
+           s->irq[I2000_IRQ_KBD].legacy, s->keyboard_retry_ninsts, s->cpu->ninsts);
     i2000_pit_run(s);
-    for (unsigned c = 0; c < 3; c++)
-        gemu_monitor_printf(mon, "PIT%u: mode=%u reload=%u count=%u out=%u "
-               "gate=%u\n", c, s->pit.ch[c].mode,
-               s->pit.ch[c].reload ? (unsigned)s->pit.ch[c].reload : 65536u,
-               (unsigned)s->pit.ch[c].count, s->pit.ch[c].out,
-               s->pit.ch[c].gate);
+    i8253_monitor_print(mon, &s->pit);
     gemu_monitor_printf(mon, "IRQ0: pending=%u mask=%02X\n",
-           s->pit_irq_pending, s->pic.master.imr);
-    if (ps2_keyboard_has_data(&s->ps2_keyboard)) {
-        gemu_monitor_printf(mon, "keyboard bytes:");
-        for (unsigned i = s->ps2_keyboard.queue_pos;
-             i < s->ps2_keyboard.queue_len; i++)
-            gemu_monitor_printf(mon, " %02X", s->ps2_keyboard.queue[i]);
-        gemu_monitor_printf(mon, "\n");
-    }
+           s->irq[I2000_IRQ_PIT].legacy, s->pic.master.imr);
     return GEMU_MON_NONE;
 }
 
@@ -2670,7 +2712,6 @@ static GemuMonCmd i2000_cmd_calls(GemuMonitor *mon, const char *args, void *ud) 
 static GemuMonCmd i2000_cmd_mousestate(GemuMonitor *mon, const char *args,
                                        void *ud) {
     Ia64I2000State *s = ud;
-    (void)mon;
     (void)args;
     fprintf(stderr, "i2000: ninsts=%" PRIu64 " ip=%016" PRIx64
             " psr=%016" PRIx64
@@ -2680,22 +2721,18 @@ static GemuMonCmd i2000_cmd_mousestate(GemuMonitor *mon, const char *args,
             s->cpu->cr[66] /* CR_TPR */,
             !!(s->cpu->cr[66] & (UINT64_C(1) << 16)));
     merced_dump_trace(s->cpu, 12, stderr);
-    fprintf(stderr, "i2000: mouse_enabled=%d mouse_streaming=%d "
-            "kbc_command_byte=%02x aux_out_len=%u aux_out_pos=%u "
-            "mouse_param_cmd=%02x mouse_prev_left=%d mouse_prev_right=%d "
-            "mouse_accum=(%d,%d) mouse_resolution=%u "
-            "mouse_sample_rate=%u kbc_out_len=%u "
-            "kbc_pending_write=%u\n",
-            s->mouse_enabled, s->mouse.streaming, s->kbc.command_byte,
-            s->mouse.out_len, s->mouse.out_pos, s->mouse.param_cmd,
-            s->mouse.left, s->mouse.right,
-            s->mouse_accum_dx, s->mouse_accum_dy, s->mouse.resolution,
-            s->mouse.sample_rate, s->kbc.out_len, s->kbc.pending_write);
-    fprintf(stderr, "i2000: iosapic_rte[12]=%016" PRIX64 " masked=%d "
+    fflush(stderr);
+    i8042_monitor_print(mon, &s->kbc);
+    gemu_monitor_printf(mon, "host mouse: attached=%d accum=(%d,%d) buttons=%s%s "
+            "events=%u retry=%" PRIu64 " wait_rfi=%" PRIu64 "\n",
+            s->mouse_enabled, s->mouse_accum_dx, s->mouse_accum_dy,
+            s->mouse_host_left ? "L" : "-", s->mouse_host_right ? "R" : "-",
+            (unsigned)((s->mouse_events_tail - s->mouse_events_head + 64) % 64),
+            s->mouse_retry_ninsts, s->mouse_wait_rfi_generation);
+    gemu_monitor_printf(mon, "iosapic_rte[12]=%016" PRIX64 " masked=%d "
             "pic_master_mask=%02x pic_slave_mask=%02x\n",
             s->chipset.iosapic_rte[12], !!(s->chipset.iosapic_rte[12] & I460GX_IOSAPIC_RTE_MASK),
             s->pic.master.imr, s->pic.slave.imr);
-    fflush(stderr);
     return GEMU_MON_NONE;
 }
 
@@ -2791,11 +2828,10 @@ static GemuMonCmd i2000_cmd_mousekick(GemuMonitor *mon, const char *args,
      * unread bytes, regardless of the empty->nonempty transition
      * aux_queue_byte()/the 0x60 read handler normally require. For
      * recovering a stuck backlog from an old snapshot saved before
-     * mouse_irq_pending existed, not part of the real device model. */
+     * the mouse's legacy latch existed, not part of the real device model. */
     if (i8042_aux_pending(&s->kbc) &&
         !(s->pic.slave.imr & 0x10) && !(s->pic.master.imr & 0x04)) {
-        s->mouse_irq_pending = true;
-        i2000_pic_raise(s);
+        i2000_irq_legacy(s, I2000_IRQ_MOUSE);
         gemu_monitor_printf(mon, "mousekick: re-raised (aux=%u/%u)\n",
                             s->mouse.out_pos, s->mouse.out_len);
     } else {
@@ -2931,26 +2967,6 @@ static GemuMonCmd i2000_cmd_faultstats(GemuMonitor *mon, const char *args,
     return GEMU_MON_NONE;
 }
 
-static GemuMonCmd i2000_cmd_atapistate(GemuMonitor *mon, const char *args,
-                                       void *ud) {
-    Ia64I2000State *s = ud;
-    (void)args;
-    const AtapiCdrom *d = &s->cd;
-    gemu_monitor_printf(mon, "atapi: status=%#04x error=%#04x count=%#04x "
-           "device=%#04x control=%#04x irq_pending=%u irq_delivered=%u "
-           "irq_ready=%" PRIu64 " status_pending=%u "
-           "status_ready=%" PRIu64 " ready_status=%#04x ready_irq=%u "
-           "data=%" PRIu64 "/%" PRIu64 " phase_end=%" PRIu64
-           " ninsts=%" PRIu64 "\n",
-           d->status, d->error, d->count, d->device, d->control,
-           d->irq_pending, s->atapi_irq_delivered == d->irq_epoch,
-           d->irq_ready_at, d->status_pending,
-           d->status_ready_at, d->ready_status,
-           d->ready_irq, (uint64_t)d->data_pos,
-           (uint64_t)d->data_len, (uint64_t)d->phase_end,
-           s->cpu->ninsts);
-    return GEMU_MON_NONE;
-}
 
 
 static GemuMonCmd i2000_cmd_ntsym(GemuMonitor *mon, const char *args, void *ud) {
@@ -2966,50 +2982,22 @@ static GemuMonCmd i2000_cmd_ntsym(GemuMonitor *mon, const char *args, void *ud) 
 
 static GemuMonCmd i2000_cmd_audio(GemuMonitor *mon, const char *args, void *ud) {
     Ia64I2000State *s = ud;
-    PciAudio *a = &s->audio;
     (void)args;
-    gemu_monitor_printf(mon, "audio: %s command=%04x BAR0=%08x BAR1=%08x irq=%u\n",
-        pci_audio_name(a->model), pci_audio_cfg_read(a, 4, 2),
-        pci_audio_cfg_read(a, 0x10, 4), pci_audio_cfg_read(a, 0x14, 4), a->irq_level);
-    gemu_monitor_printf(mon, "  frames=%" PRIu64 " nonzero=%" PRIu64
-        " dma_bytes=%" PRIu64 " interrupts=%" PRIu64
-        " master=%04x pcm=%04x host=%s queued=%u underruns=%u\n",
-        a->frames, a->nonzero_frames, a->dma_bytes, a->interrupts,
-        a->codec[1], a->codec[0x18 / 2], s->audio_out ? "open" : "closed",
+    pci_audio_monitor_print(mon, &s->audio);
+    gemu_monitor_printf(mon, "  host=%s queued=%u underruns=%u\n",
+        s->audio_out ? "open" : "closed",
         gemu_audio_queued(s->audio_out), gemu_audio_underruns(s->audio_out));
-    if (a->model == PCI_AUDIO_CS4281) {
-        for (unsigned c = 0; c < 4; c++)
-            gemu_monitor_printf(mon, "  dma%u mode=%08x control=%08x address=%08x count=%08x fifo=%08x\n",
-                c, a->u.cs.reg[(0x150 + c * 8) / 4], a->u.cs.reg[(0x154 + c * 8) / 4],
-                a->u.cs.reg[(0x110 + c * 16) / 4], a->u.cs.reg[(0x114 + c * 16) / 4],
-                a->u.cs.reg[(0x180 + c * 4) / 4]);
-    } else if (a->model == PCI_AUDIO_AC97) {
-        for (unsigned c = 0; c < 3; c++) {
-            IchAudioDma *d = &a->u.ich.dma[c];
-            gemu_monitor_printf(mon, "  dma%u bdl=%08x civ=%u lvi=%u remaining=%u status=%04x control=%02x\n",
-                c, d->bdbar, d->civ, d->lvi, d->remaining, d->status, d->command);
-        }
-    }
     return GEMU_MON_NONE;
 }
 
 static GemuMonCmd i2000_cmd_iosapic(GemuMonitor *mon, const char *args, void *ud) {
     Ia64I2000State *s = ud;
     (void)args;
-    for (unsigned i = 0; i < 64; i++) {
-        uint64_t rte = s->chipset.iosapic_rte[i];
-        if (rte == I460GX_IOSAPIC_RTE_MASK || rte == 0)
-            continue;
-        gemu_monitor_printf(mon, "gsi%-2u rte=%016" PRIX64 " vector=%02x mode=%u%s%s%s\n",
-                            i, rte, (unsigned)(uint8_t)rte, (unsigned)((rte >> 8) & 7),
-                            (rte & I460GX_IOSAPIC_RTE_MASK) ? " masked" : "",
-                            (rte & (UINT64_C(1) << 15)) ? " level" : " edge",
-                            (rte & (UINT64_C(1) << 13)) ? " low" : " high");
-    }
+    i460gx_monitor_print_iosapic(mon, &s->chipset);
     gemu_monitor_printf(mon, "pic masks master=%02x slave=%02x kbd_data=%d gsi1_asserted=%d\n",
                         s->pic.master.imr, s->pic.slave.imr,
                         i8042_kbd_pending(&s->kbc),
-                        s->keyboard_gsi_asserted);
+                        i2000_irq_edge_sent(s, I2000_IRQ_KBD, s->kbc_data_reads));
     gemu_monitor_printf(mon, "cpu psr.i=%u psr.ic=%u psr.is=%u eflags.if=%u cflg=%" PRIX64
                         " iva=%016" PRIX64 " tpr=%016" PRIX64
                         " lrr0=%016" PRIX64 " pending=%u in-service:",
@@ -3040,42 +3028,38 @@ static GemuMonCmd i2000_cmd_powerdown(GemuMonitor *mon, const char *args, void *
     return GEMU_MON_NONE;
 }
 
-static GemuMonCmd i2000_cmd_vgareg(GemuMonitor *mon, const char *args, void *ud) {
-    Ia64I2000State *s = ud;
-    (void)args;
-    gemu_monitor_printf(mon, "vga: misc=%02x text_mode=%d blanked=%d\n",
-                        s->vga.misc, vga_text_mode(&s->vga),
-                        vga_blanked(&s->vga));
-    gemu_monitor_printf(mon, "seq[0-7]:");
-    for (int i = 0; i < 8; i++) gemu_monitor_printf(mon, " %02x", s->vga.seq[i]);
-    gemu_monitor_printf(mon, "\ngc[0-15]:");
-    for (int i = 0; i < 16; i++) gemu_monitor_printf(mon, " %02x", s->vga.gc[i]);
-    gemu_monitor_printf(mon, "\ncrtc[0-31]:");
-    for (int i = 0; i < 32; i++) gemu_monitor_printf(mon, " %02x", s->vga.crtc[i]);
-    gemu_monitor_printf(mon, "\nattr[0-31]:");
-    for (int i = 0; i < 32; i++) gemu_monitor_printf(mon, " %02x", s->vga.attr[i]);
-    gemu_monitor_printf(mon, "\n");
-    gemu_monitor_printf(mon, "dac[0-15] (r,g,b):");
-    for (int i = 0; i < 16; i++)
-        gemu_monitor_printf(mon, " %02x%02x%02x", s->vga.dac[i * 3],
-                            s->vga.dac[i * 3 + 1], s->vga.dac[i * 3 + 2]);
-    gemu_monitor_printf(mon, "\ndac write index=%u sub=%u mask=%02x\n",
-                        s->vga.dac_idx, s->vga.dac_sub, s->vga.pixel_mask);
-    return GEMU_MON_NONE;
-}
 
-static GemuMonCmd i2000_cmd_vgapeek(GemuMonitor *mon, const char *args, void *ud) {
+/* monitor "irqs": the interrupt lines (A8's route table) and where each
+ * goes now. */
+static GemuMonCmd i2000_cmd_irqs(GemuMonitor *mon, const char *args, void *ud) {
     Ia64I2000State *s = ud;
-    unsigned plane, off, count;
-    if (sscanf(args, "%u %x %u", &plane, &off, &count) == 3 && plane < 4 &&
-        count <= 256 && off + count <= 0x10000) {
-        gemu_monitor_printf(mon, "vgapeek plane=%u off=0x%x:", plane, off);
-        for (unsigned i = 0; i < count; i++)
-            gemu_monitor_printf(mon, " %02x", s->vga.plane[plane][off + i]);
-        gemu_monitor_printf(mon, "\n");
-    } else {
-        gemu_monitor_printf(mon, "usage: vgapeek <plane 0-3> <hex offset> <count>\n");
+    static const char *const routes[] = { "none", "sapic", "legacy" };
+    (void)args;
+    i2000_pic_sync(s);
+    gemu_monitor_printf(mon, "line      irq gsi rte              route  legacy edge-sent\n");
+    for (unsigned line = 0; line < I2000_IRQS; line++) {
+        unsigned gsi = i2000_irq_lines[line].gsi;
+        const I2000IrqState *q = &s->irq[line];
+        char irq[8] = "-", sent[16] = "-";
+        if (i2000_irq_lines[line].pic >= 0)
+            snprintf(irq, sizeof irq, "%d", i2000_irq_lines[line].pic);
+        if (q->sent_valid)
+            snprintf(sent, sizeof sent, "%u", q->sent);
+        gemu_monitor_printf(mon, "%-9s %-3s %-3u %016" PRIX64 " %-6s %-6u %s\n",
+                            i2000_irq_lines[line].name, irq, gsi,
+                            s->chipset.iosapic_rte[gsi],
+                            i2000_irq_lines[line].pic < 0 &&
+                            i2000_route(s, (I2000Irq)line) == I2000_ROUTE_LEGACY
+                                ? "masked" : routes[i2000_route(s, (I2000Irq)line)],
+                            q->legacy, sent);
     }
+    gemu_monitor_printf(mon, "8259: irr %02x/%02x isr %02x/%02x imr %02x/%02x int=%u\n",
+                        s->pic.master.irr, s->pic.slave.irr,
+                        s->pic.master.isr, s->pic.slave.isr,
+                        s->pic.master.imr, s->pic.slave.imr, i8259_pair_intr(&s->pic));
+    gemu_monitor_printf(mon, "ide epochs: disk %u, cd %u; 8042 data reads %u; sci gsi %d level %u\n",
+                        ata_disk_irq_epoch(&s->hd), atapi_cdrom_irq_epoch(&s->cd),
+                        s->kbc_data_reads, s->sci_irq, s->sci_level);
     return GEMU_MON_NONE;
 }
 
@@ -3096,13 +3080,13 @@ static void i2000_monitor_setup(Ia64I2000State *s) {
     gemu_monitor_bind(mon, "dump",       i2000_cmd_dump, s);
     gemu_monitor_bind(mon, "vhptstats",  i2000_cmd_vhptstats, s);
     gemu_monitor_bind(mon, "faultstats", i2000_cmd_faultstats, s);
-    gemu_monitor_bind(mon, "atapistate", i2000_cmd_atapistate, s);
-    gemu_monitor_bind(mon, "vgareg",     i2000_cmd_vgareg, s);
+    atapi_cdrom_monitor_bind(mon, "atapistate", &s->cd);
+    vga_monitor_bind(mon, &s->vga);
+    gemu_monitor_bind(mon, "irqs",       i2000_cmd_irqs, s);
     gemu_monitor_bind(mon, "iosapic",    i2000_cmd_iosapic, s);
     gemu_monitor_bind(mon, "audio",      i2000_cmd_audio, s);
     gemu_monitor_bind(mon, "system_powerdown", i2000_cmd_powerdown, s);
     gemu_monitor_bind(mon, "ntsym",      i2000_cmd_ntsym, s);
-    gemu_monitor_bind(mon, "vgapeek",    i2000_cmd_vgapeek, s);
     gemu_monitor_set_memory(mon, &(GemuMonMemory){
         .read = i2000_mon_read, .write = i2000_mon_write, .ud = s,
         .addr_bits = 64, .big_endian = false });
@@ -3345,10 +3329,10 @@ static void i2000_devices_reset(Ia64I2000State *s, bool warm) {
     i2000_pit_reset(s);
     atapi_cdrom_reset(&s->cd);
     ide_reset(&s->ide_secondary);
-    s->atapi_legacy_irq_latched = false;
+    s->irq[I2000_IRQ_ATAPI].legacy = false;
     ata_disk_reset(&s->hd);
     ide_reset(&s->ide_primary);
-    s->ata_legacy_irq_latched = false;
+    s->irq[I2000_IRQ_ATA].legacy = false;
 
     cmd649_reset(&s->cmd649);
     spd_init(s);
@@ -3549,7 +3533,7 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
     ins8250_tick(&s->uart, 1);
     if (s->audio.model) {
         pci_audio_poll(&s->audio);
-        if (s->audio.irq_level) iosapic_raise_gsi(s, 45);
+        if (s->audio.irq_level) i2000_irq_gsi(s, I2000_IRQ_AUDIO);
     }
     if (s->nic_enabled)
         e100_poll(&s->nic);
@@ -3588,27 +3572,20 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * the next poll naturally reasserts it. */
     i2000_kbd_feed(s);
     bool kbd_data = i8042_kbd_pending(&s->kbc);
-    uint64_t kbd_rte = s->chipset.iosapic_rte[1];
-    bool kbd_fixed = !(kbd_rte & I460GX_IOSAPIC_RTE_MASK) &&
-                     ((kbd_rte >> 8) & 7) <= 1;
-    if (kbd_fixed) {
+    I2000Route kbd_route = i2000_route(s, I2000_IRQ_KBD);
+    if (kbd_route == I2000_ROUTE_SAPIC) {
         /* Windows' i8042 driver takes IRQ1 through the SAPIC vector it
          * programs into GSI1, not the firmware's legacy ExtINT thunk (the
          * PIC is masked by then).  Without this, keystrokes queued in the
          * 8042 were never signalled and text-mode Setup ignored Enter. */
-        if (kbd_data && !s->keyboard_gsi_asserted) {
-            iosapic_raise_gsi(s, 1);
-            s->keyboard_gsi_asserted = true;
-        }
-    } else if (kbd_data &&
-               (kbd_rte == I460GX_IOSAPIC_RTE_MASK ||
-                (!(kbd_rte & I460GX_IOSAPIC_RTE_MASK) && ((kbd_rte >> 8) & 7) == 7)) &&
+        if (kbd_data)
+            i2000_irq_sapic_edge(s, I2000_IRQ_KBD, s->kbc_data_reads);
+    } else if (kbd_data && kbd_route == I2000_ROUTE_LEGACY &&
                s->cpu->ninsts >= s->keyboard_retry_ninsts &&
                !(s->pic.master.imr & 0x02)) {
         /* The firmware's reset-RTE (or explicit ExtINT) legacy path.  An OS
          * that masks its own GSI1 vector must not get IRQ1 via the PIC. */
-        s->keyboard_irq_pending = true;
-        i2000_pic_raise(s);
+        i2000_irq_legacy(s, I2000_IRQ_KBD);
     }
     /* The single place that actually raises vector 0 on mouse's behalf -
      * covers both a brand new packet (aux_queue_byte() only queues bytes,
@@ -3621,8 +3598,8 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * mouse_retry_ninsts defaults to 0 (calloc'd), so a fresh packet with
      * no prior cooldown scheduled raises as soon as it's queued.
      *
-     * Deliberately does NOT gate on !mouse_irq_pending: the ack handler's
-     * retry case leaves mouse_irq_pending TRUE (on purpose, so ack
+     * Deliberately does NOT gate on the mouse's legacy latch: the ack handler's
+     * retry case leaves that latch set (on purpose, so ack
      * arbitration can still attribute the eventual ack to mouse) while it
      * still wants this loop to keep re-raising every time the retry
      * deadline is hit. merced_raise_external() is a plain OR of an
@@ -3630,26 +3607,19 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * instruction between the deadline and the guest actually taking it is
      * harmless, not a flood - mouse_retry_ninsts is the real rate limiter,
      * not this flag. */
-    uint64_t aux_rte = s->chipset.iosapic_rte[12];
-    bool aux_fixed = !(aux_rte & I460GX_IOSAPIC_RTE_MASK) &&
-                     ((aux_rte >> 8) & 7) <= 1;
-    if (aux_fixed) {
+    if (i2000_route(s, I2000_IRQ_MOUSE) == I2000_ROUTE_SAPIC) {
         /* Windows' i8042 driver takes IRQ12 through its own GSI12 vector,
          * like IRQ1 above; the PIC is masked by then.  Without this, the
          * first aux byte (e.g. the mouse's reset reply) was never signalled
          * and, sitting first in the shared output buffer, also starved the
          * keyboard.  The 8042 only drives IRQ12 with command-byte INT2 set. */
-        if (i8042_aux_pending(&s->kbc) && i8042_aux_irq_enabled(&s->kbc) &&
-            !s->mouse_gsi_asserted) {
-            iosapic_raise_gsi(s, 12);
-            s->mouse_gsi_asserted = true;
-        }
+        if (i8042_aux_pending(&s->kbc) && i8042_aux_irq_enabled(&s->kbc))
+            i2000_irq_sapic_edge(s, I2000_IRQ_MOUSE, s->kbc_data_reads);
     } else if (i8042_aux_pending(&s->kbc) &&
         s->cpu->ninsts >= s->mouse_retry_ninsts &&
         s->mouse_wait_rfi_generation == 0 &&
         !(s->pic.slave.imr & 0x10) && !(s->pic.master.imr & 0x04)) {
-        s->mouse_irq_pending = true;
-        i2000_pic_raise(s);
+        i2000_irq_legacy(s, I2000_IRQ_MOUSE);
     }
     /* SCI is level-triggered: present it through its I/O SAPIC entry again
      * after each acknowledgement until the handler clears the source. */
@@ -3671,20 +3641,21 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
     if (s->rtc_irq && s->cpu->ninsts >= s->rtc_retry_ninsts) {
         uint8_t vector;
         bool extint;
-        if (i460gx_interrupt(&s->chipset, 8, &vector, &extint) && !extint) {
-            if (i460gx_gsi_level(&s->chipset, 8)) {
+        unsigned gsi = i2000_irq_lines[I2000_IRQ_RTC].gsi;
+        if (i460gx_interrupt(&s->chipset, gsi, &vector, &extint) && !extint) {
+            if (i460gx_gsi_level(&s->chipset, gsi)) {
                 if (!merced_external_pending(s->cpu, vector)) {
-                    iosapic_raise_gsi(s, 8);
+                    i2000_irq_gsi(s, I2000_IRQ_RTC);
                     s->rtc_retry_ninsts = s->cpu->ninsts + SCI_REPRESENT_INSTS;
                 }
-            } else if (i2000_rtc_edge_pending) {
-                iosapic_raise_gsi(s, 8);
-                i2000_rtc_edge_pending = false;
+            } else if (s->rtc_edge_pending) {
+                i2000_irq_gsi(s, I2000_IRQ_RTC);
+                s->rtc_edge_pending = false;
             }
         }
     }
     /* Primary IDE (the -hda disk) uses GSI14; see ata_deliver_irq(). */
-    if (s->ata_legacy_irq_latched)
+    if (s->irq[I2000_IRQ_ATA].legacy)
         i2000_pic_raise(s);
     ata_deliver_irq(s);
     /* Secondary IDE uses GSI15. Windows installs a fixed SAPIC vector;
@@ -3694,26 +3665,19 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
     /* A PIC edge survives a device Status read until the legacy INTA
      * replacement cycle acknowledges it. Keep that ownership separately
      * from the device's INTRQ latch. */
-    if (s->atapi_legacy_irq_latched)
+    if (s->irq[I2000_IRQ_ATAPI].legacy)
         i2000_pic_raise(s);
     if (ide_intrq(&s->ide_secondary)) {
-        uint64_t rte = s->chipset.iosapic_rte[15];
-        uint32_t epoch = atapi_cdrom_irq_epoch(&s->cd);
-        if (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) <= 1) {
-            if (s->atapi_irq_delivered != epoch) {
-                iosapic_raise_gsi(s, 15);
-                s->atapi_irq_delivered = epoch;
-            }
-        } else if (rte == I460GX_IOSAPIC_RTE_MASK ||
-                   (!(rte & I460GX_IOSAPIC_RTE_MASK) && ((rte >> 8) & 7) == 7)) {
+        I2000Route route = i2000_route(s, I2000_IRQ_ATAPI);
+        if (route == I2000_ROUTE_SAPIC) {
+            i2000_irq_sapic_edge(s, I2000_IRQ_ATAPI, atapi_cdrom_irq_epoch(&s->cd));
+        } else if (route == I2000_ROUTE_LEGACY) {
             /* Preserve the firmware's reset-RTE ExtINT path. Masking a
              * configured OS vector must not fall back to a legacy IRQ, and
              * a PIC-masked IRQ15 isn't delivered either: EFI masks it and
              * polls the CD. */
-            if (i2000_pic_irq_open(s, 15)) {
-                s->atapi_legacy_irq_latched = true;
-                i2000_pic_raise(s);
-            }
+            if (i2000_pic_irq_open(s, 15))
+                i2000_irq_legacy(s, I2000_IRQ_ATAPI);
         }
     }
 }

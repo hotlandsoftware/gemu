@@ -45,3 +45,7 @@ void    i8253_tick(I8253 *p, uint32_t ticks);
 
 void    i8253_set_gate(I8253 *p, unsigned ch, bool level);
 bool    i8253_out(const I8253 *p, unsigned ch);
+
+/* Monitor output (the device's _mon.c, linked with the monitor). */
+struct GemuMonitor;
+void i8253_monitor_print(struct GemuMonitor *mon, const I8253 *p);

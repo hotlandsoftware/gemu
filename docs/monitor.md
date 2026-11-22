@@ -217,8 +217,11 @@ Run `help` on any machine for the authoritative list; the machines each command 
 | `service` | vssmb, vsskatekids | press the service button |
 | `mouse`, `mousemove`, `mouseclear`, `mousestate` | um6578, asobou, czdf1 (`mousemove`, `mousestate` also i2000) | drive a synthetic mouse |
 | `key`, `trace`, `history`, `calls`, `dump`, `vhptstats`, `faultstats` | i2000, generic-ia64 | IA-64 debugging |
-| `input`, `panel`, `mousekick`, `atapistate` | i2000 | i2000 debugging |
-| `regpoke`, `vgareg`, `vgapeek` | generic-ia64 | generic IA-64 debugging |
+| `atapistate` | i2000, generic-ia64 | ATAPI CD-ROM state (the device's own) |
+| `vgareg`, `vgapeek` | i2000, generic-ia64 | VGA registers / plane bytes (on the i2000, the Rage 128's VGA core) |
+| `input`, `panel`, `mousekick`, `iosapic`, `audio` | i2000 | i2000 debugging: keyboard controller, PIT and key backlog; front panel; I/O SAPIC, PIC and CPU interrupt state; sound card and host audio |
+| `irqs` | i2000 | the interrupt lines: each one's 8259 input, GSI, I/O SAPIC entry, current route (sapic, legacy, none), legacy latch and last edge sent, plus the 8259 registers |
+| `regpoke` | generic-ia64 | generic IA-64 debugging |
 | `disas [addr] [count]` / `u` | atari2600 | disassemble, with TIA/RIOT register names and symbols |
 | `tia`, `riot` | atari2600 | chip state: registers, object positions, collisions; timer and ports |
 | `frame [n]`, `scanline [n]`, `breakline <n> \| off` | atari2600 | run n frames / scanlines then stop; stop when the beam reaches a scanline |

@@ -92,7 +92,7 @@ static GemuMonCmd cmd_set_link(GemuMonitor *, const char *);
 static const MonCmdDef mon_cmds[] = {
     /* name          aliases         params                        help */
     { "atapistate",  NULL,           "",
-      "show ATAPI controller state", "i2000", NULL, 0 },
+      "show ATAPI CD-ROM state", M_IA64, NULL, 0 },
     { "audio",       NULL,           "",
       "show PCI audio, DMA and host output state", "i2000", NULL, 0 },
     { "autoreload",  NULL,           "[on | off]",
@@ -151,6 +151,8 @@ static const MonCmdDef mon_cmds[] = {
       "show keyboard controller and PIT state", "i2000", NULL, 0 },
     { "iosapic",     NULL,           "",
       "show programmed I/O SAPIC redirection entries", "i2000", NULL, 0 },
+    { "irqs",        NULL,           "",
+      "show the interrupt lines: 8259 input, GSI, route, latches", "i2000", NULL, 0 },
     { "key",         NULL,           "<key|text>",
       "inject a key (up, down, enter, ctrl-alt-delete, ...) or type text", M_IA64, NULL, 0 },
     { "loadvm",      NULL,           "<file>",

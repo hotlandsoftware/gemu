@@ -118,3 +118,9 @@ bool vga_blit_ex(Vga *vg, uint32_t *fb, uint32_t fb_w, uint32_t fb_h,
 bool vga_planes_dirty(const Vga *vg);
 /* Changes exactly when a register the renderer reads changes. */
 uint64_t vga_render_key(const Vga *vg);
+
+/* Monitor output (the device's _mon.c, linked with the monitor). */
+struct GemuMonitor;
+/* "vgareg" (registers and the first DAC entries) and "vgapeek" (plane
+ * bytes). */
+void vga_monitor_bind(struct GemuMonitor *mon, Vga *v);

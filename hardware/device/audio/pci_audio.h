@@ -77,3 +77,7 @@ void ich_audio_reset(PciAudio *);
 uint8_t ich_audio_read(PciAudio *, unsigned);
 void ich_audio_write(PciAudio *, unsigned, uint8_t);
 bool ich_audio_frame(PciAudio *, float out[2]);
+
+/* Monitor output (the device's _mon.c, linked with the monitor). */
+struct GemuMonitor;
+void pci_audio_monitor_print(struct GemuMonitor *mon, PciAudio *a);

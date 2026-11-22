@@ -1322,6 +1322,7 @@ Ia64GenericState *ia64_generic_create(const GenericConfig *cfg) {
         });
         s->ide.dev[0] = &s->cd.ide;
         ide_reset(&s->ide);
+        atapi_cdrom_monitor_bind(s->monitor, "atapistate", &s->cd);
     }
 
     s->serial_listen_fd = GENERIC_INVALID_SOCK;

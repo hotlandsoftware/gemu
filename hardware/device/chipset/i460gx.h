@@ -196,3 +196,8 @@ bool i460gx_flash_access(I460GX *s, bool write, uint64_t addr, unsigned size,
 /* The image range the firmware programmed or erased since the last call, as
  * offsets into the board's flash; false when nothing changed. */
 bool i460gx_flash_take_changes(I460GX *s, uint32_t *offset, uint32_t *length);
+
+/* Monitor output (the device's _mon.c, linked with the monitor). */
+struct GemuMonitor;
+/* The I/O SAPIC entries that aren't at a reset value. */
+void i460gx_monitor_print_iosapic(struct GemuMonitor *mon, const I460GX *s);

@@ -49,3 +49,8 @@ bool    i8042_aux_pending(const I8042 *k);
 bool    i8042_aux_irq_enabled(const I8042 *k);
 /* Nothing waiting anywhere. */
 bool    i8042_empty(const I8042 *k);
+
+/* Monitor output (the device's _mon.c, linked with the monitor). */
+struct GemuMonitor;
+/* The controller, its keyboard's queue and the mouse. */
+void i8042_monitor_print(struct GemuMonitor *mon, const I8042 *k);

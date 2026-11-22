@@ -76,3 +76,9 @@ void atapi_cdrom_poll(AtapiCdrom *d);
 uint32_t atapi_cdrom_irq_epoch(const AtapiCdrom *d);
 /* Drop a pending interrupt, as a Status read does, without the read. */
 void atapi_cdrom_clear_irq(AtapiCdrom *d);
+
+/* Monitor output (the device's _mon.c, linked with the monitor). */
+struct GemuMonitor;
+void atapi_cdrom_monitor_print(struct GemuMonitor *mon, const AtapiCdrom *d);
+/* A command that prints it, under `name`. */
+void atapi_cdrom_monitor_bind(struct GemuMonitor *mon, const char *name, AtapiCdrom *d);
