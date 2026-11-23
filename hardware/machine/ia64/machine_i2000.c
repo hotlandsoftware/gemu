@@ -3,6 +3,7 @@
 #include "bus/pci.h"
 #include "chipset/i460gx.h"
 #include "controller/i8259.h"
+#include "controller/pc_sysctl.h"
 #include "i2c/at24.h"
 #include "i2c/i2c.h"
 #include "i2c/itanium_cart.h"
@@ -12,6 +13,7 @@
 #include "storage/atapi_cdrom.h"
 #include "storage/cmd649.h"
 #include "storage/ide.h"
+#include "timer/clock_div.h"
 #include "timer/i8253.h"
 #include "timer/mc146818.h"
 #include "input_menu.h"
@@ -297,16 +299,15 @@ struct Ia64I2000State {
     bool      con_dirty;
 
     /* devices */
-    uint8_t   post_code;
     bool      legacy_irq_routed;
     /* Interval timer, clocked at 1.193182 MHz from the ITC: its state is
-     * brought up to date from the ITC whenever it is accessed or polled.
-     * port61 is the system-control port B latch (bit 0 gates channel 2). */
+     * brought up to date from the ITC whenever it is accessed or polled. */
     I8253     pit;
-    uint64_t  pit_itc_mark;      /* ITC value the timer was last advanced to */
-    uint64_t  pit_remainder;     /* leftover ITC ticks x 1193182 */
-    uint64_t  pit_clock;         /* PIT clocks since reset */
-    uint8_t   port61;
+    ClockDiv  pit_div;           /* ITC -> timer input clocks */
+    uint64_t  pit_clock;         /* timer input clocks since reset */
+    /* Port 61h (channel 2's gate and output, the refresh toggle) and the
+     * POST port, 80h. */
+    PcSysctl  sysctl;
     /* The IFB's 8259 pair.  Its lines come from the devices' legacy
      * interrupt state (i2000_pic_sync()); its INT reaches the processor as
      * an ExtINT, and the INTA cycles are the read of I2000_LEGACY_ACK_ADDR. */
@@ -592,16 +593,7 @@ static void i2000_pit_out(void *ud, unsigned channel, bool level) {
 
 /* Advance the timer to the present ITC. */
 static void i2000_pit_run(Ia64I2000State *s) {
-    uint64_t now = merced_get_time_base(s->cpu);
-    if (now < s->pit_itc_mark) {            /* the ITC was set backwards */
-        s->pit_itc_mark = now;
-        return;
-    }
-    uint64_t scaled = (now - s->pit_itc_mark) * I8254_INPUT_HZ +
-                      s->pit_remainder;
-    s->pit_itc_mark = now;
-    s->pit_remainder = scaled % I2000_ITC_HZ;
-    uint64_t clocks = scaled / I2000_ITC_HZ;
+    uint64_t clocks = clock_div_advance(&s->pit_div, merced_get_time_base(s->cpu));
     s->pit_clock += clocks;
     while (clocks) {
         uint32_t step = clocks > UINT32_MAX ? UINT32_MAX : (uint32_t)clocks;
@@ -614,27 +606,12 @@ static void i2000_pit_reset(Ia64I2000State *s) {
     s->pit.out_changed = i2000_pit_out;
     s->pit.ud = s;
     i8253_reset(&s->pit);
-    i8253_set_gate(&s->pit, 2, false);      /* port 61h bit 0 is clear */
-    s->pit_itc_mark = s->cpu ? merced_get_time_base(s->cpu) : 0;
-    s->pit_remainder = 0;
+    pc_sysctl_init(&s->sysctl, &s->pit);    /* channel 2 ungated */
+    clock_div_init(&s->pit_div, I2000_ITC_HZ, I8254_INPUT_HZ,
+                   s->cpu ? merced_get_time_base(s->cpu) : 0);
     s->pit_clock = 0;
-    s->port61 = 0;
 }
 
-/* System control port B (61h): bit 0 gates channel 2, bit 1 is the speaker
- * enable, bit 4 the refresh toggle (about every 15 us) and bit 5 channel
- * 2's output. */
-static uint8_t i2000_port61_read(Ia64I2000State *s) {
-    i2000_pit_run(s);
-    return (uint8_t)((s->port61 & 0x0F) | (((s->pit_clock / 18) & 1) << 4) |
-                     (i8253_out(&s->pit, 2) ? 0x20 : 0));
-}
-
-static void i2000_port61_write(Ia64I2000State *s, uint8_t value) {
-    i2000_pit_run(s);
-    s->port61 = value & 0x0F;
-    i8253_set_gate(&s->pit, 2, value & 1);
-}
 
 static uint64_t size_mask(unsigned size) {
     return size >= 8 ? ~0ull : (1ull << (size * 8)) - 1;
@@ -1057,8 +1034,12 @@ static uint64_t io_port_read(Ia64I2000State *s, uint64_t port, unsigned size) {
         i2000_pit_run(s);
         return i8253_io_read(&s->pit, port);
     }
-    if (port == 0x61 && size == 1)
-        return i2000_port61_read(s);
+    if (port == 0x61 && size == 1) {
+        uint8_t v;
+        i2000_pit_run(s);
+        pc_sysctl_io_read(&s->sysctl, (uint16_t)port, s->pit_clock, &v);
+        return v;
+    }
     unsigned ide_ch, ide_reg;
     if (port <= 0xFFFF && cmd649_decode(&s->cmd649, (uint16_t)port, &ide_ch, &ide_reg)) {
         /* A ready disk interrupt reaches the PIC/SAPIC before the Status
@@ -1150,7 +1131,7 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         return;
     }
     if (port == POST_PORT) {
-        s->post_code = (uint8_t)val;
+        pc_sysctl_io_write(&s->sysctl, (uint16_t)port, (uint8_t)val);
         return;
     }
     if (port >= 0x40 && port <= 0x43 && size == 1) {
@@ -1159,7 +1140,8 @@ static void io_port_write(Ia64I2000State *s, uint64_t port, uint64_t val,
         return;
     }
     if (port == 0x61 && size == 1) {
-        i2000_port61_write(s, (uint8_t)val);
+        i2000_pit_run(s);
+        pc_sysctl_io_write(&s->sysctl, (uint16_t)port, (uint8_t)val);
         return;
     }
     if (port <= 0xFFFF && cmd649_io_write(&s->cmd649, (uint16_t)port, size, val))
@@ -1954,7 +1936,7 @@ static void panel_render(Ia64I2000State *s) {
 
     panel_text(s, 0, 0, C_TITLE,
                "HP i2000 - Intel Itanium (Merced) - GEMU front panel");
-    snprintf(line, sizeof(line), "POST %02X", s->post_code);
+    snprintf(line, sizeof(line), "POST %02X", s->sysctl.post);
     panel_text(s, COLS - 8, 0, C_TITLE, line);
 
     snprintf(line, sizeof(line),
@@ -2213,7 +2195,7 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
  * host-ABI-dependent; changes to its layout require a new version.
  * Version 31 separates the 460GX state and intentionally rejects old saves. */
 #define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 49u   /* interrupt lines as I2000IrqState */
+#define I2000_SNAPSHOT_VERSION 50u   /* pc_sysctl and the PIT's ClockDiv */
 
 /* Version 40 ends Rage128 just before cce. Its following machine fields
  * keep their relative layout because the inserted state is 8-byte aligned. */
@@ -2258,6 +2240,7 @@ static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
     memset(snap->ide_secondary.dev, 0, sizeof(snap->ide_secondary.dev));
     memset(snap->cmd649.channel, 0, sizeof(snap->cmd649.channel));
     memset(&snap->pci, 0, sizeof(snap->pci));
+    snap->sysctl.pit = NULL;
     snap->kbc.kbd = NULL;
     snap->kbc.aux = NULL;
     snap->hda = NULL;
@@ -2429,7 +2412,8 @@ static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
         i2000_uart_wire(s);
         i2000_kbc_wire(s);
         i2000_pci_wire(s);
-        s->pit_itc_mark = merced_get_time_base(s->cpu);
+        s->sysctl.pit = &s->pit;
+        clock_div_rebase(&s->pit_div, merced_get_time_base(s->cpu));
     }
     free(loaded_cpu);
     if (ok && version >= 39) {
@@ -4028,7 +4012,7 @@ static void i2000_reset(Ia64I2000State *s, bool warm) {
     s->halted = false;
     s->reset_requested = false;
     s->fw_shadow_enabled = false;
-    s->post_code = 0;
+    s->sysctl.post = 0;
     s->legacy_irq_routed = false;
     i2000_pic_reset(s);
     i2000_devices_reset(s, warm);
