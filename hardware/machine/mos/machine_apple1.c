@@ -250,8 +250,11 @@ static void apple1_display_clear(Apple1Display *d) {
     d->dirty = true;
 }
 
+static void apple1_pia_setup(Apple1State *s);
+
 static void apple1_reset_machine(Apple1State *s) {
     mos6502_reset(&s->cpu);
+    apple1_pia_setup(s);
     s->native_monitor = !s->have_monitor_rom;
     s->quit_requested = false;
     apple1_display_clear(s->display);
@@ -442,18 +445,25 @@ static bool apple1_screendump(void *ud, const char *path) {
     return ok;
 }
 
+/* A key reaches the PIA: its code on port A and a strobe on CA1, which sets
+ * CRA bit 7 until the program reads the key.  The next key waits until then. */
+static bool apple1_key_waiting(const Apple1State *s) {
+    return (s->pia.cra & 0x80u) != 0;
+}
+static void apple1_key_strobe(Apple1State *s, uint8_t key) {
+    s->key_data = key;
+    pia6821_set_ca1(&s->pia, true);
+    pia6821_set_ca1(&s->pia, false);
+}
+
 static void apple1_poll_keyboard(Apple1State *s) {
     apple1_poll_input_devices(s);
-    if (s->display && !s->key_ready && apple1_display_key_available(s->display)) {
-        s->key_data = apple1_normalize_key(apple1_display_read_key(s->display));
-        s->key_ready = true;
-    }
+    if (s->display && !apple1_key_waiting(s) && apple1_display_key_available(s->display))
+        apple1_key_strobe(s, apple1_normalize_key(apple1_display_read_key(s->display)));
 
     GemuSerial *ser = s->cfg->serial;
-    if (ser && !s->key_ready && ser->key_available(ser->ud)) {
-        s->key_data = apple1_normalize_key(ser->read_byte(ser->ud));
-        s->key_ready = true;
-    }
+    if (ser && !apple1_key_waiting(s) && ser->key_available(ser->ud))
+        apple1_key_strobe(s, apple1_normalize_key(ser->read_byte(ser->ud)));
 }
 
 static void apple1_write_display(Apple1State *s, uint8_t val) {
@@ -479,6 +489,37 @@ static void apple1_write_display(Apple1State *s, uint8_t val) {
     else {
         putchar(val);
         fflush(stdout);
+    }
+}
+
+/* The PIA's wiring: port A reads the keyboard latch; port B's outputs are
+ * the display's character; PB7, the display's busy line, reads 0 (the
+ * display takes characters as fast as they come). */
+static uint8_t apple1_pia_read_pa(void *ud) {
+    return ((Apple1State *)ud)->key_data;
+}
+static uint8_t apple1_pia_read_pb(void *ud) {
+    (void)ud;
+    return 0;
+}
+static void apple1_pia_write_pb(void *ud, uint8_t val) {
+    apple1_write_display(ud, val);
+}
+
+/* Reset the PIA.  Without a monitor ROM the native monitor stands in for
+ * the Woz monitor, so leave the PIA as its reset code does: PB0-6 outputs
+ * (DDRB $7F), and both control registers $A7 (output registers selected,
+ * CA1/CB1 active on the rising edge). */
+static void apple1_pia_setup(Apple1State *s) {
+    s->pia.read_pa = apple1_pia_read_pa;
+    s->pia.read_pb = apple1_pia_read_pb;
+    s->pia.write_pb = apple1_pia_write_pb;
+    s->pia.ud = s;
+    pia6821_init(&s->pia);
+    if (!s->have_monitor_rom) {
+        pia6821_write(&s->pia, 2, 0x7F);
+        pia6821_write(&s->pia, 1, 0xA7);
+        pia6821_write(&s->pia, 3, 0xA7);
     }
 }
 
@@ -846,15 +887,8 @@ static uint8_t apple1_read(uint16_t addr, void *ud) {
     Apple1State *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
 
-    if (addr == APPLE1_KBD) {
-        uint8_t v = s->key_ready ? s->key_data : 0;
-        s->key_ready = false;
-        return v;
-    }
-    if (addr == APPLE1_KBDCR)
-        return s->key_ready ? 0x80u : 0x00u;
-    if (addr == APPLE1_DSPCR)
-        return 0x80u;
+    if (addr >= APPLE1_KBD && addr <= APPLE1_DSPCR)
+        return pia6821_read(&s->pia, addr & 3u);
 
     if (!s->rom_map[addr] && addr >= s->ram_size)
         return 0x00u;
@@ -865,12 +899,10 @@ static void apple1_write(uint16_t addr, uint8_t val, void *ud) {
     Apple1State *s = ud;
     gemu_monitor_check_write(s->monitor, addr);
 
-    if (addr == APPLE1_DSP) {
-        apple1_write_display(s, val);
+    if (addr >= APPLE1_KBD && addr <= APPLE1_DSPCR) {
+        pia6821_write(&s->pia, addr & 3u, val);
         return;
     }
-    if (addr >= APPLE1_KBD && addr <= APPLE1_DSPCR)
-        return;
 
     if (!s->rom_map[addr] && addr < s->ram_size)
         s->mem[addr] = val;
@@ -881,9 +913,10 @@ static void apple1_write(uint16_t addr, uint8_t val, void *ud) {
 static bool apple1_mon_read(void *ud, uint64_t addr, uint8_t *val) {
     Apple1State *s = ud;
     if (addr > 0xFFFF) return false;
-    if (addr == APPLE1_KBD)   { *val = s->key_ready ? s->key_data : 0; return true; }
-    if (addr == APPLE1_KBDCR) { *val = s->key_ready ? 0x80u : 0x00u;   return true; }
-    if (addr == APPLE1_DSPCR) { *val = 0x80u; return true; }
+    if (addr >= APPLE1_KBD && addr <= APPLE1_DSPCR) {
+        *val = pia6821_peek(&s->pia, (unsigned)addr & 3u);
+        return true;
+    }
     *val = apple1_peek_mem(s, (uint16_t)addr);
     return true;
 }
@@ -1003,6 +1036,7 @@ Apple1State *apple1_create(const MosConfig *cfg) {
         apple1_destroy(s);
         return NULL;
     }
+    apple1_pia_setup(s);
     if (!s->have_monitor_rom) {
         s->native_monitor = true;
         fprintf(stderr,

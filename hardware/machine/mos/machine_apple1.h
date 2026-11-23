@@ -1,6 +1,7 @@
 #pragma once
 #include "mos6502.h"
 #include "mos6502cfg.h"
+#include "controller/pia6821.h"
 #include "gemu/monitor.h"
 #include "gemu/serial.h"
 #include <stdint.h>
@@ -23,11 +24,14 @@ typedef struct Apple1State {
     char             mon_line[128];
     int              mon_len;
     uint16_t         mon_last_addr;
+    /* The 6821 at $D010-$D013: the keyboard on port A (a key's code, bit 7
+     * set, latched in key_data; its strobe on CA1), the display on port B
+     * (PB0-6 the character, PB7 busy). */
+    Pia6821          pia;
     uint8_t          key_data;
     bool             have_monitor_rom;
     bool             native_monitor;
     bool             quit_requested;
-    bool             key_ready;
 } Apple1State;
 
 Apple1State *apple1_create (const MosConfig *cfg);

@@ -228,6 +228,8 @@ TESTS = [
     dict(name='cmd649', family=None, kind='device', src='tests/cmd649.c',
          links=['hardware/device/storage/cmd649.c', 'hardware/device/storage/ide.c'],
          cflags='-Werror'),
+    dict(name='pia6821', family=None, kind='device', src='tests/pia6821.c',
+         links=['hardware/device/controller/pia6821.c'], cflags='-Werror'),
     dict(name='pc_sysctl', family=None, kind='device', src='tests/pc_sysctl.c',
          links=['hardware/device/controller/pc_sysctl.c', 'hardware/device/timer/i8253.c'],
          cflags='-Werror'),
