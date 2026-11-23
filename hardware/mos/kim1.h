@@ -1,4 +1,5 @@
 #pragma once
+#include "controller/m6530.h"
 #include "mos6502.h"
 #include "mos6502cfg.h"
 #include "gemu/monitor.h"
@@ -100,18 +101,6 @@
 
 #define KIM1_NUM_ACTIONS  23
 
-/* ── Per-6530 state ──────────────────────────────────────────────────────── */
-
-typedef struct {
-    uint8_t  pa, pb;
-    uint8_t  ddra, ddrb;
-    uint8_t  reload;        /* 8-bit countdown load value */
-    uint16_t prescale;      /* 1, 8, 64, or 1024 */
-    bool     irq_en;        /* true = drive CPU IRQ line on underflow */
-    bool     running;
-    bool     irq_flag;
-    uint64_t next_fire;     /* cpu cycle count at timer underflow */
-} Kim1Rriot;
 
 typedef struct Kim1State {
     Mos6502          cpu;
@@ -120,9 +109,11 @@ typedef struct Kim1State {
     uint8_t          rom_002[1024];
     uint8_t          rom_003[1024];
 
-    Kim1Rriot        u2;
-    Kim1Rriot        u3;
-    uint8_t          rriot_ram[128];
+    /* The two 6530s: -003 (I/O $1700, RAM $1780) for the application
+     * ports, -002 (I/O $1740, RAM $17C0) for the display, keypad and tape.
+     * Their ROMs are rom_002/rom_003 above. */
+    M6530            rriot_003;
+    M6530            rriot_002;
 
     /* Display */
     uint8_t          seg_cache[KIM1_NUM_DIGITS]; /* segment patterns cached from Port A/B writes */

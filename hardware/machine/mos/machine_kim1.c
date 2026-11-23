@@ -62,7 +62,7 @@ static const GemuActionDef kim1_actions[KIM1_NUM_ACTIONS] = {
 };
 
 /* ── Hardware keyboard matrix (4 rows × 6 columns) ──────────────────────── *
- * Row selected by 74145 decoder (PB1-PB4 of u3): decoder values 0-3 = rows.
+ * Row selected by 74145 decoder (PB1-PB4 of the 6530-002): decoder values 0-3 = rows.
  * Columns read on PA0-PA5 (active-low when key pressed).
  *
  *        PA0      PA1      PA2      PA3      PA4       PA5
@@ -358,11 +358,11 @@ static uint32_t kim1_raw_key_to_action(uint32_t cp) {
  * PC is redirected to $1C4F (MONITR entry) after either op.
  */
 
-#define TAPE_SAL  (s->rriot_ram[0x75])
-#define TAPE_SAH  (s->rriot_ram[0x76])
-#define TAPE_EAL  (s->rriot_ram[0x77])
-#define TAPE_EAH  (s->rriot_ram[0x78])
-#define TAPE_ID   (s->rriot_ram[0x79])
+#define TAPE_SAL  (s->rriot_002.ram[0x35])   /* $17F5 */
+#define TAPE_SAH  (s->rriot_002.ram[0x36])   /* $17F6 */
+#define TAPE_EAL  (s->rriot_002.ram[0x37])   /* $17F7 */
+#define TAPE_EAH  (s->rriot_002.ram[0x38])   /* $17F8 */
+#define TAPE_ID   (s->rriot_002.ram[0x39])   /* $17F9 */
 
 static void tape_ok(Kim1State *s) {
     s->ram[0xFA] = 0x00;
@@ -889,35 +889,59 @@ static void kim1_render_fb(Kim1State *s) {
 
 /* ── 6530 timer helpers ─────────────────────────────────────────────────── */
 
-/* irq_en (set by $0C-$0F writes) controls whether irq_flag drives cpu.irq. */
-static void rriot_update_irq(Kim1State *s) {
-    s->cpu.irq = (s->u2.irq_flag && s->u2.irq_en)
-              || (s->u3.irq_flag && s->u3.irq_en);
+/* The 6530s' IRQ outputs are wired-OR onto the CPU's IRQ. */
+static void kim1_rriot_irq(void *ud) {
+    Kim1State *s = ud;
+    s->cpu.irq = m6530_irq(&s->rriot_002) || m6530_irq(&s->rriot_003);
 }
 
-/* Live 8-bit count: counts down from reload to 0 (underflow), then wraps
- * to $FF and continues freely. */
-static uint8_t rriot_current_count(const Kim1Rriot *r, uint64_t cycle) {
-    if (!r->running) return r->reload;
-    if (cycle < r->next_fire)
-        return (uint8_t)((r->next_fire - cycle - 1u) / r->prescale);
-    /* post-underflow: wraps $00 → $FF → $FE … */
-    return (uint8_t)(-(uint8_t)((cycle - r->next_fire) / r->prescale));
+/* 6530-002 port A: the keypad's columns (PA0-PA5, active low) for the row
+ * the 74145 decoder selects from PB1-PB4 (values 0-3); PA7 is the TTY's
+ * break line, high when idle. */
+static uint8_t kim1_keypad_read(void *ud) {
+    Kim1State *s = ud;
+    uint8_t in = 0xFFu;
+    int dec = (s->rriot_002.pb >> 1) & 0x0F;
+    if (dec <= 3) {
+        for (int col = 0; col < 6; col++) {
+            uint32_t bit = hw_keymap[dec][col];
+            if (bit && (s->keypad_held & bit))
+                in &= (uint8_t)~(1u << col);
+        }
+    }
+    return in;
 }
 
-static void rriot_timer_tick(Kim1Rriot *r, Kim1State *s) {
-    if (!r->running || r->irq_flag) return;
-    if (s->cpu.cycle_count < r->next_fire) return;
-    r->irq_flag = true;
-    rriot_update_irq(s);
+/* Port B inputs read low on both chips. */
+static uint8_t kim1_rriot_pb_read(void *ud) {
+    (void)ud;
+    return 0;
 }
 
-static void rriot_timer_start(Kim1Rriot *r, Kim1State *s) {
-    r->running  = true;
-    r->irq_flag = false;
-    rriot_update_irq(s);
-    uint64_t period = (uint64_t)(r->reload ? r->reload : 256u) * r->prescale;
-    r->next_fire = s->cpu.cycle_count + period;
+/* 6530-002 PA: segment data for the digit PB1-PB4 selects through the
+ * 74145 (values 4-9 are LEDs 1-6). */
+static void kim1_segments_write(void *ud, uint8_t val) {
+    Kim1State *s = ud;
+    int dec = (s->rriot_002.pb >> 1) & 0x0F;
+    if (dec >= 4 && dec <= 9) {
+        s->seg_cache[dec - 4] = val;
+        s->display_dirty = true;
+    }
+}
+/* 6530-002 PB: a new digit selected latches the current PA into it. */
+static void kim1_digit_select(void *ud, uint8_t val) {
+    Kim1State *s = ud;
+    int dec = (val >> 1) & 0x0F;
+    if (dec >= 4 && dec <= 9) {
+        s->seg_cache[dec - 4] = s->rriot_002.pa;
+        s->display_dirty = true;
+    }
+}
+
+/* The 6530 RAM at $1780-$17FF: -003's at $1780, -002's at $17C0. */
+static uint8_t *kim1_rriot_ram(Kim1State *s, uint16_t a) {
+    return a < 0x17C0u ? &s->rriot_003.ram[a - 0x1780u]
+                       : &s->rriot_002.ram[a - 0x17C0u];
 }
 
 /* ── 6530 RRIOT reset state ─────────────────────────────────────────────── */
@@ -931,21 +955,27 @@ static void kim1_reset_rriots(Kim1State *s) {
     s->kim_saved_pc = 0x0000u;
     s->kim_running_user = false;
 
-    /* 6530-003 (u2, addr 0x1700): application I/O */
-    s->u2 = (Kim1Rriot){0};
-    s->u2.prescale = 1;
-    s->u2.irq_flag = true;
+    s->rriot_003.read_pb = kim1_rriot_pb_read;
+    s->rriot_003.irq_changed = kim1_rriot_irq;
+    s->rriot_003.ud = s;
+    s->rriot_002.read_pa = kim1_keypad_read;
+    s->rriot_002.read_pb = kim1_rriot_pb_read;
+    s->rriot_002.write_pa = kim1_segments_write;
+    s->rriot_002.write_pb = kim1_digit_select;
+    s->rriot_002.irq_changed = kim1_rriot_irq;
+    s->rriot_002.ud = s;
+    m6530_reset(&s->rriot_003);
+    m6530_reset(&s->rriot_002);
 
-    /* 6530-002 (u3, addr 0x1740): LED display / keyboard / tape.
-     * PB0=1 (TTY idle-high), DDRB=$3F (PB0-PB5 outputs).
-     * irq_flag=true so the monitor's first BIT $1747 spin exits immediately
-     * rather than looping forever waiting for a timer that hasn't started yet. */
-    s->u3 = (Kim1Rriot){0};
-    s->u3.prescale = 1;
-    s->u3.pb      = 0x01u;
-    s->u3.ddrb    = 0x3Fu;
-    s->u3.irq_flag = true;
-    rriot_update_irq(s);
+    /* The monitor's setup runs as traps, so leave the chips as it would:
+     * 6530-002 PB0=1 (TTY idle high) with PB0-PB5 outputs.  Both timer
+     * flags start set, so the monitor's first BIT $1747 spin exits instead
+     * of waiting for a timer that hasn't been started. */
+    s->rriot_002.pb = 0x01u;
+    s->rriot_002.ddrb = 0x3Fu;
+    s->rriot_003.irq_flag = true;
+    s->rriot_002.irq_flag = true;
+    kim1_rriot_irq(s);
     kim1_panel_refresh(s);
 }
 
@@ -998,53 +1028,13 @@ static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
     uint16_t a = addr & 0x1FFFu;
 
     if (a >= KIM1_U2_BASE && a < KIM1_U2_BASE + 0x0080u) {
-        uint8_t off = a & 0x0Fu;
-        Kim1Rriot *r = (a & 0x0040u) ? &s->u3 : &s->u2;
-
-        switch (off) {
-        case KIM1_RA: {
-            uint8_t out = r->pa & r->ddra;
-            /* PA0-PA5 keyboard columns, active-low; PA7 = TTY break (high = no break) */
-            uint8_t in = 0xFFu;
-            if (r == &s->u3) {
-                /* 74145 decoder value from PB1-PB4 selects keyboard row (0-3) */
-                int dec = (s->u3.pb >> 1) & 0x0F;
-                if (dec <= 3) {
-                    for (int col = 0; col < 6; col++) {
-                        uint32_t bit = hw_keymap[dec][col];
-                        if (bit && (s->keypad_held & bit))
-                            in &= (uint8_t)~(1u << col);
-                    }
-                }
-            }
-            return (out & r->ddra) | (in & ~r->ddra);
-        }
-        case KIM1_DDRA:  return r->ddra;
-        case KIM1_RB: {
-            uint8_t out = r->pb & r->ddrb;
-            return out | (0u & ~r->ddrb);
-        }
-        case KIM1_DDRB:  return r->ddrb;
-        /* $04/$05 ($0C/$0D): read live count, no side-effects */
-        case KIM1_TL: case KIM1_TH:
-        case 0x0Cu:   case 0x0Du:
-            return rriot_current_count(r, s->cpu.cycle_count);
-        /* $06/$07 ($0E/$0F): read IRQ status + count, clears IRQ flag */
-        case KIM1_TW: case KIM1_TIF:
-        case 0x0Eu:   case 0x0Fu: {
-            uint8_t cnt = rriot_current_count(r, s->cpu.cycle_count);
-            uint8_t v = (r->irq_flag ? 0x80u : 0u) | (cnt & 0x7Fu);
-            r->irq_flag = false;
-            rriot_update_irq(s);
-            return v;
-        }
-        default:         return 0u;
-        }
+        M6530 *r = (a & 0x0040u) ? &s->rriot_002 : &s->rriot_003;
+        return m6530_read(r, a & 0x0Fu, s->cpu.cycle_count);
     }
 
     /* RRIOT internal RAM: 6530-003 @ $1780–$17BF, 6530-002 @ $17C0–$17FF */
     if (a >= 0x1780u && a < 0x1800u)
-        return s->rriot_ram[a - 0x1780u];
+        return *kim1_rriot_ram(s, a);
 
     if (a >= 0x1800u) {
         if (a == 0x1F1Fu) {
@@ -1126,58 +1116,14 @@ static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
     uint16_t a = addr & 0x1FFFu;
 
     if (a >= KIM1_U2_BASE && a < KIM1_U2_BASE + 0x0080u) {
-        uint8_t off = a & 0x0Fu;
-        Kim1Rriot *r = (a & 0x0040u) ? &s->u3 : &s->u2;
-
-        switch (off) {
-        case KIM1_RA:
-            r->pa = val;
-            if (r == &s->u3) {
-                /* PA write during display refresh: latch segment data into the digit
-                 * currently selected by PB1-PB4 (74145 decoder, values 4-9 = LEDs 1-6). */
-                int dec = (s->u3.pb >> 1) & 0x0F;
-                if (dec >= 4 && dec <= 9) {
-                    s->seg_cache[dec - 4] = val;
-                    s->display_dirty = true;
-                }
-            }
-            break;
-        case KIM1_DDRA:
-            r->ddra = val;
-            break;
-        case KIM1_RB:
-            r->pb = val;
-            if (r == &s->u3) {
-                /* PB write changes 74145 decoder; latch current PA into the new digit slot.
-                 * Decoder input = PB1-PB4; values 4-9 → LED digits 1-6 (seg_cache[0-5]). */
-                int dec = (val >> 1) & 0x0F;
-                if (dec >= 4 && dec <= 9) {
-                    s->seg_cache[dec - 4] = s->u3.pa;
-                    s->display_dirty = true;
-                }
-            }
-            break;
-        case KIM1_DDRB:
-            r->ddrb = val;
-            break;
-        /* $04-$07: load 8-bit timer, prescale ×1/×8/×64/×1024, no CPU IRQ */
-        /* $0C-$0F: same prescales but assert CPU IRQ line on underflow      */
-        case KIM1_TL: case KIM1_TH: case KIM1_TW: case KIM1_TIF:
-        case 0x0Cu:   case 0x0Du:   case 0x0Eu:   case 0x0Fu: {
-            static const uint16_t ps[4] = {1, 8, 64, 1024};
-            r->reload   = val;
-            r->prescale = ps[off & 3u];
-            r->irq_en   = (off & 0x08u) != 0;
-            rriot_timer_start(r, s);
-            break;
-        }
-        }
+        M6530 *r = (a & 0x0040u) ? &s->rriot_002 : &s->rriot_003;
+        m6530_write(r, a & 0x0Fu, val, s->cpu.cycle_count);
         return;
     }
 
     /* RRIOT internal RAM: 6530-003 @ $1780–$17BF, 6530-002 @ $17C0–$17FF */
     if (a >= 0x1780u && a < 0x1800u) {
-        s->rriot_ram[a - 0x1780u] = val;
+        *kim1_rriot_ram(s, a) = val;
         return;
     }
 
@@ -1212,7 +1158,7 @@ static bool kim1_mon_read(void *ud, uint64_t addr, uint8_t *val) {
     if (addr > 0xFFFF) return false;
     uint16_t a = (uint16_t)(addr & 0x1FFFu);
     if (a >= KIM1_U2_BASE && a < KIM1_U2_BASE + 0x0080u) return false;
-    if (a >= 0x1780u && a < 0x1800u) { *val = s->rriot_ram[a - 0x1780u]; return true; }
+    if (a >= 0x1780u && a < 0x1800u) { *val = *kim1_rriot_ram(s, a); return true; }
     if (a >= 0x1800u) {
         *val = a < 0x1C00u ? s->rom_002[a - 0x1800u] : s->rom_003[a - 0x1C00u];
         return true;
@@ -1229,7 +1175,7 @@ static bool kim1_mon_write(void *ud, uint64_t addr, uint8_t val) {
     if (addr > 0xFFFF) return false;
     uint16_t a = (uint16_t)(addr & 0x1FFFu);
     if (a >= KIM1_U2_BASE && a < KIM1_U2_BASE + 0x0080u) return false;
-    if (a >= 0x1780u && a < 0x1800u) { s->rriot_ram[a - 0x1780u] = val; return true; }
+    if (a >= 0x1780u && a < 0x1800u) { *kim1_rriot_ram(s, a) = val; return true; }
     if (a >= 0x1800u) return false;
     if (addr < 0x0400u) { s->ram[addr] = val; return true; }
     if (s->ext_ram && addr < s->ext_ram_top) { s->ext_ram[addr - 0x0400u] = val; return true; }
@@ -1397,13 +1343,14 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     }
 
     {   /* for the display in use (none with -display none or curses) */
-        HexRegion kim1_regions[5] = {
+        HexRegion kim1_regions[6] = {
             { "RAM ($0000-$03FF)",      s->ram,      sizeof(s->ram),      false, 0x0000u },
-            { "RRIOT RAM ($1780-$17FF)",s->rriot_ram,sizeof(s->rriot_ram),false, 0x1780u },
+            { "6530-003 RAM ($1780)",   s->rriot_003.ram, sizeof(s->rriot_003.ram), false, 0x1780u },
+            { "6530-002 RAM ($17C0)",   s->rriot_002.ram, sizeof(s->rriot_002.ram), false, 0x17C0u },
             { "ROM 6530-002 ($1800)",   s->rom_002,  sizeof(s->rom_002),  true,  0x1800u },
             { "ROM 6530-003 ($1C00)",   s->rom_003,  sizeof(s->rom_003),  true,  0x1C00u },
         };
-        int n_regions = 4;
+        int n_regions = 5;
         if (s->ext_ram) {
             /* Cap the hex editor's view of expansion RAM to 4 KB - plenty
              * for hand-scrolling, and keeps startup allocation bounded. */
@@ -1444,8 +1391,8 @@ void kim1_destroy(Kim1State *s) {
 /* Execute one CPU instruction and advance the RRIOT timers with it. */
 static void kim1_step_insn(Kim1State *s) {
     mos6502_step(&s->cpu);
-    rriot_timer_tick(&s->u2, s);
-    rriot_timer_tick(&s->u3, s);
+    m6530_tick(&s->rriot_003, s->cpu.cycle_count);
+    m6530_tick(&s->rriot_002, s->cpu.cycle_count);
 }
 
 void kim1_run(Kim1State *s, const MosConfig *cfg) {
