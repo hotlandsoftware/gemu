@@ -563,6 +563,17 @@ static void switch_to_tab(HexEditorWin32 *he, int index) {
     InvalidateRect(he->view, NULL, FALSE);
 }
 
+void hex_editor_win32_set_region(HexEditorWin32 *he, int index, uint8_t *data, size_t size,
+                                  bool read_only) {
+    if (!he || index < 0 || index >= he->n_tabs) return;
+    HexEditorTab *tab = &he->tabs[index];
+    tab->data = data;
+    tab->size = size;
+    tab->read_only = read_only;
+    tab->scroll_line = 0;
+    if (he->cur_tab == index) switch_to_tab(he, index);   /* selection, scroll bar, redraw */
+}
+
 static LRESULT CALLBACK win_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     HexEditorWin32 *he = (HexEditorWin32 *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
     switch (msg) {

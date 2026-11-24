@@ -422,6 +422,22 @@ void hex_editor_sdl_hide(HexEditorSdl *he) {
     he->goto_open = false;
 }
 
+void hex_editor_sdl_set_region(HexEditorSdl *he, int index, uint8_t *data, size_t size,
+                                bool read_only) {
+    if (!he || index < 0 || index >= he->n_tabs) return;
+    HexRegion *r = &he->tabs[index];
+    r->data = data;
+    r->size = size;
+    r->read_only = read_only;
+    he->sel[index] = 0;
+    he->top[index] = 0;
+    if (index == he->cur) {
+        he->low_nibble = false;
+        he->goto_open = false;
+    }
+    he->dirty = true;
+}
+
 bool hex_editor_sdl_is_visible(const HexEditorSdl *he) {
     return he && he->visible;
 }

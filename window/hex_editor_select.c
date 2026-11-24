@@ -12,6 +12,7 @@ struct HexEditor {
     void (*hide)(void *);
     bool (*is_visible)(const void *);
     void (*refresh)(void *);
+    void (*set_region)(void *, int, uint8_t *, size_t, bool);
 };
 
 /* typed wrappers, so no function pointer is called through the wrong type */
@@ -20,12 +21,15 @@ struct HexEditor {
     static void prefix##_show(void *p)             { hex_editor_##prefix##_show(p); }       \
     static void prefix##_hide(void *p)             { hex_editor_##prefix##_hide(p); }       \
     static bool prefix##_is_visible(const void *p) { return hex_editor_##prefix##_is_visible(p); } \
-    static void prefix##_refresh(void *p)          { hex_editor_##prefix##_refresh(p); }
+    static void prefix##_refresh(void *p)          { hex_editor_##prefix##_refresh(p); }    \
+    static void prefix##_set_region(void *p, int i, uint8_t *d, size_t n, bool ro)          \
+        { hex_editor_##prefix##_set_region(p, i, d, n, ro); }
 
 #define BIND(he, prefix) do {                                  \
         (he)->destroy = prefix##_destroy; (he)->show = prefix##_show;   \
         (he)->hide = prefix##_hide; (he)->is_visible = prefix##_is_visible; \
         (he)->refresh = prefix##_refresh;                          \
+        (he)->set_region = prefix##_set_region;                    \
     } while (0)
 
 #ifdef GEMU_GTK
@@ -69,3 +73,6 @@ void hex_editor_show(HexEditor *he)             { if (he) he->show(he->impl); }
 void hex_editor_hide(HexEditor *he)             { if (he) he->hide(he->impl); }
 bool hex_editor_is_visible(const HexEditor *he) { return he && he->is_visible(he->impl); }
 void hex_editor_refresh(HexEditor *he)          { if (he) he->refresh(he->impl); }
+void hex_editor_set_region(HexEditor *he, int index, uint8_t *data, size_t size, bool read_only) {
+    if (he) he->set_region(he->impl, index, data, size, read_only);
+}

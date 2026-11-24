@@ -1,5 +1,5 @@
 /*
- * Atari 2600 machine - see hardware/mos/atari2600.h for the memory map.
+ * Atari 2600 machine - see hardware/mos/a2600/atari2600.h for the memory map.
  */
 #include "atari2600.h"
 #include "a2600_bus.h"

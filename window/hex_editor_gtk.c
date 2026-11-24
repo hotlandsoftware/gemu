@@ -419,6 +419,17 @@ static void hex_update_cur_tab(HexEditorGtk *he) {
     gtk_label_set_text(GTK_LABEL(he->status_label), "");
 }
 
+void hex_editor_gtk_set_region(HexEditorGtk *he, int index, uint8_t *data, size_t size,
+                                bool read_only) {
+    if (!he || index < 0 || index >= he->n_tabs) return;
+    HexEditorTab *tab = &he->tabs[index];
+    tab->data = data;
+    tab->size = size;
+    tab->read_only = read_only;
+    if (he->cur_tab == tab) hex_update_cur_tab(he);   /* selection, Write button */
+    if (he->visible) hex_tab_rebuild(tab);            /* else show() rebuilds every tab */
+}
+
 /* ── Callbacks ───────────────────────────────────────────────────────────── */
 
 static gboolean on_text_click(GtkWidget *w, GdkEventButton *ev, gpointer ud) {

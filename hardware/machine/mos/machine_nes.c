@@ -1,63 +1,35 @@
+/*
+ * The NES / Famicom console: CPU bus, PPU, APU and their timing, DMA, the
+ * controller ports, the cartridge connector (device/cart/nes_cart.h) and
+ * its faults, the FDS RAM adapter, the VS. System's inputs, reset and save
+ * states.  Everything the player sees and touches (the window, input
+ * bindings, dialogs, save files, netplay, frame pacing) is the front end's:
+ * nes_frontend.c and nes_netplay.c, through the API in nes.h.
+ */
 #ifndef _WIN32
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "nes.h"
-#include "gemu/util.h"
 #include "storage/fds.h"
-#include "romdb.h"
 #include "storage/fds_hle.h"
+#include "romdb.h"
 #include "apu2a03.h"
-#include "nes_ntsc_encode.h"
-#include "ntsc_decode.h"
-#include "crt_tube.h"
-#include "gemu/memory.h"
-#include "gemu/screendump.h"
-#include "gemu/gemu_display.h"
-#include "gemu/netplay.h"
-#include "gemu/netplay_dialog.h"
-#include "gemu/sha256.h"
-#include "gemu/gemu.h"
-#include <SDL2/SDL.h>  /* needed for APU audio queue sync */
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <inttypes.h>
+#include <math.h>
 #ifdef _WIN32
-#  include <direct.h>
-#  define strcasecmp      _stricmp
-#  define strncasecmp     _strnicmp
+#  define strncasecmp _strnicmp
 #else
-#  include <sys/stat.h>
 #  include <strings.h>
 #endif
-#ifdef GEMU_GTK
-#  include <gtk/gtk.h>
-#endif
-#include "hex_editor.h"
-#include "cheat_dialog.h"
-#include "nes_pin_window.h"
-#include "nes_cheats.h"
 
 #define VS_DEBUG(s, ...) do { \
     if ((s)->cfg->is_arcade && nes_vs_debug_enabled()) { \
         fprintf(stderr, "vs: " __VA_ARGS__); \
     } \
 } while (0)
-
-/* -device crt: decoded output resolution. Matches the NES's native
- * 256x240 exactly -- SDL_RenderSetLogicalSize (core/src/video_sdl.c)
- * always preserves *this* aspect ratio via letterboxing regardless of
- * window shape, so any width other than RP2C02_WIDTH here distorts the
- * displayed picture into that ratio (an earlier attempt at 4x width for
- * "more decode detail" did exactly that -- stretched the whole image
- * widescreen). The extra horizontal detail from oversampled decoding
- * (see NES_NTSC_OVERSAMPLE in crt/nes_ntsc_encode.h) still improves the
- * signal recovery quality even when resampled back down to native width
- * here; it just isn't shown as literal extra pixels. */
-#define NES_CRT_WIDTH  RP2C02_WIDTH
-#define NES_CRT_HEIGHT RP2C02_HEIGHT
 
 static bool nes_vs_debug_enabled(void) {
     static int enabled = -1;
@@ -73,97 +45,8 @@ static uint8_t nes_pal3bit(uint8_t v) {
     return (uint8_t)((v << 5) | (v << 2) | (v >> 1));
 }
 
-/* ── NES controller action table ─────────────────────────────────────────── */
-/* GEMU_ACTION(n) = 1u<<n; NES_BTN_* happen to match, so ctrl_state[0] = held & 0xFF */
-#define NES_N_ACTIONS 8
-#define NES_2P_N_ACTIONS 16
-
-static const GemuActionDef nes_actions[NES_N_ACTIONS] = {
-    { "A",      GEMU_ACTION(0), "z"           },  /* NES_BTN_A      = 0x01 */
-    { "B",      GEMU_ACTION(1), "x"           },  /* NES_BTN_B      = 0x02 */
-    { "Select", GEMU_ACTION(2), "Right Shift" },  /* NES_BTN_SELECT = 0x04 */
-    { "Start",  GEMU_ACTION(3), "Return"      },  /* NES_BTN_START  = 0x08 */
-    { "Up",     GEMU_ACTION(4), "Up"          },  /* NES_BTN_UP     = 0x10 */
-    { "Down",   GEMU_ACTION(5), "Down"        },  /* NES_BTN_DOWN   = 0x20 */
-    { "Left",   GEMU_ACTION(6), "Left"        },  /* NES_BTN_LEFT   = 0x40 */
-    { "Right",  GEMU_ACTION(7), "Right"       },  /* NES_BTN_RIGHT  = 0x80 */
-};
-
-#define NES_FC2MIC_N_ACTIONS 15
-static const GemuActionDef nes_fc2mic_actions[NES_FC2MIC_N_ACTIONS] = {
-    /* nes-controller page (P1: full controller with Select + Start) */
-    { "A",         GEMU_ACTION(0),  "z"           },
-    { "B",         GEMU_ACTION(1),  "x"           },
-    { "Select",    GEMU_ACTION(2),  "Right Shift" },
-    { "Start",     GEMU_ACTION(3),  "Return"      },
-    { "Up",        GEMU_ACTION(4),  "Up"          },
-    { "Down",      GEMU_ACTION(5),  "Down"        },
-    { "Left",      GEMU_ACTION(6),  "Left"        },
-    { "Right",     GEMU_ACTION(7),  "Right"       },
-    /* famicom-mic page (P2: no Select/Start on FC2 hardware) */
-    { "P2 A",      GEMU_ACTION(8),  "a"           },
-    { "P2 B",      GEMU_ACTION(9),  "s"           },
-    { "P2 Up",     GEMU_ACTION(12), "i"           },
-    { "P2 Down",   GEMU_ACTION(13), "k"           },
-    { "P2 Left",   GEMU_ACTION(14), "j"           },
-    { "P2 Right",  GEMU_ACTION(15), "l"           },
-    { "Send Mic",  GEMU_ACTION(16), "m"           },
-};
-
-static const GemuInputPage nes_fc2mic_pages[] = {
-    { "nes-controller", 8 },   /* P1: A, B, Select, Start, Up, Down, Left, Right */
-    { "famicom-mic",    7 },   /* P2: A, B, Up, Down, Left, Right, Send Mic */
-};
-
-static const GemuInputPage nes_2p_pages[] = {
-    { "nes-controller", 8 },   /* P1 */
-    { "nes-controller", 8 },   /* P2 */
-};
-
-static const GemuActionDef nes_2p_actions[NES_2P_N_ACTIONS] = {
-    { "A",        GEMU_ACTION(0),  "z"           },
-    { "B",        GEMU_ACTION(1),  "x"           },
-    { "Select",   GEMU_ACTION(2),  "Right Shift" },
-    { "Start",    GEMU_ACTION(3),  "Return"      },
-    { "Up",       GEMU_ACTION(4),  "Up"          },
-    { "Down",     GEMU_ACTION(5),  "Down"        },
-    { "Left",     GEMU_ACTION(6),  "Left"        },
-    { "Right",    GEMU_ACTION(7),  "Right"       },
-    { "P2 A",      GEMU_ACTION(8),  "" },
-    { "P2 B",      GEMU_ACTION(9),  "" },
-    { "P2 Select", GEMU_ACTION(10), "" },
-    { "P2 Start",  GEMU_ACTION(11), "" },
-    { "P2 Up",     GEMU_ACTION(12), "" },
-    { "P2 Down",   GEMU_ACTION(13), "" },
-    { "P2 Left",   GEMU_ACTION(14), "" },
-    { "P2 Right",  GEMU_ACTION(15), "" },
-};
-
-/* ── VS. System arcade actions ────────────────────────────────────────────── */
 /* VS wiring: bit 2 is the cabinet Select/Start button, not NES Start (bit 3). */
 #define VS_BTN_START NES_BTN_SELECT
-
-/* Bit layout: 0-7 = P1 VS_UNI_JOYSTICK bits, 8-15 = P2, 16 = Coin1, 17 = Coin2, 18 = Svc */
-#define VS_NES_N_ACTIONS 19
-static const GemuActionDef vs_nes_actions[VS_NES_N_ACTIONS] = {
-    { "P1 A",     GEMU_ACTION(8),  "z"      },
-    { "P1 B",     GEMU_ACTION(9),  "x"      },
-    { "P1 Start", GEMU_ACTION(10), "Return" },
-    { "P1 Up",    GEMU_ACTION(12), "Up"     },
-    { "P1 Down",  GEMU_ACTION(13), "Down"   },
-    { "P1 Left",  GEMU_ACTION(14), "Left"   },
-    { "P1 Right", GEMU_ACTION(15), "Right"  },
-    { "P2 A",     GEMU_ACTION(0),  "d"      },
-    { "P2 B",     GEMU_ACTION(1),  "f"      },
-    { "P2 Start", GEMU_ACTION(2),  "g"      },
-    { "P2 Up",    GEMU_ACTION(4),  "r"      },
-    { "P2 Down",  GEMU_ACTION(5),  "v"      },
-    { "P2 Left",  GEMU_ACTION(6),  "c"      },
-    { "P2 Right", GEMU_ACTION(7),  "b"      },
-    { "Coin 1",   GEMU_ACTION(16), "5"      },
-    { "Coin 2",   GEMU_ACTION(17), "6"      },
-    { "Service",  GEMU_ACTION(18), "F2"     },
-};
 
 /* ── VS. SMB DIP switch table ────────────────────────────────────────────── */
 
@@ -277,918 +160,32 @@ static bool vs_service_cmd(NesState *s) {
     return true;
 }
 
-static bool nes_device_is_rob(NesDeviceType dev) {
-    return dev == NES_DEVICE_ROB || dev == NES_DEVICE_ROB_FAMICOM;
-}
 
-/* Debug > Hex Editor menu callback. */
-static void nes_hex_toggle(void *ud) {
+/* ── The cartridge slot ────────────────────────────────────────────────── */
+
+/* The cartridge's /IRQ changed (the FDS sets cart_irq itself). */
+static void nes_cart_irq_changed(void *ud) {
     NesState *s = ud;
-    if (!s->hex_editor) return;
-    if (hex_editor_is_visible(s->hex_editor))
-        hex_editor_hide(s->hex_editor);
-    else
-        hex_editor_show(s->hex_editor);
+    s->cart_irq = s->cart.irq;
+    nes_update_irq(s);
 }
 
-/* ── Battery-backed SRAM persistence ────────────────────────────────────── */
-
-static void nes_game_basename(const char *path, char *out, size_t len) {
-    const char *name = path;
-    for (const char *p = path; *p; p++)
-        if (*p == '/' || *p == '\\') name = p + 1;
-    const char *dot = strrchr(name, '.');
-    size_t n = dot ? (size_t)(dot - name) : strlen(name);
-    if (n >= len) n = len - 1;
-    memcpy(out, name, n);
-    out[n] = '\0';
+static void nes_cart_wire(NesState *s) {
+    s->cart.ppu = &s->ppu;
+    s->cart.irq_changed = nes_cart_irq_changed;
+    s->cart.ud = s;
 }
 
-static void nes_build_sav_path(const char *game, char *out, size_t len) {
-    char file[300];
-    snprintf(file, sizeof(file), "%s.sav", game);
-    gemu_config_path(out, len, file);
-}
-
-static void nes_build_fds_sav_path(const char *game, char *out, size_t len) {
-    char file[300];
-    snprintf(file, sizeof(file), "%s.fds.sav", game);
-    gemu_config_path(out, len, file);
-}
-
-static bool nes_battery_prompt(void) {
-#ifdef GEMU_GTK
-    GtkWidget *dlg = gtk_message_dialog_new(
-        NULL, GTK_DIALOG_MODAL,
-        GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO,
-        "This game has a battery.\n"
-        "Do you want GEMU to save data automatically?");
-    gtk_window_set_title(GTK_WINDOW(dlg), "Battery-backed Save");
-    gint resp = gtk_dialog_run(GTK_DIALOG(dlg));
-    gtk_widget_destroy(dlg);
-    while (gtk_events_pending()) gtk_main_iteration_do(FALSE);
-    return resp == GTK_RESPONSE_YES;
-#else
-    SDL_MessageBoxButtonData buttons[] = {
-        { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Yes" },
-        { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "No"  },
-    };
-    SDL_MessageBoxData data = {
-        .flags       = SDL_MESSAGEBOX_INFORMATION,
-        .window      = NULL,
-        .title       = "Battery-backed Save",
-        .message     = "This game has a battery.\n"
-                       "Do you want GEMU to save data automatically?",
-        .numbuttons  = 2,
-        .buttons     = buttons,
-        .colorScheme = NULL,
-    };
-    int choice = 0;
-    SDL_ShowMessageBox(&data, &choice);
-    return choice == 1;
-#endif
-}
-
-static void nes_sav_load(NesState *s) {
-    FILE *f = fopen(s->sav_path, "rb");
-    if (!f) return;
-    fread(s->prg_ram, 1, sizeof(s->prg_ram), f);
-    fclose(f);
-    printf("nes: loaded save '%s'\n", s->sav_path);
-}
-
-static void nes_sav_save(NesState *s) {
-    if (!s->battery_autosave || !s->sav_path[0]) return;
-    gemu_ensure_parent_dir(s->sav_path);
-    FILE *f = fopen(s->sav_path, "wb");
-    if (!f) { fprintf(stderr, "nes: cannot write save '%s'\n", s->sav_path); return; }
-    fwrite(s->prg_ram, 1, sizeof(s->prg_ram), f);
-    fclose(f);
-    printf("nes: saved to '%s'\n", s->sav_path);
-}
-
-static void nes_fds_save(NesState *s) {
-    if (!s->fds_enabled || !s->fds.dirty || !s->sav_path[0])
-        return;
-    gemu_ensure_parent_dir(s->sav_path);
-    if (!fds_disk_save(&s->fds, s->sav_path))
-        fprintf(stderr, "fds: cannot write save '%s'\n", s->sav_path);
-}
-
-static void nes_fds_save_setup(NesState *s, const char *disk_path) {
-    if (!disk_path || !disk_path[0]) return;
-    char game[256];
-    nes_game_basename(disk_path, game, sizeof(game));
-    nes_build_fds_sav_path(game, s->sav_path, sizeof(s->sav_path));
-    fds_disk_load_save(&s->fds, s->sav_path);
-}
-
-static void nes_save_persistent(NesState *s) {
-    if (s->fds_enabled)
-        nes_fds_save(s);
-    else
-        nes_sav_save(s);
-}
-
-static void nes_battery_setup(NesState *s) {
-    if (!s->cart.has_battery) return;
-    char game[256];
-    nes_game_basename(s->cart_path_buf, game, sizeof(game));
-    nes_build_sav_path(game, s->sav_path, sizeof(s->sav_path));
-    FILE *existing = fopen(s->sav_path, "rb");
-    if (existing) {
-        fclose(existing);
-        s->battery_autosave = true;
-        nes_sav_load(s);
-    } else {
-        s->battery_autosave = nes_battery_prompt();
-    }
-}
-
-/* ── iNES cartridge loading ──────────────────────────────────────────────── */
-
-static bool ines_load(NesState *s, const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "nes: cannot open '%s'\n", path); return false; }
-
-    uint8_t hdr[16];
-    if (fread(hdr, 1, 16, f) != 16 ||
-        hdr[0] != 'N' || hdr[1] != 'E' || hdr[2] != 'S' || hdr[3] != 0x1A) {
-        fprintf(stderr, "nes: '%s' is not a valid iNES file\n", path);
-        fclose(f); return false;
-    }
-
-    s->cart.prg_banks   = hdr[4];
-    s->cart.chr_banks   = hdr[5];
-    s->cart.mapper      = (hdr[7] & 0xF0) | (hdr[6] >> 4);
-    s->cart.has_battery = (hdr[6] >> 1) & 1;
-
-    bool four_screen = (hdr[6] >> 3) & 1;
-    bool vertical    = hdr[6] & 1;
-    if      (four_screen) s->cart.mirror = RP2C02_MIRROR_4SCREEN;
-    else if (vertical)    s->cart.mirror = RP2C02_MIRROR_VERTICAL;
-    else                  s->cart.mirror = RP2C02_MIRROR_HORIZONTAL;
-
-    switch (s->cart.mapper) {
-    case 0: case 1: case 2: case 3: case 4: case 5: case 7: case 9: case 24: case 26:
-    case 66: case 119: case 178: case 228: break;
-    default:
-        if (nes_board_supported(s->cart.mapper)) break;
-        fprintf(stderr, "nes: mapper %u not supported!\n",
-                s->cart.mapper);
-        fclose(f); return false;
-    }
-    if (s->cart.prg_banks == 0) {
-        fprintf(stderr, "nes: invalid PRG bank count 0\n");
-        fclose(f); return false;
-    }
-    if ((s->cart.mapper == 0 || s->cart.mapper == 3) && s->cart.prg_banks > 2) {
-        fprintf(stderr, "nes: %s requires 1 or 2 PRG banks, got %u\n",
-                s->cart.mapper ? "CNROM" : "NROM", s->cart.prg_banks);
-        fclose(f); return false;
-    }
-
-    /* Skip optional 512-byte trainer */
-    if ((hdr[6] >> 2) & 1) fseek(f, 512, SEEK_CUR);
-
-    /* Some dumps claim more PRG than the file holds; if what's there is a
-     * whole number of 16 KB banks plus the stated CHR, believe the file. */
-    long data_start = ftell(f);
-    fseek(f, 0, SEEK_END);
-    long data_len = ftell(f) - data_start;
-    fseek(f, data_start, SEEK_SET);
-    long chr_len  = (long)s->cart.chr_banks * 0x2000;
-    long prg_have = data_len - chr_len;
-    if (prg_have > 0 && prg_have < (long)s->cart.prg_banks * 0x4000 && prg_have % 0x4000 == 0) {
-        fprintf(stderr, "nes: header says %u×16KB PRG but the file has %ld; using the file\n",
-                s->cart.prg_banks, prg_have / 0x4000);
-        s->cart.prg_banks = (uint8_t)(prg_have / 0x4000);
-    }
-
-    uint32_t prg_bytes = (uint32_t)s->cart.prg_banks * 0x4000;
-    s->prg = malloc(prg_bytes);
-    if (!s->prg || fread(s->prg, 1, prg_bytes, f) != prg_bytes) {
-        fprintf(stderr, "nes: failed to read PRG ROM\n");
-        fclose(f); free(s->prg); s->prg = NULL; return false;
-    }
-
-    if (s->cart.chr_banks > 0) {
-        uint32_t chr_bytes = (uint32_t)s->cart.chr_banks * 0x2000;
-        s->chr = malloc(chr_bytes);
-        if (!s->chr || fread(s->chr, 1, chr_bytes, f) != chr_bytes) {
-            fprintf(stderr, "nes: failed to read CHR ROM\n");
-            fclose(f); free(s->chr); s->chr = NULL; free(s->prg); return false;
-        }
-        s->chr_is_ram = false;
-        if (s->cart.mapper == 119) {   /* TQROM: 8 KB CHR RAM after the ROM */
-            uint8_t *chr = realloc(s->chr, chr_bytes + 0x2000u);
-            if (!chr) { fclose(f); free(s->chr); s->chr = NULL; free(s->prg); return false; }
-            memset(chr + chr_bytes, 0, 0x2000u);
-            s->chr = chr;
-        }
-    } else {
-        /* CHR RAM: 8 KB writable by PPU */
-        s->chr = calloc(1, 0x2000);
-        if (!s->chr) { fclose(f); free(s->prg); return false; }
-        s->chr_is_ram = true;
-        s->cart.chr_banks = 1;
-    }
-
-    fclose(f);
-    s->has_board  = nes_board_supported(s->cart.mapper);
-    s->fine_banks = s->has_board || s->cart.mapper == 4 || s->cart.mapper == 119 ||
-                    s->cart.mapper == 24 || s->cart.mapper == 26;
+/* Load a cartridge into the (empty) slot. */
+static bool nes_cart_insert(NesState *s, const char *path) {
+    if (!nes_cart_load(&s->cart, path)) return false;
     snprintf(s->cart_path_buf, sizeof(s->cart_path_buf), "%s", path);
-    printf("nes: loaded '%s' - mapper %u, %u×16KB PRG, %u×8KB CHR%s\n",
-           path, s->cart.mapper,
-           s->cart.prg_banks, s->cart.chr_banks,
-           s->chr_is_ram ? " (RAM)" : "");
     return true;
-}
-
-/* MMC3 and TQROM (MMC3 with 8 KB of CHR RAM beside the CHR ROM). */
-static bool is_mmc3(const NesState *s) {
-    return s->cart.mapper == 4 || s->cart.mapper == 119;
-}
-
-/* ── Mapper 1 (MMC1/SxROM) ───────────────────────────────────────────────── */
-
-static void mmc1_update_banks(NesState *s) {
-    uint8_t  prg_mode  = (s->mmc1_ctrl >> 2) & 3;
-    uint8_t  chr_mode  = (s->mmc1_ctrl >> 4) & 1;
-    uint8_t  prg_bank  =  s->mmc1_prg  & 0x0F;
-    uint32_t prg_size  = (uint32_t)s->cart.prg_banks * 0x4000u;
-    uint32_t prg_last  = prg_size - 0x4000u;
-    uint32_t chr_size  = (uint32_t)s->cart.chr_banks * 0x2000u;
-
-    switch (prg_mode) {
-    case 0: case 1:   /* 32 KB: switch both halves together */
-        s->prg_offsets[0] = ((uint32_t)(prg_bank & ~1u) * 0x4000u) % prg_size;
-        s->prg_offsets[1] =  s->prg_offsets[0] + 0x4000u;
-        break;
-    case 2:           /* fix first bank at $8000, switch $C000 */
-        s->prg_offsets[0] = 0;
-        s->prg_offsets[1] = ((uint32_t)prg_bank * 0x4000u) % prg_size;
-        break;
-    case 3:           /* switch $8000, fix last bank at $C000 */
-        s->prg_offsets[0] = ((uint32_t)prg_bank * 0x4000u) % prg_size;
-        s->prg_offsets[1] = prg_last;
-        break;
-    }
-
-    if (chr_mode == 0) {   /* 8 KB: one window */
-        s->chr_offsets[0] = ((uint32_t)(s->mmc1_chr0 & ~1u) * 0x1000u) % chr_size;
-        s->chr_offsets[1] =  s->chr_offsets[0] + 0x1000u;
-    } else {               /* 4 KB x 2: independent windows */
-        s->chr_offsets[0] = ((uint32_t)s->mmc1_chr0 * 0x1000u) % chr_size;
-        s->chr_offsets[1] = ((uint32_t)s->mmc1_chr1 * 0x1000u) % chr_size;
-    }
-
-    static const uint8_t mirror_map[] = {
-        RP2C02_MIRROR_SINGLE_A, RP2C02_MIRROR_SINGLE_B,
-        RP2C02_MIRROR_VERTICAL, RP2C02_MIRROR_HORIZONTAL
-    };
-    s->ppu.mirror = mirror_map[s->mmc1_ctrl & 3];
-}
-
-static void mmc1_serial_write(NesState *s, uint16_t addr, uint8_t val) {
-    if (val & 0x80) {          /* reset: force PRG mode 3 */
-        s->mmc1_shift       = 0;
-        s->mmc1_shift_count = 0;
-        s->mmc1_ctrl       |= 0x0C;
-        mmc1_update_banks(s);
-        return;
-    }
-    /* Shift bit 0 in from the MSB side; after 5 writes the register is full. */
-    s->mmc1_shift = (s->mmc1_shift >> 1) | ((val & 1u) << 4);
-    if (++s->mmc1_shift_count < 5) return;
-
-    uint8_t reg = (addr >> 13) & 3;
-    switch (reg) {
-    case 0: s->mmc1_ctrl = s->mmc1_shift; break;
-    case 1: s->mmc1_chr0 = s->mmc1_shift; break;
-    case 2: s->mmc1_chr1 = s->mmc1_shift; break;
-    case 3: s->mmc1_prg  = s->mmc1_shift; break;
-    }
-    s->mmc1_shift       = 0;
-    s->mmc1_shift_count = 0;
-    mmc1_update_banks(s);
-}
-
-/* ── Mapper 4 (MMC3/TxROM) ───────────────────────────────────────────────── */
-
-static void mmc3_update_banks(NesState *s) {
-    uint32_t prg_8k   = (uint32_t)s->cart.prg_banks * 2;   /* total 8 KB banks */
-    uint32_t chr_1k   = (uint32_t)s->cart.chr_banks * 8;   /* total 1 KB banks */
-
-    /* PRG: four 8 KB windows at $8000, $A000, $C000, $E000 */
-    uint8_t  prg_mode = (s->mmc3_bank_sel >> 6) & 1;
-    uint32_t r6 = (s->mmc3_regs[6] % prg_8k) * 0x2000u;
-    uint32_t r7 = (s->mmc3_regs[7] % prg_8k) * 0x2000u;
-    uint32_t f0 = (prg_8k - 2) * 0x2000u;   /* second-to-last fixed bank */
-    uint32_t f1 = (prg_8k - 1) * 0x2000u;   /* last fixed bank */
-
-    if (!prg_mode) {
-        s->mmc3_prg_offsets[0] = r6;  s->mmc3_prg_offsets[1] = r7;
-        s->mmc3_prg_offsets[2] = f0;  s->mmc3_prg_offsets[3] = f1;
-    } else {
-        s->mmc3_prg_offsets[0] = f0;  s->mmc3_prg_offsets[1] = r7;
-        s->mmc3_prg_offsets[2] = r6;  s->mmc3_prg_offsets[3] = f1;
-    }
-
-    /* CHR: eight 1 KB windows at PPU $0000–$1FFF.
-     * R0/R1 select 2 KB pairs (bit 0 ignored); R2–R5 select 1 KB banks.
-     * CHR-invert bit swaps which half gets the 2 KB banks. */
-    if (s->chr_is_ram || chr_1k == 0) return;
-
-    uint8_t inv = (s->mmc3_bank_sel >> 7) & 1;
-    uint8_t bank[8] = {
-        (uint8_t)(s->mmc3_regs[0] & 0xFEu), (uint8_t)(s->mmc3_regs[0] | 1u),
-        (uint8_t)(s->mmc3_regs[1] & 0xFEu), (uint8_t)(s->mmc3_regs[1] | 1u),
-        s->mmc3_regs[2], s->mmc3_regs[3], s->mmc3_regs[4], s->mmc3_regs[5],
-    };
-
-    /* 2 KB at $0000, 2 KB at $0800, 1 KB×4 at $1000–$1FFF; the invert bit
-     * swaps the halves. */
-    s->tqrom_ram_windows = 0;
-    for (int i = 0; i < 8; i++) {
-        int w = inv ? i ^ 4 : i;
-        if (s->cart.mapper == 119 && (bank[i] & 0x40u)) {   /* TQROM: CHR RAM */
-            s->mmc3_chr_offsets[w] = chr_1k * 0x400u + (bank[i] & 7u) * 0x400u;
-            s->tqrom_ram_windows |= (uint8_t)(1u << w);
-        } else {
-            s->mmc3_chr_offsets[w] = (bank[i] % chr_1k) * 0x400u;
-        }
-    }
-}
-
-static void mmc3_cpu_write(NesState *s, uint16_t addr, uint8_t val) {
-    bool odd = (addr & 1) != 0;
-    if (addr < 0xA000) {
-        if (!odd) { s->mmc3_bank_sel = val; }
-        else      { s->mmc3_regs[s->mmc3_bank_sel & 7] = val; mmc3_update_banks(s); }
-    } else if (addr < 0xC000) {
-        if (!odd && s->cart.mirror != RP2C02_MIRROR_4SCREEN)
-            s->ppu.mirror = (val & 1) ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
-        /* $A001 PRG-RAM protect: ignored */
-    } else if (addr < 0xE000) {
-        if (!odd) { s->mmc3_irq_latch = val; }
-        else      { s->mmc3_irq_reload = true; s->mmc3_irq_counter = 0; }
-    } else {
-        if (!odd) { s->mmc3_irq_enabled = false; s->cart_irq = false; nes_update_irq(s); }
-        else      { s->mmc3_irq_enabled = true; }
-    }
-}
-
-static void mmc3_irq_scanline(void *ud) {
-    NesState *s = ud;
-    if (s->mmc3_irq_reload || s->mmc3_irq_counter == 0) {
-        s->mmc3_irq_counter = s->mmc3_irq_latch;
-        s->mmc3_irq_reload  = false;
-    } else {
-        s->mmc3_irq_counter--;
-    }
-    if (s->mmc3_irq_counter == 0 && s->mmc3_irq_enabled) {
-        s->cart_irq = true;
-        nes_update_irq(s);
-    }
-}
-
-/* ── Mapper 178 (WaixingFS) ──────────────────────────────────────────────── */
-
-static void m178_update_banks(NesState *s) {
-    uint8_t  prg_mode = (s->m178_mode >> 1) & 3u;
-    uint32_t prg_size = (uint32_t)s->cart.prg_banks * 0x4000u;
-    uint32_t outer    = (uint32_t)s->m178_prg_hi * 0x20000u;
-    uint32_t inner    = (uint32_t)(s->m178_prg_lo & 7u) * 0x4000u;
-
-    switch (prg_mode) {
-    case 0: /* NROM-256/BNROM: 32KB page, CPU A14 = PRG A14 */
-        {
-            uint32_t base = (outer + (uint32_t)(s->m178_prg_lo & 6u) * 0x4000u) % prg_size;
-            s->prg_offsets[0] = base;
-            s->prg_offsets[1] = (base + 0x4000u) % prg_size;
-        }
-        break;
-    case 1: /* UNROM: switchable $8000–$BFFF, last inner bank fixed at $C000 */
-        s->prg_offsets[0] = (outer + inner) % prg_size;
-        s->prg_offsets[1] = (outer + 7u * 0x4000u) % prg_size;
-        break;
-    case 2: /* NROM-128: same 16KB bank mirrored at both windows */
-        s->prg_offsets[0] = (outer + inner) % prg_size;
-        s->prg_offsets[1] = (outer + inner) % prg_size;
-        break;
-    default: /* mode 3: UNROM variant - treat as mode 1 */
-        s->prg_offsets[0] = (outer + inner) % prg_size;
-        s->prg_offsets[1] = (outer + 7u * 0x4000u) % prg_size;
-        break;
-    }
-
-    s->ppu.mirror = (s->m178_mode & 1u) ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
-}
-
-/* ── Mapper 5 (MMC5) ─────────────────────────────────────────────────────── */
-
-static void mmc5_update_prg_banks(NesState *s) {
-    uint32_t prg_size = (uint32_t)s->cart.prg_banks * 0x4000u;
-    uint32_t unit     = 0x2000u; /* 8KB per slot */
-    uint8_t  *r       = s->mmc5_prg_regs; /* r[0]=$5113 … r[4]=$5117 */
-
-    for (int i = 0; i < 4; i++) s->mmc5_prg_is_ram[i] = false;
-
-    switch (s->mmc5_prg_mode) {
-    case 0: { /* 32KB at $8000-$FFFF from $5117 (always ROM) */
-        uint32_t base = ((uint32_t)(r[4] & 0x7Cu) * unit) % prg_size;
-        for (int i = 0; i < 4; i++) s->mmc5_prg_offsets[i] = base + (uint32_t)i * unit;
-        break;
-    }
-    case 1: { /* 16KB from $5115 at $8000, 16KB from $5117 at $C000 */
-        if (!(r[2] & 0x80u)) { s->mmc5_prg_is_ram[0] = s->mmc5_prg_is_ram[1] = true; }
-        uint32_t b0 = ((uint32_t)(r[2] & 0x7Eu) * unit) % prg_size;
-        uint32_t b1 = ((uint32_t)(r[4] & 0x7Eu) * unit) % prg_size;
-        s->mmc5_prg_offsets[0] = b0;  s->mmc5_prg_offsets[1] = b0 + unit;
-        s->mmc5_prg_offsets[2] = b1;  s->mmc5_prg_offsets[3] = b1 + unit;
-        break;
-    }
-    case 2: { /* 16KB from $5115, 8KB from $5116, 8KB from $5117 */
-        if (!(r[2] & 0x80u)) { s->mmc5_prg_is_ram[0] = s->mmc5_prg_is_ram[1] = true; }
-        if (!(r[3] & 0x80u)) { s->mmc5_prg_is_ram[2] = true; }
-        uint32_t b0 = ((uint32_t)(r[2] & 0x7Eu) * unit) % prg_size;
-        s->mmc5_prg_offsets[0] = b0;  s->mmc5_prg_offsets[1] = b0 + unit;
-        s->mmc5_prg_offsets[2] = ((uint32_t)(r[3] & 0x7Fu) * unit) % prg_size;
-        s->mmc5_prg_offsets[3] = ((uint32_t)(r[4] & 0x7Fu) * unit) % prg_size;
-        break;
-    }
-    case 3: /* Four 8KB banks from $5114-$5117 */
-        for (int i = 0; i < 4; i++) {
-            uint8_t reg = r[i + 1];
-            if (i < 3 && !(reg & 0x80u)) s->mmc5_prg_is_ram[i] = true;
-            s->mmc5_prg_offsets[i] = ((uint32_t)(reg & 0x7Fu) * unit) % prg_size;
-        }
-        break;
-    }
-}
-
-/* Return 1KB CHR byte offset for a given register index + sub-slot offset. */
-static uint32_t mmc5_chr1kb(const NesState *s, uint8_t reg_idx, uint8_t sub) {
-    uint32_t chr_size = (uint32_t)s->cart.chr_banks * 0x2000u;
-    uint16_t bank = (uint16_t)(((uint16_t)(s->mmc5_chr_hi & 3u) << 8) |
-                                s->mmc5_chr_regs[reg_idx]);
-    return ((uint32_t)(bank + sub) * 0x400u) % chr_size;
-}
-
-static uint8_t mmc5_chr_read(NesState *s, uint16_t addr) {
-    if (s->chr_is_ram) return s->chr[addr & 0x1FFFu];
-
-    uint32_t chr_size = (uint32_t)s->cart.chr_banks * 0x2000u;
-    bool rendering = (s->ppu.ppumask & (PPUMASK_SHOW_BG | PPUMASK_SHOW_SPR)) &&
-                     (s->ppu.scanline >= 0 && s->ppu.scanline < 240);
-
-    /* Extended attribute mode: BG uses ExRAM bank bits instead of normal CHR banking */
-    bool is_spr_fetch = rendering && (s->ppu.dot == 257) &&
-                        (s->ppu.ppuctrl & PPUCTRL_SPR_8x16);
-    if (!is_spr_fetch && rendering && s->mmc5_exram_mode == 1) {
-        uint8_t bank8 = (uint8_t)(((s->mmc5_chr_hi & 3u) << 6) |
-                                   (s->mmc5_exattr_latch & 0x3Fu));
-        return s->chr[((uint32_t)bank8 * 0x1000u + (addr & 0x0FFFu)) % chr_size];
-    }
-
-    /* Determine whether this is a sprite or BG fetch */
-    bool use_spr;
-    if (s->ppu.ppuctrl & PPUCTRL_SPR_8x16)
-        use_spr = is_spr_fetch;   /* 8x16: sprites at dot 257, BG elsewhere */
-    else
-        use_spr = !s->mmc5_last_chr_bg; /* 8x8: whichever set was last written */
-
-    uint8_t mode = s->mmc5_chr_mode;
-
-    if (use_spr) {
-        /* Sprite banks: $5120-$5127 (indices 0-7) → 8 × 1KB windows */
-        uint8_t s8 = (addr >> 10) & 7u;
-        switch (mode) {
-        case 0: return s->chr[(mmc5_chr1kb(s, 7, s8))         + (addr & 0x3FFu)];
-        case 1: return s->chr[(mmc5_chr1kb(s, s8 >= 4 ? 7 : 3, s8 & 3u)) + (addr & 0x3FFu)];
-        case 2: return s->chr[(mmc5_chr1kb(s, (s8 >> 1) * 2u + 1u, s8 & 1u)) + (addr & 0x3FFu)];
-        case 3: return s->chr[(mmc5_chr1kb(s, s8, 0))          + (addr & 0x3FFu)];
-        }
-    } else {
-        /* BG banks: $5128-$512B (indices 8-11) → 4 × 1KB, mirrored to $0000-$1FFF */
-        uint8_t s4 = (addr >> 10) & 3u;
-        switch (mode) {
-        case 0: return s->chr[(mmc5_chr1kb(s, 11, s4))          + (addr & 0x3FFu)];
-        case 1: return s->chr[(mmc5_chr1kb(s, 11, s4))          + (addr & 0x3FFu)];
-        case 2: return s->chr[(mmc5_chr1kb(s, (s4 >> 1) * 2u + 9u, s4 & 1u)) + (addr & 0x3FFu)];
-        case 3: return s->chr[(mmc5_chr1kb(s, 8u + s4, 0))      + (addr & 0x3FFu)];
-        }
-    }
-    return 0;
-}
-
-static uint8_t mmc5_nt_read(uint16_t addr, void *ud) {
-    NesState *s = ud;
-    uint8_t  nt  = (addr >> 10) & 3u;
-    uint8_t  mode = (s->mmc5_nt_map >> (nt * 2u)) & 3u;
-    uint16_t off  = addr & 0x3FFu;
-
-    /* Save ExRAM latch on tile reads (used for extended attribute CHR banking) */
-    if (off < 0x3C0u && s->mmc5_exram_mode == 1)
-        s->mmc5_exattr_latch = s->mmc5_exram[off];
-
-    /* Extended attribute: override attribute reads with ExRAM palette bits */
-    if (off >= 0x3C0u && s->mmc5_exram_mode == 1) {
-        uint8_t pal   = (s->mmc5_exattr_latch >> 6) & 3u;
-        uint8_t shift = (uint8_t)(((s->ppu.v >> 4) & 4u) | (s->ppu.v & 2u));
-        return (uint8_t)(pal << shift);
-    }
-
-    switch (mode) {
-    case 0: return s->ppu.vram[off];
-    case 1: return s->ppu.vram[0x400u + off];
-    case 2: return (s->mmc5_exram_mode >= 2) ? s->mmc5_exram[off & 0x3FFu] : 0;
-    case 3: /* fill mode */
-        return (off >= 0x3C0u) ? (uint8_t)(s->mmc5_fill_attr & 3u) * 0x55u
-                                : s->mmc5_fill_tile;
-    }
-    return 0;
-}
-
-static void mmc5_nt_write(uint16_t addr, uint8_t val, void *ud) {
-    NesState *s = ud;
-    uint8_t  nt  = (addr >> 10) & 3u;
-    uint8_t  mode = (s->mmc5_nt_map >> (nt * 2u)) & 3u;
-    uint16_t off  = addr & 0x3FFu;
-    switch (mode) {
-    case 0: s->ppu.vram[off]          = val; break;
-    case 1: s->ppu.vram[0x400u + off] = val; break;
-    case 2: s->mmc5_exram[off & 0x3FFu] = val; break;
-    case 3: break; /* fill-mode: writes ignored */
-    }
-}
-
-static void mmc5_irq_scanline(void *ud) {
-    NesState *s = ud;
-    int sl = s->ppu.scanline;
-    if (sl >= 240) {
-        s->mmc5_in_frame = false;
-        return;
-    }
-    if (!s->mmc5_in_frame) {
-        s->mmc5_in_frame    = true;
-        s->mmc5_irq_counter = 0;
-    } else {
-        s->mmc5_irq_counter++;
-    }
-    if (s->mmc5_irq_target > 0 && s->mmc5_irq_counter == s->mmc5_irq_target) {
-        s->mmc5_irq_pending = true;
-        if (s->mmc5_irq_enabled) {
-            s->cart_irq = true;
-            nes_update_irq(s);
-        }
-    }
-}
-
-/* ── Mapper 24/26 (Konami VRC6a/VRC6b) ──────────────────────────────────── */
-
-/* Advance all VRC6 state by one CPU cycle: handles IRQ and audio timers.
- * Returns current expansion audio output level (for apu.fds_in). */
-static float vrc6_tick(NesState *s) {
-    /* IRQ: prescaler counts CPU cycles; fires at 341 in scanline mode, each cycle in CPU mode */
-    if (s->vrc6_irq_enabled) {
-        bool fire = false;
-        if (!s->vrc6_irq_mode) {
-            if (++s->vrc6_prescaler >= 341) { s->vrc6_prescaler = 0; fire = true; }
-        } else { fire = true; }
-        if (fire) {
-            if (s->vrc6_irq_counter == 0xFF) {
-                s->vrc6_irq_counter = s->vrc6_irq_latch;
-                s->cart_irq = true;
-                nes_update_irq(s);
-            } else { s->vrc6_irq_counter++; }
-        }
-    }
-
-    if (s->vrc6_halt) return 0.0f;
-
-    /* Pulse 1 */
-    float p1 = 0.0f;
-    if (s->vrc6_p1_en) {
-        if (s->vrc6_p1_timer == 0) {
-            s->vrc6_p1_timer = s->vrc6_p1_period;
-            s->vrc6_p1_seq   = (s->vrc6_p1_seq + 1u) & 15u;
-        } else { s->vrc6_p1_timer--; }
-        uint8_t vol = s->vrc6_p1_ctrl & 0x0Fu;
-        if ((s->vrc6_p1_ctrl & 0x80u) || s->vrc6_p1_seq <= ((s->vrc6_p1_ctrl >> 4) & 7u))
-            p1 = (float)vol;
-    }
-
-    /* Pulse 2 */
-    float p2 = 0.0f;
-    if (s->vrc6_p2_en) {
-        if (s->vrc6_p2_timer == 0) {
-            s->vrc6_p2_timer = s->vrc6_p2_period;
-            s->vrc6_p2_seq   = (s->vrc6_p2_seq + 1u) & 15u;
-        } else { s->vrc6_p2_timer--; }
-        uint8_t vol = s->vrc6_p2_ctrl & 0x0Fu;
-        if ((s->vrc6_p2_ctrl & 0x80u) || s->vrc6_p2_seq <= ((s->vrc6_p2_ctrl >> 4) & 7u))
-            p2 = (float)vol;
-    }
-
-    /* Sawtooth: 6 accumulator additions per 14-clock cycle (even steps 2,4,6,8,10,12) */
-    float saw = 0.0f;
-    if (s->vrc6_saw_en) {
-        if (s->vrc6_saw_timer == 0) {
-            s->vrc6_saw_timer = s->vrc6_saw_period;
-            s->vrc6_saw_step++;
-            if (s->vrc6_saw_step >= 14u) {
-                s->vrc6_saw_step  = 0;
-                s->vrc6_saw_accum = 0;
-            } else if ((s->vrc6_saw_step & 1u) == 0u) {
-                s->vrc6_saw_accum += s->vrc6_saw_rate;
-            }
-        } else { s->vrc6_saw_timer--; }
-        saw = (float)(s->vrc6_saw_accum >> 3);
-    }
-
-    /* Mix: VRC6 pulses use same nonlinear formula as 2A03 (vol 0-15 = same units).
-     * Sawtooth scaled to roughly match one 2A03 pulse at full volume. */
-    float pulse = (p1 + p2 > 0.0f) ? 95.88f / (8128.0f / (p1 + p2) + 100.0f) : 0.0f;
-    return pulse + saw * (0.15f / 31.0f);
-}
-
-static void vrc6_cpu_write(NesState *s, uint16_t addr, uint8_t val) {
-    /* Mapper 26 (VRC6b) swaps address pins A0 and A1 */
-    if (s->cart.mapper == 26) {
-        uint8_t a01 = addr & 3u;
-        addr = (uint16_t)((addr & ~3u) | ((a01 & 1u) << 1) | ((a01 >> 1) & 1u));
-    }
-    uint32_t prg_8k = (uint32_t)s->cart.prg_banks * 2u;
-    uint32_t chr_1k = (uint32_t)s->cart.chr_banks * 8u;
-
-    if (addr < 0x9000) {
-        /* $8000: 16KB PRG bank at $8000-$BFFF (bits 3:0) */
-        uint32_t bank = (uint32_t)(val & 0x0Fu) % s->cart.prg_banks;
-        s->mmc3_prg_offsets[0] = bank * 0x4000u;
-        s->mmc3_prg_offsets[1] = bank * 0x4000u + 0x2000u;
-    } else if (addr < 0xA000) {
-        switch (addr & 3u) {
-        case 0: s->vrc6_p1_ctrl   = val; break;
-        case 1: s->vrc6_p1_period = (s->vrc6_p1_period & 0xFF00u) | val; break;
-        case 2:
-            s->vrc6_p1_period = (s->vrc6_p1_period & 0x00FFu) | ((uint16_t)(val & 0x0Fu) << 8);
-            s->vrc6_p1_en     = (val >> 7) & 1;
-            break;
-        case 3: s->vrc6_halt = val & 1; break;
-        }
-    } else if (addr < 0xB000) {
-        switch (addr & 3u) {
-        case 0: s->vrc6_p2_ctrl   = val; break;
-        case 1: s->vrc6_p2_period = (s->vrc6_p2_period & 0xFF00u) | val; break;
-        case 2:
-            s->vrc6_p2_period = (s->vrc6_p2_period & 0x00FFu) | ((uint16_t)(val & 0x0Fu) << 8);
-            s->vrc6_p2_en     = (val >> 7) & 1;
-            break;
-        }
-    } else if (addr < 0xC000) {
-        switch (addr & 3u) {
-        case 0: s->vrc6_saw_rate   = val & 0x3Fu; break;
-        case 1: s->vrc6_saw_period = (s->vrc6_saw_period & 0xFF00u) | val; break;
-        case 2:
-            s->vrc6_saw_period = (s->vrc6_saw_period & 0x00FFu) | ((uint16_t)(val & 0x0Fu) << 8);
-            s->vrc6_saw_en     = (val >> 7) & 1;
-            break;
-        case 3:
-            switch ((val >> 2) & 3u) {
-            case 0: s->ppu.mirror = RP2C02_MIRROR_VERTICAL;   break;
-            case 1: s->ppu.mirror = RP2C02_MIRROR_HORIZONTAL; break;
-            case 2: s->ppu.mirror = RP2C02_MIRROR_SINGLE_A;   break;
-            case 3: s->ppu.mirror = RP2C02_MIRROR_SINGLE_B;   break;
-            }
-            break;
-        }
-    } else if (addr < 0xD000) {
-        /* $C000: 8KB PRG bank at $C000-$DFFF (bits 4:0) */
-        if ((addr & 3u) == 0)
-            s->mmc3_prg_offsets[2] = ((uint32_t)(val & 0x1Fu) % prg_8k) * 0x2000u;
-    } else if (addr < 0xE000) {
-        /* $D000-$D003: CHR 1KB banks for PPU $0000-$0FFF */
-        if (chr_1k) s->mmc3_chr_offsets[addr & 3u] = ((uint32_t)val % chr_1k) * 0x400u;
-    } else if (addr < 0xF000) {
-        /* $E000-$E003: CHR 1KB banks for PPU $1000-$1FFF */
-        if (chr_1k) s->mmc3_chr_offsets[4u + (addr & 3u)] = ((uint32_t)val % chr_1k) * 0x400u;
-    } else {
-        /* $F000-$F002: IRQ */
-        switch (addr & 3u) {
-        case 0: s->vrc6_irq_latch = val; break;
-        case 1:
-            s->vrc6_irq_after   = val & 1u;
-            s->vrc6_irq_enabled = (val >> 1) & 1u;
-            s->vrc6_irq_mode    = (val >> 2) & 1u;
-            if (s->vrc6_irq_enabled) {
-                s->vrc6_irq_counter = s->vrc6_irq_latch;
-                s->vrc6_prescaler   = 0;
-            } else { s->cart_irq = false; nes_update_irq(s); }
-            break;
-        case 2:
-            s->cart_irq = false;
-            nes_update_irq(s);
-            s->vrc6_irq_counter = s->vrc6_irq_latch;
-            s->vrc6_irq_enabled = s->vrc6_irq_after;
-            s->vrc6_prescaler   = 0;
-            break;
-        }
-    }
-}
-
-/* ── CHR bus callbacks (PPU address space 0x0000–0x1FFF) ─────────────────── */
-
-static uint8_t nes_chr_read(uint16_t addr, void *ud) {
-    NesState *s = ud;
-    if (!s->chr) return 0;
-    if (s->cart.mapper == 5) return mmc5_chr_read(s, addr);
-    if (is_mmc3(s) && s->chr_is_ram) return s->chr[addr & 0x1FFF];
-    if (s->fine_banks) {
-        if (s->board.chr_disabled) return 0xFF;
-        return s->chr[s->mmc3_chr_offsets[addr >> 10] + (addr & 0x3FFu)];
-    }
-    if (s->cart.mapper == 9) {
-        /* MMC2: 4 KB CHR windows with latch-based bank selection.
-         * Latch updates AFTER the fetch - the triggering tile ($FD/$FE)
-         * renders with the old bank; the new bank takes effect next fetch. */
-        if (s->chr_is_ram) return s->chr[addr & 0x1FFF];
-        bool     is_right = (addr & 0x1000u) != 0;
-        uint16_t tile     = addr & 0x0FF8u;
-        uint8_t  bank;
-        if (is_right)
-            bank = s->m9_latch_r ? s->m9_chr_rfe : s->m9_chr_rfd;
-        else
-            bank = s->m9_latch_l ? s->m9_chr_lfe : s->m9_chr_lfd;
-        uint32_t chr_size = (uint32_t)s->cart.chr_banks * 0x2000u;
-        uint8_t  data = s->chr[((uint32_t)bank * 0x1000u + (addr & 0x0FFFu)) % chr_size];
-        /* Latch fires only on the high bitplane fetch ($xFD8-$xFDF / $xFE8-$xFEF) */
-        if (tile == 0x0FD8u) {
-            if (is_right) s->m9_latch_r = false; else s->m9_latch_l = false;
-        } else if (tile == 0x0FE8u) {
-            if (is_right) s->m9_latch_r = true;  else s->m9_latch_l = true;
-        }
-        return data;
-    }
-    if ((s->cart.mapper >= 1 && s->cart.mapper != 7) ||
-        (s->cfg->is_arcade && !s->chr_is_ram)) {
-        uint8_t slot = addr >= 0x1000 ? 1 : 0;
-        return s->chr[s->chr_offsets[slot] + (addr & 0x0FFF)];
-    }
-    return s->chr[addr & 0x1FFF];
-}
-
-static void nes_chr_write(uint16_t addr, uint8_t val, void *ud) {
-    NesState *s = ud;
-    if (s->cart.mapper == 119 && (s->tqrom_ram_windows >> (addr >> 10) & 1u)) {
-        s->chr[s->mmc3_chr_offsets[addr >> 10] + (addr & 0x3FFu)] = val;
-        return;
-    }
-    if (!s->chr_is_ram) return;
-    if (s->cart.mapper == 4) { s->chr[addr & 0x1FFF] = val; return; }
-    if (s->fine_banks) {
-        s->chr[s->mmc3_chr_offsets[addr >> 10] + (addr & 0x3FFu)] = val; return;
-    }
-    if (s->cart.mapper >= 1 && s->cart.mapper != 7) {
-        uint8_t slot = addr >= 0x1000 ? 1 : 0;
-        s->chr[s->chr_offsets[slot] + (addr & 0x0FFF)] = val;
-    } else {
-        s->chr[addr & 0x1FFF] = val;
-    }
 }
 
 /* ── CPU memory map ──────────────────────────────────────────────────────── */
 
-/* ── Game Genie ──────────────────────────────────────────────────────────── *
- *
- * The cheat list (Debug > Game Genie and the monitor's "gamegenie") lives
- * outside NesState - snapshots store NesState raw, and cheats are the
- * player's settings rather than machine state, as in FCE Ultra.  The ROM
- * patches the CPU applies (gg_patches) are rebuilt from its enabled codes.
- * One NES per process, so file-scope state is fine. */
 
-static NesCheats    g_cheats;
-static CheatDialog *g_cheat_dialog;
-static void nes_np_setup(struct NesState *s);
-static void nes_np_end(struct NesState *s);
-static bool nes_np_frame(struct NesState *s);
-static void nes_np_after_frame(struct NesState *s);
-static void nes_np_reset_or(struct NesState *s);
-static void nes_np_game_name(const struct NesState *s, char *out, size_t len);
-
-/* Netplay (see "Netplay" below): the session, and while a game is on,
- * where the player was before it. */
-static Netplay     *g_np;
-static NetplayDialog *g_np_dialog;   /* Netplay > Connect... / Lobby... */
-static bool         g_np_active;     /* this machine is playing a netplay game */
-static bool         g_np_port2;      /* ...and port 2, empty otherwise, has player 2's controller */
-static uint64_t     g_np_frame;
-static bool         g_np_reset;      /* Reset pressed: sent with our next input */
-static uint8_t     *g_poweron;       /* the machine as created: every player's start */
-static size_t       g_poweron_len;
-static uint8_t     *g_np_before;     /* the player's own game, put back afterwards */
-static size_t       g_np_before_len;
-
-static void nes_cheats_apply(void *ud) {
-    NesState *s = ud;
-    s->gg_count = 0;
-    if (g_np_active) return;   /* codes would change one player's game only */
-    for (int i = 0; i < g_cheats.n && s->gg_count < NES_GG_MAX; i++) {
-        if (!g_cheats.list[i].enabled) continue;
-        NesGgPatch *g = &s->gg_patches[s->gg_count];
-        if (!nes_gg_decode(g_cheats.list[i].code, &g->addr, &g->val, &g->cmp, &g->has_cmp)) continue;
-        snprintf(g->code, sizeof(g->code), "%s", g_cheats.list[i].code);
-        s->gg_count++;
-    }
-}
-
-/* This cartridge's codes, from <config>/<game>.cht. */
-static void nes_cheats_load(NesState *s) {
-    char path[512] = "";
-    if (s->cart_path_buf[0] && !s->cfg->is_arcade) {
-        char game[256], file[300];
-        nes_game_basename(s->cart_path_buf, game, sizeof(game));
-        snprintf(file, sizeof(file), "%s.cht", game);
-        gemu_config_path(path, sizeof(path), file);
-    }
-    nes_cheats_init(&g_cheats, path, nes_cheats_apply, s);
-    nes_cheats_apply(s);
-    if (g_cheats.n)
-        printf("nes: %d Game Genie code%s from %s\n", g_cheats.n, g_cheats.n == 1 ? "" : "s", path);
-}
-
-static NesPinWindow *g_pin_window;   /* Debug > Cartridge Pins */
-
-static void nes_pin_window_toggle_cb(void *ud) {
-    (void)ud;
-    nes_pin_window_toggle(g_pin_window);
-}
-
-static void nes_cheat_dialog_toggle(void *ud) {
-    (void)ud;
-    cheat_dialog_toggle(g_cheat_dialog);
-}
-
-static uint8_t nes_prg_direct(const NesState *s, uint16_t addr) {
-    if (addr < 0x8000 || !s->prg) return 0;
-    if (s->cart.mapper == 9) {
-        uint8_t slot   = (uint8_t)((addr - 0x8000u) >> 13);
-        uint32_t prg8k = (uint32_t)s->cart.prg_banks * 2u;
-        uint32_t bank8;
-        if      (slot == 0) bank8 = s->m9_prg_reg & 0x0Fu;
-        else if (slot == 1) bank8 = prg8k - 3u;
-        else if (slot == 2) bank8 = prg8k - 2u;
-        else                bank8 = prg8k - 1u;
-        return s->prg[bank8 * 0x2000u + (addr & 0x1FFFu)];
-    }
-    if (s->fine_banks) {
-        uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
-        return s->prg[s->mmc3_prg_offsets[slot] + (addr & 0x1FFFu)];
-    }
-    if (s->cart.mapper >= 1) {
-        uint8_t slot = addr >= 0xC000 ? 1 : 0;
-        return s->prg[s->prg_offsets[slot] + (addr & 0x3FFF)];
-    }
-    uint32_t off = addr - 0x8000u;
-    if (s->cart.prg_banks == 1) off &= 0x3FFF;
-    return s->prg[off];
-}
-
-/* Cartridge byte the CPU sees at $8000-$FFFF under the current banking,
- * before Game Genie patches.  No side effects; requires s->prg. */
-static uint8_t nes_prg_mapped(const NesState *s, uint16_t addr) {
-    if (s->cart.mapper == 9) {
-        uint8_t slot   = (uint8_t)((addr - 0x8000u) >> 13);  /* 0..3 */
-        uint32_t prg8k = (uint32_t)s->cart.prg_banks * 2u;
-        uint32_t bank8;
-        if      (slot == 0) bank8 = s->m9_prg_reg & 0x0Fu;
-        else if (slot == 1) bank8 = prg8k - 3u;
-        else if (slot == 2) bank8 = prg8k - 2u;
-        else                bank8 = prg8k - 1u;  /* slot 3 */
-        return s->prg[bank8 * 0x2000u + (addr & 0x1FFFu)];
-    } else if (s->cart.mapper == 5) {
-        uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
-        if (s->mmc5_prg_is_ram[slot])
-            return s->prg_ram[(s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)) & 0x1FFFu];
-        else
-            return s->prg[s->mmc5_prg_offsets[slot] + (addr & 0x1FFFu)];
-    } else if (s->fine_banks) {
-        uint8_t slot = (uint8_t)((addr - 0x8000u) >> 13);
-        return s->prg[s->mmc3_prg_offsets[slot] + (addr & 0x1FFFu)];
-    } else if (s->cart.mapper >= 1) {
-        uint8_t slot = addr >= 0xC000 ? 1 : 0;
-        return s->prg[s->prg_offsets[slot] + (addr & 0x3FFF)];
-    } else {
-        /* NROM: 1 bank → mirrored; 2 banks → direct 32 KB */
-        uint32_t off = addr - 0x8000u;
-        if (s->cart.prg_banks == 1) off &= 0x3FFF;
-        return s->prg[off];
-    }
-}
-
-static uint8_t nes_cpu_read(uint16_t addr, void *ud);
 static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud);
 static void    nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud);
 
@@ -1279,7 +276,7 @@ static void nes_dmc_dma_check(NesState *s) {
  * count M2 (VRC IRQs and audio, FME-7 and friends, the FDS), or connector
  * faults that can stop M2.  Otherwise the APU alone runs in batches. */
 static bool nes_apu_eager(const NesState *s) {
-    return s->board.ticks || s->cart.mapper == 24 || s->cart.mapper == 26 || s->fds_enabled ||
+    return nes_cart_ticks(&s->cart) || s->fds_enabled ||
            (nes_pins_any(&s->pins) && !s->cfg->is_arcade);
 }
 
@@ -1302,7 +299,7 @@ static void nes_sync_apu_to_cpu(NesState *s, uint64_t cpu_cycle) {
         nes_update_irq(s);
         return;
     }
-    bool is_vrc6 = s->cart.mapper == 24 || s->cart.mapper == 26;
+    bool cart_ticks = nes_cart_ticks(&s->cart);
     bool m2 = true;
     if (nes_pins_any(&s->pins) && !s->cfg->is_arcade) {
         uint64_t open = nes_pins_sample(&s->pins);
@@ -1312,14 +309,12 @@ static void nes_sync_apu_to_cpu(NesState *s, uint64_t cpu_cycle) {
         s->apu_synced_cpu_cycle++;
         if (!m2)
             s->apu.fds_in = 0.0f;
-        else if (is_vrc6)
-            s->apu.fds_in = vrc6_tick(s);
+        else if (cart_ticks)   /* the board's counters, and its audio */
+            s->apu.fds_in = nes_cart_tick(&s->cart);
         else if (s->apu.audio_dev && s->fds_enabled)
             s->apu.fds_in = fds_audio_tick(&s->fds);
         s->apu.cycle = s->apu_synced_cpu_cycle - 1u;   /* tick numbers the cycle */
         apu2a03_tick(&s->apu);
-        if (s->board.ticks && m2)
-            nes_board_tick(s, 1);
         nes_dmc_dma_check(s);
     }
     if (s->apu.audio_dev && s->apu.frame_n > 900) apu2a03_flush(&s->apu);
@@ -1427,7 +422,7 @@ static void nes_run_dma(NesState *s, uint16_t cpu_addr) {
     s->in_dma = false;
 }
 
-static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
+uint8_t nes_cpu_read(uint16_t addr, void *ud) {
     NesState *s = ud;
     nes_sync_all(s);
     if (s->dma_halt && !s->in_dma) {
@@ -1439,7 +434,7 @@ static uint8_t nes_cpu_read(uint16_t addr, void *ud) {
     return v;
 }
 
-static void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
+void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
     NesState *s = ud;
     nes_sync_all(s);
     s->cpu_bus = val;
@@ -1463,78 +458,6 @@ static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
     }
 }
 
-static void gg_print(NesState *s, const NesCheat *e) {
-    uint16_t a; uint8_t v, k; bool h;
-    if (!nes_gg_decode(e->code, &a, &v, &k, &h)) return;
-    uint8_t rom = s->prg ? nes_prg_direct(s, a) : 0;
-    const char *state = !e->enabled ? "off" : (h && rom != k) ? "on, compare mismatch" : "on";
-    if (h)
-        gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  (if $%02X)  ROM=$%02X [%s]  %s\n",
-                            e->code, a, v, k, rom, state, e->name);
-    else
-        gemu_monitor_printf(s->monitor, "  %-8s  $%04X = $%02X  ROM=$%02X [%s]  %s\n",
-                            e->code, a, v, rom, state, e->name);
-}
-
-/* line = arguments after "gamegenie":
- *   list [code] | add <code> [name] | delete <code> | on <code> | off <code> */
-static void nes_gamegenie_cmd(NesState *s, const char *line) {
-    while (*line && isspace((unsigned char)*line)) line++;
-    char sub[32] = {0}, code[32] = {0};
-    int si = 0;
-    while (*line && !isspace((unsigned char)*line) && si < 31)
-        sub[si++] = (char)tolower((unsigned char)*line++);
-    while (*line && isspace((unsigned char)*line)) line++;
-    si = 0;
-    while (*line && !isspace((unsigned char)*line) && si < 31) code[si++] = *line++;
-    while (*line && isspace((unsigned char)*line)) line++;
-    char name[64];
-    snprintf(name, sizeof(name), "%s", line);
-    for (int i = (int)strlen(name) - 1; i >= 0 && isspace((unsigned char)name[i]); i--) name[i] = '\0';
-    char err[160];
-
-    if (strcmp(sub, "list") == 0) {
-        if (code[0]) {
-            int i = nes_cheats_find(&g_cheats, code);
-            if (i < 0) gemu_monitor_printf(s->monitor, "gamegenie: code '%s' not found\n", code);
-            else gg_print(s, &g_cheats.list[i]);
-            return;
-        }
-        if (g_cheats.n == 0) { gemu_monitor_printf(s->monitor, "gamegenie: no codes\n"); return; }
-        gemu_monitor_printf(s->monitor, "Game Genie codes:\n");
-        for (int i = 0; i < g_cheats.n; i++) gg_print(s, &g_cheats.list[i]);
-        return;
-    }
-    if (strcmp(sub, "add") == 0) {
-        if (!code[0]) { gemu_monitor_printf(s->monitor, "usage: gamegenie add <code> [name]\n"); return; }
-        if (!nes_cheats_add(&g_cheats, code, name, true, err, sizeof(err))) {
-            gemu_monitor_printf(s->monitor, "gamegenie: %s\n", err);
-            return;
-        }
-        gemu_monitor_printf(s->monitor, "gamegenie: added\n");
-        gg_print(s, &g_cheats.list[g_cheats.n - 1]);
-        return;
-    }
-    int i = code[0] ? nes_cheats_find(&g_cheats, code) : -1;
-    if (strcmp(sub, "delete") == 0 || strcmp(sub, "remove") == 0 ||
-        strcmp(sub, "on") == 0 || strcmp(sub, "off") == 0) {
-        if (i < 0) {
-            gemu_monitor_printf(s->monitor, code[0] ? "gamegenie: code '%s' not found\n"
-                                                    : "usage: gamegenie %s <code>\n", code[0] ? code : sub);
-            return;
-        }
-        if (sub[0] == 'o') {
-            nes_cheats_set_enabled(&g_cheats, i, sub[1] == 'n');
-            gemu_monitor_printf(s->monitor, "gamegenie: %s %s\n", g_cheats.list[i].code, sub[1] == 'n' ? "on" : "off");
-        } else {
-            gemu_monitor_printf(s->monitor, "gamegenie: removed %s\n", g_cheats.list[i].code);
-            nes_cheats_remove(&g_cheats, i);
-        }
-        return;
-    }
-    gemu_monitor_printf(s->monitor, "gamegenie list [code] | add <code> [name] | delete <code> | on <code> | off <code>\n"
-                                    "(Debug > Game Genie in the window does the same)\n");
-}
 
 static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
     NesState *s = ud;
@@ -1638,64 +561,31 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
         }
         if (s->cfg->ports[1] != NES_DEVICE_CONTROLLER &&
             s->cfg->ports[1] != NES_DEVICE_FC2_MIC &&
-            !nes_device_is_rob(s->cfg->ports[1]) && !g_np_port2) return ctrl_open;
+            !nes_device_is_rob(s->cfg->ports[1]) && !s->port2_controller) return ctrl_open;
         if (s->ctrl_strobe) return ctrl_open | ((s->ctrl_state[1] & NES_BTN_A) ? 1u : 0u);
         uint8_t bit = s->ctrl_shift[1] & 1;
         s->ctrl_shift[1] = (s->ctrl_shift[1] >> 1) | 0x80u;
         return ctrl_open | bit;
     }
 
-    if (s->has_board && addr >= 0x4020 && addr < 0x8000) {
-        uint8_t v;
-        if (nes_board_read(s, addr, &v)) return v;
+    if (addr < 0x4020) return s->cpu_bus;
+
+    /* FDS: RAM at $6000-$DFFF, the BIOS above */
+    if (s->fds_enabled && addr >= 0x6000) {
+        if (addr >= 0xE000) return s->fds.bios[addr - 0xE000u];
+        return s->fds.ram[addr - 0x6000u];
     }
 
-    /* MMC5: readable registers at $5100-$5BFF and ExRAM at $5C00-$5FFF */
-    if (s->cart.mapper == 5 && addr >= 0x5000 && addr < 0x6000) {
-        if (addr == 0x5204) {
-            uint8_t v = (s->mmc5_irq_pending ? 0x80u : 0u) |
-                        (s->mmc5_in_frame    ? 0x40u : 0u);
-            s->mmc5_irq_pending = false;
-            s->cart_irq = false;
-            nes_update_irq(s);
-            return v;
-        }
-        if (addr == 0x5205) return (uint8_t)((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]);
-        if (addr == 0x5206) return (uint8_t)(((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]) >> 8);
-        if (addr >= 0x5C00)
-            return (s->mmc5_exram_mode >= 2) ? s->mmc5_exram[addr - 0x5C00u] : s->cpu_bus;
-        return s->cpu_bus;
-    }
+    if (addr < 0x8000) return nes_cart_read(&s->cart, addr, s->cpu_bus);
 
-    if (addr >= 0x6000 && addr < 0x8000) {
-        if (s->fds_enabled) return s->fds.ram[addr - 0x6000u];
-        if (s->cart.mapper == 5)
-            return s->prg_ram[addr & 0x1FFFu]; /* $5113 always maps RAM here */
-        if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
-            is_mmc3(s) || s->cart.mapper == 24 || s->cart.mapper == 26 ||
-            s->cart.mapper == 178 || s->cfg->is_arcade ||
-            (s->has_board && nes_board_has_prg_ram(s)))
-            return s->prg_ram[addr & 0x1FFF];
-        return s->cpu_bus;   /* no PRG-RAM: open bus */
+    if (!s->cart.prg) return s->cpu_bus;
+    uint8_t rom = nes_cart_prg(&s->cart, addr);
+    for (int i = 0; i < s->gg_count; i++) {
+        if (s->gg_patches[i].addr == addr &&
+            (!s->gg_patches[i].has_cmp || rom == s->gg_patches[i].cmp))
+            return s->gg_patches[i].val;
     }
-
-    if (addr >= 0x8000) {
-        if (s->fds_enabled) {
-            if (addr >= 0xE000)
-                return s->fds.bios[addr - 0xE000u];          /* BIOS ROM */
-            return s->fds.ram[addr - 0x6000u];               /* $8000–$DFFF: upper FDS RAM */
-        }
-        if (!s->prg) return s->cpu_bus;
-        uint8_t rom = nes_prg_mapped(s, addr);
-        for (int i = 0; i < s->gg_count; i++) {
-            if (s->gg_patches[i].addr == addr &&
-                (!s->gg_patches[i].has_cmp || rom == s->gg_patches[i].cmp))
-                return s->gg_patches[i].val;
-        }
-        return rom;
-    }
-
-    return s->cpu_bus;  /* open bus: the last value on the data bus */
+    return rom;
 }
 
 static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
@@ -1741,7 +631,7 @@ static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
         bool new_strobe = (val & 1) != 0;
         if (s->cfg->is_arcade &&
             (new_strobe != s->ctrl_strobe ||
-             ((val & 0x04u) ? 0x2000u : 0u) != s->chr_offsets[0]))
+             ((val & 0x04u) ? 0x2000u : 0u) != s->cart.chr_off[0]))
             VS_DEBUG(s, "write 4016 <- %02X pc=%04X strobe %d->%d chr=%05X\n",
                      val, s->cpu.PC, s->ctrl_strobe ? 1 : 0,
                      new_strobe ? 1 : 0, (val & 0x04u) ? 0x2000u : 0u);
@@ -1755,12 +645,7 @@ static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
             s->ctrl_shift[1] = s->ctrl_state[1];
         }
         s->ctrl_strobe = new_strobe;
-        /* VS. System: bit 2 selects 8KB VROM bank (0 = bank 2b at offset 0, 1 = bank 2a at 0x2000) */
-        if (s->cfg->is_arcade && !s->chr_is_ram) {
-            uint32_t bank_off = (val & 0x04u) ? 0x2000u : 0u;
-            s->chr_offsets[0] = bank_off;
-            s->chr_offsets[1] = bank_off + 0x1000u;
-        }
+        nes_cart_out(&s->cart, val);   /* OUT0-2: the VS. System's CHR bank */
         return;
     }
 
@@ -1781,260 +666,15 @@ static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
         return;
     }
 
-    if (s->has_board && addr >= 0x4020 && nes_board_write(s, addr, val))
-        return;
+    if (addr < 0x4020) return;
 
-    if (s->cart.mapper == 178 && addr >= 0x4800 && addr <= 0x4803) {
-        switch (addr) {
-        case 0x4800: s->m178_mode   = val; break;
-        case 0x4801: s->m178_prg_lo = val; break;
-        case 0x4802: s->m178_prg_hi = val; break;
-        default: break; /* $4803: PRG-RAM bank - stored implicitly, single 8KB bank only */
-        }
-        m178_update_banks(s);
+    /* FDS: $6000-$DFFF is RAM */
+    if (s->fds_enabled && addr >= 0x6000) {
+        if (addr < 0xE000) s->fds.ram[addr - 0x6000u] = val;
         return;
     }
 
-    /* MMC5 registers at $5000-$5BFF and ExRAM at $5C00-$5FFF */
-    if (s->cart.mapper == 5 && addr >= 0x5000 && addr < 0x6000) {
-        if (addr == 0x5100) { s->mmc5_prg_mode = val & 3u; mmc5_update_prg_banks(s); return; }
-        if (addr == 0x5101) { s->mmc5_chr_mode = val & 3u; return; }
-        /* $5102/$5103: PRG-RAM protect - always allow writes (not enforced) */
-        if (addr == 0x5104) { s->mmc5_exram_mode = val & 3u; return; }
-        if (addr == 0x5105) { s->mmc5_nt_map = val; return; }
-        if (addr == 0x5106) { s->mmc5_fill_tile = val; return; }
-        if (addr == 0x5107) { s->mmc5_fill_attr = val & 3u; return; }
-        if (addr >= 0x5113 && addr <= 0x5117) {
-            s->mmc5_prg_regs[addr - 0x5113u] = val;
-            mmc5_update_prg_banks(s);
-            return;
-        }
-        if (addr >= 0x5120 && addr <= 0x5127) {
-            s->mmc5_chr_regs[addr - 0x5120u] = val;
-            s->mmc5_last_chr_bg = false;
-            return;
-        }
-        if (addr >= 0x5128 && addr <= 0x512B) {
-            s->mmc5_chr_regs[8u + (addr - 0x5128u)] = val;
-            s->mmc5_last_chr_bg = true;
-            return;
-        }
-        if (addr == 0x5130) { s->mmc5_chr_hi = val & 3u; return; }
-        if (addr == 0x5203) { s->mmc5_irq_target = val; return; }
-        if (addr == 0x5204) {
-            s->mmc5_irq_enabled = (val & 0x80u) != 0;
-            if (!s->mmc5_irq_enabled) { s->mmc5_irq_pending = false; s->cart_irq = false; nes_update_irq(s); }
-            return;
-        }
-        if (addr == 0x5205) { s->mmc5_mul[0] = val; return; }
-        if (addr == 0x5206) { s->mmc5_mul[1] = val; return; }
-        if (addr >= 0x5C00 && s->mmc5_exram_mode <= 2) {
-            s->mmc5_exram[addr - 0x5C00u] = val;
-            return;
-        }
-        return; /* ignore other MMC5 writes */
-    }
-
-    if (addr >= 0x6000 && addr < 0x8000) {
-        if (s->fds_enabled) { s->fds.ram[addr - 0x6000u] = val; return; }
-        if (s->cart.mapper == 5) { s->prg_ram[addr & 0x1FFFu] = val; return; }
-        if ((s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
-            is_mmc3(s) || s->cart.mapper == 24 || s->cart.mapper == 26 ||
-            s->cart.mapper == 178 || s->cfg->is_arcade ||
-            (s->has_board && nes_board_has_prg_ram(s)))
-            s->prg_ram[addr & 0x1FFF] = val;
-        return;
-    }
-
-    /* FDS: $8000–$DFFF is writable RAM */
-    if (s->fds_enabled && addr >= 0x8000 && addr < 0xE000) {
-        s->fds.ram[addr - 0x6000u] = val;
-        return;
-    }
-
-    if (addr >= 0x8000) {
-        if      (s->cart.mapper == 1) mmc1_serial_write(s, addr, val);
-        else if (s->cart.mapper == 2) s->prg_offsets[0] = ((uint32_t)(val % s->cart.prg_banks)) * 0x4000u;
-        else if (s->cart.mapper == 3) {
-            /* CNROM: 8KB CHR bank select, with bus conflicts like GxROM */
-            val &= nes_prg_direct(s, addr);
-            s->chr_offsets[0] = ((uint32_t)val % s->cart.chr_banks) * 0x2000u;
-            s->chr_offsets[1] = s->chr_offsets[0] + 0x1000u;
-        }
-        else if (s->cart.mapper == 66) {
-            /* GxROM has bus conflicts: the CPU write value is ANDed with
-             * the ROM byte currently driving the data bus. */
-            val &= nes_prg_direct(s, addr);
-            uint32_t prg_size = (uint32_t)s->cart.prg_banks * 0x4000u;
-            uint32_t chr_size = (uint32_t)s->cart.chr_banks * 0x2000u;
-            s->prg_offsets[0] = (((uint32_t)(val >> 4) & 3u) * 0x8000u) % prg_size;
-            s->prg_offsets[1] = s->prg_offsets[0] + 0x4000u;
-            if (chr_size > 0) {
-                s->chr_offsets[0] = (((uint32_t)val & 3u) * 0x2000u) % chr_size;
-                s->chr_offsets[1] = s->chr_offsets[0] + 0x1000u;
-            }
-        }
-        else if (is_mmc3(s)) mmc3_cpu_write(s, addr, val);
-        else if (s->cart.mapper == 9) {
-            /* MMC2 register map (decoded from CPU A14..A12):
-             *   $A000-$AFFF  PRG bank (bits 3:0)
-             *   $B000-$BFFF  left CHR  FD-latch bank (bits 4:0)
-             *   $C000-$CFFF  left CHR  FE-latch bank
-             *   $D000-$DFFF  right CHR FD-latch bank
-             *   $E000-$EFFF  right CHR FE-latch bank
-             *   $F000-$FFFF  mirroring (bit 0: 0=vertical, 1=horizontal) */
-            if (addr < 0xB000)
-                s->m9_prg_reg = val & 0x0Fu;
-            else if (addr < 0xC000)
-                s->m9_chr_lfd = val & 0x1Fu;
-            else if (addr < 0xD000)
-                s->m9_chr_lfe = val & 0x1Fu;
-            else if (addr < 0xE000)
-                s->m9_chr_rfd = val & 0x1Fu;
-            else if (addr < 0xF000)
-                s->m9_chr_rfe = val & 0x1Fu;
-            else
-                s->ppu.mirror = (val & 1u) ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
-        }
-        else if (s->cart.mapper == 7) {
-            /* AxROM: bits 2:0 = 32KB PRG bank, bit 4 = mirror (0=single-A, 1=single-B) */
-            uint32_t prg_size = (uint32_t)s->cart.prg_banks * 0x4000u;
-            uint8_t  bank     = val & 0x07u;
-            s->prg_offsets[0] = ((uint32_t)bank * 0x8000u) % prg_size;
-            s->prg_offsets[1] = s->prg_offsets[0] + 0x4000u;
-            s->ppu.mirror     = (val & 0x10u) ? RP2C02_MIRROR_SINGLE_B
-                                               : RP2C02_MIRROR_SINGLE_A;
-        }
-        else if (s->cart.mapper == 228) {
-            /* Action 52 - NESdev register layout (address + data bus):
-             *   FEDCBA98 76543210  (full 16-bit address)
-             *   1.MHHPPP PPS.CCCC
-             * D(13)=mirror  C:B(12:11)=chip-sel  A→6(10:6)=page(5-bit)
-             * 5=PRG-mode  3:0=chr_hi   data[1:0]=chr_lo
-             * Three 512KB chips at chip-sel 0,1,3; chip-sel 2 = open bus. */
-            uint8_t chip     = (uint8_t)((addr >> 11) & 3u);
-            uint8_t page     = (uint8_t)((addr >> 6) & 0x1Fu);
-            uint8_t prg_mode = (uint8_t)((addr >> 5) & 1u);
-            uint8_t chr_hi   = (uint8_t)(addr & 0xFu);
-            uint8_t mirror   = (uint8_t)((addr >> 13) & 1u);
-            uint8_t chr_bank = (uint8_t)((chr_hi << 2) | (val & 3u));
-
-            if (chip == 2u) return; /* open bus - no PRG chip, ignore */
-
-            uint32_t global_bank = (chip == 3u) ? (64u + page)
-                                                 : ((uint32_t)chip * 32u + page);
-            uint32_t prg_size = (uint32_t)s->cart.prg_banks * 0x4000u;
-            if (!prg_mode) {
-                /* 32KB split: round to even/odd pair */
-                uint32_t base = (global_bank & ~1u) * 0x4000u;
-                s->prg_offsets[0] = base % prg_size;
-                s->prg_offsets[1] = (base + 0x4000u) % prg_size;
-            } else {
-                /* 16KB: same bank mirrored in both $8000 and $C000 windows */
-                uint32_t base = (global_bank * 0x4000u) % prg_size;
-                s->prg_offsets[0] = base;
-                s->prg_offsets[1] = base;
-            }
-
-            uint32_t chr_size = (uint32_t)s->cart.chr_banks * 0x2000u;
-            if (chr_size > 0) {
-                s->chr_offsets[0] = ((uint32_t)chr_bank * 0x2000u) % chr_size;
-                s->chr_offsets[1] = s->chr_offsets[0] + 0x1000u;
-            }
-
-            s->ppu.mirror = mirror ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
-        }
-        else if (s->cart.mapper == 24 || s->cart.mapper == 26)
-            vrc6_cpu_write(s, addr, val);
-    }
-}
-
-#ifdef HAVE_LUA
-/* Only installed as cpu.mem_read/mem_write when -lua is active, so a script
- * with no memory.register{read,write}() hooks costs nothing on the hot path. */
-static uint8_t nes_cpu_read_lua(uint16_t addr, void *ud) {
-    NesState *s = ud;
-    uint8_t val = nes_cpu_read(addr, ud);
-    nes_lua_notify_read(s->lua, addr, val);
-    return val;
-}
-static void nes_cpu_write_lua(uint16_t addr, uint8_t val, void *ud) {
-    NesState *s = ud;
-    nes_cpu_write(addr, val, ud);
-    nes_lua_notify_write(s->lua, addr, val);
-}
-static uint64_t nes_lua_get_framecount(void *ud) {
-    NesState *s = ud;
-    return s->ppu.frame;
-}
-static void nes_lua_get_zapper(void *ud, int *x, int *y, int *click) {
-    NesState *s = ud;
-    *x = s->zapper_x;
-    *y = s->zapper_y;
-    /* Report the live mouse-button state, not the Zapper's decaying 10-frame
-     * hardware trigger pulse (nes_handle_keys()) - a Lua drag-and-drop
-     * script needs "still held" to stay true for as long as the button is
-     * actually down, not just the first 10 frames of the click. */
-    GemuPointerState ptr = gemu_display_get_pointer(s->display);
-    *click = ptr.button ? 1 : 0;
-}
-#endif
-
-/* ── FDS media device ────────────────────────────────────────────────────── */
-
-static GemuMediaResult fds_media_change(void *ud, const char *arg,
-                                         char *err, size_t err_len) {
-    NesState *s = ud;
-    if (!arg || !arg[0]) { snprintf(err, err_len, "missing disk path"); return GEMU_MEDIA_ERR; }
-    nes_fds_save(s);
-    s->sav_path[0] = '\0';
-    fds_disk_eject(&s->fds);
-    if (!fds_disk_load(&s->fds, arg)) {
-        snprintf(err, err_len, "failed to load '%s'", arg);
-        return GEMU_MEDIA_ERR;
-    }
-    nes_fds_save_setup(s, arg);
-    if (s->fds.hle_mode)
-        fds_hle_boot(&s->fds, s->chr);
-    return GEMU_MEDIA_OK;
-}
-
-static GemuMediaResult fds_media_eject(void *ud, char *err, size_t err_len) {
-    (void)err; (void)err_len;
-    NesState *s = ud;
-    nes_fds_save(s);
-    s->sav_path[0] = '\0';
-    fds_disk_eject(&s->fds);
-    return GEMU_MEDIA_OK;
-}
-
-static GemuMediaResult fds_media_flip(void *ud, char *err, size_t err_len) {
-    NesState *s = ud;
-    if (!s->fds.disk_inserted) {
-        snprintf(err, err_len, "no disk inserted");
-        return GEMU_MEDIA_ERR;
-    }
-    if (s->fds.disk_sides < 2) {
-        snprintf(err, err_len, "disk has only one side");
-        return GEMU_MEDIA_ERR;
-    }
-    return fds_disk_flip(&s->fds) ? GEMU_MEDIA_OK : GEMU_MEDIA_ERR;
-}
-
-static void fds_media_status(void *ud, char *buf, size_t buf_len) {
-    const NesState *s = ud;
-    if (!s->fds.disk_inserted)
-        snprintf(buf, buf_len, "no disk");
-    else if (s->fds.disk_change_cycles > 0)
-        snprintf(buf, buf_len, "changing disk, side %c (%u/%u)",
-                 (char)('A' + s->fds.cur_side),
-                 (unsigned)s->fds.cur_side + 1u,
-                 (unsigned)s->fds.disk_sides);
-    else
-        snprintf(buf, buf_len, "disk inserted, side %c (%u/%u)",
-                 (char)('A' + s->fds.cur_side),
-                 (unsigned)s->fds.cur_side + 1u,
-                 (unsigned)s->fds.disk_sides);
+    nes_cart_write(&s->cart, addr, val);
 }
 
 /* ── Cartridge media device ──────────────────────────────────────────────── */
@@ -2042,166 +682,17 @@ static void fds_media_status(void *ud, char *buf, size_t buf_len) {
 /* PPU hooks for the cartridge's mapper: scanline IRQ counters and
  * nametable mapping.  Called again when the cartridge changes. */
 static void nes_install_mapper_hooks(NesState *s) {
-    unsigned m = s->cart.mapper;
-    s->ppu.irq_scanline = NULL;
-    s->ppu.nt_read      = NULL;
-    s->ppu.nt_write     = NULL;
-    s->ppu.irq_ud = s->ppu.nt_ud = s;
-    if (m == 4 || m == 119) s->ppu.irq_scanline = mmc3_irq_scanline;
-    if (m == 5) {
-        s->ppu.irq_scanline = mmc5_irq_scanline;
-        s->ppu.nt_read      = mmc5_nt_read;
-        s->ppu.nt_write     = mmc5_nt_write;
-    }
-    if (s->has_board && nes_board_wants_scanline(m)) s->ppu.irq_scanline = nes_board_scanline;
-    if (s->has_board && nes_board_wants_nt(m)) {
-        s->ppu.nt_read  = nes_board_nt_read;
-        s->ppu.nt_write = nes_board_nt_write;
-    }
+    NesCart *c = &s->cart;
+    s->ppu.irq_scanline = nes_cart_wants_scanline(c) ? nes_cart_scanline : NULL;
+    s->ppu.nt_read      = nes_cart_wants_nt(c) ? nes_cart_nt_read : NULL;
+    s->ppu.nt_write     = nes_cart_wants_nt(c) ? nes_cart_nt_write : NULL;
+    s->ppu.irq_ud = s->ppu.nt_ud = c;
 }
 
-static GemuMediaResult nes_media_change(void *ud, const char *arg,
-                                         char *err, size_t err_len) {
-    NesState *s = ud;
-    if (!arg || !arg[0]) {
-        snprintf(err, err_len, "missing cartridge path");
-        return GEMU_MEDIA_ERR;
-    }
-    if (g_np_active) {
-        snprintf(err, err_len, "can't change the cartridge during a netplay game");
-        return GEMU_MEDIA_ERR;
-    }
-    nes_sav_save(s);
-    s->battery_autosave = false;
-    s->sav_path[0] = '\0';
-    free(s->prg); s->prg = NULL;
-    free(s->chr); s->chr = NULL;
-    if (!ines_load(s, arg)) {
-        snprintf(err, err_len, "failed to load '%s'", arg);
-        return GEMU_MEDIA_ERR;
-    }
-    nes_battery_setup(s);
-    nes_cheats_load(s);         /* this cartridge's Game Genie codes */
-    nes_install_mapper_hooks(s);
-    if (g_np) {                 /* listed under its own name; not a fresh power-on any more */
-        char game[NETPLAY_GAME_LEN];
-        nes_np_game_name(s, game, sizeof(game));
-        netplay_set_game(g_np, game);
-        free(g_poweron);
-        g_poweron = NULL;
-    }
-    return GEMU_MEDIA_OK_RESET;
-}
-
-static GemuMediaResult nes_media_eject(void *ud, char *err, size_t err_len) {
-    (void)err; (void)err_len;
-    NesState *s = ud;
-    nes_sav_save(s);
-    s->battery_autosave = false;
-    s->sav_path[0] = '\0';
-    free(s->prg); s->prg = NULL;
-    free(s->chr); s->chr = NULL;
-    s->cart_path_buf[0] = '\0';
-    printf("cartridge: ejected\n");
-    return GEMU_MEDIA_OK;
-}
-
-static void nes_media_status(void *ud, char *buf, size_t buf_len) {
-    const NesState *s = ud;
-    snprintf(buf, buf_len, "%s",
-             s->cart_path_buf[0] ? s->cart_path_buf : "no cartridge");
-}
-
-/* ── Controller input ────────────────────────────────────────────────────── */
-
-/* held: bitmask returned by gemu_display_poll() this frame (0 if headless) */
-static void nes_handle_keys(NesState *s, uint32_t held) {
-    if (s->cfg->is_arcade) {
-        /* VS. arcade: bits 0-7 = P1, 8-15 = P2, 16 = Coin1, 17 = Coin2, 18 = Service */
-        if (s->display) {
-            s->ctrl_state[0] = (uint8_t)(held & 0xFFu);
-            s->ctrl_state[1] = (uint8_t)((held >> 8) & 0xFFu);
-            bool coin1 = (held >> 16) & 1;
-            bool coin2 = (held >> 17) & 1;
-            s->vs_service = (held >> 18) & 1;
-            if (coin1 && !s->vs_coin_prev[0]) s->vs_coin_latch[0] = 15;
-            if (coin2 && !s->vs_coin_prev[1]) s->vs_coin_latch[1] = 15;
-            s->vs_coin_prev[0] = coin1;
-            s->vs_coin_prev[1] = coin2;
-        }
-        if (s->ctrl_inject_frames > 0) {
-            s->ctrl_state[0] |= s->ctrl_inject_mask;
-            s->ctrl_inject_frames--;
-        }
-        return;
-    }
-
-    if (!s->display) {
-        /* Headless: no input source */
-        s->ctrl_state[0] = 0; s->ctrl_state[1] = 0;
-    } else {
-        /* Action bits 0-7 and 8-15 map directly to NES_BTN_* for ports 1/2. */
-        if (s->cfg->ports[0] == NES_DEVICE_CONTROLLER)
-            s->ctrl_state[0] = (uint8_t)(held & 0xFFu);
-        else
-            s->ctrl_state[0] = 0;
-        if (s->cfg->ports[1] == NES_DEVICE_CONTROLLER ||
-            s->cfg->ports[1] == NES_DEVICE_FC2_MIC)
-            s->ctrl_state[1] = (uint8_t)((held >> 8) & 0xFFu);
-        else if (!nes_device_is_rob(s->cfg->ports[1]))
-            s->ctrl_state[1] = 0;
-        if (s->cfg->ports[1] == NES_DEVICE_FC2_MIC)
-            s->mic_noise = (held & GEMU_ACTION(16)) != 0;
-        /* Track host pointer position unconditionally (not just when a real
-         * NES Zapper is attached) so Lua scripts using input.get()/
-         * zapper.read() for mouse-driven GUIs (drag-and-drop tools, etc.)
-         * see live coordinates even on a plain controller-only setup. */
-        GemuPointerState ptr = gemu_display_get_pointer(s->display);
-        s->zapper_x = ptr.x;
-        s->zapper_y = ptr.y;
-        if (s->cfg->ports[1] == NES_DEVICE_ZAPPER) {
-            /* Real light-gun games need the trigger held "on" for a short
-             * pulse for the CRT light-sensing to register - a single-frame
-             * click would be invisible to the game's polling loop. */
-            if (ptr.button && s->zapper_trigger_ttl == 0)
-                s->zapper_trigger_ttl = 10; /* 10-frame trigger pulse */
-            if (s->zapper_trigger_ttl > 0)
-                s->zapper_trigger_ttl--;
-        }
-    }
-
-    /* Monitor key injection */
-    if (s->ctrl_inject_frames > 0) {
-        s->ctrl_state[0] |= s->ctrl_inject_mask;
-        s->ctrl_inject_frames--;
-    }
-}
-
-/* ── Screendump ──────────────────────────────────────────────────────────── */
-
-static bool nes_screendump(void *ud, const char *path) {
-    NesState *s = ud;
-    if (s->cfg->crt_type != MOS_CRT_NONE && s->crt_argb)
-        return gemu_screendump_argb(path, s->crt_argb, NES_CRT_WIDTH, NES_CRT_HEIGHT);
-    int w = RP2C02_WIDTH, h = RP2C02_HEIGHT;
-    uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
-    if (!rgb) return false;
-    const uint32_t *palette = s->ppu.alt_palette_rgb ? s->ppu.alt_palette_rgb
-                                                     : rp2c02_palette_rgb;
-    for (int i = 0; i < w * h; i++) {
-        uint32_t c    = palette[s->ppu.pixels[i] & 0x3F];
-        rgb[i*3+0]    = (uint8_t)(c >> 16);
-        rgb[i*3+1]    = (uint8_t)(c >>  8);
-        rgb[i*3+2]    = (uint8_t)(c      );
-    }
-    bool ok = gemu_screendump(path, rgb, w, h);
-    free(rgb);
-    return ok;
-}
 
 /* ── Machine lifecycle ───────────────────────────────────────────────────── */
 
-static void nes_reset(NesState *s) {
+void nes_reset(NesState *s) {
     rp2c02_reset(&s->ppu);
     if (s->fds_enabled) {
         /* FDS: horizontal mirroring until $4025 says otherwise */
@@ -2212,124 +703,22 @@ static void nes_reset(NesState *s) {
         apu2a03_reset(&s->apu);
         return;
     }
-    s->ppu.mirror = s->cart.mirror;
+    s->ppu.mirror = s->cart.info.mirror;
     s->ppu_synced_cpu_cycle = s->apu_synced_cpu_cycle = s->cpu.cycle_count;
     s->apu_deadline = 0;
 
-    /* Mapper bank state must be set before mos6502_reset reads the reset
-       vector, otherwise prg_offsets[1] is 0 and the vector is fetched from
-       the wrong physical bank. */
-    if (s->cart.mapper == 1) {
-        s->mmc1_shift       = 0;
-        s->mmc1_shift_count = 0;
-        s->mmc1_ctrl        = 0x0C;   /* PRG mode 3: fix last bank at $C000 */
-        s->mmc1_chr0        = 0;
-        s->mmc1_chr1        = 0;
-        s->mmc1_prg         = 0;
-        mmc1_update_banks(s);
-    } else if (s->cart.mapper == 2) {
-        s->prg_offsets[0] = 0;
-        s->prg_offsets[1] = (uint32_t)(s->cart.prg_banks - 1) * 0x4000u;
-        s->chr_offsets[0] = 0;
-        s->chr_offsets[1] = 0x1000u;
-    } else if (s->cart.mapper == 3) {
-        /* NROM-style fixed PRG: 16KB mirrored, or 32KB */
-        s->prg_offsets[0] = 0;
-        s->prg_offsets[1] = s->cart.prg_banks > 1 ? 0x4000u : 0;
-        s->chr_offsets[0] = 0;
-        s->chr_offsets[1] = 0x1000u;
-    } else if (s->cart.mapper == 66) {
-        s->prg_offsets[0] = 0;
-        s->prg_offsets[1] = 0x4000u;
-        s->chr_offsets[0] = 0;
-        s->chr_offsets[1] = 0x1000u;
-    } else if (s->cart.mapper == 228) {
-        /* Reset maps the last two 16KB banks so the reset vector is readable */
-        uint32_t last = (uint32_t)(s->cart.prg_banks - 1) * 0x4000u;
-        s->prg_offsets[0] = last >= 0x4000u ? last - 0x4000u : 0;
-        s->prg_offsets[1] = last;
-        s->chr_offsets[0] = 0;
-        s->chr_offsets[1] = 0x1000u;
-    } else if (s->cart.mapper == 5) {
-        s->mmc5_prg_mode    = 3;    /* four 8KB banks */
-        s->mmc5_chr_mode    = 3;    /* 1KB CHR banks */
-        s->mmc5_exram_mode  = 3;    /* read-only at reset */
-        s->mmc5_nt_map      = 0;    /* all CIRAM page 0 */
-        s->mmc5_irq_enabled = false;
-        s->mmc5_irq_pending = false;
-        s->mmc5_in_frame    = false;
-        s->mmc5_irq_counter = 0;
-        s->mmc5_last_chr_bg = false;
-        s->mmc5_exattr_latch = 0;
-        memset(s->mmc5_prg_regs,  0xFF, sizeof(s->mmc5_prg_regs));
-        memset(s->mmc5_chr_regs,  0,    sizeof(s->mmc5_chr_regs));
-        s->mmc5_chr_hi = 0;
-        /* $5117 = 0xFF → last 8KB ROM bank at $E000-$FFFF */
-        mmc5_update_prg_banks(s);
-    } else if (s->cart.mapper == 178) {
-        s->m178_mode   = 0;
-        s->m178_prg_lo = 0;
-        s->m178_prg_hi = 0;
-        m178_update_banks(s);
-        s->chr_offsets[0] = 0;
-        s->chr_offsets[1] = 0x1000u;
-    } else if (s->cart.mapper == 9) {
-        s->m9_prg_reg  = 0;
-        s->m9_chr_lfd  = 0;
-        s->m9_chr_lfe  = 0;
-        s->m9_chr_rfd  = 0;
-        s->m9_chr_rfe  = 0;
-        s->m9_latch_l  = false;
-        s->m9_latch_r  = false;
-    } else if (s->cart.mapper == 7) {
-        s->prg_offsets[0] = 0;
-        s->prg_offsets[1] = 0x4000u;
-        s->ppu.mirror     = RP2C02_MIRROR_SINGLE_A;
-    } else if (is_mmc3(s)) {
-        memset(s->mmc3_regs, 0, sizeof(s->mmc3_regs));
-        s->mmc3_bank_sel    = 0;
-        s->mmc3_irq_latch   = 0;
-        s->mmc3_irq_counter = 0;
-        s->mmc3_irq_reload  = false;
-        s->mmc3_irq_enabled = false;
-        s->cart_irq         = false;
-        mmc3_update_banks(s);
-    } else if (s->cart.mapper == 24 || s->cart.mapper == 26) {
-        uint32_t n8k = (uint32_t)s->cart.prg_banks * 2u;
-        s->mmc3_prg_offsets[0] = 0;
-        s->mmc3_prg_offsets[1] = 0x2000u;
-        s->mmc3_prg_offsets[2] = 0;
-        s->mmc3_prg_offsets[3] = (n8k - 1u) * 0x2000u;  /* $E000: fixed last 8KB */
-        memset(s->mmc3_chr_offsets, 0, sizeof(s->mmc3_chr_offsets));
-        s->vrc6_irq_latch   = 0;
-        s->vrc6_irq_counter = 0;
-        s->vrc6_irq_enabled = false;
-        s->vrc6_irq_after   = false;
-        s->vrc6_irq_mode    = false;
-        s->vrc6_prescaler   = 0;
-        s->vrc6_p1_ctrl  = 0; s->vrc6_p1_period = 0; s->vrc6_p1_en = false;
-        s->vrc6_p1_timer = 0; s->vrc6_p1_seq    = 0;
-        s->vrc6_p2_ctrl  = 0; s->vrc6_p2_period = 0; s->vrc6_p2_en = false;
-        s->vrc6_p2_timer = 0; s->vrc6_p2_seq    = 0;
-        s->vrc6_saw_rate = 0; s->vrc6_saw_period = 0; s->vrc6_saw_en = false;
-        s->vrc6_saw_timer = 0; s->vrc6_saw_accum = 0; s->vrc6_saw_step = 0;
-        s->vrc6_halt    = false;
-        s->cart_irq     = false;
-    }
-    memset(&s->board, 0, sizeof(s->board));
-    if (s->has_board) {
-        nes_board_reset(s);
-        s->cart_irq = false;
-    }
+    /* The board's banks before mos6502_reset reads the reset vector */
+    nes_cart_reset(&s->cart);
+    s->cart_irq = s->cart.irq;
     nes_update_irq(s);
 
     mos6502_reset(&s->cpu);
     VS_DEBUG(s, "reset pc=%04X nmi=%04X reset=%04X irq=%04X prgfffc=%02X%02X dip=%02X\n",
              s->cpu.PC,
-             (uint16_t)(s->prg[0x7FFAu] | ((uint16_t)s->prg[0x7FFBu] << 8)),
-             (uint16_t)(s->prg[0x7FFCu] | ((uint16_t)s->prg[0x7FFDu] << 8)),
-             (uint16_t)(s->prg[0x7FFEu] | ((uint16_t)s->prg[0x7FFFu] << 8)),
-             s->prg[0x7FFDu], s->prg[0x7FFCu], s->vs_dip);
+             (uint16_t)(s->cart.prg[0x7FFAu] | ((uint16_t)s->cart.prg[0x7FFBu] << 8)),
+             (uint16_t)(s->cart.prg[0x7FFCu] | ((uint16_t)s->cart.prg[0x7FFDu] << 8)),
+             (uint16_t)(s->cart.prg[0x7FFEu] | ((uint16_t)s->cart.prg[0x7FFFu] << 8)),
+             s->cart.prg[0x7FFDu], s->cart.prg[0x7FFCu], s->vs_dip);
     apu2a03_reset(&s->apu);
 }
 
@@ -2417,27 +806,8 @@ static bool nes_arcade_assemble(NesState *s, const MosConfig *cfg) {
         free(prg); free(chr); return false;
     }
 
-    s->cart.prg_banks   = 2;   /* 2 × 16KB = 32KB */
-    s->cart.chr_banks   = has_chr ? 2 : 0; /* 2 × 8KB VROM banks */
-    s->cart.mapper      = 0;
-    s->cart.mirror      = RP2C02_MIRROR_4SCREEN;
-    s->cart.has_battery = false;
-
-    s->prg = prg;
-    if (has_chr) {
-        s->chr = chr;
-        s->chr_is_ram = false;
-    } else {
-        free(chr);
-        s->chr = calloc(1, 8192);
-        s->chr_is_ram = true;
-    }
-
-    /* Mapper 0 fixed windows: $8000–$BFFF → prg[0], $C000–$FFFF → prg[16KB] */
-    s->prg_offsets[0] = 0;
-    s->prg_offsets[1] = 0x4000;
-    s->chr_offsets[0] = 0;
-    s->chr_offsets[1] = 0x1000;
+    if (!has_chr) { free(chr); chr = NULL; }
+    if (!nes_cart_init_vs(&s->cart, prg, chr)) { free(prg); free(chr); return false; }
 
     /* Load 2C04 palette file if present.  MAME .pal files are 64 palette
      * indexes stored as RGB-looking triples; each first byte selects one of
@@ -2468,343 +838,24 @@ static bool nes_arcade_assemble(NesState *s, const MosConfig *cfg) {
     return true;
 }
 
-static void nes_monitor_setup(NesState *s);
-
-NesState *nes_create(const MosConfig *cfg) {
-    NesState *s = calloc(1, sizeof(*s));
-    if (!s) return NULL;
-
-    s->cfg         = cfg;
-    s->fds_enabled = cfg->fds_enabled;
-
-    if (s->fds_enabled) {
-        /* 8 KB CHR RAM for PPU (needed before HLE boot so CHR files can load) */
-        s->chr = calloc(1, FDS_CHR_SIZE);
-        if (!s->chr) { free(s); return NULL; }
-        s->chr_is_ram     = true;
-        s->cart.chr_banks = 1;
-        s->cart.mapper    = 0;
-
-        /* BIOS: use real ROM if provided, otherwise install HLE stub */
-        const char *bios_path = NULL;
-        for (int i = 0; i < cfg->n_roms; i++) {
-            if (cfg->roms[i].addr == 0xE000u) { bios_path = cfg->roms[i].path; break; }
-        }
-        if (!bios_path && cfg->n_roms > 0)
-            bios_path = cfg->roms[0].path;
-
-        if (bios_path) {
-            if (!fds_bios_load(&s->fds, bios_path)) { free(s->chr); free(s); return NULL; }
-        } else {
-            fds_hle_build_rom(&s->fds);
-            s->fds.hle_mode = true;
-        }
-
-        if (cfg->fda_path) {
-            if (!fds_disk_load(&s->fds, cfg->fda_path)) { free(s->chr); free(s); return NULL; }
-            nes_fds_save_setup(s, cfg->fda_path);
-            if (s->fds.hle_mode)
-                fds_hle_boot(&s->fds, s->chr);
-        }
-    } else {
-        if (!cfg->cart_path) {
-            if (cfg->is_arcade && cfg->n_roms > 0) {
-                if (!nes_arcade_assemble(s, cfg)) { free(s); return NULL; }
-            } else {
-                fprintf(stderr, "nes: no cartridge specified - use -cartridge FILE.nes\n");
-                free(s); return NULL;
-            }
-        } else {
-            if (!ines_load(s, cfg->cart_path)) { free(s); return NULL; }
-        }
-    }
-
-    nes_pins_init(&s->pins, cfg->cpu == MOS_CPU_2A07 ? 1662607u : 1789773u);
-    s->clock_seen = s->pins.clock_hz;
-
-    /* Wire up PPU CHR bus */
-    rp2c02_init(&s->ppu, cfg->is_pal);
-    if (cfg->is_dendy) s->ppu.vblank_line = 291;  /* Dendy: 50 extra post-render lines */
-    if (cfg->vga == MOS_VGA_RP2C04_0004)
-        s->ppu.no_odd_skip = true;
-    if (cfg->disabled_features & MOS_FEATURE_ODD_FRAME_SKIP)
-        s->ppu.no_odd_skip = true;
-    if (cfg->is_arcade && s->vs_palette_rgb[0])    /* 2C04 palette present */
-        s->ppu.alt_palette_rgb = s->vs_palette_rgb;
-    s->ppu.chr_read  = nes_chr_read;
-    s->ppu.chr_write = nes_chr_write;
-    s->ppu.chr_ud    = s;
-    s->ppu.mirror    = s->cart.mirror;
-
-    mos6502_init(&s->cpu);
-    s->cpu.mem_read        = nes_cpu_read;
-    s->cpu.mem_write       = nes_cpu_write;
-    s->cpu.mem_ud          = s;
-    mos_cpu_apply(&s->cpu, cfg->cpu);
-    s->cpu.dummy_cycles = true;   /* page-crossing and branch dummy reads hit registers */
-    s->cpu.cycle_polling = true;  /* interrupts polled on each instruction's penultimate cycle */
-
-    s->apu.sweep_enabled = true;
-    s->apu.dmc_enabled = true;
-    s->apu.frame_irq_enabled = true;
-
-    /* APU - only initialise when sound is enabled */
-    if (cfg->sound == MOS_SOUND_2A03) {
-        uint32_t apu_clock = cfg->cpu == MOS_CPU_2A07 ? 1662607u : 1789773u;
-        if (!apu2a03_init(&s->apu, apu_clock))
-            fprintf(stderr, "nes: APU audio init failed (continuing silently)\n");
-        s->apu.mem_read = nes_cpu_read;
-        s->apu.mem_ud   = s;
-#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
-    } else if (cfg->sound == MOS_SOUND_2A03_MIDI) {
-        s->apu.mem_read    = nes_cpu_read;
-        s->apu.mem_ud      = s;
-        apu_midi_open(&s->apu_midi);
-        s->apu.write_tap    = apu_midi_tap;
-        s->apu.write_tap_ud = &s->apu_midi;
-#endif
-    }
-    s->apu.sweep_enabled = (cfg->disabled_features & MOS_FEATURE_SWEEP_REGISTERS) == 0;
-    s->apu.dmc_enabled = (cfg->disabled_features & MOS_FEATURE_DMC_CHANNEL) == 0;
-    s->apu.dma_external = true;   /* the DMC's fetches are DMAs that halt the CPU */
-    s->apu.frame_irq_enabled = (cfg->disabled_features & MOS_FEATURE_FRAME_IRQ) == 0;
-
-    s->monitor = gemu_monitor_create();
-    nes_monitor_setup(s);
-    gemu_monitor_set_screendump_cb(s->monitor, nes_screendump, s);
-    {   /* for the display in use (none with -display none or curses) */
-        HexRegion nes_regions[] = {
-            { "CPU RAM ($0000-$07FF)", s->ram,
-              sizeof(s->ram), false, 0x0000 },
-            { "PRG ROM ($8000+)", s->prg,
-              s->prg ? (size_t)s->cart.prg_banks * 0x4000u : 0,
-              true, 0x8000 },
-            { "CHR ROM/RAM", s->chr,
-              s->chr ? (size_t)s->cart.chr_banks * 0x2000u : 0,
-              !s->chr_is_ram, 0x0000 },
-        };
-        s->hex_editor = hex_editor_create(cfg->display_type, nes_regions, 3);
-    }
-    if (s->fds_enabled) {
-        GemuMediaDevice floppy_dev = {
-            .name   = "floppy",
-            .kind   = "floppy",
-            .ud     = s,
-            .change = fds_media_change,
-            .eject  = fds_media_eject,
-            .flip   = fds_media_flip,
-            .status = fds_media_status,
-        };
-        if (cfg->fda_path)
-            snprintf(floppy_dev.file, sizeof(floppy_dev.file), "%s", cfg->fda_path);
-        gemu_monitor_register_media(s->monitor, &floppy_dev);
-    } else {
-        GemuMediaDevice cart_dev = {
-            .name   = "cartridge",
-            .kind   = "cartridge",
-            .ud     = s,
-            .change = nes_media_change,
-            .eject  = nes_media_eject,
-            .status = nes_media_status,
-        };
-        if (s->cart_path_buf[0])
-            snprintf(cart_dev.file, sizeof(cart_dev.file), "%s", s->cart_path_buf);
-        gemu_monitor_register_media(s->monitor, &cart_dev);
-    }
-
-    if (gemu_display_wanted(cfg->display_type)) {
-        bool two_controllers = cfg->ports[0] == NES_DEVICE_CONTROLLER &&
-                               cfg->ports[1] == NES_DEVICE_CONTROLLER;
-        bool has_fc2_mic     = cfg->ports[1] == NES_DEVICE_FC2_MIC;
-        const GemuActionDef  *acts      = nes_actions;
-        int                   n_acts    = NES_N_ACTIONS;
-        const GemuInputPage  *act_pages = NULL;
-        int                   n_pages   = 0;
-        const char           *ini_sec   = "nes-controller";
-        if (cfg->is_arcade) {
-            acts    = vs_nes_actions;
-            n_acts  = VS_NES_N_ACTIONS;
-            ini_sec = "vssmb";
-        } else if (two_controllers) {
-            acts      = nes_2p_actions; n_acts  = NES_2P_N_ACTIONS;
-            act_pages = nes_2p_pages;   n_pages = 2;
-        } else if (has_fc2_mic) {
-            acts      = nes_fc2mic_actions; n_acts  = NES_FC2MIC_N_ACTIONS;
-            act_pages = nes_fc2mic_pages;   n_pages = 2;
-        }
-        s->display = gemu_display_create(cfg->display_type,
-            &(GemuDisplayConfig){
-                .fb_width    = NES_CRT_WIDTH,
-                .fb_height   = NES_CRT_HEIGHT,
-                .scale       = cfg->display_scale,
-                .renderer    = cfg->display_renderer,
-                .actions     = acts,
-                .n_actions   = n_acts,
-                .ini_section = ini_sec,
-                .pages       = act_pages,
-                .n_pages     = n_pages,
-                .gtk         = &(GemuDisplayGtkExtras){
-                    .monitor       = s->monitor,
-                    .hex_toggle_cb = nes_hex_toggle,
-                    .hex_toggle_ud = s,
-                },
-            });
-        if (!s->display)
-            fprintf(stderr, "nes: failed to create display window\n");
-        /* Debug > Game Genie (a Game Genie plugs into a home console only) */
-        if (s->display && !cfg->is_arcade) {
-#ifdef GEMU_GTK
-            if (cfg->display_type == GEMU_DISPLAY_GTK)
-                g_cheat_dialog = cheat_dialog_gtk_create(&g_cheats);
-#endif
-            if (cfg->display_type == GEMU_DISPLAY_SDL)
-                g_cheat_dialog = cheat_dialog_sdl_create(&g_cheats);
-            if (g_cheat_dialog)
-                gemu_display_add_debug_item(s->display, "Game Genie...", nes_cheat_dialog_toggle, s);
-            /* Debug > Cartridge Pins (a VS. board has no cartridge connector) */
-#ifdef GEMU_GTK
-            if (cfg->display_type == GEMU_DISPLAY_GTK)
-                g_pin_window = nes_pin_window_gtk_create(&s->pins);
-#endif
-            if (cfg->display_type == GEMU_DISPLAY_SDL)
-                g_pin_window = nes_pin_window_sdl_create(&s->pins);
-            if (g_pin_window)
-                gemu_display_add_debug_item(s->display, "Cartridge Pins...", nes_pin_window_toggle_cb, s);
-        }
-        else
-            gemu_monitor_set_input_reset_cb(s->monitor,
-                                            gemu_display_reset_input_bindings_ud,
-                                            s->display);
-    }
-
-    /* -device crt: independent of display_type -- also drives screendump
-     * on headless "-display none" runs, so it must not be gated on a
-     * display existing. */
-    if (cfg->crt_type != MOS_CRT_NONE) {
-        s->crt_signal = calloc((size_t)RP2C02_WIDTH * NES_NTSC_OVERSAMPLE *
-                               RP2C02_HEIGHT, sizeof(float));
-        s->crt_decoded_argb = calloc((size_t)NES_CRT_WIDTH * NES_CRT_HEIGHT,
-                                     sizeof(uint32_t));
-        s->crt_argb = calloc((size_t)NES_CRT_WIDTH * NES_CRT_HEIGHT,
-                             sizeof(uint32_t));
-        if (!s->crt_signal || !s->crt_decoded_argb || !s->crt_argb) {
-            fprintf(stderr, "nes: -device crt: out of memory, disabling\n");
-            free(s->crt_signal);       s->crt_signal = NULL;
-            free(s->crt_decoded_argb); s->crt_decoded_argb = NULL;
-            free(s->crt_argb);         s->crt_argb   = NULL;
-        }
-    }
-
-    if (!s->fds_enabled)
-        nes_battery_setup(s);
-    nes_cheats_load(s);
-
-    nes_install_mapper_hooks(s);
-
-#ifdef HAVE_ROB
-    for (int p = 0; p < cfg->n_ports; p++) {
-        if (nes_device_is_rob(cfg->ports[p])) {
-            rob_init(&s->rob);
-            s->rob_window = rob_window_create("mdl/rob",
-                                              cfg->ports[p] == NES_DEVICE_ROB_FAMICOM);
-            break;
-        }
-    }
-#else
-    for (int p = 0; p < cfg->n_ports; p++)
-        if (nes_device_is_rob(cfg->ports[p])) {
-            fprintf(stderr, "gemu: R.O.B. needs the 3D window, which this build lacks "
-                            "(install assimp, then re-run configure)\n");
-            break;
-        }
-#endif
-
-    if (cfg->is_arcade)
-        s->vs_dip = VS_DIP_DEFAULT;
-
-#ifdef HAVE_LUA
-    if (cfg->lua_path) {
-        NesLuaBus bus = {
-            .mem_read       = nes_cpu_read,
-            .mem_write      = nes_cpu_write,
-            .get_framecount = nes_lua_get_framecount,
-            .get_zapper     = nes_lua_get_zapper,
-            .ud             = s,
-            .rom_path       = s->cart_path_buf[0] ? s->cart_path_buf : NULL,
-        };
-        s->lua = nes_lua_create(cfg->lua_path, &bus);
-        if (s->lua) {
-            s->cpu.mem_read  = nes_cpu_read_lua;
-            s->cpu.mem_write = nes_cpu_write_lua;
-        }
-    }
-#endif
-
-    nes_reset(s);
-    nes_np_setup(s);
-
-    return s;
-}
-
-void nes_destroy(NesState *s) {
-    nes_np_end(s);              /* the player's own game back, then save it */
-    if (g_np_dialog) { g_np_dialog->destroy(g_np_dialog); g_np_dialog = NULL; }
-    netplay_destroy(g_np);
-    g_np = NULL;
-    free(g_poweron);
-    g_poweron = NULL;
-    nes_save_persistent(s);
-#ifdef HAVE_LUA
-    nes_lua_destroy(s->lua);
-#endif
-    if (s->fds_enabled) { free(s->fds.raw_disk); }
-    hex_editor_destroy(s->hex_editor);
-    if (g_cheat_dialog) { g_cheat_dialog->destroy(g_cheat_dialog); g_cheat_dialog = NULL; }
-    if (g_pin_window) { g_pin_window->destroy(g_pin_window); g_pin_window = NULL; }
-#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
-    apu_midi_close(&s->apu_midi);
-#endif
-    apu2a03_destroy(&s->apu);
-    gemu_monitor_destroy(s->monitor);
-#ifdef HAVE_ROB
-    rob_window_destroy(s->rob_window);  /* must happen before display destroy */
-#endif
-    gemu_display_destroy(s->display);
-    free(s->crt_signal);
-    free(s->crt_decoded_argb);
-    free(s->crt_argb);
-    free(s->prg);
-    free(s->chr);
-    free(s);
-}
 
 /* ── Snapshots (monitor "savevm"/"loadvm") ──────────────────────────────────
  *
  * Dumps the whole NesState verbatim (CPU/PPU/APU/mapper registers, work RAM,
  * OAM, etc. are all plain embedded arrays/scalars) plus the CHR banks when
- * they're RAM rather than ROM. Pointer/handle fields (display, monitor, the
- * PRG/CHR ROM buffers, callback wiring set up once in nes_create(), the live
+ * they're RAM rather than ROM. Pointer/handle fields (the monitor, the
+ * PRG/CHR ROM buffers, callback wiring set up once in nes_core_create(), the live
  * SDL audio device, ...) are never meaningful to persist - they're captured
  * before the struct is overwritten and spliced back in afterward, the same
  * pattern machine_i2000.c uses for its savevm/loadvm. */
 
 #define NES_SNAPSHOT_MAGIC    0x314D5645534d454eULL /* "NEMSVE1" */
-#define NES_SNAPSHOT_VERSION  3u   /* 2: board state; 3: dot-by-dot sprite evaluation */
+#define NES_SNAPSHOT_VERSION  5u   /* 2: board state; 3: dot-by-dot sprite evaluation;
+                                       4: the cartridge as a NesCart;
+                                       5: the front end's fields out of NesState */
 
-/* The CHR RAM a snapshot carries: all of CHR on CHR-RAM carts, the 8 KB
- * beside the ROM on TQROM. */
-static uint8_t *nes_chr_ram(const NesState *s, uint64_t *len) {
-    if (s->chr_is_ram) { *len = (uint64_t)s->cart.chr_banks * 0x2000u; return s->chr; }
-    if (s->cart.mapper == 119 && s->chr) {
-        *len = 0x2000u;
-        return s->chr + (size_t)s->cart.chr_banks * 0x2000u;
-    }
-    *len = 0;
-    return NULL;
-}
-
-/* Snapshots are built in memory (SnapBuf) - netplay keeps them there - and
- * savevm/loadvm write and read them as files. */
+/* Snapshots are built in memory (SnapBuf); the front end's savevm/loadvm
+ * write and read them as files, and netplay keeps them there. */
 typedef struct { uint8_t *p; size_t n, cap; bool ok; } SnapBuf;
 
 static void sb_put(SnapBuf *b, const void *d, size_t n) {
@@ -2830,7 +881,7 @@ static bool sr_get(SnapRd *r, void *d, size_t n) {
     return true;
 }
 
-static bool nes_snapshot_save(NesState *s, SnapBuf *b) {
+static bool snapshot_save(NesState *s, SnapBuf *b) {
     if (s->fds_enabled) {
         fprintf(stderr, "nes: savevm not supported for FDS yet\n");
         return false;
@@ -2840,10 +891,11 @@ static bool nes_snapshot_save(NesState *s, SnapBuf *b) {
     uint32_t version = NES_SNAPSHOT_VERSION;
     sb_put(b, &magic, sizeof(magic));
     sb_put(b, &version, sizeof(version));
-    sb_put(b, &s->cart, sizeof(s->cart));
+    sb_put(b, &s->cart.info, sizeof(s->cart.info));
 
-    uint64_t chr_len;
-    uint8_t *chr_ram = nes_chr_ram(s, &chr_len);
+    size_t chr_ram_len;
+    uint8_t *chr_ram = nes_cart_chr_ram(&s->cart, &chr_ram_len);
+    uint64_t chr_len = chr_ram_len;
     sb_put(b, &chr_len, sizeof(chr_len));
     if (chr_len) sb_put(b, chr_ram, chr_len);
 
@@ -2851,13 +903,9 @@ static bool nes_snapshot_save(NesState *s, SnapBuf *b) {
     if (!snap) { free(b->p); return false; }
     *snap = *s;
     snap->cfg     = NULL;
-    snap->prg     = NULL;
-    snap->chr     = NULL;
-    snap->display = NULL;
+    nes_cart_strip(&snap->cart);
     snap->monitor = NULL;
-    snap->crt_signal       = NULL;
-    snap->crt_decoded_argb = NULL;
-    snap->crt_argb         = NULL;
+    snap->exec_hook = NULL; snap->exec_hook_ud = NULL;
     snap->cpu.mem_read  = NULL; snap->cpu.mem_write  = NULL; snap->cpu.mem_ud  = NULL;
     snap->ppu.chr_read  = NULL; snap->ppu.chr_write  = NULL; snap->ppu.chr_ud  = NULL;
     snap->ppu.nt_read   = NULL; snap->ppu.nt_write   = NULL; snap->ppu.nt_ud   = NULL;
@@ -2870,20 +918,13 @@ static bool nes_snapshot_save(NesState *s, SnapBuf *b) {
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     snap->apu_midi.out = NULL;
 #endif
-    snap->hex_editor = NULL;
-#ifdef HAVE_ROB
-    snap->rob_window = NULL;
-#endif
-#ifdef HAVE_LUA
-    snap->lua = NULL;
-#endif
     sb_put(b, snap, sizeof(*snap));
     free(snap);
     if (!b->ok) { free(b->p); b->p = NULL; }
     return b->ok;
 }
 
-static bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
+bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
     if (s->fds_enabled) {
         fprintf(stderr, "nes: loadvm not supported for FDS yet\n");
         return false;
@@ -2892,19 +933,20 @@ static bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
     bool ok = true;
     uint64_t magic   = 0;
     uint32_t version = 0;
-    NesCart  cart     = {0};
+    NesCartInfo cart  = {0};
     ok &= sr_get(&r, &magic, sizeof(magic));
     ok &= sr_get(&r, &version, sizeof(version));
     ok &= sr_get(&r, &cart, sizeof(cart));
     if (!ok || magic != NES_SNAPSHOT_MAGIC || version != NES_SNAPSHOT_VERSION ||
-        cart.mapper != s->cart.mapper || cart.prg_banks != s->cart.prg_banks ||
-        cart.chr_banks != s->cart.chr_banks) {
+        cart.mapper != s->cart.info.mapper || cart.prg_banks != s->cart.info.prg_banks ||
+        cart.chr_banks != s->cart.info.chr_banks) {
         fprintf(stderr, "nes: loadvm: snapshot doesn't match the loaded cartridge\n");
         return false;
     }
 
-    uint64_t chr_len = 0, want_len;
-    uint8_t *chr_ram = nes_chr_ram(s, &want_len);
+    uint64_t chr_len = 0;
+    size_t want_len;
+    uint8_t *chr_ram = nes_cart_chr_ram(&s->cart, &want_len);
     ok &= sr_get(&r, &chr_len, sizeof(chr_len));
     if (!ok || chr_len != want_len) {
         fprintf(stderr, "nes: loadvm: CHR RAM size mismatch\n");
@@ -2916,13 +958,12 @@ static bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
     if (!loaded) return false;
     if (!sr_get(&r, loaded, sizeof(*loaded))) { free(loaded); return false; }
     const MosConfig *cfg     = s->cfg;
-    uint8_t          *prg     = s->prg;
-    uint8_t          *chr     = s->chr;
-    GemuDisplay      *display = s->display;
+    NesCart          *live_cart = malloc(sizeof(*live_cart));   /* its wiring */
+    if (!live_cart) { free(loaded); return false; }
+    *live_cart = s->cart;
     GemuMonitor      *monitor = s->monitor;
-    float            *crt_signal       = s->crt_signal;
-    uint32_t         *crt_decoded_argb = s->crt_decoded_argb;
-    uint32_t         *crt_argb         = s->crt_argb;
+    void (*exec_hook)(void *, uint16_t) = s->exec_hook;
+    void             *exec_hook_ud = s->exec_hook_ud;
     void *cpu_mem_ud  = s->cpu.mem_ud;
     void *ppu_chr_ud  = s->ppu.chr_ud;
     void *ppu_nt_ud   = s->ppu.nt_ud;
@@ -2944,14 +985,6 @@ static bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     MidiOut *apu_midi_out = s->apu_midi.out;
 #endif
-    HexEditor *hex_editor = s->hex_editor;
-#ifdef HAVE_ROB
-    RobWindow *rob_window = s->rob_window;
-#endif
-#ifdef HAVE_LUA
-    NesLua *lua = s->lua;
-#endif
-
     NesPins pins = s->pins;       /* a debugging setting, not machine state */
     *s = *loaded;
     free(loaded);
@@ -2961,13 +994,11 @@ static bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
     s->clock_seen = 0;
 
     s->cfg     = cfg;
-    s->prg     = prg;
-    s->chr     = chr;
-    s->display = display;
+    nes_cart_rewire(&s->cart, live_cart);
+    free(live_cart);
     s->monitor = monitor;
-    s->crt_signal       = crt_signal;
-    s->crt_decoded_argb = crt_decoded_argb;
-    s->crt_argb         = crt_argb;
+    s->exec_hook = exec_hook;
+    s->exec_hook_ud = exec_hook_ud;
     s->cpu.mem_read  = cpu_mem_read;  s->cpu.mem_write = cpu_mem_write; s->cpu.mem_ud = cpu_mem_ud;
     s->ppu.chr_read  = ppu_chr_read;  s->ppu.chr_write = ppu_chr_write; s->ppu.chr_ud = ppu_chr_ud;
     s->ppu.nt_read   = ppu_nt_read;   s->ppu.nt_write  = ppu_nt_write;  s->ppu.nt_ud  = ppu_nt_ud;
@@ -2980,226 +1011,19 @@ static bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     s->apu_midi.out = apu_midi_out;
 #endif
-    s->hex_editor = hex_editor;
-#ifdef HAVE_ROB
-    s->rob_window = rob_window;
-#endif
-#ifdef HAVE_LUA
-    s->lua = lua;
-#endif
-    nes_cheats_apply(s);    /* the codes that are on now, not the snapshot's */
     return true;
 }
 
-static bool nes_save_snapshot(NesState *s, const char *path) {
+bool nes_snapshot_save(NesState *s, uint8_t **data, size_t *len) {
     SnapBuf b;
-    if (!nes_snapshot_save(s, &b)) return false;
-    FILE *f = fopen(path, "wb");
-    bool ok = f && fwrite(b.p, 1, b.n, f) == b.n;
-    if (f && fclose(f) != 0) ok = false;
-    free(b.p);
-    return ok;
-}
-
-static bool nes_load_snapshot(NesState *s, const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return false;
-    uint8_t *data = NULL;
-    size_t n = 0, cap = 0, got;
-    do {
-        if (n == cap) {
-            cap = cap ? cap * 2 : 1u << 20;
-            uint8_t *p = realloc(data, cap);
-            if (!p) { free(data); fclose(f); return false; }
-            data = p;
-        }
-        got = fread(data + n, 1, cap - n, f);
-        n += got;
-    } while (got);
-    fclose(f);
-    bool ok = nes_snapshot_load(s, data, n);
-    free(data);
-    return ok;
-}
-
-/* ── Netplay ───────────────────────────────────────────────────────────────
- *
- * Every player's NES has to run the same frames with the same input, so a
- * netplay game starts every machine from the same state: the snapshot taken
- * when this one was created (before any battery save was loaded, with
- * PRG-RAM cleared), which is the same for everyone with the same ROM and
- * settings.  The player's own game is kept aside and put back when the
- * netplay game ends, and nothing is saved to their battery file meanwhile.
- * Controller 1 is ours; the session hands back each player's, and players 1
- * and 2 drive the two ports.  Reset goes through the session too, so every
- * machine resets on the same frame. */
-
-#define NES_NP_SYNC_FRAMES 300   /* compare state every 5 s */
-
-/* The game's name in the lobby: the ROM's name, and a hash of what has to
- * match for the games to stay in step (ROM contents, region, controllers). */
-static void nes_np_game_name(const NesState *s, char *out, size_t len) {
-    char base[256];
-    nes_game_basename(s->cart_path_buf, base, sizeof(base));
-    GemuSha256Ctx ctx;
-    uint8_t d[GEMU_SHA256_DIGEST_LEN];
-    gemu_sha256_init(&ctx);
-    if (s->prg) gemu_sha256_update(&ctx, s->prg, (size_t)s->cart.prg_banks * 0x4000u);
-    if (s->chr && !s->chr_is_ram) gemu_sha256_update(&ctx, s->chr, (size_t)s->cart.chr_banks * 0x2000u);
-    uint8_t cfg[4] = { (uint8_t)s->cfg->is_pal, (uint8_t)s->cfg->n_ports,
-                       (uint8_t)s->cfg->ports[0], (uint8_t)s->cfg->ports[1] };
-    gemu_sha256_update(&ctx, cfg, sizeof(cfg));
-    gemu_sha256_final(&ctx, d);
-    snprintf(out, len, "%.100s [%02x%02x%02x%02x]", base, d[0], d[1], d[2], d[3]);
-}
-
-/* The state compared between players: RAM, PRG-RAM and the CPU. */
-static uint32_t nes_np_state_hash(const NesState *s) {
-    uint32_t h = 2166136261u;
-    const uint8_t *parts[] = { s->ram, s->prg_ram };
-    const size_t sizes[] = { sizeof(s->ram), sizeof(s->prg_ram) };
-    for (int p = 0; p < 2; p++)
-        for (size_t i = 0; i < sizes[p]; i++) h = (h ^ parts[p][i]) * 16777619u;
-    uint8_t cpu[6] = { s->cpu.A, s->cpu.X, s->cpu.Y, s->cpu.SP, (uint8_t)s->cpu.PC, (uint8_t)(s->cpu.PC >> 8) };
-    for (int i = 0; i < 6; i++) h = (h ^ cpu[i]) * 16777619u;
-    return h;
-}
-
-static void nes_np_begin(NesState *s, int player, int players) {
-    const char *why = NULL;
-    if (s->cfg->is_arcade)    why = "Netplay is for NES/Famicom cartridges, not the VS. System";
-    else if (s->fds_enabled)  why = "Netplay doesn't support the Famicom Disk System yet";
-    else if (!g_poweron)      why = "This game was loaded with Change...: restart GEMU with -cartridge "
-                                    "for netplay, so it starts from a fresh power-on";
-#ifdef HAVE_LUA
-    if (!why && s->lua)       why = "Netplay can't run with a Lua script loaded";
-#endif
-    SnapBuf before;
-    if (!why && !nes_snapshot_save(s, &before)) why = "couldn't save your game state";
-    if (why) {
-        netplay_note(g_np, "%s - leaving the game", why);
-        netplay_leave_game(g_np);
-        return;
-    }
-    nes_save_persistent(s);          /* the player's battery save, as it is now */
-    g_np_before = before.p;
-    g_np_before_len = before.n;
-    nes_snapshot_load(s, g_poweron, g_poweron_len);
-    memset(s->prg_ram, 0, sizeof(s->prg_ram));
-    g_np_active = true;
-    /* A netplay game has a player 2 even when this NES has one controller
-     * (the default): plug one into the empty port for the game. */
-    g_np_port2 = players > 1 && s->cfg->ports[1] == NES_DEVICE_NONE;
-    s->gg_count = 0;
-    g_np_frame = 0;
-    g_np_reset = false;
-    netplay_note(g_np, "Console powered on - player %d of %d%s", player, players,
-                 players > 2 ? " (players 3 and up have no controller port)" : "");
-    netplay_ready(g_np);
-}
-
-static void nes_np_end(NesState *s) {
-    if (!g_np_active) return;
-    g_np_active = false;
-    g_np_port2 = false;
-    if (g_np_before) nes_snapshot_load(s, g_np_before, g_np_before_len);
-    free(g_np_before);
-    g_np_before = NULL;
-    netplay_note(g_np, "Netplay game over - back to your own game");
-}
-
-/* Before a frame: false while the other players' input hasn't arrived
- * (run nothing this time round). */
-static bool nes_np_frame(NesState *s) {
-    int player, players;
-    if (g_np && netplay_take_start(g_np, &player, &players)) nes_np_begin(s, player, players);
-    if (!g_np_active) return true;
-    if (gemu_monitor_is_paused(s->monitor)) return true;   /* paused: everyone waits */
-    uint8_t local[NETPLAY_INPUT_BYTES] = { s->ctrl_state[0], g_np_reset ? NETPLAY_INPUT_RESET : 0 };
-    uint8_t all[NETPLAY_MAX_PLAYERS * NETPLAY_INPUT_BYTES];
-    int r = netplay_frame(g_np, local, all, &players);
-    if (r < 0) { nes_np_end(s); return true; }
-    if (r == 0) return false;
-    g_np_reset = false;
-    for (int p = 0; p < players; p++)
-        if (all[p * NETPLAY_INPUT_BYTES + 1] & NETPLAY_INPUT_RESET) {
-            nes_reset(s);
-            netplay_note(g_np, "Console reset (player %d)", p + 1);
-            break;
-        }
-    s->ctrl_state[0] = all[0];
-    s->ctrl_state[1] = players > 1 ? all[NETPLAY_INPUT_BYTES] : 0;
-    g_np_frame++;
+    if (!snapshot_save(s, &b)) return false;
+    *data = b.p;
+    *len = b.n;
     return true;
 }
 
-static void nes_np_after_frame(NesState *s) {
-    if (g_np_active && g_np_frame % NES_NP_SYNC_FRAMES == 0)
-        netplay_sync_hash(g_np, g_np_frame, nes_np_state_hash(s));
-}
-
-/* Reset: in a netplay game every machine resets together. */
-static void nes_np_reset_or(NesState *s) {
-    if (g_np_active) { g_np_reset = true; return; }
-    nes_save_persistent(s);
-    nes_reset(s);
-}
-
-static GemuMonCmd nes_cmd_netplay(GemuMonitor *mon, const char *args, void *ud) {
-    (void)ud;
-    netplay_monitor(g_np, mon, args);
-    return GEMU_MON_NONE;
-}
-
-/* The Netplay menu */
-static bool nes_np_offline(void *ud) {
-    (void)ud;
-    NetplayInfo in;
-    netplay_info(g_np, &in);
-    return in.state == NETPLAY_OFFLINE;
-}
-
-static bool nes_np_online(void *ud) { return !nes_np_offline(ud); }
-
-static void nes_np_show(void *ud) {
-    (void)ud;
-    if (g_np_dialog) g_np_dialog->show(g_np_dialog);
-}
-
-static void nes_np_disconnect(void *ud) {
-    (void)ud;
-    netplay_disconnect(g_np);
-}
-
-static void nes_np_setup(NesState *s) {
-    if (s->cfg->is_arcade || s->fds_enabled || !s->prg) return;
-    SnapBuf b;
-    if (nes_snapshot_save(s, &b)) { g_poweron = b.p; g_poweron_len = b.n; }
-    char game[NETPLAY_GAME_LEN];
-    nes_np_game_name(s, game, sizeof(game));
-    g_np = netplay_create("GEMU " GEMU_VERSION_STR, game);
-    gemu_monitor_bind(s->monitor, "netplay", nes_cmd_netplay, s);
-    if (!s->display || !g_np) return;
-#ifdef GEMU_GTK
-    if (s->cfg->display_type == GEMU_DISPLAY_GTK) g_np_dialog = netplay_dialog_gtk_create(g_np);
-#endif
-    if (s->cfg->display_type == GEMU_DISPLAY_SDL) g_np_dialog = netplay_dialog_sdl_create(g_np);
-    if (!g_np_dialog) return;
-    gemu_display_add_netplay_item(s->display, "Connect...", nes_np_show, nes_np_offline, s);
-    gemu_display_add_netplay_item(s->display, "Lobby...", nes_np_show, nes_np_online, s);
-    gemu_display_add_netplay_item(s->display, "Disconnect", nes_np_disconnect, nes_np_online, s);
-}
 
 /* ── Monitor commands and memory view ────────────────────────────────────── */
-
-/* True when $6000-$7FFF is mapped to cartridge PRG-RAM (mirrors nes_cpu_read). */
-static bool nes_prg_ram_mapped(const NesState *s) {
-    return s->cart.mapper == 5 ||
-           (s->cart.mapper == 1 && !(s->mmc1_prg & 0x10)) ||
-           is_mmc3(s) || s->cart.mapper == 24 || s->cart.mapper == 26 ||
-           s->cart.mapper == 178 || s->cfg->is_arcade ||
-           (s->has_board && nes_board_has_prg_ram(s));
-}
 
 /* Side-effect-free CPU-space read for x/peek/memsave.  PPU, APU and
  * controller registers ($2000-$401F) and FDS I/O return false because
@@ -3219,27 +1043,10 @@ static bool nes_mon_read(void *ud, uint64_t addr64, uint8_t *val) {
         return true;
     }
 
-    if (addr < 0x6000) {
-        if (s->cfg->is_arcade) { *val = s->vs_coin_counter; return true; }
-        if (s->cart.mapper == 5 && addr >= 0x5000) {
-            if (addr == 0x5205) { *val = (uint8_t)((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]); return true; }
-            if (addr == 0x5206) { *val = (uint8_t)(((uint16_t)s->mmc5_mul[0] * s->mmc5_mul[1]) >> 8); return true; }
-            if (addr >= 0x5C00 && s->mmc5_exram_mode >= 2) {
-                *val = s->mmc5_exram[addr - 0x5C00u];
-                return true;
-            }
-        }
-        return false;
-    }
-
-    if (addr < 0x8000) {
-        if (!nes_prg_ram_mapped(s)) return false;
-        *val = s->prg_ram[addr & 0x1FFFu];
-        return true;
-    }
-
-    if (!s->prg) return false;
-    uint8_t rom = nes_prg_mapped(s, addr);
+    if (addr < 0x6000 && s->cfg->is_arcade) { *val = s->vs_coin_counter; return true; }
+    uint8_t rom;
+    if (!nes_cart_peek(&s->cart, addr, &rom)) return false;
+    if (addr < 0x8000) { *val = rom; return true; }
     for (int i = 0; i < s->gg_count; i++) {
         if (s->gg_patches[i].addr == addr &&
             (!s->gg_patches[i].has_cmp || rom == s->gg_patches[i].cmp)) {
@@ -3264,8 +1071,8 @@ static bool nes_mon_write(void *ud, uint64_t addr64, uint8_t val) {
         s->fds.ram[addr - 0x6000u] = val;
         return true;
     }
-    if (addr < 0x8000 && nes_prg_ram_mapped(s)) {
-        s->prg_ram[addr & 0x1FFFu] = val;
+    if (addr < 0x8000 && nes_cart_prg_ram_mapped(&s->cart)) {
+        s->cart.prg_ram[addr & 0x1FFFu] = val;
         return true;
     }
     return false;
@@ -3276,64 +1083,13 @@ static void nes_cpu_state(void *ud, char *buf, size_t buf_len) {
     mos6502_format_state(&s->cpu, buf, buf_len);
 }
 
-static GemuMonCmd nes_cmd_savevm(GemuMonitor *mon, const char *args, void *ud) {
-    NesState *s = ud;
-    char vm_path[256];
-    if (sscanf(args, "%255s", vm_path) != 1) {
-        gemu_monitor_printf(mon, "usage: savevm <file>\n");
-        return GEMU_MON_NONE;
-    }
-    if (nes_save_snapshot(s, vm_path))
-        gemu_monitor_printf(mon, "saved snapshot to %s (frame=%" PRIu64 ")\n",
-                            vm_path, s->ppu.frame);
-    else
-        gemu_monitor_printf(mon, "failed to save snapshot to %s\n", vm_path);
-    return GEMU_MON_NONE;
-}
-
-static GemuMonCmd nes_cmd_loadvm(GemuMonitor *mon, const char *args, void *ud) {
-    NesState *s = ud;
-    char vm_path[256];
-    if (sscanf(args, "%255s", vm_path) != 1) {
-        gemu_monitor_printf(mon, "usage: loadvm <file>\n");
-        return GEMU_MON_NONE;
-    }
-    if (g_np_active) {
-        gemu_monitor_printf(mon, "loadvm: not during a netplay game\n");
-        return GEMU_MON_NONE;
-    }
-    if (nes_load_snapshot(s, vm_path))
-        gemu_monitor_printf(mon, "loaded snapshot from %s (frame=%" PRIu64 ")\n",
-                            vm_path, s->ppu.frame);
-    else
-        gemu_monitor_printf(mon, "failed to load snapshot from %s\n", vm_path);
-    return GEMU_MON_NONE;
-}
 
 static GemuMonCmd nes_cmd_mapperdump(GemuMonitor *mon, const char *args, void *ud) {
     NesState *s = ud;
     (void)args;
-    gemu_monitor_printf(mon, "mapper=%u bank_sel=%02X regs=%02X %02X %02X %02X %02X %02X %02X %02X\n",
-                        s->cart.mapper, s->mmc3_bank_sel,
-                        s->mmc3_regs[0], s->mmc3_regs[1], s->mmc3_regs[2], s->mmc3_regs[3],
-                        s->mmc3_regs[4], s->mmc3_regs[5], s->mmc3_regs[6], s->mmc3_regs[7]);
-    gemu_monitor_printf(mon, "prg_offsets($8000,$A000,$C000,$E000)=%06X %06X %06X %06X\n",
-                        s->mmc3_prg_offsets[0], s->mmc3_prg_offsets[1],
-                        s->mmc3_prg_offsets[2], s->mmc3_prg_offsets[3]);
-    if (s->fine_banks)
-        gemu_monitor_printf(mon, "chr_offsets(1KB x8)=%05X %05X %05X %05X %05X %05X %05X %05X\n",
-                            s->mmc3_chr_offsets[0], s->mmc3_chr_offsets[1],
-                            s->mmc3_chr_offsets[2], s->mmc3_chr_offsets[3],
-                            s->mmc3_chr_offsets[4], s->mmc3_chr_offsets[5],
-                            s->mmc3_chr_offsets[6], s->mmc3_chr_offsets[7]);
-    if (s->has_board) {
-        const NesBoard *b = &s->board;
-        gemu_monitor_printf(mon, "board cmd=%02X regs=", b->cmd);
-        for (int i = 0; i < 16; i++) gemu_monitor_printf(mon, "%02X%s", b->regs[i], i < 15 ? " " : "\n");
-        gemu_monitor_printf(mon, "board irq counter=%04X latch=%04X enabled=%d nt=%02X %02X %02X %02X\n",
-                            b->irq_counter, b->irq_latch, b->irq_enabled,
-                            b->nt[0], b->nt[1], b->nt[2], b->nt[3]);
-    }
+    char buf[1024];
+    nes_cart_dump(&s->cart, buf, sizeof(buf));
+    gemu_monitor_printf(mon, "%s", buf);
     return GEMU_MON_NONE;
 }
 
@@ -3355,11 +1111,6 @@ static GemuMonCmd nes_cmd_service(GemuMonitor *mon, const char *args, void *ud) 
     return GEMU_MON_NONE;
 }
 
-static GemuMonCmd nes_cmd_gamegenie(GemuMonitor *mon, const char *args, void *ud) {
-    (void)mon;
-    nes_gamegenie_cmd(ud, args);
-    return GEMU_MON_NONE;
-}
 
 /* sendkey <button>[-<button>...] [frames]: hold the buttons (e.g. "right-b-a")
  * on controller 1 for the given number of frames (default 5). */
@@ -3439,22 +1190,7 @@ static GemuMonCmd nes_cmd_ppudump(GemuMonitor *mon, const char *args, void *ud) 
     return GEMU_MON_NONE;
 }
 
-static GemuMonCmd nes_cmd_hexeditor(GemuMonitor *mon, const char *args, void *ud) {
-    NesState *s = ud;
-    (void)args;
-    if (!s->hex_editor) {
-        gemu_monitor_printf(mon, "hexeditor: not available with this display\n");
-    } else if (hex_editor_is_visible(s->hex_editor)) {
-        hex_editor_hide(s->hex_editor);
-        gemu_monitor_printf(mon, "hexeditor: closed\n");
-    } else {
-        hex_editor_show(s->hex_editor);
-        gemu_monitor_printf(mon, "hexeditor: opened\n");
-    }
-    return GEMU_MON_NONE;
-}
 
-/* cartpin [list | <pin> good|open|flaky | tilt <deg> | reinsert | clock <Hz>|default] */
 static GemuMonCmd nes_cmd_cartpin(GemuMonitor *mon, const char *args, void *ud) {
     NesState *s = ud;
     NesPins *p = &s->pins;
@@ -3510,218 +1246,196 @@ static GemuMonCmd nes_cmd_cartpin(GemuMonitor *mon, const char *args, void *ud) 
     return GEMU_MON_NONE;
 }
 
+
+/* ── Run loop ────────────────────────────────────────────────────────────── */
+
+/* Execute one CPU instruction and bring the APU, expansion audio and PPU up
+ * to the same cycle. */
+void nes_step_insn(NesState *s) {
+    if (s->exec_hook) s->exec_hook(s->exec_hook_ud, s->cpu.PC);
+    mos6502_step(&s->cpu);
+    nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+}
+
+
+/* ── The console's front-end interface (nes.h) ───────────────────────────── */
+
 static void nes_monitor_setup(NesState *s) {
     GemuMonitor *mon = s->monitor;
     gemu_monitor_set_memory(mon, &(GemuMonMemory){
         .read = nes_mon_read, .write = nes_mon_write, .ud = s,
         .addr_bits = 16, .big_endian = false });
     gemu_monitor_set_cpu_state_cb(mon, nes_cpu_state, s);
-    gemu_monitor_bind(mon, "savevm",     nes_cmd_savevm,     s);
-    gemu_monitor_bind(mon, "loadvm",     nes_cmd_loadvm,     s);
     gemu_monitor_bind(mon, "mapperdump", nes_cmd_mapperdump, s);
     gemu_monitor_bind(mon, "sendkey",    nes_cmd_sendkey,    s);
     gemu_monitor_bind(mon, "ppudump",    nes_cmd_ppudump,    s);
-    /* A Game Genie plugs into a home console's cartridge slot, not a VS. cabinet. */
-    if (!s->cfg->is_arcade) {
-        gemu_monitor_bind(mon, "gamegenie", nes_cmd_gamegenie, s);
-        gemu_monitor_bind(mon, "cartpin",   nes_cmd_cartpin,   s);
-    }
+    if (!s->cfg->is_arcade)   /* a VS. board has no cartridge connector */
+        gemu_monitor_bind(mon, "cartpin", nes_cmd_cartpin, s);
     if (s->cfg->is_arcade) {
         gemu_monitor_bind(mon, "dipswitch", nes_cmd_dipswitch, s);
         gemu_monitor_bind(mon, "coin",      nes_cmd_coin,      s);
         gemu_monitor_bind(mon, "service",   nes_cmd_service,   s);
     }
-    gemu_monitor_bind(mon, "hexeditor",  nes_cmd_hexeditor,  s);
 }
 
-/* ── Run loop ────────────────────────────────────────────────────────────── */
+NesState *nes_core_create(const MosConfig *cfg) {
+    NesState *s = calloc(1, sizeof(*s));
+    if (!s) return NULL;
 
-/* Fallback frame duration when audio is off (headless / -soundhw none). */
-#define NES_FRAME_MS       17u   /* NTSC: 1000/60 ≈ 16.67 ms */
-#define NES_FRAME_PAL_MS   20u   /* PAL:  1000/50 = 20.00 ms */
+    s->cfg         = cfg;
+    s->fds_enabled = cfg->fds_enabled;
+    nes_cart_wire(s);
 
-/* Audio queue threshold for sync: allow up to 3 frames of latency (~50 ms).
- * ~735 samples/frame * 3 frames * 4 bytes/float = 8820 bytes */
-#define AUDIO_QUEUE_MAX  (3u * 735u * (unsigned)sizeof(float))
+    if (s->fds_enabled) {
+        /* 8 KB CHR RAM for PPU (needed before HLE boot so CHR files can load) */
+        if (!nes_cart_init_chr_ram(&s->cart)) { free(s); return NULL; }
 
-/* Execute one CPU instruction and bring the APU, expansion audio and PPU up
- * to the same cycle. */
-static void nes_step_insn(NesState *s) {
-#ifdef HAVE_LUA
-    if (s->lua) nes_lua_notify_exec(s->lua, s->cpu.PC);
-#endif
-    mos6502_step(&s->cpu);
-    nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
-}
-
-/* Show the PPU's picture: at the end of every frame, and after a monitor
- * "step" (mid-frame: the lines drawn so far over the last frame's), so the
- * window and screendump follow single-stepping while paused.
- *
- * -device crt: re-derive the frame from the PPU's raw hue+luma values
- * (ppu.pixels[], not the already-quantized pixels_argb) through a genuine
- * NTSC composite encode+decode into crt_argb. Independent of s->display so
- * screendump still gets a decoded frame on headless "-display none" runs.
- * Note this means anything drawn as an emulator-only overlay straight into
- * pixels_argb (e.g. the Lua gui.* API) won't appear in CRT mode — correctly
- * so, since it was never part of the real signal.  end_of_frame advances
- * the subcarrier phase (dot crawl); a redraw after a step must not, or
- * stepping would change every later frame. */
-static void nes_present_frame(NesState *s, const MosConfig *cfg, bool end_of_frame) {
-    if (cfg->crt_type != MOS_CRT_NONE && s->crt_argb && s->crt_decoded_argb) {
-        NesNtscEncodeSpec enc_spec = {
-            .oversample = NES_NTSC_OVERSAMPLE,
-            .emphasis   = (uint8_t)(s->ppu.ppumask & 0xE0u),
-        };
-        nes_ntsc_encode(&enc_spec, s->ppu.pixels, RP2C02_WIDTH, RP2C02_HEIGHT,
-                        s->crt_dot_counter, s->crt_signal);
-        if (end_of_frame)
-            s->crt_dot_counter += (uint64_t)RP2C02_WIDTH * RP2C02_HEIGHT;
-
-        NtscDecodeSpec dec_spec = {
-            .samples_per_line = RP2C02_WIDTH * NES_NTSC_OVERSAMPLE,
-            .lines            = RP2C02_HEIGHT,
-            .subcarrier_cycles_per_sample =
-                nes_ntsc_subcarrier_cycles_per_sample(NES_NTSC_OVERSAMPLE),
-            .out_width        = NES_CRT_WIDTH,
-            .comb_filter      = cfg->crt_type == MOS_CRT_COMB,
-        };
-        ntsc_decode(&dec_spec, s->crt_signal, s->crt_decoded_argb);
-        crt_tube_apply(crt_tube_profile_generic(), s->crt_decoded_argb,
-                       s->crt_argb, NES_CRT_WIDTH, NES_CRT_HEIGHT);
-    }
-
-    /* PPU already builds pixels_argb. */
-    if (s->display && cfg->crt_type != MOS_CRT_NONE && s->crt_argb) {
-        gemu_display_render(s->display, s->crt_argb,
-                            NES_CRT_WIDTH, NES_CRT_HEIGHT);
-    } else if (s->display) {
-        gemu_display_render(s->display, s->ppu.pixels_argb,
-                            RP2C02_WIDTH, RP2C02_HEIGHT);
-    }
-}
-
-void nes_run(NesState *s, const MosConfig *cfg) {
-    gemu_monitor_start(s->monitor);
-
-    bool quit = false;
-    while (!quit) {
-        Uint32 t0 = SDL_GetTicks();  /* used for non-audio frame sync below */
-        nes_pins_apply(s);
-
-        /* Poll display: pump events, update held bitmask, check quit/reset */
-        uint32_t held = 0;
-        if (s->display) {
-            held = gemu_display_poll(s->display);
-            if (gemu_display_should_quit(s->display)) break;
-            if (gemu_display_reset_requested(s->display)) {
-                gemu_display_clear_flags(s->display);
-                nes_np_reset_or(s);
-            }
+        /* BIOS: use real ROM if provided, otherwise install HLE stub */
+        const char *bios_path = NULL;
+        for (int i = 0; i < cfg->n_roms; i++) {
+            if (cfg->roms[i].addr == 0xE000u) { bios_path = cfg->roms[i].path; break; }
         }
-        /* Monitor commands */
-        GemuMonCmd cmd;
-        while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-            if      (cmd == GEMU_MON_QUIT)   { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else { quit = true; break; } }
-            else if (cmd == GEMU_MON_RESET)  nes_np_reset_or(s);
-            else if (cmd == GEMU_MON_STEP) {
-                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
-                    nes_step_insn(s);
-                nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);   /* show the monitor the whole state */
-                nes_sync_apu_to_cpu(s, s->cpu.cycle_count);
-                nes_present_frame(s, cfg, false);              /* and the window */
-            }
-        }
-        if (quit) break;
-        if (s->display)
-            gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
+        if (!bios_path && cfg->n_roms > 0)
+            bios_path = cfg->roms[0].path;
 
-        /* Input: display action bits (includes VNC input) */
-        nes_handle_keys(s, held);
-#ifdef HAVE_LUA
-        nes_lua_pre_frame(s->lua, s->ctrl_state);
-#endif
-        if (s->cfg->is_arcade) {
-            if (s->vs_coin_latch[0] > 0) s->vs_coin_latch[0]--;
-            if (s->vs_coin_latch[1] > 0) s->vs_coin_latch[1]--;
-        }
-        /* Netplay: everyone's input for this frame, or wait for it */
-        bool np_waiting = !nes_np_frame(s);
-
-        if (!gemu_monitor_is_paused(s->monitor) && !np_waiting) {
-            /* Run one full frame (until PPU marks frame complete) */
-            s->ppu.dirty = false;
-            while (!s->ppu.dirty) {
-                if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-                nes_step_insn(s);
-                if (gemu_monitor_is_paused(s->monitor)) break;
-            }
-            VS_DEBUG(s, "frame=%llu pc=%04X a=%02X x=%02X y=%02X p=%02X sp=%02X "
-                        "ctrl=%02X mask=%02X status=%02X chr=%05X/%05X nmi=%d irq=%d\n",
-                     (unsigned long long)s->ppu.frame, s->cpu.PC,
-                     s->cpu.A, s->cpu.X, s->cpu.Y, s->cpu.P, s->cpu.SP,
-                     s->ppu.ppuctrl, s->ppu.ppumask, s->ppu.ppustatus,
-                     s->chr_offsets[0], s->chr_offsets[1],
-                     s->cpu.nmi ? 1 : 0, s->cpu.irq ? 1 : 0);
-
-            /* Flush APU samples to SDL audio */
-            nes_sync_apu_to_cpu(s, s->cpu.cycle_count);
-            apu2a03_flush(&s->apu);
-            nes_np_after_frame(s);
-
-#ifdef HAVE_LUA
-            /* Resume the script for this frame; gui.* draws straight into
-             * pixels_argb so overlays show up in both the display and VNC. */
-            nes_lua_run_frame(s->lua, s->ppu.pixels_argb, RP2C02_WIDTH, RP2C02_HEIGHT);
-#endif
-
-            nes_present_frame(s, cfg, true);
-#ifdef HAVE_ROB
-            if (s->cfg->n_ports > 1 && nes_device_is_rob(s->cfg->ports[1])) {
-                rob_frame(&s->rob, s->ppu.pixels_argb, RP2C02_WIDTH, RP2C02_HEIGHT);
-                s->ctrl_state[1] = 0;
-                if (s->rob.btn_a) s->ctrl_state[1] |= NES_BTN_A;
-                if (s->rob.btn_b) s->ctrl_state[1] |= NES_BTN_B;
-            }
-            if (s->rob_window) {
-                if (rob_window_close_requested(s->rob_window)) {
-                    rob_window_destroy(s->rob_window);
-                    s->rob_window = NULL;
-                } else {
-                    rob_window_render(s->rob_window, &s->rob);
-                }
-            }
-#endif
-        }
-
-        /* Frame sync:
-         * - Audio enabled: block until SDL has consumed enough samples so the
-         *   queue stays at ~3 frames. This locks emulation to the audio clock
-         *   (exactly 60.099 fps) and eliminates drift entirely.
-         * - Audio off / headless: fall back to a software timer. */
-        if (np_waiting) {
-            SDL_Delay(1);       /* the network, not the audio, sets the pace */
-        } else if (s->apu.audio_dev) {
-            while (gemu_audio_queued(s->apu.audio_dev) > AUDIO_QUEUE_MAX)
-                SDL_Delay(1);
+        if (bios_path) {
+            if (!fds_bios_load(&s->fds, bios_path)) { nes_cart_free(&s->cart); free(s); return NULL; }
         } else {
-            Uint32 elapsed = SDL_GetTicks() - t0;
-            Uint32 frame_ms = cfg->is_pal ? NES_FRAME_PAL_MS : NES_FRAME_MS;
-            /* a changed M2 (Debug > Cartridge Pins) lengthens or shortens it */
-            frame_ms = (Uint32)((uint64_t)frame_ms * s->pins.clock_default / s->pins.clock_hz);
-            if (elapsed < frame_ms)
-                SDL_Delay(frame_ms - elapsed);
+            fds_hle_build_rom(&s->fds);
+            s->fds.hle_mode = true;
         }
 
-        hex_editor_refresh(s->hex_editor);
-        if (g_cheat_dialog) g_cheat_dialog->refresh(g_cheat_dialog);
-        if (g_pin_window) g_pin_window->refresh(g_pin_window);
-        if (g_np_dialog) g_np_dialog->refresh(g_np_dialog);
-        /* GTK event pump is done inside gemu_display_poll() via the backend */
+        /* the disk's save data and the HLE boot: the front end
+         * (nes_fds_disk_inserted) */
+        if (cfg->fda_path && !fds_disk_load(&s->fds, cfg->fda_path)) {
+            nes_cart_free(&s->cart); free(s); return NULL;
+        }
+    } else {
+        if (!cfg->cart_path) {
+            if (cfg->is_arcade && cfg->n_roms > 0) {
+                if (!nes_arcade_assemble(s, cfg)) { free(s); return NULL; }
+            } else {
+                fprintf(stderr, "nes: no cartridge specified - use -cartridge FILE.nes\n");
+                free(s); return NULL;
+            }
+        } else {
+            if (!nes_cart_insert(s, cfg->cart_path)) { free(s); return NULL; }
+        }
     }
 
-    printf("nes: %llu frames, %llu cpu cycles\n",
-           (unsigned long long)s->ppu.frame,
-           (unsigned long long)s->cpu.cycle_count);
-    gemu_monitor_stop(s->monitor);
+    nes_pins_init(&s->pins, cfg->cpu == MOS_CPU_2A07 ? 1662607u : 1789773u);
+    s->clock_seen = s->pins.clock_hz;
+
+    /* Wire up PPU CHR bus */
+    rp2c02_init(&s->ppu, cfg->is_pal);
+    if (cfg->is_dendy) s->ppu.vblank_line = 291;  /* Dendy: 50 extra post-render lines */
+    if (cfg->vga == MOS_VGA_RP2C04_0004)
+        s->ppu.no_odd_skip = true;
+    if (cfg->disabled_features & MOS_FEATURE_ODD_FRAME_SKIP)
+        s->ppu.no_odd_skip = true;
+    if (cfg->is_arcade && s->vs_palette_rgb[0])    /* 2C04 palette present */
+        s->ppu.alt_palette_rgb = s->vs_palette_rgb;
+    s->ppu.chr_read  = nes_cart_chr_read;
+    s->ppu.chr_write = nes_cart_chr_write;
+    s->ppu.chr_ud    = &s->cart;
+    s->ppu.mirror    = s->cart.info.mirror;
+
+    mos6502_init(&s->cpu);
+    s->cpu.mem_read        = nes_cpu_read;
+    s->cpu.mem_write       = nes_cpu_write;
+    s->cpu.mem_ud          = s;
+    mos_cpu_apply(&s->cpu, cfg->cpu);
+    s->cpu.dummy_cycles = true;   /* page-crossing and branch dummy reads hit registers */
+    s->cpu.cycle_polling = true;  /* interrupts polled on each instruction's penultimate cycle */
+
+    s->apu.sweep_enabled = true;
+    s->apu.dmc_enabled = true;
+    s->apu.frame_irq_enabled = true;
+
+    /* APU - only initialise when sound is enabled */
+    if (cfg->sound == MOS_SOUND_2A03) {
+        uint32_t apu_clock = cfg->cpu == MOS_CPU_2A07 ? 1662607u : 1789773u;
+        if (!apu2a03_init(&s->apu, apu_clock))
+            fprintf(stderr, "nes: APU audio init failed (continuing silently)\n");
+        s->apu.mem_read = nes_cpu_read;
+        s->apu.mem_ud   = s;
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
+    } else if (cfg->sound == MOS_SOUND_2A03_MIDI) {
+        s->apu.mem_read    = nes_cpu_read;
+        s->apu.mem_ud      = s;
+        apu_midi_open(&s->apu_midi);
+        s->apu.write_tap    = apu_midi_tap;
+        s->apu.write_tap_ud = &s->apu_midi;
+#endif
+    }
+    s->apu.sweep_enabled = (cfg->disabled_features & MOS_FEATURE_SWEEP_REGISTERS) == 0;
+    s->apu.dmc_enabled = (cfg->disabled_features & MOS_FEATURE_DMC_CHANNEL) == 0;
+    s->apu.dma_external = true;   /* the DMC's fetches are DMAs that halt the CPU */
+    s->apu.frame_irq_enabled = (cfg->disabled_features & MOS_FEATURE_FRAME_IRQ) == 0;
+
+    s->monitor = gemu_monitor_create();
+    nes_monitor_setup(s);
+    nes_install_mapper_hooks(s);
+#ifdef HAVE_ROB
+    for (int p = 0; p < cfg->n_ports; p++)
+        if (nes_device_is_rob(cfg->ports[p])) { rob_init(&s->rob); break; }
+#endif
+    if (cfg->is_arcade)
+        s->vs_dip = VS_DIP_DEFAULT;
+    return s;
+}
+
+void nes_core_destroy(NesState *s) {
+    if (s->fds_enabled) free(s->fds.raw_disk);
+#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
+    apu_midi_close(&s->apu_midi);
+#endif
+    apu2a03_destroy(&s->apu);
+    gemu_monitor_destroy(s->monitor);
+    nes_cart_free(&s->cart);
+    free(s);
+}
+
+/* A disk went in (or was there at power-on): the HLE BIOS loads its boot
+ * files now. */
+void nes_fds_disk_inserted(NesState *s) {
+    if (s->fds.hle_mode)
+        fds_hle_boot(&s->fds, s->cart.chr);
+}
+
+bool nes_insert_cartridge(NesState *s, const char *path) {
+    if (!nes_cart_insert(s, path)) return false;
+    nes_install_mapper_hooks(s);
+    return true;
+}
+
+void nes_eject_cartridge(NesState *s) {
+    nes_cart_free(&s->cart);
+    s->cart_path_buf[0] = '\0';
+}
+
+void nes_apply_pins(NesState *s) { nes_pins_apply(s); }
+
+void nes_sync(NesState *s) {
+    nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+    nes_sync_apu_to_cpu(s, s->cpu.cycle_count);
+}
+
+void nes_run_frame(NesState *s) {
+    s->ppu.dirty = false;
+    while (!s->ppu.dirty) {
+        if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
+        nes_step_insn(s);
+        if (gemu_monitor_is_paused(s->monitor)) break;
+    }
+    VS_DEBUG(s, "frame=%llu pc=%04X a=%02X x=%02X y=%02X p=%02X sp=%02X "
+                "ctrl=%02X mask=%02X status=%02X chr=%05X/%05X nmi=%d irq=%d\n",
+             (unsigned long long)s->ppu.frame, s->cpu.PC,
+             s->cpu.A, s->cpu.X, s->cpu.Y, s->cpu.P, s->cpu.SP,
+             s->ppu.ppuctrl, s->ppu.ppumask, s->ppu.ppustatus,
+             s->cart.chr_off[0], s->cart.chr_off[4],
+             s->cpu.nmi ? 1 : 0, s->cpu.irq ? 1 : 0);
+    /* the frame's audio out to the host */
+    nes_sync_apu_to_cpu(s, s->cpu.cycle_count);
+    apu2a03_flush(&s->apu);
 }

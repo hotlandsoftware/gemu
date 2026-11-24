@@ -89,5 +89,9 @@ uint8_t  nes_pins_cpu_data_open(uint64_t open);      /* CPU D0-D7 */
 uint16_t nes_pins_ppu_addr_open(uint64_t open);      /* PPU A0-A13 */
 uint8_t  nes_pins_ppu_data_open(uint64_t open);      /* PPU D0-D7 */
 
+/* The M2 clock a user can set (Debug > Cartridge Pins, "cartpin clock") */
+#define NES_PIN_CLOCK_MIN 100000u
+#define NES_PIN_CLOCK_MAX 4000000u
+
 /* A pin by number ("32") or label ("m2", "cpu_a3", "ppu/rd"); 0 if none. */
 int      nes_pins_find(const char *name);

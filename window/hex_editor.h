@@ -39,6 +39,11 @@ void hex_editor_show(HexEditor *he);
 void hex_editor_hide(HexEditor *he);
 bool hex_editor_is_visible(const HexEditor *he);
 
+/* Point tab `index` at other memory (label and base address kept): the
+ * machine's memory moved, e.g. another cartridge went in.  data may be
+ * NULL ("(no data)").  The tab's selection and scroll position reset. */
+void hex_editor_set_region(HexEditor *he, int index, uint8_t *data, size_t size, bool read_only);
+
 /* Refresh the hex display with current data.  Safe to call from the run
  * loop every frame - it will only redraw when the window is visible. */
 void hex_editor_refresh(HexEditor *he);
@@ -52,7 +57,9 @@ void hex_editor_refresh(HexEditor *he);
     void  hex_editor_##prefix##_show(Type *he);                                   \
     void  hex_editor_##prefix##_hide(Type *he);                                   \
     bool  hex_editor_##prefix##_is_visible(const Type *he);                       \
-    void  hex_editor_##prefix##_refresh(Type *he);
+    void  hex_editor_##prefix##_refresh(Type *he);                                \
+    void  hex_editor_##prefix##_set_region(Type *he, int index, uint8_t *data,   \
+                                           size_t size, bool read_only);
 
 #ifdef GEMU_GTK
 HEX_EDITOR_IMPL(gtk, HexEditorGtk)
