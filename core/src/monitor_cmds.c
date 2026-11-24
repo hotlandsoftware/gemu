@@ -149,6 +149,8 @@ static const MonCmdDef mon_cmds[] = {
       "show machine information ('help info' lists subcommands)", NULL, cmd_info, 0 },
     { "input",       "input-state",  "",
       "show keyboard controller and PIT state", "i2000", NULL, 0 },
+    { "ioports",     NULL,           "",
+      "show the I/O port map: each range and its device", "ibm5150", NULL, 0 },
     { "iosapic",     NULL,           "",
       "show programmed I/O SAPIC redirection entries", "i2000", NULL, 0 },
     { "irqs",        NULL,           "",

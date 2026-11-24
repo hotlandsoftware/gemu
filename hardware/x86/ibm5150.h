@@ -94,6 +94,12 @@ typedef struct Ibm5150State {
     bool halted_for_debug; /* set on an unimplemented/trapped opcode - keeps
                              * the machine parked so the monitor can inspect
                              * state instead of spinning on garbage */
+
+    /* I/O ports A0-A9: each one's handler per direction, built from the
+     * configuration at power-on (NULL: unclaimed, read $FF and logged).
+     * Last, out of the way of the fields the CPU loop uses. */
+    uint8_t (*io_rd[0x400])(struct Ibm5150State *s, uint16_t port);
+    void    (*io_wr[0x400])(struct Ibm5150State *s, uint16_t port, uint8_t val);
 } Ibm5150State;
 
 Ibm5150State *ibm5150_create(const X86Config *cfg);

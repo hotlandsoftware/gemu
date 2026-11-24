@@ -69,21 +69,6 @@ static bool video_mem_write(Ibm5150State *s, uint32_t addr, uint8_t val) {
     return false;
 }
 
-/* Registers: MDA at 0x3B0-0x3BB (0x3BC- is its printer port), CGA at
- * 0x3D0-0x3DF. */
-static bool mda_port(const Ibm5150State *s, uint16_t port) {
-    return s->has_mda && port >= 0x3B0 && port <= 0x3BB;
-}
-
-/* Hercules: the MDA's, and its configuration switch at 0x3BF. */
-static bool herc_port(const Ibm5150State *s, uint16_t port) {
-    return s->has_herc && ((port >= 0x3B0 && port <= 0x3BB) || port == 0x3BF);
-}
-
-static bool cga_port(const Ibm5150State *s, uint16_t port) {
-    return s->has_cga && port >= 0x3D0 && port <= 0x3DF;
-}
-
 /* Both cards run; the primary's frames pace the machine. */
 static bool video_tick(Ibm5150State *s, uint32_t clocks) {
     bool mda_frame = s->has_mda && mda_tick(&s->mda, clocks);
@@ -270,73 +255,166 @@ static void kb_port_b_changed(Ibm5150State *s, uint8_t old, uint8_t val) {
     kb_update_irq(s);
 }
 
-/* ── I/O ports ───────────────────────────────────────────────────────────── */
+/* ── I/O ports ───────────────────────────────────────────────────────────── *
+ *
+ * The PC decodes A0-A9 only: 1024 ports.  ibm5150_io_map() lists what this
+ * configuration has there, in priority order (the first range to claim a
+ * port for reads, or for writes, gets it); io_build() turns that into a
+ * handler per port and direction.  Ports nobody claims read $FF (the bus
+ * floats high) and are logged once (iolog). */
 
-/* Standard adapters this machine doesn't have.  POST probes all of them,
- * so accesses are expected and not worth logging; the bus floats high. */
-static bool empty_slot(uint16_t port) {
-    return (port >= 0x200 && port <= 0x20F) ||   /* game port */
-           (port >= 0x210 && port <= 0x217) ||   /* 5161 expansion unit */
-           (port >= 0x320 && port <= 0x32F) ||   /* fixed disk adapters (when absent) */
-           (port >= 0x278 && port <= 0x27F) ||   /* LPT2 */
-           (port >= 0x2F8 && port <= 0x2FF) ||   /* COM2 */
-           (port >= 0x378 && port <= 0x37F) ||   /* LPT1 */
-           (port >= 0x3B0 && port <= 0x3BF) ||   /* MDA + its printer port (when absent) */
-           (port >= 0x3D0 && port <= 0x3DF) ||   /* CGA (when absent) */
-           (port >= 0x3F0 && port <= 0x3F7) ||   /* diskette adapter (when absent) */
-           (port >= 0x3F8 && port <= 0x3FF);     /* COM1 */
+typedef uint8_t (*IoRead)(Ibm5150State *s, uint16_t port);
+typedef void    (*IoWrite)(Ibm5150State *s, uint16_t port, uint8_t val);
+
+static uint8_t dma_rd(Ibm5150State *s, uint16_t p)            { return i8237_io_read(&s->dma, p); }
+static void    dma_wr(Ibm5150State *s, uint16_t p, uint8_t v) { i8237_io_write(&s->dma, p, v); }
+static uint8_t pic_rd(Ibm5150State *s, uint16_t p)            { return i8259_io_read(&s->pic, p); }
+static void    pic_wr(Ibm5150State *s, uint16_t p, uint8_t v) { i8259_io_write(&s->pic, p, v); }
+static uint8_t pit_rd(Ibm5150State *s, uint16_t p)            { return i8253_io_read(&s->pit, p); }
+static void    pit_wr(Ibm5150State *s, uint16_t p, uint8_t v) {
+    i8253_io_write(&s->pit, p, v);
+    update_speaker(s);
+}
+static uint8_t ppi_rd(Ibm5150State *s, uint16_t p)            { return i8255_io_read(&s->ppi, p); }
+/* Port B: PB0 gates PIT channel 2, PB0/PB1 the speaker, PB6/PB7 the
+ * keyboard's clock and clear. */
+static void    ppi_wr(Ibm5150State *s, uint16_t p, uint8_t v) {
+    uint8_t old = s->ppi.port_b;
+    i8255_io_write(&s->ppi, p, v);
+    if ((p & 3) == 1) {
+        i8253_set_gate(&s->pit, 2, v & 0x01);
+        kb_port_b_changed(s, old, v);
+        update_speaker(s);
+    }
+}
+static uint8_t page_rd(Ibm5150State *s, uint16_t p)           { return i8237_page_read(&s->dma, p); }
+static void    page_wr(Ibm5150State *s, uint16_t p, uint8_t v) { i8237_page_write(&s->dma, p, v); }
+static void    nmi_wr(Ibm5150State *s, uint16_t p, uint8_t v) { (void)p; s->nmi_mask = v; }
+static uint8_t mda_rd(Ibm5150State *s, uint16_t p)            { return mda_io_read(&s->mda, p); }
+static void    mda_wr(Ibm5150State *s, uint16_t p, uint8_t v) { mda_io_write(&s->mda, p, v); }
+static uint8_t herc_rd(Ibm5150State *s, uint16_t p)           { return hercules_io_read(&s->herc, p); }
+static void    herc_wr(Ibm5150State *s, uint16_t p, uint8_t v) { hercules_io_write(&s->herc, p, v); }
+static uint8_t cga_rd(Ibm5150State *s, uint16_t p)            { return cga_io_read(&s->cga, p); }
+static void    cga_wr(Ibm5150State *s, uint16_t p, uint8_t v) { cga_io_write(&s->cga, p, v); }
+static uint8_t fdc_rd(Ibm5150State *s, uint16_t p)            { return upd765_read(&s->fdc, p); }
+static void    fdc_wr(Ibm5150State *s, uint16_t p, uint8_t v) { upd765_write(&s->fdc, p, v); }
+static uint8_t hdc_rd(Ibm5150State *s, uint16_t p)            { return ibm_hdc_read(&s->hdc, p - 0x320u); }
+static void    hdc_wr(Ibm5150State *s, uint16_t p, uint8_t v) { ibm_hdc_write(&s->hdc, p - 0x320u, v); }
+static uint8_t com1_rd(Ibm5150State *s, uint16_t p)           { return ins8250_read(&s->com[0], p & 7u); }
+static void    com1_wr(Ibm5150State *s, uint16_t p, uint8_t v) { ins8250_write(&s->com[0], p & 7u, v); }
+static uint8_t com2_rd(Ibm5150State *s, uint16_t p)           { return ins8250_read(&s->com[1], p & 7u); }
+static void    com2_wr(Ibm5150State *s, uint16_t p, uint8_t v) { ins8250_write(&s->com[1], p & 7u, v); }
+/* Standard adapters this machine doesn't have: POST probes them all, so
+ * the accesses are expected and not worth logging; the bus floats high. */
+static uint8_t empty_rd(Ibm5150State *s, uint16_t p)          { (void)s; (void)p; return 0xFF; }
+static void    empty_wr(Ibm5150State *s, uint16_t p, uint8_t v) { (void)s; (void)p; (void)v; }
+
+typedef struct {
+    uint16_t    lo, hi;
+    IoRead      read;      /* NULL: reads fall through to later ranges */
+    IoWrite     write;
+    const char *name;
+} IoRange;
+
+#define IO_MAX_RANGES 32
+
+/* This configuration's ports, highest priority first. */
+static int ibm5150_io_map(const Ibm5150State *s, IoRange *r) {
+    int n = 0;
+#define RANGE(l, h, rd, wr, nm) (r[n++] = (IoRange){ (l), (h), (rd), (wr), (nm) })
+    RANGE(0x000, 0x00F, dma_rd,  dma_wr,  "8237 DMA");
+    RANGE(0x020, 0x021, pic_rd,  pic_wr,  "8259 PIC");
+    RANGE(0x040, 0x043, pit_rd,  pit_wr,  "8253 PIT");
+    RANGE(0x060, 0x063, ppi_rd,  ppi_wr,  "8255 PPI");
+    RANGE(0x080, 0x083, page_rd, page_wr, "DMA page registers");
+    RANGE(0x0A0, 0x0AF, NULL,    nmi_wr,  "NMI mask");
+    /* MDA 3B0-3BB (3BC- is its printer port); Hercules adds 3BF */
+    if (s->has_mda)    RANGE(0x3B0, 0x3BB, mda_rd,  mda_wr,  "MDA");
+    if (s->has_herc) { RANGE(0x3B0, 0x3BB, herc_rd, herc_wr, "Hercules");
+                       RANGE(0x3BF, 0x3BF, herc_rd, herc_wr, "Hercules configuration"); }
+    if (s->has_cga)    RANGE(0x3D0, 0x3DF, cga_rd,  cga_wr,  "CGA");
+    if (s->has_fdc)    RANGE(0x3F0, 0x3F7, fdc_rd,  fdc_wr,  "diskette adapter (765)");
+    if (s->has_hdc)    RANGE(0x320, 0x323, hdc_rd,  hdc_wr,  "fixed disk adapter");
+    if (s->has_com[0]) RANGE(0x3F8, 0x3FF, com1_rd, com1_wr, "COM1 (8250)");
+    if (s->has_com[1]) RANGE(0x2F8, 0x2FF, com2_rd, com2_wr, "COM2 (8250)");
+    RANGE(0x200, 0x20F, empty_rd, empty_wr, "game port (empty)");
+    RANGE(0x210, 0x217, empty_rd, empty_wr, "expansion unit (empty)");
+    RANGE(0x320, 0x32F, empty_rd, empty_wr, "fixed disk adapters (empty)");
+    RANGE(0x278, 0x27F, empty_rd, empty_wr, "LPT2 (empty)");
+    RANGE(0x2F8, 0x2FF, empty_rd, empty_wr, "COM2 (empty)");
+    RANGE(0x378, 0x37F, empty_rd, empty_wr, "LPT1 (empty)");
+    RANGE(0x3B0, 0x3BF, empty_rd, empty_wr, "MDA and its printer port (empty)");
+    RANGE(0x3D0, 0x3DF, empty_rd, empty_wr, "CGA (empty)");
+    RANGE(0x3F0, 0x3F7, empty_rd, empty_wr, "diskette adapter (empty)");
+    RANGE(0x3F8, 0x3FF, empty_rd, empty_wr, "COM1 (empty)");
+#undef RANGE
+    return n;
+}
+
+/* Fill the per-port tables: each port's first claimant, per direction. */
+static void io_build(Ibm5150State *s) {
+    IoRange r[IO_MAX_RANGES];
+    int n = ibm5150_io_map(s, r);
+    memset(s->io_rd, 0, sizeof(s->io_rd));
+    memset(s->io_wr, 0, sizeof(s->io_wr));
+    for (int i = n - 1; i >= 0; i--)          /* last first, so earlier ranges win */
+        for (unsigned p = r[i].lo; p <= r[i].hi; p++) {
+            if (r[i].read)  s->io_rd[p] = r[i].read;
+            if (r[i].write) s->io_wr[p] = r[i].write;
+        }
 }
 
 static uint8_t io_read8(uint16_t port, void *ud) {
     Ibm5150State *s = ud;
     port &= 0x3FF;   /* the PC decodes only A0-A9 */
-    if (port <= 0x0F) return i8237_io_read(&s->dma, port);
-    if (port >= 0x20 && port <= 0x21) return i8259_io_read(&s->pic, port);
-    if (port >= 0x40 && port <= 0x43) return i8253_io_read(&s->pit, port);
-    if (port >= 0x60 && port <= 0x63) return i8255_io_read(&s->ppi, port);
-    if (port >= 0x80 && port <= 0x83) return i8237_page_read(&s->dma, port);
-    if (mda_port(s, port)) return mda_io_read(&s->mda, port);
-    if (herc_port(s, port)) return hercules_io_read(&s->herc, port);
-    if (cga_port(s, port)) return cga_io_read(&s->cga, port);
-    if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) return upd765_read(&s->fdc, port);
-    if (s->has_hdc && port >= 0x320 && port <= 0x323) return ibm_hdc_read(&s->hdc, port - 0x320);
-    if (s->has_com[0] && port >= 0x3F8 && port <= 0x3FF) return ins8250_read(&s->com[0], port & 7);
-    if (s->has_com[1] && port >= 0x2F8 && port <= 0x2FF) return ins8250_read(&s->com[1], port & 7);
-    if (empty_slot(port)) return 0xFF;
+    IoRead rd = s->io_rd[port];
+    if (rd) return rd(s, port);
     iolog(s, port, false, 0);
     return 0xFF;
 }
+
 static void io_write8(uint16_t port, uint8_t val, void *ud) {
     Ibm5150State *s = ud;
     port &= 0x3FF;
-    if (port <= 0x0F) { i8237_io_write(&s->dma, port, val); return; }
-    if (port >= 0x20 && port <= 0x21) { i8259_io_write(&s->pic, port, val); return; }
-    if (port >= 0x40 && port <= 0x43) {
-        i8253_io_write(&s->pit, port, val);
-        update_speaker(s);
-        return;
-    }
-    if (port >= 0x60 && port <= 0x63) {
-        uint8_t old = s->ppi.port_b;
-        i8255_io_write(&s->ppi, port, val);
-        if ((port & 3) == 1) {
-            i8253_set_gate(&s->pit, 2, val & 0x01);
-            kb_port_b_changed(s, old, val);
-            update_speaker(s);
-        }
-        return;
-    }
-    if (port >= 0x80 && port <= 0x83) { i8237_page_write(&s->dma, port, val); return; }
-    if (port >= 0xA0 && port <= 0xAF) { s->nmi_mask = val; return; }
-    if (mda_port(s, port)) { mda_io_write(&s->mda, port, val); return; }
-    if (herc_port(s, port)) { hercules_io_write(&s->herc, port, val); return; }
-    if (cga_port(s, port)) { cga_io_write(&s->cga, port, val); return; }
-    if (s->has_fdc && port >= 0x3F0 && port <= 0x3F7) { upd765_write(&s->fdc, port, val); return; }
-    if (s->has_hdc && port >= 0x320 && port <= 0x323) { ibm_hdc_write(&s->hdc, port - 0x320, val); return; }
-    if (s->has_com[0] && port >= 0x3F8 && port <= 0x3FF) { ins8250_write(&s->com[0], port & 7, val); return; }
-    if (s->has_com[1] && port >= 0x2F8 && port <= 0x2FF) { ins8250_write(&s->com[1], port & 7, val); return; }
-    if (empty_slot(port)) return;
+    IoWrite wr = s->io_wr[port];
+    if (wr) { wr(s, port, val); return; }
     iolog(s, port, true, val);
+}
+
+/* ioports: the port map, as the CPU sees it now - each range's ports that
+ * it actually owns (earlier ranges shadow later ones), in port order. */
+static GemuMonCmd ibm5150_cmd_ioports(GemuMonitor *mon, const char *args, void *ud) {
+    const Ibm5150State *s = ud;
+    (void)args;
+    IoRange r[IO_MAX_RANGES];
+    int n = ibm5150_io_map(s, r);
+    struct { uint16_t lo, hi; int range; } span[0x400];
+    int n_span = 0;
+    for (int i = 0; i < n; i++) {
+        int start = -1;
+        for (unsigned p = r[i].lo; p <= (unsigned)r[i].hi + 1u; p++) {
+            /* no two ranges with the same handlers overlap */
+            bool owned = p <= r[i].hi &&
+                         ((r[i].read && s->io_rd[p] == r[i].read) ||
+                          (r[i].write && s->io_wr[p] == r[i].write));
+            if (owned && start < 0) start = (int)p;
+            if (!owned && start >= 0) {
+                span[n_span++] = (typeof(span[0])){ (uint16_t)start, (uint16_t)(p - 1u), i };
+                start = -1;
+            }
+        }
+    }
+    for (int i = 1; i < n_span; i++)          /* insertion sort by port */
+        for (int j = i; j > 0 && span[j - 1].lo > span[j].lo; j--) {
+            typeof(span[0]) t = span[j]; span[j] = span[j - 1]; span[j - 1] = t;
+        }
+    for (int i = 0; i < n_span; i++) {
+        const IoRange *q = &r[span[i].range];
+        gemu_monitor_printf(mon, "  %03X-%03X  %s%s\n", span[i].lo, span[i].hi, q->name,
+                            !q->read ? " (write only)" : "");
+    }
+    gemu_monitor_printf(mon, "  (anything else reads FF and is logged as unhandled)\n");
+    return GEMU_MON_NONE;
 }
 
 /* ── Diskette adapter wiring: IRQ6, DMA channel 2 ────────────────────────── */
@@ -1028,6 +1106,8 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     }
     for (int u = 0; u < 2; u++)
         if (s->hdc.drive[u]) gemu_drive_attach_monitor(s->hdc.drive[u], s->monitor);
+    io_build(s);   /* every adapter is in */
+    gemu_monitor_bind(s->monitor, "ioports", ibm5150_cmd_ioports, s);
 
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {

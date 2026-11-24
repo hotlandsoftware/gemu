@@ -129,7 +129,7 @@ static void load(I8253Channel *c) {
     c->counting = true;
 }
 
-static void clock_channel(I8253 *p, unsigned idx) {
+static inline __attribute__((always_inline)) void clock_channel(I8253 *p, unsigned idx) {
     I8253Channel *c = &p->ch[idx];
     bool trigger = c->trigger;
     c->trigger = false;
