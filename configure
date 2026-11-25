@@ -33,7 +33,7 @@ import xml.etree.ElementTree as ET
 
 CORE_SRC = [
     'core/src/memory.c', 'core/src/dev/device.c', 'core/src/dev/space.c', 'core/src/dev/scheduler.c', 'core/src/dev/line.c', 'core/src/dev/option.c', 'core/src/dev/state.c', 'core/src/tcg.c', 'jit/jit_mem.c', 'jit/jit_backend_x64.c', 'core/src/monitor.c',
-    'core/src/monitor_cmds.c', 'core/src/monitor_qmp.c',
+    'core/src/monitor_cmds.c', 'core/src/monitor_dev.c', 'core/src/monitor_qmp.c',
     'core/src/monitor_block.c', 'core/src/monitor_symbols.c',
     'core/third_party/cjson/cJSON.c',
     'core/src/vnc.c', 'core/src/video_sdl.c', 'core/src/args.c',
@@ -286,6 +286,8 @@ TESTS = [
     dict(name='i2000_interrupts', family='ia64', kind='program',
          src='tests/i2000_interrupts.c',
          replaces=['hardware/machine/ia64/machine_i2000.c']),
+    dict(name='monitor_dev', family=None, kind='program', src='tests/monitor_dev.c',
+         cflags='-Werror'),
     dict(name='i2000_memory', family='ia64', kind='program', src='tests/i2000_memory.c'),
     dict(name='merced_jit', family='ia64', kind='program', src='tests/merced_jit.c'),
     dict(name='merced_msr', family='ia64', kind='program', src='tests/merced_msr.c'),

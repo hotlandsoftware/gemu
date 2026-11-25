@@ -37,6 +37,18 @@ typedef struct GemuDevice     GemuDevice;
 typedef struct GemuDeviceType GemuDeviceType;
 typedef struct GemuOptionDef  GemuOptionDef;     /* gemu/dev/option.h */
 typedef struct GemuDeviceCore GemuDeviceCore;    /* the core's own per-device data */
+typedef struct GemuMonitor    GemuMonitor;       /* gemu/monitor.h */
+
+/* A monitor command a device type provides (gemu_monitor_attach_machine).
+ * It is offered on machines that have a device of the type; with several,
+ * the user picks one with "@path" as the first argument.  args are trimmed;
+ * print with gemu_monitor_printf(). */
+typedef struct GemuDeviceCmd {
+    const char *name;
+    const char *params;      /* synopsis, e.g. "[channel]" */
+    const char *help;
+    void (*fn)(GemuDevice *d, GemuMonitor *mon, const char *args);
+} GemuDeviceCmd;
 
 /* Power-on: everything to its initial state.  Hard: the reset line (RAM and
  * the like may survive).  Soft: a program-requested reset (a reset register,
@@ -52,6 +64,7 @@ struct GemuDeviceType {
     const char *desc;
     size_t      size;      /* bytes of instance state (priv), zeroed; may be 0 */
     const GemuOptionDef *options;   /* gemu/dev/option.h; NULL = none */
+    const GemuDeviceCmd *commands;  /* ended by a NULL name; NULL = none */
     /* Has no state to save (a bus, a container).  Otherwise init must
      * register its state (gemu/dev/state.h) or the machine won't start. */
     bool        stateless;

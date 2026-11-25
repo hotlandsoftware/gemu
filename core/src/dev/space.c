@@ -781,3 +781,31 @@ uint8_t *gemu_space_ptr(GemuSpace *s, uint64_t addr, bool write, uint64_t *avail
         *avail = s->page_mask - off + 1;
     return p->dir[write ? WR : RD].fast + off;
 }
+
+bool gemu_space_mirror_get(const GemuSpace *s, unsigned i, uint64_t *base, uint64_t *size,
+                           uint64_t *mask) {
+    const Mirror *mi = s->mirrors;
+    while (mi && i--)
+        mi = mi->next;
+    if (!mi)
+        return false;
+    *base = mi->lo;
+    *size = mi->hi - mi->lo + 1;
+    *mask = mi->mask;
+    return true;
+}
+
+/* The machine's list is newest first: the first made is its tail. */
+GemuSpace *gemu_space_first(GemuMachine *m) {
+    GemuSpace *s = m->spaces;
+    while (s && s->next)
+        s = s->next;
+    return s;
+}
+
+GemuSpace *gemu_space_next(GemuSpace *s) {
+    GemuSpace *prev = NULL;
+    for (GemuSpace *x = s->machine->spaces; x && x != s; x = x->next)
+        prev = x;
+    return prev;
+}

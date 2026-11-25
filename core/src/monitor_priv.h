@@ -137,6 +137,8 @@ struct GemuMonitor {
     bool            has_mem;
     MonBinding      bindings[MON_BIND_MAX];
     int             n_bindings;
+    GemuMachine    *machine;          /* a core machine (monitor_dev.c), or NULL */
+    char            default_space[32];
 
     MonSymbol      *syms;            /* symbols loaded from an assembler's output */
     int             n_syms, cap_syms;
@@ -192,6 +194,28 @@ bool       mon_line_is_quit(const char *line);
 /* Called by the reader thread for lines it must handle itself because they
  * read further input from the transport (e.g. "change vnc password"). */
 bool       mon_line_is_vnc_password(const char *line);
+
+/* monitor_cmds.c: whether a word is a command in the table (or an alias). */
+bool       mon_is_table_command(const char *word);
+
+/* monitor_dev.c - core machines (gemu_monitor_attach_machine) */
+/* "info <sub> <rest>": qtree, mtree or a device path; false if not one. */
+bool mon_dev_info(GemuMonitor *mon, const char *sub, const char *rest);
+void mon_dev_info_help(GemuMonitor *mon, void (*row)(GemuMonitor *, const char *syn,
+                                                     const char *help));
+/* A device type's command; false if no device here has one called verb. */
+bool mon_dev_dispatch(GemuMonitor *mon, const char *verb, const char *args);
+/* help: the device commands section, and one command's description. */
+void mon_dev_help(GemuMonitor *mon, void (*row)(GemuMonitor *, const char *syn,
+                                                const char *help));
+bool mon_dev_help_command(GemuMonitor *mon, const char *word);
+/* Whether the memory commands can run: a view, or a machine with spaces. */
+bool mon_dev_has_spaces(const GemuMonitor *mon);
+/* The memory view for an address token: a "space:" prefix picks that
+ * space (*addr_text then points past it); otherwise the monitor's own view,
+ * or the default space.  false (message printed) if there is none. */
+bool mon_dev_view(GemuMonitor *mon, const char *cmd, const char *tok, GemuMonMemory *view,
+                  const char **addr_text);
 
 /* monitor_symbols.c */
 GemuMonCmd mon_cmd_symbols(GemuMonitor *mon, const char *args);

@@ -133,6 +133,12 @@ bool gemu_space_mirror(GemuSpace *s, uint64_t base, uint64_t size, uint64_t mask
 
 /* The mappings, most recently added first. */
 GemuMapping *gemu_space_mappings(GemuSpace *s);
+/* Mirror i (0 = the most recent); false past the last. */
+bool gemu_space_mirror_get(const GemuSpace *s, unsigned i, uint64_t *base, uint64_t *size,
+                           uint64_t *mask);
+/* A machine's spaces, in the order they were made. */
+GemuSpace *gemu_space_first(GemuMachine *m);
+GemuSpace *gemu_space_next(GemuSpace *s);
 
 /* ── Access ───────────────────────────────────────────────────────────────── */
 /* Addresses are truncated to the space's width. */

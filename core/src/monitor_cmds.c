@@ -331,6 +331,8 @@ static const MonCmdDef *find_def(const char *word) {
     return NULL;
 }
 
+bool mon_is_table_command(const char *word) { return find_def(word) != NULL; }
+
 static const MonBinding *find_binding(const GemuMonitor *mon, const MonCmdDef *def) {
     for (int i = 0; i < mon->n_bindings; i++)
         if (mon->bindings[i].name == def->name)
@@ -356,9 +358,11 @@ static MonAvail availability(const GemuMonitor *mon, const MonCmdDef *def) {
         return AVAIL_OK;
     if (!def->builtin)
         return AVAIL_UNSUPPORTED;
-    if ((def->needs & NEED_MEM) && !mon->has_mem)
+    /* a core machine's spaces count as memory ("space:addr") */
+    if ((def->needs & NEED_MEM) && !mon->has_mem && !mon_dev_has_spaces(mon))
         return AVAIL_UNSUPPORTED;
-    if ((def->needs & NEED_MEM_WRITE) && !(mon->has_mem && mon->mem.write))
+    if ((def->needs & NEED_MEM_WRITE) && !(mon->has_mem && mon->mem.write) &&
+        !mon_dev_has_spaces(mon))
         return AVAIL_UNSUPPORTED;
     if ((def->needs & NEED_SCREEN) && !mon->screendump_cb)
         return AVAIL_UNSUPPORTED;
@@ -410,6 +414,53 @@ bool gemu_monitor_bind(GemuMonitor *mon, const char *name,
 
 /* ── Dispatch ────────────────────────────────────────────────────────────── */
 
+/* x/xp/peek/poke/memsave: the address is the first argument that isn't a
+ * "/fmt"; with a core machine attached it may be "space:addr".  The chosen
+ * view stands in for mon->mem while the command runs. */
+static GemuMonCmd run_mem_cmd(GemuMonitor *mon, const MonCmdDef *def, const char *args) {
+    char buf[MON_LINE_MAX];
+    snprintf(buf, sizeof buf, "%s", args);
+    char *tok = buf;
+    for (;;) {
+        while (isspace((unsigned char)*tok)) tok++;
+        if (*tok != '/') break;
+        while (*tok && !isspace((unsigned char)*tok)) tok++;
+    }
+    if (!*tok)
+        return def->builtin(mon, args);       /* no address: its usage message */
+    char *end = tok;
+    while (*end && !isspace((unsigned char)*end)) end++;
+    char addr[64];
+    size_t n = (size_t)(end - tok);
+    if (n >= sizeof addr) n = sizeof addr - 1;
+    memcpy(addr, tok, n);
+    addr[n] = 0;
+
+    GemuMonMemory view;
+    const char *at;
+    if (!mon_dev_view(mon, def->name, addr, &view, &at))
+        return GEMU_MON_NONE;
+    if (view.addr_bits == 0 || view.addr_bits > 64)
+        view.addr_bits = 64;
+    if ((def->needs & NEED_MEM_WRITE) && !view.write) {
+        mon_printf(mon, "%s: this memory can't be written\n", def->name);
+        return GEMU_MON_NONE;
+    }
+    /* the arguments again, without the "space:" prefix */
+    char out[MON_LINE_MAX];
+    size_t skip = (size_t)(at - addr);
+    snprintf(out, sizeof out, "%.*s%s", (int)(tok - buf), buf, tok + skip);
+
+    GemuMonMemory saved = mon->mem;
+    bool had = mon->has_mem;
+    mon->mem = view;
+    mon->has_mem = true;
+    GemuMonCmd r = def->builtin(mon, out);
+    mon->mem = saved;
+    mon->has_mem = had;
+    return r;
+}
+
 GemuMonCmd mon_dispatch(GemuMonitor *mon, const char *line) {
     char verb[64];
     const char *args = take_token(line, verb, sizeof(verb));
@@ -423,7 +474,8 @@ GemuMonCmd mon_dispatch(GemuMonitor *mon, const char *line) {
     cur_mon = mon;
     const MonCmdDef *def = find_def(verb);
     if (!def) {
-        mon_printf(mon, "unknown command '%s' (try 'help')\n", verb);
+        if (!mon_dev_dispatch(mon, verb, argbuf))       /* a device type's command */
+            mon_printf(mon, "unknown command '%s' (try 'help')\n", verb);
         return GEMU_MON_NONE;
     }
 
@@ -442,6 +494,8 @@ GemuMonCmd mon_dispatch(GemuMonitor *mon, const char *line) {
 
     const MonBinding *b = find_binding(mon, def);
     if (b) return b->fn(mon, argbuf, b->ud);
+    if (def->needs & NEED_MEM)
+        return run_mem_cmd(mon, def, argbuf);
     return def->builtin(mon, argbuf);
 }
 
@@ -621,6 +675,8 @@ static GemuMonCmd cmd_info(GemuMonitor *mon, const char *args) {
             return GEMU_MON_NONE;
         }
     }
+    if (mon_dev_info(mon, sub, args))                   /* qtree, mtree, a device */
+        return GEMU_MON_NONE;
     mon_printf(mon, "info: unknown subcommand '%s' (try 'help info')\n", sub);
     return GEMU_MON_NONE;
 }
@@ -660,6 +716,11 @@ static void print_help_row(GemuMonitor *mon, char mark, const char *syn,
         mon_printf(mon, "%c %-*s -- %s%s\n", mark, HELP_COL, syn, help, note);
 }
 
+/* print_help_row without a mark or note (for monitor_dev.c) */
+static void help_row(GemuMonitor *mon, const char *syn, const char *help) {
+    print_help_row(mon, ' ', syn, help, "");
+}
+
 static void print_help_line(GemuMonitor *mon, const MonCmdDef *def) {
     char syn[160];
     format_synopsis(def, syn, sizeof(syn));
@@ -697,6 +758,7 @@ static void help_command(GemuMonitor *mon, const MonCmdDef *def) {
                      info_cmds[i].aliases ? info_cmds[i].aliases : "");
             print_help_row(mon, ' ', name, info_cmds[i].help, "");
         }
+        mon_dev_info_help(mon, help_row);
     }
 }
 
@@ -707,7 +769,8 @@ static GemuMonCmd cmd_help(GemuMonitor *mon, const char *args) {
         if (strcasecmp(word, "all") != 0) {
             const MonCmdDef *def = find_def(word);
             if (def) help_command(mon, def);
-            else     mon_printf(mon, "help: unknown command '%s'\n", word);
+            else if (!mon_dev_help_command(mon, word))
+                mon_printf(mon, "help: unknown command '%s'\n", word);
             return GEMU_MON_NONE;
         }
         all = true;
@@ -739,6 +802,7 @@ static GemuMonCmd cmd_help(GemuMonitor *mon, const char *args) {
         format_synopsis(def, syn, sizeof(syn));
         print_help_row(mon, all && here ? '*' : ' ', syn, def->help, "");
     }
+    mon_dev_help(mon, help_row);
     if (!all)
         mon_printf(mon, "\n'help <command>' describes one; 'help all' lists every machine's.\n");
     return GEMU_MON_NONE;

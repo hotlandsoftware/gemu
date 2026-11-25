@@ -19,6 +19,9 @@
  * Machines provide implementations with gemu_monitor_bind() and a memory
  * view with gemu_monitor_set_memory(); anything a machine doesn't provide
  * reports "not supported on this machine" instead of "unknown command".
+ * Machines built on the core attach their device tree instead
+ * (gemu_monitor_attach_machine): their device types bring their own
+ * commands, which help lists while such a device is present.
  */
 
 typedef enum {
@@ -121,6 +124,24 @@ typedef struct GemuMonMemory {
 } GemuMonMemory;
 
 void         gemu_monitor_set_memory(GemuMonitor *mon, const GemuMonMemory *mem);
+
+/* ── Core machines (the gemu/dev/ headers) ──────────────────────────────────────────
+ *
+ * A machine built on the core attaches its tree (NULL detaches):
+ *   info qtree           the device tree
+ *   info mtree           every space's mappings and mirrors
+ *   info <path>          one device (its type's describe hook)
+ *   x/xp/peek/poke/memsave accept "space:addr" ("x /16xb io:0x3c0"); without
+ *                        a prefix they use the memory view set above, or
+ *                        default_space when there is none (NULL: no default)
+ *   device commands      each device type's own commands (GemuDeviceType
+ *                        .commands), listed by help; "@path" picks a device
+ *                        when there are several.  A command whose name the
+ *                        table above already has is refused (logged).
+ * Peeks go through gemu_space_peek8 (no side effects); pokes are writes. */
+typedef struct GemuMachine GemuMachine;
+void         gemu_monitor_attach_machine(GemuMonitor *mon, GemuMachine *m,
+                                         const char *default_space);
 
 bool         gemu_monitor_register_media(GemuMonitor *mon,
                                          const GemuMediaDevice *dev);
