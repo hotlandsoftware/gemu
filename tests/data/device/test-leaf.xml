@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<device name="test-leaf" description="A device-model test type">
+    <type symbol="test_leaf_type" source="tests/device.c"/>
+</device>

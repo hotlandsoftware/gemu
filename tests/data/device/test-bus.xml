@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- Device types defined by tests/device.c, for the device-model test's
+     type registry (configure: TEST_DEVICE_TYPE_XML).  Not in the emulator. -->
+<device name="test-bus" description="A device-model test type with children">
+    <type symbol="test_bus_type" source="tests/device.c"/>
+</device>

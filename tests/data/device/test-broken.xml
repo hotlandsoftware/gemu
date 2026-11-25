@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<device name="test-broken" description="A device-model test type whose init fails">
+    <type symbol="test_broken_type" source="tests/device.c"/>
+</device>
