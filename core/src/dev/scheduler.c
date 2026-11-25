@@ -1,22 +1,8 @@
 /* Time, timers and executors: see gemu/dev/scheduler.h. */
 #include "dev_priv.h"
+#include <inttypes.h>
 #include <stdlib.h>
-
-struct GemuTimer {
-    GemuMachine *m;
-    void       (*cb)(void *ud, int param);
-    void        *ud;
-    int          param;
-    bool         on;
-    GemuTime     deadline;
-    uint64_t     seq;
-    size_t       hidx;               /* in the heap, while on */
-    /* periodic: in picoseconds, or in cycles of hz from anchor */
-    GemuTime     period;
-    uint64_t     hz, k, period_cycles;
-    GemuTime     anchor;
-    GemuTimer   *next, *prev;        /* all timers */
-};
+#include <string.h>
 
 typedef unsigned __int128 u128;
 
@@ -165,6 +151,8 @@ GemuTimer *gemu_timer_new(GemuDevice *d, void (*cb)(void *ud, int param), void *
         return NULL;
     GemuSched *s = &d->machine->sched;
     t->m = d->machine;
+    t->owner = d;
+    t->index = d->core ? d->core->ntimers++ : 0;
     t->cb = cb;
     t->ud = ud;
     t->deadline = GEMU_TIME_NEVER;
@@ -258,6 +246,7 @@ GemuExecutor *gemu_executor_new(GemuDevice *d, uint64_t hz, const GemuExecutorOp
     GemuSched *s = &d->machine->sched;
     e->machine = d->machine;
     e->device = d;
+    e->index = d->core ? d->core->nexecs++ : 0;
     e->ops = *ops;
     e->ud = ud;
     e->hz = hz;
@@ -335,6 +324,7 @@ void gemu_machine_stop(GemuMachine *m) {
 bool gemu_machine_run_until(GemuMachine *m, GemuTime t) {
     GemuSched *s = &m->sched;
     s->stop = false;
+    s->in_run = true;
     fire_due(s);
     while (s->now < t && !s->stop) {
         GemuTime end = t;
@@ -370,6 +360,7 @@ bool gemu_machine_run_until(GemuMachine *m, GemuTime t) {
         s->cur = s->now;
         fire_due(s);
     }
+    s->in_run = false;
     return !s->stop;
 }
 
@@ -383,3 +374,161 @@ void gemu_sched_free_all(GemuMachine *m) {
     s->heap = NULL;
     s->nheap = s->cap = 0;
 }
+
+void gemu_sched_remove_device(GemuDevice *d) {
+    GemuSched *s = &d->machine->sched;
+    for (GemuTimer *t = s->timers, *n; t; t = n) {
+        n = t->next;
+        if (t->owner == d)
+            gemu_timer_free(t);
+    }
+    for (GemuExecutor *e = s->execs, *n; e; e = n) {
+        n = e->next;
+        if (e->device == d)
+            gemu_executor_free(e);
+    }
+}
+
+void gemu_sched_rebuild_heap(GemuMachine *m) {
+    GemuSched *s = &m->sched;
+    s->nheap = 0;
+    for (GemuTimer *t = s->timers; t; t = t->next)
+        if (t->on)
+            heap_push(s, t);
+}
+
+/* ── Save state ───────────────────────────────────────────────────────────── */
+
+void gemu_sched_state_save(GemuMachine *m, GemuStateWriter *w) {
+    GemuSched *s = &m->sched;
+    gemu_sw_u64(w, s->now);
+    gemu_sw_u64(w, s->seq);
+    uint64_t n = 0;
+    for (GemuTimer *t = s->timers; t; t = t->next)
+        n++;
+    gemu_sw_u64(w, n);
+    for (GemuTimer *t = s->timers; t; t = t->next) {
+        gemu_sw_str(w, t->owner->path);
+        gemu_sw_u64(w, t->index);
+        gemu_sw_u8(w, t->on);
+        gemu_sw_u64(w, t->deadline);
+        gemu_sw_u64(w, t->seq);
+        gemu_sw_u64(w, t->period);
+        gemu_sw_u64(w, t->hz);
+        gemu_sw_u64(w, t->k);
+        gemu_sw_u64(w, t->period_cycles);
+        gemu_sw_u64(w, t->anchor);
+        gemu_sw_u64(w, (uint64_t)(int64_t)t->param);
+    }
+    gemu_sw_u64(w, s->nexecs);
+    for (GemuExecutor *e = s->execs; e; e = e->next) {
+        gemu_sw_str(w, e->device->path);
+        gemu_sw_u64(w, e->index);
+        gemu_sw_u64(w, e->hz);
+        gemu_sw_u64(w, e->anchor);
+        gemu_sw_u64(w, e->cycles);
+        gemu_sw_u8(w, e->suspended);
+    }
+}
+
+static GemuTimer *find_timer(GemuSched *s, const char *path, uint64_t index) {
+    for (GemuTimer *t = s->timers; t; t = t->next)
+        if (t->index == index && !strcmp(t->owner->path, path))
+            return t;
+    return NULL;
+}
+
+static GemuExecutor *find_exec(GemuSched *s, const char *path, uint64_t index) {
+    for (GemuExecutor *e = s->execs; e; e = e->next)
+        if (e->index == index && !strcmp(e->device->path, path))
+            return e;
+    return NULL;
+}
+
+#define BAD() do { gemu_machine_set_error(m, "state: the scheduler section is damaged"); return false; } while (0)
+
+bool gemu_sched_state_load(GemuMachine *m, GemuStateReader *r, bool apply, unsigned epoch) {
+    GemuSched *s = &m->sched;
+    uint64_t now, seq, n;
+    if (!gemu_sr_u64(r, &now) || !gemu_sr_u64(r, &seq) || !gemu_sr_u64(r, &n))
+        BAD();
+    uint64_t live = 0;
+    for (GemuTimer *t = s->timers; t; t = t->next)
+        live++;
+    if (n != live) {
+        gemu_machine_set_error(m, "state: %" PRIu64 " timers saved, %" PRIu64 " in this machine",
+                               n, live);
+        return false;
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        char path[GEMU_DEVICE_PATH_MAX];
+        uint64_t index, deadline, tseq, period, hz, k, pc, anchor, param;
+        uint8_t on;
+        if (!gemu_sr_str(r, path, sizeof path) || !gemu_sr_u64(r, &index) || !gemu_sr_u8(r, &on) ||
+            !gemu_sr_u64(r, &deadline) || !gemu_sr_u64(r, &tseq) || !gemu_sr_u64(r, &period) ||
+            !gemu_sr_u64(r, &hz) || !gemu_sr_u64(r, &k) || !gemu_sr_u64(r, &pc) ||
+            !gemu_sr_u64(r, &anchor) || !gemu_sr_u64(r, &param))
+            BAD();
+        GemuTimer *t = find_timer(s, path, index);
+        if (!t) {
+            gemu_machine_set_error(m, "state: %s has no timer %" PRIu64 " here",
+                                   path[0] ? path : "(machine)", index);
+            return false;
+        }
+        if (!apply) {
+            if (t->load_mark == epoch)
+                BAD();                          /* saved twice */
+            t->load_mark = epoch;
+            continue;
+        }
+        t->on = on;
+        t->deadline = deadline;
+        t->seq = tseq;
+        t->period = period;
+        t->hz = hz;
+        t->k = k;
+        t->period_cycles = pc;
+        t->anchor = anchor;
+        t->param = (int)(int64_t)param;
+    }
+    if (!gemu_sr_u64(r, &n))
+        BAD();
+    if (n != s->nexecs) {
+        gemu_machine_set_error(m, "state: %" PRIu64 " executors saved, %u in this machine",
+                               n, s->nexecs);
+        return false;
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        char path[GEMU_DEVICE_PATH_MAX];
+        uint64_t index, hz, anchor, cycles;
+        uint8_t susp;
+        if (!gemu_sr_str(r, path, sizeof path) || !gemu_sr_u64(r, &index) || !gemu_sr_u64(r, &hz) ||
+            !gemu_sr_u64(r, &anchor) || !gemu_sr_u64(r, &cycles) || !gemu_sr_u8(r, &susp))
+            BAD();
+        GemuExecutor *e = find_exec(s, path, index);
+        if (!e || !hz) {
+            gemu_machine_set_error(m, "state: %s has no executor %" PRIu64 " here",
+                                   path[0] ? path : "(machine)", index);
+            return false;
+        }
+        if (!apply) {
+            if (e->load_mark == epoch)
+                BAD();
+            e->load_mark = epoch;
+            continue;
+        }
+        e->hz = hz;
+        e->anchor = anchor;
+        e->cycles = cycles;
+        e->suspended = susp;
+    }
+    if (r->left)
+        BAD();
+    if (apply) {
+        s->now = s->cur = now;
+        s->seq = seq;
+        gemu_sched_rebuild_heap(m);
+    }
+    return true;
+}
+#undef BAD

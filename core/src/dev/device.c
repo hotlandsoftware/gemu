@@ -27,6 +27,11 @@ GemuMachine *gemu_machine_new(const char *name) {
     m->root.machine = m;
     m->root.name = m->root.path;
     m->root.started = true;
+    if (!(m->root.core = calloc(1, sizeof *m->root.core))) {
+        free(m->name);
+        free(m);
+        return NULL;
+    }
     return m;
 }
 
@@ -38,6 +43,8 @@ void gemu_machine_free(GemuMachine *m) {
     gemu_lines_free_all(m);
     gemu_sched_free_all(m);
     gemu_space_free_all(m);
+    gemu_state_free_items(&m->root);
+    free(m->root.core);
     free(m->name);
     free(m);
 }
@@ -47,27 +54,53 @@ GemuDevice *gemu_machine_root(GemuMachine *m) { return &m->root; }
 bool gemu_machine_started(const GemuMachine *m) { return m->started; }
 const char *gemu_machine_error(const GemuMachine *m) { return m->error; }
 
+/* Run d's init and check it registered its save state (question 7: every
+ * device saves).  On failure the destroy hook undoes the init. */
+static bool init_device(GemuDevice *d) {
+    GemuMachine *m = d->machine;
+    if (d->type->init && !d->type->init(d)) {
+        if (!m->error[0])
+            gemu_machine_set_error(m, "%s: init failed", d->path);
+        return false;
+    }
+    if (d->core->state_error[0])
+        gemu_machine_set_error(m, "%s", d->core->state_error);
+    else if (!d->type->stateless && !d->core->nitems)
+        gemu_machine_set_error(m, "%s: %s registers no save state (and isn't marked stateless)",
+                               d->path, d->type->name);
+    else {
+        d->started = true;
+        return true;
+    }
+    if (d->type->destroy)
+        d->type->destroy(d);
+    return false;
+}
+
 /* Init d and then its children, in order. */
 static bool start_tree(GemuDevice *d) {
-    if (!d->started) {
-        if (d->type->init && !d->type->init(d)) {
-            if (!d->machine->error[0])
-                gemu_machine_set_error(d->machine, "%s: init failed", d->path);
-            return false;
-        }
-        d->started = true;
-    }
+    if (!d->started && !init_device(d))
+        return false;
     for (GemuDevice *c = d->first_child; c; c = c->next_sibling)
         if (!start_tree(c))
             return false;
     return true;
 }
 
-bool gemu_machine_start(GemuMachine *m) {
-    if (m->started)
+bool gemu_machine_init(GemuMachine *m) {
+    if (m->inited)
         return true;
     m->error[0] = 0;
     if (!start_tree(&m->root))
+        return false;
+    m->inited = true;
+    return true;
+}
+
+bool gemu_machine_start(GemuMachine *m) {
+    if (m->started)
+        return true;
+    if (!gemu_machine_init(m))
         return false;
     m->started = true;
     gemu_device_reset(&m->root, GEMU_RESET_POWER_ON);
@@ -106,7 +139,16 @@ static void unlink_device(GemuDevice *d) {
     d->next_sibling = d->prev_sibling = NULL;
 }
 
+/* Everything the core holds for d: its lines, timers, executors, state
+ * items and options; then d. */
 static void free_device(GemuDevice *d) {
+    if (d->core) {
+        gemu_lines_remove_device(d);
+        gemu_sched_remove_device(d);
+        gemu_state_free_items(d);
+        gemu_options_free(d);
+        free(d->core);
+    }
     free(d->priv);
     free(d->opts);
     free(d);
@@ -159,8 +201,12 @@ GemuDevice *gemu_device_add(GemuMachine *m, const GemuDeviceType *t,
         free(d);
         return NULL;
     }
-    if (opts && !(d->opts = strdup(opts))) {
+    if ((opts && !(d->opts = strdup(opts))) || !(d->core = calloc(1, sizeof *d->core))) {
         gemu_machine_set_error(m, "%s: out of memory", d->path);
+        free_device(d);
+        return NULL;
+    }
+    if (!gemu_options_parse(d, opts)) {
         free_device(d);
         return NULL;
     }
@@ -173,16 +219,14 @@ GemuDevice *gemu_device_add(GemuMachine *m, const GemuDeviceType *t,
     /* Hot-plug: a device added to a running machine (under a started
      * parent) starts now.  Under a parent that isn't started yet, it waits
      * for the parent. */
-    if (m->started && parent->started) {
-        if (t->init && !t->init(d)) {
-            if (!m->error[0])
-                gemu_machine_set_error(m, "%s: init failed", d->path);
+    if (m->inited && parent->started) {
+        if (!init_device(d)) {
             unlink_device(d);
             free_device(d);
             return NULL;
         }
-        d->started = true;
-        gemu_device_reset(d, GEMU_RESET_POWER_ON);
+        if (m->started)
+            gemu_device_reset(d, GEMU_RESET_POWER_ON);
     }
     return d;
 }
@@ -248,7 +292,6 @@ void gemu_device_destroy(GemuDevice *d) {
         gemu_device_destroy(d->last_child);
     if (d->started && d->type->destroy)
         d->type->destroy(d);
-    gemu_lines_remove_device(d);
     unlink_device(d);
     free_device(d);
 }

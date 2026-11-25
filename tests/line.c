@@ -25,7 +25,7 @@ static void self_release(void *ud, int idx, bool level) {
         gemu_line_set(self_out, false);
 }
 
-static const GemuDeviceType chip = { .name = "chip" };
+static const GemuDeviceType chip = { .name = "chip", .stateless = true };
 
 int main(void) {
     GemuMachine *m = gemu_machine_new("lines");

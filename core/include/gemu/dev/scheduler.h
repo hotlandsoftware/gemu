@@ -60,7 +60,8 @@ void gemu_machine_set_quantum(GemuMachine *m, GemuTime q);
 
 /* ── Timers ───────────────────────────────────────────────────────────────── */
 
-/* d: the owner (its machine's scheduler); the machine frees what's left. */
+/* d: the owner (its machine's scheduler); destroying d frees its timers
+ * (and executors); the machine frees what's left. */
 GemuTimer *gemu_timer_new(GemuDevice *d, void (*cb)(void *ud, int param), void *ud);
 void       gemu_timer_free(GemuTimer *t);
 /* First after delay from gemu_now(), then every period (0 = once). */
@@ -92,12 +93,14 @@ struct GemuExecutor {
     uint64_t         budget;      /* cycles allowed in the current run */
     GemuMachine     *machine;
     GemuDevice      *device;
+    unsigned         index;       /* the device's nth executor (its name in states) */
     GemuExecutorOps  ops;
     void            *ud;
     uint64_t         hz;
     GemuTime         anchor;      /* local time = anchor + gemu_clocks(hz, cycles) */
     uint64_t         cycles;      /* cycles since the anchor, up to the current run */
     bool             suspended, running;
+    unsigned         load_mark;   /* (state.c) */
     GemuExecutor    *next;
 };
 

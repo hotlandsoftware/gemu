@@ -9,10 +9,15 @@
  * Life cycle:
  *   gemu_machine_new()           an empty tree (the root has path "")
  *   gemu_device_add() ...        build the tree; nothing runs yet
- *   gemu_machine_start()         init every device, parents before children,
- *                                in the order they were added; then a
- *                                power-on reset
- *   gemu_device_add() later      (hot-plug) inits and resets that device now
+ *   gemu_machine_init()          init every device, parents before children,
+ *                                in the order they were added (each must
+ *                                register its save state or be stateless);
+ *                                they make their lines, timers, mappings
+ *   (connect lines here)
+ *   gemu_machine_start()         init if not done yet, then a power-on reset;
+ *                                line callbacks run from here on
+ *   gemu_device_add() later      (hot-plug) inits that device now, and
+ *                                resets it if the machine is started
  *   gemu_machine_reset(kind)     reset hooks, pre-order, then
  *                                reset_after_children, post-order
  *   gemu_device_destroy()        children first (last added first), then the
@@ -30,6 +35,8 @@
 typedef struct GemuMachine    GemuMachine;
 typedef struct GemuDevice     GemuDevice;
 typedef struct GemuDeviceType GemuDeviceType;
+typedef struct GemuOptionDef  GemuOptionDef;     /* gemu/dev/option.h */
+typedef struct GemuDeviceCore GemuDeviceCore;    /* the core's own per-device data */
 
 /* Power-on: everything to its initial state.  Hard: the reset line (RAM and
  * the like may survive).  Soft: a program-requested reset (a reset register,
@@ -44,12 +51,18 @@ struct GemuDeviceType {
     const char *name;      /* "i8259": the data/device XML name */
     const char *desc;
     size_t      size;      /* bytes of instance state (priv), zeroed; may be 0 */
+    const GemuOptionDef *options;   /* gemu/dev/option.h; NULL = none */
+    /* Has no state to save (a bus, a container).  Otherwise init must
+     * register its state (gemu/dev/state.h) or the machine won't start. */
+    bool        stateless;
     /* All hooks optional. */
     bool (*init)(GemuDevice *d);       /* false = fail (set gemu_device_error) */
     void (*reset)(GemuDevice *d, GemuResetKind kind);
     void (*reset_after_children)(GemuDevice *d, GemuResetKind kind);
     void (*destroy)(GemuDevice *d);    /* free what init made; priv is freed after */
     void (*describe)(GemuDevice *d, char *buf, size_t len);   /* monitor "info" */
+    void (*pre_save)(GemuDevice *d);   /* bring the registered state up to date */
+    void (*post_load)(GemuDevice *d);  /* rebuild what follows from it (mappings, pointers) */
 };
 
 #define GEMU_DEVICE_PATH_MAX 64
@@ -63,6 +76,7 @@ struct GemuDevice {
     const char  *name;              /* the last path component (points into path) */
     uint64_t     clock_hz;          /* 0 = the parent's (gemu_device_clock) */
     char        *opts;              /* the option string given to add, or NULL */
+    GemuDeviceCore *core;           /* parsed options, state items, ... */
     void        *priv;              /* type->size zeroed bytes, or NULL */
     bool         started;           /* init has run */
 };
@@ -73,6 +87,7 @@ GemuMachine *gemu_machine_new(const char *name);
 void         gemu_machine_free(GemuMachine *m);
 const char  *gemu_machine_name(const GemuMachine *m);
 GemuDevice  *gemu_machine_root(GemuMachine *m);
+bool         gemu_machine_init(GemuMachine *m);
 bool         gemu_machine_start(GemuMachine *m);
 bool         gemu_machine_started(const GemuMachine *m);
 void         gemu_machine_reset(GemuMachine *m, GemuResetKind kind);
@@ -82,7 +97,7 @@ const char  *gemu_machine_error(const GemuMachine *m);   /* "" when none */
 
 /* Add a device of type t called `name` under parent (NULL = the root).  The
  * name is one path component: letters, digits, '_', '-' and '.'.  opts is
- * kept as given (parsed in stage C5); NULL for none. */
+ * parsed against the type's options (gemu/dev/option.h); NULL for none. */
 GemuDevice *gemu_device_add(GemuMachine *m, const GemuDeviceType *t,
                             const char *name, GemuDevice *parent, const char *opts);
 /* The same, with the type looked up in the registry by name. */

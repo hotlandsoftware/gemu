@@ -1,5 +1,6 @@
 /* Lines: see gemu/dev/line.h. */
 #include "dev_priv.h"
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,7 @@ struct GemuLine {
     bool        level;
     Conn       *conns;
     GemuLine   *next;
+    unsigned    load_mark;
 };
 
 struct GemuLineIn {
@@ -275,4 +277,74 @@ void gemu_lines_free_all(GemuMachine *m) {
         ls->outs = l->next;
         free(l);
     }
+}
+
+/* ── Save state: the outputs' levels; inputs follow from them ─────────────── */
+
+void gemu_lines_state_save(GemuMachine *m, GemuStateWriter *w) {
+    uint64_t n = 0;
+    for (GemuLine *l = m->lines.outs; l; l = l->next)
+        n++;
+    gemu_sw_u64(w, n);
+    for (GemuLine *l = m->lines.outs; l; l = l->next) {
+        gemu_sw_str(w, l->dev->path);
+        gemu_sw_str(w, l->name);
+        gemu_sw_u8(w, l->level);
+    }
+}
+
+bool gemu_lines_state_load(GemuMachine *m, GemuStateReader *r, bool apply, unsigned epoch) {
+    uint64_t n, live = 0;
+    for (GemuLine *l = m->lines.outs; l; l = l->next)
+        live++;
+    if (!gemu_sr_u64(r, &n))
+        goto bad;
+    if (n != live) {
+        gemu_machine_set_error(m, "state: %" PRIu64 " line outputs saved, %" PRIu64 " in this machine",
+                               n, live);
+        return false;
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        char path[GEMU_DEVICE_PATH_MAX], name[32];
+        uint8_t level;
+        if (!gemu_sr_str(r, path, sizeof path) || !gemu_sr_str(r, name, sizeof name) ||
+            !gemu_sr_u8(r, &level))
+            goto bad;
+        GemuLine *l = NULL;
+        for (GemuLine *x = m->lines.outs; x; x = x->next)
+            if (!strcmp(x->name, name) && !strcmp(x->dev->path, path)) {
+                l = x;
+                break;
+            }
+        if (!l) {
+            gemu_machine_set_error(m, "state: %s has no line output %s here",
+                                   path[0] ? path : "(machine)", name);
+            return false;
+        }
+        if (!apply) {
+            if (l->load_mark == epoch)
+                goto bad;
+            l->load_mark = epoch;
+        } else {
+            l->level = level;
+        }
+    }
+    if (r->left)
+        goto bad;
+    if (apply) {
+        /* the inputs, from the outputs: quietly (the devices' own state
+         * already holds what they had latched) */
+        for (GemuLineIn *in = m->lines.ins; in; in = in->next) {
+            in->nasserted = 0;
+            for (Conn *c = in->conns; c; c = c->next_in) {
+                c->counted = conn_value(c);
+                in->nasserted += c->counted;
+            }
+            in->level = combined(in);
+        }
+    }
+    return true;
+bad:
+    gemu_machine_set_error(m, "state: the lines section is damaged");
+    return false;
 }
