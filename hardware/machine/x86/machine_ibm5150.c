@@ -1,4 +1,12 @@
 #include "ibm5150.h"
+#include "controller/i8237_dev.h"
+#include "controller/i8255_dev.h"
+#include "controller/i8259_dev.h"
+#include "serial/ins8250_dev.h"
+#include "storage/ibm_hdc_dev.h"
+#include "storage/upd765_dev.h"
+#include "timer/i8253_dev.h"
+#include "gemu/dev/state.h"
 #include "cgafont8x8.h"
 #include "mdafont8x14.h"
 #include "gemu/util.h"
@@ -202,8 +210,8 @@ static void iolog(Ibm5150State *s, uint16_t port, bool is_write, uint8_t val) {
 
 static void update_speaker(Ibm5150State *s) {
     if (!s->speaker) return;
-    const I8253Channel *c = &s->pit.ch[2];
-    bool on = (s->ppi.port_b & 0x03) == 0x03 && c->mode == 3 && c->counting;
+    const I8253Channel *c = &s->pit->ch[2];
+    bool on = (s->ppi->port_b & 0x03) == 0x03 && c->mode == 3 && c->counting;
     if (on) {
         unsigned div = c->reload ? c->reload : 0x10000u;
         rca_pcspk_set_freq(s->speaker, PIT_HZ / div);
@@ -214,11 +222,11 @@ static void update_speaker(Ibm5150State *s) {
 /* ── Keyboard ────────────────────────────────────────────────────────────── */
 
 static bool kb_enabled(const Ibm5150State *s) {
-    return !(s->ppi.port_b & 0x80) && (s->ppi.port_b & 0x40);
+    return !(s->ppi->port_b & 0x80) && (s->ppi->port_b & 0x40);
 }
 
 static void kb_update_irq(Ibm5150State *s) {
-    i8259_set_irq(&s->pic, 1, s->kb_full && !(s->ppi.port_b & 0x80));
+    gemu_line_set(s->kb_irq, s->kb_full && !(s->ppi->port_b & 0x80));
 }
 
 /* Shift the next byte into the PPI if the keyboard may send one. */
@@ -227,9 +235,9 @@ static void kb_service(Ibm5150State *s) {
     if (s->kb_reset_at) {
         if (s->cycles < s->kb_reset_at) return;
         s->kb_reset_at = 0;
-        s->ppi.kb_data = 0xAA;
+        s->ppi->kb_data = 0xAA;
     } else if (s->kbq_len > 0) {
-        s->ppi.kb_data = s->kbq[0];
+        s->ppi->kb_data = s->kbq[0];
         memmove(s->kbq, s->kbq + 1, (size_t)(s->kbq_len - 1));
         s->kbq_len--;
     } else {
@@ -250,70 +258,74 @@ static void kb_port_b_changed(Ibm5150State *s, uint8_t old, uint8_t val) {
     }
     if (val & 0x80) {                            /* clear: empty the shift register */
         s->kb_full = false;
-        s->ppi.kb_data = 0;
+        s->ppi->kb_data = 0;
     }
     kb_update_irq(s);
 }
 
 /* ── I/O ports ───────────────────────────────────────────────────────────── *
  *
- * The PC decodes A0-A9 only: 1024 ports.  ibm5150_io_map() lists what this
- * configuration has there, in priority order (the first range to claim a
- * port for reads, or for writes, gets it); io_build() turns that into a
- * handler per port and direction.  Ports nobody claims read $FF (the bus
- * floats high) and are logged once (iolog). */
+ * The PC decodes A0-A9 only: the "io" space mirrors 0-3FFh across all 64K.
+ * ibm5150_io_map() lists what this configuration has there, in priority
+ * order (the first range to claim a port for reads, or for writes, gets
+ * it); io_build() maps each range at a priority that keeps that order.
+ * The chips' ranges use their devices' handlers; the display adapters,
+ * the NMI mask and the empty slots are the machine's.  Ports nobody claims
+ * read $FF (the bus floats high) and are logged once (iolog). */
 
-typedef uint8_t (*IoRead)(Ibm5150State *s, uint16_t port);
-typedef void    (*IoWrite)(Ibm5150State *s, uint16_t port, uint8_t val);
-
-static uint8_t dma_rd(Ibm5150State *s, uint16_t p)            { return i8237_io_read(&s->dma, p); }
-static void    dma_wr(Ibm5150State *s, uint16_t p, uint8_t v) { i8237_io_write(&s->dma, p, v); }
-static uint8_t pic_rd(Ibm5150State *s, uint16_t p)            { return i8259_io_read(&s->pic, p); }
-static void    pic_wr(Ibm5150State *s, uint16_t p, uint8_t v) { i8259_io_write(&s->pic, p, v); }
-static uint8_t pit_rd(Ibm5150State *s, uint16_t p)            { return i8253_io_read(&s->pit, p); }
-static void    pit_wr(Ibm5150State *s, uint16_t p, uint8_t v) {
-    i8253_io_write(&s->pit, p, v);
-    update_speaker(s);
-}
-static uint8_t ppi_rd(Ibm5150State *s, uint16_t p)            { return i8255_io_read(&s->ppi, p); }
-/* Port B: PB0 gates PIT channel 2, PB0/PB1 the speaker, PB6/PB7 the
- * keyboard's clock and clear. */
-static void    ppi_wr(Ibm5150State *s, uint16_t p, uint8_t v) {
-    uint8_t old = s->ppi.port_b;
-    i8255_io_write(&s->ppi, p, v);
-    if ((p & 3) == 1) {
-        i8253_set_gate(&s->pit, 2, v & 0x01);
-        kb_port_b_changed(s, old, v);
-        update_speaker(s);
-    }
-}
-static uint8_t page_rd(Ibm5150State *s, uint16_t p)           { return i8237_page_read(&s->dma, p); }
-static void    page_wr(Ibm5150State *s, uint16_t p, uint8_t v) { i8237_page_write(&s->dma, p, v); }
-static void    nmi_wr(Ibm5150State *s, uint16_t p, uint8_t v) { (void)p; s->nmi_mask = v; }
-static uint8_t mda_rd(Ibm5150State *s, uint16_t p)            { return mda_io_read(&s->mda, p); }
-static void    mda_wr(Ibm5150State *s, uint16_t p, uint8_t v) { mda_io_write(&s->mda, p, v); }
-static uint8_t herc_rd(Ibm5150State *s, uint16_t p)           { return hercules_io_read(&s->herc, p); }
-static void    herc_wr(Ibm5150State *s, uint16_t p, uint8_t v) { hercules_io_write(&s->herc, p, v); }
-static uint8_t cga_rd(Ibm5150State *s, uint16_t p)            { return cga_io_read(&s->cga, p); }
-static void    cga_wr(Ibm5150State *s, uint16_t p, uint8_t v) { cga_io_write(&s->cga, p, v); }
-static uint8_t fdc_rd(Ibm5150State *s, uint16_t p)            { return upd765_read(&s->fdc, p); }
-static void    fdc_wr(Ibm5150State *s, uint16_t p, uint8_t v) { upd765_write(&s->fdc, p, v); }
-static uint8_t hdc_rd(Ibm5150State *s, uint16_t p)            { return ibm_hdc_read(&s->hdc, p - 0x320u); }
-static void    hdc_wr(Ibm5150State *s, uint16_t p, uint8_t v) { ibm_hdc_write(&s->hdc, p - 0x320u, v); }
-static uint8_t com1_rd(Ibm5150State *s, uint16_t p)           { return ins8250_read(&s->com[0], p & 7u); }
-static void    com1_wr(Ibm5150State *s, uint16_t p, uint8_t v) { ins8250_write(&s->com[0], p & 7u, v); }
-static uint8_t com2_rd(Ibm5150State *s, uint16_t p)           { return ins8250_read(&s->com[1], p & 7u); }
-static void    com2_wr(Ibm5150State *s, uint16_t p, uint8_t v) { ins8250_write(&s->com[1], p & 7u, v); }
+#define MS(ud) ((Ibm5150State *)(ud))
+static void    nmi_w(void *ud, uint64_t o, uint8_t v)  { (void)o; MS(ud)->nmi_mask = v; }
+static uint8_t mda_r(void *ud, uint64_t o)             { return mda_io_read(&MS(ud)->mda, (uint16_t)(0x3B0 + o)); }
+static void    mda_w(void *ud, uint64_t o, uint8_t v)  { mda_io_write(&MS(ud)->mda, (uint16_t)(0x3B0 + o), v); }
+static uint8_t herc_r(void *ud, uint64_t o)            { return hercules_io_read(&MS(ud)->herc, (uint16_t)(0x3B0 + o)); }
+static void    herc_w(void *ud, uint64_t o, uint8_t v) { hercules_io_write(&MS(ud)->herc, (uint16_t)(0x3B0 + o), v); }
+static uint8_t hcfg_r(void *ud, uint64_t o)            { return hercules_io_read(&MS(ud)->herc, (uint16_t)(0x3BF + o)); }
+static void    hcfg_w(void *ud, uint64_t o, uint8_t v) { hercules_io_write(&MS(ud)->herc, (uint16_t)(0x3BF + o), v); }
+static uint8_t cga_r(void *ud, uint64_t o)             { return cga_io_read(&MS(ud)->cga, (uint16_t)(0x3D0 + o)); }
+static void    cga_w(void *ud, uint64_t o, uint8_t v)  { cga_io_write(&MS(ud)->cga, (uint16_t)(0x3D0 + o), v); }
 /* Standard adapters this machine doesn't have: POST probes them all, so
  * the accesses are expected and not worth logging; the bus floats high. */
-static uint8_t empty_rd(Ibm5150State *s, uint16_t p)          { (void)s; (void)p; return 0xFF; }
-static void    empty_wr(Ibm5150State *s, uint16_t p, uint8_t v) { (void)s; (void)p; (void)v; }
+static uint8_t empty_r(void *ud, uint64_t o)           { (void)ud; (void)o; return 0xFF; }
+static void    empty_w(void *ud, uint64_t o, uint8_t v) { (void)ud; (void)o; (void)v; }
+static bool    empty_peek(void *ud, uint64_t o, uint8_t *v) { (void)ud; (void)o; *v = 0xFF; return true; }
+
+static const GemuHandlers nmi_io   = { .w8 = nmi_w };
+static const GemuHandlers mda_io   = { .r8 = mda_r, .w8 = mda_w };
+static const GemuHandlers herc_io  = { .r8 = herc_r, .w8 = herc_w };
+static const GemuHandlers hcfg_io  = { .r8 = hcfg_r, .w8 = hcfg_w };
+static const GemuHandlers cga_io   = { .r8 = cga_r, .w8 = cga_w };
+static const GemuHandlers empty_io = { .r8 = empty_r, .w8 = empty_w, .peek8 = empty_peek };
+
+/* What follows a write on the board, stacked (shared) after the chip's own
+ * handler so it sees the chip already updated: the speaker after PIT
+ * writes; the keyboard clock/clear and the speaker after port B.  (PB0's
+ * gate for PIT channel 2 is a line.) */
+static void pit_written(void *ud, uint64_t o, uint8_t v) { (void)o; (void)v; update_speaker(MS(ud)); }
+static void port_b_written(void *ud, uint64_t o, uint8_t v) {
+    Ibm5150State *s = ud;
+    (void)o;
+    uint8_t old = s->port_b;
+    s->port_b = v;
+    kb_port_b_changed(s, old, v);
+    update_speaker(s);
+}
+static const GemuHandlers pit_after  = { .w8 = pit_written };
+static const GemuHandlers ppib_after = { .w8 = port_b_written };
+
+static void io_unmapped_read(void *ud, uint64_t addr, unsigned n) {
+    (void)n;
+    iolog(ud, (uint16_t)(addr & 0x3FF), false, 0);
+}
+static void io_unmapped_write(void *ud, uint64_t addr, unsigned n, uint64_t v) {
+    (void)n;
+    iolog(ud, (uint16_t)(addr & 0x3FF), true, (uint8_t)v);
+}
 
 typedef struct {
-    uint16_t    lo, hi;
-    IoRead      read;      /* NULL: reads fall through to later ranges */
-    IoWrite     write;
-    const char *name;
+    uint16_t            lo, hi;
+    const GemuHandlers *h;
+    void               *ud;
+    const char         *name;
 } IoRange;
 
 #define IO_MAX_RANGES 32
@@ -321,64 +333,79 @@ typedef struct {
 /* This configuration's ports, highest priority first. */
 static int ibm5150_io_map(const Ibm5150State *s, IoRange *r) {
     int n = 0;
-#define RANGE(l, h, rd, wr, nm) (r[n++] = (IoRange){ (l), (h), (rd), (wr), (nm) })
-    RANGE(0x000, 0x00F, dma_rd,  dma_wr,  "8237 DMA");
-    RANGE(0x020, 0x021, pic_rd,  pic_wr,  "8259 PIC");
-    RANGE(0x040, 0x043, pit_rd,  pit_wr,  "8253 PIT");
-    RANGE(0x060, 0x063, ppi_rd,  ppi_wr,  "8255 PPI");
-    RANGE(0x080, 0x083, page_rd, page_wr, "DMA page registers");
-    RANGE(0x0A0, 0x0AF, NULL,    nmi_wr,  "NMI mask");
+    void *m = (void *)s;
+#define RANGE(l, h, hd, u, nm) (r[n++] = (IoRange){ (l), (h), (hd), (u), (nm) })
+    RANGE(0x000, 0x00F, &gemu_i8237_io,      s->dev_dma, "8237 DMA");
+    RANGE(0x020, 0x021, &gemu_i8259_io,      s->dev_pic, "8259 PIC");
+    RANGE(0x040, 0x043, &gemu_i8253_io,      s->dev_pit, "8253 PIT");
+    RANGE(0x060, 0x063, &gemu_i8255_io,      s->dev_ppi, "8255 PPI");
+    RANGE(0x080, 0x083, &gemu_i8237_page_io, s->dev_dma, "DMA page registers");
+    RANGE(0x0A0, 0x0AF, &nmi_io,             m,          "NMI mask");
     /* MDA 3B0-3BB (3BC- is its printer port); Hercules adds 3BF */
-    if (s->has_mda)    RANGE(0x3B0, 0x3BB, mda_rd,  mda_wr,  "MDA");
-    if (s->has_herc) { RANGE(0x3B0, 0x3BB, herc_rd, herc_wr, "Hercules");
-                       RANGE(0x3BF, 0x3BF, herc_rd, herc_wr, "Hercules configuration"); }
-    if (s->has_cga)    RANGE(0x3D0, 0x3DF, cga_rd,  cga_wr,  "CGA");
-    if (s->has_fdc)    RANGE(0x3F0, 0x3F7, fdc_rd,  fdc_wr,  "diskette adapter (765)");
-    if (s->has_hdc)    RANGE(0x320, 0x323, hdc_rd,  hdc_wr,  "fixed disk adapter");
-    if (s->has_com[0]) RANGE(0x3F8, 0x3FF, com1_rd, com1_wr, "COM1 (8250)");
-    if (s->has_com[1]) RANGE(0x2F8, 0x2FF, com2_rd, com2_wr, "COM2 (8250)");
-    RANGE(0x200, 0x20F, empty_rd, empty_wr, "game port (empty)");
-    RANGE(0x210, 0x217, empty_rd, empty_wr, "expansion unit (empty)");
-    RANGE(0x320, 0x32F, empty_rd, empty_wr, "fixed disk adapters (empty)");
-    RANGE(0x278, 0x27F, empty_rd, empty_wr, "LPT2 (empty)");
-    RANGE(0x2F8, 0x2FF, empty_rd, empty_wr, "COM2 (empty)");
-    RANGE(0x378, 0x37F, empty_rd, empty_wr, "LPT1 (empty)");
-    RANGE(0x3B0, 0x3BF, empty_rd, empty_wr, "MDA and its printer port (empty)");
-    RANGE(0x3D0, 0x3DF, empty_rd, empty_wr, "CGA (empty)");
-    RANGE(0x3F0, 0x3F7, empty_rd, empty_wr, "diskette adapter (empty)");
-    RANGE(0x3F8, 0x3FF, empty_rd, empty_wr, "COM1 (empty)");
+    if (s->has_mda)    RANGE(0x3B0, 0x3BB, &mda_io,  m, "MDA");
+    if (s->has_herc) { RANGE(0x3B0, 0x3BB, &herc_io, m, "Hercules");
+                       RANGE(0x3BF, 0x3BF, &hcfg_io, m, "Hercules configuration"); }
+    if (s->has_cga)    RANGE(0x3D0, 0x3DF, &cga_io,  m, "CGA");
+    if (s->has_fdc)    RANGE(0x3F0, 0x3F7, &gemu_upd765_io,  s->dev_fdc, "diskette adapter (765)");
+    if (s->has_hdc)    RANGE(0x320, 0x323, &gemu_ibm_hdc_io, s->dev_hdc, "fixed disk adapter");
+    if (s->has_com[0]) RANGE(0x3F8, 0x3FF, &gemu_ins8250_io, s->dev_com[0], "COM1 (8250)");
+    if (s->has_com[1]) RANGE(0x2F8, 0x2FF, &gemu_ins8250_io, s->dev_com[1], "COM2 (8250)");
+    RANGE(0x200, 0x20F, &empty_io, m, "game port (empty)");
+    RANGE(0x210, 0x217, &empty_io, m, "expansion unit (empty)");
+    RANGE(0x320, 0x32F, &empty_io, m, "fixed disk adapters (empty)");
+    RANGE(0x278, 0x27F, &empty_io, m, "LPT2 (empty)");
+    RANGE(0x2F8, 0x2FF, &empty_io, m, "COM2 (empty)");
+    RANGE(0x378, 0x37F, &empty_io, m, "LPT1 (empty)");
+    RANGE(0x3B0, 0x3BF, &empty_io, m, "MDA and its printer port (empty)");
+    RANGE(0x3D0, 0x3DF, &empty_io, m, "CGA (empty)");
+    RANGE(0x3F0, 0x3F7, &empty_io, m, "diskette adapter (empty)");
+    RANGE(0x3F8, 0x3FF, &empty_io, m, "COM1 (empty)");
 #undef RANGE
     return n;
 }
 
-/* Fill the per-port tables: each port's first claimant, per direction. */
-static void io_build(Ibm5150State *s) {
+static bool reads(const GemuHandlers *h)  { return h->r8 != NULL; }
+static bool writes(const GemuHandlers *h) { return h->w8 != NULL; }
+
+/* Map every range: earlier ranges get higher priorities, so they win. */
+static bool io_build(Ibm5150State *s) {
     IoRange r[IO_MAX_RANGES];
     int n = ibm5150_io_map(s, r);
-    memset(s->io_rd, 0, sizeof(s->io_rd));
-    memset(s->io_wr, 0, sizeof(s->io_wr));
-    for (int i = n - 1; i >= 0; i--)          /* last first, so earlier ranges win */
-        for (unsigned p = r[i].lo; p <= r[i].hi; p++) {
-            if (r[i].read)  s->io_rd[p] = r[i].read;
-            if (r[i].write) s->io_wr[p] = r[i].write;
-        }
+    for (int i = 0; i < n; i++) {
+        GemuMapping *mp = gemu_space_map(s->io, r[i].lo, (uint64_t)(r[i].hi - r[i].lo + 1),
+                                         r[i].h, r[i].ud, n - i, 0);
+        if (!mp) return false;
+        gemu_mapping_set_name(mp, r[i].name);
+        /* the board's reactions, at the chip's priority, after it */
+        GemuMapping *after = NULL;
+        if (r[i].h == &gemu_i8253_io &&
+            !(after = gemu_space_map(s->io, 0x040, 4, &pit_after, s, n - i, GEMU_MAP_SHARED)))
+            return false;
+        if (r[i].h == &gemu_i8255_io &&
+            !(after = gemu_space_map(s->io, 0x061, 1, &ppib_after, s, n - i, GEMU_MAP_SHARED)))
+            return false;
+        if (after)
+            gemu_mapping_set_name(after, r[i].h == &gemu_i8253_io ? "speaker (after PIT writes)"
+                                                                 : "keyboard, speaker (after port B)");
+    }
+    gemu_space_set_unmapped(s->io, 0xFF, io_unmapped_read, io_unmapped_write, s);
+    return gemu_space_mirror(s->io, 0, 0x10000, 0x3FF);
 }
 
 static uint8_t io_read8(uint16_t port, void *ud) {
-    Ibm5150State *s = ud;
-    port &= 0x3FF;   /* the PC decodes only A0-A9 */
-    IoRead rd = s->io_rd[port];
-    if (rd) return rd(s, port);
-    iolog(s, port, false, 0);
-    return 0xFF;
+    return gemu_space_read8(((Ibm5150State *)ud)->io, port);
 }
 
 static void io_write8(uint16_t port, uint8_t val, void *ud) {
-    Ibm5150State *s = ud;
-    port &= 0x3FF;
-    IoWrite wr = s->io_wr[port];
-    if (wr) { wr(s, port, val); return; }
-    iolog(s, port, true, val);
+    gemu_space_write8(((Ibm5150State *)ud)->io, port, val);
+}
+
+/* The range that gets port p's reads (or writes): the first that has it. */
+static int io_owner(const IoRange *r, int n, unsigned p, bool write) {
+    for (int i = 0; i < n; i++)
+        if (p >= r[i].lo && p <= r[i].hi && (write ? writes(r[i].h) : reads(r[i].h)))
+            return i;
+    return -1;
 }
 
 /* ioports: the port map, as the CPU sees it now - each range's ports that
@@ -393,10 +420,9 @@ static GemuMonCmd ibm5150_cmd_ioports(GemuMonitor *mon, const char *args, void *
     for (int i = 0; i < n; i++) {
         int start = -1;
         for (unsigned p = r[i].lo; p <= (unsigned)r[i].hi + 1u; p++) {
-            /* no two ranges with the same handlers overlap */
             bool owned = p <= r[i].hi &&
-                         ((r[i].read && s->io_rd[p] == r[i].read) ||
-                          (r[i].write && s->io_wr[p] == r[i].write));
+                         ((reads(r[i].h) && io_owner(r, n, p, false) == i) ||
+                          (writes(r[i].h) && io_owner(r, n, p, true) == i));
             if (owned && start < 0) start = (int)p;
             if (!owned && start >= 0) {
                 span[n_span++] = (typeof(span[0])){ (uint16_t)start, (uint16_t)(p - 1u), i };
@@ -411,83 +437,27 @@ static GemuMonCmd ibm5150_cmd_ioports(GemuMonitor *mon, const char *args, void *
     for (int i = 0; i < n_span; i++) {
         const IoRange *q = &r[span[i].range];
         gemu_monitor_printf(mon, "  %03X-%03X  %s%s\n", span[i].lo, span[i].hi, q->name,
-                            !q->read ? " (write only)" : "");
+                            !reads(q->h) ? " (write only)" : "");
     }
     gemu_monitor_printf(mon, "  (anything else reads FF and is logged as unhandled)\n");
     return GEMU_MON_NONE;
 }
 
-/* ── Diskette adapter wiring: IRQ6, DMA channel 2 ────────────────────────── */
-
-static void fdc_set_irq(void *ud, bool level) {
-    Ibm5150State *s = ud;
-    i8259_set_irq(&s->pic, 6, level);
-}
-
-static bool fdc_dma_from_mem(void *ud, uint8_t *val, bool *tc) {
-    Ibm5150State *s = ud;
-    uint32_t phys;
-    if (!i8237_transfer(&s->dma, 2, &phys, tc)) return false;
-    *val = bus_read8(phys, s);
-    return true;
-}
-
-static bool fdc_dma_to_mem(void *ud, uint8_t val, bool *tc) {
-    Ibm5150State *s = ud;
-    uint32_t phys;
-    if (!i8237_transfer(&s->dma, 2, &phys, tc)) return false;
-    bus_write8(phys, val, s);
-    return true;
-}
-
-/* ── Fixed disk adapter wiring: IRQ5, DMA channel 3 ──────────────────────── */
-
-static void hdc_set_irq(void *ud, bool level) {
-    Ibm5150State *s = ud;
-    i8259_set_irq(&s->pic, s->hdc_irq, level);
-}
-
-static bool hdc_dma_from_mem(void *ud, uint8_t *val, bool *tc) {
-    Ibm5150State *s = ud;
-    uint32_t phys;
-    if (!i8237_transfer(&s->dma, 3, &phys, tc)) return false;
-    *val = bus_read8(phys, s);
-    return true;
-}
-
-static bool hdc_dma_to_mem(void *ud, uint8_t val, bool *tc) {
-    Ibm5150State *s = ud;
-    uint32_t phys;
-    if (!i8237_transfer(&s->dma, 3, &phys, tc)) return false;
-    bus_write8(phys, val, s);
-    return true;
-}
-
-/* ── Asynchronous communications adapters: COM1 on IRQ4, COM2 on IRQ3 ───── */
-
-static void com1_set_irq(void *ud, bool level) {
-    Ibm5150State *s = ud;
-    i8259_set_irq(&s->pic, 4, level);
-}
-
-static void com2_set_irq(void *ud, bool level) {
-    Ibm5150State *s = ud;
-    i8259_set_irq(&s->pic, 3, level);
-}
+/* ── Adapters' wiring ─────────────────────────────────────────────────────── *
+ *
+ * The diskette adapter is IRQ 6 / DMA 2, the fixed disk adapter IRQ 5 (or 2)
+ * / DMA 3, COM1 IRQ 4 and COM2 IRQ 3: lines and DMA channels set up in
+ * build_board().  Here only which adapters there are. */
 
 static void attach_com(Ibm5150State *s, int n) {
-    Ins8250 *u = &s->com[n];
-    u->clock_hz = IBM5150_CPU_HZ;
-    u->set_irq = n == 0 ? com1_set_irq : com2_set_irq;
-    u->ud = s;
     s->has_com[n] = true;
 }
 
-/* -device msmouse: the mouse and the serial adapter it plugs into. */
+/* -device msmouse: the mouse and the serial adapter it plugs into (once
+ * the adapter's device exists: see build_board()). */
 static void attach_mouse(Ibm5150State *s, int com) {
-    attach_com(s, com - 1);
     msmouse_init(&s->mouse, IBM5150_CPU_HZ);
-    Ins8250 *u = &s->com[com - 1];
+    Ins8250 *u = s->com[com - 1];
     u->dev = &s->mouse;
     u->dev_lines = msmouse_lines;
     u->dev_rx = msmouse_rx;
@@ -520,23 +490,12 @@ static GemuMonCmd ibm5150_cmd_mouse_button(GemuMonitor *mon, const char *args, v
 
 static bool cpu_intr_pending(void *ud) {
     Ibm5150State *s = ud;
-    return i8259_intr(&s->pic);
+    return i8259_intr(s->pic);
 }
 
 static uint8_t cpu_intr_ack(void *ud) {
     Ibm5150State *s = ud;
-    return i8259_ack(&s->pic);
-}
-
-/* PIT outputs: channel 0 is IRQ0, channel 1 requests a DRAM refresh cycle
- * on DMA channel 0, channel 2 feeds the speaker and PPI port C bit 5. */
-static void pit_out_changed(void *ud, unsigned ch, bool level) {
-    Ibm5150State *s = ud;
-    switch (ch) {
-    case 0: i8259_set_irq(&s->pic, 0, level); break;
-    case 1: if (level) i8237_refresh(&s->dma); break;
-    case 2: s->ppi.timer2_out = level; break;
-    }
+    return gemu_i8259_ack(s->dev_pic);
 }
 
 static void on_unknown_opcode(X86Cpu *cpu, uint8_t opcode, void *ud) {
@@ -559,15 +518,15 @@ static bool advance(Ibm5150State *s, unsigned clocks) {
     s->cycles += clocks;
     s->pit_phase += clocks;
     if (s->pit_phase >= 4) {
-        i8253_tick(&s->pit, s->pit_phase / 4);
+        i8253_tick(s->pit, s->pit_phase / 4);
         s->pit_phase %= 4;
     }
     kb_service(s);
-    if (s->has_fdc) upd765_tick(&s->fdc, clocks);
-    if (s->has_hdc) ibm_hdc_tick(&s->hdc, clocks);
+    if (s->has_fdc) upd765_tick(s->fdc, clocks);
+    if (s->has_hdc) ibm_hdc_tick(s->hdc, clocks);
     if (s->has_mouse) msmouse_tick(&s->mouse, clocks);
     for (int i = 0; i < 2; i++)
-        if (s->has_com[i]) ins8250_tick(&s->com[i], clocks);
+        if (s->has_com[i]) ins8250_tick(s->com[i], clocks);
     return video_tick(s, clocks);
 }
 
@@ -734,9 +693,9 @@ static uint32_t configure_switches(Ibm5150State *s, uint32_t ram) {
     uint32_t planar = kb >= 64 ? 64 : (kb < 16 ? 16 : kb / 16 * 16);
     uint32_t blocks = kb > 64 ? (kb - 64) / 32 : 0;
     if (blocks > 15) blocks = 15;
-    s->ppi.sw1 = (uint8_t)(((planar / 16 - 1) << 2) |
-                           (x86_vga_mono(s->vga) ? 0x30 : 0x20));   /* mono / 80x25 color */
-    s->ppi.sw2 = (uint8_t)blocks;
+    s->sw1 = (uint8_t)(((planar / 16 - 1) << 2) |
+                       (x86_vga_mono(s->vga) ? 0x30 : 0x20));   /* mono / 80x25 color */
+    s->sw2 = (uint8_t)blocks;
     return (planar + blocks * 32) << 10;
 }
 
@@ -802,24 +761,20 @@ static bool parse_switches(const char *opts, Switches *sw) {
 static void attach_floppies(Ibm5150State *s, int want) {
     int count = 0;
     for (int u = 0; u < 4; u++) {
-        s->fdc.drive[u] = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, u);
+        s->floppy[u] = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, u);
         /* floppies=N: the drives it counts are there, empty if not given */
-        if (!s->fdc.drive[u] && u < want) {
+        if (!s->floppy[u] && u < want) {
             char opts[32];
             snprintf(opts, sizeof(opts), "if=floppy,index=%d", u);
-            if (gemu_drive_add(opts)) s->fdc.drive[u] = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, u);
+            if (gemu_drive_add(opts)) s->floppy[u] = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, u);
         }
-        if (s->fdc.drive[u]) count = u + 1;
+        if (s->floppy[u]) count = u + 1;
     }
-    if (!count && (s->fdc.drive[0] = gemu_drive_add_default(GEMU_DRIVE_IF_FLOPPY, 0)))
+    if (!count && (s->floppy[0] = gemu_drive_add_default(GEMU_DRIVE_IF_FLOPPY, 0)))
         count = 1;
     if (!count) return;
     s->has_fdc = true;
-    s->fdc.set_irq = fdc_set_irq;
-    s->fdc.dma_from_mem = fdc_dma_from_mem;
-    s->fdc.dma_to_mem = fdc_dma_to_mem;
-    s->fdc.ud = s;
-    s->ppi.sw1 = (uint8_t)(s->ppi.sw1 | 0x01 | ((count - 1) << 6));
+    s->sw1 = (uint8_t)(s->sw1 | 0x01 | ((count - 1) << 6));
 }
 
 /* BIOSes from before 10/27/82 don't look for adapter ROMs, so the fixed
@@ -910,7 +865,7 @@ static bool attach_fixed_disk(Ibm5150State *s, const X86Config *cfg, const char 
         return false;
     }
 
-    IbmHdc *h = &s->hdc;
+    IbmHdc *h = s->hdc;
     for (int u = 0; u < 2; u++) {
         GemuDrive *d = gemu_drive_get(GEMU_DRIVE_IF_IDE, 0, u);
         if (!d) continue;
@@ -950,36 +905,181 @@ static bool attach_fixed_disk(Ibm5150State *s, const X86Config *cfg, const char 
      * ROM's table - they're what the drive jumpers select. */
     s->hdc_rom_mapped = rom_on ? s->hdc_rom_size : 0;
     h->clock_hz = IBM5150_CPU_HZ;
-    h->set_irq = hdc_set_irq;
-    h->dma_to_mem = hdc_dma_to_mem;
-    h->dma_from_mem = hdc_dma_from_mem;
-    h->ud = s;
-    s->has_hdc = true;
     warn_old_bios(s);
+    return true;
+}
+
+/* ── The board as core devices ───────────────────────────────────────────── *
+ *
+ *   board            the motherboard: CPU clock bookkeeping, the NMI mask
+ *     dma pic pit ppi   the chips (i8237, i8259, i8253, i8255-pc)
+ *     kbd            the keyboard interface: the scan code queue, IRQ 1
+ *   isa              the expansion slots
+ *     fdc hdc com1 com2 the adapters this configuration has
+ *
+ * Wired as the 5150 is: PIT 0 -> IRQ 0, PIT 1 -> DMA refresh, PIT 2 -> PPI
+ * PC5, PPI PB0 -> PIT gate 2; keyboard IRQ 1, COM2 3, COM1 4, fixed disk 5
+ * (or 2), diskette 6; DMA 2 diskette, 3 fixed disk.  Device resets run in
+ * that order: the chips, then the adapters, as the machine always did. */
+
+static Ibm5150State *machine_of(GemuDevice *d) { return *(Ibm5150State **)d->priv; }
+
+static bool board_init(GemuDevice *d) {
+    Ibm5150State *s = machine_of(d);
+    GEMU_STATE_VAR(d, "cycles", s->cycles);
+    GEMU_STATE_VAR(d, "pit_phase", s->pit_phase);
+    GEMU_STATE_VAR(d, "nmi_mask", s->nmi_mask);
+    return true;
+}
+static void board_reset(GemuDevice *d, GemuResetKind kind) {
+    (void)kind;
+    Ibm5150State *s = machine_of(d);
+    s->nmi_mask = 0;
+    s->pit_phase = 0;
+}
+static const GemuDeviceType board_type = {
+    .name = "ibm5150-board", .desc = "IBM 5150 system board", .size = sizeof(Ibm5150State *),
+    .init = board_init, .reset = board_reset,
+};
+
+static bool kbd_init(GemuDevice *d) {
+    Ibm5150State *s = machine_of(d);
+    if (!(s->kb_irq = gemu_line_out(d, "irq"))) return false;
+    GEMU_STATE_ARRAY(d, "queue", s->kbq);
+    GEMU_STATE_VAR(d, "queued", s->kbq_len);
+    GEMU_STATE_VAR(d, "full", s->kb_full);
+    GEMU_STATE_VAR(d, "clock_low_at", s->kb_clock_low_at);
+    GEMU_STATE_VAR(d, "reset_at", s->kb_reset_at);
+    GEMU_STATE_VAR(d, "next_at", s->kb_next_at);
+    GEMU_STATE_VAR(d, "port_b", s->port_b);
+    return true;
+}
+/* After the PPI's reset (it's later in the tree): port B is 0 again. */
+static void kbd_reset(GemuDevice *d, GemuResetKind kind) {
+    (void)kind;
+    Ibm5150State *s = machine_of(d);
+    s->kbq_len = 0;
+    s->kb_full = false;
+    s->kb_reset_at = s->kb_next_at = 0;
+    s->port_b = s->ppi->port_b;
+    kb_update_irq(s);
+}
+static const GemuDeviceType kbd_type = {
+    .name = "ibm5150-keyboard", .desc = "IBM 5150 keyboard interface (scan codes into the PPI, IRQ 1)",
+    .size = sizeof(Ibm5150State *), .init = kbd_init, .reset = kbd_reset,
+};
+
+static const GemuDeviceType isa_type = {
+    .name = "isa", .desc = "ISA expansion slots", .stateless = true,
+};
+
+/* DMA sees the CPU's memory bus. */
+static uint8_t bus_r(void *ud, uint64_t a)            { return bus_read8((uint32_t)a, ud); }
+static void    bus_w(void *ud, uint64_t a, uint8_t v) { bus_write8((uint32_t)a, v, ud); }
+static bool    bus_peek(void *ud, uint64_t a, uint8_t *v) { return ibm5150_mon_read(ud, a, v); }
+static const GemuHandlers bus_io = { .r8 = bus_r, .w8 = bus_w, .peek8 = bus_peek };
+
+static GemuDevice *add_dev(Ibm5150State *s, const char *type, const char *name,
+                           GemuDevice *parent, const char *opts) {
+    GemuDevice *d = gemu_device_add_type(s->machine, type, name, parent, opts);
+    if (!d) fprintf(stderr, "gemu: ibm5150: %s\n", gemu_machine_error(s->machine));
+    return d;
+}
+
+static GemuDevice *add_own(Ibm5150State *s, const GemuDeviceType *t, const char *name,
+                           GemuDevice *parent) {
+    GemuDevice *d = gemu_device_add(s->machine, t, name, parent, NULL);
+    if (!d) fprintf(stderr, "gemu: ibm5150: %s\n", gemu_machine_error(s->machine));
+    else if (t->size) *(Ibm5150State **)d->priv = s;
+    return d;
+}
+
+/* The devices and spaces for this configuration, up to the point where the
+ * adapters can be given their drives (then wire_board()). */
+static bool build_board(Ibm5150State *s) {
+    GemuMachine *m = s->machine = gemu_machine_new("ibm5150");
+    if (!m) return false;
+    s->io = gemu_space_new(m, "io", 16, 8, GEMU_LITTLE_ENDIAN);
+    s->bus = gemu_space_new(m, "program", 20, 8, GEMU_LITTLE_ENDIAN);
+    if (!s->io || !s->bus || !gemu_space_map(s->bus, 0, 0x100000, &bus_io, s, 0, 0))
+        return false;
+
+    char sw[48], clock[32];
+    snprintf(sw, sizeof(sw), "sw1=%u,sw2=%u", s->sw1, s->sw2);
+    snprintf(clock, sizeof(clock), "clock=%u", IBM5150_CPU_HZ);
+    GemuDevice *board = add_own(s, &board_type, "board", NULL);
+    if (!board ||
+        !(s->dev_dma = add_dev(s, "i8237", "dma", board, "space=program")) ||
+        !(s->dev_pic = add_dev(s, "i8259", "pic", board, NULL)) ||
+        !(s->dev_pit = add_dev(s, "i8253", "pit", board, NULL)) ||
+        !(s->dev_ppi = add_dev(s, "i8255-pc", "ppi", board, sw)) ||
+        !(s->dev_kbd = add_own(s, &kbd_type, "kbd", board)))
+        return false;
+    gemu_device_set_clock(board, IBM5150_CPU_HZ);
+    gemu_device_set_clock(s->dev_pit, PIT_HZ);
+    GemuDevice *isa = add_own(s, &isa_type, "isa", NULL);
+    if (!isa) return false;
+    if (s->has_fdc && !(s->dev_fdc = add_dev(s, "upd765", "fdc", isa, NULL))) return false;
+    if (s->has_hdc && !(s->dev_hdc = add_dev(s, "ibm-fixed-disk", "hdc", isa, NULL))) return false;
+    for (int i = 0; i < 2; i++)
+        if (s->has_com[i] &&
+            !(s->dev_com[i] = add_dev(s, "ins8250", i == 0 ? "com1" : "com2", isa, clock)))
+            return false;
+    if (!gemu_machine_init(m)) {
+        fprintf(stderr, "gemu: ibm5150: %s\n", gemu_machine_error(m));
+        return false;
+    }
+    s->dma = gemu_i8237(s->dev_dma);
+    s->pic = gemu_i8259(s->dev_pic);
+    s->pit = gemu_i8253(s->dev_pit);
+    s->ppi = gemu_i8255(s->dev_ppi);
+    if (s->has_fdc) {
+        s->fdc = gemu_upd765(s->dev_fdc);
+        for (int u = 0; u < 4; u++) s->fdc->drive[u] = s->floppy[u];
+    }
+    if (s->has_hdc) s->hdc = gemu_ibm_hdc(s->dev_hdc);
+    for (int i = 0; i < 2; i++)
+        if (s->has_com[i]) s->com[i] = gemu_ins8250(s->dev_com[i]);
+    return true;
+}
+
+/* Ports, lines and DMA channels; then the power-on reset. */
+static bool wire_board(Ibm5150State *s) {
+    GemuMachine *m = s->machine;
+    if (!io_build(s)) return false;
+    char hdc_irq[32];
+    snprintf(hdc_irq, sizeof(hdc_irq), "board/pic:ir%u", s->hdc_irq);
+    struct { const char *out, *in; bool want; } w[] = {
+        { "board/pit:out0", "board/pic:ir0",   true },
+        { "board/pit:out1", "board/dma:dreq0", true },
+        { "board/pit:out2", "board/ppi:pc5",   true },
+        { "board/ppi:pb0",  "board/pit:gate2", true },
+        { "board/kbd:irq",  "board/pic:ir1",   true },
+        { "isa/com2:int",   "board/pic:ir3",   s->has_com[1] },
+        { "isa/com1:int",   "board/pic:ir4",   s->has_com[0] },
+        { "isa/hdc:int",    hdc_irq,           s->has_hdc },
+        { "isa/fdc:int",    "board/pic:ir6",   s->has_fdc },
+    };
+    for (size_t i = 0; i < sizeof(w) / sizeof(w[0]); i++)
+        if (w[i].want && !gemu_lines_connect(m, w[i].out, w[i].in, 0)) {
+            fprintf(stderr, "gemu: ibm5150: %s\n", gemu_machine_error(m));
+            return false;
+        }
+    if (s->has_fdc) gemu_upd765_set_dma(s->dev_fdc, s->dev_dma, 2);
+    if (s->has_hdc) gemu_ibm_hdc_set_dma(s->dev_hdc, s->dev_dma, 3);
+    if (!gemu_machine_start(m)) {
+        fprintf(stderr, "gemu: ibm5150: %s\n", gemu_machine_error(m));
+        return false;
+    }
     return true;
 }
 
 static void ibm5150_reset(Ibm5150State *s) {
     x86_reset(&s->cpu);
-    i8237_reset(&s->dma);
-    i8259_reset(&s->pic);
-    i8253_reset(&s->pit);
-    i8255_reset(&s->ppi);
+    gemu_machine_reset(s->machine, GEMU_RESET_HARD);   /* the chips and adapters */
     cga_reset(&s->cga);
     mda_reset(&s->mda);
     hercules_reset(&s->herc);
-    if (s->has_fdc) { s->fdc.dor = 0; upd765_reset(&s->fdc); }
-    if (s->has_hdc) ibm_hdc_reset(&s->hdc);
-    for (int i = 0; i < 2; i++)
-        if (s->has_com[i]) ins8250_reset(&s->com[i]);
-    /* The PIT's outputs start high without a change callback; the PPI's
-     * copy of timer 2 must match or POST's cassette test misses an edge. */
-    s->ppi.timer2_out = i8253_out(&s->pit, 2);
-    s->nmi_mask = 0;
-    s->pit_phase = 0;
-    s->kbq_len = 0;
-    s->kb_full = false;
-    s->kb_reset_at = s->kb_next_at = 0;
     s->halted_for_debug = false;
     update_speaker(s);
 }
@@ -1057,8 +1157,6 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     s->cpu.intr_ack = cpu_intr_ack;
     s->cpu.bus_ud = s;
     s->cpu.on_unknown_opcode = on_unknown_opcode;
-    s->pit.out_changed = pit_out_changed;
-    s->pit.ud = s;
 
     s->fb_w = x86_vga_mono(s->vga) ? MDA_WIDTH  : IBM5150_CGA_FB_W;   /* Hercules: the same */
     s->fb_h = x86_vga_mono(s->vga) ? MDA_HEIGHT : IBM5150_CGA_FB_H;
@@ -1074,40 +1172,47 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
     gemu_monitor_set_screendump_cb(s->monitor, ibm5150_screendump, s);
     gemu_monitor_bind(s->monitor, "sendkey", ibm5150_cmd_sendkey, s);
     if (cfg->mouse_com) {
-        attach_mouse(s, cfg->mouse_com);
+        attach_com(s, cfg->mouse_com - 1);
+        s->has_mouse = true;
         gemu_monitor_bind(s->monitor, "mouse_move", ibm5150_cmd_mouse_move, s);
         gemu_monitor_bind(s->monitor, "mouse_button", ibm5150_cmd_mouse_button, s);
     }
     attach_floppies(s, sw.floppies);
-    if (sw.floppy >= 0)   s->ppi.sw1 = (uint8_t)((s->ppi.sw1 & ~0x01) | sw.floppy);
-    if (sw.floppies > 0)  s->ppi.sw1 = (uint8_t)((s->ppi.sw1 & ~0xC0) | (sw.floppies - 1) << 6);
-    if (sw.display >= 0)  s->ppi.sw1 = (uint8_t)((s->ppi.sw1 & ~0x30) | sw.display << 4);
+    if (sw.floppy >= 0)   s->sw1 = (uint8_t)((s->sw1 & ~0x01) | sw.floppy);
+    if (sw.floppies > 0)  s->sw1 = (uint8_t)((s->sw1 & ~0xC0) | (sw.floppies - 1) << 6);
+    if (sw.display >= 0)  s->sw1 = (uint8_t)((s->sw1 & ~0x30) | sw.display << 4);
     if (cfg->machine_opts) {
         static const char *const disp[] = { "none", "CGA 40x25", "CGA 80x25", "monochrome" };
         printf("gemu: DIP switches: diskettes %s, %d drive(s), display %s, %u K\n",
-               s->ppi.sw1 & 1 ? "on" : "off", ((s->ppi.sw1 >> 6) & 3) + 1,
-               disp[(s->ppi.sw1 >> 4) & 3],
-               (((s->ppi.sw1 >> 2) & 3) + 1) * 16 + (s->ppi.sw2 & 0x1F) * 32);
+               s->sw1 & 1 ? "on" : "off", ((s->sw1 >> 6) & 3) + 1,
+               disp[(s->sw1 >> 4) & 3],
+               (((s->sw1 >> 2) & 3) + 1) * 16 + (s->sw2 & 0x1F) * 32);
     }
     for (int u = 0; u < 4; u++)
-        if (s->fdc.drive[u]) gemu_drive_attach_monitor(s->fdc.drive[u], s->monitor);
+        if (s->floppy[u]) gemu_drive_attach_monitor(s->floppy[u], s->monitor);
     if (cfg->hdc == X86_HDC_NONE &&
         (gemu_drive_get(GEMU_DRIVE_IF_IDE, 0, 0) || gemu_drive_get(GEMU_DRIVE_IF_IDE, 0, 1))) {
         fprintf(stderr, "gemu: the 5150 needs a hard disk adapter for -hda/-hdb: "
                         "add -device ibm-fixed-disk\n");
-        gemu_monitor_destroy(s->monitor);
-        free(s->fb); free(s->ram); free(s);
+        ibm5150_destroy(s);
         return NULL;
     }
-    if (cfg->hdc == X86_HDC_IBM && !attach_fixed_disk(s, cfg, hdc_rom)) {
-        gemu_monitor_destroy(s->monitor);
-        free(s->fb); free(s->ram); free(s);
+    s->has_hdc = cfg->hdc == X86_HDC_IBM;
+    s->hdc_irq = 5;
+    /* the device tree, then what needs its devices: drives, the mouse, wiring */
+    if (!build_board(s) || (s->has_hdc && !attach_fixed_disk(s, cfg, hdc_rom))) {
+        ibm5150_destroy(s);
+        return NULL;
+    }
+    if (s->has_mouse) attach_mouse(s, cfg->mouse_com);
+    if (!wire_board(s)) {
+        ibm5150_destroy(s);
         return NULL;
     }
     for (int u = 0; u < 2; u++)
-        if (s->hdc.drive[u]) gemu_drive_attach_monitor(s->hdc.drive[u], s->monitor);
-    io_build(s);   /* every adapter is in */
+        if (s->hdc && s->hdc->drive[u]) gemu_drive_attach_monitor(s->hdc->drive[u], s->monitor);
     gemu_monitor_bind(s->monitor, "ioports", ibm5150_cmd_ioports, s);
+    gemu_monitor_attach_machine(s->monitor, s->machine, NULL);
 
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
@@ -1150,6 +1255,7 @@ void ibm5150_destroy(Ibm5150State *s) {
     if (s->speaker) rca_pcspk_destroy(s->speaker);
     if (s->display) gemu_display_destroy(s->display);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
+    gemu_machine_free(s->machine);
     free(s->fb);
     free(s->ram);
     free(s);
@@ -1178,10 +1284,10 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
            video_desc(s),
            s->has_basic ? "Cassette BASIC present" : "(none loaded)");
     for (int u = 0; u < 4; u++)
-        if (s->fdc.drive[u])
-            printf("  %s: %s\n", gemu_drive_name(s->fdc.drive[u]),
-                   gemu_drive_inserted(s->fdc.drive[u]) ? gemu_drive_filename(s->fdc.drive[u])
-                                                        : "(empty)");
+        if (s->floppy[u])
+            printf("  %s: %s\n", gemu_drive_name(s->floppy[u]),
+                   gemu_drive_inserted(s->floppy[u]) ? gemu_drive_filename(s->floppy[u])
+                                                     : "(empty)");
     if (s->has_mouse)
         printf("  Mouse : Microsoft serial mouse on COM%d (click the window to capture, "
                "Ctrl+Alt+G to release)\n", s->has_com[0] ? 1 : 2);
@@ -1189,11 +1295,11 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
         printf("  Fixed disk adapter: IBM, %s, IRQ %u, DMA 3\n",
                s->hdc_rom_mapped ? "ROM at C8000h" : "ROM disabled", s->hdc_irq);
         for (int u = 0; u < 2; u++)
-            if (s->hdc.drive[u])
+            if (s->hdc->drive[u])
                 printf("  %s: %s (%u cylinders, %u heads, drive type %u)\n",
-                       gemu_drive_name(s->hdc.drive[u]), gemu_drive_filename(s->hdc.drive[u]),
-                       s->hdc.geom[u].cyls, s->hdc.geom[u].heads,
-                       (s->hdc.jumpers >> (u == 0 ? 2 : 0)) & 3u);
+                       gemu_drive_name(s->hdc->drive[u]), gemu_drive_filename(s->hdc->drive[u]),
+                       s->hdc->geom[u].cyls, s->hdc->geom[u].heads,
+                       (s->hdc->jumpers >> (u == 0 ? 2 : 0)) & 3u);
     }
 
     gemu_monitor_start(s->monitor);

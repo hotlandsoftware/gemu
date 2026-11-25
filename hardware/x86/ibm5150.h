@@ -14,6 +14,9 @@
 #include "pcspk.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/line.h"
+#include "gemu/dev/space.h"
 #include <stdlib.h>
 
 /* ── IBM PC 5150 (1981) machine state ───────────────────────────────────── */
@@ -42,10 +45,21 @@ typedef struct Ibm5150State {
     uint8_t  basic[IBM5150_BASIC_SIZE];
     bool     has_basic;
 
-    I8237     dma;
-    I8259     pic;
-    I8253     pit;
-    I8255     ppi;
+    /* The machine as a core device tree (stage D2): board/{dma,pic,pit,ppi,
+     * kbd}, isa/{fdc,hdc,com1,com2}; the chips' state lives in the devices,
+     * these point at it. */
+    GemuMachine *machine;
+    GemuSpace   *io;        /* ports: A0-A9 decoded (a mirror of 0-3FFh) */
+    GemuSpace   *bus;       /* the memory bus as DMA sees it */
+    GemuDevice  *dev_dma, *dev_pic, *dev_pit, *dev_ppi, *dev_kbd;
+    GemuDevice  *dev_fdc, *dev_hdc, *dev_com[2];
+    GemuLine    *kb_irq;    /* the keyboard's IRQ 1 */
+    I8237     *dma;
+    I8259     *pic;
+    I8253     *pit;
+    I8255     *ppi;
+    uint8_t    sw1, sw2;    /* the DIP switches, worked out from the configuration */
+    uint8_t    port_b;      /* port B as last written (the keyboard's edge detection) */
     X86VgaType vga;       /* the primary display adapter (-vga): POST uses it */
     bool      has_cga, has_mda; /* installed cards: -vga plus an optional
                                  * second one (-device), each on its own monitor */
@@ -56,15 +70,16 @@ typedef struct Ibm5150State {
     int       n_heads;    /* monitors: 1, or 2 with both cards */
     X86VgaType head_card[2]; /* card shown on each monitor, primary first */
     int       fb_w, fb_h; /* the shown card's framebuffer size */
-    Upd765    fdc;        /* diskette adapter, present when -drive if=floppy is */
+    Upd765   *fdc;        /* diskette adapter, present when -drive if=floppy is */
+    GemuDrive *floppy[4];
     bool      has_fdc;
-    IbmHdc    hdc;        /* fixed disk adapter, -device ibm-fixed-disk */
+    IbmHdc   *hdc;        /* fixed disk adapter, -device ibm-fixed-disk */
     bool      has_hdc;
     uint8_t   hdc_rom[IBM5150_HDC_ROM_MAX];
     uint32_t  hdc_rom_size;
     uint32_t  hdc_rom_mapped;   /* bytes on the bus at C8000h: 0 with rom=off */
     uint8_t   hdc_irq;          /* IRQ jumper: 5 (IBM's setting) or 2 */
-    Ins8250   com[2];     /* asynchronous communications adapters: COM1, COM2 */
+    Ins8250  *com[2];     /* asynchronous communications adapters: COM1, COM2 */
     bool      has_com[2];
     MsMouse   mouse;      /* -device msmouse, on one of them */
     bool      has_mouse;
@@ -94,12 +109,6 @@ typedef struct Ibm5150State {
     bool halted_for_debug; /* set on an unimplemented/trapped opcode - keeps
                              * the machine parked so the monitor can inspect
                              * state instead of spinning on garbage */
-
-    /* I/O ports A0-A9: each one's handler per direction, built from the
-     * configuration at power-on (NULL: unclaimed, read $FF and logged).
-     * Last, out of the way of the fields the CPU loop uses. */
-    uint8_t (*io_rd[0x400])(struct Ibm5150State *s, uint16_t port);
-    void    (*io_wr[0x400])(struct Ibm5150State *s, uint16_t port, uint8_t val);
 } Ibm5150State;
 
 Ibm5150State *ibm5150_create(const X86Config *cfg);

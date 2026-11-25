@@ -81,7 +81,7 @@ struct GemuMapping {
     int          priority;
     unsigned     flags;
     bool         enabled;
-    char         name[32];         /* for listings; "" if not set */
+    char         name[48];         /* for listings; "" if not set */
     uint64_t     seq;              /* order added (later wins ties) */
     GemuMapping *next;
 };
