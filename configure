@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 # ── Source file lists per family ───────────────────────────────────────────────
 
 CORE_SRC = [
-    'core/src/memory.c', 'core/src/dev/device.c', 'core/src/dev/space.c', 'core/src/dev/scheduler.c', 'core/src/tcg.c', 'jit/jit_mem.c', 'jit/jit_backend_x64.c', 'core/src/monitor.c',
+    'core/src/memory.c', 'core/src/dev/device.c', 'core/src/dev/space.c', 'core/src/dev/scheduler.c', 'core/src/dev/line.c', 'core/src/tcg.c', 'jit/jit_mem.c', 'jit/jit_backend_x64.c', 'core/src/monitor.c',
     'core/src/monitor_cmds.c', 'core/src/monitor_qmp.c',
     'core/src/monitor_block.c', 'core/src/monitor_symbols.c',
     'core/third_party/cjson/cJSON.c',
@@ -227,7 +227,7 @@ I460GX_TEST_LINKS = [
 ]
 # the core device framework (core/src/dev/): one machine needs all of it
 DEV_CORE_LINKS = ['core/src/dev/device.c', 'core/src/dev/space.c',
-                  'core/src/dev/scheduler.c']
+                  'core/src/dev/scheduler.c', 'core/src/dev/line.c']
 TESTS = [
     dict(name='audio_out', family=None, kind='device', src='tests/audio_out.c',
          links=[], cflags='-Werror', needs=['sdl']),
@@ -259,6 +259,8 @@ TESTS = [
     dict(name='space', family=None, kind='device', src='tests/space.c',
          links=DEV_CORE_LINKS, cflags='-Werror'),
     dict(name='scheduler', family=None, kind='device', src='tests/scheduler.c',
+         links=DEV_CORE_LINKS, cflags='-Werror'),
+    dict(name='line', family=None, kind='device', src='tests/line.c',
          links=DEV_CORE_LINKS, cflags='-Werror'),
     dict(name='i8259', family=None, kind='device', src='tests/i8259.c',
          links=['hardware/device/controller/i8259.c'], cflags='-Werror'),

@@ -6,9 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void set_error(GemuMachine *m, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
-static void set_error(GemuMachine *m, const char *fmt, ...) {
+void gemu_machine_set_error(GemuMachine *m, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(m->error, sizeof m->error, fmt, ap);
@@ -37,6 +35,7 @@ void gemu_machine_free(GemuMachine *m) {
         return;
     while (m->root.last_child)
         gemu_device_destroy(m->root.last_child);
+    gemu_lines_free_all(m);
     gemu_sched_free_all(m);
     gemu_space_free_all(m);
     free(m->name);
@@ -53,7 +52,7 @@ static bool start_tree(GemuDevice *d) {
     if (!d->started) {
         if (d->type->init && !d->type->init(d)) {
             if (!d->machine->error[0])
-                set_error(d->machine, "%s: init failed", d->path);
+                gemu_machine_set_error(d->machine, "%s: init failed", d->path);
             return false;
         }
         d->started = true;
@@ -119,32 +118,32 @@ GemuDevice *gemu_device_add(GemuMachine *m, const GemuDeviceType *t,
     if (!parent)
         parent = &m->root;
     if (!t) {
-        set_error(m, "%s: no device type", name ? name : "(null)");
+        gemu_machine_set_error(m, "%s: no device type", name ? name : "(null)");
         return NULL;
     }
     if (!name || !valid_name(name)) {
-        set_error(m, "\"%s\": not a valid device name", name ? name : "(null)");
+        gemu_machine_set_error(m, "\"%s\": not a valid device name", name ? name : "(null)");
         return NULL;
     }
     if (parent->machine != m) {
-        set_error(m, "%s: the parent belongs to another machine", name);
+        gemu_machine_set_error(m, "%s: the parent belongs to another machine", name);
         return NULL;
     }
     if (child_named(parent, name, strlen(name))) {
-        set_error(m, "%s%s%s: already exists", parent->path,
+        gemu_machine_set_error(m, "%s%s%s: already exists", parent->path,
                   parent->path[0] ? "/" : "", name);
         return NULL;
     }
     size_t plen = strlen(parent->path), nlen = strlen(name);
     if (plen + (plen ? 1 : 0) + nlen >= GEMU_DEVICE_PATH_MAX) {
-        set_error(m, "%s/%s: path longer than %d characters", parent->path, name,
+        gemu_machine_set_error(m, "%s/%s: path longer than %d characters", parent->path, name,
                   GEMU_DEVICE_PATH_MAX - 1);
         return NULL;
     }
 
     GemuDevice *d = calloc(1, sizeof *d);
     if (!d) {
-        set_error(m, "%s: out of memory", name);
+        gemu_machine_set_error(m, "%s: out of memory", name);
         return NULL;
     }
     d->type = t;
@@ -156,12 +155,12 @@ GemuDevice *gemu_device_add(GemuMachine *m, const GemuDeviceType *t,
     memcpy(d->path + plen + (plen ? 1 : 0), name, nlen + 1);
     d->name = d->path + (plen ? plen + 1 : 0);
     if (t->size && !(d->priv = calloc(1, t->size))) {
-        set_error(m, "%s: out of memory", d->path);
+        gemu_machine_set_error(m, "%s: out of memory", d->path);
         free(d);
         return NULL;
     }
     if (opts && !(d->opts = strdup(opts))) {
-        set_error(m, "%s: out of memory", d->path);
+        gemu_machine_set_error(m, "%s: out of memory", d->path);
         free_device(d);
         return NULL;
     }
@@ -177,7 +176,7 @@ GemuDevice *gemu_device_add(GemuMachine *m, const GemuDeviceType *t,
     if (m->started && parent->started) {
         if (t->init && !t->init(d)) {
             if (!m->error[0])
-                set_error(m, "%s: init failed", d->path);
+                gemu_machine_set_error(m, "%s: init failed", d->path);
             unlink_device(d);
             free_device(d);
             return NULL;
@@ -193,7 +192,7 @@ GemuDevice *gemu_device_add_type(GemuMachine *m, const char *type_name,
     const GemuDeviceType *t = gemu_device_type_find(type_name);
     if (!t) {
         m->error[0] = 0;
-        set_error(m, "%s: no device type \"%s\"", name ? name : "(null)", type_name);
+        gemu_machine_set_error(m, "%s: no device type \"%s\"", name ? name : "(null)", type_name);
         return NULL;
     }
     return gemu_device_add(m, t, name, parent, opts);
@@ -249,6 +248,7 @@ void gemu_device_destroy(GemuDevice *d) {
         gemu_device_destroy(d->last_child);
     if (d->started && d->type->destroy)
         d->type->destroy(d);
+    gemu_lines_remove_device(d);
     unlink_device(d);
     free_device(d);
 }

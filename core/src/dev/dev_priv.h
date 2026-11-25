@@ -3,6 +3,13 @@
 #include "gemu/dev/device.h"
 #include "gemu/dev/space.h"
 #include "gemu/dev/scheduler.h"
+#include "gemu/dev/line.h"
+
+/* line.c's part of the machine */
+typedef struct {
+    GemuLine   *outs;
+    GemuLineIn *ins;
+} GemuLines;
 
 /* scheduler.c's part of the machine */
 typedef struct {
@@ -27,9 +34,17 @@ struct GemuMachine {
     char        error[256];
     GemuSpace  *spaces;           /* space.c: newest first */
     GemuSched   sched;
+    GemuLines   lines;
 };
+
+/* device.c: the machine's error message (gemu_machine_error). */
+void gemu_machine_set_error(GemuMachine *m, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 
 /* space.c: free the machine's spaces (after its devices are gone). */
 void gemu_space_free_all(GemuMachine *m);
 /* scheduler.c: free the machine's timers and executors. */
 void gemu_sched_free_all(GemuMachine *m);
+/* line.c: drop a device's lines (on destroy), and all of them. */
+void gemu_lines_remove_device(GemuDevice *d);
+void gemu_lines_free_all(GemuMachine *m);
