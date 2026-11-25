@@ -1,17 +1,10 @@
 /* The core device model: see gemu/dev/device.h. */
-#include "gemu/dev/device.h"
+#include "dev_priv.h"
 #include "gemu/dev/registry.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-struct GemuMachine {
-    char       *name;
-    GemuDevice  root;
-    bool        started;
-    char        error[256];
-};
 
 static void set_error(GemuMachine *m, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
@@ -44,6 +37,7 @@ void gemu_machine_free(GemuMachine *m) {
         return;
     while (m->root.last_child)
         gemu_device_destroy(m->root.last_child);
+    gemu_space_free_all(m);
     free(m->name);
     free(m);
 }
@@ -155,7 +149,10 @@ GemuDevice *gemu_device_add(GemuMachine *m, const GemuDeviceType *t,
     d->type = t;
     d->machine = m;
     d->parent = parent;
-    snprintf(d->path, sizeof d->path, "%s%s%s", parent->path, plen ? "/" : "", name);
+    memcpy(d->path, parent->path, plen);          /* the length was checked above */
+    if (plen)
+        d->path[plen] = '/';
+    memcpy(d->path + plen + (plen ? 1 : 0), name, nlen + 1);
     d->name = d->path + (plen ? plen + 1 : 0);
     if (t->size && !(d->priv = calloc(1, t->size))) {
         set_error(m, "%s: out of memory", d->path);
