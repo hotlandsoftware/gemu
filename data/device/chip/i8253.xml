@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="i8253" description="Intel 8253 programmable interval timer" status="working">
+    <type symbol="gemu_i8253_type" source="hardware/device/timer/i8253_dev.c"/>
+</device>

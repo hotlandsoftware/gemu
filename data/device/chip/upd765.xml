@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="upd765" description="NEC uPD765 floppy disk controller (PC diskette adapter)" status="working">
+    <type symbol="gemu_upd765_type" source="hardware/device/storage/upd765_dev.c"/>
+</device>

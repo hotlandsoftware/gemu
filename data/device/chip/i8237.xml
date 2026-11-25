@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="i8237" description="Intel 8237A DMA controller (with PC page registers)" status="working">
+    <type symbol="gemu_i8237_type" source="hardware/device/controller/i8237_dev.c"/>
+</device>

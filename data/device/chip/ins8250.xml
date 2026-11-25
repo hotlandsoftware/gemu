@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="ins8250" description="National INS8250 UART (IBM asynchronous communications adapter)" status="working">
+    <type symbol="gemu_ins8250_type" source="hardware/device/serial/ins8250_dev.c"/>
+</device>

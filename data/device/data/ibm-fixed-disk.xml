@@ -1,4 +1,5 @@
 <?xml version="1.0"?>
 <device name="ibm-fixed-disk" description="IBM Fixed Disk Adapter" status="working">
     <machine name="ibm5150"/>
+    <type symbol="gemu_ibm_hdc_type" source="hardware/device/storage/ibm_hdc_dev.c"/>
 </device>

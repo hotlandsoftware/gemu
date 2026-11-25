@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="i8259" description="Intel 8259A programmable interrupt controller" status="working">
+    <type symbol="gemu_i8259_type" source="hardware/device/controller/i8259_dev.c"/>
+</device>
