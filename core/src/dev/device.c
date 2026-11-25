@@ -37,6 +37,7 @@ void gemu_machine_free(GemuMachine *m) {
         return;
     while (m->root.last_child)
         gemu_device_destroy(m->root.last_child);
+    gemu_sched_free_all(m);
     gemu_space_free_all(m);
     free(m->name);
     free(m);

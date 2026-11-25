@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 # ── Source file lists per family ───────────────────────────────────────────────
 
 CORE_SRC = [
-    'core/src/memory.c', 'core/src/dev/device.c', 'core/src/dev/space.c', 'core/src/tcg.c', 'jit/jit_mem.c', 'jit/jit_backend_x64.c', 'core/src/monitor.c',
+    'core/src/memory.c', 'core/src/dev/device.c', 'core/src/dev/space.c', 'core/src/dev/scheduler.c', 'core/src/tcg.c', 'jit/jit_mem.c', 'jit/jit_backend_x64.c', 'core/src/monitor.c',
     'core/src/monitor_cmds.c', 'core/src/monitor_qmp.c',
     'core/src/monitor_block.c', 'core/src/monitor_symbols.c',
     'core/third_party/cjson/cJSON.c',
@@ -225,6 +225,9 @@ I460GX_TEST_LINKS = [
     'hardware/device/i2c/i2c.c', 'hardware/device/i2c/itanium_cart.c',
     'hardware/device/i2c/lm87.c', 'hardware/device/storage/fwh82802.c',
 ]
+# the core device framework (core/src/dev/): one machine needs all of it
+DEV_CORE_LINKS = ['core/src/dev/device.c', 'core/src/dev/space.c',
+                  'core/src/dev/scheduler.c']
 TESTS = [
     dict(name='audio_out', family=None, kind='device', src='tests/audio_out.c',
          links=[], cflags='-Werror', needs=['sdl']),
@@ -252,9 +255,11 @@ TESTS = [
          links=['hardware/device/input/i8042.c', 'hardware/device/input/ps2_keyboard.c',
                 'hardware/device/input/ps2_mouse.c'], cflags='-Werror'),
     dict(name='device', family=None, kind='device', src='tests/device.c',
-         links=['core/src/dev/device.c', 'core/src/dev/space.c'], cflags='-Werror'),
+         links=DEV_CORE_LINKS, cflags='-Werror'),
     dict(name='space', family=None, kind='device', src='tests/space.c',
-         links=['core/src/dev/device.c', 'core/src/dev/space.c'], cflags='-Werror'),
+         links=DEV_CORE_LINKS, cflags='-Werror'),
+    dict(name='scheduler', family=None, kind='device', src='tests/scheduler.c',
+         links=DEV_CORE_LINKS, cflags='-Werror'),
     dict(name='i8259', family=None, kind='device', src='tests/i8259.c',
          links=['hardware/device/controller/i8259.c'], cflags='-Werror'),
     dict(name='ins8250', family=None, kind='device', src='tests/ins8250.c',
