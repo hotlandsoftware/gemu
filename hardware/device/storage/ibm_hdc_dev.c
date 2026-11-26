@@ -94,6 +94,8 @@ static bool hdc_init(GemuDevice *d) {
     }
     GEMU_STATE_VAR(d, "status_byte", c->status_byte);
     GEMU_STATE_ARRAY(d, "sense", c->sense);
+    gemu_drive_add_state(d, "media0", &c->drive[0]);   /* the disks' contents */
+    gemu_drive_add_state(d, "media1", &c->drive[1]);
     return true;
 }
 

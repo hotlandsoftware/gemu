@@ -209,6 +209,12 @@ bool mon_dev_dispatch(GemuMonitor *mon, const char *verb, const char *args);
 void mon_dev_help(GemuMonitor *mon, void (*row)(GemuMonitor *, const char *syn,
                                                 const char *help));
 bool mon_dev_help_command(GemuMonitor *mon, const char *word);
+/* wavcapture <file> / stopcapture: the machine's mixer to a WAV file. */
+GemuMonCmd mon_dev_wavcapture(GemuMonitor *mon, const char *args);
+GemuMonCmd mon_dev_stopcapture(GemuMonitor *mon, const char *args);
+/* savevm <file> / loadvm <file>: the machine's save state (gemu/dev/state.h). */
+GemuMonCmd mon_dev_savevm(GemuMonitor *mon, const char *args);
+GemuMonCmd mon_dev_loadvm(GemuMonitor *mon, const char *args);
 /* Whether the memory commands can run: a view, or a machine with spaces. */
 bool mon_dev_has_spaces(const GemuMonitor *mon);
 /* The memory view for an address token: a "space:" prefix picks that

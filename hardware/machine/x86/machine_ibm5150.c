@@ -8,6 +8,8 @@
 #include "timer/i8253_dev.h"
 #include "pc_video_dev.h"
 #include "gemu/dev/state.h"
+#include "gemu/dev/stream.h"
+#include "audio/pc_speaker.h"
 #include "cgafont8x8.h"
 #include "mdafont8x14.h"
 #include "gemu/util.h"
@@ -181,21 +183,18 @@ static void iolog(Ibm5150State *s, uint16_t port, bool is_write, uint8_t val) {
     }
 }
 
-/* ── Speaker ─────────────────────────────────────────────────────────────── *
+/* ── Speaker and sound ───────────────────────────────────────────────────── *
  *
- * The speaker sounds PIT channel 2's square wave when PB0 (gate) and PB1
- * (data) are both set; the tone generator is retuned whenever either the
- * port or the channel changes. */
+ * The speaker is a device (board/speaker, a pc-speaker): PIT channel 2's
+ * output and PPI port B bit 1 drive it, and its stream goes through the
+ * machine's mixer to the audio output - in emulated time, edge by edge. */
 
-static void update_speaker(Ibm5150State *s) {
-    if (!s->speaker) return;
-    const I8253Channel *c = &s->pit->ch[2];
-    bool on = (s->ppi->port_b & 0x03) == 0x03 && c->mode == 3 && c->counting;
-    if (on) {
-        unsigned div = c->reload ? c->reload : 0x10000u;
-        rca_pcspk_set_freq(s->speaker, PIT_HZ / div);
-    }
-    rca_pcspk_set_gate(s->speaker, on);
+#define IBM5150_AUDIO_HZ 48000
+/* bytes of float samples to keep queued: 50 ms */
+#define IBM5150_AUDIO_QUEUE_MAX (IBM5150_AUDIO_HZ / 20 * sizeof(float))
+
+static void audio_sink(void *ud, const float *samples, size_t frames) {
+    gemu_audio_queue(ud, samples, frames);
 }
 
 /* ── Keyboard ────────────────────────────────────────────────────────────── */
@@ -264,19 +263,16 @@ static const GemuHandlers nmi_io   = { .w8 = nmi_w };
 static const GemuHandlers empty_io = { .r8 = empty_r, .w8 = empty_w, .peek8 = empty_peek };
 
 /* What follows a write on the board, stacked (shared) after the chip's own
- * handler so it sees the chip already updated: the speaker after PIT
- * writes; the keyboard clock/clear and the speaker after port B.  (PB0's
- * gate for PIT channel 2 is a line.) */
-static void pit_written(void *ud, uint64_t o, uint8_t v) { (void)o; (void)v; update_speaker(MS(ud)); }
+ * handler so it sees the chip already updated: the keyboard clock/clear
+ * after port B.  (PB0's gate for PIT channel 2 and PB1's speaker data are
+ * lines.) */
 static void port_b_written(void *ud, uint64_t o, uint8_t v) {
     Ibm5150State *s = ud;
     (void)o;
     uint8_t old = s->port_b;
     s->port_b = v;
     kb_port_b_changed(s, old, v);
-    update_speaker(s);
 }
-static const GemuHandlers pit_after  = { .w8 = pit_written };
 static const GemuHandlers ppib_after = { .w8 = port_b_written };
 
 static void io_unmapped_read(void *ud, uint64_t addr, unsigned n) {
@@ -343,17 +339,13 @@ static bool io_build(Ibm5150State *s) {
                                          r[i].h, r[i].ud, n - i, 0);
         if (!mp) return false;
         gemu_mapping_set_name(mp, r[i].name);
-        /* the board's reactions, at the chip's priority, after it */
-        GemuMapping *after = NULL;
-        if (r[i].h == &gemu_i8253_io &&
-            !(after = gemu_space_map(s->io, 0x040, 4, &pit_after, s, n - i, GEMU_MAP_SHARED)))
-            return false;
-        if (r[i].h == &gemu_i8255_io &&
-            !(after = gemu_space_map(s->io, 0x061, 1, &ppib_after, s, n - i, GEMU_MAP_SHARED)))
-            return false;
-        if (after)
-            gemu_mapping_set_name(after, r[i].h == &gemu_i8253_io ? "speaker (after PIT writes)"
-                                                                 : "keyboard, speaker (after port B)");
+        /* the board's reaction, at the chip's priority, after it */
+        if (r[i].h == &gemu_i8255_io) {
+            GemuMapping *after = gemu_space_map(s->io, 0x061, 1, &ppib_after, s, n - i,
+                                                GEMU_MAP_SHARED);
+            if (!after) return false;
+            gemu_mapping_set_name(after, "keyboard (after port B)");
+        }
     }
     gemu_space_set_unmapped(s->io, 0xFF, io_unmapped_read, io_unmapped_write, s);
     return gemu_space_mirror(s->io, 0, 0x10000, 0x3FF);
@@ -539,13 +531,16 @@ static const GemuExecutorOps cpu_ops = { cpu_run, cpu_elapsed };
 static void run_frame(Ibm5150State *s) {
     s->check_bp = gemu_monitor_has_exec_breakpoints(s->monitor);
     gemu_machine_run_until(s->machine, gemu_machine_time(s->machine) + GEMU_SEC(1));
+    gemu_mixer_run(s->machine);
 }
 
 /* Exactly n instructions. */
 static void run_steps(Ibm5150State *s, uint64_t n) {
     s->steps_left = n;
-    while (s->steps_left)
-        gemu_machine_run_until(s->machine, gemu_machine_time(s->machine) + GEMU_SEC(3600));
+    while (s->steps_left) {   /* mixing as it goes, as frames would (wavcapture) */
+        gemu_machine_run_until(s->machine, gemu_machine_time(s->machine) + GEMU_MSEC(20));
+        gemu_mixer_run(s->machine);
+    }
 }
 
 /* ── Keyboard: XT scan code set 1, polled via gemu_display_is_key_held()
@@ -929,6 +924,7 @@ static bool attach_fixed_disk(Ibm5150State *s, const X86Config *cfg, const char 
  *     cpu            the 8088 (its executor runs the machine)
  *     dma pic pit ppi   the chips (i8237, i8259, i8253, i8255-pc)
  *     kbd            the keyboard interface: the scan code queue, IRQ 1
+ *     speaker        the speaker (PIT 2 AND PB1), a sound stream
  *   isa              the expansion slots
  *     fdc hdc com1 com2 the adapters this configuration has
  *     cga mda hercules  the display adapters, each with its screen
@@ -978,12 +974,33 @@ static const GemuDeviceType cpu_type = {
     .init = cpu_init, .reset = cpu_reset, .describe = cpu_describe,
 };
 
+/* The board's state: its clocks, the RAM, the NMI mask; and the serial
+ * mouse's (it isn't a device of its own: it hangs off a COM port's lines). */
 static bool board_init(GemuDevice *d) {
     Ibm5150State *s = machine_of(d);
     GEMU_STATE_VAR(d, "cycles", s->cycles);
     GEMU_STATE_VAR(d, "pit_phase", s->pit_phase);
     GEMU_STATE_VAR(d, "nmi_mask", s->nmi_mask);
+    gemu_state_add(d, "ram", s->ram, 1, s->ram_size);
+    if (s->has_mouse) {
+        MsMouse *mo = &s->mouse;
+        GEMU_STATE_VAR(d, "mouse.powered", mo->powered);
+        GEMU_STATE_VAR(d, "mouse.start_wait", mo->start_wait);
+        GEMU_STATE_ARRAY(d, "mouse.q", mo->q);
+        GEMU_STATE_VAR(d, "mouse.qn", mo->qn);
+        GEMU_STATE_VAR(d, "mouse.qpos", mo->qpos);
+        GEMU_STATE_VAR(d, "mouse.dx", mo->dx);
+        GEMU_STATE_VAR(d, "mouse.dy", mo->dy);
+        GEMU_STATE_VAR(d, "mouse.left", mo->left);
+        GEMU_STATE_VAR(d, "mouse.right", mo->right);
+        GEMU_STATE_VAR(d, "mouse.sent_left", mo->sent_left);
+        GEMU_STATE_VAR(d, "mouse.sent_right", mo->sent_right);
+    }
     return true;
+}
+/* A machine parked on an unimplemented opcode runs again from a good state. */
+static void board_post_load(GemuDevice *d) {
+    machine_of(d)->halted_for_debug = false;
 }
 static void board_reset(GemuDevice *d, GemuResetKind kind) {
     (void)kind;
@@ -1002,7 +1019,8 @@ static void board_describe(GemuDevice *d, char *buf, size_t len) {
 }
 static const GemuDeviceType board_type = {
     .name = "ibm5150-board", .desc = "IBM 5150 system board", .size = sizeof(Ibm5150State *),
-    .init = board_init, .reset = board_reset, .describe = board_describe,
+    .init = board_init, .reset = board_reset, .post_load = board_post_load,
+    .describe = board_describe,
 };
 
 static bool kbd_init(GemuDevice *d) {
@@ -1077,7 +1095,8 @@ static bool build_board(Ibm5150State *s) {
         !(s->dev_pic = add_dev(s, "i8259", "pic", board, NULL)) ||
         !(s->dev_pit = add_dev(s, "i8253", "pit", board, NULL)) ||
         !(s->dev_ppi = add_dev(s, "i8255-pc", "ppi", board, sw)) ||
-        !(s->dev_kbd = add_own(s, &kbd_type, "kbd", board)))
+        !(s->dev_kbd = add_own(s, &kbd_type, "kbd", board)) ||
+        !(s->dev_speaker = add_dev(s, "pc-speaker", "speaker", board, NULL)))
         return false;
     gemu_device_set_clock(board, IBM5150_CPU_HZ);
     gemu_device_set_clock(s->dev_pit, PIT_HZ);
@@ -1134,6 +1153,8 @@ static bool wire_board(Ibm5150State *s) {
         { "board/pit:out1", "board/dma:dreq0", true },
         { "board/pit:out2", "board/ppi:pc5",   true },
         { "board/ppi:pb0",  "board/pit:gate2", true },
+        { "board/pit:out2", "board/speaker:timer", true },
+        { "board/ppi:pb1",  "board/speaker:data",  true },
         { "board/kbd:irq",  "board/pic:ir1",   true },
         { "isa/com2:int",   "board/pic:ir3",   s->has_com[1] },
         { "isa/com1:int",   "board/pic:ir4",   s->has_com[0] },
@@ -1157,7 +1178,6 @@ static bool wire_board(Ibm5150State *s) {
 static void ibm5150_reset(Ibm5150State *s) {
     gemu_machine_reset(s->machine, GEMU_RESET_HARD);   /* the CPU, chips and adapters */
     s->halted_for_debug = false;
-    update_speaker(s);
 }
 
 Ibm5150State *ibm5150_create(const X86Config *cfg) {
@@ -1311,8 +1331,10 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
             }
             gemu_display_set_heads(s->display, heads, 2);
         }
-        s->speaker = rca_pcspk_create(440);
+        s->audio = gemu_audio_open("ibm5150", IBM5150_AUDIO_HZ);
     }
+    /* the mixer runs headless too: wavcapture records without a sound card */
+    gemu_mixer_set_output(s->machine, IBM5150_AUDIO_HZ, 1, s->audio ? audio_sink : NULL, s->audio);
 
     ibm5150_reset(s);
     return s;
@@ -1320,7 +1342,7 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
 
 void ibm5150_destroy(Ibm5150State *s) {
     if (!s) return;
-    if (s->speaker) rca_pcspk_destroy(s->speaker);
+    if (s->audio) gemu_audio_close(s->audio);
     if (s->display) gemu_display_destroy(s->display);
     if (s->monitor) gemu_monitor_destroy(s->monitor);
     gemu_machine_free(s->machine);
@@ -1404,10 +1426,15 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
                 ibm5150_reset(s);
                 gemu_display_clear_flags(s->display);
             }
-            /* Real time: the scheduler paces the machine to the host clock. */
+            /* Real time.  With sound, the audio clock: keep ~3 frames of it
+             * queued (the sound card never runs dry, and nothing drifts);
+             * without, the scheduler paces the machine to the host clock. */
             if (idle) {
                 gemu_sleep_ms(16);
                 gemu_machine_pace_reset(s->machine);
+            } else if (s->audio) {
+                while (gemu_audio_queued(s->audio) > IBM5150_AUDIO_QUEUE_MAX)
+                    gemu_sleep_ms(1);
             } else {
                 gemu_machine_pace(s->machine, 0);
             }

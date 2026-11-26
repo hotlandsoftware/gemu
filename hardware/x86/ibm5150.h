@@ -11,7 +11,7 @@
 #include "cga.h"
 #include "mda.h"
 #include "hercules.h"
-#include "pcspk.h"
+#include "gemu/audio_out.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
 #include "gemu/dev/device.h"
@@ -53,7 +53,7 @@ typedef struct Ibm5150State {
     GemuMachine *machine;
     GemuSpace   *io;        /* ports: A0-A9 decoded (a mirror of 0-3FFh) */
     GemuSpace   *bus;       /* the memory bus as DMA sees it */
-    GemuDevice  *dev_cpu, *dev_dma, *dev_pic, *dev_pit, *dev_ppi, *dev_kbd;
+    GemuDevice  *dev_cpu, *dev_dma, *dev_pic, *dev_pit, *dev_ppi, *dev_kbd, *dev_speaker;
     GemuExecutor *cpu_exec; /* the 8088 on the scheduler (stage D3) */
     uint64_t     run_done;  /* CPU clocks in the executor's current run */
     uint64_t     steps_left;/* monitor "step N": instructions still to run */
@@ -111,7 +111,7 @@ typedef struct Ibm5150State {
 
     GemuMonitor  *monitor;
     GemuDisplay  *display;
-    RcaPcSpeaker *speaker;
+    GemuAudioOut *audio;   /* the mixer's output (with a display) */
 
     bool halted_for_debug; /* set on an unimplemented/trapped opcode - keeps
                              * the machine parked so the monitor can inspect

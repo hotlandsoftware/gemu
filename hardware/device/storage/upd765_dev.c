@@ -67,6 +67,11 @@ static bool fdc_init(GemuDevice *d) {
     GEMU_STATE_ARRAY(d, "int_st0", c->int_st0);
     GEMU_STATE_ARRAY(d, "int_pcn", c->int_pcn);
     GEMU_STATE_VAR(d, "n_int", c->n_int);
+    for (int u = 0; u < 4; u++) {             /* the diskettes in the drives */
+        char n[16];
+        snprintf(n, sizeof n, "media%d", u);
+        gemu_drive_add_state(d, n, &c->drive[u]);
+    }
     return true;
 }
 

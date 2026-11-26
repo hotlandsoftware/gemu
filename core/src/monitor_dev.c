@@ -5,6 +5,8 @@
 #include "gemu/dev/device.h"
 #include "gemu/dev/option.h"
 #include "gemu/dev/space.h"
+#include "gemu/dev/state.h"
+#include "gemu/dev/stream.h"
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdlib.h>
@@ -385,4 +387,70 @@ bool mon_dev_help_command(GemuMonitor *mon, const char *word) {
         mon_printf(mon, " %s (%s)", cs.found[i]->path, cs.found[i]->type->name);
     mon_printf(mon, "%s\n", cs.n > 8 ? " ..." : "");
     return true;
+}
+
+/* ── Sound capture ────────────────────────────────────────────────────────── */
+
+/* A command's file argument: "a file name" may be quoted. */
+static void file_arg(const char *args, char path[MON_LINE_MAX]) {
+    snprintf(path, MON_LINE_MAX, "%s", args);
+    size_t n = strlen(path);
+    while (n && isspace((unsigned char)path[n - 1]))
+        path[--n] = 0;
+    if (n >= 2 && path[0] == '"' && path[n - 1] == '"') {
+        memmove(path, path + 1, n - 2);
+        path[n - 2] = 0;
+    }
+}
+
+GemuMonCmd mon_dev_wavcapture(GemuMonitor *mon, const char *args) {
+    char path[MON_LINE_MAX];
+    file_arg(args, path);
+    if (!path[0]) {
+        mon_printf(mon, "usage: wavcapture <file>\n");
+    } else if (gemu_mixer_wav_running(mon->machine)) {
+        mon_printf(mon, "wavcapture: already recording (stopcapture first)\n");
+    } else if (!gemu_mixer_wav_start(mon->machine, path)) {
+        mon_printf(mon, "wavcapture: can't write %s (or the machine has no sound)\n", path);
+    } else {
+        mon_printf(mon, "recording the machine's sound to %s\n", path);
+    }
+    return GEMU_MON_NONE;
+}
+
+GemuMonCmd mon_dev_stopcapture(GemuMonitor *mon, const char *args) {
+    (void)args;                         /* QEMU's capture index: there is only one */
+    if (!gemu_mixer_wav_stop(mon->machine))
+        mon_printf(mon, "stopcapture: not recording\n");
+    return GEMU_MON_NONE;
+}
+
+/* ── Save state ───────────────────────────────────────────────────────────── *
+ *
+ * The whole machine (gemu/dev/state.h) to a file and back.  A load checks
+ * everything first and changes nothing when the file doesn't fit this
+ * machine - another configuration, another disk - saying why. */
+
+GemuMonCmd mon_dev_savevm(GemuMonitor *mon, const char *args) {
+    char path[MON_LINE_MAX];
+    file_arg(args, path);
+    if (!path[0])
+        mon_printf(mon, "usage: savevm <file>\n");
+    else if (!gemu_machine_save_file(mon->machine, path))
+        mon_printf(mon, "savevm: %s\n", gemu_machine_error(mon->machine));
+    else
+        mon_printf(mon, "saved the machine to %s\n", path);
+    return GEMU_MON_NONE;
+}
+
+GemuMonCmd mon_dev_loadvm(GemuMonitor *mon, const char *args) {
+    char path[MON_LINE_MAX];
+    file_arg(args, path);
+    if (!path[0])
+        mon_printf(mon, "usage: loadvm <file>\n");
+    else if (!gemu_machine_load_file(mon->machine, path))
+        mon_printf(mon, "loadvm: %s\n", gemu_machine_error(mon->machine));
+    else
+        mon_printf(mon, "loaded the machine from %s\n", path);
+    return GEMU_MON_NONE;
 }

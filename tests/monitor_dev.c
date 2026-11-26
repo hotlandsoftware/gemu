@@ -5,6 +5,7 @@
 #include "gemu/dev/option.h"
 #include "gemu/dev/space.h"
 #include "gemu/dev/state.h"
+#include "gemu/dev/stream.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -200,11 +201,26 @@ int main(void) {
     HAS("help info", "info qtree");
     HAS("help info", "info <device path>");
 
+    /* ── Sound capture: the machine's mixer to a WAV file ── */
+    HAS("wavcapture snd.wav", "can't write snd.wav (or the machine has no sound)");   /* no mixer output */
+    gemu_mixer_set_output(m, 48000, 1, NULL, NULL);
+    HAS("wavcapture", "usage: wavcapture <file>");
+    HAS("wavcapture \"snd.wav\"", "recording the machine's sound to snd.wav");
+    HAS("wavcapture other.wav", "already recording");
+    run("stopcapture");
+    CHECK(out[0] == 0);
+    HAS("stopcapture", "not recording");
+    f = fopen("snd.wav", "rb");
+    CHECK(f && fread(b, 1, 4, f) == 4 && !memcmp(b, "RIFF", 4));
+    fclose(f);
+    remove("snd.wav");
+
     /* ── Detached again ── */
     gemu_monitor_attach_machine(mon, NULL, "program");
     HAS("pitregs", "unknown command 'pitregs'");
     HAS("info mtree", "unknown subcommand 'mtree'");
     HAS("x 10", "not supported on this machine");
+    HAS("wavcapture a.wav", "not supported on this machine");
     LACKS("help", "Device commands");
 
     gemu_machine_free(m);

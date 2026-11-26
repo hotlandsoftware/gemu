@@ -194,7 +194,10 @@ These are available on every machine that implements them; `help` marks the ones
 
 > ``savevm <file>`` / ``loadvm <file>``
 
-Saves or restores the full machine state.
+Saves or restores the full machine state.  On machines built from core
+devices (the IBM 5150) a load checks the whole file against the machine
+first - the same devices, RAM and disks - and if anything doesn't fit it
+says what and changes nothing.
 
 > ``sendkey <keys>``
 

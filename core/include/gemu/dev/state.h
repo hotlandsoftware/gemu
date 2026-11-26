@@ -51,6 +51,12 @@ void   gemu_state_write_u32(GemuStateWriter *w, uint32_t v);
 bool   gemu_state_read(GemuStateReader *r, void *p, size_t n);
 bool   gemu_state_read_u32(GemuStateReader *r, uint32_t *v);
 size_t gemu_state_left(const GemuStateReader *r);
+/* From a check: why it says no (the load's error message names it). */
+void   gemu_state_refuse(GemuStateReader *r, const char *fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 2, 3)))
+#endif
+    ;
 
 /* The whole machine to/from memory (*buf is malloc'd) or a file. */
 bool gemu_machine_save_state(GemuMachine *m, uint8_t **buf, size_t *len);

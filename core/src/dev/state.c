@@ -11,6 +11,7 @@
  * Strings: u64 length, the bytes. */
 #include "dev_priv.h"
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,6 +62,13 @@ bool gemu_sr_u8(GemuStateReader *r, uint8_t *v) { return gemu_state_read(r, v, 1
 bool gemu_sr_u64(GemuStateReader *r, uint64_t *v) { return gemu_state_read(r, v, 8); }
 bool gemu_state_read_u32(GemuStateReader *r, uint32_t *v) { return gemu_state_read(r, v, 4); }
 size_t gemu_state_left(const GemuStateReader *r) { return r->left; }
+
+void gemu_state_refuse(GemuStateReader *r, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(r->why, sizeof r->why, fmt, ap);
+    va_end(ap);
+}
 
 bool gemu_sr_str(GemuStateReader *r, char *buf, size_t cap) {
     uint64_t n;
@@ -289,7 +297,7 @@ static bool load_device(GemuMachine *m, GemuStateReader *r, bool apply, unsigned
             gemu_machine_set_error(m, "state: %s has no state item %s here", where, name);
             return false;
         }
-        GemuStateReader sub = { r->p, (size_t)bytes };
+        GemuStateReader sub = { r->p, (size_t)bytes, "" };
         r->p += bytes;
         r->left -= bytes;
         if (!apply) {
@@ -308,7 +316,11 @@ static bool load_device(GemuMachine *m, GemuStateReader *r, bool apply, unsigned
                 return false;
             }
             if (it->save && it->check && !it->check(it->ud, &sub)) {
-                gemu_machine_set_error(m, "state: %s item %s: refused by the device", where, name);
+                if (sub.why[0])
+                    gemu_machine_set_error(m, "state: %s: %s", where, sub.why);
+                else
+                    gemu_machine_set_error(m, "state: %s item %s: refused by the device",
+                                           where, name);
                 return false;
             }
             continue;
@@ -346,7 +358,7 @@ static bool count_cb(GemuDevice *d, void *ud) {
 
 /* One pass over the state: check (apply false) or apply. */
 static bool load_pass(GemuMachine *m, const uint8_t *buf, size_t len, bool apply, unsigned epoch) {
-    GemuStateReader r = { buf, len };
+    GemuStateReader r = { buf, len, "" };
     char magic[8], name[256];
     uint64_t version;
     if (!gemu_state_read(&r, magic, 8) || memcmp(magic, STATE_MAGIC, 8)) {
@@ -375,7 +387,7 @@ static bool load_pass(GemuMachine *m, const uint8_t *buf, size_t len, bool apply
         uint64_t n;
         if (!gemu_sr_u64(&r, &n) || n > r.left)
             goto bad;
-        GemuStateReader sec = { r.p, (size_t)n };
+        GemuStateReader sec = { r.p, (size_t)n, "" };
         r.p += n;
         r.left -= n;
         bool ok;
@@ -416,6 +428,7 @@ bool gemu_machine_load_state(GemuMachine *m, const uint8_t *buf, size_t len) {
         return false;                      /* nothing changed */
     if (!load_pass(m, buf, len, true, epoch))
         return false;
+    gemu_streams_after_load(m);            /* the sound so far was another timeline's */
     gemu_device_walk(&m->root, post_load_cb, NULL);
     return true;
 }

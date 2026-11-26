@@ -11,7 +11,7 @@
 
 | Name | Full name | Status | Notes |
 |------|-----------|--------|-------|
-| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA, MDA (`-vga mda`) or Hercules (`-vga hercules`), or a colour and a monochrome card on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`). No cassette, printer yet |
+| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA, MDA (`-vga mda`) or Hercules (`-vga hercules`), or a colour and a monochrome card on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`); `savevm`/`loadvm`. No cassette, printer yet |
 
 ## IBM 5150 hardware
 
@@ -128,6 +128,27 @@ Click the window to capture the host mouse; Ctrl+Alt+G (as in QEMU) or
 Ctrl+middle-click releases it.
 The monitor's `mouse_move DX DY` and `mouse_button STATE` (1 left, 4 right)
 work as in QEMU.
+
+## Saving the machine
+
+The monitor's `savevm FILE` saves the whole PC - the CPU, RAM, every chip
+and card, the keyboard and mouse - and `loadvm FILE` puts it back, exactly
+where it was: the same instructions follow, to the clock.  Load it in a later
+run with the same configuration (the same `-M`, `-m`, `-vga` and `-device`
+options and the same disk images); a state that doesn't fit is refused and
+the machine carries on untouched:
+
+```
+(gemu) loadvm dos.gemu
+loadvm: state: isa/fdc: floppy0: 'other.img' is 737280 bytes; the state's disk ('DISK01.IMG') was 368640
+```
+
+The disks' contents are part of the state only with `-snapshot` (or
+`snapshot=on`): then the guest's writes are kept in the file, and loading it
+brings them back.  Without it the writes go to the image, so a state loaded
+after the guest has written more finds the newer disk (GEMU warns when the
+image changed since the save) - use `-snapshot` to come back to a state more
+than once.
 
 ## CPU test suite
 

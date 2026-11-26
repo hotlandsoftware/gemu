@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "gemu/dev/device.h"
 
 /*
  * Block devices: QEMU's -drive and its legacy shorthands.
@@ -125,6 +126,13 @@ bool        gemu_drive_write(GemuDrive *d, uint64_t offset, const void *buf, siz
  * reach the image) and warns if the image changed since the save. */
 bool        gemu_drive_save_state(GemuDrive *d, FILE *f);
 bool        gemu_drive_load_state(GemuDrive *d, FILE *f);
+/* The same as an item of a core device's save state (gemu/dev/state.h),
+ * for the drive in *slot when the state is saved or loaded (NULL: none).
+ * The controller registers one per drive it can have, in its init hook.
+ * Loading refuses, before anything changes, a disk of another size, or
+ * none where the state had one; an empty drive in the state takes
+ * whatever is in the drive now. */
+bool        gemu_drive_add_state(GemuDevice *dev, const char *name, GemuDrive **slot);
 
 /* Removable media (cdrom, floppy). */
 bool        gemu_drive_insert(GemuDrive *d, const char *file, char *err, size_t err_len);

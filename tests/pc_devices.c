@@ -15,6 +15,7 @@
 #include "gemu/dev/line.h"
 #include "gemu/dev/option.h"
 #include "gemu/dev/state.h"
+#include "gemu/drive.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -365,6 +366,71 @@ int main(void) {
     CHECK(n2 == n1 && !memcmp(s1, s2, n1));
     free(s1);
     free(s2);
+
+    /* ── The disks' contents: a controller's drives are part of its state ── */
+    static const char *const imgs[] = { "pcdev-a.img", "pcdev-b.img", "pcdev-c.img" };
+    static const long sizes[] = { 163840, 327680, 163840 };
+    for (int i = 0; i < 3; i++) {
+        FILE *f = fopen(imgs[i], "wb");
+        CHECK(f && fseek(f, sizes[i] - 1, SEEK_SET) == 0 && fputc(0, f) == 0 && !fclose(f));
+    }
+    CHECK(gemu_drive_add("file=pcdev-a.img,if=floppy,index=0,snapshot=on"));
+    CHECK(gemu_drive_add("file=pcdev-b.img,if=floppy,index=1,snapshot=on"));
+    CHECK(gemu_drive_add("file=pcdev-c.img,if=floppy,index=2"));
+    GemuDrive *da = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, 0);
+    GemuDrive *db = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, 1);
+    GemuDrive *dc = gemu_drive_get(GEMU_DRIVE_IF_FLOPPY, 0, 2);
+    CHECK(da && db && dc);
+    Upd765 *fdc = gemu_upd765(pc2.fdc);
+    fdc->drive[0] = da;
+    uint8_t got4[4];
+    CHECK(gemu_drive_write(da, 0, "AAAA", 4));
+    uint8_t *ds;
+    size_t dn;
+    CHECK(gemu_machine_save_state(pc2.m, &ds, &dn));
+    CHECK(gemu_drive_write(da, 0, "BBBB", 4) && gemu_drive_write(da, 70000, "BBBB", 4));
+    CHECK(gemu_machine_load_state(pc2.m, ds, dn));     /* the writes since are gone */
+    CHECK(gemu_drive_read(da, 0, got4, 4) && !memcmp(got4, "AAAA", 4));
+    CHECK(gemu_drive_read(da, 70000, got4, 4) && !memcmp(got4, "\0\0\0\0", 4));
+    /* another disk (by size), or none: refused, nothing changed */
+    out(&pc2, 0x21, 0x5A);
+    fdc->drive[0] = db;
+    CHECK(gemu_drive_write(db, 0, "CCCC", 4));
+    CHECK(!gemu_machine_load_state(pc2.m, ds, dn));
+    CHECK(strstr(gemu_machine_error(pc2.m), "board/fdc: floppy1: 'pcdev-b.img' is 327680 bytes; "
+                                            "the state's disk ('pcdev-a.img') was 163840"));
+    CHECK(in(&pc2, 0x21) == 0x5A && fdc->drive[0] == db);
+    CHECK(gemu_drive_read(db, 0, got4, 4) && !memcmp(got4, "CCCC", 4));
+    fdc->drive[0] = NULL;
+    CHECK(!gemu_machine_load_state(pc2.m, ds, dn));
+    CHECK(strstr(gemu_machine_error(pc2.m), "the drive: the state has 'pcdev-a.img' (163840 "
+                                            "bytes) in it; this drive is not here"));
+    /* the same size, not in snapshot mode: it is from here on, the image untouched */
+    fdc->drive[0] = dc;
+    CHECK(gemu_machine_load_state(pc2.m, ds, dn));
+    CHECK(gemu_drive_read(dc, 0, got4, 4) && !memcmp(got4, "AAAA", 4));
+    CHECK(gemu_drive_write(dc, 4, "DDDD", 4));
+    FILE *cf = fopen("pcdev-c.img", "rb");
+    CHECK(cf && fread(got4, 1, 4, cf) == 4 && !fclose(cf) && !memcmp(got4, "\0\0\0\0", 4));
+    free(ds);
+    /* an empty drive in the state takes whatever is in the drive now */
+    fdc->drive[0] = NULL;
+    CHECK(gemu_machine_save_state(pc2.m, &ds, &dn));
+    fdc->drive[0] = db;
+    CHECK(gemu_machine_load_state(pc2.m, ds, dn));
+    CHECK(gemu_drive_read(db, 0, got4, 4) && !memcmp(got4, "CCCC", 4));
+    free(ds);
+    fdc->drive[0] = NULL;
+    /* the same through a FILE (the i2000's savevm) */
+    FILE *sf = fopen("pcdev-state.bin", "w+b");
+    CHECK(sf && gemu_drive_save_state(da, sf) && gemu_drive_save_state(NULL, sf));
+    CHECK(gemu_drive_write(da, 0, "EEEE", 4));
+    rewind(sf);
+    CHECK(gemu_drive_load_state(da, sf) && gemu_drive_load_state(NULL, sf));
+    CHECK(gemu_drive_read(da, 0, got4, 4) && !memcmp(got4, "AAAA", 4));
+    CHECK(fgetc(sf) == EOF && !fclose(sf));
+    remove("pcdev-state.bin");
+    for (int i = 0; i < 3; i++) remove(imgs[i]);
 
     /* ── Option errors ── */
     GemuMachine *bad = gemu_machine_new("bad");

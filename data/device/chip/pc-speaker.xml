@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A part machines build in, not a -device option (no <machine>). -->
+<device name="pc-speaker" description="IBM PC speaker" status="working">
+    <type symbol="gemu_pc_speaker_type" source="hardware/device/audio/pc_speaker.c"/>
+</device>

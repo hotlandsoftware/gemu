@@ -40,6 +40,7 @@ enum {
     NEED_MEM_WRITE = 1 << 1,
     NEED_SCREEN    = 1 << 2,
     NEED_FLIP      = 1 << 3,   /* some media device can flip sides */
+    NEED_MACHINE   = 1 << 4,   /* a core machine is attached (monitor_dev.c) */
 };
 
 typedef struct {
@@ -88,6 +89,10 @@ static GemuMonCmd cmd_memsave(GemuMonitor *, const char *);
 static GemuMonCmd cmd_set_password(GemuMonitor *, const char *);
 static GemuMonCmd cmd_expire_password(GemuMonitor *, const char *);
 static GemuMonCmd cmd_set_link(GemuMonitor *, const char *);
+static GemuMonCmd cmd_wavcapture(GemuMonitor *mon, const char *args) { return mon_dev_wavcapture(mon, args); }
+static GemuMonCmd cmd_stopcapture(GemuMonitor *mon, const char *args) { return mon_dev_stopcapture(mon, args); }
+static GemuMonCmd cmd_savevm(GemuMonitor *mon, const char *args) { return mon_dev_savevm(mon, args); }
+static GemuMonCmd cmd_loadvm(GemuMonitor *mon, const char *args) { return mon_dev_loadvm(mon, args); }
 
 static const MonCmdDef mon_cmds[] = {
     /* name          aliases         params                        help */
@@ -158,7 +163,7 @@ static const MonCmdDef mon_cmds[] = {
     { "key",         NULL,           "<key|text>",
       "inject a key (up, down, enter, ctrl-alt-delete, ...) or type text", M_IA64, NULL, 0 },
     { "loadvm",      NULL,           "<file>",
-      "restore machine state from file", NULL, NULL, 0 },
+      "restore machine state from file", NULL, cmd_loadvm, NEED_MACHINE },
     { "mapperdump",  NULL,           "",
       "show cartridge mapper registers", M_NES_ALL " " M_A2600, NULL, 0 },
     { "memsave",     "pmemsave",     "<addr> <size> <file>",
@@ -203,7 +208,7 @@ static const MonCmdDef mon_cmds[] = {
     { "rwatch",      NULL,           "<addr>",
       "set read watchpoint", NULL, cmd_rwatch, 0 },
     { "savevm",      NULL,           "<file>",
-      "save machine state to file", NULL, NULL, 0 },
+      "save machine state to file", NULL, cmd_savevm, NEED_MACHINE },
     { "scanline",    NULL,           "[count]",
       "run count scanlines (default 1), then stop", M_A2600, NULL, 0 },
     { "screendump",  NULL,           "<file>[.png]",
@@ -219,6 +224,8 @@ static const MonCmdDef mon_cmds[] = {
       NULL, cmd_set_link, 0 },
     { "set_password", NULL,          "vnc <password>",
       "set the VNC password (needs -vnc ...,password=on)", NULL, cmd_set_password, 0 },
+    { "stopcapture", NULL,           "",
+      "stop the WAV recording", NULL, cmd_stopcapture, NEED_MACHINE },
     { "step",        "s",            "[count]",
       "execute count instructions (default 1), then stop", NULL, cmd_step, 0 },
     { "stop",        "halt",         "",
@@ -242,6 +249,8 @@ static const MonCmdDef mon_cmds[] = {
       "show VGA registers", M_IA64, NULL, 0 },
     { "vhptstats",   NULL,           "",
       "show VHPT walker statistics", M_IA64, NULL, 0 },
+    { "wavcapture",  NULL,           "<file>",
+      "record the machine's sound to a WAV file", NULL, cmd_wavcapture, NEED_MACHINE },
     { "watch",       "awatch",       "<addr>",
       "set read+write watchpoint", NULL, cmd_watch, 0 },
     { "wwatch",      NULL,           "<addr>",
@@ -363,6 +372,8 @@ static MonAvail availability(const GemuMonitor *mon, const MonCmdDef *def) {
         return AVAIL_UNSUPPORTED;
     if ((def->needs & NEED_MEM_WRITE) && !(mon->has_mem && mon->mem.write) &&
         !mon_dev_has_spaces(mon))
+        return AVAIL_UNSUPPORTED;
+    if ((def->needs & NEED_MACHINE) && !mon->machine)
         return AVAIL_UNSUPPORTED;
     if ((def->needs & NEED_SCREEN) && !mon->screendump_cb)
         return AVAIL_UNSUPPORTED;

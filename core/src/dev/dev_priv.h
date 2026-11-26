@@ -1,9 +1,23 @@
 /* Shared between the files of core/src/dev. */
 #pragma once
+#include <stdio.h>
 #include "gemu/dev/device.h"
 #include "gemu/dev/space.h"
 #include "gemu/dev/scheduler.h"
 #include "gemu/dev/line.h"
+
+/* stream.c's mixer */
+typedef struct {
+    unsigned  rate, channels;
+    void    (*sink)(void *ud, const float *samples, size_t frames);
+    void     *sink_ud;
+    uint64_t  out_pos;          /* output samples made (an absolute index) */
+    bool      synced;
+    float    *mix;
+    size_t    mix_cap;
+    FILE     *wav;
+    uint64_t  wav_frames;
+} GemuMixer;
 
 /* line.c's part of the machine */
 typedef struct {
@@ -105,6 +119,8 @@ struct GemuMachine {
     GemuSched   sched;
     GemuLines   lines;
     struct GemuScreen *screens;   /* screen.c: in the order made */
+    struct GemuStream *streams;   /* stream.c: in the order made */
+    GemuMixer   mixer;
     unsigned    load_epoch;       /* state.c: marks what a load has matched */
 };
 
@@ -134,6 +150,7 @@ struct GemuStateWriter {
 struct GemuStateReader {
     const uint8_t *p;
     size_t         left;
+    char           why[160];      /* gemu_state_refuse(): a check's reason */
 };
 
 void gemu_sw_u8(GemuStateWriter *w, uint8_t v);
@@ -153,3 +170,8 @@ bool gemu_lines_state_load(GemuMachine *m, GemuStateReader *r, bool apply, unsig
 /* screen.c: drop a device's screens (on destroy), and all of them. */
 void gemu_screens_remove_device(GemuDevice *d);
 void gemu_screens_free_all(GemuMachine *m);
+/* stream.c: drop a device's streams (on destroy), and all of them. */
+void gemu_streams_remove_device(GemuDevice *d);
+void gemu_streams_free_all(GemuMachine *m);
+/* After a load: every stream and the mixer start again from now. */
+void gemu_streams_after_load(GemuMachine *m);

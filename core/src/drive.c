@@ -4,6 +4,7 @@
  */
 #include "gemu/drive.h"
 #include "gemu/monitor.h"
+#include "gemu/dev/state.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -181,40 +182,57 @@ static int64_t medium_mtime(const GemuDrive *d) {
     return d->file[0] && stat(d->file, &st) == 0 ? (int64_t)st.st_mtime : -1;
 }
 
-bool gemu_drive_save_state(GemuDrive *d, FILE *f) {
+/* Where the bytes go: a FILE (the i2000's savevm) or a core save state. */
+typedef struct {
+    bool (*put)(void *ud, const void *p, size_t n);
+    bool (*get)(void *ud, void *p, size_t n);
+    void  *ud;
+} StateIo;
+
+typedef struct { uint64_t size, n; int64_t mtime; uint8_t overlay; } StateHead;
+
+static bool file_put(void *ud, const void *p, size_t n) { return fwrite(p, 1, n, ud) == n; }
+static bool file_get(void *ud, void *p, size_t n) { return fread(p, 1, n, ud) == n; }
+
+static bool state_save(GemuDrive *d, const StateIo *io) {
     uint64_t magic = DRIVE_STATE_MAGIC, size = d && d->f ? d->size : 0, n = 0;
     uint8_t overlay = d && d->snap;
     if (d && d->f && !d->snap) fflush(d->f);
     int64_t mtime = d && d->f ? medium_mtime(d) : -1;
     for (size_t i = 0; overlay && i < d->n_snap; i++) n += d->snap[i] != NULL;
-    bool ok = fwrite(&magic, 8, 1, f) == 1 && fwrite(&size, 8, 1, f) == 1 &&
-              fwrite(&mtime, 8, 1, f) == 1 && fwrite(&overlay, 1, 1, f) == 1 &&
-              fwrite(&n, 8, 1, f) == 1;
+    bool ok = io->put(io->ud, &magic, 8) && io->put(io->ud, &size, 8) &&
+              io->put(io->ud, &mtime, 8) && io->put(io->ud, &overlay, 1) &&
+              io->put(io->ud, &n, 8);
     for (size_t i = 0; ok && overlay && i < d->n_snap; i++) {
         if (!d->snap[i]) continue;
         uint64_t idx = i;
-        ok = fwrite(&idx, 8, 1, f) == 1 && fwrite(d->snap[i], 1, SNAP_CHUNK, f) == SNAP_CHUNK;
+        ok = io->put(io->ud, &idx, 8) && io->put(io->ud, d->snap[i], SNAP_CHUNK);
     }
     return ok;
 }
 
-bool gemu_drive_load_state(GemuDrive *d, FILE *f) {
-    uint64_t magic = 0, size = 0, n = 0;
-    int64_t mtime = -1;
-    uint8_t overlay = 0;
-    if (fread(&magic, 8, 1, f) != 1 || magic != DRIVE_STATE_MAGIC ||
-        fread(&size, 8, 1, f) != 1 || fread(&mtime, 8, 1, f) != 1 ||
-        fread(&overlay, 1, 1, f) != 1 || fread(&n, 8, 1, f) != 1)
+static bool read_head(const StateIo *io, StateHead *h) {
+    uint64_t magic = 0;
+    return io->get(io->ud, &magic, 8) && magic == DRIVE_STATE_MAGIC &&
+           io->get(io->ud, &h->size, 8) && io->get(io->ud, &h->mtime, 8) &&
+           io->get(io->ud, &h->overlay, 1) && io->get(io->ud, &h->n, 8);
+}
+
+/* strict (a core save state): the medium is known to be the saved one's
+ * size (state_check), and failing to switch to snapshot mode fails. */
+static bool state_load(GemuDrive *d, const StateIo *io, bool strict) {
+    StateHead h;
+    if (!read_head(io, &h))
         return false;
     const char *name = d ? d->name : "drive";
-    bool usable = d && d->f && d->size == size;
-    if (size && !usable)
+    bool usable = d && d->f && d->size == h.size;
+    if (h.size && !usable)
         fprintf(stderr, "gemu: loadvm: %s: the saved state had a %" PRIu64
-                "-byte medium; this one differs - its contents won't match\n", name, size);
-    else if (usable && mtime != medium_mtime(d))
+                "-byte medium; this one differs - its contents won't match\n", name, h.size);
+    else if (usable && h.mtime != medium_mtime(d))
         fprintf(stderr, "gemu: loadvm: warning: %s: '%s' changed since this state was saved;"
                 " the guest may find a disk it doesn't expect\n", name, d->file);
-    if (usable && n && !d->snap) {
+    if (usable && h.n && !d->snap) {
         /* The saved writes must not land in the image: run this drive in
          * snapshot mode from here on. */
         char file[sizeof(d->file)], err[600];
@@ -222,6 +240,7 @@ bool gemu_drive_load_state(GemuDrive *d, FILE *f) {
         d->snapshot = true;
         if (!open_medium(d, file, err, sizeof(err))) {
             fprintf(stderr, "gemu: loadvm: %s: %s\n", name, err);
+            if (strict) return false;
             usable = false;
         } else
             fprintf(stderr, "gemu: loadvm: %s: the saved state has snapshot-mode writes;"
@@ -231,18 +250,103 @@ bool gemu_drive_load_state(GemuDrive *d, FILE *f) {
         for (size_t i = 0; i < d->n_snap; i++) { free(d->snap[i]); d->snap[i] = NULL; }
     uint8_t *chunk = malloc(SNAP_CHUNK);
     bool ok = chunk != NULL;
-    for (uint64_t k = 0; ok && k < n; k++) {
+    for (uint64_t k = 0; ok && k < h.n; k++) {
         uint64_t idx;
-        ok = fread(&idx, 8, 1, f) == 1 && fread(chunk, 1, SNAP_CHUNK, f) == SNAP_CHUNK;
+        ok = io->get(io->ud, &idx, 8) && io->get(io->ud, chunk, SNAP_CHUNK);
         if (ok && usable && idx < d->n_snap) {
+            free(d->snap[idx]);
             d->snap[idx] = chunk;
             chunk = malloc(SNAP_CHUNK);
             ok = chunk != NULL;
         }
     }
     free(chunk);
-    (void)overlay;
     return ok;
+}
+
+bool gemu_drive_save_state(GemuDrive *d, FILE *f) {
+    return state_save(d, &(StateIo){ file_put, NULL, f });
+}
+
+bool gemu_drive_load_state(GemuDrive *d, FILE *f) {
+    return state_load(d, &(StateIo){ NULL, file_get, f }, false);
+}
+
+/* ── ... as a core save state item ── */
+
+static bool w_put(void *ud, const void *p, size_t n) { gemu_state_write(ud, p, n); return true; }
+static bool r_get(void *ud, void *p, size_t n) { return gemu_state_read(ud, p, n); }
+
+/* The item: the file's name, then the drive's state as above. */
+static void media_save(void *ud, GemuStateWriter *w) {
+    GemuDrive *d = *(GemuDrive **)ud;
+    const char *file = d && d->f ? d->file : "";
+    uint32_t n = (uint32_t)strlen(file);
+    gemu_state_write_u32(w, n);
+    gemu_state_write(w, file, n);
+    state_save(d, &(StateIo){ w_put, NULL, w });
+}
+
+static bool media_file(GemuStateReader *r, char file[512]) {
+    uint32_t n;
+    if (!gemu_state_read_u32(r, &n) || n >= 512 || !gemu_state_read(r, file, n))
+        return false;
+    file[n] = 0;
+    return true;
+}
+
+/* All or nothing: a different disk (by its size) or none where the state
+ * had one refuses the load; an empty drive in the state takes anything. */
+static bool media_check(void *ud, GemuStateReader *r) {
+    GemuDrive *d = *(GemuDrive **)ud;
+    const char *name = d ? d->name : "the drive";
+    char file[512];
+    StateHead h;
+    StateIo io = { NULL, r_get, r };
+    if (!media_file(r, file) || !read_head(&io, &h)) {
+        gemu_state_refuse(r, "%s: damaged drive state", name);
+        return false;
+    }
+    uint64_t have = d && d->f ? d->size : 0, chunks = (h.size + SNAP_CHUNK - 1) / SNAP_CHUNK;
+    if (h.size && have != h.size) {
+        if (!have)
+            gemu_state_refuse(r, "%s: the state has '%s' (%" PRIu64 " bytes) in it; this "
+                              "drive is %s", name, file, h.size, d ? "empty" : "not here");
+        else
+            gemu_state_refuse(r, "%s: '%s' is %" PRIu64 " bytes; the state's disk ('%s') "
+                              "was %" PRIu64, name, d->file, have, file, h.size);
+        return false;
+    }
+    if (h.n > chunks || gemu_state_left(r) != h.n * (8 + (uint64_t)SNAP_CHUNK)) {
+        gemu_state_refuse(r, "%s: damaged drive state", name);
+        return false;
+    }
+    for (uint64_t k = 0; k < h.n; k++) {
+        uint64_t idx;
+        uint8_t skip[SNAP_CHUNK / 64];
+        bool ok = gemu_state_read(r, &idx, 8) && idx < chunks;
+        for (unsigned j = 0; ok && j < 64; j++) ok = gemu_state_read(r, skip, sizeof skip);
+        if (!ok) {
+            gemu_state_refuse(r, "%s: damaged drive state", name);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool media_load(void *ud, GemuStateReader *r) {
+    GemuDrive *d = *(GemuDrive **)ud;
+    char file[512];
+    if (!media_file(r, file))
+        return false;
+    if (d && d->f && file[0] && strcmp(file, d->file))
+        fprintf(stderr, "gemu: loadvm: warning: %s: the state was saved with '%s' in it; "
+                "'%s' is the same size\n", d->name, file, d->file);
+    return state_load(d, &(StateIo){ NULL, r_get, r }, true);
+}
+
+bool gemu_drive_add_state(GemuDevice *dev, const char *name, GemuDrive **slot) {
+    return gemu_state_add_custom(dev, name, media_save, media_check, media_load, slot);
 }
 
 /* ── Accessors ───────────────────────────────────────────────────────────── */
