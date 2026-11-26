@@ -31,6 +31,9 @@ jobs:
       - name: Unit tests
         run: ninja check
 
+      - name: Third-party code as released
+        run: python3 tools/check-third-party.py
+
       - name: Package
         run: tar czf gemu-linux-x86_64.tar.gz -C bin gemu gemu-chip8 gemu-mos gemu-rca gemu-ia64 gemu-x86 gemu-mitsu gemu-other gemu-z80
 

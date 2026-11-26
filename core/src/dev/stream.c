@@ -1,12 +1,12 @@
 /* Sound streams and the mixer: see gemu/dev/stream.h. */
 #include "dev_priv.h"
+#include "gemu/dev/u128.h"
 #include "gemu/dev/stream.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef unsigned __int128 u128;
 
 struct GemuStream {
     GemuMachine *m;
@@ -189,8 +189,8 @@ void gemu_mixer_run(GemuMachine *m) {
     for (GemuStream *s = m->streams; s; s = s->next) {
         for (size_t k = 0; k < n; k++) {
             uint64_t K = x->out_pos + k;
-            uint64_t lo = (uint64_t)((u128)K * s->rate / x->rate);
-            uint64_t hi = (uint64_t)((u128)(K + 1) * s->rate / x->rate);
+            uint64_t lo = gemu_muldiv(K, s->rate, x->rate);
+            uint64_t hi = gemu_muldiv(K + 1, s->rate, x->rate);
             float v[2];
             for (unsigned c = 0; c < s->outputs; c++) {
                 if (hi > lo) {                    /* the input samples in this output sample */
@@ -211,7 +211,7 @@ void gemu_mixer_run(GemuMachine *m) {
             }
         }
         /* what this mix used is done with */
-        uint64_t used = (uint64_t)((u128)target * s->rate / x->rate);
+        uint64_t used = gemu_muldiv(target, s->rate, x->rate);
         if (used > s->consumed)
             drop_front(s, (size_t)(used - s->consumed));
     }

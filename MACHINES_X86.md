@@ -11,7 +11,7 @@
 
 | Name | Full name | Status | Notes |
 |------|-----------|--------|-------|
-| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA, MDA (`-vga mda`) or Hercules (`-vga hercules`), or a colour and a monochrome card on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`), the AdLib, the Sound Blaster 1.0-2.0 and the Game Blaster (`-device adlib|sb2.0|cms`); `savevm`/`loadvm`. No cassette, printer yet |
+| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA, MDA (`-vga mda`) or Hercules (`-vga hercules`), or a colour and a monochrome card on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`), the AdLib, the Sound Blaster 1.0-2.0 and the Game Blaster (`-device adlib|sb2.0|cms`), option ROM boards (`-device isarom`); `savevm`/`loadvm`. No cassette, printer yet |
 
 ## IBM 5150 hardware
 
@@ -145,6 +145,17 @@ The speaker, and sound cards from 86Box (through GEMU's 86Box layer,
   SAA1099s at `base=` 220h.
 
 `wavcapture FILE` in the monitor records the lot.
+
+## Option ROMs
+
+`-device isarom,bios_fn=FILE,bios_addr=0xD0000` fits 86Box's generic ISA ROM
+board: a socket with a ROM image at an address from C0000h to EE000h (8K
+steps; `bios_size=` 4K-64K, default 8K).  `isarom_dual` and `isarom_quad`
+have two and four sockets (`bios_fn2=`, `bios_addr2=`, ...).  The 10/27/82
+BIOS (`-rom roms/ibm5150`) scans C8000h-F4000h at POST and runs every ROM it
+finds there (55 AAh, the length, a good checksum); the earlier BIOSes don't
+look.  `rom_writes_enabled=on` makes a socket a flash part: writes stick,
+are part of `savevm`, and are kept between runs in `~/.gemu/86box/`.
 
 ## Saving the machine
 

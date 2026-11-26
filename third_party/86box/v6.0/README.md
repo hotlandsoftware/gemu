@@ -41,13 +41,18 @@ GPLv3-compatible before it is vendored.
 | `src/include/86box/snd_mpu401.h` | none in file; project GPLv2+ (declarations only) | none |
 | `src/include/86box/snd_azt2316a.h` | none in file; project GPLv2+ (declarations only) | none |
 | `src/include/86box/snd_azt2320.h` | none in file; project GPLv2+ (declarations only) | none |
+| `src/device/isarom.c` | none in file; project GPLv2+ | none |
+| `src/include/86box/isarom.h` | none in file; project GPLv2+ | none |
 | `COPYING` | GPLv2 text | none |
 
 **Local changes are not allowed** without a row here saying what and why.
-To check, compare a file with the tag:
+`MANIFEST` has the SHA-256 of each file as the tag has it, and
+`tools/check-third-party.py` (CI runs it) fails on a file that differs
+without a local change listed here, and on a file that isn't listed:
 
 ```
-git -C <86box clone> show v6.0:src/device/novell_cardkey.c | cmp - third_party/86box/v6.0/src/device/novell_cardkey.c
+tools/check-third-party.py                  # the check (offline)
+tools/check-third-party.py --tag <clone>    # MANIFEST against the v6.0 tag itself
 ```
 
 Not vendored on purpose: `src/sound/snd_opl.c` (86Box's FM core chooser,
@@ -58,4 +63,5 @@ its own `fm_driver_get()` (`compat/86box/fm.c`).
 
 1. Copy it from the v6.0 tag to the same path under `src/`.
 2. Add a row above, after checking its license header.
-3. Write its port in `compat/86box/ports/` (see `compat/86box/README.md`).
+3. `tools/check-third-party.py --update <86box clone>` adds it to `MANIFEST`.
+4. Write its port in `compat/86box/ports/` (see `compat/86box/README.md`).

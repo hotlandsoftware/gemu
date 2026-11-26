@@ -184,6 +184,15 @@ extern int         device_get_config_hex16(const char *name);
 extern int         device_get_config_hex20(const char *name);
 extern const char *device_get_config_string(const char *name);
 #define device_get_config_bios device_get_config_string
+/* The current device's number among the machine's devices of its type
+ * (0 for the first). */
+extern int         device_get_instance(void);
+
+/* The device_t's internal name ("" for NULL), and the "no device" and
+ * "on-board" placeholders lists of devices start with. */
+extern const char *device_get_internal_name(const device_t *dev);
+extern const device_t device_none;
+extern const device_t device_internal;
 
 /* From a device's init: another device as a part of it (a core child,
  * started at once); its private data, or NULL if its init failed.  The

@@ -1,0 +1,3 @@
+# Vendored upstream code stays byte for byte as released, on every
+# platform (tools/check-third-party.py checks its SHA-256s).
+third_party/** -text

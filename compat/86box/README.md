@@ -30,9 +30,13 @@ third_party/86box/v6.0/       the drivers' sources, unchanged (README.md there)
 | `sound_set_cd_audio_filter`, `sound_set_pc_speaker_filter` | nothing: no CD audio, and the machine's speaker isn't mixed through a card |
 | `rom_present`, `rom_fopen` | "not there": 86Box's ROM set isn't GEMU's |
 | game port, ISA PnP, IDE, MPU-401, EMU8000, Aztech (`absent.c`) | stop GEMU with a message - only models GEMU doesn't offer reach them |
+| `mem_mapping_add/set/set_addr/set_handler/set_write_handler/set_exec/set_p/enable/disable` (`mem.c`) | core mappings in the machine's `isa-memory` space (else `program`); handlers get absolute addresses, reads use `exec` without a read handler, the latest mapping wins; a load puts them back where the structure says |
+| `rom_init`, `rom_read*`, `rom_write*`, `rom_load_linear`, `rom_present`, `rom_fopen` | ROM images: files as named; the buffers are the layer's, freed after the driver's close |
+| `nvr_fopen` | a device's own NVRAM files, in GEMU's settings directory under `86box/` |
+| `device_get_instance`, `device_get_internal_name`, `device_none`/`device_internal` | the device's number among its type, the name, the placeholders |
 
 The headers declare only what is implemented: a driver that uses anything
-else - `mem_mapping_*`, CPU state, 86Box's global settings - doesn't
+else - CPU state, paging, shadow RAM, 86Box's global settings - doesn't
 compile.  One driver file can hold many models (`snd_sb.c`: the Sound
 Blaster 1.0 to the AWE64), so what the other models refer to must link:
 `absent.c` has those, each stopping GEMU if it is ever reached.  That's the point: each gap is filled when a
@@ -51,6 +55,14 @@ Things to know:
   bit in 86Box; level requests are plain lines, wired-OR across devices.
 - **Word I/O** to a port reaches the driver's `inw`/`outw` when the access
   is inside one `io_sethandler` range; otherwise it is made of bytes.
+- **Memory** goes in the machine's `isa-memory` space when it has one: the
+  bus's memory as cards see it.  The 5150 has one and asks it for whatever
+  its own decode doesn't claim (RAM, video RAM, the BIOS, BASIC and the
+  fixed-disk ROM come first), only once a card has mapped something.
+- **ROM buffers** from `rom_init()` belong to the layer, which frees them
+  after the driver's close: nearly all of v6.0's drivers forget to.  A
+  driver that frees its own (`hdc_st506_xt.c` does) needs its port to say
+  so before it's ported.
 - **Sub-devices** (`device_add` in an init) are core children named after
   their type (`isa/adlib/ym3812_nuked_opl2`), so they have their own state
   and show in `info qtree`; the parent's handlers reach them through their
@@ -67,7 +79,8 @@ Things to know:
 ## Porting a driver
 
 1. Copy its files from the v6.0 tag into `third_party/86box/v6.0/` (same
-   paths) and list them, with their license, in the README there.
+   paths), list them, with their license, in the README there, and run
+   `tools/check-third-party.py --update <86box clone>` (CI checks them).
 2. Write `ports/<file>.c`: include the driver's .c (it is the same
    translation unit, so it sees the driver's private structure), then
 
@@ -107,6 +120,7 @@ Things to know:
 | `ym3812_nuked_opl2` | `src/sound/snd_opl2_nuked.c` | the AdLib's and the Sound Blasters' chip |
 | `sb`, `sb1.5`, `sb2.0` | `src/sound/snd_sb.c` (+ `snd_sb_dsp.c`, `snd_cms.c`) | the 5150: `-device sb2.0`, ... |
 | `cms` | `src/sound/snd_cms.c` | the 5150: `-device cms` (Game Blaster) |
+| `isarom`, `isarom_dual`, `isarom_quad` | `src/device/isarom.c` | the 5150: `-device isarom,bios_fn=...` |
 | (libraries) | `snd_sb_dsp.c`, `utils/fifo.c` | inside the Sound Blaster |
 
 The OPL2's port saves the chip whole and moves its pointers (all into the

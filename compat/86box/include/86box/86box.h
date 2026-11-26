@@ -42,6 +42,9 @@ extern "C" {
 
 /* IDE controllers on non-IDE cards (GEMU offers none such: 0). */
 extern int other_ide_present;
+/* 86Box's settings of which ISA ROM boards to add: GEMU adds cards with
+ * -device, so this stays empty (the drivers' settings glue reads it). */
+extern int isarom_type[];
 
 /* To stderr, as GEMU logs. */
 extern void pclog_ex(const char *fmt, va_list ap);

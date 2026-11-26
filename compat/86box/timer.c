@@ -15,6 +15,7 @@
 #include <86box/86box.h>
 #include <86box/timer.h>
 #include "gemu/dev/state.h"
+#include "gemu/dev/u128.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,14 +30,12 @@ struct Gemu86BoxTimer {
     Gemu86BoxTimer *next;          /* the owner's */
 };
 
-typedef unsigned __int128 u128;
-
 /* The moment of a 32.32 timestamp, rounded up. */
 static GemuTime moment(uint64_t ts_integer, uint32_t ts_frac) {
-    u128 fixed = ((u128)ts_integer << 32) | ts_frac;
-    u128 den = (u128)gemu_86box_hz << 32;
-    u128 num = fixed * GEMU_PS_PER_SEC;
-    return (GemuTime)((num + den - 1) / den);
+    GemuU128 fixed = gemu_u128_add(gemu_u128_shl(gemu_u128(ts_integer), 32), gemu_u128(ts_frac));
+    uint64_t rem, q = gemu_u128_div64_sat(gemu_u128_mul(fixed, GEMU_PS_PER_SEC),
+                                          gemu_86box_hz << 32, &rem);
+    return q == UINT64_MAX ? GEMU_TIME_NEVER : (GemuTime)(q + (rem != 0));
 }
 
 static void timer_advance_ex(pc_timer_t *timer, int start);

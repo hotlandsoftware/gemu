@@ -13,7 +13,6 @@
 #include <86box/hdc_ide.h>
 #include <86box/isapnp.h>
 #include <86box/midi.h>
-#include <86box/rom.h>
 #include <86box/sound.h>
 #include <86box/timer.h>
 #include <86box/snd_azt2316a.h>
@@ -40,11 +39,8 @@ void sound_set_pc_speaker_filter(void (*filter)(int channel, double *buffer, voi
     (void)filter; (void)priv;
 }
 
-/* 86Box's ROM set isn't here: devices that need ROM files aren't available. */
-FILE *rom_fopen(const char *fn, char *mode) { (void)fn; (void)mode; return NULL; }
-int   rom_present(const char *fn) { (void)fn; return 0; }
-
 int other_ide_present;
+int isarom_type[4];          /* 86Box's settings (ISAROM_MAX): GEMU's are -device */
 
 /* ── Models GEMU doesn't offer: these stop it ─────────────────────────────── */
 

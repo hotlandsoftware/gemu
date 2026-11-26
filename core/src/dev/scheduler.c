@@ -1,5 +1,6 @@
 /* Time, timers and executors: see gemu/dev/scheduler.h. */
 #include "dev_priv.h"
+#include "gemu/dev/u128.h"
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,10 @@
 #  include <time.h>
 #endif
 
+/* These are hot (every slice, every timer): with __int128 the division by
+ * the constant GEMU_PS_PER_SEC compiles to a multiplication; elsewhere
+ * (32-bit hosts) gemu/dev/u128.h does it the long way. */
+#if defined(__SIZEOF_INT128__)
 typedef unsigned __int128 u128;
 
 GemuTime gemu_clocks(uint64_t hz, uint64_t cycles) {
@@ -28,6 +33,22 @@ uint64_t gemu_cycles_to(uint64_t hz, GemuTime t) {
     u128 v = ((u128)t * hz + GEMU_PS_PER_SEC - 1) / GEMU_PS_PER_SEC;
     return v > UINT64_MAX ? UINT64_MAX : (uint64_t)v;
 }
+#else
+GemuTime gemu_clocks(uint64_t hz, uint64_t cycles) {
+    if (!hz)
+        return GEMU_TIME_NEVER;
+    uint64_t v = gemu_muldiv_sat(cycles, GEMU_PS_PER_SEC, hz);
+    return v > GEMU_TIME_NEVER ? GEMU_TIME_NEVER : (GemuTime)v;
+}
+
+uint64_t gemu_cycles_in(uint64_t hz, GemuTime t) {
+    return gemu_muldiv_sat(t, hz, GEMU_PS_PER_SEC);
+}
+
+uint64_t gemu_cycles_to(uint64_t hz, GemuTime t) {
+    return gemu_muldiv_ceil_sat(t, hz, GEMU_PS_PER_SEC);
+}
+#endif
 
 static GemuTime add_sat(GemuTime a, GemuTime b) {
     return a > GEMU_TIME_NEVER - b ? GEMU_TIME_NEVER : a + b;
@@ -548,7 +569,7 @@ static uint64_t host_ns(void) {
     if (!freq.QuadPart)
         QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&c);
-    return (uint64_t)((u128)c.QuadPart * 1000000000u / (uint64_t)freq.QuadPart);
+    return gemu_muldiv_sat((uint64_t)c.QuadPart, 1000000000u, (uint64_t)freq.QuadPart);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

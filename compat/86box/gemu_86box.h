@@ -50,6 +50,7 @@ typedef struct _device_ device_t;           /* <86box/device.h> */
 typedef struct Gemu86BoxIo Gemu86BoxIo;
 typedef struct Gemu86BoxTimer Gemu86BoxTimer;
 typedef struct Gemu86BoxSound Gemu86BoxSound;
+typedef struct Gemu86BoxMem Gemu86BoxMem;
 
 #define GEMU_86BOX_MAX_OPTIONS 32
 
@@ -88,6 +89,9 @@ typedef struct Gemu86BoxDev {
     GemuDevice     *dma;                    /* the machine's 8237 (dma.c), found when needed */
     void           *blobs[8];               /* gemu_86box_state_blob()'s records */
     unsigned        n_blobs;
+    Gemu86BoxMem   *mem;                    /* its memory mappings (mem.h) */
+    uint8_t       **roms;                   /* rom_init()'s buffers: the layer's to free */
+    unsigned        n_roms;
 } Gemu86BoxDev;
 
 bool gemu_86box_init(GemuDevice *d, const Gemu86BoxPort *p);

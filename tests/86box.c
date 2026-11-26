@@ -10,9 +10,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <86box/86box.h>
 #include <86box/device.h>
 #include <86box/io.h>
+#include <86box/mem.h>
 #include <86box/pic.h>
 #include <86box/plat.h>
 #include <86box/timer.h>
@@ -24,6 +26,8 @@
 #include "gemu/dev/space.h"
 #include "gemu/dev/state.h"
 #include "gemu/dev/stream.h"
+#include "gemu/dev/u128.h"
+#include "gemu/util.h"
 #include <math.h>
 
 static unsigned checks;
@@ -45,7 +49,16 @@ typedef struct tdev_t {
     unsigned   ticks, onces, bigs;
     GemuTime   tick_at[64], last_at, big_at;   /* test only: when they fired */
     uint64_t   tick_tsc[64], big_t0;
+    mem_mapping_t win;                  /* a 4K window of card memory at 30000h */
+    uint8_t    winram[4096];
 } tdev_t;
+
+static uint8_t win_read(uint32_t addr, void *priv) {
+    return ((tdev_t *) priv)->winram[addr & 0xFFF] ^ 0x5A;     /* a register-ish view */
+}
+static void win_write(uint32_t addr, uint8_t val, void *priv) {
+    ((tdev_t *) priv)->winram[addr & 0xFFF] = val;
+}
 
 static unsigned closed;
 
@@ -88,8 +101,16 @@ static void tdev_out(uint16_t port, uint8_t val, void *priv) {
             else
                 timer_disable(&dev->once);
             break;
-        case 3:                                          /* take port base off */
-            io_removehandler(dev->base, 1, tdev_in, NULL, NULL, tdev_out, tdev_outw, NULL, dev);
+        case 3:                                          /* port base off; the window */
+            switch (val) {
+                case 0: io_removehandler(dev->base, 1, tdev_in, NULL, NULL, tdev_out, tdev_outw, NULL, dev); break;
+                case 1: mem_mapping_disable(&dev->win); break;
+                case 2: mem_mapping_enable(&dev->win); break;
+                case 3: mem_mapping_set_addr(&dev->win, 0x31000, 0x1000); break;
+                case 4: mem_mapping_set_addr(&dev->win, 0x30000, 0x1000); break;
+                case 5: mem_mapping_set_handler(&dev->win, NULL, NULL, NULL, win_write, NULL, NULL); break;   /* reads: exec */
+                case 6: mem_mapping_set_handler(&dev->win, win_read, NULL, NULL, NULL, NULL, NULL); break;   /* read-only */
+            }
             break;
     }
 }
@@ -123,6 +144,8 @@ static void *tdev_init(UNUSED(const device_t *info)) {
     timer_add(&dev->tick, tdev_tick, dev, 0);
     timer_add(&dev->once, tdev_once, dev, 0);
     timer_add(&dev->big, tdev_big, dev, 0);
+    mem_mapping_add(&dev->win, 0x30000, 0x1000, win_read, NULL, NULL, win_write, NULL, NULL,
+                    dev->winram, MEM_MAPPING_EXTERNAL, dev);
     if (device_get_config_int("ticking"))
         timer_set_delay_u64(&dev->tick, dev->period * TIMER_USEC);
     pclog("tdev: %s at %03X, IRQ %d\n", dev->label, dev->base, dev->irq);
@@ -166,7 +189,9 @@ static bool tdev_state(GemuDevice *d, void *priv) {
     tdev_t *dev = priv;
     return GEMU_STATE_VAR(d, "reg", dev->reg) && GEMU_STATE_VAR(d, "irq_state", dev->irq_state) &&
            GEMU_STATE_VAR(d, "ticks", dev->ticks) && GEMU_STATE_VAR(d, "onces", dev->onces) &&
-           GEMU_STATE_VAR(d, "bigs", dev->bigs);
+           GEMU_STATE_VAR(d, "bigs", dev->bigs) && GEMU_STATE_ARRAY(d, "winram", dev->winram) &&
+           GEMU_STATE_VAR(d, "win.enable", dev->win.enable) &&
+           GEMU_STATE_VAR(d, "win.base", dev->win.base) && GEMU_STATE_VAR(d, "win.size", dev->win.size);
 }
 GEMU_86BOX_PORT(tdev_type, tdev_device, "tdev", tdev_state, NULL, false);
 
@@ -233,11 +258,13 @@ static uint8_t irr(void) {
 }
 
 /* When the k-th tick (from 1) is due: the timestamp, rounded up */
+static GemuTime at_ts(GemuU128 ts) {             /* a 32.32 timestamp's moment, rounded up */
+    uint64_t rem, q = gemu_u128_div64(gemu_u128_mul(ts, GEMU_PS_PER_SEC), (uint64_t)BUS_HZ << 32, &rem);
+    return q + (rem != 0);
+}
 static GemuTime tick_due(uint64_t start_ts, unsigned k, unsigned period_us) {
-    unsigned __int128 ts = ((unsigned __int128)start_ts << 32) +
-                           (unsigned __int128)k * period_us * TIMER_USEC;
-    unsigned __int128 den = (unsigned __int128)BUS_HZ << 32;
-    return (GemuTime)((ts * GEMU_PS_PER_SEC + den - 1) / den);
+    return at_ts(gemu_u128_add(gemu_u128_shl(gemu_u128(start_ts), 32),
+                               gemu_u128_mul64((uint64_t)k * period_us, TIMER_USEC)));
 }
 
 /* ── The AdLib ──────────────────────────────────────────────────────────── */
@@ -465,11 +492,10 @@ int main(void) {
         gemu_machine_run_until(m, GEMU_SEC(4));
         CHECK(ta->bigs == 1);
         /* 1 s + 1 s + 0.5 s of TIMER_USEC steps from t0 */
-        unsigned __int128 ts = ((unsigned __int128)t0 << 32) +
-                               (unsigned __int128)2000000u * TIMER_USEC +
-                               (unsigned __int128)(uint64_t)(500000.0 * (double)TIMER_USEC);
-        unsigned __int128 den = (unsigned __int128)BUS_HZ << 32;
-        CHECK(ta->big_at == (GemuTime)((ts * GEMU_PS_PER_SEC + den - 1) / den));
+        GemuU128 ts = gemu_u128_add(gemu_u128_add(gemu_u128_shl(gemu_u128(t0), 32),
+                                                  gemu_u128_mul64(2000000u, TIMER_USEC)),
+                                    gemu_u128((uint64_t)(500000.0 * (double)TIMER_USEC)));
+        CHECK(ta->big_at == at_ts(ts));
     }
 
     /* ── Save state: the timers mid-period, the driver's fields ── */
@@ -582,6 +608,107 @@ int main(void) {
 
     gemu_machine_free(m);
     m = NULL;
+    /* ── Memory mappings: a card's window, moved, disabled, re-handled, in
+     *    the order 86Box gives them; after a load where the state says ── */
+    build();
+    a = gemu_device_add(m, &tdev_type, "a", isa, "base=0x300,ticking=off");
+    CHECK(a);
+    start();
+    ta = gemu_86box_priv(a);
+    gemu_space_write8(mem, 0x30010, 0x11);                /* "program": no isa-memory here */
+    CHECK(ta->winram[0x10] == 0x11 && gemu_space_read8(mem, 0x30010) == (0x11 ^ 0x5A));
+    uint8_t pk;
+    CHECK(gemu_space_peek8(mem, 0x30010, &pk) && pk == 0x11);   /* the monitor: exec */
+    out8(0x303, 1);                                       /* disabled */
+    CHECK(gemu_space_read8(mem, 0x30010) == 0xFF);
+    gemu_space_write8(mem, 0x30010, 0x22);
+    CHECK(ta->winram[0x10] == 0x11);
+    out8(0x303, 2);                                       /* enabled */
+    CHECK(gemu_space_read8(mem, 0x30010) == (0x11 ^ 0x5A));
+    out8(0x303, 3);                                       /* moved to 31000h */
+    CHECK(gemu_space_read8(mem, 0x30010) == 0xFF && gemu_space_read8(mem, 0x31010) == (0x11 ^ 0x5A));
+    out8(0x303, 5);                                       /* no read handler: reads use exec */
+    CHECK(gemu_space_read8(mem, 0x31010) == 0x11);
+    out8(0x303, 6);                                       /* no write handler: writes don't arrive */
+    gemu_space_write8(mem, 0x31010, 0x33);
+    CHECK(ta->winram[0x10] == 0x11 && gemu_space_read8(mem, 0x31010) == (0x11 ^ 0x5A));
+    /* two cards' windows on one place: the one given it last wins */
+    GemuDevice *b2 = gemu_device_add(m, &tdev_type, "b", isa, "base=0x320,ticking=off");
+    CHECK(b2);                                            /* (hot-plugged: its window at 30000h) */
+    tdev_t *tb2 = gemu_86box_priv(b2);
+    tb2->winram[0x10] = 0x44;
+    CHECK(gemu_space_read8(mem, 0x30010) == (0x44 ^ 0x5A));
+    out8(0x303, 4);                                       /* a's back to 30000h, later: a's */
+    CHECK(gemu_space_read8(mem, 0x30010) == (0x11 ^ 0x5A));
+    /* a load puts the window where the state had it */
+    out8(0x303, 3);                                       /* a at 31000h */
+    uint8_t *ms;
+    size_t msn;
+    CHECK(gemu_machine_save_state(m, &ms, &msn));
+    out8(0x303, 4);
+    ta->winram[0x10] = 0x99;
+    CHECK(gemu_space_read8(mem, 0x31010) == 0xFF);
+    CHECK(gemu_machine_load_state(m, ms, msn));
+    CHECK(gemu_space_read8(mem, 0x31010) == (0x11 ^ 0x5A) && ta->winram[0x10] == 0x11);
+    CHECK(gemu_space_read8(mem, 0x30010) == (0x44 ^ 0x5A));   /* b's again */
+    free(ms);
+    gemu_device_destroy(b2);                              /* its window goes */
+    CHECK(gemu_space_read8(mem, 0x30010) == 0xFF);
+
+    /* ── The ISA ROM board: an image at D0000h, read-only; a flash socket
+     *    keeps its writes in GEMU's settings directory and in the state ── */
+    {
+        char cwd[512];
+        CHECK(getcwd(cwd, sizeof cwd));
+#ifdef _WIN32                                             /* not the user's settings */
+        CHECK(_putenv_s("LOCALAPPDATA", cwd) == 0);
+#else
+        CHECK(setenv("HOME", cwd, 1) == 0);
+#endif
+        char nvr[1024];
+        gemu_config_path(nvr, sizeof nvr, "86box/isarom_0_1.nvr");
+        uint8_t img[4096];
+        for (unsigned i = 0; i < sizeof img; i++) img[i] = (uint8_t)(i * 7);
+        img[0] = 0x55;
+        img[1] = 0xAA;
+        FILE *rf = fopen("test.rom", "wb");
+        CHECK(rf && fwrite(img, 1, sizeof img, rf) == sizeof img && !fclose(rf));
+        build();
+        GemuDevice *rb = gemu_device_add_type(m, "isarom", "rom", isa,
+                                              "bios_fn=test.rom,bios_addr=0xD0000,bios_size=4096");
+        CHECK(rb);
+        start();
+        CHECK(gemu_space_read8(mem, 0xD0000) == 0x55 && gemu_space_read8(mem, 0xD0001) == 0xAA);
+        CHECK(gemu_space_read8(mem, 0xD0FFF) == img[0xFFF] && gemu_space_read8(mem, 0xD1000) == 0xFF);
+        gemu_space_write8(mem, 0xD0002, 0x00);            /* a ROM */
+        CHECK(gemu_space_read8(mem, 0xD0002) == img[2]);
+        CHECK(!gemu_device_add_type(m, "isarom", "r2", isa, "bios_addr=0xD1000"));   /* not a choice */
+        /* a flash socket at C8000h */
+        build();
+        rb = gemu_device_add_type(m, "isarom", "rom", isa,
+                                  "bios_fn=test.rom,bios_addr=0xC8000,bios_size=4096,rom_writes_enabled=on");
+        CHECK(rb);
+        start();
+        gemu_space_write8(mem, 0xC8010, 0xEE);
+        CHECK(gemu_space_read8(mem, 0xC8010) == 0xEE);
+        CHECK(gemu_machine_save_state(m, &ms, &msn));
+        gemu_space_write8(mem, 0xC8010, 0xDD);
+        CHECK(gemu_machine_load_state(m, ms, msn));
+        CHECK(gemu_space_read8(mem, 0xC8010) == 0xEE);     /* the flash is state */
+        free(ms);
+        gemu_device_destroy(rb);                          /* closes: the flash to its NVR file */
+        FILE *nf = fopen(nvr, "rb");
+        uint8_t nv[4096];
+        CHECK(nf && fread(nv, 1, sizeof nv, nf) == sizeof nv && !fclose(nf) && nv[0x10] == 0xEE);
+        build();                                          /* and back in the next run */
+        CHECK(gemu_device_add_type(m, "isarom", "rom", isa,
+                                   "bios_fn=test.rom,bios_addr=0xC8000,bios_size=4096,rom_writes_enabled=on"));
+        start();
+        CHECK(gemu_space_read8(mem, 0xC8010) == 0xEE && gemu_space_read8(mem, 0xC8011) == img[0x11]);
+        remove("test.rom");
+        remove(nvr);
+    }
+
     /* ── The Sound Blaster 2.0: DSP reset and version, 8-bit DMA playback
      *    with its IRQ at the end, auto-init blocks, save and load ── */
     sound_machine("sb2.0", NULL);

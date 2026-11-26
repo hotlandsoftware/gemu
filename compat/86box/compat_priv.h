@@ -25,3 +25,7 @@ void gemu_86box_sound_pre_save(Gemu86BoxDev *b);
 void gemu_86box_sound_post_load(Gemu86BoxDev *b);
 void gemu_86box_sound_free(Gemu86BoxDev *b);
 void gemu_86box_timers_free(Gemu86BoxDev *b);   /* timer.c: its records */
+/* mem.c: the core mappings again from the structures (after a load); off,
+ * with the ROM buffers (after the driver's close) */
+void gemu_86box_mem_post_load(Gemu86BoxDev *b);
+void gemu_86box_mem_free(Gemu86BoxDev *b);

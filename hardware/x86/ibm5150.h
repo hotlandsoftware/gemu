@@ -53,6 +53,7 @@ typedef struct Ibm5150State {
     GemuMachine *machine;
     GemuSpace   *io;        /* ports: A0-A9 decoded (a mirror of 0-3FFh) */
     GemuSpace   *bus;       /* the memory bus as DMA sees it */
+    GemuSpace   *isa_mem;   /* the cards' memory: what the board doesn't decode */
     GemuDevice  *dev_cpu, *dev_dma, *dev_pic, *dev_pit, *dev_ppi, *dev_kbd, *dev_speaker;
     GemuExecutor *cpu_exec; /* the 8088 on the scheduler (stage D3) */
     uint64_t     run_done;  /* CPU clocks in the executor's current run */

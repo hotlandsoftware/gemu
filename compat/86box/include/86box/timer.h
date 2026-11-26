@@ -15,12 +15,24 @@
 #define _TIMER_H_
 #include <stdint.h>
 
+#if defined(__SIZEOF_INT128__)
 #ifndef int128_t
 #define int128_t __int128
 #endif
 
 #ifndef uint128_t
 #define uint128_t unsigned __int128
+#endif
+#else
+/* GEMU: a host without __int128 (32-bit Windows): 64 bits, and the two
+ * timer_get_remaining_*() below saturate past 2^31 clocks (minutes). */
+#ifndef int128_t
+#define int128_t int64_t
+#endif
+
+#ifndef uint128_t
+#define uint128_t uint64_t
+#endif
 #endif
 
 extern uint64_t tsc;
@@ -149,6 +161,7 @@ timer_get_ts_int(pc_timer_t *timer)
 
 /*Return remaining time before timer expires, in us. If the timer has already
   expired then return 0*/
+#if defined(__SIZEOF_INT128__)
 static __inline uint64_t
 timer_get_remaining_us(pc_timer_t *timer)
 {
@@ -178,6 +191,43 @@ timer_get_remaining_u64(pc_timer_t *timer)
 
     return 0;
 }
+
+#else
+static __inline uint64_t
+timer_get_remaining_us(pc_timer_t *timer)
+{
+    if (timer->flags & TIMER_ENABLED) {
+        int64_t whole = (int64_t) (timer->ts_integer - tsc);
+
+        if (whole < 0)
+            return 0;
+        if (whole > 0x7fffffffLL)
+            whole = 0x7fffffffLL;
+        return ((((uint64_t) whole) << 32) | timer->ts_frac) / TIMER_USEC;
+    }
+
+    return 0;
+}
+
+/*Return remaining time before timer expires, in 32:32 timestamp format. If the
+  timer has already expired then return 0*/
+static __inline uint128_t
+timer_get_remaining_u64(pc_timer_t *timer)
+{
+    if (timer->flags & TIMER_ENABLED) {
+        int64_t whole = (int64_t) (timer->ts_integer - tsc);
+
+        if (whole < 0)
+            return 0;
+        if (whole > 0x7fffffffLL)
+            whole = 0x7fffffffLL;
+        return (((uint64_t) whole) << 32) | timer->ts_frac;
+    }
+
+    return 0;
+}
+
+#endif
 
 /*Set timer callback function*/
 static __inline void

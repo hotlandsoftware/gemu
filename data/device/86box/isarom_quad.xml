@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- An 86Box v6.0 driver through GEMU's 86Box layer (compat/86box). -->
+<device name="isarom_quad" description="Generic ISA ROM board: four ROM sockets (86Box)" status="working">
+    <machine name="ibm5150"/>
+    <type symbol="gemu_86box_isarom_quad_type" source="compat/86box/ports/isarom.c"/>
+</device>

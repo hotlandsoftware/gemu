@@ -56,11 +56,11 @@ CORE_SRC_GTK = [
 # (third_party/86box/v6.0, compiled inside the ports).
 COMPAT_86BOX = ['compat/86box/device.c', 'compat/86box/io.c', 'compat/86box/timer.c',
                 'compat/86box/pic.c', 'compat/86box/sound.c', 'compat/86box/fm.c',
-                'compat/86box/dma.c', 'compat/86box/absent.c']
+                'compat/86box/dma.c', 'compat/86box/absent.c', 'compat/86box/mem.c']
 COMPAT_86BOX_PORTS = ['compat/86box/ports/novell_cardkey.c', 'compat/86box/ports/snd_adlib.c',
                       'compat/86box/ports/snd_opl2_nuked.c', 'compat/86box/ports/snd_cms.c',
                       'compat/86box/ports/snd_sb.c', 'compat/86box/ports/snd_sb_dsp.c',
-                      'compat/86box/ports/fifo.c']
+                      'compat/86box/ports/fifo.c', 'compat/86box/ports/isarom.c']
 FAMILY_SRC = {
     'chip8': [
         'cpu/chip8/chip8_cpu.c', 'cpu/chip8/octo.c',
@@ -290,7 +290,8 @@ TESTS = [
     dict(name='86box', family=None, kind='device', src='tests/86box.c',
          links=DEV_CORE_LINKS + COMPAT_86BOX + COMPAT_86BOX_PORTS + [
              'hardware/device/controller/i8259.c', 'hardware/device/controller/i8259_dev.c',
-             'hardware/device/controller/i8237.c', 'hardware/device/controller/i8237_dev.c'],
+             'hardware/device/controller/i8237.c', 'hardware/device/controller/i8237_dev.c',
+             'core/src/util.c'],
          cflags='-Werror'),
     dict(name='pc_devices', family=None, kind='device', src='tests/pc_devices.c',
          links=DEV_CORE_LINKS + [

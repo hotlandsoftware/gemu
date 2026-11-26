@@ -125,13 +125,16 @@ static uint8_t bus_read8(uint32_t addr, void *ud) {
         return s->bios[addr - IBM5150_BIOS_BASE];
     if (s->has_hdc && addr >= IBM5150_HDC_ROM_BASE && addr < IBM5150_HDC_ROM_BASE + s->hdc_rom_mapped)
         return s->hdc_rom[addr - IBM5150_HDC_ROM_BASE];
-    return 0xFF;
+    /* a card's memory, or open bus (FFh) - the space only when a card
+     * has mapped some (the boot reads unclaimed memory often) */
+    return gemu_space_mappings(s->isa_mem) ? gemu_space_read8(s->isa_mem, addr) : 0xFF;
 }
 static void bus_write8(uint32_t addr, uint8_t val, void *ud) {
     Ibm5150State *s = ud;
     if (addr < s->ram_size) { s->ram[addr] = val; return; }
     if (video_mem_write(s, addr, val)) return;
-    /* ROM regions: writes silently ignored, matching real hardware */
+    /* the board's ROMs ignore writes, matching real hardware; a card may not */
+    if (gemu_space_mappings(s->isa_mem)) gemu_space_write8(s->isa_mem, addr, val);
 }
 
 /* Monitor memory view (20-bit physical): RAM, video RAM and the ROMs are
@@ -154,7 +157,7 @@ static bool ibm5150_mon_read(void *ud, uint64_t addr, uint8_t *val) {
         *val = s->hdc_rom[addr - IBM5150_HDC_ROM_BASE];
         return true;
     }
-    return false;
+    return addr <= 0xFFFFF && gemu_space_peek8(s->isa_mem, addr, val);   /* a card's ROM */
 }
 
 static bool ibm5150_mon_write(void *ud, uint64_t addr, uint8_t val) {
@@ -1083,7 +1086,9 @@ static bool build_board(Ibm5150State *s) {
     if (!m) return false;
     s->io = gemu_space_new(m, "io", 16, 8, GEMU_LITTLE_ENDIAN);
     s->bus = gemu_space_new(m, "program", 20, 8, GEMU_LITTLE_ENDIAN);
-    if (!s->io || !s->bus || !gemu_space_map(s->bus, 0, 0x100000, &bus_io, s, 0, 0))
+    /* the cards' memory (option ROMs, ...): what the board doesn't decode */
+    s->isa_mem = gemu_space_new(m, "isa-memory", 20, 8, GEMU_LITTLE_ENDIAN);
+    if (!s->io || !s->bus || !s->isa_mem || !gemu_space_map(s->bus, 0, 0x100000, &bus_io, s, 0, 0))
         return false;
 
     char sw[48], clock[32];

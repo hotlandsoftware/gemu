@@ -236,6 +236,30 @@ const char *device_get_config_string(const char *name) {
     return s ? s : "";
 }
 
+static bool count_type(GemuDevice *d, void *ud) {
+    struct { const GemuDeviceType *t; GemuDevice *self; int n; bool done; } *c = ud;
+    if (d == c->self) {
+        c->done = true;
+        return false;
+    }
+    if (d->type == c->t)
+        c->n++;
+    return true;
+}
+
+int device_get_instance(void) {
+    Gemu86BoxDev *b = gemu_86box_need("device_get_instance");
+    struct { const GemuDeviceType *t; GemuDevice *self; int n; bool done; } c =
+        { b->dev->type, b->dev, 0, false };
+    gemu_device_walk(gemu_machine_root(b->dev->machine), count_type, &c);
+    return c.n;
+}
+
+const char *device_get_internal_name(const device_t *dev) { return dev ? dev->internal_name : ""; }
+
+const device_t device_none     = { .name = "None", .internal_name = "none" };
+const device_t device_internal = { .name = "Internal", .internal_name = "internal" };
+
 /* ── The device ───────────────────────────────────────────────────────────── */
 
 bool gemu_86box_init(GemuDevice *d, const Gemu86BoxPort *p) {
@@ -318,6 +342,7 @@ void gemu_86box_destroy(GemuDevice *d) {
     }
     b->priv = NULL;
     gemu_86box_io_free(b);
+    gemu_86box_mem_free(b);
     gemu_86box_timers_free(b);
     gemu_86box_sound_free(b);
     for (unsigned i = 0; i < b->n_blobs; i++)
@@ -340,6 +365,7 @@ void gemu_86box_post_load(GemuDevice *d) {
     Gemu86BoxDev *b = d->priv;
     if (!b->port)
         return;
+    gemu_86box_mem_post_load(b);
     gemu_86box_sound_post_load(b);
     if (!b->port->post_load)
         return;
