@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- An 86Box v6.0 driver through GEMU's 86Box layer (compat/86box). -->
+<device name="sb" description="Sound Blaster 1.0 (DSP 1.05, CMS, OPL2; 86Box)" status="working">
+    <machine name="ibm5150"/>
+    <type symbol="gemu_86box_sb1_type" source="compat/86box/ports/snd_sb.c"/>
+</device>

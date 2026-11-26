@@ -60,6 +60,8 @@ typedef struct Gemu86BoxPort {
     bool          (*state)(GemuDevice *d, void *priv);
     /* After a load: what the state implies (moved ports, ...). */
     void          (*post_load)(GemuDevice *d, void *priv);
+    /* Before device_t.close: what the driver's close forgets to free. */
+    void          (*close)(void *priv);
     GemuOptionDef  *options;                /* GEMU_86BOX_MAX_OPTIONS + 1, filled at startup */
     const GemuDeviceType *type;
 } Gemu86BoxPort;
@@ -83,6 +85,9 @@ typedef struct Gemu86BoxDev {
     struct Gemu86BoxDev *parent86;          /* the device whose device_add made it */
     Gemu86BoxSound *sound;                  /* its sound/music handlers (sound.h) */
     device_t       *init_dev;               /* device_add_params(): the device_t it got */
+    GemuDevice     *dma;                    /* the machine's 8237 (dma.c), found when needed */
+    void           *blobs[8];               /* gemu_86box_state_blob()'s records */
+    unsigned        n_blobs;
 } Gemu86BoxDev;
 
 bool gemu_86box_init(GemuDevice *d, const Gemu86BoxPort *p);
@@ -98,6 +103,16 @@ void gemu_86box_register(Gemu86BoxPortLink *l);
  * for n < count.  False (the machine's error says why) on a failure. */
 bool gemu_86box_connect_irqs(GemuDevice *d, const char *in_fmt, unsigned count);
 
+/* A driver structure as one state item: saved whole, and on load copied
+ * back except for the ranges listed, which keep their live values - its
+ * pointers (to functions, to other structures: set at init, the same after
+ * a load) and its timers (whose fields the layer saves itself).  The ranges
+ * end with { 0, 0 }; use GEMU_86BOX_KEEP(type, member) or offsets. */
+typedef struct { size_t offset, size; } Gemu86BoxKeep;
+#define GEMU_86BOX_KEEP(type, member) { offsetof(type, member), sizeof(((type *)0)->member) }
+bool gemu_86box_state_blob(GemuDevice *d, const char *name, void *ptr, size_t size,
+                           const Gemu86BoxKeep *keep);
+
 /* The driver's private data, for a machine or a test that looks inside. */
 void *gemu_86box_priv(GemuDevice *d);
 
@@ -108,10 +123,13 @@ void *gemu_86box_priv(GemuDevice *d);
 #endif
 
 #define GEMU_86BOX_PORT(sym, devt, tname, state_fn, post_load_fn, is_stateless)          \
+    GEMU_86BOX_PORT_CLOSE(sym, devt, tname, state_fn, post_load_fn, NULL, is_stateless)
+/* The same, with a close hook (see Gemu86BoxPort.close). */
+#define GEMU_86BOX_PORT_CLOSE(sym, devt, tname, state_fn, post_load_fn, close_fn, is_stateless) \
     extern const GemuDeviceType sym;                                                    \
     static GemuOptionDef sym##_options[GEMU_86BOX_MAX_OPTIONS + 1];                     \
     static const Gemu86BoxPort sym##_port = {                                           \
-        &(devt), (tname), (state_fn), (post_load_fn), sym##_options, &sym };            \
+        &(devt), (tname), (state_fn), (post_load_fn), (close_fn), sym##_options, &sym };\
     static Gemu86BoxPortLink sym##_link = { &sym##_port, 0 };                           \
     static bool sym##_init(GemuDevice *d) { return gemu_86box_init(d, &sym##_port); }   \
     GEMU_86BOX_CTOR static void sym##_ctor(void) {                                      \

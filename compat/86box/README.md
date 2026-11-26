@@ -25,10 +25,17 @@ third_party/86box/v6.0/       the drivers' sources, unchanged (README.md there)
 | `fm_driver_get`, `fm_driver_get_ex` (`fm.c`) | the Nuked OPL2 (YM3812) as a sub-device; other chips stop GEMU |
 | `cycles`, `isa_timing` (`"cpu.h"`) | a sink: GEMU's CPUs time their own bus cycles |
 | `mca_add` | stops GEMU: no machine has an MCA bus |
+| `dma_channel_read`, `dma_channel_write`, `dma_set_drq` (`dma.c`) | the machine's 8237 (GEMU's `i8237`, channels 0-3), with 86Box's `DMA_NODATA`/`DMA_OVER` rules |
+| `midi_raw_out_byte`, `midi_in_handler`, `midi_clear_buffer` | a MIDI port with nothing plugged in: output lost, no input |
+| `sound_set_cd_audio_filter`, `sound_set_pc_speaker_filter` | nothing: no CD audio, and the machine's speaker isn't mixed through a card |
+| `rom_present`, `rom_fopen` | "not there": 86Box's ROM set isn't GEMU's |
+| game port, ISA PnP, IDE, MPU-401, EMU8000, Aztech (`absent.c`) | stop GEMU with a message - only models GEMU doesn't offer reach them |
 
 The headers declare only what is implemented: a driver that uses anything
-else - `mem_mapping_*`, DMA, CPU state, 86Box's global settings - doesn't
-compile.  That's the point: each gap is filled when a
+else - `mem_mapping_*`, CPU state, 86Box's global settings - doesn't
+compile.  One driver file can hold many models (`snd_sb.c`: the Sound
+Blaster 1.0 to the AWE64), so what the other models refer to must link:
+`absent.c` has those, each stopping GEMU if it is ever reached.  That's the point: each gap is filled when a
 port needs it (E2-E5 in the plan), never by a silent stub.
 
 Things to know:
@@ -74,7 +81,12 @@ Things to know:
 
    Every device saves (question 7): register what the driver changes after
    init; a driver whose private data all comes from its options passes
-   `NULL, NULL, true` (stateless).  Its timers register themselves.  A
+   `NULL, NULL, true` (stateless).  For a big structure,
+   `gemu_86box_state_blob(d, name, ptr, size, keep)` saves it whole and on
+   load keeps the listed ranges (its pointers and timers) at their live
+   values - `GEMU_86BOX_KEEP(type, member)` names one.
+   `GEMU_86BOX_PORT_CLOSE` adds a hook that runs before the driver's close,
+   for what the close forgets to free.  Its timers register themselves.  A
    `post_load` hook redoes what follows from the state (ports moved by a
    register, say).  Upstream warnings are silenced around the `#include`
    with `#pragma GCC diagnostic`, not by editing the file.
@@ -92,10 +104,20 @@ Things to know:
 |---|---|---|
 | `novellkeycard` | `src/device/novell_cardkey.c` | (none yet) |
 | `adlib` | `src/sound/snd_adlib.c` | the 5150: `-device adlib` |
-| `ym3812_nuked_opl2` | `src/sound/snd_opl2_nuked.c` | the AdLib's chip |
+| `ym3812_nuked_opl2` | `src/sound/snd_opl2_nuked.c` | the AdLib's and the Sound Blasters' chip |
+| `sb`, `sb1.5`, `sb2.0` | `src/sound/snd_sb.c` (+ `snd_sb_dsp.c`, `snd_cms.c`) | the 5150: `-device sb2.0`, ... |
+| `cms` | `src/sound/snd_cms.c` | the 5150: `-device cms` (Game Blaster) |
+| (libraries) | `snd_sb_dsp.c`, `utils/fifo.c` | inside the Sound Blaster |
 
 The OPL2's port saves the chip whole and moves its pointers (all into the
 chip) on load, and switches off the driver's CPU-cycle charging.
+
+The Sound Blaster's port saves `sb_t` whole but for its pointers and timers.
+Its output filter (`filters.h`, `sb_iir`) keeps its history in
+function-local statics - shared by every card, as in 86Box - which a port
+can't reach: for about a millisecond after a load the sound settles from
+where the filter was.  Everything the CPU can see is exact.  The port also
+frees the DSP's ESPCM FIFO, which v6.0's `sb_dsp_close()` leaks.
 
 `tests/86box.c` is the reference: a driver written as 86Box's are, the
 Novell key card and the AdLib from `third_party`, on a small machine.

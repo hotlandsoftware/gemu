@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- An 86Box v6.0 driver through GEMU's 86Box layer (compat/86box). -->
+<device name="cms" description="Creative Music System / Game Blaster (2x SAA1099; 86Box)" status="working">
+    <machine name="ibm5150"/>
+    <type symbol="gemu_86box_cms_type" source="compat/86box/ports/snd_cms.c"/>
+</device>

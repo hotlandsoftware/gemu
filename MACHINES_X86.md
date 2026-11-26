@@ -11,7 +11,7 @@
 
 | Name | Full name | Status | Notes |
 |------|-----------|--------|-------|
-| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA, MDA (`-vga mda`) or Hercules (`-vga hercules`), or a colour and a monochrome card on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`), the AdLib (`-device adlib`); `savevm`/`loadvm`. No cassette, printer yet |
+| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA, MDA (`-vga mda`) or Hercules (`-vga hercules`), or a colour and a monochrome card on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`), the AdLib, the Sound Blaster 1.0-2.0 and the Game Blaster (`-device adlib|sb2.0|cms`); `savevm`/`loadvm`. No cassette, printer yet |
 
 ## IBM 5150 hardware
 
@@ -131,11 +131,20 @@ work as in QEMU.
 
 ## Sound
 
-The speaker, and `-device adlib`: the AdLib Music Synthesizer Card, an OPL2
-(YM3812) at ports 388h-389h - 86Box's driver and its Nuked OPL2 core,
-through GEMU's 86Box layer (`compat/86box`).  Software finds it the way
-AdLib documented, by its timers, and both play through the same output.
-`wavcapture FILE` in the monitor records them.
+The speaker, and sound cards from 86Box (through GEMU's 86Box layer,
+`compat/86box`), all mixed to the same output:
+
+- `-device adlib`: the AdLib Music Synthesizer Card, an OPL2 (YM3812) at
+  388h-389h (the Nuked OPL2 core).
+- `-device sb2.0`, `sb1.5` or `sb`: the Sound Blaster 2.0, 1.5 or 1.0 -
+  the DSP (2.01 or 1.05: 8-bit digitised sound by DMA on channel 1,
+  auto-init on the 2.0) and an OPL2, at `base=` 220h (210h-260h)
+  on `irq=` 5 (the 2.0) or 7 (the others); the 1.0 has the Game Blaster's
+  two SAA1099s too (`cms=on` on the 1.5 and 2.0).
+- `-device cms`: the Creative Music System / Game Blaster, two Philips
+  SAA1099s at `base=` 220h.
+
+`wavcapture FILE` in the monitor records the lot.
 
 ## Saving the machine
 

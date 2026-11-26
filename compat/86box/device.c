@@ -308,15 +308,21 @@ void gemu_86box_destroy(GemuDevice *d) {
     if (!b->port || !b->dev)              /* its init never got going */
         return;
     if (live) live--;
-    if (b->port->dev->close && b->priv) {
+    if (b->priv) {
         Gemu86BoxDev *prev = gemu_86box_enter(b);
-        b->port->dev->close(b->priv);
+        if (b->port->close)
+            b->port->close(b->priv);
+        if (b->port->dev->close)
+            b->port->dev->close(b->priv);
         gemu_86box_leave(prev);
     }
     b->priv = NULL;
     gemu_86box_io_free(b);
     gemu_86box_timers_free(b);
     gemu_86box_sound_free(b);
+    for (unsigned i = 0; i < b->n_blobs; i++)
+        free(b->blobs[i]);
+    b->n_blobs = 0;
     free(b->init_dev);
     b->init_dev = NULL;
 }
@@ -346,6 +352,58 @@ void gemu_86box_pre_save(GemuDevice *d) {
     Gemu86BoxDev *b = d->priv;
     if (b->port)
         gemu_86box_sound_pre_save(b);
+}
+
+/* ── State: a structure whole, but for its pointers ────────────────────────── */
+
+typedef struct {
+    void                *ptr;
+    size_t               size;
+    const Gemu86BoxKeep *keep;
+} Blob;
+
+static void blob_save(void *ud, GemuStateWriter *w) {
+    Blob *b = ud;
+    gemu_state_write(w, b->ptr, b->size);
+}
+
+static bool blob_check(void *ud, GemuStateReader *r) {
+    Blob *b = ud;
+    if (gemu_state_left(r) == b->size)
+        return true;
+    gemu_state_refuse(r, "a driver structure of another size (another version of it)");
+    return false;
+}
+
+static bool blob_load(void *ud, GemuStateReader *r) {
+    Blob *b = ud;
+    unsigned char *tmp = malloc(b->size);
+    if (!tmp || !gemu_state_read(r, tmp, b->size)) {
+        free(tmp);
+        return false;
+    }
+    for (const Gemu86BoxKeep *k = b->keep; k && k->size; k++)
+        memcpy(tmp + k->offset, (unsigned char *)b->ptr + k->offset, k->size);
+    memcpy(b->ptr, tmp, b->size);
+    free(tmp);
+    return true;
+}
+
+bool gemu_86box_state_blob(GemuDevice *d, const char *name, void *ptr, size_t size,
+                           const Gemu86BoxKeep *keep) {
+    Gemu86BoxDev *b86 = d->priv;
+    for (const Gemu86BoxKeep *k = keep; k && k->size; k++)
+        if (k->offset > size || k->size > size - k->offset)
+            fatal("state %s: a kept range outside the structure\n", name);
+    if (b86->n_blobs == sizeof b86->blobs / sizeof b86->blobs[0])
+        fatal("state %s: more than %u structures for one device\n", name,
+              (unsigned)(sizeof b86->blobs / sizeof b86->blobs[0]));
+    Blob *b = malloc(sizeof *b);
+    if (!b)
+        fatal("out of memory\n");
+    *b = (Blob){ ptr, size, keep };
+    b86->blobs[b86->n_blobs++] = b;                    /* freed with the device */
+    return gemu_state_add_custom(d, name, blob_save, blob_check, blob_load, b);
 }
 
 /* ── Sub-devices ──────────────────────────────────────────────────────────── */

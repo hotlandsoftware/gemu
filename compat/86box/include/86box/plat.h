@@ -11,6 +11,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <86box/plat_unused.h>
+#include <86box/plat_fallthrough.h>
 
 #ifdef _WIN32
 #    define wcscasecmp _wcsicmp

@@ -30,6 +30,12 @@
 #define MUSIC_FREQ  FREQ_49716
 #define MUSICBUFLEN (MUSIC_FREQ / 36)
 
+/* (the CD-audio and wavetable rates: sizes in drivers' structures) */
+#define CD_FREQ     FREQ_44100
+#define CD_BUFLEN   (CD_FREQ / 10)
+#define WT_FREQ     FREQ_44100
+#define WTBUFLEN    (WT_FREQ / 45)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,6 +46,14 @@ extern int music_pos_global;
 /* In the device's init. */
 extern void sound_add_handler(void (*get_buffer)(int32_t *buffer, uint16_t len, void *priv), void *priv);
 extern void music_add_handler(void (*get_buffer)(int32_t *buffer, uint16_t len, void *priv), void *priv);
+/* The wavetable kind (the AWE's EMU8000) isn't here yet: stops GEMU. */
+extern void wavetable_add_handler(void (*get_buffer)(int32_t *buffer, uint16_t len, void *priv), void *priv);
+
+/* A card's mixer filtering the CD audio and the PC speaker: GEMU has no CD
+ * audio, and the machine's speaker doesn't go through a card's mixer, so
+ * these take note of nothing. */
+extern void sound_set_cd_audio_filter(void (*filter)(int channel, double *buffer, void *priv), void *priv);
+extern void sound_set_pc_speaker_filter(void (*filter)(int channel, double *buffer, void *priv), void *priv);
 
 #ifdef __cplusplus
 }

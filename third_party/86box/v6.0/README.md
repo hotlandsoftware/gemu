@@ -28,6 +28,19 @@ GPLv3-compatible before it is vendored.
 | `src/include/86box/snd_opl.h` | none in file; project GPLv2+ | none |
 | `src/sound/snd_opl2_nuked.c` | Nuked OPL2 Lite (nukeykt): GPLv2 or later, in the file | none |
 | `src/include/86box/snd_opl2_nuked.h` | Nuked OPL2 Lite: GPLv2 or later, in the file | none |
+| `src/sound/snd_sb.c` | none in file; project GPLv2+ | none |
+| `src/sound/snd_sb_dsp.c` | none in file; project GPLv2+ | none |
+| `src/sound/snd_cms.c` | none in file; project GPLv2+ | none |
+| `src/utils/fifo.c` | none in file; project GPLv2+ | none |
+| `src/include/86box/snd_sb.h` | none in file; project GPLv2+ | none |
+| `src/include/86box/snd_sb_dsp.h` | none in file; project GPLv2+ | none |
+| `src/include/86box/snd_cms.h` | none in file; project GPLv2+ | none |
+| `src/include/86box/filters.h` | none in file; project GPLv2+ | none |
+| `src/include/86box/fifo.h` | none in file; project GPLv2+ | none |
+| `src/include/86box/snd_emu8k.h` | none in file; project GPLv2+ (declarations only: the EMU8000 itself isn't vendored) | none |
+| `src/include/86box/snd_mpu401.h` | none in file; project GPLv2+ (declarations only) | none |
+| `src/include/86box/snd_azt2316a.h` | none in file; project GPLv2+ (declarations only) | none |
+| `src/include/86box/snd_azt2320.h` | none in file; project GPLv2+ (declarations only) | none |
 | `COPYING` | GPLv2 text | none |
 
 **Local changes are not allowed** without a row here saying what and why.

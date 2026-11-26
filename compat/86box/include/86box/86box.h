@@ -40,6 +40,9 @@
 extern "C" {
 #endif
 
+/* IDE controllers on non-IDE cards (GEMU offers none such: 0). */
+extern int other_ide_present;
+
 /* To stderr, as GEMU logs. */
 extern void pclog_ex(const char *fmt, va_list ap);
 extern void pclog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

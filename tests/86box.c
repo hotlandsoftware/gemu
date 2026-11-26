@@ -17,6 +17,7 @@
 #include <86box/plat.h>
 #include <86box/timer.h>
 #include "gemu_86box.h"
+#include "controller/i8237_dev.h"
 #include "controller/i8259_dev.h"
 #include "gemu/dev/line.h"
 #include "gemu/dev/scheduler.h"
@@ -188,15 +189,21 @@ static bool probe_init(GemuDevice *d) {
 static const GemuDeviceType probe_type = { .name = "probe", .size = sizeof(Probe), .init = probe_init };
 static const GemuDeviceType isa_type = { .name = "isa", .stateless = true };
 
-static GemuSpace *io;
-static GemuDevice *isa, *pic;
+static GemuSpace *io, *mem;
+static GemuDevice *isa, *pic, *dma;
+static uint8_t ram[0x10000];          /* 0-FFFFh of "program", for DMA */
 static Probe *probe;
 
 static void build(void) {
     if (m) gemu_machine_free(m);
     m = gemu_machine_new("box");
     io = gemu_space_new(m, "io", 16, 8, GEMU_LITTLE_ENDIAN);
+    mem = gemu_space_new(m, "program", 20, 8, GEMU_LITTLE_ENDIAN);
+    memset(ram, 0, sizeof ram);
+    CHECK(gemu_space_map_ram(mem, 0, sizeof ram, ram, 0, 0));
     pic = gemu_device_add_type(m, "i8259", "pic", NULL, NULL);
+    dma = gemu_device_add_type(m, "i8237", "dma", NULL, "space=program");
+    CHECK(dma);
     GemuDevice *pr = gemu_device_add(m, &probe_type, "probe", NULL, NULL);
     isa = gemu_device_add(m, &isa_type, "isa", NULL, NULL);
     CHECK(io && pic && pr && isa);
@@ -207,6 +214,8 @@ static void build(void) {
 static void start(void) {
     CHECK(gemu_machine_init(m));
     CHECK(gemu_space_map(io, 0x20, 2, &gemu_i8259_io, pic, 0, 0));
+    CHECK(gemu_space_map(io, 0x00, 16, &gemu_i8237_io, dma, 0, 0));
+    CHECK(gemu_space_map(io, 0x80, 4, &gemu_i8237_page_io, dma, 0, 0));
     for (GemuDevice *d = isa->first_child; d; d = d->next_sibling) {
         CHECK(gemu_86box_connect_irqs(d, "pic:ir%u", 8));
         CHECK(gemu_86box_connect_irqs(d, "probe:in%u", 8));
@@ -255,14 +264,18 @@ static void run_mixing(GemuTime t) {
     }
 }
 
-/* The frequency of what the sink got from sample a on: rising zero
- * crossings over the span */
+/* The frequency of what the sink got from sample a on: rising crossings
+ * of its mean over the span (a square wave of 0 and +v has no zero ones) */
 static double freq_of(size_t a, size_t b) {
-    double first = -1, last = -1;
+    double first = -1, last = -1, mean = 0;
     unsigned n = 0;
+    for (size_t i = a; i < b; i++)
+        mean += got[i];
+    mean /= (double)(b - a);
     for (size_t i = a + 1; i < b; i++)
-        if (got[i - 1] < 0 && got[i] >= 0) {
-            double x = (double)(i - 1) + got[i - 1] / (got[i - 1] - got[i]);
+        if (got[i - 1] < mean && got[i] >= mean) {
+            double y0 = got[i - 1] - mean, y1 = got[i] - mean;
+            double x = (double)(i - 1) + y0 / (y0 - y1);
             if (first < 0) first = x;
             last = x;
             n++;
@@ -290,6 +303,62 @@ static void adlib_note(void) {
         opl(inst[i][0], inst[i][1]);
     opl(0xA0, 0x44);                          /* A4: block 4, F-number 0x244 */
     opl(0xB0, 0x20 | (4 << 2) | 0x02);        /* key on */
+}
+
+/* ── The Sound Blaster and the Game Blaster ─────────────────────────────── */
+
+static void out8(uint16_t port, uint8_t v) { gemu_space_write8(io, port, v); }
+static uint8_t in8(uint16_t port) { return gemu_space_read8(io, port); }
+static void run_us(unsigned us) { gemu_machine_run_until(m, gemu_machine_time(m) + GEMU_USEC(us)); }
+
+static void dsp_write(uint8_t v) {
+    for (int i = 0; i < 1000 && (in8(0x22C) & 0x80); i++)
+        run_us(1);
+    out8(0x22C, v);
+}
+static int dsp_read(void) {
+    for (int i = 0; i < 1000; i++) {
+        if (in8(0x22E) & 0x80)
+            return in8(0x22A);
+        run_us(1);
+    }
+    return -1;
+}
+static bool dsp_reset(void) {
+    out8(0x226, 1);
+    run_us(3);
+    out8(0x226, 0);
+    return dsp_read() == 0xAA;
+}
+
+/* An 8237 channel 1 transfer of n bytes from addr: memory to the card */
+static void dma1(uint16_t addr, uint16_t n, bool autoinit) {
+    out8(0x0A, 0x05);                         /* mask 1 */
+    out8(0x0C, 0);                            /* flip-flop */
+    out8(0x0B, autoinit ? 0x59 : 0x49);       /* single, read, (auto-init,) channel 1 */
+    out8(0x02, addr & 0xFF);
+    out8(0x02, addr >> 8);
+    out8(0x83, 0);                            /* page */
+    out8(0x03, (n - 1) & 0xFF);
+    out8(0x03, (n - 1) >> 8);
+    out8(0x0A, 0x01);                         /* unmask 1 */
+}
+
+/* A square wave of `period` samples (8-bit unsigned) at addr */
+static void square(uint16_t addr, unsigned n, unsigned period) {
+    for (unsigned i = 0; i < n; i++)
+        ram[addr + i] = (i % period) < period / 2 ? 0xE0 : 0x20;
+}
+
+static GemuDevice *sound_machine(const char *type, const char *opts) {
+    build();
+    GemuDevice *d = gemu_device_add_type(m, type, type, isa, opts);
+    CHECK(d);
+    start();
+    n_got = 0;
+    gemu_mixer_set_output(m, 48000, 1, sink, NULL);
+    gemu_mixer_run(m);
+    return d;
 }
 
 int main(void) {
@@ -513,6 +582,112 @@ int main(void) {
 
     gemu_machine_free(m);
     m = NULL;
+    /* ── The Sound Blaster 2.0: DSP reset and version, 8-bit DMA playback
+     *    with its IRQ at the end, auto-init blocks, save and load ── */
+    sound_machine("sb2.0", NULL);
+    CHECK(gemu_device_find(m, "isa/sb2.0/ym3812_nuked_opl2"));
+    CHECK(dsp_reset());
+    dsp_write(0xE1);
+    int vhi = dsp_read(), vlo = dsp_read();
+    CHECK(vhi == 2 && vlo == 1);                          /* DSP 2.01 */
+    /* single-cycle: 2000 samples of a 22-sample square at 1000000/91 Hz */
+    square(0x1000, 2000, 22);
+    dma1(0x1000, 2000, false);
+    dsp_write(0xD1);                                      /* speaker on */
+    dsp_write(0x40);
+    dsp_write(0xA5);                                      /* time constant: 256 - 91 */
+    GemuTime t0 = gemu_machine_time(m);
+    unsigned irq0 = probe->rises[5];
+    size_t s0 = n_got;
+    dsp_write(0x14);
+    dsp_write((2000 - 1) & 0xFF);
+    dsp_write((2000 - 1) >> 8);
+    run_mixing(t0 + GEMU_MSEC(175));                      /* 2000 samples: 182 ms */
+    CHECK(probe->rises[5] == irq0);
+    run_mixing(t0 + GEMU_MSEC(200));
+    CHECK(probe->rises[5] == irq0 + 1);                   /* the end of the block */
+    CHECK(in8(0x08) & 0x02);                              /* the 8237: channel 1 at TC */
+    in8(0x22E);                                           /* acknowledge */
+    double fsb = freq_of(s0 + 48 * 20, s0 + 48 * 170);
+    printf("sb2.0: DMA playback at %.2f Hz (want %.2f)\n", fsb, 1000000.0 / 91 / 22);
+    CHECK(fabs(fsb - 1000000.0 / 91 / 22) < 1.0);
+    /* auto-init: 5 blocks of 1000, an IRQ each */
+    square(0x1000, 1000, 22);
+    dma1(0x1000, 1000, true);
+    dsp_write(0x48);
+    dsp_write((1000 - 1) & 0xFF);
+    dsp_write((1000 - 1) >> 8);
+    t0 = gemu_machine_time(m);
+    irq0 = probe->rises[5];
+    dsp_write(0x1C);
+    for (int k = 1; k <= 3; k++) {                        /* 91 ms a block */
+        run_mixing(t0 + GEMU_USEC(91000 * k + 5000));
+        CHECK(probe->rises[5] == irq0 + (unsigned)k);
+        in8(0x22E);
+    }
+    /* save mid-block; after a load the same sound and IRQs follow */
+    run_mixing(t0 + GEMU_MSEC(300));
+    gemu_machine_run_until(m, t0 + GEMU_MSEC(305));
+    size_t sb_from = n_got;
+    CHECK(gemu_machine_save_state(m, &as, &asn));
+    run_mixing(t0 + GEMU_MSEC(500));
+    in8(0x22E);
+    unsigned irq_first = probe->rises[5];
+    size_t sb_len = n_got - sb_from;
+    memcpy(first, got + sb_from, sb_len * sizeof *first);
+    CHECK(gemu_machine_load_state(m, as, asn));
+    n_got = sb_from;
+    run_mixing(t0 + GEMU_MSEC(500));
+    in8(0x22E);
+    /* blocks 4 and 5 end at 364 and 455 ms; 4's IRQ isn't acknowledged
+     * before 5 ends, so the line is still up: one edge, as on the card */
+    CHECK(probe->rises[5] == irq_first && irq_first == irq0 + 4);
+    /* The SB's output filter (filters.h, sb_iir) keeps its history in
+     * function-local statics - not the card's state, shared by every card
+     * in 86Box - so it isn't saved: for about a millisecond after a load it
+     * settles from where it was.  From 2 ms on, the sound is the same. */
+    CHECK(n_got - sb_from == sb_len - 240 &&
+          !memcmp(first + 240 + 96, got + sb_from + 96, (sb_len - 240 - 96) * sizeof *first));
+    /* and in a new machine, whose card was idle (the test's RAM isn't in
+     * its state, as a machine's would be: put the samples back) */
+    sound_machine("sb2.0", NULL);
+    square(0x1000, 1000, 22);
+    CHECK(gemu_machine_load_state(m, as, asn));
+    n_got = sb_from;
+    gemu_mixer_run(m);
+    run_mixing(t0 + GEMU_MSEC(500));
+    in8(0x22E);
+    CHECK(probe->rises[5] == irq_first);
+    CHECK(n_got - sb_from == sb_len - 240 &&
+          !memcmp(first + 240 + 96, got + sb_from + 96, (sb_len - 240 - 96) * sizeof *first));
+    free(as);
+    dsp_write(0xDA);                                      /* exit auto-init */
+    dsp_write(0xD3);                                      /* speaker off */
+
+    /* ── The Sound Blaster 1.0: DSP 1.05 ── */
+    sound_machine("sb", NULL);
+    CHECK(dsp_reset());
+    dsp_write(0xE1);
+    vhi = dsp_read();
+    vlo = dsp_read();
+    CHECK(vhi == 1 && vlo == 5);
+
+    /* ── The Game Blaster: a SAA1099 tone ── */
+    sound_machine("cms", NULL);
+    static const uint8_t saa[][2] = {
+        { 0x1C, 0x02 }, { 0x1C, 0x01 },                   /* reset, then sound on */
+        { 0x00, 0xFF }, { 0x08, 255 }, { 0x10, 3 }, { 0x14, 0x01 },
+    };
+    for (unsigned i = 0; i < sizeof saa / sizeof saa[0]; i++) {
+        out8(0x221, saa[i][0]);
+        out8(0x220, saa[i][1]);
+    }
+    s0 = n_got;
+    run_mixing(gemu_machine_time(m) + GEMU_MSEC(100));
+    double fcms = freq_of(s0 + 480, n_got);
+    printf("cms: tone at %.2f Hz (want %.2f)\n", fcms, (7159090.0 / 512 * 8) / 256);
+    CHECK(fabs(fcms - (7159090 / 512 << 3) / 256) < 3.0);
+
     printf("86box: %u checks passed\n", checks);
     return 0;
 }
