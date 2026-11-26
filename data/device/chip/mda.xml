@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- A display adapter as a core device type (chosen with -vga / -device, not
+     listed as a -device option from here: no <machine>). -->
+<device name="mda" description="IBM Monochrome Display Adapter" status="working">
+    <type symbol="gemu_mda_type" source="vga/x86/pc_video_dev.c"/>
+</device>

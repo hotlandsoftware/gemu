@@ -104,6 +104,7 @@ struct GemuMachine {
     GemuSpace  *spaces;           /* space.c: newest first */
     GemuSched   sched;
     GemuLines   lines;
+    struct GemuScreen *screens;   /* screen.c: in the order made */
     unsigned    load_epoch;       /* state.c: marks what a load has matched */
 };
 
@@ -149,3 +150,6 @@ void gemu_sched_state_save(GemuMachine *m, GemuStateWriter *w);
 bool gemu_sched_state_load(GemuMachine *m, GemuStateReader *r, bool apply, unsigned epoch);
 void gemu_lines_state_save(GemuMachine *m, GemuStateWriter *w);
 bool gemu_lines_state_load(GemuMachine *m, GemuStateReader *r, bool apply, unsigned epoch);
+/* screen.c: drop a device's screens (on destroy), and all of them. */
+void gemu_screens_remove_device(GemuDevice *d);
+void gemu_screens_free_all(GemuMachine *m);

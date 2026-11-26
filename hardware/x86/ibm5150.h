@@ -18,6 +18,7 @@
 #include "gemu/dev/line.h"
 #include "gemu/dev/space.h"
 #include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
 #include <stdlib.h>
 
 /* ── IBM PC 5150 (1981) machine state ───────────────────────────────────── */
@@ -68,13 +69,15 @@ typedef struct Ibm5150State {
     X86VgaType vga;       /* the primary display adapter (-vga): POST uses it */
     bool      has_cga, has_mda; /* installed cards: -vga plus an optional
                                  * second one (-device), each on its own monitor */
-    CgaDevice cga;
-    MdaDevice mda;
-    HerculesDevice herc;
+    CgaDevice *cga;       /* the cards' state lives in their devices (stage D4) */
+    MdaDevice *mda;
+    HerculesDevice *herc;
+    GemuDevice *dev_cga, *dev_mda, *dev_herc;
     bool      has_herc;
     int       n_heads;    /* monitors: 1, or 2 with both cards */
     X86VgaType head_card[2]; /* card shown on each monitor, primary first */
-    int       fb_w, fb_h; /* the shown card's framebuffer size */
+    const char *head_opts[2]; /* each card's options (-vga ..., -device ...) */
+    GemuScreen *head_screen[2]; /* its screen */
     Upd765   *fdc;        /* diskette adapter, present when -drive if=floppy is */
     GemuDrive *floppy[4];
     bool      has_fdc;
@@ -109,7 +112,6 @@ typedef struct Ibm5150State {
     GemuMonitor  *monitor;
     GemuDisplay  *display;
     RcaPcSpeaker *speaker;
-    uint32_t     *fb; /* fb_w x fb_h ARGB, rendered from the adapter each frame */
 
     bool halted_for_debug; /* set on an unimplemented/trapped opcode - keeps
                              * the machine parked so the monitor can inspect

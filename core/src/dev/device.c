@@ -40,6 +40,7 @@ void gemu_machine_free(GemuMachine *m) {
         return;
     while (m->root.last_child)
         gemu_device_destroy(m->root.last_child);
+    gemu_screens_free_all(m);
     gemu_lines_free_all(m);
     gemu_sched_free_all(m);
     gemu_space_free_all(m);
@@ -143,6 +144,7 @@ static void unlink_device(GemuDevice *d) {
  * items and options; then d. */
 static void free_device(GemuDevice *d) {
     if (d->core) {
+        gemu_screens_remove_device(d);
         gemu_lines_remove_device(d);
         gemu_sched_remove_device(d);
         gemu_state_free_items(d);
