@@ -5,6 +5,8 @@
 #include "compat_priv.h"
 #include <86box/86box.h>
 #include <86box/device.h>
+#include <86box/mca.h>
+#include "cpu.h"
 #include "gemu/dev/state.h"
 #include <inttypes.h>
 #include <stdarg.h>
@@ -14,6 +16,10 @@
 
 Gemu86BoxDev *gemu_86box_cur;
 uint64_t      gemu_86box_hz;
+static Gemu86BoxPortLink *ports;
+/* device_add(): what the child's init gets */
+static Gemu86BoxDev *pending_parent;
+static void         *pending_params;
 static unsigned live;              /* devices; with none, the clock is free again */
 extern uint64_t tsc;
 extern uint64_t TIMER_USEC;
@@ -49,13 +55,16 @@ Gemu86BoxDev *gemu_86box_enter(Gemu86BoxDev *b) {
     Gemu86BoxDev *prev = gemu_86box_cur;
     gemu_86box_cur = b;
     tsc = gemu_cycles_in(gemu_86box_hz, gemu_now(b->dev->machine));
+    gemu_86box_sound_enter(b);
     return prev;
 }
 
 void gemu_86box_leave(Gemu86BoxDev *prev) {
     gemu_86box_cur = prev;
-    if (prev)
+    if (prev) {
         tsc = gemu_cycles_in(gemu_86box_hz, gemu_now(prev->dev->machine));
+        gemu_86box_sound_enter(prev);
+    }
 }
 
 Gemu86BoxDev *gemu_86box_need(const char *what) {
@@ -248,6 +257,10 @@ bool gemu_86box_init(GemuDevice *d, const Gemu86BoxPort *p) {
     live++;
     b->port = p;                          /* from here destroy undoes it */
     b->dev = d;
+    b->parent86 = pending_parent;
+    void *params = pending_params;
+    pending_parent = NULL;
+    pending_params = NULL;
     for (unsigned i = 0; i < 16; i++) {
         char name[8];
         snprintf(name, sizeof name, "irq%u", i);
@@ -255,13 +268,21 @@ bool gemu_86box_init(GemuDevice *d, const Gemu86BoxPort *p) {
             return false;
     }
     const device_t *dev = p->dev;
+    if (params) {                         /* 86Box: a copy, params ORed into local */
+        if (!(b->init_dev = malloc(sizeof *b->init_dev))) {
+            gemu_device_error(d, "out of memory");
+            return false;
+        }
+        *b->init_dev = *dev;
+        b->init_dev->local |= (uintptr_t)params;
+    }
     if (dev->available && !dev->available()) {
         gemu_device_error(d, "%s isn't available (are its ROMs there?)", dev->name);
         return false;
     }
     Gemu86BoxDev *prev = gemu_86box_enter(b);
     b->in_init = true;
-    b->priv = dev->init ? dev->init(dev) : NULL;
+    b->priv = dev->init ? dev->init(b->init_dev ? b->init_dev : dev) : NULL;
     b->in_init = false;
     bool ok = b->priv != NULL || !dev->init;
     if (!ok)
@@ -295,6 +316,9 @@ void gemu_86box_destroy(GemuDevice *d) {
     b->priv = NULL;
     gemu_86box_io_free(b);
     gemu_86box_timers_free(b);
+    gemu_86box_sound_free(b);
+    free(b->init_dev);
+    b->init_dev = NULL;
 }
 
 void gemu_86box_describe(GemuDevice *d, char *buf, size_t len) {
@@ -308,11 +332,85 @@ void gemu_86box_describe(GemuDevice *d, char *buf, size_t len) {
 
 void gemu_86box_post_load(GemuDevice *d) {
     Gemu86BoxDev *b = d->priv;
-    if (!b->port || !b->port->post_load)
+    if (!b->port)
+        return;
+    gemu_86box_sound_post_load(b);
+    if (!b->port->post_load)
         return;
     Gemu86BoxDev *prev = gemu_86box_enter(b);
     b->port->post_load(d, b->priv);
     gemu_86box_leave(prev);
+}
+
+void gemu_86box_pre_save(GemuDevice *d) {
+    Gemu86BoxDev *b = d->priv;
+    if (b->port)
+        gemu_86box_sound_pre_save(b);
+}
+
+/* ── Sub-devices ──────────────────────────────────────────────────────────── */
+
+void gemu_86box_register(Gemu86BoxPortLink *l) {
+    l->next = ports;
+    ports = l;
+}
+
+static void *add_sub(const device_t *dev, int inst, void *params) {
+    Gemu86BoxDev *b = gemu_86box_need("device_add");
+    if (!dev)
+        return NULL;
+    if (!b->in_init)
+        fatal("device_add(%s) outside a device's init\n", dev->internal_name);
+    const Gemu86BoxPort *p = NULL;
+    for (Gemu86BoxPortLink *l = ports; l && !p; l = l->next)
+        if (l->port->dev == dev)
+            p = l->port;
+    if (!p)
+        fatal("device_add: %s (%s) has no GEMU port (compat/86box/ports)\n", dev->name,
+              dev->internal_name);
+    /* named after its type; the first free of name, name.1, ... (86Box's
+     * instance numbers count across the whole emulator) */
+    (void)inst;
+    char name[64];
+    for (int k = 0;; k++) {
+        if (k)
+            snprintf(name, sizeof name, "%s.%d", p->type_name, k);
+        else
+            snprintf(name, sizeof name, "%s", p->type_name);
+        if (!gemu_device_lookup(b->dev, name))
+            break;
+    }
+    pending_parent = b;
+    pending_params = params;
+    GemuDevice *d = gemu_device_add(b->dev->machine, p->type, name, b->dev, NULL);
+    bool ok = d && gemu_device_start_now(d);
+    pending_parent = NULL;
+    pending_params = NULL;
+    if (!ok) {
+        pclog("gemu: %s: device_add(%s): %s\n", b->dev->path, dev->internal_name,
+              gemu_machine_error(b->dev->machine));
+        return NULL;
+    }
+    return ((Gemu86BoxDev *)d->priv)->priv;
+}
+
+void *device_add(const device_t *dev)                   { return add_sub(dev, 0, NULL); }
+void *device_add_inst(const device_t *dev, int inst)    { return add_sub(dev, inst, NULL); }
+void *device_add_params(const device_t *dev, void *params) { return add_sub(dev, 0, params); }
+void *device_add_inst_params(const device_t *dev, int inst, void *params) {
+    return add_sub(dev, inst, params);
+}
+
+/* ── What GEMU doesn't have (<86box/mca.h>, "cpu.h") ──────────────────────── */
+
+int    gemu_86box_cycles;     /* GEMU's CPUs time their own bus cycles: a sink */
+double isa_timing;
+
+void mca_add(uint8_t (*read)(uint16_t port, void *priv),
+             void (*write)(uint16_t port, uint8_t val, void *priv),
+             uint8_t (*feedb)(void *priv), void (*reset)(void *priv), void *priv) {
+    (void)read; (void)write; (void)feedb; (void)reset; (void)priv;
+    fatal("a MicroChannel card: no GEMU machine has an MCA bus\n");
 }
 
 void *gemu_86box_priv(GemuDevice *d) {

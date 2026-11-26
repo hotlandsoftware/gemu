@@ -55,8 +55,9 @@ CORE_SRC_GTK = [
 # GEMU's 86Box layer (compat/86box) and its ports of 86Box v6.0 drivers
 # (third_party/86box/v6.0, compiled inside the ports).
 COMPAT_86BOX = ['compat/86box/device.c', 'compat/86box/io.c', 'compat/86box/timer.c',
-                'compat/86box/pic.c']
-COMPAT_86BOX_PORTS = ['compat/86box/ports/novell_cardkey.c']
+                'compat/86box/pic.c', 'compat/86box/sound.c', 'compat/86box/fm.c']
+COMPAT_86BOX_PORTS = ['compat/86box/ports/novell_cardkey.c', 'compat/86box/ports/snd_adlib.c',
+                      'compat/86box/ports/snd_opl2_nuked.c']
 FAMILY_SRC = {
     'chip8': [
         'cpu/chip8/chip8_cpu.c', 'cpu/chip8/octo.c',

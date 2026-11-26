@@ -93,6 +93,8 @@ typedef struct Ibm5150State {
     bool      has_mouse;
     uint8_t   mouse_buttons; /* set by the monitor's mouse_button */
     uint8_t   nmi_mask;  /* port 0xA0 */
+    const char *isa_cards[X86_MAX_ISA_CARDS]; /* -device TYPE[,opts]: other cards */
+    int       n_isa_cards;
 
     Ibm5150IoLogEnt iolog[IBM5150_IOLOG_N];
     int             iolog_n;

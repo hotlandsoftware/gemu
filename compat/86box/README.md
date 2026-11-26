@@ -1,7 +1,6 @@
 # GEMU's 86Box layer
 
-86Box (v6.0) device drivers, unchanged, as GEMU core devices.  The design is
-in `.work/modular-devices/03-compat-86box.md`.
+86Box (v6.0) device drivers, unchanged, as GEMU core devices. 
 
 ```
 compat/86box/include/86box/   the framework headers, shaped like v6.0's
@@ -21,10 +20,15 @@ third_party/86box/v6.0/       the drivers' sources, unchanged (README.md there)
 | `timer_add`, `timer_set_delay_u64`, `timer_advance_u64`, `timer_on_auto`, `timer_disable`, `timer_stop`, `tsc`, `TIMER_USEC` | core timers, exact to the picosecond; saved with the device |
 | `picint`, `picintc`, `picintlevel`, `picintclevel` | the device's `irq0`..`irq15` lines |
 | `pclog`, `pclog_ex`, `fatal` | stderr; `fatal` stops GEMU |
+| `device_add`, `_inst`, `_params`, `_inst_params` (from an init) | a child core device of the `device_t`'s port, started at once |
+| `sound_add_handler`, `music_add_handler`, `sound_pos_global`, `music_pos_global` | a core stream per kind (48000 / 49716 Hz, stereo) through the mixer |
+| `fm_driver_get`, `fm_driver_get_ex` (`fm.c`) | the Nuked OPL2 (YM3812) as a sub-device; other chips stop GEMU |
+| `cycles`, `isa_timing` (`"cpu.h"`) | a sink: GEMU's CPUs time their own bus cycles |
+| `mca_add` | stops GEMU: no machine has an MCA bus |
 
 The headers declare only what is implemented: a driver that uses anything
-else - `device_add`, `mem_mapping_*`, DMA, sound, CPU state, 86Box's global
-settings - doesn't compile.  That's the point: each gap is filled when a
+else - `mem_mapping_*`, DMA, CPU state, 86Box's global settings - doesn't
+compile.  That's the point: each gap is filled when a
 port needs it (E2-E5 in the plan), never by a silent stub.
 
 Things to know:
@@ -40,6 +44,18 @@ Things to know:
   bit in 86Box; level requests are plain lines, wired-OR across devices.
 - **Word I/O** to a port reaches the driver's `inw`/`outw` when the access
   is inside one `io_sethandler` range; otherwise it is made of bytes.
+- **Sub-devices** (`device_add` in an init) are core children named after
+  their type (`isa/adlib/ym3812_nuked_opl2`), so they have their own state
+  and show in `info qtree`; the parent's handlers reach them through their
+  priv as in 86Box.
+- **Sound**: the handlers are called with the samples since the last call,
+  in pieces of at most a buffer, whenever the device's stream is brought
+  up to date (the mixer, a timer every half buffer, before a save).  On
+  every entry into the device's code `*_pos_global` says how far the present
+  is into the current piece, which is where a driver generates up to
+  before a register change: changes land on the right sample.  Before a
+  save the handlers are run up to that moment, so a driver that generates
+  lazily (an OPL) is saved at it; after a load they start empty there.
 
 ## Porting a driver
 
@@ -64,8 +80,22 @@ Things to know:
    with `#pragma GCC diagnostic`, not by editing the file.
 3. Add `ports/<file>.c` to `COMPAT_86BOX_PORTS` in `configure`, and a
    `data/device/86box/<name>.xml` with the type's symbol and source.
-4. A machine adds it like any device type and connects its IRQs:
-   `gemu_86box_connect_irqs(dev, "board/pic:ir%u", 8)`.
+4. A machine adds it like any device type and connects its IRQs
+   (`gemu_86box_connect_irqs(dev, "board/pic:ir%u", 8)`).  The 5150 does
+   it for any card whose XML names it (`<machine name="ibm5150"/>`):
+   `-device <type>[,opts]` puts it under `isa/` and connects its
+   `irq2`..`irq7` to the PIC.
 
-`tests/86box.c` is the reference: a driver written as 86Box's are, and the
-Novell key card from `third_party`, on a small machine.
+## Ports
+
+| Type | Driver | Machine |
+|---|---|---|
+| `novellkeycard` | `src/device/novell_cardkey.c` | (none yet) |
+| `adlib` | `src/sound/snd_adlib.c` | the 5150: `-device adlib` |
+| `ym3812_nuked_opl2` | `src/sound/snd_opl2_nuked.c` | the AdLib's chip |
+
+The OPL2's port saves the chip whole and moves its pointers (all into the
+chip) on load, and switches off the driver's CPU-cycle charging.
+
+`tests/86box.c` is the reference: a driver written as 86Box's are, the
+Novell key card and the AdLib from `third_party`, on a small machine.

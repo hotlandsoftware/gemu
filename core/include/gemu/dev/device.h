@@ -122,6 +122,12 @@ GemuDevice *gemu_device_add_type(GemuMachine *m, const char *type_name,
 GemuDevice *gemu_device_find(GemuMachine *m, const char *path);
 GemuDevice *gemu_device_lookup(GemuDevice *from, const char *rel);
 
+/* Start (init) d now instead of after its parent's init: for a device a
+ * parent adds in its own init hook and needs at once - 86Box's device_add()
+ * returns the new device's private data.  True if d is started; on false
+ * d is gone (removed and freed) and the machine's error says why. */
+bool gemu_device_start_now(GemuDevice *d);
+
 /* Reset d and everything under it. */
 void gemu_device_reset(GemuDevice *d, GemuResetKind kind);
 /* Remove d and everything under it.  Not the root. */

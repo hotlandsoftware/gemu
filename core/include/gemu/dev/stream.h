@@ -18,7 +18,9 @@
  *
  * Streams and the mixer keep no save state: a load, time going backwards
  * or a gap of more than a second resyncs them to now.  What makes the
- * sound is the devices' state.
+ * sound is the devices' state, so after a load the sound is what it was -
+ * but for the one output sample the load falls inside, whose average lacks
+ * the input samples from before the load.
  */
 #pragma once
 #include <stdbool.h>

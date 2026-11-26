@@ -23,6 +23,11 @@ GPLv3-compatible before it is vendored.
 |---|---|---|
 | `src/device/novell_cardkey.c` | none in file; project GPLv2+ | none |
 | `src/include/86box/novell_cardkey.h` | none in file; project GPLv2+ | none |
+| `src/sound/snd_adlib.c` | none in file; project GPLv2+ | none |
+| `src/include/86box/snd_adlib.h` | none in file; project GPLv2+ | none |
+| `src/include/86box/snd_opl.h` | none in file; project GPLv2+ | none |
+| `src/sound/snd_opl2_nuked.c` | Nuked OPL2 Lite (nukeykt): GPLv2 or later, in the file | none |
+| `src/include/86box/snd_opl2_nuked.h` | Nuked OPL2 Lite: GPLv2 or later, in the file | none |
 | `COPYING` | GPLv2 text | none |
 
 **Local changes are not allowed** without a row here saying what and why.
@@ -31,6 +36,10 @@ To check, compare a file with the tag:
 ```
 git -C <86box clone> show v6.0:src/device/novell_cardkey.c | cmp - third_party/86box/v6.0/src/device/novell_cardkey.c
 ```
+
+Not vendored on purpose: `src/sound/snd_opl.c` (86Box's FM core chooser,
+which names every core, the C++ ymfm ones among them) - GEMU's layer has
+its own `fm_driver_get()` (`compat/86box/fm.c`).
 
 ## Adding a file
 

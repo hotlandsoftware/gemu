@@ -6,8 +6,8 @@
  * the ones the layer implements: a port's GemuDeviceType (gemu_86box.h)
  * runs device_t.init/close/reset, and the device_get_config_*() calls read
  * the GEMU device's options, which are made from the config table (an
- * option per entry).  device_add() and the rest of the device manager are
- * not here yet: a driver that adds devices of its own doesn't compile.
+ * option per entry).  device_add() and friends make a sub-device; the
+ * rest of 86Box's device manager is not here.
  *
  * From 86Box (src/include/86box/device.h), GPLv2 or later:
  *   Copyright 2017-2019 Fred N. van Kempen.  Copyright 2016-2019 Miran Grca.
@@ -184,6 +184,15 @@ extern int         device_get_config_hex16(const char *name);
 extern int         device_get_config_hex20(const char *name);
 extern const char *device_get_config_string(const char *name);
 #define device_get_config_bios device_get_config_string
+
+/* From a device's init: another device as a part of it (a core child,
+ * started at once); its private data, or NULL if its init failed.  The
+ * device_t must have a GEMU port.  params is ORed into a copy's local, as in
+ * 86Box; inst numbers several of one kind. */
+extern void *device_add(const device_t *dev);
+extern void *device_add_inst(const device_t *dev, int inst);
+extern void *device_add_params(const device_t *dev, void *params);
+extern void *device_add_inst_params(const device_t *dev, int inst, void *params);
 
 #ifdef __cplusplus
 }

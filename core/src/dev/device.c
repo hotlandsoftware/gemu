@@ -289,6 +289,16 @@ void gemu_device_reset(GemuDevice *d, GemuResetKind kind) {
         reset_tree(d, kind);
 }
 
+bool gemu_device_start_now(GemuDevice *d) {
+    if (d->started)
+        return true;
+    if (init_device(d))
+        return true;
+    unlink_device(d);
+    free_device(d);
+    return false;
+}
+
 void gemu_device_destroy(GemuDevice *d) {
     if (!d || !d->parent)
         return;               /* the root goes with gemu_machine_free */

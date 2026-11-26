@@ -3,6 +3,7 @@
 #include "gemu/args.h"
 #include "gemu/monitor.h"
 #include "gemu/drive.h"
+#include "gemu/dev/device.h"
 #include <SDL2/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,6 +86,9 @@ static const GemuArgsDef def = {
         "\nMouse: -device msmouse[,port=com2]  Microsoft serial mouse on COM1\n"
         "                  (or COM2), with its serial adapter.  Click the window\n"
         "                  to capture the mouse, Ctrl+Alt+G to release it.\n"
+        "\nSound: -device adlib  AdLib Music Synthesizer Card (OPL2 at 388h,\n"
+        "                  from 86Box).  'wavcapture FILE' records the speaker\n"
+        "                  and the cards.\n"
         "Not yet emulated: cassette, printer.  Monitor:\n"
         "'sendkey' types into the keyboard (sendkey PRINT spc 2+2 ret,\n"
         "sendkey ctrl-alt-delete); 'change floppy0 FILE' swaps diskettes.\n"
@@ -116,6 +120,22 @@ static bool romdb_add_x86(const char *path, const char *region, uint32_t addr, v
     r->region = region && region[0] ? strdup(region) : NULL;
     ctx->loaded++;
     return true;
+}
+
+/* A card for the 5150's slots: a device whose data/device XML names the
+ * 5150 and that has a core device type (the 86Box ports, ...). */
+static bool isa_card(const char *name) {
+    static const GemuDevDesc3 devs[] = {
+#include "generated/devices.inc"
+    };
+    for (size_t i = 0; i < sizeof devs / sizeof devs[0]; i++) {
+        if (strcmp(devs[i].name, name))
+            continue;
+        for (const char *p = devs[i].machines; (p = strstr(p, "ibm5150")); p += 7)
+            if ((p == devs[i].machines || p[-1] == ' ') && (p[7] == ',' || p[7] == 0))
+                return gemu_device_type_find(name) != NULL;
+    }
+    return false;
 }
 
 int x86_setup(int argc, char *argv[]) {
@@ -203,6 +223,16 @@ int x86_setup(int argc, char *argv[]) {
                     fprintf(stderr, "gemu: -device msmouse takes port=com1 (default) or port=com2\n");
                     return 1;
                 }
+                continue;
+            }
+            char tname[64];
+            snprintf(tname, sizeof tname, "%.*s", (int)(len < 63 ? len : 63), dev);
+            if (isa_card(tname)) {
+                if (cfg.n_isa_cards == X86_MAX_ISA_CARDS) {
+                    fprintf(stderr, "gemu: -device %s: the slots are full\n", tname);
+                    return 1;
+                }
+                cfg.isa_cards[cfg.n_isa_cards++] = dev;
                 continue;
             }
             X86VgaType type;

@@ -20,6 +20,7 @@ typedef enum {
 static inline bool x86_vga_mono(X86VgaType t) { return t == X86_VGA_MDA || t == X86_VGA_HERCULES; }
 
 #define X86_MAX_ROM_LOADS 8
+#define X86_MAX_ISA_CARDS 8   /* -device cards in the slots */
 
 typedef enum {
     X86_HDC_NONE,
@@ -44,6 +45,8 @@ typedef struct X86Config {
     X86HdcType      hdc;        /* hard disk controller (-device) */
     const char     *hdc_opts;   /* its options (romfile=, interleave=) */
     int             mouse_com;  /* -device msmouse: on COM1 or COM2 (0 = none) */
+    const char     *isa_cards[X86_MAX_ISA_CARDS]; /* other -device TYPE[,opts]: ISA cards */
+    int             n_isa_cards;
     const char     *machine_opts; /* -M ibm5150,OPTS: DIP switch settings */
     uint32_t        ram_size; /* bytes */
     GemuDisplayType display_type;

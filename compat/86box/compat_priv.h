@@ -17,4 +17,11 @@ void          gemu_86box_leave(Gemu86BoxDev *prev);
 Gemu86BoxDev *gemu_86box_need(const char *what);
 
 void gemu_86box_io_free(Gemu86BoxDev *b);       /* io.c: its handlers off */
+/* sound.c: on entry, sound_pos_global/music_pos_global for the device (or
+ * the one that added it) with handlers; before a save, generate up to now;
+ * after a load, start again from now; free them. */
+void gemu_86box_sound_enter(Gemu86BoxDev *b);
+void gemu_86box_sound_pre_save(Gemu86BoxDev *b);
+void gemu_86box_sound_post_load(Gemu86BoxDev *b);
+void gemu_86box_sound_free(Gemu86BoxDev *b);
 void gemu_86box_timers_free(Gemu86BoxDev *b);   /* timer.c: its records */

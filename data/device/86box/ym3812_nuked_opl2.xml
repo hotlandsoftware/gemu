@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- An 86Box v6.0 driver through GEMU's 86Box layer: a chip cards add
+     (fm_driver_get), not a -device option (no <machine>). -->
+<device name="ym3812_nuked_opl2" description="Yamaha YM3812 OPL2 (Nuked OPL2, 86Box)" status="working">
+    <type symbol="gemu_86box_ym3812_nuked_opl2_type" source="compat/86box/ports/snd_opl2_nuked.c"/>
+</device>

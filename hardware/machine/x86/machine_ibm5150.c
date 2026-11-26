@@ -7,6 +7,7 @@
 #include "storage/upd765_dev.h"
 #include "timer/i8253_dev.h"
 #include "pc_video_dev.h"
+#include "gemu/dev/option.h"
 #include "gemu/dev/state.h"
 #include "gemu/dev/stream.h"
 #include "audio/pc_speaker.h"
@@ -1102,6 +1103,7 @@ static bool build_board(Ibm5150State *s) {
     gemu_device_set_clock(s->dev_pit, PIT_HZ);
     GemuDevice *isa = add_own(s, &isa_type, "isa", NULL);
     if (!isa) return false;
+    gemu_device_set_clock(isa, IBM5150_CPU_HZ);   /* the bus runs at the CPU's clock */
     if (s->has_fdc && !(s->dev_fdc = add_dev(s, "upd765", "fdc", isa, NULL))) return false;
     if (s->has_hdc && !(s->dev_hdc = add_dev(s, "ibm-fixed-disk", "hdc", isa, NULL))) return false;
     for (int i = 0; i < 2; i++)
@@ -1115,6 +1117,14 @@ static bool build_board(Ibm5150State *s) {
         GemuDevice **slot = t == X86_VGA_CGA ? &s->dev_cga : t == X86_VGA_HERCULES ? &s->dev_herc
                                                                                  : &s->dev_mda;
         if (!(*slot = add_dev(s, type, type, isa, t == X86_VGA_CGA ? NULL : s->head_opts[i])))
+            return false;
+    }
+    /* other cards in the slots (-device adlib, ...) */
+    for (int i = 0; i < s->n_isa_cards; i++) {
+        char type[64];
+        const char *opts = NULL;
+        if (!gemu_device_spec_split(s->isa_cards[i], type, sizeof type, &opts) ||
+            !add_dev(s, type, type, isa, opts))
             return false;
     }
     if (!gemu_machine_init(m)) {
@@ -1165,6 +1175,19 @@ static bool wire_board(Ibm5150State *s) {
         if (w[i].want && !gemu_lines_connect(m, w[i].out, w[i].in, 0)) {
             fprintf(stderr, "gemu: ibm5150: %s\n", gemu_machine_error(m));
             return false;
+        }
+    /* a card's IRQ lines irq2..irq7 (the XT slot's) to the PIC */
+    for (GemuDevice *d = gemu_device_find(m, "isa")->first_child; d; d = d->next_sibling)
+        for (int n = 2; n < 8; n++) {
+            char out[16], from[GEMU_DEVICE_PATH_MAX + 16], to[32];
+            snprintf(out, sizeof out, "irq%d", n);
+            if (!gemu_line_find_out(d, out)) continue;
+            snprintf(from, sizeof from, "%s:%s", d->path, out);
+            snprintf(to, sizeof to, "board/pic:ir%d", n);
+            if (!gemu_lines_connect(m, from, to, 0)) {
+                fprintf(stderr, "gemu: ibm5150: %s\n", gemu_machine_error(m));
+                return false;
+            }
         }
     if (s->has_fdc) gemu_upd765_set_dma(s->dev_fdc, s->dev_dma, 2);
     if (s->has_hdc) gemu_ibm_hdc_set_dma(s->dev_hdc, s->dev_dma, 3);
@@ -1282,6 +1305,8 @@ Ibm5150State *ibm5150_create(const X86Config *cfg) {
         return NULL;
     }
     s->has_hdc = cfg->hdc == X86_HDC_IBM;
+    s->n_isa_cards = cfg->n_isa_cards;
+    for (int i = 0; i < cfg->n_isa_cards; i++) s->isa_cards[i] = cfg->isa_cards[i];
     s->hdc_irq = 5;
     /* the device tree, then what needs its devices: drives, the mouse, wiring */
     if (!build_board(s) || (s->has_hdc && !attach_fixed_disk(s, cfg, hdc_rom))) {

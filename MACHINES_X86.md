@@ -11,7 +11,7 @@
 
 | Name | Full name | Status | Notes |
 |------|-----------|--------|-------|
-| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA, MDA (`-vga mda`) or Hercules (`-vga hercules`), or a colour and a monochrome card on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`); `savevm`/`loadvm`. No cassette, printer yet |
+| `ibm5150` | IBM 5150 (1981) | imperfect | boots the 19OCT81 BIOS from diskette or into Cassette BASIC; CGA, MDA (`-vga mda`) or Hercules (`-vga hercules`), or a colour and a monochrome card on two monitors (`-device`), keyboard, speaker, floppy drives, IBM Fixed Disk Adapter (`-device ibm-fixed-disk`), serial ports and the Microsoft Mouse (`-device msmouse`), the AdLib (`-device adlib`); `savevm`/`loadvm`. No cassette, printer yet |
 
 ## IBM 5150 hardware
 
@@ -128,6 +128,14 @@ Click the window to capture the host mouse; Ctrl+Alt+G (as in QEMU) or
 Ctrl+middle-click releases it.
 The monitor's `mouse_move DX DY` and `mouse_button STATE` (1 left, 4 right)
 work as in QEMU.
+
+## Sound
+
+The speaker, and `-device adlib`: the AdLib Music Synthesizer Card, an OPL2
+(YM3812) at ports 388h-389h - 86Box's driver and its Nuked OPL2 core,
+through GEMU's 86Box layer (`compat/86box`).  Software finds it the way
+AdLib documented, by its timers, and both play through the same output.
+`wavcapture FILE` in the monitor records them.
 
 ## Saving the machine
 

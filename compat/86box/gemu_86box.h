@@ -32,6 +32,11 @@
  *   - its timers count in clocks of the device's clock (gemu_device_clock:
  *     the bus's), which is 86Box's tsc.  All 86Box devices in a machine
  *     share one: tsc and TIMER_USEC are globals in 86Box.
+ *   - device_add() from its init (a sub-device: the AdLib's OPL) makes a
+ *     child core device of the device_t's port, started at once;
+ *   - its sound and music handlers are core streams (<86box/sound.h>),
+ *     brought up to date before a save so what they generate lazily (an
+ *     OPL's chip) is saved at the right moment.
  */
 #pragma once
 #include <stdbool.h>
@@ -44,6 +49,7 @@
 typedef struct _device_ device_t;           /* <86box/device.h> */
 typedef struct Gemu86BoxIo Gemu86BoxIo;
 typedef struct Gemu86BoxTimer Gemu86BoxTimer;
+typedef struct Gemu86BoxSound Gemu86BoxSound;
 
 #define GEMU_86BOX_MAX_OPTIONS 32
 
@@ -55,7 +61,14 @@ typedef struct Gemu86BoxPort {
     /* After a load: what the state implies (moved ports, ...). */
     void          (*post_load)(GemuDevice *d, void *priv);
     GemuOptionDef  *options;                /* GEMU_86BOX_MAX_OPTIONS + 1, filled at startup */
+    const GemuDeviceType *type;
 } Gemu86BoxPort;
+
+/* Every port, found by its device_t (device_add); linked at startup. */
+typedef struct Gemu86BoxPortLink {
+    const Gemu86BoxPort      *port;
+    struct Gemu86BoxPortLink *next;
+} Gemu86BoxPortLink;
 
 /* A port device's priv. */
 typedef struct Gemu86BoxDev {
@@ -67,6 +80,9 @@ typedef struct Gemu86BoxDev {
     Gemu86BoxTimer *timers;
     unsigned        n_timers;
     bool            in_init;
+    struct Gemu86BoxDev *parent86;          /* the device whose device_add made it */
+    Gemu86BoxSound *sound;                  /* its sound/music handlers (sound.h) */
+    device_t       *init_dev;               /* device_add_params(): the device_t it got */
 } Gemu86BoxDev;
 
 bool gemu_86box_init(GemuDevice *d, const Gemu86BoxPort *p);
@@ -74,7 +90,9 @@ void gemu_86box_reset(GemuDevice *d, GemuResetKind kind);
 void gemu_86box_destroy(GemuDevice *d);
 void gemu_86box_describe(GemuDevice *d, char *buf, size_t len);
 void gemu_86box_post_load(GemuDevice *d);
+void gemu_86box_pre_save(GemuDevice *d);
 void gemu_86box_make_options(const Gemu86BoxPort *p);
+void gemu_86box_register(Gemu86BoxPortLink *l);
 
 /* Connect d's irq<n> to the input pattern with n in it ("board/pic:ir%u"),
  * for n < count.  False (the machine's error says why) on a failure. */
@@ -90,14 +108,20 @@ void *gemu_86box_priv(GemuDevice *d);
 #endif
 
 #define GEMU_86BOX_PORT(sym, devt, tname, state_fn, post_load_fn, is_stateless)          \
+    extern const GemuDeviceType sym;                                                    \
     static GemuOptionDef sym##_options[GEMU_86BOX_MAX_OPTIONS + 1];                     \
     static const Gemu86BoxPort sym##_port = {                                           \
-        &(devt), (tname), (state_fn), (post_load_fn), sym##_options };                  \
+        &(devt), (tname), (state_fn), (post_load_fn), sym##_options, &sym };            \
+    static Gemu86BoxPortLink sym##_link = { &sym##_port, 0 };                           \
     static bool sym##_init(GemuDevice *d) { return gemu_86box_init(d, &sym##_port); }   \
-    GEMU_86BOX_CTOR static void sym##_ctor(void) { gemu_86box_make_options(&sym##_port); } \
+    GEMU_86BOX_CTOR static void sym##_ctor(void) {                                      \
+        gemu_86box_make_options(&sym##_port);                                           \
+        gemu_86box_register(&sym##_link);                                               \
+    }                                                                                   \
     const GemuDeviceType sym = {                                                        \
         .name = (tname), .desc = "86Box v6.0 device", .size = sizeof(Gemu86BoxDev),     \
         .options = sym##_options, .stateless = (is_stateless),                          \
         .init = sym##_init, .reset = gemu_86box_reset, .destroy = gemu_86box_destroy,   \
-        .describe = gemu_86box_describe, .post_load = gemu_86box_post_load,             \
+        .describe = gemu_86box_describe, .pre_save = gemu_86box_pre_save,               \
+        .post_load = gemu_86box_post_load,                                              \
     }

@@ -22,6 +22,8 @@
 #include "gemu/dev/scheduler.h"
 #include "gemu/dev/space.h"
 #include "gemu/dev/state.h"
+#include "gemu/dev/stream.h"
+#include <math.h>
 
 static unsigned checks;
 #define CHECK(expr) do { checks++; if (!(expr)) { \
@@ -229,6 +231,67 @@ static GemuTime tick_due(uint64_t start_ts, unsigned k, unsigned period_us) {
     return (GemuTime)((ts * GEMU_PS_PER_SEC + den - 1) / den);
 }
 
+/* ── The AdLib ──────────────────────────────────────────────────────────── */
+
+static float got[48000 * 4];
+static size_t n_got;
+static void sink(void *ud, const float *smp, size_t frames) {
+    (void)ud;
+    for (size_t i = 0; i < frames && n_got < sizeof got / sizeof got[0]; i++)
+        got[n_got++] = smp[i];
+}
+
+static void opl(uint8_t reg, uint8_t val) {
+    gemu_space_write8(io, 0x388, reg);
+    gemu_space_write8(io, 0x389, val);
+}
+
+/* Run to t, mixing every 10 ms as a machine's frames would */
+static void run_mixing(GemuTime t) {
+    while (gemu_machine_time(m) < t) {
+        GemuTime next = gemu_machine_time(m) + GEMU_MSEC(10);
+        gemu_machine_run_until(m, next < t ? next : t);
+        gemu_mixer_run(m);
+    }
+}
+
+/* The frequency of what the sink got from sample a on: rising zero
+ * crossings over the span */
+static double freq_of(size_t a, size_t b) {
+    double first = -1, last = -1;
+    unsigned n = 0;
+    for (size_t i = a + 1; i < b; i++)
+        if (got[i - 1] < 0 && got[i] >= 0) {
+            double x = (double)(i - 1) + got[i - 1] / (got[i - 1] - got[i]);
+            if (first < 0) first = x;
+            last = x;
+            n++;
+        }
+    return n > 1 ? (n - 1) * 48000.0 / (last - first) : 0;
+}
+
+/* An AdLib machine, the note A4 on channel 0 from t = 1 ms */
+static GemuDevice *adlib_machine(void) {
+    build();
+    GemuDevice *ad = gemu_device_add_type(m, "adlib", "adlib", isa, NULL);
+    CHECK(ad);
+    start();
+    n_got = 0;
+    gemu_mixer_set_output(m, 48000, 1, sink, NULL);
+    gemu_mixer_run(m);
+    return ad;
+}
+static void adlib_note(void) {
+    static const uint8_t inst[][2] = {
+        { 0x01, 0x20 }, { 0x20, 0x01 }, { 0x40, 0x10 }, { 0x60, 0xF0 }, { 0x80, 0x77 },
+        { 0x23, 0x01 }, { 0x43, 0x00 }, { 0x63, 0xF0 }, { 0x83, 0x77 }, { 0xC0, 0x01 },
+    };
+    for (unsigned i = 0; i < sizeof inst / sizeof inst[0]; i++)
+        opl(inst[i][0], inst[i][1]);
+    opl(0xA0, 0x44);                          /* A4: block 4, F-number 0x244 */
+    opl(0xB0, 0x20 | (4 << 2) | 0x02);        /* key on */
+}
+
 int main(void) {
     /* ── The key card, unchanged from 86Box ── */
     build();
@@ -364,6 +427,90 @@ int main(void) {
     closed = 0;
     gemu_device_destroy(a);
     CHECK(closed == 1 && gemu_space_read8(io, 0x311) == 0xFF);
+
+    /* ── The AdLib: its OPL2 a sub-device, detected by its timers, a note
+     *    at its pitch, sound that carries on exactly across a load ── */
+    GemuDevice *ad = adlib_machine();
+    GemuDevice *chip = gemu_device_find(m, "isa/adlib/ym3812_nuked_opl2");
+    CHECK(chip);
+    gemu_device_describe(chip, buf, sizeof buf);
+    CHECK(strstr(buf, "YM3812"));
+    /* AdLib's documented detection: timer 1 overflows after 80 us */
+    opl(0x04, 0x60);
+    opl(0x04, 0x80);
+    CHECK((gemu_space_read8(io, 0x388) & 0xE0) == 0x00);
+    opl(0x02, 0xFF);
+    opl(0x04, 0x21);
+    gemu_machine_run_until(m, gemu_machine_time(m) + GEMU_USEC(70));
+    CHECK((gemu_space_read8(io, 0x388) & 0xE0) == 0x00);
+    gemu_machine_run_until(m, gemu_machine_time(m) + GEMU_USEC(20));
+    CHECK((gemu_space_read8(io, 0x388) & 0xE0) == 0xC0);
+    opl(0x04, 0x60);
+    opl(0x04, 0x80);
+    CHECK((gemu_space_read8(io, 0x388) & 0xE0) == 0x00);
+    /* silence, then A4 */
+    run_mixing(GEMU_MSEC(1));
+    size_t quiet = n_got;
+    for (size_t i = 0; i < quiet; i++)
+        CHECK(got[i] == 0.0f);
+    adlib_note();
+    run_mixing(GEMU_MSEC(150));
+    double f = freq_of(quiet + 2400, n_got);
+    float peak = 0;
+    for (size_t i = quiet; i < n_got; i++)
+        peak = fabsf(got[i]) > peak ? fabsf(got[i]) : peak;
+    if (fabs(f - 440.0) > 1.0 || peak < 0.05f)
+        fprintf(stderr, "A4: %.2f Hz, peak %.3f\n", f, peak);
+    CHECK(fabs(f - 440.0) <= 1.0 && peak >= 0.05f);
+    printf("adlib: A4 at %.2f Hz, peak %.3f\n", f, peak);
+    /* save mid-note, 5 ms after the last mix: the chip has made its sound
+     * only that far (pre_save brings it up to the save); the sound after
+     * a load - from the load on - is the sound that was */
+    size_t from = n_got;                      /* 150 ms */
+    gemu_machine_run_until(m, GEMU_MSEC(155));
+    uint8_t *as;
+    size_t asn;
+    CHECK(gemu_machine_save_state(m, &as, &asn));
+    const size_t skip = 48 * 5;               /* 150-155 ms: not heard after a load */
+    opl(0xA0, 0x59);                          /* C5 at 160 ms */
+    gemu_machine_run_until(m, GEMU_MSEC(160));
+    opl(0xB0, 0x20 | (5 << 2) | 0x01);
+    run_mixing(GEMU_MSEC(250));
+    size_t len = n_got - from;
+    static float first[48000];
+    CHECK(len < 48000);
+    memcpy(first, got + from, len * sizeof *first);
+    float loud = 0;
+    for (size_t i = 0; i < len; i++)
+        loud = fabsf(first[i]) > loud ? fabsf(first[i]) : loud;
+    CHECK(loud >= 0.05f);                     /* what's compared isn't silence */
+    CHECK(fabs(freq_of(from + 48000 * 15 / 1000, n_got) - 523.25) < 2.0);   /* C5 */
+    CHECK(gemu_machine_load_state(m, as, asn));
+    n_got = from;
+    opl(0xA0, 0x59);
+    gemu_machine_run_until(m, GEMU_MSEC(160));
+    opl(0xB0, 0x20 | (5 << 2) | 0x01);
+    run_mixing(GEMU_MSEC(250));
+    CHECK(n_got - from == len - skip &&
+          !memcmp(first + skip, got + from, (len - skip) * sizeof *first));
+    /* and into a new machine */
+    adlib_machine();
+    CHECK(gemu_machine_load_state(m, as, asn));
+    n_got = from;
+    gemu_mixer_run(m);
+    opl(0xA0, 0x59);
+    gemu_machine_run_until(m, GEMU_MSEC(160));
+    opl(0xB0, 0x20 | (5 << 2) | 0x01);
+    run_mixing(GEMU_MSEC(250));
+    CHECK(n_got - from == len - skip &&
+          !memcmp(first + skip, got + from, (len - skip) * sizeof *first));
+    free(as);
+    (void)ad;
+    ad = gemu_device_find(m, "isa/adlib");
+    gemu_device_destroy(ad);                  /* the chip goes with it */
+    CHECK(!gemu_device_find(m, "isa/adlib/ym3812_nuked_opl2"));
+    CHECK(gemu_space_read8(io, 0x388) == 0xFF);
+
     gemu_machine_free(m);
     m = NULL;
     printf("86box: %u checks passed\n", checks);
