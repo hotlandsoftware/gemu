@@ -3,6 +3,12 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <time.h>
+#endif
 
 typedef unsigned __int128 u128;
 
@@ -532,3 +538,54 @@ bool gemu_sched_state_load(GemuMachine *m, GemuStateReader *r, bool apply, unsig
     return true;
 }
 #undef BAD
+
+/* ── Real-time pacing ─────────────────────────────────────────────────────── */
+
+static uint64_t host_ns(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER c;
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)((u128)c.QuadPart * 1000000000u / (uint64_t)freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static void host_sleep_ns(uint64_t ns) {
+#ifdef _WIN32
+    Sleep((DWORD)(ns / 1000000u));
+#else
+    struct timespec ts = { (time_t)(ns / 1000000000u), (long)(ns % 1000000000u) };
+    nanosleep(&ts, NULL);
+#endif
+}
+
+void gemu_machine_pace_reset(GemuMachine *m) { m->sched.paced = false; }
+
+GemuTime gemu_machine_pace(GemuMachine *m, GemuTime slack) {
+    GemuSched *s = &m->sched;
+    uint64_t now = host_ns();
+    if (!slack)
+        slack = GEMU_MSEC(250);
+    if (!s->paced || s->now < s->pace_machine) {
+        s->paced = true;
+        s->pace_host_ns = now;
+        s->pace_machine = s->now;
+        return 0;
+    }
+    uint64_t due = s->pace_host_ns + (s->now - s->pace_machine) / 1000u;   /* ps -> ns */
+    if (due > now) {
+        host_sleep_ns(due - now);
+        return (due - now) * 1000u;
+    }
+    if ((now - due) * 1000u > slack) {               /* far behind: start over from here */
+        s->pace_host_ns = now;
+        s->pace_machine = s->now;
+    }
+    return 0;
+}

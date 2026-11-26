@@ -13,7 +13,6 @@
 #include "gemu/screendump.h"
 #include "gemu/sha256.h"
 #include <ctype.h>
-#include <SDL2/SDL.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -530,8 +529,55 @@ static bool advance(Ibm5150State *s, unsigned clocks) {
     return video_tick(s, clocks);
 }
 
-static bool step_cpu(Ibm5150State *s) {
-    return advance(s, x86_step(&s->cpu));
+/* ── The 8088 on the scheduler ────────────────────────────────────────────── *
+ *
+ * The CPU is the machine's executor: the scheduler gives it a budget of
+ * CPU clocks, it runs instructions and clocks the board's chips after each
+ * one (advance()), as the machine always has.  A run also ends at the
+ * instruction where the display adapter starts a frame (the front end then
+ * shows it), at an exec breakpoint, or when a monitor "step N" has run its
+ * N instructions - each by stopping the machine, which leaves its time
+ * exactly where the CPU got. */
+
+static uint64_t cpu_run(void *ud, uint64_t budget) {
+    Ibm5150State *s = ud;
+    (void)budget;                      /* gemu_executor_budget() can shrink mid-run */
+    s->run_done = 0;
+    while (s->run_done < gemu_executor_budget(s->cpu_exec)) {
+        if (s->steps_left) {           /* stepping: no breakpoints, frames don't stop it */
+            unsigned c = x86_step(&s->cpu);
+            s->run_done += c;
+            advance(s, c);
+            if (--s->steps_left == 0) gemu_machine_stop(s->machine);
+            continue;
+        }
+        if (s->check_bp && !s->cpu.halted &&
+            gemu_monitor_check_exec(s->monitor, x86_linear(s->cpu.cs, s->cpu.ip))) {
+            gemu_machine_stop(s->machine);
+            break;
+        }
+        unsigned c = x86_step(&s->cpu);
+        s->run_done += c;
+        if (advance(s, c)) gemu_machine_stop(s->machine);   /* a new frame */
+    }
+    return s->run_done;
+}
+
+static uint64_t cpu_elapsed(void *ud) { return ((Ibm5150State *)ud)->run_done; }
+
+static const GemuExecutorOps cpu_ops = { cpu_run, cpu_elapsed };
+
+/* Run to the next frame (or breakpoint). */
+static void run_frame(Ibm5150State *s) {
+    s->check_bp = gemu_monitor_has_exec_breakpoints(s->monitor);
+    gemu_machine_run_until(s->machine, gemu_machine_time(s->machine) + GEMU_SEC(1));
+}
+
+/* Exactly n instructions. */
+static void run_steps(Ibm5150State *s, uint64_t n) {
+    s->steps_left = n;
+    while (s->steps_left)
+        gemu_machine_run_until(s->machine, gemu_machine_time(s->machine) + GEMU_SEC(3600));
 }
 
 /* ── Keyboard: XT scan code set 1, polled via gemu_display_is_key_held()
@@ -912,6 +958,7 @@ static bool attach_fixed_disk(Ibm5150State *s, const X86Config *cfg, const char 
 /* ── The board as core devices ───────────────────────────────────────────── *
  *
  *   board            the motherboard: CPU clock bookkeeping, the NMI mask
+ *     cpu            the 8088 (its executor runs the machine)
  *     dma pic pit ppi   the chips (i8237, i8259, i8253, i8255-pc)
  *     kbd            the keyboard interface: the scan code queue, IRQ 1
  *   isa              the expansion slots
@@ -923,6 +970,44 @@ static bool attach_fixed_disk(Ibm5150State *s, const X86Config *cfg, const char 
  * that order: the chips, then the adapters, as the machine always did. */
 
 static Ibm5150State *machine_of(GemuDevice *d) { return *(Ibm5150State **)d->priv; }
+
+/* The 8088: its registers, and its executor. */
+static bool cpu_init(GemuDevice *d) {
+    Ibm5150State *s = machine_of(d);
+    X86Cpu *c = &s->cpu;
+    if (!(s->cpu_exec = gemu_executor_new(d, IBM5150_CPU_HZ, &cpu_ops, s))) return false;
+    GEMU_STATE_VAR(d, "ax", c->ax.x);
+    GEMU_STATE_VAR(d, "bx", c->bx.x);
+    GEMU_STATE_VAR(d, "cx", c->cx.x);
+    GEMU_STATE_VAR(d, "dx", c->dx.x);
+    GEMU_STATE_VAR(d, "sp", c->sp);
+    GEMU_STATE_VAR(d, "bp", c->bp);
+    GEMU_STATE_VAR(d, "si", c->si);
+    GEMU_STATE_VAR(d, "di", c->di);
+    GEMU_STATE_VAR(d, "cs", c->cs);
+    GEMU_STATE_VAR(d, "ds", c->ds);
+    GEMU_STATE_VAR(d, "es", c->es);
+    GEMU_STATE_VAR(d, "ss", c->ss);
+    GEMU_STATE_VAR(d, "ip", c->ip);
+    GEMU_STATE_VAR(d, "flags", c->flags);
+    GEMU_STATE_VAR(d, "halted", c->halted);
+    GEMU_STATE_VAR(d, "irq_pending", c->irq_pending);
+    GEMU_STATE_VAR(d, "irq_vector", c->irq_vector);
+    GEMU_STATE_VAR(d, "int_inhibit", c->int_inhibit);
+    GEMU_STATE_VAR(d, "insn_count", c->insn_count);
+    return true;
+}
+static void cpu_reset(GemuDevice *d, GemuResetKind kind) {
+    (void)kind;
+    x86_reset(&machine_of(d)->cpu);
+}
+static void cpu_describe(GemuDevice *d, char *buf, size_t len) {
+    x86_format_state(&machine_of(d)->cpu, buf, len);
+}
+static const GemuDeviceType cpu_type = {
+    .name = "i8088", .desc = "Intel 8088 CPU", .size = sizeof(Ibm5150State *),
+    .init = cpu_init, .reset = cpu_reset, .describe = cpu_describe,
+};
 
 static bool board_init(GemuDevice *d) {
     Ibm5150State *s = machine_of(d);
@@ -937,9 +1022,18 @@ static void board_reset(GemuDevice *d, GemuResetKind kind) {
     s->nmi_mask = 0;
     s->pit_phase = 0;
 }
+static void board_describe(GemuDevice *d, char *buf, size_t len) {
+    Ibm5150State *s = machine_of(d);
+    GemuTime t = gemu_machine_time(s->machine);
+    snprintf(buf, len, "%llu CPU clocks since power-on; machine time %llu.%06llu s\n"
+             "NMI mask %02X; %d unhandled port%s logged",
+             (unsigned long long)s->cycles, (unsigned long long)(t / GEMU_PS_PER_SEC),
+             (unsigned long long)(t % GEMU_PS_PER_SEC / 1000000u), s->nmi_mask,
+             s->iolog_n, s->iolog_n == 1 ? "" : "s");
+}
 static const GemuDeviceType board_type = {
     .name = "ibm5150-board", .desc = "IBM 5150 system board", .size = sizeof(Ibm5150State *),
-    .init = board_init, .reset = board_reset,
+    .init = board_init, .reset = board_reset, .describe = board_describe,
 };
 
 static bool kbd_init(GemuDevice *d) {
@@ -1009,6 +1103,7 @@ static bool build_board(Ibm5150State *s) {
     snprintf(clock, sizeof(clock), "clock=%u", IBM5150_CPU_HZ);
     GemuDevice *board = add_own(s, &board_type, "board", NULL);
     if (!board ||
+        !(s->dev_cpu = add_own(s, &cpu_type, "cpu", board)) ||
         !(s->dev_dma = add_dev(s, "i8237", "dma", board, "space=program")) ||
         !(s->dev_pic = add_dev(s, "i8259", "pic", board, NULL)) ||
         !(s->dev_pit = add_dev(s, "i8253", "pit", board, NULL)) ||
@@ -1075,8 +1170,7 @@ static bool wire_board(Ibm5150State *s) {
 }
 
 static void ibm5150_reset(Ibm5150State *s) {
-    x86_reset(&s->cpu);
-    gemu_machine_reset(s->machine, GEMU_RESET_HARD);   /* the chips and adapters */
+    gemu_machine_reset(s->machine, GEMU_RESET_HARD);   /* the CPU, chips and adapters */
     cga_reset(&s->cga);
     mda_reset(&s->mda);
     hercules_reset(&s->herc);
@@ -1304,22 +1398,13 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
 
     gemu_monitor_start(s->monitor);
 
-    const uint64_t perf_hz = SDL_GetPerformanceFrequency();
-    uint64_t next_frame = SDL_GetPerformanceCounter();
     bool running = true;
     bool reported_halt = false;
     while (running) {
         /* Run until the display adapter starts its next frame (1/60 s of PC
          * time on the CGA, 1/50 s on the MDA). */
-        if (!gemu_monitor_is_paused(s->monitor) && !s->halted_for_debug) {
-            bool check_bp = gemu_monitor_has_exec_breakpoints(s->monitor);
-            for (;;) {
-                if (check_bp && !s->cpu.halted &&
-                    gemu_monitor_check_exec(s->monitor, x86_linear(s->cpu.cs, s->cpu.ip)))
-                    break;
-                if (step_cpu(s)) break;
-            }
-        }
+        bool idle = gemu_monitor_is_paused(s->monitor) || s->halted_for_debug;
+        if (!idle) run_frame(s);
 
         /* HLT with interrupts off never resumes: POST does this on failure. */
         bool dead = s->cpu.halted && !(s->cpu.flags & X86_FLAG_IF);
@@ -1346,24 +1431,17 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
                 ibm5150_reset(s);
                 gemu_display_clear_flags(s->display);
             }
-
-            /* Pace to the adapter's frame rate (CGA 59.92 Hz, MDA 49.8 Hz). */
-            uint32_t frame_clocks = s->vga == X86_VGA_HERCULES
-                                    ? hercules_clocks_per_frame(&s->herc, IBM5150_CPU_HZ)
-                                  : s->vga == X86_VGA_MDA ? MDA_CLOCKS_PER_FRAME
-                                                         : CGA_CLOCKS_PER_FRAME;
-            next_frame += perf_hz * frame_clocks / IBM5150_CPU_HZ;
-            uint64_t now = SDL_GetPerformanceCounter();
-            if (next_frame > now) {
-                uint64_t ms = (next_frame - now) * 1000 / perf_hz;
-                if (ms) gemu_sleep_ms((unsigned)ms);
-            } else if (now - next_frame > perf_hz / 4) {
-                next_frame = now;   /* fell far behind (e.g. paused): resync */
+            /* Real time: the scheduler paces the machine to the host clock. */
+            if (idle) {
+                gemu_sleep_ms(16);
+                gemu_machine_pace_reset(s->machine);
+            } else {
+                gemu_machine_pace(s->machine, 0);
             }
         }
         /* headless (-display none): deliberately unthrottled while running -
          * see machine_i2000.c's Sleep(0) history before adding a sleep. */
-        else if (gemu_monitor_is_paused(s->monitor) || s->halted_for_debug || dead)
+        else if (idle || dead)
             gemu_sleep_ms(1);
 
         GemuMonCmd cmd;
@@ -1375,7 +1453,7 @@ void ibm5150_run(Ibm5150State *s, const X86Config *cfg) {
                 break;
             case GEMU_MON_RESET: ibm5150_reset(s); break;
             case GEMU_MON_STEP:
-                for (uint32_t k = gemu_monitor_step_count(s->monitor); k; k--) step_cpu(s);
+                run_steps(s, gemu_monitor_step_count(s->monitor));
                 break;
             default: break;
             }

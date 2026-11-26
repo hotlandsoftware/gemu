@@ -334,8 +334,40 @@ static void stopping(void) {
     free(cs);
 }
 
+/* ── Real-time pacing ── */
+#include <time.h>
+static double wall(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+static void pacing(void) {
+    new_machine();
+    gemu_executor_new(gemu_machine_root(m), 1000000, &take_ops, NULL);
+    CHECK(gemu_machine_pace(m, 0) == 0);                 /* the first call anchors */
+    double t0 = wall();
+    gemu_machine_run_until(m, GEMU_MSEC(40));            /* instantly */
+    GemuTime slept = gemu_machine_pace(m, 0);
+    double dt = wall() - t0;
+    CHECK(slept > GEMU_MSEC(30) && slept <= GEMU_MSEC(40));
+    CHECK(dt >= 0.035 && dt < 0.2);                       /* it waited for the host */
+    /* fall behind by more than the slack: no sleeping, no racing - resync */
+    struct timespec ts = { 0, 300000000 };
+    nanosleep(&ts, NULL);
+    gemu_machine_run_until(m, GEMU_MSEC(50));
+    CHECK(gemu_machine_pace(m, 0) == 0);
+    gemu_machine_run_until(m, GEMU_MSEC(70));
+    slept = gemu_machine_pace(m, 0);
+    CHECK(slept > GEMU_MSEC(10) && slept <= GEMU_MSEC(20));   /* paced from the resync */
+    /* a reset anchor starts over */
+    gemu_machine_pace_reset(m);
+    gemu_machine_run_until(m, GEMU_MSEC(500));
+    CHECK(gemu_machine_pace(m, 0) == 0);
+}
+
 int main(void) {
     conversions();
+    pacing();
     timers();
     no_drift();
     executor();

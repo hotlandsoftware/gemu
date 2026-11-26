@@ -90,6 +90,9 @@ typedef struct {
     GemuTime      quantum;
     bool          stop;
     bool          in_run;         /* inside gemu_machine_run_until */
+    bool          paced;          /* gemu_machine_pace: anchored */
+    uint64_t      pace_host_ns;   /* host time at the anchor */
+    GemuTime      pace_machine;   /* machine time at the anchor */
 } GemuSched;
 
 struct GemuMachine {

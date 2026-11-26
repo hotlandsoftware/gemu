@@ -17,6 +17,7 @@
 #include "gemu/dev/device.h"
 #include "gemu/dev/line.h"
 #include "gemu/dev/space.h"
+#include "gemu/dev/scheduler.h"
 #include <stdlib.h>
 
 /* ── IBM PC 5150 (1981) machine state ───────────────────────────────────── */
@@ -51,7 +52,11 @@ typedef struct Ibm5150State {
     GemuMachine *machine;
     GemuSpace   *io;        /* ports: A0-A9 decoded (a mirror of 0-3FFh) */
     GemuSpace   *bus;       /* the memory bus as DMA sees it */
-    GemuDevice  *dev_dma, *dev_pic, *dev_pit, *dev_ppi, *dev_kbd;
+    GemuDevice  *dev_cpu, *dev_dma, *dev_pic, *dev_pit, *dev_ppi, *dev_kbd;
+    GemuExecutor *cpu_exec; /* the 8088 on the scheduler (stage D3) */
+    uint64_t     run_done;  /* CPU clocks in the executor's current run */
+    uint64_t     steps_left;/* monitor "step N": instructions still to run */
+    bool         check_bp;  /* this run checks exec breakpoints */
     GemuDevice  *dev_fdc, *dev_hdc, *dev_com[2];
     GemuLine    *kb_irq;    /* the keyboard's IRQ 1 */
     I8237     *dma;

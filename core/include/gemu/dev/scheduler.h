@@ -19,8 +19,8 @@
  *
  * During a timer callback, gemu_now() is the timer's deadline.
  *
- * Real-time pacing is not here yet (stage D3): gemu_machine_run_until()
- * runs as fast as it can.
+ * gemu_machine_run_until() runs as fast as it can; a machine that wants
+ * real time calls gemu_machine_pace() between runs (e.g. once a frame).
  */
 #pragma once
 #include <stdbool.h>
@@ -53,6 +53,14 @@ GemuTime gemu_machine_time(GemuMachine *m);
  * gemu_machine_stop() is called; the machine time is then where it got. */
 bool gemu_machine_run_until(GemuMachine *m, GemuTime t);
 void gemu_machine_stop(GemuMachine *m);
+
+/* Real-time pacing: sleep until the host clock catches up with the machine
+ * time (measured from the first call, or the last resync).  Falling more
+ * than `slack` behind (a pause, a slow host) resyncs instead of racing to
+ * catch up; 0 = a quarter second.  Returns how long it slept. */
+GemuTime gemu_machine_pace(GemuMachine *m, GemuTime slack);
+/* Forget the pacing anchor (after a pause, say): the next pace starts over. */
+void     gemu_machine_pace_reset(GemuMachine *m);
 
 /* With several executors, the longest slice each gets before the others
  * catch up (MAME's quantum).  0 = up to the next timer (the default). */
