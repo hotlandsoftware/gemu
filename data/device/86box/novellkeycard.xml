@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- An 86Box v6.0 driver through GEMU's 86Box layer (compat/86box). -->
+<device name="novellkeycard" description="Novell NetWare 2.x Key Card (86Box)" status="working">
+    <type symbol="gemu_86box_novellkeycard_type" source="compat/86box/ports/novell_cardkey.c"/>
+</device>

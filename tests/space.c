@@ -37,6 +37,29 @@ static const GemuHandlers HW8  = { .w8 = d_w8 };
 
 static unsigned unmapped_reads, unmapped_writes;
 static uint64_t unmapped_addr;
+/* Handlers that change the map from inside a dispatch (an 86Box card
+ * moving its ports): handler 0 removes the victims and moves itself. */
+static GemuMapping *mv_victim[2], *mv_self;
+static unsigned mv_calls[3];
+static void mv_act(int id) {
+    mv_calls[id]++;
+    if (id != 0)
+        return;
+    for (int i = 0; i < 2; i++)
+        if (mv_victim[i]) {
+            gemu_mapping_remove(mv_victim[i]);
+            mv_victim[i] = NULL;
+        }
+    gemu_mapping_move(mv_self, 0x400, 1);
+}
+static uint8_t mv_r8(void *ud, uint64_t off) {
+    (void)off;
+    mv_act((int)(intptr_t)ud);
+    return (uint8_t)(0xF0 | (int)(intptr_t)ud);
+}
+static void mv_w8(void *ud, uint64_t off, uint8_t v) { (void)off; (void)v; mv_act((int)(intptr_t)ud); }
+static const GemuHandlers MV = { .r8 = mv_r8, .w8 = mv_w8 };
+
 static void on_ur(void *ud, uint64_t a, unsigned n) { (void)ud; (void)n; unmapped_reads++; unmapped_addr = a; }
 static void on_uw(void *ud, uint64_t a, unsigned n, uint64_t v) { (void)ud; (void)n; (void)v; unmapped_writes++; unmapped_addr = a; }
 
@@ -196,6 +219,36 @@ static void fixed_cases(void) {
     GemuMapping *em = gemu_space_map(io, 0x388, 1, &H8, &e, 0, 0);
     CHECK(gemu_space_read8(io, 0x388) == (0x3C & 0x0F));
     gemu_mapping_remove(em);
+
+    /* ── A handler changing the map mid-dispatch: those it removed aren't
+     *    called after it, the others are, nothing freed is touched ── */
+    for (int first = 0; first < 3; first++) {         /* handler 0 mapped 1st, 2nd, 3rd */
+        GemuMapping *mp[3];
+        for (int k = 0; k < 3; k++) {
+            int id = (first + k) % 3;
+            mp[id] = gemu_space_map(io, 0x300, 1, &MV, (void *)(intptr_t)id, 0, GEMU_MAP_SHARED);
+        }
+        mv_self = mp[0];
+        mv_victim[0] = mp[1];
+        mv_victim[1] = mp[2];
+        memset(mv_calls, 0, sizeof mv_calls);
+        gemu_space_write8(io, 0x300, 1);
+        CHECK(mv_calls[0] == 1 && mv_calls[1] <= 1 && mv_calls[2] <= 1);
+        unsigned before = mv_calls[1] + mv_calls[2];
+        CHECK(gemu_space_read8(io, 0x300) == 0xFF);       /* all gone from 300 */
+        CHECK(gemu_space_read8(io, 0x400) == 0xF0);       /* handler 0 moved */
+        CHECK(mv_calls[1] + mv_calls[2] == before);
+        /* the same in a read */
+        mv_victim[0] = gemu_space_map(io, 0x400, 1, &MV, (void *)(intptr_t)1, 0, GEMU_MAP_SHARED);
+        mv_victim[1] = gemu_space_map(io, 0x400, 1, &MV, (void *)(intptr_t)2, 0, GEMU_MAP_SHARED);
+        gemu_mapping_move(mv_self, 0x300, 1);
+        CHECK(gemu_space_read8(io, 0x300) == 0xF0);
+        gemu_mapping_move(mv_self, 0x400, 1);
+        memset(mv_calls, 0, sizeof mv_calls);
+        uint8_t got = gemu_space_read8(io, 0x400);        /* 0 moves itself to 400 (stays) */
+        CHECK(mv_calls[0] == 1 && (got & 0xF0) == 0xF0);
+        gemu_mapping_remove(mv_self);
+    }
 
     /* ── Mirrors: the 5150's 10-bit decode, the NES's 2K of RAM ── */
     Dev pic = { .id = 0x80 };

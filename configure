@@ -52,6 +52,11 @@ CORE_SRC_GTK = [
     'core/src/machine_manager_gtk.c',
 ]
 
+# GEMU's 86Box layer (compat/86box) and its ports of 86Box v6.0 drivers
+# (third_party/86box/v6.0, compiled inside the ports).
+COMPAT_86BOX = ['compat/86box/device.c', 'compat/86box/io.c', 'compat/86box/timer.c',
+                'compat/86box/pic.c']
+COMPAT_86BOX_PORTS = ['compat/86box/ports/novell_cardkey.c']
 FAMILY_SRC = {
     'chip8': [
         'cpu/chip8/chip8_cpu.c', 'cpu/chip8/octo.c',
@@ -181,7 +186,7 @@ FAMILY_SRC = {
         'vga/multi/input_menu.c',
         'hardware/romdb.c',
         'src/x86_setup.c',
-    ],
+    ] + COMPAT_86BOX + COMPAT_86BOX_PORTS,
     'z80': [
         'cpu/z80/z80.c', 'cpu/z80/z80_dis.c',
         'hardware/machine/z80/machine_z80.c',
@@ -278,6 +283,10 @@ TESTS = [
          links=DEV_CORE_LINKS, cflags='-Werror'),
     dict(name='state', family=None, kind='device', src='tests/state.c',
          links=DEV_CORE_LINKS, cflags='-Werror'),
+    dict(name='86box', family=None, kind='device', src='tests/86box.c',
+         links=DEV_CORE_LINKS + COMPAT_86BOX + COMPAT_86BOX_PORTS + [
+             'hardware/device/controller/i8259.c', 'hardware/device/controller/i8259_dev.c'],
+         cflags='-Werror'),
     dict(name='pc_devices', family=None, kind='device', src='tests/pc_devices.c',
          links=DEV_CORE_LINKS + [
              'core/src/drive.c',
@@ -924,7 +933,8 @@ def main():
                 'hardware/machine/rca', 'hardware/machine/x86', 'hardware/machine/z80',
                 'vga/ia64', 'vga/mos', 'vga/rca', 'vga/multi', 'vga/x86',
                 'cpu/chip8', 'cpu/ia64', 'cpu/mos', 'cpu/other', 'cpu/rca', 'cpu/x86', 'cpu/z80',
-                'src', build_dir]
+                'src', 'compat/86box', 'compat/86box/include',
+                'third_party/86box/v6.0/src/include', build_dir]
     inc_flags = ' '.join(f'-I{d}' for d in inc_dirs)
 
     defs_list = [f'HAVE_{t.upper()}' for t in targets]

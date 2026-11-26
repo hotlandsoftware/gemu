@@ -672,6 +672,64 @@ static const Seg *find_seg(const GemuSpace *s, const Page *p, int dir, uint64_t 
     return NULL;
 }
 
+/* Handlers may change the map (an 86Box card moving its own ports from a
+ * write to them), which frees the page's segments and maybe a mapping.  So
+ * an access takes a copy of the segment's mapping list first, calls each
+ * through a copy of the mapping, and once the map has changed calls only
+ * those still in it and still covering the address. */
+#define DISPATCH_INLINE 8
+typedef struct {
+    GemuMapping **maps;
+    uint64_t     *seq;
+    GemuMapping  *maps_in[DISPATCH_INLINE];
+    uint64_t      seq_in[DISPATCH_INLINE];
+    uint32_t      n, i;
+    uint64_t      generation;
+} Dispatch;
+
+static void dispatch_begin(Dispatch *d, GemuSpace *s, const Seg *g) {
+    d->n = g->n;
+    d->i = 0;
+    d->generation = s->generation;
+    d->maps = d->maps_in;
+    d->seq = d->seq_in;
+    if (g->n > DISPATCH_INLINE) {
+        d->maps = malloc(g->n * sizeof *d->maps);
+        d->seq = malloc(g->n * sizeof *d->seq);
+        if (!d->maps || !d->seq)
+            abort();
+    }
+    for (uint32_t i = 0; i < g->n; i++) {
+        d->maps[i] = g->maps[i];
+        d->seq[i] = g->maps[i]->seq;
+    }
+}
+
+static bool still_there(GemuSpace *s, GemuMapping *m, uint64_t seq, uint64_t eff, unsigned n) {
+    for (GemuMapping *x = s->maps; x; x = x->next)
+        if (x == m)
+            return x->seq == seq && x->enabled && eff >= x->base && eff + n - 1 <= last_of(x);
+    return false;
+}
+
+static bool dispatch_next(Dispatch *d, GemuSpace *s, uint64_t eff, unsigned n, GemuMapping *out) {
+    while (d->i < d->n) {
+        uint32_t i = d->i++;
+        if (s->generation != d->generation && !still_there(s, d->maps[i], d->seq[i], eff, n))
+            continue;
+        *out = *d->maps[i];
+        return true;
+    }
+    return false;
+}
+
+static void dispatch_end(Dispatch *d) {
+    if (d->maps != d->maps_in) {
+        free(d->maps);
+        free(d->seq);
+    }
+}
+
 static uint64_t read_n(GemuSpace *s, uint64_t addr, unsigned n);
 static void write_n(GemuSpace *s, uint64_t addr, unsigned n, uint64_t v);
 
@@ -681,8 +739,14 @@ static uint64_t slow_read(GemuSpace *s, uint64_t addr, unsigned n) {
     bool fits = last >= addr && last <= s->mask;
     if (g && fits && last <= g->hi) {
         uint64_t eff = addr & g->mask, v = ones(n);
-        for (uint32_t i = 0; i < g->n; i++)
-            v &= map_read(s, g->maps[i], eff - g->maps[i]->base, n);
+        if (g->n == 1 && g->maps[0]->ram)
+            return map_read(s, g->maps[0], eff - g->maps[0]->base, n);
+        Dispatch d;
+        dispatch_begin(&d, s, g);
+        GemuMapping m;
+        while (dispatch_next(&d, s, eff, n, &m))
+            v &= map_read(s, &m, eff - m.base, n);
+        dispatch_end(&d);
         return v;
     }
     if (!g && fits && last <= gap_end) {
@@ -702,8 +766,16 @@ static void slow_write(GemuSpace *s, uint64_t addr, unsigned n, uint64_t v) {
     bool fits = last >= addr && last <= s->mask;
     if (g && fits && last <= g->hi) {
         uint64_t eff = addr & g->mask;
-        for (uint32_t i = 0; i < g->n; i++)
-            map_write(s, g->maps[i], eff - g->maps[i]->base, n, v);
+        if (g->n == 1 && g->maps[0]->ram) {
+            map_write(s, g->maps[0], eff - g->maps[0]->base, n, v);
+            return;
+        }
+        Dispatch d;
+        dispatch_begin(&d, s, g);
+        GemuMapping m;
+        while (dispatch_next(&d, s, eff, n, &m))
+            map_write(s, &m, eff - m.base, n, v);
+        dispatch_end(&d);
         return;
     }
     if (!g && fits && last <= gap_end) {
