@@ -42,6 +42,8 @@ static uint16_t nt_mirror(const Rp2c02 *ppu, uint16_t addr) {
     return (uint16_t)(((map[mode][nt] & 1u) * 0x400u) + off);
 }
 
+uint16_t rp2c02_ciram_index(const Rp2c02 *ppu, uint16_t addr) { return nt_mirror(ppu, addr); }
+
 static uint8_t palette_index(uint8_t addr) {
     addr &= 0x1Fu;
     if ((addr & 0x13u) == 0x10u) addr &= (uint8_t)~0x10u;

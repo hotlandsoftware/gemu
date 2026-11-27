@@ -14,6 +14,16 @@
 #include "storage/fds_hle.h"
 #include "romdb.h"
 #include "apu2a03.h"
+#include "apu2a03_state.h"
+#include "rp2c02_state.h"
+#include "mos6502_state.h"
+#include "cart/nes_cart_state.h"
+#include "storage/fds_state.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/line.h"
+#include "gemu/dev/scheduler.h"
+#include "gemu/dev/space.h"
+#include "gemu/dev/state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -188,13 +198,21 @@ static bool nes_cart_insert(NesState *s, const char *path) {
 
 static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud);
 static void    nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud);
+static GemuSpace *nes_space_cpu(const NesState *s);
+static inline uint8_t *nes_page(NesState *s, uint16_t addr, bool write);
+static void nes_maps_sync(NesState *s);
+static GemuSpace *nes_space_ppu(const NesState *s);
+static void nes_lines_irq(NesState *s, bool apu, bool cart);
+static void nes_lines_nmi(NesState *s);
+static void nes_lines_resync(NesState *s);
+static void nes_exec_clock(NesState *s, uint32_t hz);
 
 /* ── Cartridge connector (Debug > Cartridge Pins, nes_pins.h) ─────────────── */
 
 void nes_update_irq(NesState *s) {
     bool apu = s->apu.fc_irq || s->apu.dmc.irq_flag;
     bool cart = s->cart_irq && !(nes_pins_sample(&s->pins) & NES_PIN_BIT(NP_IRQ));
-    s->cpu.irq = apu || cart;
+    nes_lines_irq(s, apu, cart);     /* wired-OR into the CPU's /IRQ */
     if (apu) s->pins.tp_apu_irq = true;
     if (s->cart_irq) s->pins.tp_map_irq = true;   /* the test point is on the cartridge side */
 }
@@ -218,6 +236,7 @@ static void nes_pins_apply(NesState *s) {
     }
     if (s->clock_seen != p->clock_hz) {
         s->clock_seen = p->clock_hz;
+        nes_exec_clock(s, p->clock_hz);
         /* The APU resamples from the CPU clock: a slower clock makes more
          * output samples per cycle, so pacing to the audio slows everything
          * (and lowers the pitch) as on a real underclocked console. */
@@ -450,7 +469,7 @@ static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
         for (int i = 0; i < 3; i++) {
             rp2c02_tick(&s->ppu);
             if (s->ppu.nmi_pending) {
-                s->cpu.nmi = true;
+                nes_lines_nmi(s);
                 s->pins.tp_nmi = true;
                 s->ppu.nmi_pending = false;
             }
@@ -459,25 +478,63 @@ static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
 }
 
 
+/* ── The CPU's bus (stage N2) ────────────────────────────────────────────────
+ *
+ * A 16-bit core space, "program" (nes_core_build()):
+ *   $0000-$1FFF  work RAM, 2 KB mirrored
+ *   $2000-$3FFF  the PPU's registers, mirrored every 8 bytes
+ *   $4000-$401F  the 2A03's own: APU, OAM DMA, the controller ports
+ *   $4020-$FFFF  the cartridge slot; above it, at higher priority:
+ *                  the VS. System's coin counter ($4020-$5FFF)
+ *                  the Disk System's registers ($4020-$408F) and its
+ *                  RAM and BIOS ($6000-$FFFF)
+ *                  the Game Genie ($8000-$FFFF, while codes are on)
+ * Each handler gets its offset from its mapping's base. */
+
+/* Plain memory (work RAM, a board's PRG ROM windows, the Disk System's
+ * RAM...) is read and written straight from host memory: each 256-byte page
+ * the space serves from one RAM mapping is cached (nes_page()), until the
+ * space's map changes.  Everything else is a space access. */
 static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
     NesState *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
+    uint8_t *p = nes_page(s, addr, false);
+    return p ? p[addr & 0xFFu] : gemu_space_read8(nes_space_cpu(s), addr);
+}
 
-    if (addr < 0x2000) return s->ram[addr & 0x07FF];
+static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
+    NesState *s = ud;
+    gemu_monitor_check_write(s->monitor, addr);
+    uint8_t *p = nes_page(s, addr, true);
+    if (p) p[addr & 0xFFu] = val;
+    else gemu_space_write8(nes_space_cpu(s), addr, val);
+}
 
-    if (addr < 0x4000) {
-        nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
-        return rp2c02_read(&s->ppu, (uint8_t)(addr & 7));
+/* $2000-$2007 */
+static uint8_t bus_ppu_r(void *ud, uint64_t off) {
+    NesState *s = ud;
+    nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+    return rp2c02_read(&s->ppu, (uint8_t)(off & 7));
+}
+
+static void bus_ppu_w(void *ud, uint64_t off, uint8_t val) {
+    NesState *s = ud;
+    if (s->cfg->is_arcade) {
+        uint8_t r = (uint8_t)(off & 7);
+        if (r == 0 || r == 1 || r == 5 || r == 6)
+            VS_DEBUG(s, "write 200%u <- %02X pc=%04X frame=%llu sl=%d dot=%d\n",
+                     r, val, s->cpu.PC,
+                     (unsigned long long)s->ppu.frame,
+                     s->ppu.scanline, s->ppu.dot);
     }
+    nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
+    rp2c02_write(&s->ppu, (uint8_t)(off & 7), val);
+}
 
-    /* FDS I/O registers ($4020-$408F covers disk regs + wavetable + sound) */
-    if (s->fds_enabled && addr >= 0x4020 && addr <= 0x408Fu) {
-        uint8_t v = fds_reg_read(&s->fds, addr);
-        s->cart_irq = fds_tick(&s->fds);  /* recalculate IRQ after flag clear */
-        nes_update_irq(s);
-        return v;
-    }
-
+/* $4000-$401F */
+static uint8_t bus_io_r(void *ud, uint64_t off) {
+    NesState *s = ud;
+    uint16_t addr = (uint16_t)(0x4000u + off);
     if (addr == 0x4015) {
         nes_sync_apu_to_cpu(s, s->cpu.cycle_count - 1);
         s->apu_deadline = 0;
@@ -522,12 +579,6 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
         return v;
     }
 
-    if (s->cfg->is_arcade && addr >= 0x4020 && addr < 0x6000) {
-        VS_DEBUG(s, "read %04X -> %02X pc=%04X coin_counter\n",
-                 addr, s->vs_coin_counter, s->cpu.PC);
-        return s->vs_coin_counter;
-    }
-
     /* The controller ports drive D0-D4 (whatever is plugged in uses D0, the
      * Famicom's microphone D2, the Zapper D3-D4); D5-D7 are open bus. */
     uint8_t ctrl_open = s->cpu_bus & 0xE0u;
@@ -567,58 +618,12 @@ static uint8_t nes_cpu_read_bus(uint16_t addr, void *ud) {
         s->ctrl_shift[1] = (s->ctrl_shift[1] >> 1) | 0x80u;
         return ctrl_open | bit;
     }
-
-    if (addr < 0x4020) return s->cpu_bus;
-
-    /* FDS: RAM at $6000-$DFFF, the BIOS above */
-    if (s->fds_enabled && addr >= 0x6000) {
-        if (addr >= 0xE000) return s->fds.bios[addr - 0xE000u];
-        return s->fds.ram[addr - 0x6000u];
-    }
-
-    if (addr < 0x8000) return nes_cart_read(&s->cart, addr, s->cpu_bus);
-
-    if (!s->cart.prg) return s->cpu_bus;
-    uint8_t rom = nes_cart_prg(&s->cart, addr);
-    for (int i = 0; i < s->gg_count; i++) {
-        if (s->gg_patches[i].addr == addr &&
-            (!s->gg_patches[i].has_cmp || rom == s->gg_patches[i].cmp))
-            return s->gg_patches[i].val;
-    }
-    return rom;
+    return s->cpu_bus;            /* the APU's write-only registers, $4018-$401F */
 }
 
-static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
+static void bus_io_w(void *ud, uint64_t off, uint8_t val) {
     NesState *s = ud;
-    gemu_monitor_check_write(s->monitor, addr);
-
-    if (addr < 0x2000) { s->ram[addr & 0x07FF] = val; return; }
-
-    if (addr < 0x4000) {
-        if (s->cfg->is_arcade) {
-            uint8_t r = (uint8_t)(addr & 7);
-            if (r == 0 || r == 1 || r == 5 || r == 6)
-                VS_DEBUG(s, "write 200%u <- %02X pc=%04X frame=%llu sl=%d dot=%d\n",
-                         r, val, s->cpu.PC,
-                         (unsigned long long)s->ppu.frame,
-                         s->ppu.scanline, s->ppu.dot);
-        }
-        nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
-        rp2c02_write(&s->ppu, (uint8_t)(addr & 7), val);
-        return;
-    }
-
-    /* FDS I/O registers ($4020-$408A covers disk regs, wavetable and sound) */
-    if (s->fds_enabled && addr >= 0x4020 && addr <= 0x408Au) {
-        fds_reg_write(&s->fds, addr, val);
-        /* $4025 bit 3 controls mirroring (0=vertical, 1=horizontal) */
-        if (addr == 0x4025)
-            s->ppu.mirror = (val & 0x08) ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
-        s->cart_irq = fds_tick(&s->fds);
-        nes_update_irq(s);
-        return;
-    }
-
+    uint16_t addr = (uint16_t)(0x4000u + off);
     if (addr == 0x4014) {
         VS_DEBUG(s, "write 4014 <- %02X pc=%04X dma\n", val, s->cpu.PC);
         /* OAM DMA: starts on the CPU's next read (nes_run_dma) */
@@ -646,35 +651,176 @@ static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
         }
         s->ctrl_strobe = new_strobe;
         nes_cart_out(&s->cart, val);   /* OUT0-2: the VS. System's CHR bank */
-        return;
-    }
-
-    if (s->cfg->is_arcade && addr >= 0x4020 && addr < 0x6000) {
-        s->vs_coin_counter = val;
-        VS_DEBUG(s, "write %04X <- %02X pc=%04X coin_counter\n", addr, val, s->cpu.PC);
+        nes_maps_sync(s);
         return;
     }
 
     /* APU registers */
-    if ((addr >= 0x4000 && addr <= 0x4013) || addr == 0x4015 || addr == 0x4017) {
+    if (addr <= 0x4013 || addr == 0x4015 || addr == 0x4017) {
         nes_sync_apu_to_cpu(s, s->cpu.cycle_count - 1);
         apu2a03_write(&s->apu, addr, val);
         nes_dmc_dma_check(s);
         s->apu_deadline = 0;   /* the write may bring the next event closer */
         /* $4010/$4017 can clear APU IRQ flags */
         nes_update_irq(s);
-        return;
     }
+}
 
-    if (addr < 0x4020) return;
+/* $4020-$FFFF: the cartridge slot */
+static uint8_t cart_read(NesState *s, uint16_t addr) {
+    if (addr < 0x8000) return nes_cart_read(&s->cart, addr, s->cpu_bus);
+    if (!s->cart.prg) return s->cpu_bus;
+    return nes_cart_prg(&s->cart, addr);
+}
+static uint8_t bus_cart_r(void *ud, uint64_t off) {
+    return cart_read(ud, (uint16_t)(0x4020u + off));
+}
+static void bus_cart_w(void *ud, uint64_t off, uint8_t val) {
+    NesState *s = ud;
+    nes_cart_write(&s->cart, (uint16_t)(0x4020u + off), val);
+    nes_maps_sync(s);                   /* a bank switch moves the windows */
+}
+static bool bus_cart_peek(void *ud, uint64_t off, uint8_t *v) {
+    NesState *s = ud;
+    uint16_t addr = (uint16_t)(0x4020u + off);
+    if (addr < 0x6000 || !s->cart.prg) return false;   /* board registers */
+    if (addr < 0x8000) { *v = s->cart.prg_ram[addr - 0x6000u]; return true; }
+    *v = nes_cart_prg(&s->cart, addr);
+    return true;
+}
 
-    /* FDS: $6000-$DFFF is RAM */
-    if (s->fds_enabled && addr >= 0x6000) {
-        if (addr < 0xE000) s->fds.ram[addr - 0x6000u] = val;
-        return;
+/* $8000-$FFFF over the slot, while Game Genie codes are on (nes_gg_changed()) */
+static uint8_t bus_gg_r(void *ud, uint64_t off) {
+    NesState *s = ud;
+    uint16_t addr = (uint16_t)(0x8000u + off);
+    uint8_t rom = cart_read(s, addr);
+    for (int i = 0; i < s->gg_count; i++) {
+        if (s->gg_patches[i].addr == addr &&
+            (!s->gg_patches[i].has_cmp || rom == s->gg_patches[i].cmp))
+            return s->gg_patches[i].val;
     }
+    return rom;
+}
+static void bus_gg_w(void *ud, uint64_t off, uint8_t val) {
+    NesState *s = ud;
+    nes_cart_write(&s->cart, (uint16_t)(0x8000u + off), val);
+    nes_maps_sync(s);
+}
 
-    nes_cart_write(&s->cart, addr, val);
+/* $4020-$5FFF on the VS. System: the coin counter */
+static uint8_t bus_vs_r(void *ud, uint64_t off) {
+    NesState *s = ud;
+    VS_DEBUG(s, "read %04X -> %02X pc=%04X coin_counter\n",
+             (unsigned)(0x4020u + off), s->vs_coin_counter, s->cpu.PC);
+    return s->vs_coin_counter;
+}
+static void bus_vs_w(void *ud, uint64_t off, uint8_t val) {
+    NesState *s = ud;
+    s->vs_coin_counter = val;
+    VS_DEBUG(s, "write %04X <- %02X pc=%04X coin_counter\n",
+             (unsigned)(0x4020u + off), val, s->cpu.PC);
+}
+
+/* $4020-$408F with the Disk System: its registers (writes to $408B up reach
+ * the slot) */
+static uint8_t bus_fds_reg_r(void *ud, uint64_t off) {
+    NesState *s = ud;
+    uint8_t v = fds_reg_read(&s->fds, (uint16_t)(0x4020u + off));
+    s->cart_irq = fds_tick(&s->fds);  /* recalculate IRQ after flag clear */
+    nes_update_irq(s);
+    return v;
+}
+static void bus_fds_reg_w(void *ud, uint64_t off, uint8_t val) {
+    NesState *s = ud;
+    uint16_t addr = (uint16_t)(0x4020u + off);
+    if (addr > 0x408Au) { nes_cart_write(&s->cart, addr, val); nes_maps_sync(s); return; }
+    fds_reg_write(&s->fds, addr, val);
+    /* $4025 bit 3 controls mirroring (0=vertical, 1=horizontal) */
+    if (addr == 0x4025) {
+        s->ppu.mirror = (val & 0x08) ? RP2C02_MIRROR_HORIZONTAL : RP2C02_MIRROR_VERTICAL;
+        nes_maps_sync(s);
+    }
+    s->cart_irq = fds_tick(&s->fds);
+    nes_update_irq(s);
+}
+
+/* $6000-$FFFF with the Disk System: its RAM, then the BIOS */
+static uint8_t bus_fds_mem_r(void *ud, uint64_t off) {
+    NesState *s = ud;
+    uint16_t addr = (uint16_t)(0x6000u + off);
+    if (addr >= 0xE000) return s->fds.bios[addr - 0xE000u];
+    return s->fds.ram[addr - 0x6000u];
+}
+static void bus_fds_mem_w(void *ud, uint64_t off, uint8_t val) {
+    NesState *s = ud;
+    uint16_t addr = (uint16_t)(0x6000u + off);
+    if (addr < 0xE000) s->fds.ram[addr - 0x6000u] = val;
+}
+static bool bus_fds_mem_peek(void *ud, uint64_t off, uint8_t *v) {
+    *v = bus_fds_mem_r(ud, off);
+    return true;
+}
+
+static const GemuHandlers nes_bus_ppu = { .r8 = bus_ppu_r, .w8 = bus_ppu_w };
+static const GemuHandlers nes_bus_io = { .r8 = bus_io_r, .w8 = bus_io_w };
+static const GemuHandlers nes_bus_cart = { .r8 = bus_cart_r, .w8 = bus_cart_w,
+                                           .peek8 = bus_cart_peek };
+static const GemuHandlers nes_bus_gg = { .r8 = bus_gg_r, .w8 = bus_gg_w };
+static const GemuHandlers nes_bus_vs = { .r8 = bus_vs_r, .w8 = bus_vs_w };
+static const GemuHandlers nes_bus_fds_reg = { .r8 = bus_fds_reg_r, .w8 = bus_fds_reg_w };
+static const GemuHandlers nes_bus_fds_mem = { .r8 = bus_fds_mem_r, .w8 = bus_fds_mem_w,
+                                              .peek8 = bus_fds_mem_peek };
+
+/* ── The PPU's bus (stage N2) ────────────────────────────────────────────────
+ * A 14-bit core space, "ppu": the pattern tables ($0000-$1FFF) through the
+ * board's CHR windows, the nametables ($2000-$2FFF, mirrored to $3EFF)
+ * through the console's 2 KB CIRAM as the board's mirroring arranges it, or
+ * through the board itself when it maps its own (MMC5, four-screen).  The
+ * palette is inside the PPU.  The PPU reaches it through its chr and nt
+ * hooks (nes_ppu_space_*). */
+
+static uint8_t ppu_chr_r(void *ud, uint64_t off) {
+    return nes_cart_chr_read((uint16_t)off, &((NesState *)ud)->cart);
+}
+static void ppu_chr_w(void *ud, uint64_t off, uint8_t val) {
+    nes_cart_chr_write((uint16_t)off, val, &((NesState *)ud)->cart);
+}
+static bool ppu_chr_peek(void *ud, uint64_t off, uint8_t *v) {
+    *v = ppu_chr_r(ud, off);
+    return true;
+}
+static uint8_t ppu_nt_r(void *ud, uint64_t off) {
+    NesState *s = ud;
+    uint16_t a = (uint16_t)(0x2000u + off);
+    if (nes_cart_wants_nt(&s->cart)) return nes_cart_nt_read(a, &s->cart);
+    return s->ppu.vram[rp2c02_ciram_index(&s->ppu, a)];
+}
+static void ppu_nt_w(void *ud, uint64_t off, uint8_t val) {
+    NesState *s = ud;
+    uint16_t a = (uint16_t)(0x2000u + off);
+    if (nes_cart_wants_nt(&s->cart)) nes_cart_nt_write(a, val, &s->cart);
+    else s->ppu.vram[rp2c02_ciram_index(&s->ppu, a)] = val;
+}
+static bool ppu_nt_peek(void *ud, uint64_t off, uint8_t *v) {
+    NesState *s = ud;
+    if (nes_cart_wants_nt(&s->cart)) return false;   /* MMC5's ExRAM modes have effects */
+    *v = ppu_nt_r(ud, off);
+    return true;
+}
+static const GemuHandlers nes_ppu_chr = { .r8 = ppu_chr_r, .w8 = ppu_chr_w,
+                                          .peek8 = ppu_chr_peek };
+static const GemuHandlers nes_ppu_nt = { .r8 = ppu_nt_r, .w8 = ppu_nt_w, .peek8 = ppu_nt_peek };
+
+/* The PPU's hooks: its bus is the space. */
+static inline uint8_t *nes_ppu_page(NesState *s, uint16_t addr, bool write);
+static uint8_t nes_ppu_space_r(uint16_t addr, void *ud) {
+    uint8_t *p = nes_ppu_page(ud, addr, false);
+    return p ? p[addr & 0xFFu] : gemu_space_read8(nes_space_ppu(ud), addr);
+}
+static void nes_ppu_space_w(uint16_t addr, uint8_t val, void *ud) {
+    uint8_t *p = nes_ppu_page(ud, addr, true);
+    if (p) p[addr & 0xFFu] = val;
+    else gemu_space_write8(nes_space_ppu(ud), addr, val);
 }
 
 /* ── Cartridge media device ──────────────────────────────────────────────── */
@@ -684,9 +830,19 @@ static void nes_cpu_write_bus(uint16_t addr, uint8_t val, void *ud) {
 static void nes_install_mapper_hooks(NesState *s) {
     NesCart *c = &s->cart;
     s->ppu.irq_scanline = nes_cart_wants_scanline(c) ? nes_cart_scanline : NULL;
-    s->ppu.nt_read      = nes_cart_wants_nt(c) ? nes_cart_nt_read : NULL;
-    s->ppu.nt_write     = nes_cart_wants_nt(c) ? nes_cart_nt_write : NULL;
-    s->ppu.irq_ud = s->ppu.nt_ud = c;
+    s->ppu.irq_ud = c;
+    if (s->core) {
+        /* the PPU's bus is the "ppu" space (its handlers ask the board) */
+        s->ppu.chr_read  = nes_ppu_space_r;
+        s->ppu.chr_write = nes_ppu_space_w;
+        s->ppu.nt_read   = nes_ppu_space_r;
+        s->ppu.nt_write  = nes_ppu_space_w;
+        s->ppu.chr_ud = s->ppu.nt_ud = s;
+    } else {
+        s->ppu.nt_read  = nes_cart_wants_nt(c) ? nes_cart_nt_read : NULL;
+        s->ppu.nt_write = nes_cart_wants_nt(c) ? nes_cart_nt_write : NULL;
+        s->ppu.nt_ud = c;
+    }
 }
 
 
@@ -701,6 +857,7 @@ void nes_reset(NesState *s) {
         s->apu_deadline = 0;
         mos6502_reset(&s->cpu);
         apu2a03_reset(&s->apu);
+        nes_maps_sync(s);
         return;
     }
     s->ppu.mirror = s->cart.info.mirror;
@@ -709,6 +866,7 @@ void nes_reset(NesState *s) {
 
     /* The board's banks before mos6502_reset reads the reset vector */
     nes_cart_reset(&s->cart);
+    nes_maps_sync(s);
     s->cart_irq = s->cart.irq;
     nes_update_irq(s);
 
@@ -850,9 +1008,10 @@ static bool nes_arcade_assemble(NesState *s, const MosConfig *cfg) {
  * pattern machine_i2000.c uses for its savevm/loadvm. */
 
 #define NES_SNAPSHOT_MAGIC    0x314D5645534d454eULL /* "NEMSVE1" */
-#define NES_SNAPSHOT_VERSION  5u   /* 2: board state; 3: dot-by-dot sprite evaluation;
+#define NES_SNAPSHOT_VERSION  6u   /* 2: board state; 3: dot-by-dot sprite evaluation;
                                        4: the cartridge as a NesCart;
-                                       5: the front end's fields out of NesState */
+                                       5: the front end's fields out of NesState;
+                                       6: NesState's core pointer (stage N1) */
 
 /* Snapshots are built in memory (SnapBuf); the front end's savevm/loadvm
  * write and read them as files, and netplay keeps them there. */
@@ -915,6 +1074,7 @@ static bool snapshot_save(NesState *s, SnapBuf *b) {
     snap->apu.write_tap    = NULL; snap->apu.write_tap_ud = NULL;
     snap->apu.audio_dev    = NULL;
     snap->fds.raw_disk = NULL;
+    snap->core = NULL;
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     snap->apu_midi.out = NULL;
 #endif
@@ -986,7 +1146,9 @@ bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
     MidiOut *apu_midi_out = s->apu_midi.out;
 #endif
     NesPins pins = s->pins;       /* a debugging setting, not machine state */
+    struct NesCore *core = s->core;
     *s = *loaded;
+    s->core = core;
     free(loaded);
     s->pins = pins;
     s->pins_seen = pins.version - 1u;   /* reapply: the hook pointers came from the file */
@@ -1008,6 +1170,8 @@ bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
     s->apu.write_tap = apu_write_tap; s->apu.write_tap_ud = apu_write_tap_ud;
     s->apu.audio_dev = audio_dev;
     s->fds.raw_disk = fds_raw_disk;
+    nes_lines_resync(s);
+    nes_maps_sync(s);
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     s->apu_midi.out = apu_midi_out;
 #endif
@@ -1278,6 +1442,410 @@ static void nes_monitor_setup(NesState *s) {
     }
 }
 
+/* ── The console on the core (stage N) ──────────────────────────────────────
+ *
+ *   board    the console's glue: work RAM, the 2A03's DMA unit and its
+ *            catch-up counters, the controller ports, the VS. System's
+ *            inputs, the data bus
+ *   cpu      the 2A03's 6502
+ *   ppu      the 2C02 (2C07, 2C04 ...)
+ *   apu      the 2A03's sound and frame counter
+ *   cart     the cartridge slot (the board inside it)
+ *   fds      the Famicom Disk System's RAM adapter, when there is one
+ *
+ * N1: the parts stay where NesState keeps them - the front end, Lua and
+ * netplay read them there - and each device describes (`info`) and saves
+ * its part.  The console still runs itself; N2 moves its decode into spaces
+ * and lines, N3 its CPU onto the scheduler. */
+typedef struct NesCore {
+    GemuMachine *machine;
+    GemuDevice  *board, *cpu, *ppu, *apu, *cart, *fds;
+    /* N2: the buses and the interrupt lines */
+    GemuSpace   *bus, *ppu_bus;
+    GemuMapping *gg;                     /* the Game Genie's layer */
+    GemuMapping *prg_map[4];             /* the board's PRG windows, read-only */
+    uint8_t     *prg_ptr[4];
+    GemuMapping *chr_map[8], *chr_wmap[8]; /* its CHR windows: reads, RAM writes */
+    uint8_t     *chr_ptr[8], *chr_wptr[8];
+    GemuMapping *nt_map[4];              /* CIRAM, as the board mirrors it */
+    uint8_t     *nt_ptr[4];
+    uint8_t     *ppage[2][64];           /* nes_ppu_page(): as page[] for the PPU's bus */
+    uint64_t     ppage_gen;
+    /* N3: the 2A03's 6502 runs the machine (nes_exec_run()) */
+    GemuExecutor *exec;
+    uint64_t     run_start;              /* cycle_count when this run began */
+    bool         stopped;                /* the last run ended at a breakpoint or pause */
+    /* nes_page(): host memory per 256-byte page, [0] reads, [1] writes;
+     * NES_PAGE_SLOW = a space access.  Good while the space's generation
+     * is page_gen. */
+    uint8_t     *page[2][256];
+    uint64_t     page_gen;
+    GemuLine    *nmi, *apu_irq, *cart_irq;
+    GemuLineIn  *cpu_nmi, *cpu_irq;
+} NesCore;
+
+static GemuSpace *nes_space_cpu(const NesState *s) { return s->core->bus; }
+
+static uint8_t nes_page_slow;
+#define NES_PAGE_SLOW (&nes_page_slow)
+
+static inline uint8_t *nes_page(NesState *s, uint16_t addr, bool write) {
+    NesCore *c = s->core;
+    uint64_t gen = gemu_space_generation(c->bus);
+    if (c->page_gen != gen) {
+        memset(c->page, 0, sizeof c->page);
+        c->page_gen = gen;
+    }
+    uint8_t **slot = &c->page[write][addr >> 8];
+    if (!*slot) {
+        uint64_t avail;
+        uint8_t *p = gemu_space_ptr(c->bus, addr & 0xFF00u, write, &avail);
+        *slot = p && avail >= 256 ? p : NES_PAGE_SLOW;
+    }
+    return *slot == NES_PAGE_SLOW ? NULL : *slot;
+}
+
+static inline uint8_t *nes_ppu_page(NesState *s, uint16_t addr, bool write) {
+    NesCore *c = s->core;
+    uint64_t gen = gemu_space_generation(c->ppu_bus);
+    if (c->ppage_gen != gen) {
+        memset(c->ppage, 0, sizeof c->ppage);
+        c->ppage_gen = gen;
+    }
+    addr &= 0x3FFFu;
+    uint8_t **slot = &c->ppage[write][addr >> 8];
+    if (!*slot) {
+        uint64_t avail;
+        uint8_t *p = gemu_space_ptr(c->ppu_bus, addr & 0x3F00u, write, &avail);
+        *slot = p && avail >= 256 ? p : NES_PAGE_SLOW;
+    }
+    return *slot == NES_PAGE_SLOW ? NULL : *slot;
+}
+
+/* One window of host memory in a space: mapped at base (size bytes, with
+ * flags) when ptr is set, re-pointed as ptr moves, disabled when it's NULL. */
+static void nes_window(GemuSpace *sp, GemuMapping **map, uint8_t **cur, uint64_t base,
+                       uint64_t size, unsigned flags, uint8_t *ptr, const char *name) {
+    if (!ptr) {
+        if (*map && *cur) gemu_mapping_enable(*map, false);
+        *cur = NULL;
+        return;
+    }
+    if (!*map) {
+        *map = gemu_space_map_ram(sp, base, size, ptr, flags, 1);
+        if (*map) gemu_mapping_set_name(*map, name);
+    } else if (!*cur) {
+        gemu_mapping_set_ptr(*map, ptr);
+        gemu_mapping_enable(*map, true);
+    } else if (*cur != ptr) {
+        gemu_mapping_set_ptr(*map, ptr);
+    }
+    *cur = *map ? ptr : NULL;
+}
+
+/* The board's windows as plain memory in the spaces, where the board reads
+ * them plainly: PRG ROM read-only (no prg_read hook, as MMC5's RAM windows
+ * need; writes reach the board's handler underneath), CHR read-only plus
+ * writes where it's RAM (no chr_read hook, as MMC2's latches need), and
+ * CIRAM as the board's mirroring arranges it (unless it maps the nametables
+ * itself).  After anything that can move them: a write to the board, $4016
+ * (the VS. System's CHR bank), the Disk System's mirroring, a reset, a load,
+ * another cartridge. */
+static void nes_maps_sync(NesState *s) {
+    NesCore *c = s->core;
+    if (!c || !c->bus) return;
+    NesCart *k = &s->cart;
+    bool board = k->ops != NULL;
+    bool prg = board && k->prg && !k->ops->prg_read && !s->fds_enabled;
+    for (int i = 0; i < 4; i++)
+        nes_window(c->bus, &c->prg_map[i], &c->prg_ptr[i], 0x8000u + 0x2000u * (unsigned)i,
+                   0x2000, GEMU_MAP_READONLY, prg ? k->prg + k->prg_off[i] : NULL, "PRG window");
+    bool chr = board && k->chr && !k->ops->chr_read;
+    for (int i = 0; i < 8; i++) {
+        uint8_t *p = chr ? k->chr + k->chr_off[i] : NULL;
+        nes_window(c->ppu_bus, &c->chr_map[i], &c->chr_ptr[i], 0x400u * (unsigned)i, 0x400,
+                   GEMU_MAP_READONLY, p, "CHR window");
+        nes_window(c->ppu_bus, &c->chr_wmap[i], &c->chr_wptr[i], 0x400u * (unsigned)i, 0x400,
+                   GEMU_MAP_WRITEONLY, (k->chr_wmask >> i) & 1u ? p : NULL, "CHR RAM window");
+    }
+    bool ciram = !(board && nes_cart_wants_nt(k));
+    for (int i = 0; i < 4; i++)
+        nes_window(c->ppu_bus, &c->nt_map[i], &c->nt_ptr[i], 0x2000u + 0x400u * (unsigned)i, 0x400,
+                   0, ciram ? s->ppu.vram + rp2c02_ciram_index(&s->ppu, (uint16_t)(0x2000u + 0x400u * (unsigned)i))
+                            : NULL, "CIRAM");
+}
+static GemuSpace *nes_space_ppu(const NesState *s) { return s->core->ppu_bus; }
+
+/* The 2A03's /NMI (an edge: the PPU's vblank) and /IRQ (level, wired-OR). */
+static void cpu_nmi_in(void *ud, int idx, bool level) {
+    (void)idx;
+    if (level) ((NesState *)ud)->cpu.nmi = true;
+}
+static void cpu_irq_in(void *ud, int idx, bool level) {
+    (void)idx;
+    ((NesState *)ud)->cpu.irq = level;
+}
+static void nes_lines_irq(NesState *s, bool apu, bool cart) {
+    if (!s->core) { s->cpu.irq = apu || cart; return; }
+    gemu_line_set(s->core->apu_irq, apu);
+    gemu_line_set(s->core->cart_irq, cart);
+}
+static void nes_lines_nmi(NesState *s) {
+    if (s->core) gemu_line_pulse(s->core->nmi);
+    else s->cpu.nmi = true;
+}
+
+/* The Game Genie's codes changed (the front end rebuilt gg_patches). */
+void nes_gg_changed(NesState *s) {
+    if (s->core && s->core->gg)
+        gemu_mapping_enable(s->core->gg, s->gg_count > 0);
+}
+
+/* The spaces' mappings for this console (see "The CPU's bus"). */
+static bool nes_bus_build(NesState *s) {
+    NesCore *c = s->core;
+    GemuMachine *m = c->machine;
+    if (!(c->bus = gemu_space_new(m, "program", 16, 8, GEMU_LITTLE_ENDIAN)) ||
+        !(c->ppu_bus = gemu_space_new(m, "ppu", 14, 8, GEMU_LITTLE_ENDIAN)))
+        return false;
+    bool ok = gemu_space_map_ram(c->bus, 0x0000, 0x800, s->ram, 0, 0) &&
+              gemu_space_mirror(c->bus, 0x0000, 0x2000, 0x07FF) &&
+              gemu_space_map(c->bus, 0x2000, 8, &nes_bus_ppu, s, 0, 0) &&
+              gemu_space_mirror(c->bus, 0x2000, 0x2000, 0x2007) &&
+              gemu_space_map(c->bus, 0x4000, 0x20, &nes_bus_io, s, 0, 0) &&
+              gemu_space_map(c->bus, 0x4020, 0x10000 - 0x4020, &nes_bus_cart, s, 0, 0);
+    if (ok && s->cfg->is_arcade)
+        ok = gemu_space_map(c->bus, 0x4020, 0x6000 - 0x4020, &nes_bus_vs, s, 2, 0);
+    if (ok && s->fds_enabled)
+        ok = gemu_space_map(c->bus, 0x4020, 0x70, &nes_bus_fds_reg, s, 2, 0) &&
+             gemu_space_map(c->bus, 0x6000, 0xA000, &nes_bus_fds_mem, s, 2, 0);
+    if (ok && (c->gg = gemu_space_map(c->bus, 0x8000, 0x8000, &nes_bus_gg, s, 3, 0)))
+        gemu_mapping_enable(c->gg, false);
+    ok = ok && c->gg &&
+         gemu_space_map(c->ppu_bus, 0x0000, 0x2000, &nes_ppu_chr, s, 0, 0) &&
+         gemu_space_map(c->ppu_bus, 0x2000, 0x1000, &nes_ppu_nt, s, 0, 0) &&
+         gemu_space_mirror(c->ppu_bus, 0x2000, 0x2000, 0x2FFF);
+    return ok;
+}
+
+/* NMI from the PPU, /IRQ from the APU and the cartridge (wired-OR). */
+static bool nes_lines_build(NesState *s) {
+    NesCore *c = s->core;
+    return (c->cpu_nmi = gemu_line_in(c->cpu, "nmi", cpu_nmi_in, s, 0)) &&
+           (c->cpu_irq = gemu_line_in(c->cpu, "irq", cpu_irq_in, s, 0)) &&
+           (c->nmi = gemu_line_out(c->ppu, "nmi")) &&
+           (c->apu_irq = gemu_line_out(c->apu, "irq")) &&
+           (c->cart_irq = gemu_line_out(c->cart, "irq")) &&
+           gemu_line_connect_in(c->nmi, c->cpu_nmi, 0) &&
+           gemu_line_connect_in(c->apu_irq, c->cpu_irq, 0) &&
+           gemu_line_connect_in(c->cart_irq, c->cpu_irq, 0);
+}
+
+/* The 6502 as the machine's executor, at the console's CPU clock (the pin
+ * window's clock).  A run executes instructions until its budget is spent,
+ * the PPU finishes a frame, or the monitor stops it; the PPU and APU still
+ * catch up to the CPU's cycle - the executor's time - at a register access,
+ * a DMA or the end of the frame. */
+static uint64_t nes_exec_run(void *ud, uint64_t budget) {
+    NesState *s = ud;
+    NesCore *c = s->core;
+    uint64_t start = c->run_start = s->cpu.cycle_count;
+    (void)budget;
+    while (s->cpu.cycle_count - start < gemu_executor_budget(c->exec)) {
+        if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) { c->stopped = true; break; }
+        nes_step_insn(s);
+        if (gemu_monitor_is_paused(s->monitor)) { c->stopped = true; break; }
+        if (s->ppu.dirty) break;
+    }
+    if (c->stopped || s->ppu.dirty)
+        gemu_machine_stop(c->machine);
+    return s->cpu.cycle_count - start;
+}
+
+static void nes_exec_clock(NesState *s, uint32_t hz) {
+    if (s->core && s->core->exec)
+        gemu_executor_set_clock(s->core->exec, hz);
+}
+
+static uint64_t nes_exec_elapsed(void *ud) {
+    NesState *s = ud;
+    return s->cpu.cycle_count - s->core->run_start;
+}
+
+/* After the raw snapshot put the CPU's pins behind the lines' backs. */
+static void nes_lines_resync(NesState *s) {
+    if (!s->core) return;
+    nes_update_irq(s);
+    s->cpu.irq = gemu_line_in_level(s->core->cpu_irq);
+    nes_gg_changed(s);
+}
+
+static NesState *nes_of(GemuDevice *d) { return *(NesState **)d->priv; }
+
+static void nes_board_describe(GemuDevice *d, char *buf, size_t len) {
+    const NesState *s = nes_of(d);
+    snprintf(buf, len,
+             "data bus %02X, cartridge /IRQ %s\n"
+             "PPU synced to cycle %" PRIu64 ", APU to %" PRIu64 "\n"
+             "DMA: %s%s%s\n"
+             "controller strobe %s, shift registers %02X %02X",
+             s->cpu_bus, s->cart_irq ? "low" : "high",
+             s->ppu_synced_cpu_cycle, s->apu_synced_cpu_cycle,
+             s->dma_halt ? "waiting" : "idle", s->oam_dma ? ", OAM" : "",
+             s->dmc_dma ? ", DMC" : "",
+             s->ctrl_strobe ? "high" : "low", s->ctrl_shift[0], s->ctrl_shift[1]);
+}
+
+static void nes_cpu_describe(GemuDevice *d, char *buf, size_t len) {
+    const Mos6502 *c = &nes_of(d)->cpu;
+    snprintf(buf, len, "PC %04X  A %02X  X %02X  Y %02X  SP %02X  P %02X\n"
+             "cycle %" PRIu64 ", instruction %" PRIu64 "%s%s",
+             c->PC, c->A, c->X, c->Y, c->SP, c->P, c->cycle_count, c->insn_count,
+             c->nmi ? ", NMI pending" : "", c->irq ? ", /IRQ low" : "");
+}
+
+static void nes_ppu_describe(GemuDevice *d, char *buf, size_t len) {
+    const Rp2c02 *p = &nes_of(d)->ppu;
+    snprintf(buf, len, "frame %" PRIu64 ", scanline %d, dot %d (%d lines)\n"
+             "CTRL %02X  MASK %02X  STATUS %02X  OAMADDR %02X  v %04X  t %04X  x %u",
+             p->frame, p->scanline, p->dot, p->lines_total,
+             p->ppuctrl, p->ppumask, p->ppustatus, p->oamaddr, p->v, p->t, p->x);
+}
+
+static void nes_apu_describe(GemuDevice *d, char *buf, size_t len) {
+    const Apu2a03 *a = &nes_of(d)->apu;
+    snprintf(buf, len, "channels %s%s%s%s%s, frame counter %u-step step %u%s%s\n"
+             "cycle %" PRIu64,
+             a->ch_en[0] ? "P1 " : "", a->ch_en[1] ? "P2 " : "", a->ch_en[2] ? "T " : "",
+             a->ch_en[3] ? "N " : "", a->ch_en[4] ? "DMC" : "",
+             a->fc_mode ? 5 : 4, a->fc_step, a->fc_irq ? ", frame IRQ" : "",
+             a->fc_irq_inhibit ? " (inhibited)" : "", a->cycle);
+}
+
+static void nes_cart_describe(GemuDevice *d, char *buf, size_t len) {
+    const NesCart *c = &nes_of(d)->cart;
+    if (!c->prg) {
+        snprintf(buf, len, "empty");
+        return;
+    }
+    snprintf(buf, len, "mapper %u, %u x 16 KB PRG, %u x 8 KB CHR%s\n"
+             "PRG windows %05X %05X %05X %05X\n"
+             "CHR windows %05X %05X %05X %05X %05X %05X %05X %05X%s",
+             (unsigned)c->info.mapper, (unsigned)c->info.prg_banks, (unsigned)c->info.chr_banks,
+             c->chr_is_ram ? " (RAM)" : "",
+             c->prg_off[0], c->prg_off[1], c->prg_off[2], c->prg_off[3],
+             c->chr_off[0], c->chr_off[1], c->chr_off[2], c->chr_off[3],
+             c->chr_off[4], c->chr_off[5], c->chr_off[6], c->chr_off[7],
+             c->irq ? "\n/IRQ low" : "");
+}
+
+static void nes_fds_describe(GemuDevice *d, char *buf, size_t len) {
+    const FdsState *f = &nes_of(d)->fds;
+    snprintf(buf, len, "%s BIOS, %s%s", f->hle_mode ? "built-in" : "ROM",
+             f->raw_disk ? "a disk in the drive" : "no disk", f->dirty ? " (changed)" : "");
+}
+
+#define NES_TYPE(var, tname, tdesc, describe_fn) \
+    static const GemuDeviceType var = { .name = tname, .desc = tdesc, \
+        .size = sizeof(NesState *), .describe = describe_fn }
+/* After a load: what follows from the board registers and the codes. */
+static void nes_board_post_load(GemuDevice *d) {
+    NesState *s = nes_of(d);
+    nes_maps_sync(s);
+    nes_gg_changed(s);
+    s->apu_deadline = 0;
+}
+static const GemuDeviceType nes_board_type = {
+    .name = "nes-board", .desc = "NES/Famicom console board", .size = sizeof(NesState *),
+    .describe = nes_board_describe, .post_load = nes_board_post_load,
+};
+NES_TYPE(nes_cpu_type, "rp2a03-cpu", "Ricoh 2A03/2A07 CPU (6502)", nes_cpu_describe);
+NES_TYPE(nes_ppu_type, "rp2c02", "Ricoh 2C02/2C07 PPU", nes_ppu_describe);
+NES_TYPE(nes_apu_type, "rp2a03-apu", "Ricoh 2A03/2A07 APU", nes_apu_describe);
+NES_TYPE(nes_cart_type, "nes-cart-slot", "NES/Famicom cartridge slot", nes_cart_describe);
+NES_TYPE(nes_fds_type, "fds-adapter", "Famicom Disk System RAM adapter", nes_fds_describe);
+
+#define BOARD(field) ok &= GEMU_STATE_MEMBER(d, "", s, field)
+/* The board's own state.  Not saved: the configuration (cfg, fds_enabled),
+ * host input the front end sets each frame (ctrl_state, zapper_*, mic_noise,
+ * ctrl_inject_*, port2_controller is netplay's), the Game Genie codes (the
+ * front end applies its own after a load), the pin window's settings and
+ * what follows from them (pins, pins_seen, clock_seen), the VS. palette
+ * (from the ROM set), the monitor and hooks, and apu_deadline (a cache,
+ * cleared by a load). */
+static bool nes_board_state(NesState *s, GemuDevice *d) {
+    bool ok = true;
+    BOARD(ram);
+    BOARD(dma_pending);
+    BOARD(dma_page);
+    BOARD(ctrl_shift);
+    BOARD(ctrl_strobe);
+    BOARD(ppu_synced_cpu_cycle);
+    BOARD(apu_synced_cpu_cycle);
+    BOARD(apu_syncing);
+    BOARD(dma_halt);
+    BOARD(dmc_dma);
+    BOARD(dmc_dummy);
+    BOARD(dmc_abort);
+    BOARD(oam_dma);
+    BOARD(oam_page);
+    BOARD(in_dma);
+    BOARD(vs_dip);
+    BOARD(vs_coin_counter);
+    BOARD(vs_coin_latch);
+    BOARD(vs_coin_prev);
+    BOARD(vs_service);
+    BOARD(cart_irq);
+    BOARD(cpu_bus);
+    return ok;
+}
+#undef BOARD
+
+static GemuDevice *nes_part(NesState *s, const GemuDeviceType *t, const char *name) {
+    GemuDevice *d = gemu_device_add(s->core->machine, t, name, NULL, NULL);
+    if (d)
+        *(NesState **)d->priv = s;
+    return d;
+}
+
+static bool nes_core_build(NesState *s) {
+    NesCore *c = s->core = calloc(1, sizeof *c);
+    if (!c || !(c->machine = gemu_machine_new("nes")))
+        return false;
+    bool ok = (c->board = nes_part(s, &nes_board_type, "board")) && nes_board_state(s, c->board);
+    ok = ok && (c->cpu = nes_part(s, &nes_cpu_type, "cpu")) &&
+         mos6502_state_add(c->cpu, "", &s->cpu);
+    ok = ok && (c->ppu = nes_part(s, &nes_ppu_type, "ppu")) &&
+         rp2c02_state_add(c->ppu, "", &s->ppu);
+    ok = ok && (c->apu = nes_part(s, &nes_apu_type, "apu")) &&
+         apu2a03_state_add(c->apu, "", &s->apu);
+    ok = ok && (c->cart = nes_part(s, &nes_cart_type, "cart")) &&
+         nes_cart_state_add(c->cart, "", &s->cart);
+    if (ok && s->fds_enabled)
+        ok = (c->fds = nes_part(s, &nes_fds_type, "fds")) && fds_state_add(c->fds, "", &s->fds);
+    bool inited = gemu_machine_init(c->machine);
+    static const GemuExecutorOps exec_ops = { .run = nes_exec_run, .elapsed = nes_exec_elapsed };
+    ok = ok && inited && nes_bus_build(s) && nes_lines_build(s) &&
+         (c->exec = gemu_executor_new(c->cpu, s->pins.clock_hz, &exec_ops, s));
+    if (!inited || !ok || !gemu_machine_start(c->machine)) {
+        fprintf(stderr, "nes: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    gemu_monitor_attach_machine(s->monitor, c->machine, "program");
+    nes_install_mapper_hooks(s);       /* the PPU onto its space */
+    nes_maps_sync(s);
+    return true;
+}
+
+static void nes_core_free(NesState *s) {
+    if (!s->core)
+        return;
+    gemu_machine_free(s->core->machine);
+    free(s->core);
+    s->core = NULL;
+}
+
 NesState *nes_core_create(const MosConfig *cfg) {
     NesState *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -1382,10 +1950,15 @@ NesState *nes_core_create(const MosConfig *cfg) {
 #endif
     if (cfg->is_arcade)
         s->vs_dip = VS_DIP_DEFAULT;
+    if (!nes_core_build(s)) {
+        nes_core_destroy(s);
+        return NULL;
+    }
     return s;
 }
 
 void nes_core_destroy(NesState *s) {
+    nes_core_free(s);
     if (s->fds_enabled) free(s->fds.raw_disk);
 #if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
     apu_midi_close(&s->apu_midi);
@@ -1406,15 +1979,24 @@ void nes_fds_disk_inserted(NesState *s) {
 bool nes_insert_cartridge(NesState *s, const char *path) {
     if (!nes_cart_insert(s, path)) return false;
     nes_install_mapper_hooks(s);
+    nes_maps_sync(s);
     return true;
 }
 
 void nes_eject_cartridge(NesState *s) {
     nes_cart_free(&s->cart);
+    nes_maps_sync(s);
     s->cart_path_buf[0] = '\0';
 }
 
 void nes_apply_pins(NesState *s) { nes_pins_apply(s); }
+
+/* Real time: wait until the host catches up with the machine's time (the
+ * CPU's cycles at its clock); after a pause or a wait, start over. */
+void nes_pace(NesState *s, bool hold) {
+    if (hold) gemu_machine_pace_reset(s->core->machine);
+    else gemu_machine_pace(s->core->machine, 0);
+}
 
 void nes_sync(NesState *s) {
     nes_sync_ppu_to_cpu(s, s->cpu.cycle_count);
@@ -1422,12 +2004,14 @@ void nes_sync(NesState *s) {
 }
 
 void nes_run_frame(NesState *s) {
+    NesCore *c = s->core;
     s->ppu.dirty = false;
-    while (!s->ppu.dirty) {
-        if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-        nes_step_insn(s);
-        if (gemu_monitor_is_paused(s->monitor)) break;
-    }
+    c->stopped = false;
+    /* a frame's worth at a time, until the PPU has finished one */
+    uint64_t cycles = (uint64_t)s->ppu.lines_total * RP2C02_DOTS_PER_LINE / 3 + 1;
+    while (!s->ppu.dirty && !c->stopped)
+        gemu_machine_run_until(c->machine, gemu_machine_time(c->machine) +
+                               gemu_clocks(s->pins.clock_hz, cycles));
     VS_DEBUG(s, "frame=%llu pc=%04X a=%02X x=%02X y=%02X p=%02X sp=%02X "
                 "ctrl=%02X mask=%02X status=%02X chr=%05X/%05X nmi=%d irq=%d\n",
              (unsigned long long)s->ppu.frame, s->cpu.PC,

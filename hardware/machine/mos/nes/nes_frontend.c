@@ -319,6 +319,7 @@ static CheatDialog *g_cheat_dialog;
 static void nes_cheats_apply(void *ud) {
     NesState *s = ud;
     s->gg_count = 0;
+    nes_gg_changed(s);
     if (nes_np_active()) return;   /* codes would change one player's game only */
     for (int i = 0; i < g_cheats.n && s->gg_count < NES_GG_MAX; i++) {
         if (!g_cheats.list[i].enabled) continue;
@@ -327,6 +328,7 @@ static void nes_cheats_apply(void *ud) {
         snprintf(g->code, sizeof(g->code), "%s", g_cheats.list[i].code);
         s->gg_count++;
     }
+    nes_gg_changed(s);
 }
 
 /* This cartridge's codes, from <config>/<game>.cht. */
@@ -1018,8 +1020,6 @@ static void nes_present_frame(NesState *s, const MosConfig *cfg, bool end_of_fra
 }
 
 /* Fallback frame duration when audio is off (headless / -soundhw none). */
-#define NES_FRAME_MS       17u   /* NTSC: 1000/60 ≈ 16.67 ms */
-#define NES_FRAME_PAL_MS   20u   /* PAL:  1000/50 = 20.00 ms */
 
 /* Audio queue threshold for sync: allow up to 3 frames of latency (~50 ms).
  * ~735 samples/frame * 3 frames * 4 bytes/float = 8820 bytes */
@@ -1037,7 +1037,6 @@ void nes_run(NesState *s, const MosConfig *cfg) {
 
     bool quit = false;
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();  /* used for non-audio frame sync below */
         nes_apply_pins(s);
 
         /* Poll display: pump events, update held bitmask, check quit/reset */
@@ -1114,16 +1113,17 @@ void nes_run(NesState *s, const MosConfig *cfg) {
          * - Audio off / headless: fall back to a software timer. */
         if (np_waiting) {
             SDL_Delay(1);       /* the network, not the audio, sets the pace */
+            nes_pace(s, true);
         } else if (s->apu.audio_dev) {
             while (gemu_audio_queued(s->apu.audio_dev) > AUDIO_QUEUE_MAX)
                 SDL_Delay(1);
+        } else if (gemu_monitor_is_paused(s->monitor)) {
+            SDL_Delay(10);
+            nes_pace(s, true);
         } else {
-            Uint32 elapsed = SDL_GetTicks() - t0;
-            Uint32 frame_ms = cfg->is_pal ? NES_FRAME_PAL_MS : NES_FRAME_MS;
-            /* a changed M2 (Debug > Cartridge Pins) lengthens or shortens it */
-            frame_ms = (Uint32)((uint64_t)frame_ms * s->pins.clock_default / s->pins.clock_hz);
-            if (elapsed < frame_ms)
-                SDL_Delay(frame_ms - elapsed);
+            /* the machine's time, at the CPU's clock (a changed M2 in
+             * Debug > Cartridge Pins lengthens or shortens the frame) */
+            nes_pace(s, false);
         }
 
         hex_editor_refresh(g_hex_editor);

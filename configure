@@ -146,9 +146,9 @@ FAMILY_SRC = {
         'src/other_setup.c',
     ],
     'mos': [
-        'cpu/mos/mos6502.c', 'cpu/mos/mos6502_dis.c',
-        'vga/mos/rp2c02.c', 'vga/mos/ppu_sh6578.c', 'vga/multi/input_menu.c',
-        'audio/apu2a03.c', 'audio/okim6295.c',
+        'cpu/mos/mos6502.c', 'cpu/mos/mos6502_dis.c', 'cpu/mos/mos6502_state.c',
+        'vga/mos/rp2c02.c', 'vga/mos/rp2c02_state.c', 'vga/mos/ppu_sh6578.c', 'vga/multi/input_menu.c',
+        'audio/apu2a03.c', 'audio/apu2a03_state.c', 'audio/okim6295.c',
         'hardware/machine/mos/machine_mos.c', 'hardware/machine/mos/machine_apple1.c',
         'hardware/machine/mos/machine_nes.c', 'hardware/machine/mos/nes/nes_frontend.c',
         'hardware/machine/mos/nes/nes_netplay.c',
@@ -156,6 +156,7 @@ FAMILY_SRC = {
         'hardware/device/cart/nes_simple.c', 'hardware/device/cart/nes_mmc1.c',
         'hardware/device/cart/nes_mmc2.c', 'hardware/device/cart/nes_mmc3.c',
         'hardware/device/cart/nes_mmc5.c', 'hardware/device/cart/nes_vrc6.c',
+        'hardware/device/cart/nes_cart_state.c',
         'hardware/machine/mos/machine_kim1.c',
         'hardware/machine/mos/machine_5clown.c', 'hardware/device/controller/pia6821.c', 'hardware/device/controller/m6530.c',
         'hardware/machine/mos/machine_magicfly.c',
@@ -167,6 +168,7 @@ FAMILY_SRC = {
         'vga/mos/antic.c', 'audio/pokey.c',
         'crt/ntsc_decode.c', 'crt/nes_ntsc_encode.c', 'crt/crt_tube.c',
         'hardware/device/storage/fds.c', 'hardware/device/storage/fds_hle.c',
+        'hardware/device/storage/fds_state.c',
         'hardware/device/terminal/vt100.c', 'hardware/romdb.c',
         # Hex editors, chosen by display at run time (hex_editor_select.c):
         # the native Win32 one is empty off Windows, the SDL one on it; the
@@ -350,6 +352,8 @@ TESTS = [
     dict(name='i2000_memory', family='ia64', kind='program', src='tests/i2000_memory.c'),
     dict(name='merced_jit', family='ia64', kind='program', src='tests/merced_jit.c'),
     dict(name='merced_msr', family='ia64', kind='program', src='tests/merced_msr.c'),
+    dict(name='nes_core', family='mos', kind='program', src='tests/nes_core.c',
+         replaces=['hardware/machine/mos/machine_nes.c']),
 ]
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

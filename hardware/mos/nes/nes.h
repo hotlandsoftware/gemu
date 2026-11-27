@@ -115,11 +115,16 @@ typedef struct NesState {
 #ifdef HAVE_ROB
     RobState    rob;
 #endif
+    /* The console on the core (stage N; machine_nes.c's "Core"): its
+     * devices and their state.  Not part of the raw snapshot. */
+    struct NesCore *core;
 } NesState;
 
 /* The CPU's /IRQ: the APU's frame and DMC flags, and the cartridge's
  * line through connector pin 15.  Call after changing either. */
 void      nes_update_irq(NesState *s);
+/* The Game Genie codes (gg_patches, gg_count) changed. */
+void      nes_gg_changed(NesState *s);
 
 /* ── The console ─────────────────────────────────────────────────────────────
  * machine_nes.c.  The front end (nes_frontend.c: window, input, dialogs,
@@ -139,6 +144,9 @@ void      nes_sync(NesState *s);
 /* Until the PPU finishes a frame, or the monitor stops at a breakpoint or
  * pauses; then the frame's audio goes out. */
 void      nes_run_frame(NesState *s);
+/* Real-time pacing without audio: sleep until the host catches up with the
+ * console's time; hold (paused, waiting for the network) forgets it. */
+void      nes_pace(NesState *s, bool hold);
 /* Debug > Cartridge Pins changed: apply them to the PPU, APU and clock. */
 void      nes_apply_pins(NesState *s);
 /* The CPU's bus, as the CPU sees it (Lua's memory hooks wrap these). */

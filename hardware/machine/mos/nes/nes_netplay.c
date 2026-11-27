@@ -88,6 +88,7 @@ static void nes_np_begin(NesState *s, int player, int players) {
      * (the default): plug one into the empty port for the game. */
     s->port2_controller = players > 1 && s->cfg->ports[1] == NES_DEVICE_NONE;
     s->gg_count = 0;
+    nes_gg_changed(s);
     g_np_frame = 0;
     g_np_reset = false;
     netplay_note(g_np, "Console powered on - player %d of %d%s", player, players,

@@ -123,6 +123,9 @@ typedef struct Rp2c02 {
 extern const uint32_t rp2c02_palette_rgb[64];
 
 void    rp2c02_init(Rp2c02 *ppu, bool is_pal);
+/* Where a nametable address ($2000-$2FFF) lands in CIRAM (vram), with the
+ * mirroring the board has set. */
+uint16_t rp2c02_ciram_index(const Rp2c02 *ppu, uint16_t addr);
 void    rp2c02_reset(Rp2c02 *ppu);
 
 uint8_t rp2c02_read(Rp2c02 *ppu, uint8_t reg);
