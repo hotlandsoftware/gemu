@@ -567,7 +567,7 @@ bool gemu_sched_state_load(GemuMachine *m, GemuStateReader *r, bool apply, unsig
 
 /* ── Real-time pacing ─────────────────────────────────────────────────────── */
 
-static uint64_t host_ns(void) {
+uint64_t gemu_host_ns(void) {
 #ifdef _WIN32
     static LARGE_INTEGER freq;
     LARGE_INTEGER c;
@@ -595,7 +595,7 @@ void gemu_machine_pace_reset(GemuMachine *m) { m->sched.paced = false; }
 
 GemuTime gemu_machine_pace(GemuMachine *m, GemuTime slack) {
     GemuSched *s = &m->sched;
-    uint64_t now = host_ns();
+    uint64_t now = gemu_host_ns();
     if (!slack)
         slack = GEMU_MSEC(250);
     if (!s->paced || s->now < s->pace_machine) {

@@ -1,5 +1,6 @@
 /* Address spaces: see gemu/dev/space.h. */
 #include "dev_priv.h"
+#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +59,10 @@ struct GemuSpace {
     void (*on_read)(void *ud, uint64_t addr, unsigned bytes);
     void (*on_write)(void *ud, uint64_t addr, unsigned bytes, uint64_t v);
     void        *unmapped_ud;
+    /* the miss trace (gemu_space_trace_misses) */
+    GemuSpaceMiss *miss;
+    unsigned     nmiss, miss_max;
+    char        *miss_report;
     /* scratch for building a page */
     Seg         *tseg;
     size_t       tseg_cap;
@@ -372,6 +377,8 @@ void gemu_space_free(GemuSpace *s) {
         if (*pp)
             *pp = s->next;
     }
+    free(s->miss);
+    free(s->miss_report);
     free_tree(s, s->root, 0);
     for (GemuMapping *m = s->maps, *n; m; m = n) {
         n = m->next;
@@ -390,6 +397,59 @@ void gemu_space_free(GemuSpace *s) {
 void gemu_space_free_all(GemuMachine *m) {
     while (m->spaces)
         gemu_space_free(m->spaces);
+}
+
+/* ── Misses ───────────────────────────────────────────────────────────────── */
+
+void gemu_space_trace_misses(GemuSpace *s, unsigned max, const char *report) {
+    free(s->miss);
+    free(s->miss_report);
+    s->miss = NULL;
+    s->miss_report = NULL;
+    s->nmiss = 0;
+    s->miss_max = 0;
+    if (!max || !(s->miss = calloc(max, sizeof *s->miss)))
+        return;
+    if (report && !(s->miss_report = strdup(report))) {
+        free(s->miss);
+        s->miss = NULL;
+        return;
+    }
+    s->miss_max = max;
+}
+
+void gemu_space_note_miss(GemuSpace *s, bool write, uint64_t addr, unsigned size,
+                          uint64_t val) {
+    if (!s->miss_max)
+        return;
+    for (unsigned i = 0; i < s->nmiss; i++) {
+        GemuSpaceMiss *e = &s->miss[i];
+        if (e->addr == addr && e->write == write) {
+            e->count++;
+            e->val = val;
+            return;
+        }
+    }
+    if (s->nmiss == s->miss_max) {
+        s->miss[s->nmiss - 1].count++;   /* full: the last entry counts the rest */
+        return;
+    }
+    GemuSpaceMiss *e = &s->miss[s->nmiss++];
+    *e = (GemuSpaceMiss){ .addr = addr, .val = val, .count = 1, .write = write,
+                          .size = (uint8_t)size };
+    if (s->miss_report)
+        fprintf(stderr, "%s: unhandled %s 0x%012" PRIX64 " size=%u%s0x%" PRIX64 "\n",
+                s->miss_report, write ? "write" : "read ", addr, size,
+                write ? " val=" : " -> ", write ? val : s->unmapped & ones(size));
+}
+
+unsigned gemu_space_misses(const GemuSpace *s, const GemuSpaceMiss **list) {
+    *list = s->miss;
+    return s->nmiss;
+}
+
+void gemu_space_clear_misses(GemuSpace *s) {
+    s->nmiss = 0;
 }
 
 GemuSpace *gemu_space_find(GemuMachine *m, const char *name) {
@@ -783,6 +843,8 @@ static uint64_t slow_read(GemuSpace *s, const Page *p, uint64_t addr, unsigned n
         return v;
     }
     if (!g && fits && last <= gap_end) {
+        if (s->miss_max)
+            gemu_space_note_miss(s, false, addr, n, 0);
         if (s->on_read)
             s->on_read(s->unmapped_ud, addr, n);
         return s->unmapped & ones(n);
@@ -814,6 +876,8 @@ static void slow_write(GemuSpace *s, const Page *p, uint64_t addr, unsigned n, u
         return;
     }
     if (!g && fits && last <= gap_end) {
+        if (s->miss_max)
+            gemu_space_note_miss(s, true, addr, n, v);
         if (s->on_write)
             s->on_write(s->unmapped_ud, addr, n, v);
         return;

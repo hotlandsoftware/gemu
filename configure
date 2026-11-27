@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 # ── Source file lists per family ───────────────────────────────────────────────
 
 CORE_SRC = [
-    'core/src/memory.c', 'core/src/dev/device.c', 'core/src/dev/space.c', 'core/src/dev/scheduler.c', 'core/src/dev/line.c', 'core/src/dev/option.c', 'core/src/dev/state.c', 'core/src/dev/screen.c', 'core/src/dev/stream.c', 'core/src/tcg.c', 'jit/jit_mem.c', 'jit/jit_backend_x64.c', 'core/src/monitor.c',
+    'core/src/memory.c', 'core/src/dev/device.c', 'core/src/dev/space.c', 'core/src/dev/scheduler.c', 'core/src/dev/line.c', 'core/src/dev/option.c', 'core/src/dev/state.c', 'core/src/dev/screen.c', 'core/src/dev/stream.c', 'core/src/dev/bench.c', 'core/src/tcg.c', 'jit/jit_mem.c', 'jit/jit_backend_x64.c', 'core/src/monitor.c',
     'core/src/monitor_cmds.c', 'core/src/monitor_dev.c', 'core/src/monitor_qmp.c',
     'core/src/monitor_block.c', 'core/src/monitor_symbols.c',
     'core/third_party/cjson/cJSON.c',
@@ -260,7 +260,8 @@ I460GX_TEST_LINKS = [
 DEV_CORE_LINKS = ['core/src/dev/device.c', 'core/src/dev/space.c',
                   'core/src/dev/scheduler.c', 'core/src/dev/line.c',
                   'core/src/dev/option.c', 'core/src/dev/state.c',
-                  'core/src/dev/screen.c', 'core/src/dev/stream.c']
+                  'core/src/dev/screen.c', 'core/src/dev/stream.c',
+                  'core/src/dev/bench.c']
 TESTS = [
     dict(name='audio_out', family=None, kind='device', src='tests/audio_out.c',
          links=[], cflags='-Werror', needs=['sdl']),
@@ -302,6 +303,8 @@ TESTS = [
     dict(name='option', family=None, kind='device', src='tests/option.c',
          links=DEV_CORE_LINKS, cflags='-Werror'),
     dict(name='state', family=None, kind='device', src='tests/state.c',
+         links=DEV_CORE_LINKS, cflags='-Werror'),
+    dict(name='bench', family=None, kind='device', src='tests/bench.c',
          links=DEV_CORE_LINKS, cflags='-Werror'),
     dict(name='86box', family=None, kind='device', src='tests/86box.c',
          links=DEV_CORE_LINKS + COMPAT_86BOX + COMPAT_86BOX_PORTS + [

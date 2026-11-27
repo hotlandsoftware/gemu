@@ -590,8 +590,42 @@ static void random_cases(uint32_t seed) {
     }
 }
 
+/* The miss trace: off by default; distinct (address, direction) counted with
+ * the last value; full, the last entry counts the rest; notes from outside. */
+static void misses(void) {
+    GemuSpace *s = gemu_space_new(NULL, "mem", 16, 8, GEMU_LITTLE_ENDIAN);
+    const GemuSpaceMiss *m;
+    CHECK(s);
+    gemu_space_read8(s, 0x10);
+    CHECK(gemu_space_misses(s, &m) == 0);
+    gemu_space_trace_misses(s, 3, NULL);
+    gemu_space_read8(s, 0x10);
+    gemu_space_read8(s, 0x10);
+    gemu_space_write16(s, 0x10, 0x1234);
+    gemu_space_write16(s, 0x10, 0x5678);
+    CHECK(gemu_space_misses(s, &m) == 2);
+    CHECK(m[0].addr == 0x10 && !m[0].write && m[0].count == 2 && m[0].size == 1);
+    CHECK(m[1].write && m[1].count == 2 && m[1].val == 0x5678 && m[1].size == 2);
+    gemu_space_note_miss(s, false, 0x20, 4, 0);       /* a handler declined */
+    gemu_space_read8(s, 0x30);
+    gemu_space_read8(s, 0x40);
+    CHECK(gemu_space_misses(s, &m) == 3);
+    CHECK(m[2].addr == 0x20 && m[2].count == 3);      /* full: counts the rest */
+    gemu_space_clear_misses(s);
+    CHECK(gemu_space_misses(s, &m) == 0);
+    uint8_t ram[16];
+    CHECK(gemu_space_map_ram(s, 0x100, sizeof ram, ram, 0, 0));
+    gemu_space_read8(s, 0x100);                       /* decoded: no miss */
+    CHECK(gemu_space_misses(s, &m) == 0);
+    gemu_space_trace_misses(s, 0, NULL);              /* off */
+    gemu_space_read8(s, 0x10);
+    CHECK(gemu_space_misses(s, &m) == 0);
+    gemu_space_free(s);
+}
+
 int main(int argc, char **argv) {
     fixed_cases();
+    misses();
     uint32_t seed = argc > 1 ? (uint32_t)strtoul(argv[1], NULL, 0) : 2026;
     random_cases(seed);
     printf("space: %u checks passed (seed %" PRIu32 ")\n", checks, seed);

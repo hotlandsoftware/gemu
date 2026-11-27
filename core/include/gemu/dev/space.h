@@ -109,6 +109,27 @@ void gemu_space_set_unmapped(GemuSpace *s, uint64_t value,
         void (*on_write)(void *ud, uint64_t addr, unsigned bytes, uint64_t v),
         void *ud);
 
+/* ── Misses (debugging) ───────────────────────────────────────────────────────
+ * An access nothing decodes (the unmapped path) or that a handler declined
+ * (the machine calls gemu_space_note_miss()).  With the trace on, each
+ * distinct address and direction is kept with how often it happened and the
+ * last value written, up to `max` (the last entry then counts the rest), and
+ * the first of each is reported on stderr as "<report>: unhandled ...".
+ * report NULL: kept, not reported.  max 0: off (the default). */
+typedef struct {
+    uint64_t addr, val;
+    uint32_t count;
+    uint8_t  write, size;
+} GemuSpaceMiss;
+
+void gemu_space_trace_misses(GemuSpace *s, unsigned max, const char *report);
+void gemu_space_note_miss(GemuSpace *s, bool write, uint64_t addr, unsigned size,
+                          uint64_t val);
+/* The misses so far, in the order first seen; valid until the next note or
+ * clear. */
+unsigned gemu_space_misses(const GemuSpace *s, const GemuSpaceMiss **list);
+void     gemu_space_clear_misses(GemuSpace *s);
+
 /* ── Mappings ─────────────────────────────────────────────────────────────── */
 /* base and size must lie inside the space and size be > 0; NULL otherwise. */
 

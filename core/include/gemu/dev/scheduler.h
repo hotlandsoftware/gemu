@@ -63,6 +63,8 @@ GemuTime gemu_machine_next_deadline(GemuMachine *m);
  * than `slack` behind (a pause, a slow host) resyncs instead of racing to
  * catch up; 0 = a quarter second.  Returns how long it slept. */
 GemuTime gemu_machine_pace(GemuMachine *m, GemuTime slack);
+/* The host's monotonic clock, in nanoseconds. */
+uint64_t gemu_host_ns(void);
 /* Forget the pacing anchor (after a pause, say): the next pace starts over. */
 void     gemu_machine_pace_reset(GemuMachine *m);
 

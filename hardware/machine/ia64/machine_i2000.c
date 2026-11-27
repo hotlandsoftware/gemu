@@ -30,6 +30,7 @@
 #include "gemu/screendump.h"
 #include "gemu/util.h"
 #include "gemu/audio_out.h"
+#include "gemu/dev/bench.h"
 #include "gemu/dev/device.h"
 #include "gemu/dev/line.h"
 #include "gemu/dev/scheduler.h"
@@ -238,7 +239,7 @@ _Static_assert(sizeof(i2000_keyboard_keysyms) / sizeof(i2000_keyboard_keysyms[0]
  * 4,279 disk interrupts arrived within 1,000 instructions, 6 within 128,
  * none of them a problem. */
 #define I2000_IDE_LATENCY_TICKS UINT64_C(2000)
-#define MMIO_LOG_N 768
+#define I2000_MISSES_MAX 768   /* per space */
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES  32
 
@@ -246,13 +247,6 @@ _Static_assert(sizeof(i2000_keyboard_keysyms) / sizeof(i2000_keyboard_keysyms[0]
 #define NIC_PCI_DEV             5u
 #define AUDIO_PCI_DEV           4u
 
-typedef struct {
-    uint64_t addr;
-    uint64_t val;
-    uint32_t count;
-    uint8_t  is_write;
-    uint8_t  size;
-} MmioLogEnt;
 
 /* The board's interrupt lines: each source, and where its line is wired -
  * to the 8259 pair's IRQ input (or -1 for none) and to the I/O SAPIC's GSI
@@ -407,8 +401,6 @@ struct Ia64I2000State {
     PciAudio  audio;
     GemuAudioOut *audio_out;
 
-    MmioLogEnt mmio_log[MMIO_LOG_N];
-    int        mmio_log_n;
 
     /* -device mouse: whether ps2_mouse is on the 8042's aux port.  First
      * field of the bulk reset (i2000_reset()), which keeps it. */
@@ -497,6 +489,7 @@ struct I2000Core {
     uint64_t      owed;         /* host time the time base still has to catch up */
     bool          owed_only;    /* pay that, run no instructions (i2000_advance()) */
     unsigned      slot_ticks;   /* time-base ticks a slot charges (GEMU_CPI) */
+    GemuBench    *bench;        /* GEMU_BENCH_*, GEMU_PROFILE (stage G7) */
     /* Quiet intervals: while one runs, its source isn't offered again. */
     GemuTimer   *rtc_quiet, *sci_quiet, *kbd_quiet, *mouse_quiet;
 };
@@ -510,8 +503,8 @@ static inline bool i2000_mouse_quiet(const Ia64I2000State *s) {
 }
 
 
-static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
-                     unsigned size, bool is_write);
+static void i2000_miss(Ia64I2000State *s, bool io, bool write, uint64_t addr,
+                       unsigned size, uint64_t v);
 static void i2000_reset(Ia64I2000State *s, bool warm);
 static void iosapic_raise_gsi(Ia64I2000State *s, unsigned gsi);
 static void i2000_sci_wire(Ia64I2000State *s);
@@ -777,7 +770,7 @@ static uint64_t pci_cfg_read(Ia64I2000State *s, unsigned lane, unsigned size) {
     uint64_t key = 0xC000000000000000ull |
                    ((uint64_t)bus << 24) | ((uint64_t)dev << 19) |
                    ((uint64_t)fun << 16) | reg;
-    mmio_log(s, key, 0, size, false);
+    i2000_miss(s, false, false, key, size, 0);   /* (a region-6 key) */
     return size_mask(size);
 }
 
@@ -801,7 +794,7 @@ static void pci_cfg_write(Ia64I2000State *s, unsigned lane,
     uint64_t key = 0xC000000000000000ull |
                    ((uint64_t)bus << 24) | ((uint64_t)dev << 19) |
                    ((uint64_t)fun << 16) | reg;
-    mmio_log(s, key, val & size_mask(size), size, true);
+    i2000_miss(s, false, true, key, size, val & size_mask(size));
 }
 
 /* ── Serial console ──────────────────────────────────────────────────────── */
@@ -870,29 +863,6 @@ static void i2000_con_rx(Ia64I2000State *s, uint8_t c) {
 }
 
 /* ── Physical bus ────────────────────────────────────────────────────────── */
-
-static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
-                     unsigned size, bool is_write) {
-    for (int i = 0; i < s->mmio_log_n; i++) {
-        if (s->mmio_log[i].addr == addr && s->mmio_log[i].is_write == is_write) {
-            s->mmio_log[i].count++;
-            s->mmio_log[i].val = val;
-            return;
-        }
-    }
-    if (s->mmio_log_n < MMIO_LOG_N) {
-        MmioLogEnt *e = &s->mmio_log[s->mmio_log_n++];
-        e->addr = addr; e->val = val; e->count = 1;
-        e->is_write = is_write; e->size = (uint8_t)size;
-        fprintf(stderr, "i2000: unhandled %s pa=0x%012" PRIX64 " size=%u"
-                        "%s0x%" PRIX64 "\n",
-                is_write ? "write" : "read ", addr, size,
-                is_write ? " val=" : " -> ", is_write ? val : ~0ull);
-    } else {
-        /* keep counting in the last slot so the panel shows activity */
-        s->mmio_log[MMIO_LOG_N - 1].count++;
-    }
-}
 
 /* The RTC counts on the machine's own time base, so it advances exactly as
  * fast as the guest does, whether the ITC follows the host clock or the
@@ -1704,16 +1674,15 @@ static bool i2000_card_claims(const Ia64I2000State *s, uint64_t addr) {
  * the board's devices (0) - the order the chipset's old decode tried them.
  *
  * Unmapped addresses and accesses a mapping declines read as all ones and
- * go to mmio_log().  Outside the state, whose layout is the snapshot's. */
+ * are kept in the space's miss trace (stage G7: gemu_space_trace_misses(),
+ * the monitor's panel shows them); the space notes unmapped ones itself.
+ * PCI configuration cycles nothing answers are noted in memory's, under
+ * their region-6 address. */
 
 static void i2000_miss(Ia64I2000State *s, bool io, bool write, uint64_t addr,
                        unsigned size, uint64_t v) {
-    mmio_log(s, io ? I2000_IO_BASE + addr : addr, write ? v : 0, size, write);
+    gemu_space_note_miss(io ? s->core->io : s->core->mem, write, addr, size, write ? v : 0);
 }
-static void i2000_unmapped_read(void *ud, uint64_t a, unsigned n) { i2000_miss(ud, false, false, a, n, 0); }
-static void i2000_unmapped_write(void *ud, uint64_t a, unsigned n, uint64_t v) { i2000_miss(ud, false, true, a, n, v); }
-static void i2000_unmapped_in(void *ud, uint64_t a, unsigned n) { i2000_miss(ud, true, false, a, n, 0); }
-static void i2000_unmapped_out(void *ud, uint64_t a, unsigned n, uint64_t v) { i2000_miss(ud, true, true, a, n, v); }
 static void i2000_decode_miss(void *ud, bool io, bool write, uint64_t a, unsigned n, uint64_t v) {
     i2000_miss(ud, io, write, a, n, v);
 }
@@ -2118,6 +2087,10 @@ static GemuMapping *i2000_map_window(Ia64I2000State *s, bool io, uint64_t base,
 /* The spaces and their fixed mappings (the VGA window comes with the display
  * card); the PCI decode, mapped by i2000_memory_changed(); the interrupt
  * lines. */
+static uint64_t i2000_bench_count(void *ud);
+static uint64_t i2000_bench_pc(void *ud);
+static void i2000_bench_report(void *ud, FILE *f, double per_sec);
+
 static bool i2000_core_create(Ia64I2000State *s, const Ia64Config *cfg) {
     I2000Core *sp = calloc(1, sizeof *sp);
     if (!sp)
@@ -2128,8 +2101,8 @@ static bool i2000_core_create(Ia64I2000State *s, const Ia64Config *cfg) {
     if (!sp->mem || !sp->io ||
         !gemu_space_map_ram(sp->mem, 0, s->ram_size, s->ram, 0, 0))
         return false;
-    gemu_space_set_unmapped(sp->mem, ~0ull, i2000_unmapped_read, i2000_unmapped_write, s);
-    gemu_space_set_unmapped(sp->io, ~0ull, i2000_unmapped_in, i2000_unmapped_out, s);
+    gemu_space_trace_misses(sp->mem, I2000_MISSES_MAX, "i2000 memory");
+    gemu_space_trace_misses(sp->io, I2000_MISSES_MAX, "i2000 I/O");
 
     static const struct {
         bool io; uint64_t base, size; I2000AccessFn fn; int priority; const char *name;
@@ -2174,6 +2147,14 @@ static bool i2000_core_create(Ia64I2000State *s, const Ia64Config *cfg) {
         d[i]->miss = i2000_decode_miss;
         d[i]->ud = s;
     }
+    static const GemuBenchOps bench_ops = {
+        .unit = "slots", .count = i2000_bench_count, .pc = i2000_bench_pc,
+        .report = i2000_bench_report,
+    };
+    GemuBenchOps ops = bench_ops;
+    ops.ud = s;
+    if (!(sp->bench = gemu_bench_new(&ops)))
+        return false;
     return i2000_lines_create(s, cfg);
 }
 
@@ -2187,6 +2168,7 @@ static void i2000_core_destroy(Ia64I2000State *s) {
     gemu_space_free(sp->mem);
     gemu_space_free(sp->io);
     gemu_machine_free(sp->machine);
+    gemu_bench_free(sp->bench);
     free(sp);
     s->core = NULL;
 }
@@ -2619,12 +2601,17 @@ static void panel_render(Ia64I2000State *s) {
         panel_text(s, 0, 5, C_GOOD, "RUNNING");
     }
 
-    panel_text(s, 0, 7, C_DIM, "unhandled MMIO (addr / last value / count):");
-    for (int i = 0; i < s->mmio_log_n; i++) {
-        MmioLogEnt *e = &s->mmio_log[i];
-        snprintf(line, sizeof(line), "%c 0x%012" PRIX64 " %u  0x%-16" PRIX64 " x%u",
-                 e->is_write ? 'W' : 'R', e->addr, e->size, e->val, e->count);
-        panel_text(s, 2, 8 + i, C_DIM, line);
+    panel_text(s, 0, 7, C_DIM, "unhandled MMIO and I/O (addr / last value / count):");
+    int row = 8;
+    for (int sp = 0; sp < 2; sp++) {
+        const GemuSpaceMiss *e;
+        unsigned n = gemu_space_misses(sp ? s->core->io : s->core->mem, &e);
+        for (unsigned i = 0; i < n; i++, row++) {
+            snprintf(line, sizeof(line), "%c%c 0x%012" PRIX64 " %u  0x%-16" PRIX64 " x%u",
+                     sp ? 'P' : 'M', e[i].write ? 'W' : 'R', e[i].addr, e[i].size,
+                     e[i].val, e[i].count);
+            panel_text(s, 2, row, C_DIM, line);
+        }
     }
 
     int con_top = ROWS - CON_ROWS - 1;
@@ -4203,77 +4190,29 @@ static void i2000_report_halt(Ia64I2000State *s) {
     fputs(buf, stderr);
 }
 
-static uint64_t i2000_monotonic_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
-}
 
-/* GEMU_BENCH_NINSTS=<N> [+ optional GEMU_BENCH_WARMUP=<W>]: measures a
- * windowed slots/sec rate from ninsts==W (default 0) to ninsts==N, then
- * prints and exits. The warmup point matters because a few hand-patched
- * fast paths in merced_step() (e.g. the SAL RAM-clear idiom) advance ninsts
- * by hundreds of millions in a single call without doing per-slot
- * interpretation - a window starting at ninsts==0 would measure that
- * shortcut's speed, not the interpreter's. Set GEMU_BENCH_WARMUP past the
- * point where those one-shot jumps have already happened so the window only
- * covers genuine bundle-by-bundle execution. Resolved once - see the
- * getenv()-per-instruction cost warning near watch_init() in merced.c, same
- * reasoning applies to any check made from the per-slice loop below. */
-static void i2000_bench_targets(uint64_t *warmup, uint64_t *target) {
-    static uint64_t w, t;
-    static bool resolved;
-    if (!resolved) {
-        resolved = true;
-        const char *wspec = getenv("GEMU_BENCH_WARMUP");
-        const char *tspec = getenv("GEMU_BENCH_NINSTS");
-        if (wspec) w = strtoull(wspec, NULL, 0);
-        if (tspec) t = strtoull(tspec, NULL, 0);
-    }
-    *warmup = w;
-    *target = t;
-}
+/* The benchmark window and profile (gemu/dev/bench.h): GEMU_BENCH_NINSTS,
+ * GEMU_BENCH_WARMUP and GEMU_PROFILE, counted in slots.  The warm-up matters
+ * here because a few hand-patched fast paths in merced_step() (the SAL
+ * RAM-clear idiom) advance ninsts by hundreds of millions in a single call:
+ * a window from 0 would measure that shortcut, not execution. */
+static uint64_t i2000_bench_count(void *ud) { return ((Ia64I2000State *)ud)->cpu->ninsts; }
+static uint64_t i2000_bench_pc(void *ud) { return ((Ia64I2000State *)ud)->cpu->ip; }
 
-static void i2000_bench_check(Ia64I2000State *s) {
-    uint64_t warmup, target;
-    i2000_bench_targets(&warmup, &target);
-    if (!target)
-        return;
-
-    static uint64_t window_start_ninsts;
-    static uint64_t window_start_ns;
-    static bool window_open;
-    if (!window_open) {
-        if (s->cpu->ninsts < warmup)
-            return;
-        window_open = true;
-        window_start_ninsts = s->cpu->ninsts;
-        window_start_ns = i2000_monotonic_ns();
-    }
-
-    if (s->cpu->ninsts < target)
-        return;
-    uint64_t ninsts_delta = s->cpu->ninsts - window_start_ninsts;
-    double elapsed_s = (double)(i2000_monotonic_ns() - window_start_ns) / 1e9;
-    double slots_per_sec = (double)ninsts_delta / elapsed_s;
-    /* A fingerprint of the machine at the target, so a speed-up can be
-     * checked to leave emulation exactly as it was: same IP, same RAM.
-     * (Registers aren't hashed: guest code copies AR.ITC, which follows
-     * host time, into them.) */
-    const Merced *m = s->cpu;
+/* A fingerprint of the machine at the target, so a speed-up can be checked
+ * to leave emulation exactly as it was: same IP, same RAM.  (Registers
+ * aren't hashed: guest code copies AR.ITC, which follows host time, into
+ * them.) */
+static void i2000_bench_report(void *ud, FILE *f, double per_sec) {
+    Ia64I2000State *s = ud;
     uint64_t ram_h = UINT64_C(0xcbf29ce484222325);
     for (uint64_t i = 0; i + 8 <= s->ram_size; i += 8) {
         uint64_t w;
         memcpy(&w, s->ram + i, 8);
         ram_h = (ram_h ^ w) * UINT64_C(0x100000001b3);
     }
-    printf("gemu-bench: window=[%" PRIu64 ",%" PRIu64 "] ninsts_delta=%"
-           PRIu64 " elapsed=%.3fs slots/sec=%.0f bundle-equiv/sec=%.0f"
-           " ip=%016" PRIX64 " ram=%016" PRIX64 "\n",
-           window_start_ninsts, s->cpu->ninsts, ninsts_delta, elapsed_s,
-           slots_per_sec, slots_per_sec / 3.0, m->ip, ram_h);
-    fflush(stdout);
-    exit(0);
+    fprintf(f, " bundle-equiv/sec=%.0f ip=%016" PRIX64 " ram=%016" PRIX64,
+            per_sec / 3.0, s->cpu->ip, ram_h);
 }
 
 /* After a slot (or a run of them): carry out a platform reset the slot
@@ -4285,63 +4224,6 @@ static void i2000_bench_check(Ia64I2000State *s) {
  * another such slice is in a loop that only an interrupt can end; time then
  * moves straight on to the guest's next timer deadline.  Guest time runs
  * ahead of the host while it idles, so this is opt-in: GEMU_IDLE_SKIP=1. */
-/* GEMU_PROFILE=1: once per host second, the slot rate and how many poll
- * quanta were spent in an idle loop (as i2000_idle_check() detects one). */
-static int i2000_profile_on = -1;
-static uint64_t prof_quanta, prof_idle;
-
-/* Guest IP histogram, 64 KiB buckets, sampled once per poll quantum. */
-#define PROF_HIST 4096
-static struct { uint64_t key, n; } prof_hist[PROF_HIST];
-
-static void i2000_profile_sample(uint64_t ip) {
-    uint64_t key = (ip >> 16) | 1;
-    unsigned h = (unsigned)((key * UINT64_C(0x9E3779B97F4A7C15)) >> 52);
-    for (unsigned k = 0; k < PROF_HIST; k++, h = (h + 1) & (PROF_HIST - 1)) {
-        if (prof_hist[h].key == key) { prof_hist[h].n++; return; }
-        if (!prof_hist[h].key) { prof_hist[h].key = key; prof_hist[h].n = 1; return; }
-    }
-}
-
-static void i2000_profile_dump(double t) {
-    uint64_t total = 0;
-    for (unsigned i = 0; i < PROF_HIST; i++) total += prof_hist[i].n;
-    if (!total) return;
-    fprintf(stderr, "profile-ip: t=%6.1f", t);
-    for (int k = 0; k < 6; k++) {
-        unsigned best = 0;
-        for (unsigned i = 1; i < PROF_HIST; i++)
-            if (prof_hist[i].n > prof_hist[best].n) best = i;
-        if (!prof_hist[best].n) break;
-        fprintf(stderr, " %012" PRIX64 "xxxx:%.0f%%", prof_hist[best].key >> 0 & ~UINT64_C(1),
-                100.0 * (double)prof_hist[best].n / (double)total);
-        prof_hist[best].n = 0;
-    }
-    fprintf(stderr, "\n");
-    memset(prof_hist, 0, sizeof(prof_hist));
-}
-
-static void i2000_profile_tick(Ia64I2000State *s) {
-    static uint64_t last_ns, last_insts;
-    static unsigned ticks;
-    uint64_t now = i2000_monotonic_ns();
-    if (!last_ns) { last_ns = now; last_insts = s->cpu->ninsts; return; }
-    if (now - last_ns < UINT64_C(1000000000)) return;
-    static uint64_t start_ns;
-    if (!start_ns) start_ns = last_ns;
-    double dt = (double)(now - last_ns) / 1e9;
-    fprintf(stderr, "profile: t=%6.1f %7.2f Mslots/s idle %5.1f%% ip=%016" PRIX64 "\n",
-            (double)(now - start_ns) / 1e9,
-            (double)(s->cpu->ninsts - last_insts) / dt / 1e6,
-            prof_quanta ? 100.0 * (double)prof_idle / (double)prof_quanta : 0.0,
-            s->cpu->ip);
-    if (++ticks % 10 == 0)
-        i2000_profile_dump((double)(now - start_ns) / 1e9);
-    last_ns = now;
-    last_insts = s->cpu->ninsts;
-    prof_quanta = prof_idle = 0;
-}
-
 /* limit: the most ticks a skip may take (the rest of the run). */
 static void i2000_idle_check(Ia64I2000State *s, uint64_t limit) {
     static int enabled = -1;
@@ -4352,18 +4234,17 @@ static void i2000_idle_check(Ia64I2000State *s, uint64_t limit) {
     if (enabled < 0) {
         const char *e = getenv("GEMU_IDLE_SKIP");
         enabled = e && strcmp(e, "0") != 0;
-        e = getenv("GEMU_PROFILE");
-        i2000_profile_on = e && strcmp(e, "0") != 0;
     }
-    if (!enabled && !i2000_profile_on) return;
+    GemuBench *bench = s->core->bench;
+    bool profile = gemu_profile_on(bench);
+    if (!enabled && !profile) return;
     Merced *cpu = s->cpu;
-    if (i2000_profile_on) {
-        /* Windows Server 2003 IA-64's KiIdleLoop (ntoskrnl 5.2.3790). */
-        prof_quanta++;
-        i2000_profile_sample(cpu->ip);
-        prof_idle += cpu->ip >= UINT64_C(0xE000000083009500) &&
-                     cpu->ip <  UINT64_C(0xE000000083009800);
-        i2000_profile_tick(s);
+    if (profile) {
+        /* Idle: Windows Server 2003 IA-64's KiIdleLoop (ntoskrnl 5.2.3790). */
+        gemu_profile_sample(bench, cpu->ip,
+                            cpu->ip >= UINT64_C(0xE000000083009500) &&
+                            cpu->ip <  UINT64_C(0xE000000083009800));
+        gemu_profile_tick(bench);
     }
     uint64_t dirty = merced_idle_dirty(cpu);
     if (dirty != dirty_mark || cpu->ext_pending_count || cpu->timer_pending) {
@@ -4419,8 +4300,8 @@ static bool i2000_after_step(Ia64I2000State *s, MercedStatus st) {
                    I2000_FLASH_SIZE);
         s->halted = false;
         s->reset_requested = false;
-        s->mmio_log_n = 0;
-        memset(s->mmio_log, 0, sizeof(s->mmio_log));
+        gemu_space_clear_misses(s->core->mem);
+        gemu_space_clear_misses(s->core->io);
         printf("i2000: processor reset, IP=0x%016" PRIX64 "\n",
                s->cpu->ip);
         return false;
@@ -4545,8 +4426,8 @@ static void i2000_reset(Ia64I2000State *s, bool warm) {
     i2000_pic_reset(s);
     i2000_devices_reset(s, warm);
     i2000_memory_changed(s);       /* the cards' and the chipset's BARs reset */
-    s->mmio_log_n = 0;
-    memset(s->mmio_log, 0, sizeof(s->mmio_log));
+    gemu_space_clear_misses(s->core->mem);
+    gemu_space_clear_misses(s->core->io);
     memset(s->console, 0, sizeof(s->console));
     s->con_row = s->con_col = 0;
     printf("i2000: reset, IP=0x%016" PRIX64 "\n", s->cpu->ip);
@@ -4585,7 +4466,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
      * moved on; an ITC that only advanced between frames failed it and
      * sent C0 firmware into its dead loop. */
     merced_set_external_itc(s->cpu, false);
-    uint64_t itc_last_ns = i2000_monotonic_ns();
+    uint64_t itc_last_ns = gemu_host_ns();
     uint64_t itc_fraction = 0;
     uint64_t itc_target = merced_get_time_base(s->cpu);
     uint64_t itc_seen = itc_target;
@@ -4595,8 +4476,6 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
      * count instead, so the guest takes the same path however fast the
      * host is and its end-of-run fingerprint can be compared across
      * builds (with GEMU_FIXED_TIME pinning the RTC as well). */
-    uint64_t bench_warmup, bench_target;
-    i2000_bench_targets(&bench_warmup, &bench_target);
     /* GEMU_CPI=<n> paces the ITC by the instruction count instead of the
      * host clock, charging n ticks per executed slot. The guest then takes
      * the same path however fast the host is, and firmware that polls the ITC
@@ -4606,14 +4485,14 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
     unsigned cpi = cpi_text ? (unsigned)strtoul(cpi_text, NULL, 0) : 0;
     merced_set_cycles_per_slot(s->cpu, cpi ? cpi : 1);
     s->core->slot_ticks = cpi ? cpi : 1;
-    bool host_itc = bench_target == 0 && !cpi;
+    bool host_itc = gemu_bench_target(s->core->bench) == 0 && !cpi;
 
     bool running = true;
     while (running) {
         /* loadvm restores this CPU flag too, so reassert machine policy.
          * Paused time must not become one enormous timer jump on resume. */
         merced_set_external_itc(s->cpu, false);
-        uint64_t now_ns = i2000_monotonic_ns();
+        uint64_t now_ns = gemu_host_ns();
         uint64_t time_base = merced_get_time_base(s->cpu);
         if (time_base < itc_seen)           /* loadvm or reset: re-anchor */
             itc_target = time_base;
@@ -4709,7 +4588,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
          * RAM.  That host maintenance time is not guest time: counting it
          * on the next loop can expire an EFI menu timer immediately after
          * loadvm/savevm returns, so exclude it from the ITC below. */
-        uint64_t mon_start_ns = i2000_monotonic_ns();
+        uint64_t mon_start_ns = gemu_host_ns();
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
             switch (cmd) {
@@ -4749,7 +4628,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             if (!running)
                 break;
         }
-        itc_last_ns += i2000_monotonic_ns() - mon_start_ns;
+        itc_last_ns += gemu_host_ns() - mon_start_ns;
         if (!running)
             break;
 
@@ -4757,7 +4636,8 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             i2000_cpu_slice(s);
             itc_seen = merced_get_time_base(s->cpu);
             i2000_rage_dma_poll(s);
-            i2000_bench_check(s);
+            if (gemu_bench_check(s->core->bench))
+                exit(0);
             i460gx_pm_poll(&s->chipset);
             mc146818_poll(&s->rtc);
             if (mc146818_take_dirty(&s->rtc))
@@ -4785,7 +4665,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
                     gemu_monitor_is_paused(s->monitor);
         if (s->display) {
             static uint64_t last_frame_ns;
-            uint64_t frame_ns = i2000_monotonic_ns();
+            uint64_t frame_ns = gemu_host_ns();
             if (idle || frame_ns - last_frame_ns >= UINT64_C(16666667)) {
                 last_frame_ns = frame_ns;
                 gemu_display_set_paused(s->display, idle);
