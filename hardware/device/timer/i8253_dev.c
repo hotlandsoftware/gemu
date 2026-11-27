@@ -1,7 +1,7 @@
 /* The 8253 PIT as a core device: see i8253_dev.h. */
 #include "timer/i8253_dev.h"
+#include "timer/i8253_state.h"
 #include "gemu/dev/line.h"
-#include "gemu/dev/state.h"
 #include <stdio.h>
 
 typedef struct {
@@ -42,15 +42,8 @@ static bool pit_init(GemuDevice *d) {
         snprintf(name, sizeof name, "out%d", i);
         if (!(p->out[i] = gemu_line_out(d, name)))
             return false;
-        I8253Channel *c = &p->chip.ch[i];
-        char n[32];
-#define CH(field) snprintf(n, sizeof n, "ch%d.%s", i, #field); GEMU_STATE_VAR(d, n, c->field)
-        CH(count); CH(reload); CH(mode); CH(rw_mode); CH(out); CH(gate); CH(counting);
-        CH(load_pending); CH(trigger); CH(strobe); CH(write_msb_next); CH(read_msb_next);
-        CH(latched); CH(latched_value);
-#undef CH
     }
-    return true;
+    return i8253_state_add(d, "", &p->chip);
 }
 
 static void pit_reset(GemuDevice *d, GemuResetKind kind) {

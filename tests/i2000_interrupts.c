@@ -24,8 +24,12 @@ static Ia64I2000State *machine(void) { return machine_with(false); }
 static bool irq(Ia64I2000State *s, unsigned vector) {
     return (s->cpu->external_pending[vector >> 3] >> (vector & 7)) & 1;
 }
-/* Comfortably past the IDE devices' interrupt latency (2000 instructions). */
-#define IDE_SETTLE_NINSTS UINT64_C(20000)
+/* Comfortably past the IDE devices' interrupt latency. */
+#define IDE_SETTLE_TICKS (10 * I2000_IDE_LATENCY_TICKS)
+/* Past the 8042's quiet time after a legacy acknowledge. */
+#define PS2_QUIET_TICKS (gemu_cycles_to(I2000_ITC_HZ, I2000_PS2_BYTE_TIME) + 1)
+/* Past a level interrupt's re-presentation interval. */
+#define REPRESENT_TICKS (gemu_cycles_to(I2000_ITC_HZ, I2000_REPRESENT_TIME) + 1)
 /* IDENTIFY DEVICE word 47: the largest READ/WRITE MULTIPLE block. */
 #define ATA_DISK_MAX_MULTIPLE 16u
 
@@ -206,14 +210,16 @@ static void test_rtc(void) {
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x50));
     merced_ack_external(s->cpu, 0x50);
-    s->cpu->ninsts += 100000;
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0x50));                            /* not again at once */
+    i2000_advance(s, REPRESENT_TICKS);
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x50));                             /* still asserted */
     CHECK(s->chipset.pm.pm1_sts & 0x0400);
     CHECK(rtc_read(s, 0x0c) & 0xc0);
     CHECK(rtc_read(s, 0x0c) == 0);
     merced_ack_external(s->cpu, 0x50);
-    s->cpu->ninsts += 100000;
+    i2000_advance(s, REPRESENT_TICKS);
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x50));                            /* reading C lowered it */
 
@@ -251,7 +257,7 @@ static void route(Ia64I2000State *s, unsigned vector) {
     bus_write(s, I460GX_IOSAPIC_BASE + 0x10, vector, 4);
 }
 static void ready(Ia64I2000State *s) {
-    s->cpu->ninsts += IDE_SETTLE_NINSTS;
+    s->cpu->time_base += IDE_SETTLE_TICKS;
     i2000_poll_interrupts(s);
 }
 static void identify(Ia64I2000State *s) {
@@ -441,7 +447,7 @@ static void test_keyboard(void) {
     io_port_write(s, 0x21, 0xf8, 1);   /* PIC IRQ1 open, as Windows leaves it */
     route_gsi(s, 1, 0x80 | I460GX_IOSAPIC_RTE_MASK);
     type_key(s, 'b');
-    s->cpu->ninsts += 1000000;
+    i2000_advance(s, PS2_QUIET_TICKS);
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x80) && !irq(s, 0)); /* masked OS vector: no fallback */
     route_gsi(s, 1, 0x80);
@@ -516,11 +522,54 @@ static void test_mouse(void) {
     route_gsi(s, 12, 0x90 | I460GX_IOSAPIC_RTE_MASK);
     mouse_command(s, 0xf5);            /* its ACK is an aux byte */
     CHECK(io_port_read(s, 0x64, 1) & 0x20);
-    s->cpu->ninsts += 1000000;
+    i2000_advance(s, PS2_QUIET_TICKS);
     i2000_poll_interrupts(s);
     CHECK(!irq(s, 0x90) && !irq(s, 0)); /* masked OS vector: no fallback */
     ia64_i2000_destroy(s);
 }
+/* The firmware's legacy path: after IRQ1's acknowledge the 8042's next byte
+ * waits a byte time on the wire; IRQ12's waits for the handler's return
+ * (here there is none to wait for), then a byte time. */
+static void test_ps2_quiet(void) {
+    Ia64I2000State *s = machine_with(true);
+    pic_init(s, 0xF9, 0xEF);           /* IRQ1, the cascade and IRQ12 open */
+    type_key(s, 'a');                  /* make + break */
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0));
+    CHECK(io_port_read(s, 0x60, 1) == 0x1e);
+    CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == 0x09);
+    io_port_write(s, 0x20, 0x20, 1);   /* EOI */
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0) && kbc_output_full(s));
+    i2000_advance(s, PS2_QUIET_TICKS / 2);
+    i2000_poll_interrupts(s);
+    CHECK(!irq(s, 0));
+    i2000_advance(s, PS2_QUIET_TICKS / 2 + 1);
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0));                  /* the break code */
+    CHECK(io_port_read(s, 0x60, 1) == 0x9e);
+    CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == 0x09);
+    io_port_write(s, 0x20, 0x20, 1);
+
+    kbc_write_command_byte(s, kbc_read_command_byte(s) | 0x02);  /* INT2 */
+    mouse_command(s, 0xff);            /* reset reply: ACK, AA, 00 */
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0));
+    CHECK(io_port_read(s, 0x60, 1) == 0xfa);
+    CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == PIC_SLAVE_BASE + 4);
+    CHECK(s->mouse_wait_return);
+    io_port_write(s, 0xA0, 0x20, 1);
+    io_port_write(s, 0x20, 0x20, 1);
+    i2000_poll_interrupts(s);
+    CHECK(!s->mouse_wait_return);      /* not in a handler: no return to wait */
+    CHECK(!irq(s, 0) && kbc_output_full(s));
+    i2000_advance(s, PS2_QUIET_TICKS);
+    i2000_poll_interrupts(s);
+    CHECK(irq(s, 0));
+    CHECK(io_port_read(s, 0x60, 1) == 0xaa);
+    ia64_i2000_destroy(s);
+}
+
 /* Monitor text longer than the PS/2 keyboard's 64-byte queue: every key
  * arrives, fed in as the guest drains the queue, one per 20 ms. */
 static void test_key_backlog(void) {
@@ -576,12 +625,12 @@ static void test_mouse_events(void) {
     CHECK(io_port_read(s, 0x60, 1) == 0xfa);
     ia64_i2000_destroy(s);
 }
-/* An unsupported version must be rejected from its header, without reading
- * a differently laid-out payload or changing the running machine. */
+/* A snapshot in the format before G6 (the raw structures) is refused from
+ * its header, without reading its payload or changing the running machine. */
 static void old_snapshot(unsigned version, uint64_t ram_size) {
     FILE *out = fopen("irq-old.vmstate", "wb");
     CHECK(out);
-    uint64_t magic = I2000_SNAPSHOT_MAGIC;
+    uint64_t magic = I2000_OLD_SNAPSHOT_MAGIC;
     uint32_t v = version;
     CHECK(fwrite(&magic, sizeof(magic), 1, out) == 1);
     CHECK(fwrite(&v, sizeof(v), 1, out) == 1);
@@ -615,7 +664,7 @@ static void test_snapshots(void) {
     io_port_write(s, 0x376, 0, 1);
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x60));         /* ... and so is the held-back interrupt */
-    for (unsigned version = 9; version < I2000_SNAPSHOT_VERSION; version++) {
+    for (unsigned version = 9; version <= 50; version++) {
         old_snapshot(version, s->ram_size);
         s->ram[0x1234] = 0x5a;
         s->chipset.sac_ccsr = 0x12345678;
@@ -633,6 +682,51 @@ static void test_snapshots(void) {
     io_port_write(s, 0x376, 0, 1);
     i2000_poll_interrupts(s);
     CHECK(irq(s, 0x60));
+    ia64_i2000_destroy(s);
+}
+/* G6: the snapshot is the core machine's state.  Saving, loading and saving
+ * again gives the same file; a machine built differently refuses it and is
+ * left as it was. */
+static bool same_file(const char *a, const char *b) {
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    bool same = fa && fb;
+    while (same) {
+        int ca = fgetc(fa), cb = fgetc(fb);
+        same = ca == cb;
+        if (ca == EOF)
+            break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+static void test_core_state(void) {
+    Ia64I2000State *s = machine();
+    route(s, 0x60);
+    identify(s);
+    s->ram[0x4321] = 0xa7;
+    s->cpu->gr_static[9] = 0x1122334455667788ull;
+    bool requested = irq15_requested(s);    /* the 8259's pins synced, as below */
+    CHECK(i2000_save_snapshot(s, "core-a.vmstate"));
+    CHECK(i2000_load_snapshot(s, "core-a.vmstate"));
+    CHECK(i2000_save_snapshot(s, "core-b.vmstate"));
+    CHECK(same_file("core-a.vmstate", "core-b.vmstate"));
+    /* into a second machine built the same way */
+    Ia64I2000State *t = machine();
+    CHECK(i2000_load_snapshot(t, "core-a.vmstate"));
+    CHECK(t->ram[0x4321] == 0xa7 && t->cpu->gr_static[9] == 0x1122334455667788ull);
+    CHECK(irq15_requested(t) == requested);
+    CHECK(i2000_save_snapshot(t, "core-c.vmstate"));
+    CHECK(same_file("core-a.vmstate", "core-c.vmstate"));
+    ia64_i2000_destroy(t);
+    /* other RAM: refused, untouched */
+    Ia64Config cfg = {.ram_size = s->ram_size * 2, .display_type = GEMU_DISPLAY_NONE};
+    Ia64I2000State *big = ia64_i2000_create(&cfg);
+    CHECK(big);
+    big->ram[0x4321] = 0x11;
+    CHECK(!i2000_load_snapshot(big, "core-a.vmstate"));
+    CHECK(big->ram[0x4321] == 0x11);
+    ia64_i2000_destroy(big);
     ia64_i2000_destroy(s);
 }
 static void pci_write(Ia64I2000State *s, unsigned bus, unsigned dev,
@@ -699,7 +793,7 @@ static void test_chipset_snapshot(void) {
 }
 /* Primary-channel ATA disk, as Windows' IDE driver uses it (GSI14). */
 static void ata_wait(Ia64I2000State *s) {
-    s->cpu->ninsts += IDE_SETTLE_NINSTS;
+    s->cpu->time_base += IDE_SETTLE_TICKS;
     i2000_poll_interrupts(s);
 }
 static void ata_task(Ia64I2000State *s, uint8_t device, uint32_t lba,
@@ -800,7 +894,7 @@ static void test_ata(void) {
     s->cpu->psr |= UINT64_C(1) << 14;              /* native code, PSR.i on */
     s->ram[0x48E] = 0;
     ata_task(s, 0xE0, 3, 1, 0x20);
-    s->cpu->ninsts += IDE_SETTLE_NINSTS;
+    s->cpu->time_base += IDE_SETTLE_TICKS;
     CHECK(io_port_read(s, 0x1F7, 1) == 0x58);      /* delivers, then acks */
     CHECK(irq14_requested(s) && irq(s, 0));
     CHECK(bus_read(s, I2000_LEGACY_ACK_ADDR, 1) == PIC_SLAVE_BASE + 6u);
@@ -1172,6 +1266,37 @@ static void test_serial(void) {
 
 /* G3: the board's interrupt sources reach the 8259 pair and the I/O SAPIC
  * as core lines.  (This one looks at the wiring itself.) */
+/* The processor is the core machine's executor, on the time base's clock
+ * (G5): time passing with no instructions moves both together, and a timer
+ * due inside a catch-up fires at its deadline, mid-way. */
+static uint64_t clock_fired_tb;
+static GemuTime clock_fired_at;
+static void clock_cb(void *ud, int param) {
+    Ia64I2000State *s = ud;
+    (void)param;
+    clock_fired_tb = merced_get_time_base(s->cpu);
+    clock_fired_at = gemu_now(s->core->machine);
+}
+static void test_cpu_clock(void) {
+    Ia64I2000State *s = machine();
+    I2000Core *c = s->core;
+    uint64_t tb0 = merced_get_time_base(s->cpu), n0 = s->cpu->ninsts;
+    GemuTime t0 = gemu_machine_time(c->machine);
+    i2000_advance(s, 1000);
+    CHECK(merced_get_time_base(s->cpu) == tb0 + 1000);
+    CHECK(s->cpu->ninsts == n0);
+    CHECK(gemu_machine_time(c->machine) == t0 + gemu_clocks(I2000_ITC_HZ, 1000));
+    GemuTimer *t = gemu_timer_new(c->board, clock_cb, s);
+    gemu_timer_start_clocks(t, I2000_ITC_HZ, 300, 0, 0);
+    i2000_advance(s, 1000);
+    CHECK(clock_fired_tb == tb0 + 1300);
+    CHECK(clock_fired_at == t0 + gemu_clocks(I2000_ITC_HZ, 1300));
+    CHECK(merced_get_time_base(s->cpu) == tb0 + 2000);
+    CHECK(c->owed == 0 && s->cpu->ninsts == n0);
+    gemu_timer_free(t);
+    ia64_i2000_destroy(s);
+}
+
 static void test_lines(void) {
     Ia64I2000State *s = machine();
     I2000Core *c = s->core;
@@ -1223,6 +1348,9 @@ int main(void) {
     test_chipset_snapshot();
     test_keyboard();
     test_mouse();
+    test_ps2_quiet();
+    test_cpu_clock();
+    test_core_state();
     test_key_backlog();
     test_mouse_events();
     test_gpio_straps();

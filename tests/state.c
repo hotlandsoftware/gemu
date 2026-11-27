@@ -4,6 +4,7 @@
 #include "gemu/dev/option.h"
 #include "gemu/dev/scheduler.h"
 #include "gemu/dev/state.h"
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -220,6 +221,62 @@ static void refused(Rig *r, const uint8_t *buf, size_t len, const char *msg) {
     free(after);
 }
 
+/* ── A table: rows of a padded struct, saved as their fields ── */
+typedef struct { uint8_t a; uint64_t b; uint16_t c[3]; } Row;   /* padding after a */
+typedef struct { uint8_t a; uint64_t b; uint32_t c[3]; } Row2;  /* c changed */
+static const GemuStateField row_fields[] = {
+    GEMU_STATE_FIELD(Row, a), GEMU_STATE_FIELD(Row, b), GEMU_STATE_FIELD(Row, c),
+};
+static const GemuStateField row2_fields[] = {
+    GEMU_STATE_FIELD(Row2, a), GEMU_STATE_FIELD(Row2, b), GEMU_STATE_FIELD(Row2, c),
+};
+static Row rows[4];
+static Row2 rows2[4];
+static bool rows_init(GemuDevice *d) { return GEMU_STATE_TABLE(d, "rows", rows, row_fields); }
+static bool rows2_init(GemuDevice *d) { return GEMU_STATE_TABLE(d, "rows", rows2, row2_fields); }
+static const GemuDeviceType rows_type = { .name = "rows", .init = rows_init };
+static const GemuDeviceType rows2_type = { .name = "rows", .init = rows2_init };
+
+static GemuMachine *table_machine(const GemuDeviceType *type) {
+    GemuMachine *m = gemu_machine_new("tab");
+    CHECK(gemu_device_add(m, type, "t", NULL, NULL));
+    CHECK(gemu_machine_init(m) && gemu_machine_start(m));
+    return m;
+}
+
+static void tables(void) {
+    GemuMachine *m = table_machine(&rows_type);
+    memset(rows, 0xEE, sizeof rows);                 /* padding: never saved */
+    for (int i = 0; i < 4; i++) {
+        rows[i].a = (uint8_t)i;
+        rows[i].b = 0x1111111111111111ull * (unsigned)i;
+        rows[i].c[2] = (uint16_t)(100 + i);
+    }
+    uint8_t *s;
+    size_t n;
+    CHECK(gemu_machine_save_state(m, &s, &n));
+    rows[2].b = 0;
+    rows[3].c[2] = 0;
+    CHECK(gemu_machine_load_state(m, s, n));
+    CHECK(rows[2].b == 0x2222222222222222ull && rows[3].c[2] == 103);
+    /* the same bytes again, wherever the padding is */
+    memset((uint8_t *)&rows[1] + 1, 0x00, offsetof(Row, b) - 1);
+    uint8_t *s2;
+    size_t n2;
+    CHECK(gemu_machine_save_state(m, &s2, &n2));
+    CHECK(n2 == n && !memcmp(s, s2, n));
+    free(s2);
+    /* a machine whose rows have other fields refuses it, untouched */
+    GemuMachine *m2 = table_machine(&rows2_type);
+    rows2[0].b = 7;
+    CHECK(!gemu_machine_load_state(m2, s, n));
+    CHECK(strstr(gemu_machine_error(m2), "table rows"));
+    CHECK(rows2[0].b == 7);
+    free(s);
+    gemu_machine_free(m);
+    gemu_machine_free(m2);
+}
+
 static GemuMachine *cb_machine;
 static bool cb_saved;
 static void save_in_callback(void *ud, int param) {
@@ -230,6 +287,7 @@ static void save_in_callback(void *ud, int param) {
 }
 
 int main(void) {
+    tables();
     /* ── Round trip: save at t1, run to t2; load, run to t2 again: the same ── */
     Rig r = build("pc", NULL, NULL, false);
     ((Cart *)r.cart->priv)->ram[3] = 0xC3;
@@ -242,6 +300,14 @@ int main(void) {
     CHECK(gemu_machine_save_state(r.m, &s1, &n1));
     CHECK(pre_saves == ps + 1 && ((Counter *)r.pit->priv)->mode == 0x5A);
     CHECK(gemu_machine_save_file(r.m, "pc.state"));
+    {   /* the file (written as it goes, lengths patched) is the same bytes */
+        FILE *f = fopen("pc.state", "rb");
+        uint8_t *fb = malloc(n1 + 1);
+        size_t fn = f && fb ? fread(fb, 1, n1 + 1, f) : 0;
+        CHECK(fn == n1 && !memcmp(fb, s1, n1));
+        free(fb);
+        if (f) fclose(f);
+    }
     CHECK(gemu_machine_run_until(r.m, GEMU_MSEC(50)));
     Obs t2 = observe(&r);
     CHECK(t2.count == 50 && t2.edges == 25);

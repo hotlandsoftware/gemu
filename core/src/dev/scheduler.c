@@ -348,6 +348,11 @@ void gemu_machine_stop(GemuMachine *m) {
         gemu_executor_yield(s->running);
 }
 
+GemuTime gemu_machine_next_deadline(GemuMachine *m) {
+    GemuSched *s = &m->sched;
+    return s->nheap ? s->heap[0]->deadline : GEMU_TIME_NEVER;
+}
+
 bool gemu_machine_run_until(GemuMachine *m, GemuTime t) {
     GemuSched *s = &m->sched;
     s->stop = false;

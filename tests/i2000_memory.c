@@ -1093,7 +1093,8 @@ static uint64_t load_restart_fetch(void *ud, uint64_t addr, unsigned size) {
     __uint128_t bundle;
     if (addr >= 0x1000 && addr < 0x1010)
         bundle = fixture->load_bundle;
-    else if (addr >= 0x9000 && addr < 0x9010)
+    else if ((addr >= 0x9000 && addr < 0x9010) ||   /* IVA 0x8000: DTLB */
+             (addr >= 0xB000 && addr < 0xB010))     /* external interrupt */
         bundle = fixture->handler_bundle;
     else
         return UINT64_MAX;
@@ -1120,6 +1121,50 @@ static void load_restart_expect(uint64_t actual, uint64_t expected,
             fast ? "fast" : "slow", reg_update ? "register" : "immediate",
             scenario, initial_nat, what, actual, expected);
     failures++;
+}
+
+/* merced_in_external_interrupt(): from the delivery of an external interrupt
+ * to the handler's rfi (the i2000's legacy-path mouse waits on it). */
+static void check_ext_interrupt_return(bool fast) {
+    const __uint128_t nop = UINT64_C(0x08000000);
+    uint64_t rfi = UINT64_C(8) << 27;
+    LoadRestartFixture fixture = {
+        .load_bundle = 9 | (nop << 5) | (nop << 46) | (nop << 87),
+        .handler_bundle = 17 | (nop << 5) | (nop << 46) |
+                          ((__uint128_t)rfi << 87),  /* MIB: nop; nop; rfi */
+    };
+    MercedBus bus = {
+        .ud = &fixture, .read = load_restart_read, .fetch = load_restart_fetch,
+        .write = handoff_write,
+    };
+    Merced *cpu = merced_create(&bus);
+    if (!cpu) {
+        failures++;
+        return;
+    }
+    cpu->ip = 0x1000;
+    cpu->psr = (UINT64_C(1) << 13) | (UINT64_C(1) << 14) |
+               (UINT64_C(1) << 44);           /* IC, I, BN; physical code */
+    cpu->cr[2] = 0x8000;                      /* external interrupt at 0xB000 */
+    cpu->cr[72] = UINT64_C(1) << 16;           /* masked timer */
+    int bad = 0;
+    bad |= handoff_step(cpu, fast) != MERCED_OK;
+    bad |= merced_in_external_interrupt(cpu);
+    merced_raise_external(cpu, 0x40);
+    cpu->group_start = 1;                     /* recognised at a group's start */
+    bad |= handoff_step(cpu, fast) != MERCED_OK;
+    bad |= (cpu->ip & ~UINT64_C(0xF)) != 0xB000;
+    bad |= !merced_in_external_interrupt(cpu);
+    for (unsigned i = 0; i < 3 && (cpu->ip & ~UINT64_C(0xF)) == 0xB000; i++)
+        bad |= handoff_step(cpu, fast) != MERCED_OK;
+    bad |= (cpu->ip & ~UINT64_C(0xF)) != 0x1000;   /* the rfi returned */
+    bad |= merced_in_external_interrupt(cpu);
+    if (bad) {
+        fprintf(stderr, "external interrupt return (%s): ip=%#" PRIx64 " in=%d\n",
+                fast ? "fast" : "step", cpu->ip, merced_in_external_interrupt(cpu));
+        failures++;
+    }
+    merced_destroy(cpu);
 }
 
 /* The PAL dispatcher walks three-word records with postincrement loads.
@@ -2252,7 +2297,6 @@ static void check_rse_context_switch(bool fast, unsigned dirty, bool rewind,
         RSE_EXPECT(cpu->rse_flushed_regs, 64 - dirty, "failed fill keeps boundary");
         for (unsigned slot = 0; slot < 3; slot++)
             RSE_EXPECT(handoff_step(cpu, fast), MERCED_OK, "map and rfi retry");
-        RSE_EXPECT(cpu->interruption_rse_depth, 0, "rfi consumes interrupted snapshot");
     }
     RSE_EXPECT(cpu->ip, 0x2000, "target ready after required fills");
     RSE_EXPECT(cpu->bof_total, 60, "return frame popped exactly once");
@@ -2511,7 +2555,6 @@ static void check_predicate_irq_pipeline(bool fast, bool interrupt) {
     PIPE_EXPECT(cpu->gr_static[20], 10, "all four produced values accumulated once");
     PIPE_EXPECT(fixture.invalid_reads, 0, "load waits for its address-producing stage");
     PIPE_EXPECT(cpu->nfaults, interrupt ? 1 : 0, "only the requested IRQ occurs");
-    PIPE_EXPECT(cpu->interruption_rse_depth, 0, "IRQ return completes");
     PIPE_EXPECT(returned, interrupt, "interrupt resumes the pipeline");
 #undef PIPE_EXPECT
     merced_destroy(cpu);
@@ -6670,6 +6713,7 @@ int main(void) {
             for (unsigned scenario = 0; scenario < 3; scenario++)
                 for (unsigned initial_nat = 0; initial_nat < 2; initial_nat++)
                     check_load_restart(fast, reg_update, scenario, initial_nat);
+        check_ext_interrupt_return(fast);
         for (unsigned x6 = 0x20; x6 <= 0x27; x6++)
             for (unsigned form = 0; form < 3; form++)
                 check_fp_check_load(x6, form, 0, fast);

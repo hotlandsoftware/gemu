@@ -1,8 +1,8 @@
 /* The INS8250 UART as a core device: see ins8250_dev.h. */
 #include "serial/ins8250_dev.h"
+#include "serial/ins8250_state.h"
 #include "gemu/dev/line.h"
 #include "gemu/dev/option.h"
-#include "gemu/dev/state.h"
 #include <stdio.h>
 
 typedef struct {
@@ -52,26 +52,7 @@ static bool uart_init(GemuDevice *d) {
     u->clock_hz = (uint32_t)gemu_opt_int(d, "clock");
     u->set_irq = set_irq;
     u->ud = p;
-    GEMU_STATE_VAR(d, "modem_in", u->modem_in);
-    GEMU_STATE_VAR(d, "rbr", u->rbr);
-    GEMU_STATE_VAR(d, "thr", u->thr);
-    GEMU_STATE_VAR(d, "ier", u->ier);
-    GEMU_STATE_VAR(d, "lcr", u->lcr);
-    GEMU_STATE_VAR(d, "mcr", u->mcr);
-    GEMU_STATE_VAR(d, "lsr", u->lsr);
-    GEMU_STATE_VAR(d, "msr", u->msr);
-    GEMU_STATE_VAR(d, "scr", u->scr);
-    GEMU_STATE_VAR(d, "divisor", u->divisor);
-    GEMU_STATE_VAR(d, "thre_int", u->thre_int);
-    GEMU_STATE_VAR(d, "tx_busy", u->tx_busy);
-    GEMU_STATE_VAR(d, "tsr", u->tsr);
-    GEMU_STATE_VAR(d, "tx_wait", u->tx_wait);
-    GEMU_STATE_VAR(d, "rx_busy", u->rx_busy);
-    GEMU_STATE_VAR(d, "rsr", u->rsr);
-    GEMU_STATE_VAR(d, "rx_wait", u->rx_wait);
-    GEMU_STATE_VAR(d, "loop_pending", u->loop_pending);
-    GEMU_STATE_VAR(d, "loop_byte", u->loop_byte);
-    return true;
+    return ins8250_state_add(d, "", u);
 }
 
 static void uart_reset(GemuDevice *d, GemuResetKind kind) {

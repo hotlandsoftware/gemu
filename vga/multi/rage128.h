@@ -11,10 +11,9 @@
  * core (vga.h) serves the legacy ports and the 0xA0000 window, and its VRAM is
  * the card's frame buffer.
  *
- * Rage128 is plain data so a machine can snapshot it as raw bytes. The host
- * pointers inside it are `wiring` (three function pointers and an opaque),
- * `vga` and `rom`; after loading a raw dump call rage128_rebind() and
- * rage128_set_rom() to point them at the live objects again. */
+ * Its save state is registered by rage128_state_add() (rage128_state.h),
+ * which leaves out the host pointers: `wiring` (three function pointers and
+ * an opaque), `vga` and `rom`. */
 
 #include "vga.h"
 
@@ -88,7 +87,7 @@ typedef struct Rage128 {
      * and GEN_INT_STATUS CRTC_VBLANK_INT / CRTC_VLINE_INT were last cleared. */
     uint64_t vblank_save_clear, int_vblank_clear, int_vline_clear;
     bool irq_out;                     /* INTA# as last reported */
-    _Alignas(8) Rage128Cce cce;        /* appended; i2000 can import v40 states */
+    Rage128Cce cce;
 } Rage128;
 
 /* Power-on. `vga` is borrowed and must already be initialised with

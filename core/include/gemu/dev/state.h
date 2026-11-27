@@ -36,8 +36,30 @@ typedef struct GemuStateReader GemuStateReader;
  * false (and the machine won't start) on a duplicate or a bad argument. */
 bool gemu_state_add(GemuDevice *d, const char *name, void *ptr, size_t elem, size_t count);
 #define GEMU_STATE_VAR(d, name, var)   gemu_state_add((d), (name), &(var), sizeof (var), 1)
+/* Names are at most 63 characters.  prefix + name, for the parts of a
+ * device (a chip pair's "master."): */
+bool gemu_state_add_named(GemuDevice *d, const char *prefix, const char *name, void *ptr,
+                          size_t elem, size_t count);
+/* A member of a struct, under its own name: a scalar, an array (one item,
+ * the whole array) or a nested plain struct. */
+#define GEMU_STATE_MEMBER(d, prefix, obj, member) \
+    gemu_state_add_named((d), (prefix), #member, &(obj)->member, sizeof (obj)->member, 1)
 #define GEMU_STATE_ARRAY(d, name, arr) \
     gemu_state_add((d), (name), (arr), sizeof (arr)[0], sizeof (arr) / sizeof (arr)[0])
+
+/* An array of count structs, stride bytes apart from base, saved as the
+ * listed fields of each, packed (no padding, no pointers).  The field sizes
+ * are saved too: a struct whose fields change is refused, not misread. */
+typedef struct {
+    size_t offset, size;
+} GemuStateField;
+#define GEMU_STATE_FIELD(type, member) \
+    { offsetof(type, member), sizeof(((type *)0)->member) }
+bool gemu_state_add_table(GemuDevice *d, const char *name, void *base, size_t stride,
+                          size_t count, const GemuStateField *fields, size_t nfields);
+#define GEMU_STATE_TABLE(d, name, arr, fields) \
+    gemu_state_add_table((d), (name), (arr), sizeof (arr)[0], sizeof (arr) / sizeof (arr)[0], \
+                         (fields), sizeof (fields) / sizeof (fields)[0])
 
 /* Custom: save writes what it likes; load reads it back and returns false
  * if it can't use it (checked before anything is applied: see `check`).

@@ -431,20 +431,6 @@ static void fr_write(Merced *m, unsigned r, MercedFpReg v) {
 /* ── Memory / translation ────────────────────────────────────────────────── */
 
 static MercedStatus mhalt(Merced *m, const char *fmt, ...);
-static uint64_t rfi_generation;
-/* Set when the interruption currently in service was delivered via
- * VEC_EXTINT, cleared at the matching rfi (see deliver_fault() and the rfi
- * case in exec_b()). IA-64 doesn't stack interruption context - by the time
- * a guest reaches rfi it can only be returning from the single most recent
- * delivery - so a flag, not a counter, is enough to identify which rfi that
- * was. Without this, rfi_generation counted every rfi system-wide,
- * including the ones ending completely unrelated TLB-miss/fault handlers
- * that fire far more often than any interrupt; platform code waiting on it
- * to mean "the external ISR returned" was actually satisfied by the next
- * unrelated fault instead, in practice almost immediately. */
-static bool ext_interrupt_in_service;
-
-uint64_t merced_rfi_generation(void) { return rfi_generation; }
 
 static const MercedTlbEntry *tlb_search(const MercedTlbEntry *t, int n,
                                         uint32_t rid, uint64_t va,
@@ -584,6 +570,7 @@ static void irqc_pending_set(Merced *m, unsigned vector);
 static void irqc_invalidate(Merced *m);
 static int irqc_pending_hi(Merced *m);
 static unsigned irqc_in_service_hi(const Merced *m);
+static void ext_interrupt_mark(Merced *m, bool on);
 
 static void ext_pending_set(Merced *m, uint8_t vector) {
     uint8_t bit = (uint8_t)(1u << (vector & 7));
@@ -1030,7 +1017,7 @@ static MercedStatus deliver_fault(Merced *m, uint32_t vec, uint64_t isr,
     uint64_t interrupted_ipsr =
         m->psr | ((uint64_t)slot << PSR_RI_SHIFT);
     if (vec == VEC_EXTINT)
-        ext_interrupt_in_service = true;
+        ext_interrupt_mark(m, true);
     m->cr[CR_IPSR] = interrupted_ipsr;
     m->cr[CR_IIP]  = interrupted_iip;
     m->cr[CR_ISR]  = isr | ((uint64_t)slot << 41) |
@@ -1732,7 +1719,23 @@ typedef struct {
     /* debug_regs_armed(): 0 = not known (recompute), 1 = no, 2 = yes.
      * Cleared by mov dbr/ibr and by tb_flush() (snapshot loads). */
     uint8_t debug_armed;
+    /* merced_in_external_interrupt(): set by the delivery of an external
+     * interrupt, cleared by the next rfi.  IA-64 doesn't stack interruption
+     * context - by the time a guest reaches rfi it can only be returning
+     * from the single most recent delivery - so a flag is enough.  (Not
+     * cleared by tb_flush(); not part of a snapshot.) */
+    bool in_ext_interrupt;
 } MercedTranslationCache;
+
+bool merced_in_external_interrupt(const Merced *m) {
+    const MercedTranslationCache *tc = m->translation_cache;
+    return tc && tc->in_ext_interrupt;
+}
+
+static void ext_interrupt_mark(Merced *m, bool on) {
+    MercedTranslationCache *tc = m->translation_cache;
+    if (tc) tc->in_ext_interrupt = on;
+}
 
 static bool code_page_ed(Merced *m) {
     const MercedTranslationCache *tc = m->translation_cache;
@@ -5887,10 +5890,7 @@ static MercedStatus exec_b(Merced *m, uint64_t raw, int qp) {
              * a false hit and skip the software TLB refill. */
             alat_invalidate_stacked(m);
             m->taken = 1;
-            if (ext_interrupt_in_service) {
-                ext_interrupt_in_service = false;
-                rfi_generation++;
-            }
+            ext_interrupt_mark(m, false);
             /* Mandatory fills fault in the restored target context, with
              * ISR.ir set, and retry through a subsequent rfi. */
             MercedStatus fill_status;

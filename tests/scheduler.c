@@ -115,6 +115,7 @@ static void timers(void) {
     gemu_timer_start(t3, 100, 0, 0);                  /* same time: after t2 */
     gemu_timer_start(t4, 200, 0, 0);
     CHECK(gemu_timer_expires(t4) == 200 && gemu_timer_remaining(t4) == 200);
+    CHECK(gemu_machine_next_deadline(m) == 100);
     gemu_timer_stop(t4);
     gemu_timer_stop(t4);                              /* twice: fine */
     CHECK(!gemu_timer_running(t4));
@@ -123,6 +124,7 @@ static void timers(void) {
     CHECK(!strcmp(log_buf, "t2@100 t3@100 t1@250"));
     CHECK(gemu_machine_time(m) == 1000 && gemu_now(m) == 1000);
     CHECK(!gemu_timer_running(t1));
+    CHECK(gemu_machine_next_deadline(m) == GEMU_TIME_NEVER);
     /* relative to now */
     gemu_timer_start(t4, 5, 0, 0);
     CHECK(gemu_timer_expires(t4) == 1005);

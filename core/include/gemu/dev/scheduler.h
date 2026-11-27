@@ -53,6 +53,10 @@ GemuTime gemu_machine_time(GemuMachine *m);
  * gemu_machine_stop() is called; the machine time is then where it got. */
 bool gemu_machine_run_until(GemuMachine *m, GemuTime t);
 void gemu_machine_stop(GemuMachine *m);
+/* The earliest timer deadline, GEMU_TIME_NEVER if none: a machine whose
+ * time is driven from outside (no executors) needn't call run_until until
+ * then. */
+GemuTime gemu_machine_next_deadline(GemuMachine *m);
 
 /* Real-time pacing: sleep until the host clock catches up with the machine
  * time (measured from the first call, or the last resync).  Falling more

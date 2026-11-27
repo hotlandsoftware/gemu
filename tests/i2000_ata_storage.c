@@ -46,7 +46,7 @@ static void task(Ia64I2000State *s, uint32_t lba, unsigned count, uint8_t cmd) {
 
 static void complete(Ia64I2000State *s, uint8_t status) {
     CHECK(!irq(s));
-    s->cpu->ninsts += ATAPI_IRQ_LATENCY_NINSTS;
+    s->cpu->time_base += I2000_IDE_LATENCY_TICKS;
     i2000_poll_interrupts(s);
     CHECK(irq(s));
     merced_ack_external(s->cpu, VECTOR);

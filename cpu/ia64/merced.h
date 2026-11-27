@@ -138,22 +138,6 @@ struct Merced {
     uint64_t rse_anchor_addr;
     int64_t  rse_anchor_regs;
     int64_t  rse_flushed_regs;
-    /* Reserved snapshot-layout storage from the former implementation-private
-     * interruption register cache. Do not restore registers from these fields:
-     * interruption handlers and context switches manage the architectural RSE
-     * backing store, and unrelated frames can resume at the same IIP/IPSR.
-     * Retain the fields so existing raw CPU snapshots keep their layout. */
-    struct {
-        uint64_t iip, ipsr;
-        uint64_t gr_stack[MERCED_RSE_CAPACITY];
-        uint8_t  nat_stack[MERCED_RSE_CAPACITY];
-        uint32_t bof;
-        uint64_t bof_total;
-        uint64_t anchor_addr;
-        int64_t  anchor_regs;
-        int64_t  flushed_regs;
-    } interruption_rse[4];
-    uint8_t interruption_rse_depth;
     MercedFpReg fr[MERCED_N_FR];
     uint64_t br[MERCED_N_BR];
     uint64_t ar[MERCED_N_AR];
@@ -485,13 +469,12 @@ void merced_raise_external(Merced *m, uint8_t vector);
 /* Whether `vector` is still latched, i.e. not yet taken by the processor. */
 bool merced_external_pending(const Merced *m, uint8_t vector);
 void merced_ack_external(Merced *m, uint8_t vector);
-/* Monotonic count of completed *external-interrupt* servicing specifically
- * (an rfi whose matching entry was VEC_EXTINT) - NOT every rfi in the
- * system, which would also include unrelated fault/trap handlers (e.g.
- * TLB-miss refills) that return far more often than any interrupt does.
- * Platform devices use this to avoid reasserting a level interrupt before
- * its own handler has actually returned. */
-uint64_t merced_rfi_generation(void);
+/* Whether the processor is in an external-interrupt handler: from the
+ * delivery of an external interrupt to the next rfi.  A platform uses it to
+ * hold off a level interrupt until its handler has returned (the
+ * interruption registers aren't stacked: a second delivery would overwrite
+ * the first's return frame). */
+bool merced_in_external_interrupt(const Merced *m);
 
 /* Force cr.tpr directly - EXPERIMENTAL hook for the i2000 ATA controller,
  * see the call site in machine_i2000.c for why. */

@@ -9,12 +9,18 @@
  *     'S' the scheduler (scheduler.c)    'L' the line outputs (line.c)
  *   u8 'E'
  * Strings: u64 length, the bytes. */
+/* States bigger than 2 GiB (RAM) on hosts with a 32-bit off_t (MinGW). */
+#define _FILE_OFFSET_BITS 64
 #include "dev_priv.h"
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#ifndef _WIN32
+#  include <sys/mman.h>
+#endif
 
 #define STATE_MAGIC   "GEMUSTAT"
 #define STATE_VERSION 1u
@@ -24,6 +30,12 @@
 void gemu_state_write(GemuStateWriter *w, const void *p, size_t n) {
     if (w->failed || !n)
         return;
+    if (w->f) {
+        if (fwrite(p, 1, n, w->f) != n)
+            w->failed = true;
+        w->len += n;
+        return;
+    }
     if (w->len + n > w->cap) {
         size_t cap = w->cap ? w->cap : 4096;
         while (cap < w->len + n)
@@ -109,6 +121,20 @@ static GemuStateItem *new_item(GemuDevice *d, const char *name) {
     return it;
 }
 
+bool gemu_state_add_named(GemuDevice *d, const char *prefix, const char *name, void *ptr,
+                          size_t elem, size_t count) {
+    char full[GEMU_STATE_NAME_MAX + 1];
+    int n = snprintf(full, sizeof full, "%s%s", prefix ? prefix : "", name ? name : "");
+    if (n < 0 || (size_t)n >= GEMU_STATE_NAME_MAX) {
+        if (d && d->core && !d->core->state_error[0])
+            snprintf(d->core->state_error, sizeof d->core->state_error,
+                     "%s: state item name \"%s%s\" is too long", d->path,
+                     prefix ? prefix : "", name ? name : "");
+        return false;
+    }
+    return gemu_state_add(d, full, ptr, elem, count);
+}
+
 bool gemu_state_add(GemuDevice *d, const char *name, void *ptr, size_t elem, size_t count) {
     if (!d || !d->core)
         return false;
@@ -162,7 +188,100 @@ void gemu_state_free_items(GemuDevice *d) {
     c->nitems = 0;
 }
 
+/* ── Tables ───────────────────────────────────────────────────────────────── */
+
+static size_t table_row(const GemuStateItem *it) {
+    size_t n = 0;
+    for (size_t f = 0; f < it->nfields; f++)
+        n += it->fields[f].size;
+    return n;
+}
+
+static void table_save(void *ud, GemuStateWriter *w) {
+    const GemuStateItem *it = ud;
+    gemu_state_write_u32(w, (uint32_t)it->nfields);
+    for (size_t f = 0; f < it->nfields; f++)
+        gemu_state_write_u32(w, (uint32_t)it->fields[f].size);
+    for (size_t k = 0; k < it->count; k++)
+        for (size_t f = 0; f < it->nfields; f++)
+            gemu_state_write(w, it->base + k * it->stride + it->fields[f].offset,
+                             it->fields[f].size);
+}
+
+static bool table_check(void *ud, GemuStateReader *r) {
+    const GemuStateItem *it = ud;
+    uint32_t n, size;
+    if (!gemu_state_read_u32(r, &n) || n != it->nfields) {
+        gemu_state_refuse(r, "table %s: other fields", it->name);
+        return false;
+    }
+    for (size_t f = 0; f < it->nfields; f++)
+        if (!gemu_state_read_u32(r, &size) || size != it->fields[f].size) {
+            gemu_state_refuse(r, "table %s: field %zu is %u bytes here, saved otherwise",
+                              it->name, f, (unsigned)it->fields[f].size);
+            return false;
+        }
+    if (gemu_state_left(r) != it->count * table_row(it)) {
+        gemu_state_refuse(r, "table %s: other number of rows", it->name);
+        return false;
+    }
+    return true;
+}
+
+static bool table_load(void *ud, GemuStateReader *r) {
+    GemuStateItem *it = ud;
+    if (!table_check(ud, r))
+        return false;
+    /* table_check() read the header; the rows follow */
+    for (size_t k = 0; k < it->count; k++)
+        for (size_t f = 0; f < it->nfields; f++)
+            gemu_state_read(r, it->base + k * it->stride + it->fields[f].offset,
+                            it->fields[f].size);
+    return true;
+}
+
+bool gemu_state_add_table(GemuDevice *d, const char *name, void *base, size_t stride,
+                          size_t count, const GemuStateField *fields, size_t nfields) {
+    if (!d || !d->core)
+        return false;
+    bool bad = !base || !count || !fields || !nfields;
+    for (size_t f = 0; !bad && f < nfields; f++)
+        bad = !fields[f].size || fields[f].offset + fields[f].size > stride;
+    if (bad) {
+        if (!d->core->state_error[0])
+            snprintf(d->core->state_error, sizeof d->core->state_error,
+                     "%s: state table \"%s\": bad arguments", d->path, name ? name : "(null)");
+        return false;
+    }
+    GemuStateItem *it = new_item(d, name);
+    if (!it)
+        return false;
+    it->base = base;
+    it->stride = stride;
+    it->count = count;
+    it->fields = fields;
+    it->nfields = nfields;
+    it->save = table_save;
+    it->check = table_check;
+    it->load = table_load;
+    it->ud = it;
+    return true;
+}
+
 /* ── Saving ───────────────────────────────────────────────────────────────── */
+
+/* Fill in a length written earlier as 0, at offset `at`. */
+static void patch_u64(GemuStateWriter *w, size_t at, uint64_t v) {
+    if (w->failed)
+        return;
+    if (!w->f) {
+        memcpy(w->buf + at, &v, 8);
+        return;
+    }
+    if (fseeko(w->f, (off_t)at, SEEK_SET) || fwrite(&v, 8, 1, w->f) != 1 ||
+        fseeko(w->f, 0, SEEK_END))
+        w->failed = true;
+}
 
 /* A section: tag, length (patched), payload. */
 static size_t begin_section(GemuStateWriter *w, uint8_t tag) {
@@ -174,8 +293,7 @@ static size_t begin_section(GemuStateWriter *w, uint8_t tag) {
 static void end_section(GemuStateWriter *w, size_t at) {
     if (w->failed)
         return;
-    uint64_t n = w->len - at - 8;
-    memcpy(w->buf + at, &n, 8);
+    patch_u64(w, at, w->len - at - 8);
 }
 
 static bool pre_save_cb(GemuDevice *d, void *ud) {
@@ -202,10 +320,7 @@ static bool save_device(GemuDevice *d, void *ud) {
             i->save(i->ud, w);
         else
             gemu_state_write(w, i->ptr, i->elem * i->count);
-        if (!w->failed) {
-            uint64_t n = w->len - len_at - 8;
-            memcpy(w->buf + len_at, &n, 8);
-        }
+        patch_u64(w, len_at, w->len - len_at - 8);
     }
     end_section(w, at);
     return true;
@@ -223,23 +338,27 @@ static bool can_snapshot(GemuMachine *m, const char *what) {
     return true;
 }
 
+static void save_to(GemuMachine *m, GemuStateWriter *w) {
+    gemu_device_walk(&m->root, pre_save_cb, NULL);
+    gemu_state_write(w, STATE_MAGIC, 8);
+    gemu_sw_u64(w, STATE_VERSION);
+    gemu_sw_str(w, m->name);
+    gemu_device_walk(&m->root, save_device, w);
+    size_t at = begin_section(w, 'S');
+    gemu_sched_state_save(m, w);
+    end_section(w, at);
+    at = begin_section(w, 'L');
+    gemu_lines_state_save(m, w);
+    end_section(w, at);
+    gemu_sw_u8(w, 'E');
+}
+
 bool gemu_machine_save_state(GemuMachine *m, uint8_t **buf, size_t *len) {
     m->error[0] = 0;
     if (!can_snapshot(m, "save"))
         return false;
-    gemu_device_walk(&m->root, pre_save_cb, NULL);
     GemuStateWriter w = { 0 };
-    gemu_state_write(&w, STATE_MAGIC, 8);
-    gemu_sw_u64(&w, STATE_VERSION);
-    gemu_sw_str(&w, m->name);
-    gemu_device_walk(&m->root, save_device, &w);
-    size_t at = begin_section(&w, 'S');
-    gemu_sched_state_save(m, &w);
-    end_section(&w, at);
-    at = begin_section(&w, 'L');
-    gemu_lines_state_save(m, &w);
-    end_section(&w, at);
-    gemu_sw_u8(&w, 'E');
+    save_to(m, &w);
     if (w.failed) {
         free(w.buf);
         gemu_machine_set_error(m, "save: out of memory");
@@ -280,7 +399,7 @@ static bool load_device(GemuMachine *m, GemuStateReader *r, bool apply, unsigned
         }
     }
     for (uint64_t k = 0; k < nitems; k++) {
-        char name[32];
+        char name[GEMU_STATE_NAME_MAX];
         uint8_t kind;
         uint64_t elem, count, bytes;
         if (!gemu_sr_str(r, name, sizeof name) || !gemu_sr_u8(r, &kind) ||
@@ -433,47 +552,61 @@ bool gemu_machine_load_state(GemuMachine *m, const uint8_t *buf, size_t len) {
     return true;
 }
 
+/* Straight to the file: a machine with a lot of RAM isn't held twice. */
 bool gemu_machine_save_file(GemuMachine *m, const char *path) {
-    uint8_t *buf;
-    size_t len;
-    if (!gemu_machine_save_state(m, &buf, &len))
+    m->error[0] = 0;
+    if (!can_snapshot(m, "save"))
         return false;
     FILE *f = fopen(path, "wb");
-    bool ok = f && fwrite(buf, 1, len, f) == len;
-    if (f && fclose(f))
+    if (!f) {
+        gemu_machine_set_error(m, "save: can't write %s", path);
+        return false;
+    }
+    GemuStateWriter w = { .f = f };
+    save_to(m, &w);
+    bool ok = !w.failed;
+    if (fclose(f))
         ok = false;
-    free(buf);
     if (!ok)
         gemu_machine_set_error(m, "save: can't write %s", path);
     return ok;
 }
 
+/* The file mapped where the host can (read lazily, not copied), else read
+ * whole into one allocation of its size. */
 bool gemu_machine_load_file(GemuMachine *m, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         gemu_machine_set_error(m, "load: can't open %s", path);
         return false;
     }
-    uint8_t *buf = NULL;
-    size_t len = 0, cap = 0;
-    for (;;) {
-        if (len == cap) {
-            cap = cap ? cap * 2 : 65536;
-            uint8_t *b = realloc(buf, cap);
-            if (!b) {
-                free(buf);
-                fclose(f);
-                gemu_machine_set_error(m, "load: out of memory");
-                return false;
-            }
-            buf = b;
-        }
-        size_t n = fread(buf + len, 1, cap - len, f);
-        if (!n)
-            break;
-        len += n;
+    off_t size = -1;
+    if (!fseeko(f, 0, SEEK_END))
+        size = ftello(f);
+    if (size < 0 || (uint64_t)size > SIZE_MAX || fseeko(f, 0, SEEK_SET)) {
+        fclose(f);
+        gemu_machine_set_error(m, "load: can't read %s", path);
+        return false;
     }
-    bool err = ferror(f);
+    size_t len = (size_t)size;
+#ifndef _WIN32
+    if (len) {
+        void *map = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fileno(f), 0);
+        if (map != MAP_FAILED) {
+            fclose(f);
+            bool ok = gemu_machine_load_state(m, map, len);
+            munmap(map, len);
+            return ok;
+        }
+    }
+#endif
+    uint8_t *buf = malloc(len ? len : 1);
+    if (!buf) {
+        fclose(f);
+        gemu_machine_set_error(m, "load: out of memory");
+        return false;
+    }
+    bool err = fread(buf, 1, len, f) != len;
     fclose(f);
     if (err) {
         free(buf);

@@ -1,7 +1,7 @@
 /* The 8259A PIC as a core device: see i8259_dev.h. */
 #include "controller/i8259_dev.h"
+#include "controller/i8259_state.h"
 #include "gemu/dev/line.h"
-#include "gemu/dev/state.h"
 #include <stdio.h>
 
 typedef struct {
@@ -52,7 +52,6 @@ const GemuHandlers gemu_i8259_io = { .r8 = io_r8, .w8 = io_w8, .peek8 = io_peek 
 
 static bool pic_init(GemuDevice *d) {
     Pic *p = d->priv;
-    I8259 *c = &p->chip;
     for (int i = 0; i < 8; i++) {
         char name[16];
         snprintf(name, sizeof name, "ir%d", i);
@@ -61,19 +60,7 @@ static bool pic_init(GemuDevice *d) {
     }
     if (!(p->intr = gemu_line_out(d, "int")))
         return false;
-    GEMU_STATE_VAR(d, "imr", c->imr);
-    GEMU_STATE_VAR(d, "irr", c->irr);
-    GEMU_STATE_VAR(d, "isr", c->isr);
-    GEMU_STATE_VAR(d, "lines", c->lines);
-    GEMU_STATE_VAR(d, "vector_base", c->vector_base);
-    GEMU_STATE_VAR(d, "auto_eoi", c->auto_eoi);
-    GEMU_STATE_VAR(d, "level_mode", c->level_mode);
-    GEMU_STATE_VAR(d, "read_isr", c->read_isr);
-    GEMU_STATE_VAR(d, "poll", c->poll);
-    GEMU_STATE_VAR(d, "icw_step", c->icw_step);
-    GEMU_STATE_VAR(d, "single", c->single);
-    GEMU_STATE_VAR(d, "expect_icw4", c->expect_icw4);
-    return true;
+    return i8259_state_add(d, "", &p->chip);
 }
 
 static void pic_reset(GemuDevice *d, GemuResetKind kind) {

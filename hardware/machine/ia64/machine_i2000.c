@@ -32,7 +32,23 @@
 #include "gemu/audio_out.h"
 #include "gemu/dev/device.h"
 #include "gemu/dev/line.h"
+#include "gemu/dev/scheduler.h"
 #include "gemu/dev/space.h"
+#include "gemu/dev/state.h"
+#include "merced_state.h"
+#include "rage128_state.h"
+#include "chipset/i460gx_state.h"
+#include "controller/i8259_state.h"
+#include "controller/pc_sysctl_state.h"
+#include "i2c/i2c_state.h"
+#include "serial/ins8250_state.h"
+#include "storage/ide_state.h"
+#include "timer/clock_div_state.h"
+#include "timer/i8253_state.h"
+#include "timer/mc146818_state.h"
+#include "network/e100_state.h"
+#include "audio/pci_audio_state.h"
+#include "input/ps2_state.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,18 +135,20 @@ static const char *i2000_cached_getenv(const char *name) {
  * GEMU_IRQ_QUANTUM=<power of two> overrides either default (running both
  * engines with the same quantum makes their GEMU_CPI runs identical). */
 #define JIT_IRQ_POLL_QUANTUM 512
-/* File-static rather than in Ia64I2000State: that struct is snapshotted raw,
- * so a new field would invalidate existing snapshots. */
+/* A host setting (the engine), not machine state. */
 static unsigned irq_poll_quantum = IRQ_POLL_QUANTUM;
 
-/* Minimum instruction gap between a mouse byte being serviced and the next
- * one being offered - see the ack handler's mouse branch for why this can't
- * be zero (synchronous re-raise corrupts the guest ISR's return frame).
- * Matches the PIT's own tick granularity, which is already known safe. */
-#define MOUSE_RETRY_DELAY_INSTS 1000u
-#define KEYBOARD_RETRY_DELAY_INSTS 10000u
-/* Instructions between presentations of a still-asserted level interrupt. */
-#define SCI_REPRESENT_INSTS 20000u
+/* A PS/2 byte on the wire: 11 bits at the devices' 10-16.7 kHz clock, about
+ * a millisecond.  After the firmware's legacy path acknowledges IRQ1 the
+ * 8042 has no next byte for that long (it was 10,000 instructions); nor,
+ * after the handler returns, for IRQ12 (1,000). */
+#define I2000_PS2_BYTE_TIME GEMU_USEC(1000)
+/* Between presentations of a still-asserted level interrupt (the SCI, the
+ * RTC's IRQ8): 20,000 cycles of the 733 MHz processor clock.  Real hardware
+ * presents a level again as soon as the EOI lands; this is flow control,
+ * giving the handler time to clear the source, and it was 20,000
+ * instructions. */
+#define I2000_REPRESENT_TIME GEMU_USEC(27)
 
 enum {
     I2000_KEY_UP,
@@ -202,17 +220,24 @@ _Static_assert(sizeof(i2000_keyboard_keysyms) / sizeof(i2000_keyboard_keysyms[0]
  * code 3), and the ITC counts at the processor clock: 733.084 MHz. */
 #define I2000_ITC_HZ UINT64_C(733084000)
 #define I8254_INPUT_HZ UINT64_C(1193182)
-/* Command completion must not be visible in the same CPU instant as the
+/* The IDE devices' busy time, command to completion, in time-base ticks
+ * (2.7 us).  Completion must not be visible in the same CPU instant as the
  * command-register write - AtaPim arms its waiter after submission, so an
  * instantaneous interrupt would fire before anything is listening. But the
  * delay must also stay well inside AtaPim's own polling patience: observed
- * behavior is a tight status-poll loop advancing ~41 ninsts/iteration for
- * 100+ iterations before falling back to a Stall()-spaced slow poll, and an
- * interrupt arriving only after that patience is exhausted (100000 ninsts
- * was tried and is far past it) gets acknowledged by unrelated generic code
- * without ever reaching back to drain the data register. Comfortably above
- * one instruction, comfortably below the observed give-up point. */
-#define ATAPI_IRQ_LATENCY_NINSTS UINT64_C(2000)
+ * behavior is a tight status-poll loop advancing ~41 instructions/iteration
+ * for 100+ iterations before falling back to a Stall()-spaced slow poll, and
+ * an interrupt arriving only after that patience is exhausted (100000
+ * instructions was tried and is far past it) gets acknowledged by unrelated
+ * generic code without ever reaching back to drain the data register.
+ *
+ * It was 2000 instructions; within a slice the processor charges a tick a
+ * slot, so 2000 ticks is at most as many.  The time base also catches up
+ * with host time between slices, and a command just before that sees its
+ * completion sooner: measured over a boot to the logon screen (G4), 91 of
+ * 4,279 disk interrupts arrived within 1,000 instructions, 6 within 128,
+ * none of them a problem. */
+#define I2000_IDE_LATENCY_TICKS UINT64_C(2000)
 #define MMIO_LOG_N 768
 #define HALT_TRACE_LINES 32
 #define HALT_CALL_LINES  32
@@ -285,7 +310,6 @@ struct Ia64I2000State {
      * I/O SAPIC until the guest reads register C. */
     Mc146818  rtc;
     bool      rtc_irq;
-    uint64_t  rtc_retry_ninsts;
     uint8_t  *flash;
     char      flash_file[512];
     uint32_t  flash_image_size;
@@ -405,37 +429,17 @@ struct Ia64I2000State {
     /* An edge-triggered GSI8 gets one interrupt per rising edge of IRQ8:
      * set by the edge, cleared once sent. */
     bool     rtc_edge_pending;
-    /* deferred multi-byte mouse-packet retry (see the ack handler's
-     * mouse branch). Re-raising vector 0 synchronously, from within the same
-     * legacy-ack dispatch that's still servicing the CURRENT byte, risks
-     * corrupting the guest ISR: cr.ipsr/cr.iip/cr.isr are single non-stacked
-     * registers, and per merced.c's deliver_fault, a second delivery landing
-     * before this ISR invocation truly completes would overwrite its not-
-     * yet-consumed return frame - the same class of "IRQ0 handler's STI
-     * immediately re-enter[ing]" risk the pre-existing ack-arbitration
-     * comment already warned about for PIT. Deferring the retry by a real
-     * instruction gap (mirrors the PIT's own known-safe 100000-instruction
-     * tick granularity) closes off that risk for free.
-     *
-     * Update: a rapid synthetic packet burst could still reproducibly park
-     * the CPU at psr.i=0 in a stable, non-corrupted spin loop even with
-     * this field's deferral in place, as long as *new* packets kept being
-     * queued while the guest was only partway through draining an earlier
-     * one. It wasn't a one-shot POST self-test artifact after all - it
-     * also reproduced at the real BIOS Configuration Manager GUI. The real
-     * fix turned out to be at the call site: aux_out must be completely
-     * empty (not just "has room") and this deadline must have passed
-     * before a brand new packet is queued at all, not merely before it's
-     * raised - see the per-frame mouse-polling block in ia64_i2000_run().
-     * v9 replaces that arbitrary cooldown with completion of the actual
-     * interrupt return, and accumulates host motion while a packet drains. */
-    uint64_t mouse_retry_ninsts;
-    /* use the real PIC EOI handshake as mouse-flow control instead of
-     * an arbitrary multi-million-instruction cooldown. Host motion is
-     * coalesced while a report is in flight. Direction reversals discard
-     * stale motion in the old direction, and each axis is capped at two
-     * packets so a slow guest cannot build a long cursor backlog. */
-    uint64_t mouse_wait_rfi_generation;
+    /* The mouse on the firmware's legacy path (the ack handler's mouse
+     * branch).  Each aux byte waits for the handler of the last to return:
+     * cr.ipsr/cr.iip/cr.isr aren't stacked, and a second delivery before the
+     * first's rfi would overwrite its return frame.  Raising it from the
+     * acknowledge itself, synchronously, did exactly that.  Then it waits
+     * the time the next byte takes on the wire (core->mouse_quiet).
+     * mouse_wait_return is that first wait.  A new packet isn't queued at all until
+     * the last one has drained (i2000_mouse_pace()): a burst queued while
+     * the guest was partway through one parked it at psr.i=0, at POST's
+     * "Mouse 8042 Initialization" and in the BIOS Configuration Manager. */
+    bool     mouse_wait_return;
     int32_t mouse_accum_dx, mouse_accum_dy;
     bool mouse_host_left, mouse_host_right;
     uint64_t mouse_next_report_itc;
@@ -444,14 +448,12 @@ struct Ia64I2000State {
     bool nvram_dirty;
     /* reusable PS/2 keyboard device behind this machine's 8042. */
     Ps2Keyboard ps2_keyboard;
-    uint64_t keyboard_retry_ninsts;
 
     /* IFB power-management wiring. SCI is a level on the legacy line the IFB
      * routes it to; it reaches the CPU through that line's I/O SAPIC entry
      * and is re-presented until the handler clears the source. */
     int       sci_irq;
     bool      sci_level;
-    uint64_t  sci_retry_ninsts;
     bool      cpu_stopped;          /* S1: processors held in Stop-Grant */
     bool      power_off_requested;  /* S3/S4/S5: main power removed */
     bool      wake_reset_requested; /* woken from S3/S4/S5 */
@@ -487,10 +489,25 @@ struct I2000Core {
     int          sci_gsi;               /* where sci is connected; -1 none */
     GemuLineIn  *ir[16], *gsi[64];
     bool         pins_stale;            /* the pair's pins reset or loaded */
+    /* The processor as the machine's executor (stage G5; see
+     * i2000_cpu_run()). */
+    GemuDevice   *cpu;
+    GemuExecutor *exec;
+    uint64_t      run_tb;       /* the time base at the start of this run */
+    uint64_t      owed;         /* host time the time base still has to catch up */
+    bool          owed_only;    /* pay that, run no instructions (i2000_advance()) */
+    unsigned      slot_ticks;   /* time-base ticks a slot charges (GEMU_CPI) */
+    /* Quiet intervals: while one runs, its source isn't offered again. */
+    GemuTimer   *rtc_quiet, *sci_quiet, *kbd_quiet, *mouse_quiet;
 };
 
 static void i2000_memory_changed(Ia64I2000State *s);
 static void i2000_ifb_decode_update(Ia64I2000State *s);
+
+/* The legacy-path mouse holds its next byte (see mouse_wait_return). */
+static inline bool i2000_mouse_quiet(const Ia64I2000State *s) {
+    return s->mouse_wait_return || gemu_timer_running(s->core->mouse_quiet);
+}
 
 
 static void mmio_log(Ia64I2000State *s, uint64_t addr, uint64_t val,
@@ -661,24 +678,24 @@ static bool atapi_debug_enabled(void) {
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
-static uint64_t i2000_now_ninsts(void *ctx) {
-    return ((Ia64I2000State *)ctx)->cpu->ninsts;
+static uint64_t i2000_now_ticks(void *ctx) {
+    return merced_get_time_base(((Ia64I2000State *)ctx)->cpu);
 }
 
 /* The IDE devices' wiring: the -hda disk and the -cdrom drive, each busy
- * for ATAPI_IRQ_LATENCY_NINSTS instructions after a command.  Also after a state load, which brings
- * the device's state but not its host pointers. */
+ * for I2000_IDE_LATENCY_TICKS of the time base after a command.  Also after
+ * a state load, which brings the device's state but not its host pointers. */
 static void i2000_ide_wire(Ia64I2000State *s) {
     AtaDiskConfig cfg = {
-        .drive = s->hda, .now = i2000_now_ninsts, .ctx = s,
-        .latency = ATAPI_IRQ_LATENCY_NINSTS, .debug = getenv("ATA_DEBUG") != NULL,
+        .drive = s->hda, .now = i2000_now_ticks, .ctx = s,
+        .latency = I2000_IDE_LATENCY_TICKS, .debug = getenv("ATA_DEBUG") != NULL,
     };
     ata_disk_rewire(&s->hd, &cfg);
     s->ide_primary.dev[0] = s->hda ? &s->hd.ide : NULL;
     s->ide_primary.dev[1] = NULL;
     AtapiCdromConfig cd_cfg = {
-        .drive = s->cdrom, .now = i2000_now_ninsts, .ctx = s,
-        .latency = ATAPI_IRQ_LATENCY_NINSTS, .debug = atapi_debug_enabled(),
+        .drive = s->cdrom, .now = i2000_now_ticks, .ctx = s,
+        .latency = I2000_IDE_LATENCY_TICKS, .debug = atapi_debug_enabled(),
     };
     atapi_cdrom_rewire(&s->cd, &cd_cfg);
     s->ide_secondary.dev[0] = &s->cd.ide;
@@ -994,8 +1011,7 @@ static void i2000_pic_sync(Ia64I2000State *s) {
             continue;
         bool level = s->irq[line].legacy;
         if (line == I2000_IRQ_MOUSE)
-            level = level && s->mouse_wait_rfi_generation == 0 &&
-                    s->cpu->ninsts >= s->mouse_retry_ninsts;
+            level = level && !i2000_mouse_quiet(s);
         else if (line == I2000_IRQ_ATA)
             level = level || ide_intrq(&s->ide_primary);
         else if (line == I2000_IRQ_ATAPI)
@@ -1317,15 +1333,175 @@ static void i2000_gsi_in(void *ud, int idx, bool level) {
         iosapic_raise_gsi(ud, (unsigned)idx);
 }
 
-static const GemuDeviceType i2000_board_type = {
-    .name = "i2000-board", .desc = "i2000 board interrupt sources", .stateless = true,
-};
-static const GemuDeviceType i2000_pic_type = {
-    .name = "i2000-8259-pair", .desc = "IFB 8259 pair (interrupt inputs)", .stateless = true,
-};
+/* The core machine's devices (stages G3, G6).  Each saves its part of the
+ * state (i2000_state_register()); only the I/O SAPIC, whose entries are the
+ * chipset's, has none of its own. */
+#define I2000_DEVICE_TYPE(var, tname, tdesc) \
+    static const GemuDeviceType var = { .name = tname, .desc = tdesc }
+I2000_DEVICE_TYPE(i2000_board_type, "i2000-board", "i2000 board: interrupt sources, glue");
+I2000_DEVICE_TYPE(i2000_cpu_type, "i2000-merced", "Itanium (Merced) processor");
+I2000_DEVICE_TYPE(i2000_pic_type, "i2000-8259-pair", "IFB 8259 pair");
 static const GemuDeviceType i2000_iosapic_type = {
     .name = "i2000-iosapic", .desc = "IFB I/O SAPIC (interrupt inputs)", .stateless = true,
 };
+I2000_DEVICE_TYPE(i2000_ram_type, "i2000-ram", "main memory");
+I2000_DEVICE_TYPE(i2000_flash_type, "i2000-flash", "firmware hub flash");
+I2000_DEVICE_TYPE(i2000_chipset_type, "i460gx", "Intel 460GX chipset");
+I2000_DEVICE_TYPE(i2000_pit_type, "i2000-8254", "IFB 8254 timer");
+I2000_DEVICE_TYPE(i2000_sysctl_type, "i2000-sysctl", "port 61h, POST port");
+I2000_DEVICE_TYPE(i2000_rtc_type, "i2000-rtc", "IFB real-time clock");
+I2000_DEVICE_TYPE(i2000_kbc_type, "i2000-8042", "keyboard controller");
+I2000_DEVICE_TYPE(i2000_keyboard_type, "ps2-keyboard", "PS/2 keyboard");
+I2000_DEVICE_TYPE(i2000_mouse_type, "ps2-mouse", "PS/2 mouse");
+I2000_DEVICE_TYPE(i2000_uart_type, "i2000-com1", "COM1 16550");
+I2000_DEVICE_TYPE(i2000_ide_type, "i2000-ide", "CMD649 IDE, disk and CD-ROM");
+I2000_DEVICE_TYPE(i2000_smbus_type, "i2000-smbus", "SMBus: SPD, cartridge ROMs, LM87");
+I2000_DEVICE_TYPE(i2000_video_type, "rage128", "ATI Rage 128 (VGA)");
+I2000_DEVICE_TYPE(i2000_nic_type, "e100", "Intel 82559 LAN");
+I2000_DEVICE_TYPE(i2000_audio_type, "i2000-audio", "PCI audio");
+
+/* The sound card's model is fixed by -soundhw: a state from another is
+ * refused, not loaded into this one's registers. */
+static void audio_model_save(void *ud, GemuStateWriter *w) {
+    gemu_state_write_u32(w, (uint32_t)((PciAudio *)ud)->model);
+}
+static bool audio_model_check(void *ud, GemuStateReader *r) {
+    uint32_t model;
+    if (!gemu_state_read_u32(r, &model) || model != (uint32_t)((PciAudio *)ud)->model) {
+        gemu_state_refuse(r, "the snapshot's sound card differs from -soundhw");
+        return false;
+    }
+    return true;
+}
+static bool audio_model_load(void *ud, GemuStateReader *r) { return audio_model_check(ud, r); }
+
+#define BOARD(field) ok &= GEMU_STATE_MEMBER(b, "", s, field)
+/* The machine's own state: the board's glue between the devices.  Not
+ * saved: host pointers and buffers (registered by their devices), what
+ * the run owns (the monitor, display, host files and paths, mem_watch, the
+ * NVRAM flags, the MMIO log), configuration (video_enabled, nic_enabled,
+ * mouse_enabled - the devices present say so), and what a load works out
+ * again (fb, the drives' names and sizes, PciBus, the I2C buses' wiring;
+ * an I2C transfer in progress isn't carried over). */
+static bool i2000_state_board(Ia64I2000State *s, GemuDevice *b) {
+    bool ok = true;
+    static const GemuStateField irq_fields[] = {
+        GEMU_STATE_FIELD(I2000IrqState, legacy),
+        GEMU_STATE_FIELD(I2000IrqState, sent_valid),
+        GEMU_STATE_FIELD(I2000IrqState, sent),
+    };
+    typedef __typeof__(s->mouse_events[0]) MouseEvent;
+    static const GemuStateField event_fields[] = {
+        GEMU_STATE_FIELD(MouseEvent, dx), GEMU_STATE_FIELD(MouseEvent, dy),
+        GEMU_STATE_FIELD(MouseEvent, left), GEMU_STATE_FIELD(MouseEvent, right),
+    };
+    BOARD(rtc_irq);
+    BOARD(rtc_edge_pending);
+    BOARD(halted);
+    BOARD(reset_requested);
+    BOARD(fw_shadow_enabled);
+    BOARD(halt_status);
+    BOARD(console);
+    BOARD(con_row);
+    BOARD(con_col);
+    BOARD(legacy_irq_routed);
+    BOARD(pit_clock);
+    BOARD(mouse_resets_seen);
+    BOARD(pci_cfg_addr);
+    BOARD(ratio_latch);
+    BOARD(con_rx);
+    BOARD(con_rx_head);
+    BOARD(con_rx_tail);
+    BOARD(key_backlog);
+    BOARD(key_backlog_head);
+    BOARD(key_backlog_tail);
+    BOARD(key_next_itc);
+    ok &= GEMU_STATE_TABLE(b, "mouse_events", s->mouse_events, event_fields);
+    BOARD(mouse_events_head);
+    BOARD(mouse_events_tail);
+    ok &= GEMU_STATE_TABLE(b, "irq", s->irq, irq_fields);
+    BOARD(kbc_data_reads);
+    BOARD(mouse_wait_return);
+    BOARD(mouse_accum_dx);
+    BOARD(mouse_accum_dy);
+    BOARD(mouse_host_left);
+    BOARD(mouse_host_right);
+    BOARD(mouse_next_report_itc);
+    BOARD(sci_irq);
+    BOARD(sci_level);
+    BOARD(cpu_stopped);
+    BOARD(power_off_requested);
+    BOARD(wake_reset_requested);
+    return ok;
+}
+#undef BOARD
+
+/* Add a device and register its state; false if either fails. */
+static GemuDevice *i2000_part(Ia64I2000State *s, const GemuDeviceType *type, const char *name) {
+    return gemu_device_add(s->core->machine, type, name, NULL, NULL);
+}
+
+static bool i2000_state_register(Ia64I2000State *s, const Ia64Config *cfg) {
+    I2000Core *c = s->core;
+    GemuDevice *d;
+    bool ok = i2000_state_board(s, c->board);
+    ok &= merced_state_add(c->cpu, s->cpu);
+    ok &= i8259_pair_state_add(c->pic, "", &s->pic);
+    ok &= (d = i2000_part(s, &i2000_ram_type, "ram")) &&
+          gemu_state_add(d, "ram", s->ram, 1, (size_t)s->ram_size);
+    ok &= (d = i2000_part(s, &i2000_flash_type, "flash")) &&
+          gemu_state_add(d, "flash", s->flash, 1, I2000_FLASH_SIZE);
+    ok &= (d = i2000_part(s, &i2000_chipset_type, "chipset")) &&
+          i460gx_state_add(d, "", &s->chipset);
+    ok &= (d = i2000_part(s, &i2000_pit_type, "pit")) &&
+          i8253_state_add(d, "", &s->pit) && clock_div_state_add(d, "div.", &s->pit_div);
+    ok &= (d = i2000_part(s, &i2000_sysctl_type, "sysctl")) &&
+          pc_sysctl_state_add(d, "", &s->sysctl);
+    ok &= (d = i2000_part(s, &i2000_rtc_type, "rtc")) && mc146818_state_add(d, "", &s->rtc);
+    ok &= (d = i2000_part(s, &i2000_kbc_type, "kbc")) && i8042_state_add(d, "", &s->kbc);
+    ok &= (d = i2000_part(s, &i2000_keyboard_type, "keyboard")) &&
+          ps2_keyboard_state_add(d, "", &s->ps2_keyboard);
+    ok &= (d = i2000_part(s, &i2000_mouse_type, "mouse")) &&
+          ps2_mouse_state_add(d, "", &s->mouse);
+    ok &= (d = i2000_part(s, &i2000_uart_type, "com1")) && ins8250_state_add(d, "", &s->uart);
+    if ((d = i2000_part(s, &i2000_ide_type, "ide"))) {
+        ok &= cmd649_state_add(d, "cmd649.", &s->cmd649);
+        ok &= ide_channel_state_add(d, "primary.", &s->ide_primary);
+        ok &= ide_channel_state_add(d, "secondary.", &s->ide_secondary);
+        ok &= ata_disk_state_add(d, "hd.", &s->hd);
+        ok &= atapi_cdrom_state_add(d, "cd.", &s->cd);
+        ok &= gemu_drive_add_state(d, "hda", &s->hda);
+        ok &= gemu_drive_add_state(d, "cdrom", &s->cdrom);
+    } else {
+        ok = false;
+    }
+    if ((d = i2000_part(s, &i2000_smbus_type, "smbus"))) {
+        char pfx[16];
+        for (unsigned i = 0; i < I2000_SPD_SLOTS; i++) {
+            snprintf(pfx, sizeof pfx, "spd%u.", i);
+            ok &= at24_state_add(d, pfx, &s->spd[i]);
+        }
+        ok &= itanium_cart_rom_state_add(d, "pirom.", &s->cart_pirom);
+        ok &= itanium_cart_rom_state_add(d, "scratch.", &s->cart_scratch);
+        ok &= lm87_state_add(d, "lm87.", &s->hardware_monitor);
+    } else {
+        ok = false;
+    }
+    if (s->video_enabled)
+        ok &= (d = i2000_part(s, &i2000_video_type, "video")) &&
+              vga_state_add(d, "vga.", &s->vga) && rage128_state_add(d, "", &s->rage128) &&
+              gemu_state_add(d, "vram", s->vram, 1, RAGE128_VRAM_SIZE);
+    if (s->nic_enabled)
+        ok &= (d = i2000_part(s, &i2000_nic_type, "lan")) && e100_state_add(d, "", &s->nic);
+    /* Always there (an empty card without -soundhw): "card" refuses a state
+     * from another model, or from none. */
+    (void)cfg;
+    ok &= (d = i2000_part(s, &i2000_audio_type, "audio")) &&
+              gemu_state_add_custom(d, "card", audio_model_save, audio_model_check,
+                                    audio_model_load, &s->audio) &&
+              pci_audio_state_add(d, "", &s->audio);
+    return ok;
+}
 
 /* The SCI's wire to the GSI the chipset has it on now. */
 static void i2000_sci_wire(Ia64I2000State *s) {
@@ -1342,15 +1518,92 @@ static void i2000_sci_wire(Ia64I2000State *s) {
     c->sci_gsi = gsi;
 }
 
-static bool i2000_lines_create(Ia64I2000State *s) {
+/* ── Time (stages G4, G5) ─────────────────────────────────────────────────
+ *
+ * The processor is the core machine's executor, clocked by the board's time
+ * base: ITC ticks at I2000_ITC_HZ, the clock the PIT and RTC run from.  A
+ * run executes slots until the time base has moved on by the run's budget
+ * (each slot charges slot_ticks), so the machine's time is the time base's,
+ * and gemu_now() in the middle of a run is exact (i2000_cpu_elapsed()).
+ *
+ * The time base also follows host time: when the guest is slower than real
+ * time the run loop owes it the difference (owed), and a run pays that first,
+ * before any instruction.  A timer due inside the catch-up fires at its
+ * deadline, with the processor stopped in between, as it would be by a
+ * jump.
+ *
+ * The time base goes back on a state load; the machine's time can't, and
+ * doesn't need to: runs count how far the time base moved, not where it is.
+ * A load stops the timers, none of which is in the snapshot.
+ *
+ * The device delays that used to count guest instructions (cpu->ninsts) are
+ * timers on this machine (G4). */
+static void i2000_quiet_over(void *ud, int param) { (void)ud; (void)param; }
+
+static void i2000_run_slice(Ia64I2000State *s);
+
+static uint64_t i2000_cpu_run(void *ud, uint64_t budget) {
+    Ia64I2000State *s = ud;
+    I2000Core *c = s->core;
+    uint64_t start = merced_get_time_base(s->cpu);
+    c->run_tb = start;
+    if (c->owed) {
+        uint64_t pay = c->owed < budget ? c->owed : budget;
+        merced_advance_itc(s->cpu, pay);
+        c->owed -= pay;
+    }
+    if (!c->owed_only && !s->halted && !s->cpu_stopped &&
+        merced_get_time_base(s->cpu) - start < budget)
+        i2000_run_slice(s);
+    return merced_get_time_base(s->cpu) - start;
+}
+
+static uint64_t i2000_cpu_elapsed(void *ud) {
+    Ia64I2000State *s = ud;
+    return merced_get_time_base(s->cpu) - s->core->run_tb;
+}
+
+/* Time passing with no instructions run: a processor in Stop-Grant, and the
+ * tests. */
+static void i2000_advance(Ia64I2000State *s, uint64_t ticks) {
+    I2000Core *c = s->core;
+    c->owed += ticks;
+    c->owed_only = true;
+    gemu_machine_run_until(c->machine,
+                           gemu_machine_time(c->machine) + gemu_clocks(I2000_ITC_HZ, ticks));
+    c->owed_only = false;
+}
+
+/* Keep a source quiet for `d` from now. */
+static void i2000_quiet(Ia64I2000State *s, GemuTimer *t, GemuTime d) {
+    (void)s;
+    gemu_timer_start(t, d, 0, 0);
+}
+
+static void i2000_quiet_clear(Ia64I2000State *s) {
+    I2000Core *c = s->core;
+    gemu_timer_stop(c->rtc_quiet);
+    gemu_timer_stop(c->sci_quiet);
+    gemu_timer_stop(c->kbd_quiet);
+    gemu_timer_stop(c->mouse_quiet);
+}
+
+static bool i2000_lines_create(Ia64I2000State *s, const Ia64Config *cfg) {
     I2000Core *c = s->core;
     c->sci_gsi = -1;
     if (!(c->machine = gemu_machine_new("i2000")) ||
         !(c->board = gemu_device_add(c->machine, &i2000_board_type, "board", NULL, NULL)) ||
+        !(c->cpu = gemu_device_add(c->machine, &i2000_cpu_type, "cpu", NULL, NULL)) ||
         !(c->pic = gemu_device_add(c->machine, &i2000_pic_type, "pic", NULL, NULL)) ||
-        !(c->iosapic = gemu_device_add(c->machine, &i2000_iosapic_type, "iosapic", NULL, NULL)) ||
-        !gemu_machine_init(c->machine))
+        !(c->iosapic = gemu_device_add(c->machine, &i2000_iosapic_type, "iosapic", NULL, NULL)))
         return false;
+    /* A registration's error is the machine's from its init. */
+    bool registered = i2000_state_register(s, cfg);
+    if (!gemu_machine_init(c->machine) || !registered) {
+        fprintf(stderr, "i2000: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
     char name[32];
     for (int i = 0; i < 16; i++) {
         snprintf(name, sizeof name, "ir%d", i);
@@ -1375,7 +1628,16 @@ static bool i2000_lines_create(Ia64I2000State *s) {
             !gemu_line_connect_in(c->legacy[line], c->ir[irq], 0))
             return false;
     }
-    if (!(c->sci = gemu_line_out(c->board, "sci-sapic")))
+    static const GemuExecutorOps cpu_ops = {
+        .run = i2000_cpu_run, .elapsed = i2000_cpu_elapsed,
+    };
+    c->slot_ticks = 1;
+    if (!(c->exec = gemu_executor_new(c->cpu, I2000_ITC_HZ, &cpu_ops, s)) ||
+        !(c->sci = gemu_line_out(c->board, "sci-sapic")) ||
+        !(c->rtc_quiet = gemu_timer_new(c->board, i2000_quiet_over, s)) ||
+        !(c->sci_quiet = gemu_timer_new(c->board, i2000_quiet_over, s)) ||
+        !(c->kbd_quiet = gemu_timer_new(c->board, i2000_quiet_over, s)) ||
+        !(c->mouse_quiet = gemu_timer_new(c->board, i2000_quiet_over, s)))
         return false;
     i2000_sci_wire(s);
     c->pins_stale = true;
@@ -1426,8 +1688,6 @@ static bool i2000_card_claims(const Ia64I2000State *s, uint64_t addr) {
 /* The physical address space's addresses: MERCED_PHYS_MASK's 52 bits.  An
  * address beyond (region-6 uncached aliases) is the chipset's business. */
 #define I2000_MEM_BITS 52
-_Static_assert(sizeof(struct I2000Core *) == sizeof(uint64_t),
-               "the core pointer takes fast_ram_end's snapshot slot");
 
 /* ── The spaces (stages G1, G2) ───────────────────────────────────────────
  * Memory (52 bits): RAM at priority 0; the legacy VGA window over it (1)
@@ -1772,9 +2032,8 @@ static uint8_t i2000_legacy_ack(Ia64I2000State *s) {
          * identify completion of this particular IRQ1.  Keep the next
          * byte quiet long enough for the thunk and BIOS handler to
          * unwind before another shared ExtINT can overwrite cr.iip and
-         * cr.ipsr. */
-        s->keyboard_retry_ninsts =
-            s->cpu->ninsts + KEYBOARD_RETRY_DELAY_INSTS;
+         * cr.ipsr: the time the next byte takes on the wire. */
+        i2000_quiet(s, s->core->kbd_quiet, I2000_PS2_BYTE_TIME);
         break;
     case 12:
         /* Real 8042 aux OBF is level-triggered: IRQ12 stays asserted as
@@ -1802,10 +2061,8 @@ static uint8_t i2000_legacy_ack(Ia64I2000State *s) {
          * polling port 0x60 directly from what looks like this
          * firmware's own one-shot "Mouse 8042 Initialization: Waiting"
          * POST self-test, not something this delay alone resolves -
-         * see mouse_retry_ninsts's struct comment. Mirrors the PIT's
-         * own known-safe 100000-instruction tick granularity. */
-        s->mouse_wait_rfi_generation = merced_rfi_generation() + 1;
-        s->mouse_retry_ninsts = UINT64_MAX;
+         * see mouse_wait_return's struct comment. */
+        s->mouse_wait_return = 1;
         if (!i8042_aux_pending(&s->kbc))
             s->irq[I2000_IRQ_MOUSE].legacy = false;
         break;
@@ -1861,7 +2118,7 @@ static GemuMapping *i2000_map_window(Ia64I2000State *s, bool io, uint64_t base,
 /* The spaces and their fixed mappings (the VGA window comes with the display
  * card); the PCI decode, mapped by i2000_memory_changed(); the interrupt
  * lines. */
-static bool i2000_core_create(Ia64I2000State *s) {
+static bool i2000_core_create(Ia64I2000State *s, const Ia64Config *cfg) {
     I2000Core *sp = calloc(1, sizeof *sp);
     if (!sp)
         return false;
@@ -1917,7 +2174,7 @@ static bool i2000_core_create(Ia64I2000State *s) {
         d[i]->miss = i2000_decode_miss;
         d[i]->ud = s;
     }
-    return i2000_lines_create(s);
+    return i2000_lines_create(s, cfg);
 }
 
 static void i2000_core_destroy(Ia64I2000State *s) {
@@ -2145,8 +2402,7 @@ static void i2000_nic_irq(void *opaque, bool level) {
         i2000_irq_gsi(opaque, I2000_IRQ_NIC);
 }
 
-/* The host side of the LAN (gemu/net.h).  File-static: Ia64I2000State is
- * snapshotted raw. */
+/* The host side of the LAN (gemu/net.h). */
 static GemuNic *i2000_net;
 
 static bool i2000_nic_tx(void *opaque, const uint8_t *frame, size_t len) {
@@ -2386,8 +2642,8 @@ static void i2000_cpu_state(void *ud, char *buf, size_t buf_len) {
 }
 
 
-/* The size of the picture the monitor shows: the card's current mode (kept
- * out of Ia64I2000State, which snapshots copy raw). */
+/* The size of the picture the monitor shows: the card's current mode (the
+ * host's view, not machine state). */
 static uint32_t i2000_pic_w = 640, i2000_pic_h = 480;
 
 /* The card's native scan-out when its CRTC is programmed for one, otherwise
@@ -2592,247 +2848,78 @@ static bool i2000_claim_drives(Ia64I2000State *s) {
     return true;
 }
 
-/* Snapshot format: buffer contents followed by the current machine and CPU
- * structures. Host pointers and chipset wiring are cleared on save and
- * restored from the live instance on load. The raw structure format is
- * host-ABI-dependent; changes to its layout require a new version.
- * Version 31 separates the 460GX state and intentionally rejects old saves. */
-#define I2000_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
-#define I2000_SNAPSHOT_VERSION 50u   /* pc_sysctl and the PIT's ClockDiv */
-
-/* Version 40 ends Rage128 just before cce. Its following machine fields
- * keep their relative layout because the inserted state is 8-byte aligned. */
-_Static_assert(sizeof(Rage128Cce) % 8 == 0, "CCE snapshot insertion alignment");
-_Static_assert(offsetof(Rage128, cce) + sizeof(Rage128Cce) == sizeof(Rage128),
-               "CCE must remain the final Rage128 field for v40 imports");
+/* Snapshots (stage G6) are the core machine's save state: every part
+ * registers its fields with its device (i2000_state_register()), and the core
+ * also saves the timers, the processor's place in time and the lines.  The
+ * file is gemu_machine_save_file()'s, written as it goes.
+ *
+ * Snapshots from before G6 ("GEMU2K02", the raw structures) are refused:
+ * question 9 of .work/modular-devices settled on no converter. */
+#define I2000_OLD_SNAPSHOT_MAGIC 0x32304B32554D4547ull /* "GEMU2K02" */
 
 static bool i2000_save_snapshot(Ia64I2000State *s, const char *path) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return false;
-    bool ok = true;
-    uint64_t magic = I2000_SNAPSHOT_MAGIC;
-    uint32_t version = I2000_SNAPSHOT_VERSION;
-    ok &= fwrite(&magic, sizeof(magic), 1, f) == 1;
-    ok &= fwrite(&version, sizeof(version), 1, f) == 1;
-    ok &= fwrite(&s->ram_size, sizeof(s->ram_size), 1, f) == 1;
-    uint32_t audio_model = s->audio.model;
-    ok &= fwrite(&audio_model, sizeof(audio_model), 1, f) == 1;
-    ok &= fwrite(s->ram, 1, s->ram_size, f) == s->ram_size;
-    ok &= fwrite(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
+    if (!gemu_machine_save_file(s->core->machine, path)) {
+        fprintf(stderr, "gemu: savevm: %s\n", gemu_machine_error(s->core->machine));
+        return false;
+    }
+    return true;
+}
+
+/* What a load leaves to the machine: state that is worked out from the
+ * saved state, not saved itself. */
+static void i2000_post_load(Ia64I2000State *s) {
+    merced_flush_translation_cache(s->cpu);
+    s->core->owed = 0;
+    /* The processor's in-interrupt state isn't part of the CPU's state.
+     * (The time base is saved, and with it what's counted from it: the
+     * PIT's divider, the mouse's report pacing.) */
+    s->mouse_wait_return = false;
+    /* A halt checkpoint can be resumed to test the faulting operation. */
+    s->halted = false;
+    /* Restore must not implicitly overwrite persistent machine NVRAM.
+     * Subsequent guest flash writes mark it dirty normally. */
+    s->nvram_dirty = false;
+    i2000_ide_wire(s);
+    i2000_drive_info_refresh(s);
+    gemu_audio_flush(s->audio_out);
     if (s->video_enabled)
-        ok &= fwrite(s->vram, 1, RAGE128_VRAM_SIZE, f) == RAGE128_VRAM_SIZE;
-    uint64_t atapi_len = (uint64_t)s->cd.data_len;
-    ok &= fwrite(&atapi_len, sizeof(atapi_len), 1, f) == 1;
-    if (atapi_len)
-        ok &= fwrite(s->cd.data, 1, atapi_len, f) == atapi_len;
-
-    Ia64I2000State *snap = malloc(sizeof(*snap));
-    if (!snap) { fclose(f); return false; }
-    *snap = *s;
-    snap->monitor = NULL;
-    snap->display = NULL;
-    snap->cpu = NULL;
-    snap->ram = NULL;
-    snap->flash = NULL;
-    snap->vram = NULL;
-    snap->video_rom = NULL;
-    snap->cdrom = NULL;
-    snap->cd.data = NULL;
-    memset(&snap->cd.cfg, 0, sizeof(snap->cd.cfg));
-    memset(&snap->cd.ide, 0, sizeof(snap->cd.ide));
-    memset(snap->ide_secondary.dev, 0, sizeof(snap->ide_secondary.dev));
-    memset(snap->cmd649.channel, 0, sizeof(snap->cmd649.channel));
-    memset(&snap->pci, 0, sizeof(snap->pci));
-    snap->sysctl.pit = NULL;
-    snap->kbc.kbd = NULL;
-    snap->kbc.aux = NULL;
-    snap->hda = NULL;
-    memset(&snap->hd.cfg, 0, sizeof(snap->hd.cfg));
-    memset(&snap->hd.ide, 0, sizeof(snap->hd.ide));
-    memset(snap->ide_primary.dev, 0, sizeof(snap->ide_primary.dev));
-    snap->nic_rom = NULL;
-    snap->audio_out = NULL;
-    memset(&snap->audio.wiring, 0, sizeof(snap->audio.wiring));
-    memset(&snap->nic.wiring, 0, sizeof(snap->nic.wiring));
-    memset(&snap->chipset.config, 0, sizeof(snap->chipset.config));
-    memset(&snap->rtc.config, 0, sizeof(snap->rtc.config));
-    /* The I2C segments hold pointers into this run's device state. */
-    memset(&snap->memcard_i2c, 0, sizeof(snap->memcard_i2c));
-    memset(&snap->smbus, 0, sizeof(snap->smbus));
-    ok &= fwrite(snap, sizeof(*snap), 1, f) == 1;
-    free(snap);
-
-    /* Merced is ~2 MB: on the heap, as Windows threads have a 1 MiB stack. */
-    Merced *cpu_snap = malloc(sizeof(*cpu_snap));
-    if (!cpu_snap) { fclose(f); return false; }
-    *cpu_snap = *s->cpu;
-    memset(&cpu_snap->bus, 0, sizeof(cpu_snap->bus));
-    cpu_snap->translation_cache = NULL;
-    ok &= fwrite(cpu_snap, sizeof(*cpu_snap), 1, f) == 1;
-    free(cpu_snap);
-    /* The disks as of this moment: -snapshot writes live only in memory, so
-     * without them a restored guest would lose its own disk changes. */
-    ok &= gemu_drive_save_state(s->hda, f);
-    ok &= gemu_drive_save_state(s->cdrom, f);
-
-    fclose(f);
-    return ok;
+        vga_touch_all(&s->vga);        /* redraw hints aren't saved */
+    if (s->nic_enabled) {
+        /* The cable is this run's (set_link), not the snapshot's. */
+        e100_set_link(&s->nic, !i2000_net || gemu_nic_link_up(i2000_net));
+        if (!i2000_net)
+            fprintf(stderr, "gemu: note: the snapshot has the onboard LAN but "
+                    "this run has -nic none; it sees no network\n");
+    }
+    i2000_memory_changed(s);           /* the BARs and the IFB's decode */
+    i2000_sci_wire(s);
+    s->core->pins_stale = true;        /* the pair's pins are the snapshot's */
 }
 
 static bool i2000_load_snapshot(Ia64I2000State *s, const char *path) {
     FILE *f = fopen(path, "rb");
-    if (!f) return false;
-    bool ok = true;
+    if (!f) {
+        fprintf(stderr, "gemu: loadvm: can't open %s\n", path);
+        return false;
+    }
     uint64_t magic = 0;
     uint32_t version = 0;
-    uint64_t ram_size = 0;
-    ok &= fread(&magic, sizeof(magic), 1, f) == 1;
-    ok &= fread(&version, sizeof(version), 1, f) == 1;
-    ok &= fread(&ram_size, sizeof(ram_size), 1, f) == 1;
-    if (!ok || magic != I2000_SNAPSHOT_MAGIC ||
-        version != I2000_SNAPSHOT_VERSION || ram_size != s->ram_size) {
-        fclose(f);
-        return false;
-    }
-    uint32_t audio_model = 0;
-    if (fread(&audio_model, sizeof(audio_model), 1, f) != 1 || audio_model != s->audio.model) {
-        fclose(f);
-        fprintf(stderr, "gemu: snapshot sound card differs from -soundhw selection\n");
-        return false;
-    }
-    ok &= fread(s->ram, 1, s->ram_size, f) == s->ram_size;
-    ok &= fread(s->flash, 1, I2000_FLASH_SIZE, f) == I2000_FLASH_SIZE;
-    if (s->video_enabled)
-        ok &= fread(s->vram, 1, RAGE128_VRAM_SIZE, f) == RAGE128_VRAM_SIZE;
-
-    uint64_t atapi_len = 0;
-    ok &= fread(&atapi_len, sizeof(atapi_len), 1, f) == 1;
-    atapi_cdrom_free(&s->cd);
-    s->cd.data = atapi_len ? malloc((size_t)atapi_len) : NULL;
-    if (atapi_len) {
-        if (!s->cd.data) { fclose(f); return false; }
-        ok &= fread(s->cd.data, 1, atapi_len, f) == atapi_len;
-    }
-
-    GemuMonitor *monitor = s->monitor;
-    GemuDisplay *display = s->display;
-    GemuAudioOut *audio_out = s->audio_out;
-    bool audio_debug = s->audio.debug;
-    /* Drives and host device connections belong to this run, not the save. */
-    GemuDrive *cdrom = s->cdrom;
-    GemuDrive *hda = s->hda;
-    I460GXConfig chipset_config = s->chipset.config;
-    Mc146818Config rtc_config = s->rtc.config;
-    I2cBus memcard_i2c = s->memcard_i2c;
-    I2cBus smbus = s->smbus;
-    uint8_t *nic_rom = s->nic_rom;
-    uint32_t nic_rom_len = s->nic_rom_len;
-    Merced *cpu = s->cpu;
-    uint8_t *ram = s->ram;
-    struct I2000Core *core = s->core;
-    uint8_t *flash = s->flash;
-    uint8_t *vram = s->vram;
-    uint8_t *video_rom = s->video_rom;
-    uint32_t video_rom_len = s->video_rom_len;
-    uint8_t *atapi_data = s->cd.data;
-    Ia64I2000State *loaded = calloc(1, sizeof(*loaded));
-    /* Merced is ~2 MB: on the heap, as Windows threads have a 1 MiB stack. */
-    Merced *loaded_cpu = malloc(sizeof(*loaded_cpu));
-    if (!loaded || !loaded_cpu) {
-        free(loaded);
-        free(loaded_cpu);
-        fclose(f);
-        return false;
-    }
-    ok &= fread(loaded, sizeof(*loaded), 1, f) == 1;
-    if (ok) {
-        char nvram_path[sizeof(s->nvram_path)];
-        snprintf(nvram_path, sizeof(nvram_path), "%s", s->nvram_path);
-        *s = *loaded;
-        s->monitor = monitor;
-        s->display = display;
-        s->audio_out = audio_out;
-        s->audio.wiring = i2000_audio_wiring(s);
-        s->audio.debug = audio_debug;
-        gemu_audio_flush(audio_out);
-        s->cpu = cpu;
-        s->ram = ram;
-        s->core = core;
-        s->flash = flash;
-        s->vram = vram;
-        s->video_rom = video_rom;
-        s->video_rom_len = video_rom_len;
-        s->chipset.config = chipset_config;
-        s->rtc.config = rtc_config;
-        s->memcard_i2c = memcard_i2c;
-        s->smbus = smbus;
-        snprintf(s->nvram_path, sizeof(s->nvram_path), "%s", nvram_path);
-        /* Restore must not implicitly overwrite persistent machine NVRAM.
-         * Subsequent guest flash writes mark it dirty normally. */
-        s->nvram_dirty = false;
-        s->cd.data = atapi_data;
-        s->cdrom = cdrom;
-        s->hda = hda;
-        i2000_ide_wire(s);
-        i2000_drive_info_refresh(s);
-        /* A halt checkpoint can be resumed to test the faulting operation. */
-        s->halted = false;
-        s->nic_rom = nic_rom;
-        s->nic_rom_len = nic_rom_len;
-        if (s->nic_enabled) {
-            E100Wiring wiring = i2000_nic_wiring(s);
-            e100_rebind(&s->nic, &wiring);
-            e100_set_rom(&s->nic, s->nic_rom, s->nic_rom_len);
-            /* The cable is this run's (set_link), not the snapshot's. */
-            e100_set_link(&s->nic, !i2000_net || gemu_nic_link_up(i2000_net));
-            if (!i2000_net)
-                fprintf(stderr, "gemu: note: the snapshot has the onboard LAN but "
-                        "this run has -nic none; it sees no network\n");
-        }
-        if (s->video_enabled) {
-            Rage128Wiring wiring = i2000_rage_wiring(s);
-            vga_attach_vram(&s->vga, s->vram, RAGE128_VRAM_SIZE);
-            rage128_rebind(&s->rage128, &s->vga, &wiring);
-            rage128_set_rom(&s->rage128, s->video_rom, s->video_rom_len);
-        }
-    }
-    free(loaded);
-
-    MercedBus bus = s->cpu->bus;
-    void *translation_cache = s->cpu->translation_cache;
-    ok &= fread(loaded_cpu, sizeof(*loaded_cpu), 1, f) == 1;
-    if (ok) {
-        *s->cpu = *loaded_cpu;
-        s->cpu->bus = bus;
-        s->cpu->translation_cache = translation_cache;
-        merced_flush_translation_cache(s->cpu);
-        /* Interrupt-return generations and host input deadlines are local
-         * to the current run rather than portable snapshot values. */
-        s->mouse_wait_rfi_generation = 0;
-        s->keyboard_retry_ninsts = s->cpu->ninsts;
-        s->mouse_next_report_itc = merced_get_time_base(s->cpu);
-        s->pit.out_changed = i2000_pit_out;
-        s->pit.ud = s;
-        i2000_uart_wire(s);
-        i2000_kbc_wire(s);
-        i2000_pci_wire(s);
-        i2000_memory_changed(s);       /* after the bus has its functions back */
-        i2000_sci_wire(s);
-        s->core->pins_stale = true;    /* the pair's pins are the snapshot's */
-        s->sysctl.pit = &s->pit;
-        clock_div_rebase(&s->pit_div, merced_get_time_base(s->cpu));
-    }
-    free(loaded_cpu);
-    if (ok && version >= 39) {
-        ok &= gemu_drive_load_state(s->hda, f);
-        ok &= gemu_drive_load_state(s->cdrom, f);
-        i2000_drive_info_refresh(s);
-    } else if (ok)
-        fprintf(stderr, "gemu: loadvm: this older state has no disk information; it only"
-                        " works with the disk exactly as it was when it was saved\n");
-
+    bool old = fread(&magic, sizeof magic, 1, f) == 1 && magic == I2000_OLD_SNAPSHOT_MAGIC;
+    if (old && fread(&version, sizeof version, 1, f) != 1)
+        version = 0;
     fclose(f);
-    return ok;
+    if (old) {
+        fprintf(stderr, "gemu: loadvm: %s is an i2000 snapshot in the old format "
+                "(version %u), which this GEMU no longer reads; boot afresh and "
+                "save a new one\n", path, version);
+        return false;
+    }
+    if (!gemu_machine_load_file(s->core->machine, path)) {
+        fprintf(stderr, "gemu: loadvm: %s\n", gemu_machine_error(s->core->machine));
+        return false;
+    }
+    i2000_post_load(s);
+    return true;
 }
 
 /* ── Monitor memory view ─────────────────────────────────────────────────── */
@@ -2897,8 +2984,10 @@ static GemuMonCmd i2000_cmd_input(GemuMonitor *mon, const char *args, void *ud) 
            (unsigned)(uint8_t)(s->key_backlog_tail - s->key_backlog_head),
            s->key_next_itc, merced_get_time_base(s->cpu));
     i8042_monitor_print(mon, &s->kbc);
-    gemu_monitor_printf(mon, "irq1: legacy=%u retry=%" PRIu64 " ninsts=%" PRIu64 "\n",
-           s->irq[I2000_IRQ_KBD].legacy, s->keyboard_retry_ninsts, s->cpu->ninsts);
+    gemu_monitor_printf(mon, "irq1: legacy=%u quiet for %" PRIu64 " ns\n",
+           s->irq[I2000_IRQ_KBD].legacy,
+           gemu_timer_running(s->core->kbd_quiet)
+               ? gemu_timer_remaining(s->core->kbd_quiet) / 1000 : 0);
     i2000_pit_run(s);
     i8253_monitor_print(mon, &s->pit);
     gemu_monitor_printf(mon, "IRQ0: pending=%u mask=%02X\n",
@@ -3115,11 +3204,11 @@ static GemuMonCmd i2000_cmd_mousestate(GemuMonitor *mon, const char *args,
     fflush(stderr);
     i8042_monitor_print(mon, &s->kbc);
     gemu_monitor_printf(mon, "host mouse: attached=%d accum=(%d,%d) buttons=%s%s "
-            "events=%u retry=%" PRIu64 " wait_rfi=%" PRIu64 "\n",
+            "events=%u wait_return=%d quiet=%d\n",
             s->mouse_enabled, s->mouse_accum_dx, s->mouse_accum_dy,
             s->mouse_host_left ? "L" : "-", s->mouse_host_right ? "R" : "-",
             (unsigned)((s->mouse_events_tail - s->mouse_events_head + 64) % 64),
-            s->mouse_retry_ninsts, s->mouse_wait_rfi_generation);
+            (int)s->mouse_wait_return, gemu_timer_running(s->core->mouse_quiet));
     gemu_monitor_printf(mon, "iosapic_rte[12]=%016" PRIX64 " masked=%d "
             "pic_master_mask=%02x pic_slave_mask=%02x\n",
             s->chipset.iosapic_rte[12], !!(s->chipset.iosapic_rte[12] & I460GX_IOSAPIC_RTE_MASK),
@@ -3135,8 +3224,7 @@ static void i2000_mouse_pace(Ia64I2000State *s) {
      * is drained in <=127-count chunks after the real PIC EOI
      * handshake completes. */
     bool ready = s->mouse.streaming && i8042_empty(&s->kbc) &&
-                 s->mouse_wait_rfi_generation == 0 &&
-                 s->cpu->ninsts >= s->mouse_retry_ninsts &&
+                 !i2000_mouse_quiet(s) &&
                  (int64_t)(merced_get_time_base(s->cpu) -
                            s->mouse_next_report_itc) >= 0;
     bool idle = !s->mouse_accum_dx && !s->mouse_accum_dy &&
@@ -3752,21 +3840,35 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     s->ram = calloc(1, (size_t)s->ram_size);
     s->flash = malloc(I2000_FLASH_SIZE);
     i2000_pcache_clear();
-    if (!s->ram || !s->flash || !i2000_core_create(s)) {
+    /* The parts the core machine's devices save (i2000_core_create()) exist
+     * before it: memory, the video card's frame buffer, the processor. */
+    s->video_enabled = cfg->vga && strcmp(cfg->vga, "none") != 0;
+    s->nic_enabled = cfg->nic != NULL;
+    if (s->video_enabled && !(s->vram = calloc(1, RAGE128_VRAM_SIZE))) {
+        fprintf(stderr, "gemu: cannot allocate video memory\n");
+        ia64_i2000_destroy(s);
+        return NULL;
+    }
+    MercedBus bus = {
+        .ud = s, .ram_size = s->ram_size,
+        .read = bus_read, .fetch = bus_fetch, .write = bus_write,
+        .canonical = i2000_canonical_pa,
+        .fill = i2000_bus_fill
+    };
+    if (s->ram && s->flash)
+        s->cpu = merced_create(&bus);
+    if (!s->ram || !s->flash || !s->cpu) {
         fprintf(stderr, "gemu: cannot allocate %" PRIu64 " MiB guest RAM\n",
                 cfg->ram_size >> 20);
         ia64_i2000_destroy(s);
         return NULL;
     }
+    if (!i2000_core_create(s, cfg)) {
+        ia64_i2000_destroy(s);
+        return NULL;
+    }
     memset(s->flash, 0xFF, I2000_FLASH_SIZE);
-    if (cfg->vga && strcmp(cfg->vga, "none") != 0) {
-        s->vram = calloc(1, RAGE128_VRAM_SIZE);
-        if (!s->vram) {
-            fprintf(stderr, "gemu: cannot allocate video memory\n");
-            ia64_i2000_destroy(s);
-            return NULL;
-        }
-        s->video_enabled = true;
+    if (s->video_enabled) {
         /* the display card's legacy window, over RAM */
         i2000_map_window(s, false, I2000_VGA_BASE, I2000_VGA_SIZE, mem_vga, 1,
                          "legacy VGA window");
@@ -3824,17 +3926,6 @@ Ia64I2000State *ia64_i2000_create(const Ia64Config *cfg) {
     i2000_chipset_init(s);
     i2000_devices_reset(s, false);
 
-    MercedBus bus = {
-        .ud = s, .ram_size = s->ram_size,
-        .read = bus_read, .fetch = bus_fetch, .write = bus_write,
-        .canonical = i2000_canonical_pa,
-        .fill = i2000_bus_fill
-    };
-    s->cpu = merced_create(&bus);
-    if (!s->cpu) {
-        ia64_i2000_destroy(s);
-        return NULL;
-    }
     PciAudioWiring audio_wiring = i2000_audio_wiring(s);
     pci_audio_init(&s->audio, cfg->sound, &audio_wiring);
     i2000_pci_wire(s);
@@ -3935,10 +4026,9 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
     }
     if (s->nic_enabled)
         e100_poll(&s->nic);
-    if (s->mouse_wait_rfi_generation &&
-        merced_rfi_generation() >= s->mouse_wait_rfi_generation) {
-        s->mouse_wait_rfi_generation = 0;
-        s->mouse_retry_ninsts = s->cpu->ninsts + MOUSE_RETRY_DELAY_INSTS;
+    if (s->mouse_wait_return && !merced_in_external_interrupt(s->cpu)) {
+        s->mouse_wait_return = 0;
+        i2000_quiet(s, s->core->mouse_quiet, I2000_PS2_BYTE_TIME);
         if (!i8042_aux_pending(&s->kbc)) {
             unsigned rate = s->mouse.sample_rate ? s->mouse.sample_rate : 100;
             uint64_t interval = I2000_ITC_HZ / rate;
@@ -3979,7 +4069,7 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
         if (kbd_data)
             i2000_irq_sapic_edge(s, I2000_IRQ_KBD, s->kbc_data_reads);
     } else if (kbd_data && kbd_route == I2000_ROUTE_LEGACY &&
-               s->cpu->ninsts >= s->keyboard_retry_ninsts &&
+               !gemu_timer_running(s->core->kbd_quiet) &&
                !(s->pic.master.imr & 0x02)) {
         /* The firmware's reset-RTE (or explicit ExtINT) legacy path.  An OS
          * that masks its own GSI1 vector must not get IRQ1 via the PIC. */
@@ -3993,18 +4083,17 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * is exactly why it's safe to raise from here - see the long comments
      * on aux_queue_byte() and the ack handler's mouse branch for what goes
      * wrong when this is done synchronously or without a cooldown.
-     * mouse_retry_ninsts defaults to 0 (calloc'd), so a fresh packet with
-     * no prior cooldown scheduled raises as soon as it's queued.
+     * A fresh packet with no byte before it to wait out raises as soon as
+     * it's queued.
      *
      * Deliberately does NOT gate on the mouse's legacy latch: the ack handler's
      * retry case leaves that latch set (on purpose, so ack
      * arbitration can still attribute the eventual ack to mouse) while it
-     * still wants this loop to keep re-raising every time the retry
-     * deadline is hit. merced_raise_external() is a plain OR of an
-     * already-possibly-set bit, so raising here on every eligible
-     * instruction between the deadline and the guest actually taking it is
-     * harmless, not a flood - mouse_retry_ninsts is the real rate limiter,
-     * not this flag. */
+     * still wants this loop to keep re-raising once the quiet time is
+     * over. merced_raise_external() is a plain OR of an
+     * already-possibly-set bit, so raising here on every poll between then
+     * and the guest actually taking it is harmless, not a flood -
+     * i2000_mouse_quiet() is the real rate limiter, not this flag. */
     if (i2000_route(s, I2000_IRQ_MOUSE) == I2000_ROUTE_SAPIC) {
         /* Windows' i8042 driver takes IRQ12 through its own GSI12 vector,
          * like IRQ1 above; the PIC is masked by then.  Without this, the
@@ -4013,22 +4102,20 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
          * keyboard.  The 8042 only drives IRQ12 with command-byte INT2 set. */
         if (i8042_aux_pending(&s->kbc) && i8042_aux_irq_enabled(&s->kbc))
             i2000_irq_sapic_edge(s, I2000_IRQ_MOUSE, s->kbc_data_reads);
-    } else if (i8042_aux_pending(&s->kbc) &&
-        s->cpu->ninsts >= s->mouse_retry_ninsts &&
-        s->mouse_wait_rfi_generation == 0 &&
+    } else if (i8042_aux_pending(&s->kbc) && !i2000_mouse_quiet(s) &&
         !(s->pic.slave.imr & 0x10) && !(s->pic.master.imr & 0x04)) {
         i2000_irq_legacy(s, I2000_IRQ_MOUSE);
     }
     /* SCI is level-triggered: present it through its I/O SAPIC entry again
      * after each acknowledgement until the handler clears the source. */
-    if (s->sci_level && s->cpu->ninsts >= s->sci_retry_ninsts) {
+    if (s->sci_level && !gemu_timer_running(s->core->sci_quiet)) {
         unsigned gsi = (unsigned)s->sci_irq;
         uint8_t vector;
         bool extint;
         if (i460gx_interrupt(&s->chipset, gsi, &vector, &extint) && !extint &&
             !merced_external_pending(s->cpu, vector)) {
             gemu_line_pulse(s->core->sci);
-            s->sci_retry_ninsts = s->cpu->ninsts + SCI_REPRESENT_INSTS;
+            i2000_quiet(s, s->core->sci_quiet, I2000_REPRESENT_TIME);
         }
     }
     /* IRQ8 stays asserted until the guest reads register C.  Through a
@@ -4036,7 +4123,7 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
      * each acknowledgement while it does; an edge-triggered entry (HelenOS
      * programs the legacy lines that way) sees one interrupt per rising
      * edge, so a guest that never reads register C gets exactly one. */
-    if (s->rtc_irq && s->cpu->ninsts >= s->rtc_retry_ninsts) {
+    if (s->rtc_irq && !gemu_timer_running(s->core->rtc_quiet)) {
         uint8_t vector;
         bool extint;
         unsigned gsi = i2000_irq_lines[I2000_IRQ_RTC].gsi;
@@ -4044,7 +4131,7 @@ static void i2000_poll_interrupts(Ia64I2000State *s) {
             if (i460gx_gsi_level(&s->chipset, gsi)) {
                 if (!merced_external_pending(s->cpu, vector)) {
                     i2000_irq_gsi(s, I2000_IRQ_RTC);
-                    s->rtc_retry_ninsts = s->cpu->ninsts + SCI_REPRESENT_INSTS;
+                    i2000_quiet(s, s->core->rtc_quiet, I2000_REPRESENT_TIME);
                 }
             } else if (s->rtc_edge_pending) {
                 i2000_irq_gsi(s, I2000_IRQ_RTC);
@@ -4255,7 +4342,8 @@ static void i2000_profile_tick(Ia64I2000State *s) {
     prof_quanta = prof_idle = 0;
 }
 
-static void i2000_idle_check(Ia64I2000State *s) {
+/* limit: the most ticks a skip may take (the rest of the run). */
+static void i2000_idle_check(Ia64I2000State *s, uint64_t limit) {
     static int enabled = -1;
     static uint64_t dirty_mark, seen[16];
     static unsigned n_seen;
@@ -4299,6 +4387,8 @@ static void i2000_idle_check(Ia64I2000State *s) {
     if (!itm || (itv & (UINT64_C(1) << 16)) || (int64_t)(itm - itc) <= 0) return;
     uint64_t delta = itm - itc;
     if (delta > I2000_ITC_HZ) delta = I2000_ITC_HZ;   /* never more than 1 s at once */
+    if (delta > limit) delta = limit;
+    if (!delta) return;
     merced_advance_itc(cpu, delta);
     if (getenv("GEMU_IDLE_DEBUG") && ++skips % 1000 == 0)
         fprintf(stderr, "i2000: idle skips %" PRIu64 " (last %" PRIu64 " ticks at %016" PRIX64 ")\n",
@@ -4344,52 +4434,77 @@ static bool i2000_after_step(Ia64I2000State *s, MercedStatus st) {
     return true;
 }
 
+/* One executor run (i2000_cpu_run()): slots until the time base has moved on
+ * by the run's budget, which a timer started meanwhile can shorten.  A halt,
+ * a reset request or a breakpoint ends the run and stops the machine. */
 static void i2000_run_slice(Ia64I2000State *s) {
-    if (s->halted || s->cpu_stopped)
-        return;
+    I2000Core *c = s->core;
     bool check_exec = gemu_monitor_has_exec_breakpoints(s->monitor);
     bool check_mem = gemu_monitor_has_mem_breakpoints(s->monitor);
     s->mem_watch = check_mem;
-    for (int i = 0; i < INSTR_PER_FRAME; ) {
+    unsigned since_poll = 0;
+    for (;;) {
+        uint64_t ran = merced_get_time_base(s->cpu) - c->run_tb;
+        uint64_t budget = gemu_executor_budget(c->exec);
+        if (ran >= budget)
+            return;
+        uint64_t left = (budget - ran + c->slot_ticks - 1) / c->slot_ticks;
         /* Ordinary execution: one interrupt-poll quantum per call into the
-         * CPU's fast path.  It stops after a slot that requests a reset
-         * (merced_request_exit()).  The slot-by-slot loop below still runs
-         * whenever a breakpoint or watchpoint is set, and finishes a quantum
-         * the fast path left. */
-        if (!check_exec && !check_mem &&
-            (i & (irq_poll_quantum - 1)) == 0 &&
-            i + (int)irq_poll_quantum <= INSTR_PER_FRAME) {
+         * CPU's fast path (less when the run ends sooner).  It stops after a
+         * slot that requests a reset (merced_request_exit()).  The
+         * slot-by-slot loop below runs whenever a breakpoint or watchpoint
+         * is set. */
+        if (!check_exec && !check_mem) {
             i2000_poll_interrupts(s);
+            unsigned q = left < irq_poll_quantum ? (unsigned)left : irq_poll_quantum;
             unsigned n = 0;
-            MercedStatus st = merced_run_fast_range(
-                s->cpu, irq_poll_quantum, &n, 0, 0, 0, 0);
-            i += (int)n;
-            if (st == MERCED_OK)
-                i2000_idle_check(s);
+            MercedStatus st = merced_run_fast_range(s->cpu, q, &n, 0, 0, 0, 0);
+            if (st == MERCED_OK) {
+                uint64_t now_ran = merced_get_time_base(s->cpu) - c->run_tb;
+                i2000_idle_check(s, now_ran < budget ? budget - now_ran : 0);
+            }
             if (!i2000_after_step(s, st))
-                return;
+                break;
             continue;
         }
         if (check_exec &&
             gemu_monitor_check_exec(s->monitor, (uint32_t)s->cpu->ip))
-            return;
+            break;
         /* Device callbacks raise already-ready interrupts directly.  Only
-         * deadline-driven sources (PIT and retry timers) need this platform
+         * deadline-driven sources (the PIT, the RTC) need this platform
          * poll, and checking those on every IA-64 slot was a large fraction
          * of execution time.  A 16-slot quantum is far below the latency of
          * the modeled hardware while bounding delivery skew to 15 slots. */
-        if ((i & (irq_poll_quantum - 1)) == 0)
+        if (since_poll++ % irq_poll_quantum == 0)
             i2000_poll_interrupts(s);
         MercedStatus st = merced_step(s->cpu);
-        i++;
         /* A memory watchpoint can be raised from inside the bus callback.
          * Stop this execution slice immediately so the reported IP remains
          * the instruction that performed the access. */
         if (check_mem && gemu_monitor_is_paused(s->monitor))
-            return;
+            break;
         if (!i2000_after_step(s, st))
-            return;
+            break;
     }
+    gemu_machine_stop(c->machine);
+}
+
+/* A frame's worth of running: what the time base owes host time, then
+ * INSTR_PER_FRAME slots (none in Stop-Grant, where only time passes). */
+static void i2000_cpu_slice(Ia64I2000State *s) {
+    I2000Core *c = s->core;
+    if (s->halted)
+        return;
+    uint64_t ticks = c->owed;
+    if (!s->cpu_stopped)
+        ticks += (uint64_t)INSTR_PER_FRAME * c->slot_ticks;
+    if (!ticks)
+        return;
+    c->owed_only = s->cpu_stopped;
+    gemu_machine_run_until(c->machine,
+                           gemu_machine_time(c->machine) + gemu_clocks(I2000_ITC_HZ, ticks));
+    c->owed_only = false;
+    c->owed = 0;            /* a stopped run leaves the rest to the next frame's sums */
 }
 
 static void i2000_reset(Ia64I2000State *s, bool warm) {
@@ -4490,6 +4605,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
     const char *cpi_text = getenv("GEMU_CPI");
     unsigned cpi = cpi_text ? (unsigned)strtoul(cpi_text, NULL, 0) : 0;
     merced_set_cycles_per_slot(s->cpu, cpi ? cpi : 1);
+    s->core->slot_ticks = cpi ? cpi : 1;
     bool host_itc = bench_target == 0 && !cpi;
 
     bool running = true;
@@ -4507,6 +4623,7 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
         } else if (gemu_monitor_is_paused(s->monitor) || s->halted) {
             itc_last_ns = now_ns;
             itc_target = time_base;
+            s->core->owed = 0;
         } else {
             /* Exact ticks for the elapsed host time, carrying the remainder
              * (in units of 1/10^9 tick). The span is bounded so the product
@@ -4519,13 +4636,13 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             itc_fraction %= UINT64_C(1000000000);
             itc_last_ns = now_ns;
             /* Host time owed beyond what the slots already charged; a guest
-             * running ahead of real time owes nothing and carries no debt. */
+             * running ahead of real time owes nothing and carries no debt.
+             * The next run pays it (i2000_cpu_run()). */
             itc_target += ticks;
             if (time_base < itc_target)
-                merced_advance_itc(s->cpu, itc_target - time_base);
+                s->core->owed = itc_target - time_base;
             else
                 itc_target = time_base;
-            itc_seen = merced_get_time_base(s->cpu);
         }
         if (s->display) {
             uint32_t keys_held = gemu_display_poll(s->display);
@@ -4637,7 +4754,8 @@ void ia64_i2000_run(Ia64I2000State *s, const Ia64Config *cfg) {
             break;
 
         if (!gemu_monitor_is_paused(s->monitor)) {
-            i2000_run_slice(s);
+            i2000_cpu_slice(s);
+            itc_seen = merced_get_time_base(s->cpu);
             i2000_rage_dma_poll(s);
             i2000_bench_check(s);
             i460gx_pm_poll(&s->chipset);

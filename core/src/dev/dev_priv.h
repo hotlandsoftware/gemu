@@ -5,6 +5,7 @@
 #include "gemu/dev/space.h"
 #include "gemu/dev/scheduler.h"
 #include "gemu/dev/line.h"
+#include "gemu/dev/state.h"
 
 /* stream.c's mixer */
 typedef struct {
@@ -30,8 +31,9 @@ typedef struct {
 
 /* ── Per device (GemuDevice.core) ── */
 
+#define GEMU_STATE_NAME_MAX 64
 typedef struct GemuStateItem {
-    char      name[32];
+    char      name[GEMU_STATE_NAME_MAX];
     void     *ptr;                    /* memory items */
     size_t    elem, count;
     void    (*save)(void *ud, GemuStateWriter *w);       /* custom items */
@@ -39,6 +41,11 @@ typedef struct GemuStateItem {
     bool    (*load)(void *ud, GemuStateReader *r);
     void     *ud;
     unsigned  load_mark;
+    /* table items (gemu_state_add_table): custom, with ud = the item */
+    uint8_t  *base;
+    size_t    stride;
+    const GemuStateField *fields;
+    size_t    nfields;
     struct GemuStateItem *next;
 } GemuStateItem;
 
@@ -144,7 +151,8 @@ void gemu_lines_free_all(GemuMachine *m);
 struct GemuStateWriter {
     uint8_t *buf;
     size_t   len, cap;
-    bool     failed;                  /* out of memory */
+    bool     failed;                  /* out of memory, or the file failed */
+    FILE    *f;                       /* set: written straight to it (len is its offset) */
 };
 
 struct GemuStateReader {
