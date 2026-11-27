@@ -200,6 +200,18 @@ static bool port_offset(const I460GX *s, uint64_t port, unsigned size,
     return true;
 }
 
+unsigned i460gx_smbus_io_windows(const I460GX *s, PciWindow *w) {
+    if (!(s->ifb_smbus_cfg[CFG_COMMAND] & CFG_COMMAND_IO))
+        return 0;
+    uint32_t base = (uint32_t)i460gx_ifb_cfg_read8(s, 3, CFG_BASE) |
+                    (uint32_t)i460gx_ifb_cfg_read8(s, 3, CFG_BASE + 1) << 8;
+    base &= 0xfff0;
+    if (!base)
+        return 0;
+    w[0] = (PciWindow){ true, base, SMBUS_IO_SIZE };
+    return 1;
+}
+
 bool i460gx_smbus_io(I460GX *s, uint64_t port, bool write, unsigned size,
                      uint64_t *value) {
     unsigned off;

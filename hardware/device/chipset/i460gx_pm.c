@@ -638,6 +638,23 @@ static bool apm_io(I460GX *s, bool write, uint64_t port, unsigned size,
     return true;
 }
 
+/* The blocks i460gx_pm_io() decodes, enabled and placed; the APM ports. */
+unsigned i460gx_pm_io_windows(const I460GX *s, PciWindow *w) {
+    uint32_t acpi = ((uint32_t)s->ifb_cfg[CFG_ACPIBR] |
+                     (uint32_t)s->ifb_cfg[CFG_ACPIBR + 1] << 8) &
+                    CFG_BLOCK_BASE_MASK;
+    uint32_t gpio = ((uint32_t)s->ifb_cfg[CFG_GPIOBA] |
+                     (uint32_t)s->ifb_cfg[CFG_GPIOBA + 1] << 8) &
+                    CFG_BLOCK_BASE_MASK;
+    unsigned n = 0;
+    if ((s->ifb_cfg[CFG_ACPI_CNTL] & CFG_BLOCK_ENABLE) && acpi)
+        w[n++] = (PciWindow){ true, acpi, ACPI_BLOCK_SIZE };
+    if ((s->ifb_cfg[CFG_GPIO_CNTL] & CFG_BLOCK_ENABLE) && gpio)
+        w[n++] = (PciWindow){ true, gpio, GPIO_BLOCK_SIZE };
+    w[n++] = (PciWindow){ true, PORT_APMC, 2 };
+    return n;
+}
+
 bool i460gx_pm_io(I460GX *s, bool write, uint64_t port, unsigned size,
                   uint64_t *value) {
     uint32_t acpi = ((uint32_t)s->ifb_cfg[CFG_ACPIBR] |

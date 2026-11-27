@@ -2200,6 +2200,20 @@ bool e100_mem_claims(const E100 *n, uint64_t addr)
     return e100_rom_range(n, &rom, &rom_size) && addr - rom < rom_size;
 }
 
+static unsigned pci_windows_op(const void *d, PciWindow *w)
+{
+    const E100 *n = d;
+    unsigned k = 0;
+    uint64_t csr, csr_size, flash, flash_size, rom, rom_size;
+    if (e100_mem_ranges(n, &csr, &csr_size, &flash, &flash_size)) {
+        w[k++] = (PciWindow){ false, csr, csr_size };
+        w[k++] = (PciWindow){ false, flash, flash_size };
+    }
+    if (e100_rom_range(n, &rom, &rom_size)) { w[k++] = (PciWindow){ false, rom, rom_size }; }
+    const uint32_t io = get_le32(n->pci + PCI_BAR0 + 4) & ~3u;
+    if ((command(n) & CMD_IO) && io) { w[k++] = (PciWindow){ true, io, E100_CSR_IO_SIZE }; }
+    return k;
+}
 static uint32_t pci_cfg_read_op(const void *d, unsigned reg, unsigned size)
 {
     return e100_cfg_read(d, reg, size);
@@ -2223,5 +2237,5 @@ static bool pci_io_access_op(void *d, bool write, uint16_t port, unsigned size, 
 const PciFunctionOps e100_pci_ops = {
     .name = "82559", .cfg_read = pci_cfg_read_op, .cfg_write = pci_cfg_write_op,
     .mem_claims = pci_mem_claims_op, .mem_access = pci_mem_access_op,
-    .io_access = pci_io_access_op,
+    .io_access = pci_io_access_op, .windows = pci_windows_op,
 };

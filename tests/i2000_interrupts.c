@@ -1170,7 +1170,53 @@ static void test_serial(void) {
     ia64_i2000_destroy(s);
 }
 
+/* G3: the board's interrupt sources reach the 8259 pair and the I/O SAPIC
+ * as core lines.  (This one looks at the wiring itself.) */
+static void test_lines(void) {
+    Ia64I2000State *s = machine();
+    I2000Core *c = s->core;
+    CHECK(c->machine && gemu_machine_started(c->machine));
+    for (unsigned line = 0; line < I2000_IRQS; line++) {
+        int pic = i2000_irq_lines[line].pic;
+        CHECK(gemu_line_in_drivers(c->gsi[i2000_irq_lines[line].gsi]) >= 1);
+        CHECK((pic >= 0) == (c->legacy[line] != NULL));
+        if (pic >= 0)
+            CHECK(gemu_line_in_drivers(c->ir[pic]) == 1);
+    }
+    /* An edge on a SAPIC wire is delivered as its entry says. */
+    route_gsi(s, i2000_irq_lines[I2000_IRQ_RAGE].gsi, 0x70);
+    i2000_irq_gsi(s, I2000_IRQ_RAGE);
+    CHECK(irq(s, 0x70));
+    merced_ack_external(s->cpu, 0x70);
+    route_gsi(s, i2000_irq_lines[I2000_IRQ_RAGE].gsi, 0x70 | 0x10000);   /* masked */
+    i2000_irq_gsi(s, I2000_IRQ_RAGE);
+    CHECK(!irq(s, 0x70));
+
+    /* The timer's legacy wire is IRQ0's pin; a reset of the pair clears the
+     * pins, and the next sync puts a held line back. */
+    pic_init(s, 0xFE, 0xFF);
+    i2000_pit_out(s, 0, true);
+    CHECK(pic_irr(s, 0x20) & 0x01);
+    CHECK(gemu_line_in_level(c->ir[0]));
+    i2000_pic_reset(s);
+    CHECK(!(s->pic.master.lines & 0x01));
+    CHECK(pic_irr(s, 0x20) & 0x01);           /* (an OCW3; ICW1 would clear it) */
+    CHECK(s->pic.master.lines & 0x01);
+
+    /* The SCI's wire follows the GSI the chipset puts it on. */
+    i2000_pm_sci(s, 9, true);
+    CHECK(c->sci_gsi == 9 && gemu_line_in_drivers(c->gsi[9]) == 1);
+    i2000_pm_sci(s, 10, true);
+    CHECK(c->sci_gsi == 10 && gemu_line_in_drivers(c->gsi[9]) == 0 &&
+          gemu_line_in_drivers(c->gsi[10]) == 1);
+    route_gsi(s, 10, 0x71);
+    gemu_line_pulse(c->sci);
+    CHECK(irq(s, 0x71));
+    ia64_i2000_destroy(s);
+}
+
 int main(void) {
+    test_lines();
     test_serial();
     test_identify(); test_control(); test_slave_probe(); test_packet_phases(); test_legacy(); test_os_mask();
     test_snapshots();

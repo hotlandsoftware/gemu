@@ -12,6 +12,15 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
+#include "gemu/dev/space.h"
+
+/* A range a function decodes now: memory or I/O, from a BAR or fixed
+ * (a VGA card's legacy ports). */
+typedef struct PciWindow {
+    bool     io;
+    uint64_t base, size;
+} PciWindow;
+#define PCI_WINDOWS_MAX 8
 
 typedef struct PciFunctionOps {
     const char *name;
@@ -23,6 +32,10 @@ typedef struct PciFunctionOps {
     bool     (*mem_claims)(const void *dev, uint64_t addr);
     bool     (*mem_access)(void *dev, bool write, uint64_t addr, unsigned size, uint64_t *val);
     bool     (*io_access)(void *dev, bool write, uint16_t port, unsigned size, uint64_t *val);
+    /* The windows it decodes now, at most PCI_WINDOWS_MAX; how many.  What a
+     * PciDecode maps.  An access in one that mem_access/io_access then
+     * declines reads as all ones. */
+    unsigned (*windows)(const void *dev, PciWindow *w);
 } PciFunctionOps;
 
 typedef struct {
@@ -54,3 +67,40 @@ bool pci_bus_cfg_write(PciBus *b, unsigned bus, unsigned dev, unsigned fn,
 bool pci_bus_mem_claims(const PciBus *b, uint64_t addr);
 bool pci_bus_mem_access(PciBus *b, bool write, uint64_t addr, unsigned size, uint64_t *val);
 bool pci_bus_io_access(PciBus *b, bool write, uint16_t port, unsigned size, uint64_t *val);
+
+/* ── Decode as space mappings ─────────────────────────────────────────────
+ * A bus's windows as handler mappings in a memory and an I/O space, calling
+ * the functions' mem_access/io_access.  Memory windows are clipped to
+ * [mem_lo, mem_hi) (where the machine lets the bus decode).  All are mapped
+ * at one priority, the bus's first function winning an overlap as
+ * pci_bus_mem_access() would.  pci_decode_update() after anything that may
+ * move a window (a config write, a load, a card swapped); it remaps only
+ * when the windows changed.  miss, if set, hears the accesses a function
+ * declined.  Kept apart from PciBus, whose layout is in snapshots. */
+#define PCI_DECODE_MAX (PCI_BUS_MAX_FUNCTIONS * 4)
+
+typedef struct PciDecode PciDecode;
+typedef struct {
+    PciDecode   *d;
+    const PciFunctionOps *ops;
+    void        *opaque;
+    PciWindow    w;                  /* as mapped (clipped) */
+    GemuMapping *m;
+} PciMapped;
+
+struct PciDecode {
+    PciBus    *bus;
+    GemuSpace *mem, *io;
+    uint64_t   mem_lo, mem_hi;
+    int        priority;
+    void     (*miss)(void *ud, bool io, bool write, uint64_t addr, unsigned size, uint64_t val);
+    void      *ud;
+    PciMapped  map[PCI_DECODE_MAX];
+    unsigned   n;
+};
+
+void pci_decode_init(PciDecode *d, PciBus *bus, GemuSpace *mem, GemuSpace *io,
+                     uint64_t mem_lo, uint64_t mem_hi, int priority);
+void pci_decode_update(PciDecode *d);
+/* Removes the mappings (before the spaces go). */
+void pci_decode_clear(PciDecode *d);

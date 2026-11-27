@@ -85,6 +85,86 @@ static void cmd649_write(Ia64I2000State *s, unsigned reg, uint32_t value) {
     ia64_i2000_phys_write32(s, io_address(0xcfc), value);
 }
 
+/* Stage G1: plain RAM from the core space, everything else through the
+ * chipset - the words at 64K offsets 6030h/A030h are plain RAM again (SAL's
+ * scratch words are re-addressed only from their sign-extended form), the
+ * last RAM word is RAM, the next is open bus. */
+static void check_memory_space(void) {
+    Ia64Config cfg = {.ram_size = UINT64_C(64) << 20,
+                      .display_type = GEMU_DISPLAY_NONE};
+    Ia64I2000State *s = ia64_i2000_create(&cfg);
+    if (!s) { failures++; return; }
+    const uint64_t top = cfg.ram_size;
+    const uint64_t at[] = { 0x10000, 0x7FA030, 0x806030, 0x9F000, top - 4 };
+    for (unsigned i = 0; i < sizeof at / sizeof at[0]; i++) {
+        uint32_t v = 0x5A00C3E1u ^ (uint32_t)at[i];
+        ia64_i2000_phys_write32(s, at[i], v);
+        if (ia64_i2000_phys_read32(s, at[i]) != v) {
+            fprintf(stderr, "memory space: RAM word %#" PRIx64 " didn't hold\n", at[i]);
+            failures++;
+        }
+    }
+    if (ia64_i2000_phys_read32(s, top) != UINT32_C(0xFFFFFFFF)) {
+        fprintf(stderr, "memory space: the word after RAM isn't open bus\n");
+        failures++;
+    }
+    /* SAL's sign-extended scratch address: the top 64K of RAM */
+    uint64_t scratch = ((top - 0x10000) & ~UINT64_C(0xFFFF)) | 0x6030;
+    ia64_i2000_phys_write32(s, UINT64_C(0x000FFFFF00006030), 0x12345678u);
+    if (ia64_i2000_phys_read32(s, scratch) != 0x12345678u) {
+        fprintf(stderr, "memory space: the SAL scratch word didn't land at the top of RAM\n");
+        failures++;
+    }
+    ia64_i2000_destroy(s);
+}
+
+/* G2: the decode as space mappings.  The board's ports take only the widths
+ * they did; PCI windows follow their BARs and command bits, the IFB's I/O
+ * functions their config. */
+static void check_decode(void) {
+    Ia64Config cfg = {.ram_size = UINT64_C(64) << 20,
+                      .display_type = GEMU_DISPLAY_NONE,
+                      .sound = PCI_AUDIO_CS4281};
+    Ia64I2000State *s = ia64_i2000_create(&cfg);
+    if (!s) { failures++; return; }
+    /* A width a port doesn't take (the 8259's command port is byte-wide),
+     * and an unclaimed port. */
+    expect(ia64_i2000_phys_read32(s, io_address(0x20)), UINT32_MAX, "8259 command, 32-bit", 0, 0);
+    expect(ia64_i2000_phys_read8(s, io_address(0x300)), 0xFF, "unclaimed port", 0, 0);
+    /* The 8259's mask register through the window. */
+    ia64_i2000_phys_write8(s, io_address(0x21), 0xA5);
+    expect(ia64_i2000_phys_read8(s, io_address(0x21)), 0xA5, "8259 mask", 0, 0);
+
+    /* The SMBus function's I/O BAR: decoded once enabled, then moved. */
+    expect(ia64_i2000_phys_read8(s, io_address(0x1000)), 0xFF, "SMBus before", 0, 0);
+    config_select_bus(s, 0, 3, 3, 0x20);
+    ia64_i2000_phys_write32(s, io_address(0xcfc), 0x1001);
+    config_select_bus(s, 0, 3, 3, 0x04);
+    ia64_i2000_phys_write8(s, io_address(0xcfc), 0x01);
+    bool there = ia64_i2000_phys_read8(s, io_address(0x1000)) != 0xFF;
+    expect(there, 1, "SMBus decoded at 1000h", 0, 0);
+    config_select_bus(s, 0, 3, 3, 0x20);
+    ia64_i2000_phys_write32(s, io_address(0xcfc), 0x2001);
+    expect(ia64_i2000_phys_read8(s, io_address(0x1000)), 0xFF, "SMBus gone from 1000h", 0, 0);
+    expect(ia64_i2000_phys_read8(s, io_address(0x2000)) != 0xFF, 1, "SMBus at 2000h", 0, 0);
+
+    /* The CS4281's register BAR: above RAM once memory decode is on. */
+    const uint64_t bar = 0x80000000;
+    config_select_bus(s, 0, 4, 0, 0x10);
+    ia64_i2000_phys_write32(s, io_address(0xcfc), (uint32_t)bar);
+    expect(ia64_i2000_phys_read32(s, bar), UINT32_MAX, "CS4281 before decode", 0, 0);
+    config_select_bus(s, 0, 4, 0, 0x04);
+    ia64_i2000_phys_write8(s, io_address(0xcfc), 0x02);
+    expect(ia64_i2000_phys_read32(s, bar) != UINT32_MAX, 1, "CS4281 decoded", 0, 0);
+    /* Placed over RAM, DRAM wins. */
+    ia64_i2000_phys_write32(s, 0x100000, 0x600DF00Du);
+    config_select_bus(s, 0, 4, 0, 0x10);
+    ia64_i2000_phys_write32(s, io_address(0xcfc), 0x100000);
+    expect(ia64_i2000_phys_read32(s, 0x100000), 0x600DF00Du, "BAR over RAM", 0, 0);
+    expect(ia64_i2000_phys_read32(s, bar), UINT32_MAX, "CS4281 moved away", 0, 0);
+    ia64_i2000_destroy(s);
+}
+
 static void check_ifb_config(void) {
     Ia64Config cfg = {.ram_size = UINT64_C(64) << 20,
                       .display_type = GEMU_DISPLAY_NONE};
@@ -6221,6 +6301,8 @@ static void check_ia32_x87_differential(bool fast) {
 #endif
 
 int main(void) {
+    check_memory_space();
+    check_decode();
     for (unsigned engine = 0; engine < 3; engine++)
         for (unsigned ed = 0; ed < 2; ed++)
             for (unsigned fp = 0; fp < 2; fp++)

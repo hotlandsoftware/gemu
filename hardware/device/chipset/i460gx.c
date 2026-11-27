@@ -193,6 +193,40 @@ bool i460gx_ifb_io_write(I460GX *s, unsigned fun, uint64_t port,
     return true;
 }
 
+static unsigned usb_windows(const I460GX *s, PciWindow *w) {
+    uint32_t bar = (uint32_t)i460gx_ifb_cfg_read8(s, 2, 0x20) |
+                   (uint32_t)i460gx_ifb_cfg_read8(s, 2, 0x21) << 8;
+    unsigned base = bar & 0xffe0;
+    if (!(s->ifb_usb_cfg[4] & 1) || !(bar & 1) || !base)
+        return 0;
+    w[0] = (PciWindow){ true, base, sizeof(s->uhci_regs) };
+    return 1;
+}
+
+static bool ifb_io(I460GX *s, unsigned fun, bool write, uint16_t port,
+                   unsigned size, uint64_t *v) {
+    return write ? i460gx_ifb_io_write(s, fun, port, *v, size)
+                 : i460gx_ifb_io_read(s, fun, port, size, v);
+}
+static bool pm_io_op(void *d, bool write, uint16_t port, unsigned size, uint64_t *v) {
+    return ifb_io(d, 0, write, port, size, v);
+}
+static bool usb_io_op(void *d, bool write, uint16_t port, unsigned size, uint64_t *v) {
+    return ifb_io(d, 2, write, port, size, v);
+}
+static bool smbus_io_op(void *d, bool write, uint16_t port, unsigned size, uint64_t *v) {
+    return ifb_io(d, 3, write, port, size, v);
+}
+static unsigned pm_windows_op(const void *d, PciWindow *w) { return i460gx_pm_io_windows(d, w); }
+static unsigned usb_windows_op(const void *d, PciWindow *w) { return usb_windows(d, w); }
+static unsigned smbus_windows_op(const void *d, PciWindow *w) { return i460gx_smbus_io_windows(d, w); }
+const PciFunctionOps i460gx_ifb_pm_ops = {
+    .name = "IFB power management", .io_access = pm_io_op, .windows = pm_windows_op };
+const PciFunctionOps i460gx_ifb_usb_ops = {
+    .name = "IFB USB", .io_access = usb_io_op, .windows = usb_windows_op };
+const PciFunctionOps i460gx_ifb_smbus_ops = {
+    .name = "IFB SMBus", .io_access = smbus_io_op, .windows = smbus_windows_op };
+
 bool i460gx_interrupt(I460GX *s, unsigned gsi, uint8_t *vector, bool *extint) {
     if (gsi >= 64 || (s->iosapic_rte[gsi] & I460GX_IOSAPIC_RTE_MASK))
         return false;

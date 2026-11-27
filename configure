@@ -267,7 +267,7 @@ TESTS = [
          links=['hardware/device/controller/pc_sysctl.c', 'hardware/device/timer/i8253.c'],
          cflags='-Werror'),
     dict(name='pci', family=None, kind='device', src='tests/pci.c',
-         links=['hardware/device/bus/pci.c'], cflags='-Werror'),
+         links=['hardware/device/bus/pci.c'] + DEV_CORE_LINKS, cflags='-Werror'),
     dict(name='i8042', family=None, kind='device', src='tests/i8042.c',
          links=['hardware/device/input/i8042.c', 'hardware/device/input/ps2_keyboard.c',
                 'hardware/device/input/ps2_mouse.c'], cflags='-Werror'),

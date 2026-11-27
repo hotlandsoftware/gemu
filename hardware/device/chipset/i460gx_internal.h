@@ -23,6 +23,8 @@ bool i460gx_smbus_io(I460GX *s, uint64_t port, bool write, unsigned size,
 
 /* i460gx_pm.c: IFB power management. i460gx_pm_io() decodes the ACPI and GPIO
  * blocks and the APM ports; it returns false for any other port. */
+unsigned i460gx_pm_io_windows(const I460GX *s, PciWindow *w);
+unsigned i460gx_smbus_io_windows(const I460GX *s, PciWindow *w);
 bool i460gx_pm_io(I460GX *s, bool write, uint64_t port, unsigned size,
                   uint64_t *value);
 void i460gx_pm_reset(I460GX *s, bool power_on);

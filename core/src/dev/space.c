@@ -733,14 +733,47 @@ static void dispatch_end(Dispatch *d) {
 static uint64_t read_n(GemuSpace *s, uint64_t addr, unsigned n);
 static void write_n(GemuSpace *s, uint64_t addr, unsigned n, uint64_t v);
 
-static uint64_t slow_read(GemuSpace *s, uint64_t addr, unsigned n) {
+/* One handler of the access's width: called straight, with its function and
+ * ud taken first (it may change the map).  False if not that case. */
+static inline bool single_read(const Seg *g, uint64_t eff, unsigned n, uint64_t *v) {
+    if (g->n != 1)
+        return false;
+    const GemuMapping *m = g->maps[0];
+    void *ud = m->ud;
+    uint64_t off = eff - m->base;
+    switch (n) {
+    case 1: if (m->h.r8)  { *v = m->h.r8(ud, off);  return true; } break;
+    case 2: if (m->h.r16) { *v = m->h.r16(ud, off); return true; } break;
+    case 4: if (m->h.r32) { *v = m->h.r32(ud, off); return true; } break;
+    case 8: if (m->h.r64) { *v = m->h.r64(ud, off); return true; } break;
+    }
+    return false;
+}
+static inline bool single_write(const Seg *g, uint64_t eff, unsigned n, uint64_t v) {
+    if (g->n != 1)
+        return false;
+    const GemuMapping *m = g->maps[0];
+    void *ud = m->ud;
+    uint64_t off = eff - m->base;
+    switch (n) {
+    case 1: if (m->h.w8)  { m->h.w8(ud, off, (uint8_t)v);   return true; } break;
+    case 2: if (m->h.w16) { m->h.w16(ud, off, (uint16_t)v); return true; } break;
+    case 4: if (m->h.w32) { m->h.w32(ud, off, (uint32_t)v); return true; } break;
+    case 8: if (m->h.w64) { m->h.w64(ud, off, v);           return true; } break;
+    }
+    return false;
+}
+
+static uint64_t slow_read(GemuSpace *s, const Page *p, uint64_t addr, unsigned n) {
     uint64_t gap_end, last = addr + n - 1;
-    const Seg *g = find_seg(s, page_get(s, addr), RD, addr, &gap_end);
+    const Seg *g = find_seg(s, p, RD, addr, &gap_end);
     bool fits = last >= addr && last <= s->mask;
     if (g && fits && last <= g->hi) {
         uint64_t eff = addr & g->mask, v = ones(n);
         if (g->n == 1 && g->maps[0]->ram)
             return map_read(s, g->maps[0], eff - g->maps[0]->base, n);
+        if (single_read(g, eff, n, &v))
+            return v;
         Dispatch d;
         dispatch_begin(&d, s, g);
         GemuMapping m;
@@ -760,9 +793,9 @@ static uint64_t slow_read(GemuSpace *s, uint64_t addr, unsigned n) {
     return join(s, a, b, half);
 }
 
-static void slow_write(GemuSpace *s, uint64_t addr, unsigned n, uint64_t v) {
+static void slow_write(GemuSpace *s, const Page *p, uint64_t addr, unsigned n, uint64_t v) {
     uint64_t gap_end, last = addr + n - 1;
-    const Seg *g = find_seg(s, page_get(s, addr), WR, addr, &gap_end);
+    const Seg *g = find_seg(s, p, WR, addr, &gap_end);
     bool fits = last >= addr && last <= s->mask;
     if (g && fits && last <= g->hi) {
         uint64_t eff = addr & g->mask;
@@ -770,6 +803,8 @@ static void slow_write(GemuSpace *s, uint64_t addr, unsigned n, uint64_t v) {
             map_write(s, g->maps[0], eff - g->maps[0]->base, n, v);
             return;
         }
+        if (single_write(g, eff, n, v))
+            return;
         Dispatch d;
         dispatch_begin(&d, s, g);
         GemuMapping m;
@@ -794,7 +829,7 @@ static inline uint64_t read_n(GemuSpace *s, uint64_t addr, unsigned n) {
     uint64_t off = addr & s->page_mask;
     if (p && p->dir[RD].fast && off + n - 1 <= s->page_mask)
         return load(p->dir[RD].fast + off, n, s->endian);
-    return slow_read(s, addr, n);
+    return slow_read(s, p, addr, n);
 }
 
 static inline void write_n(GemuSpace *s, uint64_t addr, unsigned n, uint64_t v) {
@@ -805,7 +840,7 @@ static inline void write_n(GemuSpace *s, uint64_t addr, unsigned n, uint64_t v) 
         store(p->dir[WR].fast + off, n, s->endian, v);
         return;
     }
-    slow_write(s, addr, n, v);
+    slow_write(s, p, addr, n, v);
 }
 
 uint8_t  gemu_space_read8 (GemuSpace *s, uint64_t a) { return (uint8_t)read_n(s, a, 1); }

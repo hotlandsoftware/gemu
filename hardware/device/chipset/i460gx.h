@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bus/pci.h"
 #include "i2c/i2c.h"
 #include "storage/fwh82802.h"
 
@@ -161,6 +162,11 @@ bool i460gx_pci_write(I460GX *s, unsigned bus, unsigned dev, unsigned fun,
                       unsigned reg, uint64_t value, unsigned size);
 bool i460gx_mmio_read(I460GX *s, uint64_t addr, unsigned size, uint64_t *value);
 bool i460gx_mmio_write(I460GX *s, uint64_t addr, uint64_t value, unsigned size);
+
+/* The IFB's I/O functions 0 (PM/APM), 2 (UHCI) and 3 (SMBus) as PCI
+ * functions for a PciDecode: their windows now and these accesses.  No
+ * config ops (config cycles stay i460gx_pci_*); the opaque is the I460GX. */
+extern const PciFunctionOps i460gx_ifb_pm_ops, i460gx_ifb_usb_ops, i460gx_ifb_smbus_ops;
 
 /* Separate IFB functions preserve board I/O decode ordering: function 0 is
  * PM/APM, function 2 is UHCI, and function 3 is SMBus. */

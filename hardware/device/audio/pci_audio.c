@@ -226,6 +226,21 @@ bool pci_audio_io_access(PciAudio *s, bool write, uint16_t port, unsigned size, 
     return true;
 }
 
+static unsigned pci_windows_op(const void *d, PciWindow *w) {
+    const PciAudio *s = d;
+    if (s->cfg[0x44] & 3) return 0;
+    if (s->model == PCI_AUDIO_CS4281 && (s->cfg[4] & 2)) {
+        w[0] = (PciWindow){ false, get32(s->cfg + 0x10), 4096 };
+        w[1] = (PciWindow){ false, get32(s->cfg + 0x14), 65536 };
+        return 2;
+    }
+    if (s->model == PCI_AUDIO_AC97 && (s->cfg[4] & 1)) {
+        w[0] = (PciWindow){ true, get32(s->cfg + 0x10) & ~3u, 256 };
+        w[1] = (PciWindow){ true, get32(s->cfg + 0x14) & ~3u, 64 };
+        return 2;
+    }
+    return 0;
+}
 static bool pci_present_op(const void *d) {
     return ((const PciAudio *)d)->model != PCI_AUDIO_NONE;
 }
@@ -248,5 +263,5 @@ const PciFunctionOps pci_audio_pci_ops = {
     .name = "PCI audio", .present = pci_present_op,
     .cfg_read = pci_cfg_read_op, .cfg_write = pci_cfg_write_op,
     .mem_claims = pci_mem_claims_op, .mem_access = pci_mem_access_op,
-    .io_access = pci_io_access_op,
+    .io_access = pci_io_access_op, .windows = pci_windows_op,
 };

@@ -1221,6 +1221,26 @@ bool rage128_mem_claims(const Rage128 *r, uint64_t addr) {
     return rage128_rom_range(r, &rom, &rom_size) && addr - rom < rom_size;
 }
 
+/* Its BARs and the legacy VGA ports.  (The legacy VGA memory window is the
+ * machine's to place: it lies over RAM.) */
+static unsigned pci_windows_op(const void *d, PciWindow *w) {
+    const Rage128 *r = d;
+    unsigned n = 0;
+    uint64_t fb, fb_size, regs, regs_size, rom, rom_size;
+    if (rage128_mem_ranges(r, &fb, &fb_size, &regs, &regs_size)) {
+        w[n++] = (PciWindow){ false, fb, fb_size };
+        w[n++] = (PciWindow){ false, regs, regs_size };
+    }
+    if (rage128_rom_range(r, &rom, &rom_size))
+        w[n++] = (PciWindow){ false, rom, rom_size };
+    if (command(r) & CMD_IO) {
+        const uint32_t io = get_le32(r->cfg + 0x14) & ~3u;
+        if (io)
+            w[n++] = (PciWindow){ true, io, RAGE128_IO_BAR_SIZE };
+        w[n++] = (PciWindow){ true, 0x3B0, 0x30 };
+    }
+    return n;
+}
 static uint32_t pci_cfg_read_op(const void *d, unsigned reg, unsigned size) {
     return rage128_cfg_read(d, reg, size);
 }
@@ -1239,5 +1259,5 @@ static bool pci_io_access_op(void *d, bool write, uint16_t port, unsigned size, 
 const PciFunctionOps rage128_pci_ops = {
     .name = "Rage 128", .cfg_read = pci_cfg_read_op, .cfg_write = pci_cfg_write_op,
     .mem_claims = pci_mem_claims_op, .mem_access = pci_mem_access_op,
-    .io_access = pci_io_access_op,
+    .io_access = pci_io_access_op, .windows = pci_windows_op,
 };
