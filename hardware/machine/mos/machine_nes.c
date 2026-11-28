@@ -21,7 +21,10 @@
 #include "storage/fds_state.h"
 #include "gemu/dev/device.h"
 #include "gemu/dev/line.h"
+#include "gemu/dev/option.h"
 #include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/stream.h"
 #include "gemu/dev/space.h"
 #include "gemu/dev/state.h"
 #include <stdio.h>
@@ -105,7 +108,6 @@ static const VsDip vs_dips[] = {
     {"continue", "Continue lives", 0x80, vs_continue_opts, 2},
 };
 /* FCEUX initializes VS. SMB with all DIP switches off. */
-#define VS_DIP_DEFAULT 0x00u
 
 static const VsDip *vs_find_dip(const char *name) {
     for (size_t i = 0; i < sizeof(vs_dips)/sizeof(vs_dips[0]); i++)
@@ -205,6 +207,8 @@ static GemuSpace *nes_space_ppu(const NesState *s);
 static void nes_lines_irq(NesState *s, bool apu, bool cart);
 static void nes_lines_nmi(NesState *s);
 static void nes_lines_resync(NesState *s);
+static GemuMachine *nes_machine(const NesState *s);
+static void nes_sound_drain(NesState *s);
 static void nes_exec_clock(NesState *s, uint32_t hz);
 
 /* ── Cartridge connector (Debug > Cartridge Pins, nes_pins.h) ─────────────── */
@@ -310,7 +314,7 @@ static void nes_sync_apu_to_cpu(NesState *s, uint64_t cpu_cycle) {
             apu2a03_run(&s->apu, to);
             s->apu_synced_cpu_cycle = to;
             /* a slow clock makes a frame's audio outgrow the buffer */
-            if (s->apu.audio_dev && s->apu.frame_n > 900) apu2a03_flush(&s->apu);
+            if (s->apu.frame_n > 900) nes_sound_drain(s);
         }
         nes_dmc_dma_check(s);
         s->apu_deadline = s->apu_synced_cpu_cycle + apu2a03_until_event(&s->apu);
@@ -336,7 +340,7 @@ static void nes_sync_apu_to_cpu(NesState *s, uint64_t cpu_cycle) {
         apu2a03_tick(&s->apu);
         nes_dmc_dma_check(s);
     }
-    if (s->apu.audio_dev && s->apu.frame_n > 900) apu2a03_flush(&s->apu);
+    if (s->apu.frame_n > 900) nes_sound_drain(s);
     s->apu_syncing = false;
     nes_update_irq(s);
 }
@@ -461,7 +465,9 @@ void nes_cpu_write(uint16_t addr, uint8_t val, void *ud) {
     else nes_cpu_write_bus(addr, val, ud);
 }
 
+static void nes_screen_frame(NesState *s);
 static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
+    uint64_t frame = s->ppu.frame;
     while (s->ppu_synced_cpu_cycle < cpu_cycle) {
         s->ppu_synced_cpu_cycle++;
         if (s->fds_enabled)
@@ -475,6 +481,7 @@ static void nes_sync_ppu_to_cpu(NesState *s, uint64_t cpu_cycle) {
             }
         }
     }
+    if (s->ppu.frame != frame) nes_screen_frame(s);
 }
 
 
@@ -1007,185 +1014,48 @@ static bool nes_arcade_assemble(NesState *s, const MosConfig *cfg) {
  * before the struct is overwritten and spliced back in afterward, the same
  * pattern machine_i2000.c uses for its savevm/loadvm. */
 
-#define NES_SNAPSHOT_MAGIC    0x314D5645534d454eULL /* "NEMSVE1" */
-#define NES_SNAPSHOT_VERSION  6u   /* 2: board state; 3: dot-by-dot sprite evaluation;
-                                       4: the cartridge as a NesCart;
-                                       5: the front end's fields out of NesState;
-                                       6: NesState's core pointer (stage N1) */
+/* Save states (stage N6) are the core machine's state: every part saves
+ * itself (nes_core_build()), with the core's timers, the CPU's place in time
+ * and the lines.  They are built in memory; the front end's savevm/loadvm
+ * and its slots write and read them as files, and netplay keeps its
+ * power-on state there.
+ *
+ * States from before N6 ("NEMSEVM1", the raw console struct) are refused,
+ * as question 9 settled for the i2000's: no converter. */
+#define NES_OLD_SNAPSHOT_MAGIC 0x314D5645534d454eULL /* "NEMSEVM1" */
 
-/* Snapshots are built in memory (SnapBuf); the front end's savevm/loadvm
- * write and read them as files, and netplay keeps them there. */
-typedef struct { uint8_t *p; size_t n, cap; bool ok; } SnapBuf;
-
-static void sb_put(SnapBuf *b, const void *d, size_t n) {
-    if (!b->ok) return;
-    if (b->n + n > b->cap) {
-        size_t cap = b->cap ? b->cap : 65536;
-        while (cap < b->n + n) cap *= 2;
-        uint8_t *p = realloc(b->p, cap);
-        if (!p) { b->ok = false; return; }
-        b->p = p;
-        b->cap = cap;
-    }
-    memcpy(b->p + b->n, d, n);
-    b->n += n;
-}
-
-typedef struct { const uint8_t *p; size_t n, i; } SnapRd;
-
-static bool sr_get(SnapRd *r, void *d, size_t n) {
-    if (r->n - r->i < n) return false;
-    memcpy(d, r->p + r->i, n);
-    r->i += n;
-    return true;
-}
-
-static bool snapshot_save(NesState *s, SnapBuf *b) {
-    if (s->fds_enabled) {
-        fprintf(stderr, "nes: savevm not supported for FDS yet\n");
+bool nes_snapshot_save(NesState *s, uint8_t **data, size_t *len) {
+    if (!s->core || !gemu_machine_save_state(nes_machine(s), data, len)) {
+        fprintf(stderr, "nes: savevm: %s\n",
+                s->core ? gemu_machine_error(nes_machine(s)) : "no core machine");
         return false;
     }
-    *b = (SnapBuf){ .ok = true };
-    uint64_t magic   = NES_SNAPSHOT_MAGIC;
-    uint32_t version = NES_SNAPSHOT_VERSION;
-    sb_put(b, &magic, sizeof(magic));
-    sb_put(b, &version, sizeof(version));
-    sb_put(b, &s->cart.info, sizeof(s->cart.info));
-
-    size_t chr_ram_len;
-    uint8_t *chr_ram = nes_cart_chr_ram(&s->cart, &chr_ram_len);
-    uint64_t chr_len = chr_ram_len;
-    sb_put(b, &chr_len, sizeof(chr_len));
-    if (chr_len) sb_put(b, chr_ram, chr_len);
-
-    NesState *snap = malloc(sizeof(*snap));
-    if (!snap) { free(b->p); return false; }
-    *snap = *s;
-    snap->cfg     = NULL;
-    nes_cart_strip(&snap->cart);
-    snap->monitor = NULL;
-    snap->exec_hook = NULL; snap->exec_hook_ud = NULL;
-    snap->cpu.mem_read  = NULL; snap->cpu.mem_write  = NULL; snap->cpu.mem_ud  = NULL;
-    snap->ppu.chr_read  = NULL; snap->ppu.chr_write  = NULL; snap->ppu.chr_ud  = NULL;
-    snap->ppu.nt_read   = NULL; snap->ppu.nt_write   = NULL; snap->ppu.nt_ud   = NULL;
-    snap->ppu.irq_scanline  = NULL; snap->ppu.irq_ud = NULL;
-    snap->ppu.alt_palette_rgb = NULL;
-    snap->apu.mem_read     = NULL; snap->apu.mem_ud       = NULL;
-    snap->apu.write_tap    = NULL; snap->apu.write_tap_ud = NULL;
-    snap->apu.audio_dev    = NULL;
-    snap->fds.raw_disk = NULL;
-    snap->core = NULL;
-#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
-    snap->apu_midi.out = NULL;
-#endif
-    sb_put(b, snap, sizeof(*snap));
-    free(snap);
-    if (!b->ok) { free(b->p); b->p = NULL; }
-    return b->ok;
+    return true;
 }
 
 bool nes_snapshot_load(NesState *s, const uint8_t *data, size_t len) {
-    if (s->fds_enabled) {
-        fprintf(stderr, "nes: loadvm not supported for FDS yet\n");
+    uint64_t magic = 0;
+    if (len >= sizeof magic) memcpy(&magic, data, sizeof magic);
+    if (magic == NES_OLD_SNAPSHOT_MAGIC) {
+        uint32_t version = 0;
+        if (len >= sizeof magic + sizeof version) memcpy(&version, data + sizeof magic, sizeof version);
+        fprintf(stderr, "nes: loadvm: this is a save state in the old format (version %u), "
+                "which this GEMU no longer reads; save a new one\n", version);
         return false;
     }
-    SnapRd r = { data, len, 0 };
-    bool ok = true;
-    uint64_t magic   = 0;
-    uint32_t version = 0;
-    NesCartInfo cart  = {0};
-    ok &= sr_get(&r, &magic, sizeof(magic));
-    ok &= sr_get(&r, &version, sizeof(version));
-    ok &= sr_get(&r, &cart, sizeof(cart));
-    if (!ok || magic != NES_SNAPSHOT_MAGIC || version != NES_SNAPSHOT_VERSION ||
-        cart.mapper != s->cart.info.mapper || cart.prg_banks != s->cart.info.prg_banks ||
-        cart.chr_banks != s->cart.info.chr_banks) {
-        fprintf(stderr, "nes: loadvm: snapshot doesn't match the loaded cartridge\n");
+    if (!s->core || !gemu_machine_load_state(nes_machine(s), data, len)) {
+        fprintf(stderr, "nes: loadvm: %s\n",
+                s->core ? gemu_machine_error(nes_machine(s)) : "no core machine");
         return false;
     }
-
-    uint64_t chr_len = 0;
-    size_t want_len;
-    uint8_t *chr_ram = nes_cart_chr_ram(&s->cart, &want_len);
-    ok &= sr_get(&r, &chr_len, sizeof(chr_len));
-    if (!ok || chr_len != want_len) {
-        fprintf(stderr, "nes: loadvm: CHR RAM size mismatch\n");
-        return false;
-    }
-    if (chr_len && !sr_get(&r, chr_ram, chr_len)) return false;
-
-    NesState *loaded = malloc(sizeof(*loaded));
-    if (!loaded) return false;
-    if (!sr_get(&r, loaded, sizeof(*loaded))) { free(loaded); return false; }
-    const MosConfig *cfg     = s->cfg;
-    NesCart          *live_cart = malloc(sizeof(*live_cart));   /* its wiring */
-    if (!live_cart) { free(loaded); return false; }
-    *live_cart = s->cart;
-    GemuMonitor      *monitor = s->monitor;
-    void (*exec_hook)(void *, uint16_t) = s->exec_hook;
-    void             *exec_hook_ud = s->exec_hook_ud;
-    void *cpu_mem_ud  = s->cpu.mem_ud;
-    void *ppu_chr_ud  = s->ppu.chr_ud;
-    void *ppu_nt_ud   = s->ppu.nt_ud;
-    void *ppu_irq_ud  = s->ppu.irq_ud;
-    const uint32_t *ppu_alt_palette = s->ppu.alt_palette_rgb;
-    void *apu_mem_ud       = s->apu.mem_ud;
-    void *apu_write_tap_ud = s->apu.write_tap_ud;
-    GemuAudioOut *audio_dev = s->apu.audio_dev;
-    uint8_t *fds_raw_disk = s->fds.raw_disk;
-    typeof(s->cpu.mem_read)   cpu_mem_read   = s->cpu.mem_read;
-    typeof(s->cpu.mem_write)  cpu_mem_write  = s->cpu.mem_write;
-    typeof(s->ppu.chr_read)   ppu_chr_read   = s->ppu.chr_read;
-    typeof(s->ppu.chr_write)  ppu_chr_write  = s->ppu.chr_write;
-    typeof(s->ppu.nt_read)    ppu_nt_read    = s->ppu.nt_read;
-    typeof(s->ppu.nt_write)   ppu_nt_write   = s->ppu.nt_write;
-    typeof(s->ppu.irq_scanline) ppu_irq_scanline = s->ppu.irq_scanline;
-    typeof(s->apu.mem_read)   apu_mem_read   = s->apu.mem_read;
-    typeof(s->apu.write_tap)  apu_write_tap  = s->apu.write_tap;
-#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
-    MidiOut *apu_midi_out = s->apu_midi.out;
-#endif
-    NesPins pins = s->pins;       /* a debugging setting, not machine state */
-    struct NesCore *core = s->core;
-    *s = *loaded;
-    s->core = core;
-    free(loaded);
-    s->pins = pins;
-    s->pins_seen = pins.version - 1u;   /* reapply: the hook pointers came from the file */
-    s->apu_deadline = 0;
+    /* the board's post_load did the windows, the Game Genie layer and the
+     * APU's cache; the rest belongs to this run */
+    s->pins_seen = s->pins.version - 1u;   /* the pin window's settings: reapply */
     s->clock_seen = 0;
-
-    s->cfg     = cfg;
-    nes_cart_rewire(&s->cart, live_cart);
-    free(live_cart);
-    s->monitor = monitor;
-    s->exec_hook = exec_hook;
-    s->exec_hook_ud = exec_hook_ud;
-    s->cpu.mem_read  = cpu_mem_read;  s->cpu.mem_write = cpu_mem_write; s->cpu.mem_ud = cpu_mem_ud;
-    s->ppu.chr_read  = ppu_chr_read;  s->ppu.chr_write = ppu_chr_write; s->ppu.chr_ud = ppu_chr_ud;
-    s->ppu.nt_read   = ppu_nt_read;   s->ppu.nt_write  = ppu_nt_write;  s->ppu.nt_ud  = ppu_nt_ud;
-    s->ppu.irq_scanline = ppu_irq_scanline; s->ppu.irq_ud = ppu_irq_ud;
-    s->ppu.alt_palette_rgb = ppu_alt_palette;
-    s->apu.mem_read = apu_mem_read; s->apu.mem_ud = apu_mem_ud;
-    s->apu.write_tap = apu_write_tap; s->apu.write_tap_ud = apu_write_tap_ud;
-    s->apu.audio_dev = audio_dev;
-    s->fds.raw_disk = fds_raw_disk;
-    nes_lines_resync(s);
-    nes_maps_sync(s);
-#if defined(HAVE_ALSA) || defined(HAVE_WINMIDI)
-    s->apu_midi.out = apu_midi_out;
-#endif
+    nes_pins_apply(s);
+    rp2c02_refresh_argb(&s->ppu);
     return true;
 }
-
-bool nes_snapshot_save(NesState *s, uint8_t **data, size_t *len) {
-    SnapBuf b;
-    if (!snapshot_save(s, &b)) return false;
-    *data = b.p;
-    *len = b.n;
-    return true;
-}
-
 
 /* ── Monitor commands and memory view ────────────────────────────────────── */
 
@@ -1475,6 +1345,11 @@ typedef struct NesCore {
     GemuExecutor *exec;
     uint64_t     run_start;              /* cycle_count when this run began */
     bool         stopped;                /* the last run ended at a breakpoint or pause */
+    /* N5: the APU's sound (expansion audio mixed in) */
+    GemuStream  *sound;
+    /* N4: the PPU's picture */
+    GemuScreen  *screen;
+    uint64_t     frame_seen;             /* ppu.frame when the screen last began one */
     /* nes_page(): host memory per 256-byte page, [0] reads, [1] writes;
      * NES_PAGE_SLOW = a space access.  Good while the space's generation
      * is page_gen. */
@@ -1484,6 +1359,7 @@ typedef struct NesCore {
     GemuLineIn  *cpu_nmi, *cpu_irq;
 } NesCore;
 
+static GemuMachine *nes_machine(const NesState *s) { return s->core->machine; }
 static GemuSpace *nes_space_cpu(const NesState *s) { return s->core->bus; }
 
 static uint8_t nes_page_slow;
@@ -1662,9 +1538,93 @@ static uint64_t nes_exec_run(void *ud, uint64_t budget) {
     return s->cpu.cycle_count - start;
 }
 
+static void nes_screen_timing(NesState *s, uint32_t hz);
 static void nes_exec_clock(NesState *s, uint32_t hz) {
-    if (s->core && s->core->exec)
+    if (s->core && s->core->exec) {
         gemu_executor_set_clock(s->core->exec, hz);
+        nes_screen_timing(s, hz);
+    }
+}
+
+/* ── The PPU's screen (stage N4) ─────────────────────────────────────────────
+ * Device-timed: a frame begins when the PPU starts line 0 (ppu.frame moves,
+ * nes_sync_ppu_to_cpu()); the raw timing describes its beam (341 dots a
+ * line, the region's lines, three dots per CPU cycle) for vpos/hpos.  The
+ * bitmap is the PPU's ARGB frame, copied when the front end renders it.
+ * The CRT filters read the PPU's palette-index frame, not this: they encode
+ * a composite signal from the indices. */
+static void nes_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    const NesState *s = ud;
+    for (int y = clip->y0; y < clip->y1; y++)
+        memcpy(bmp->pix + (size_t)y * (size_t)bmp->stride,
+               s->ppu.pixels_argb + (size_t)y * RP2C02_WIDTH, RP2C02_WIDTH * sizeof(uint32_t));
+}
+
+static void nes_screen_timing(NesState *s, uint32_t hz) {
+    if (s->core->screen)
+        gemu_screen_set_raw(s->core->screen, (uint64_t)hz * 3u, RP2C02_DOTS_PER_LINE, 0,
+                            RP2C02_WIDTH, s->ppu.lines_total, 0, RP2C02_HEIGHT, false);
+}
+
+static void nes_screen_frame(NesState *s) {
+    NesCore *c = s->core;
+    if (!c || !c->screen) return;
+    c->frame_seen = s->ppu.frame;
+    gemu_screen_frame_begin(c->screen);
+}
+
+static bool nes_screen_build(NesState *s) {
+    NesCore *c = s->core;
+    if (!(c->screen = gemu_screen_new(c->ppu, "screen")) ||
+        !gemu_screen_set_size(c->screen, RP2C02_WIDTH, RP2C02_HEIGHT))
+        return false;
+    gemu_screen_set_update(c->screen, nes_screen_update, s);
+    nes_screen_timing(s, s->pins.clock_hz);
+    return true;
+}
+
+GemuScreen *nes_screen(NesState *s) { return s->core ? s->core->screen : NULL; }
+
+/* ── The APU's stream (stage N5) ─────────────────────────────────────────────
+ * The APU makes its samples as it catches up (resampled to 44.1 kHz, the
+ * cartridge's or Disk System's expansion audio already mixed in, the pin
+ * window's cuts applied) into apu.frame_buf.  Its stream hands them on as
+ * the mixer asks, in order, none lost: a request for more than there are
+ * (the two clocks round differently by a sample now and then) repeats the
+ * last; what's left over waits for the next.  The mixer runs at the end of
+ * each frame (nes_run_frame()) and sends the result to the host audio
+ * device; a slow clock that fills the APU's buffer mid-frame brings the
+ * stream up to date then (nes_sound_drain()).  MIDI out (-soundhw
+ * 2a03-midi) taps the APU's register writes and stays outside. */
+static void nes_sound_update(void *ud, float *const *out, unsigned n) {
+    NesState *s = ud;
+    Apu2a03 *a = &s->apu;
+    unsigned have = (unsigned)a->frame_n, take = n < have ? n : have;
+    memcpy(out[0], a->frame_buf, take * sizeof(float));
+    float last = take ? out[0][take - 1] : (have ? a->frame_buf[0] : 0.0f);
+    for (unsigned i = take; i < n; i++) out[0][i] = last;
+    if (take < have)
+        memmove(a->frame_buf, a->frame_buf + take, (have - take) * sizeof(float));
+    a->frame_n = (int)(have - take);
+}
+
+static void nes_sound_drain(NesState *s) {
+    if (s->core && s->core->sound) gemu_stream_update(s->core->sound);
+    else s->apu.frame_n = 0;
+}
+
+static void nes_sound_out(void *ud, const float *samples, size_t frames) {
+    gemu_audio_queue(ud, samples, frames);
+}
+
+static bool nes_sound_build(NesState *s) {
+    NesCore *c = s->core;
+    if (!(c->sound = gemu_stream_new(c->apu, "sound", 1, APU2A03_SAMPLE_RATE,
+                                     nes_sound_update, s)))
+        return false;
+    gemu_mixer_set_output(c->machine, APU2A03_SAMPLE_RATE, 1,
+                          s->apu.audio_dev ? nes_sound_out : NULL, s->apu.audio_dev);
+    return true;
 }
 
 static uint64_t nes_exec_elapsed(void *ud) {
@@ -1755,13 +1715,36 @@ static void nes_board_post_load(GemuDevice *d) {
     nes_gg_changed(s);
     s->apu_deadline = 0;
 }
+/* The machine's settings (stage N7): -M nes,-frame_irq and the like go to
+ * whichever of these devices has the option (nes_machine_opts()). */
+static const GemuOptionDef nes_board_opts[] = {
+    { "dips", "VS. System DIP switches SW1 1-8, as a byte", GEMU_OPT_INT, "0", 0, 255, NULL },
+    { NULL, NULL, 0, NULL, 0, 0, NULL },
+};
+static const GemuOptionDef nes_apu_opts[] = {
+    { "sweep_registers", "APU sweep units", GEMU_OPT_BOOL, "on", 0, 0, NULL },
+    { "dmc_channel", "APU DMC (sample) channel", GEMU_OPT_BOOL, "on", 0, 0, NULL },
+    { "frame_irq", "APU frame counter IRQ", GEMU_OPT_BOOL, "on", 0, 0, NULL },
+    { NULL, NULL, 0, NULL, 0, 0, NULL },
+};
+static const GemuOptionDef nes_ppu_opts[] = {
+    { "odd_frame_skip", "PPU skips a dot on odd frames", GEMU_OPT_BOOL, "on", 0, 0, NULL },
+    { NULL, NULL, 0, NULL, 0, 0, NULL },
+};
+
 static const GemuDeviceType nes_board_type = {
     .name = "nes-board", .desc = "NES/Famicom console board", .size = sizeof(NesState *),
-    .describe = nes_board_describe, .post_load = nes_board_post_load,
+    .describe = nes_board_describe, .post_load = nes_board_post_load, .options = nes_board_opts,
 };
 NES_TYPE(nes_cpu_type, "rp2a03-cpu", "Ricoh 2A03/2A07 CPU (6502)", nes_cpu_describe);
-NES_TYPE(nes_ppu_type, "rp2c02", "Ricoh 2C02/2C07 PPU", nes_ppu_describe);
-NES_TYPE(nes_apu_type, "rp2a03-apu", "Ricoh 2A03/2A07 APU", nes_apu_describe);
+static const GemuDeviceType nes_ppu_type = {
+    .name = "rp2c02", .desc = "Ricoh 2C02/2C07 PPU", .size = sizeof(NesState *),
+    .describe = nes_ppu_describe, .options = nes_ppu_opts,
+};
+static const GemuDeviceType nes_apu_type = {
+    .name = "rp2a03-apu", .desc = "Ricoh 2A03/2A07 APU", .size = sizeof(NesState *),
+    .describe = nes_apu_describe, .options = nes_apu_opts,
+};
 NES_TYPE(nes_cart_type, "nes-cart-slot", "NES/Famicom cartridge slot", nes_cart_describe);
 NES_TYPE(nes_fds_type, "fds-adapter", "Famicom Disk System RAM adapter", nes_fds_describe);
 
@@ -1801,8 +1784,53 @@ static bool nes_board_state(NesState *s, GemuDevice *d) {
 }
 #undef BOARD
 
+/* -M's settings, "-name", "+name", "name" or "name=value", each to the
+ * device whose type has the option: opts[i] for types[i]. */
+static bool nes_machine_opts(const char *spec, const GemuDeviceType *const *types, char (*opts)[256],
+                             int n) {
+    for (int i = 0; i < n; i++) opts[i][0] = 0;
+    const char *p = spec ? spec : "";
+    while (*p) {
+        size_t len = strcspn(p, ",");
+        char tok[128];
+        if (len && len < sizeof tok) {
+            memcpy(tok, p, len);
+            tok[len] = 0;
+            const char *name = tok, *val = NULL;
+            if (*name == '-' || *name == '+') { val = *name == '-' ? "off" : "on"; name++; }
+            char *eq = strchr(tok, '=');
+            if (eq) { *eq = 0; val = eq + 1; }
+            int found = -1;
+            for (int i = 0; i < n && found < 0; i++)
+                for (const GemuOptionDef *o = types[i]->options; o && o->name; o++)
+                    if (!strcmp(o->name, name)) { found = i; break; }
+            if (found < 0) {
+                fprintf(stderr, "gemu: unknown -M setting '%s'; this machine has:", name);
+                for (int i = 0; i < n; i++)
+                    for (const GemuOptionDef *o = types[i]->options; o && o->name; o++)
+                        fprintf(stderr, " %s", o->name);
+                fprintf(stderr, "\n");
+                return false;
+            }
+            size_t at = strlen(opts[found]);
+            snprintf(opts[found] + at, sizeof opts[found] - at, "%s%s%s%s", at ? "," : "", name,
+                     val ? "=" : "", val ? val : "");
+        }
+        p += len;
+        if (*p == ',') p++;
+    }
+    return true;
+}
+
+static GemuDevice *nes_part_opts(NesState *s, const GemuDeviceType *t, const char *name,
+                                 const char *opts);
 static GemuDevice *nes_part(NesState *s, const GemuDeviceType *t, const char *name) {
-    GemuDevice *d = gemu_device_add(s->core->machine, t, name, NULL, NULL);
+    return nes_part_opts(s, t, name, NULL);
+}
+
+static GemuDevice *nes_part_opts(NesState *s, const GemuDeviceType *t, const char *name,
+                                 const char *opts) {
+    GemuDevice *d = gemu_device_add(s->core->machine, t, name, NULL, opts && *opts ? opts : NULL);
     if (d)
         *(NesState **)d->priv = s;
     return d;
@@ -1812,21 +1840,35 @@ static bool nes_core_build(NesState *s) {
     NesCore *c = s->core = calloc(1, sizeof *c);
     if (!c || !(c->machine = gemu_machine_new("nes")))
         return false;
-    bool ok = (c->board = nes_part(s, &nes_board_type, "board")) && nes_board_state(s, c->board);
+    static const GemuDeviceType *const set_types[] = { &nes_board_type, &nes_apu_type, &nes_ppu_type };
+    char set[3][256];
+    if (!nes_machine_opts(s->cfg->machine_opts, set_types, set, 3))
+        return false;
+    bool ok = (c->board = nes_part_opts(s, &nes_board_type, "board", set[0])) &&
+              nes_board_state(s, c->board);
     ok = ok && (c->cpu = nes_part(s, &nes_cpu_type, "cpu")) &&
          mos6502_state_add(c->cpu, "", &s->cpu);
-    ok = ok && (c->ppu = nes_part(s, &nes_ppu_type, "ppu")) &&
+    ok = ok && (c->ppu = nes_part_opts(s, &nes_ppu_type, "ppu", set[2])) &&
          rp2c02_state_add(c->ppu, "", &s->ppu);
-    ok = ok && (c->apu = nes_part(s, &nes_apu_type, "apu")) &&
+    ok = ok && (c->apu = nes_part_opts(s, &nes_apu_type, "apu", set[1])) &&
          apu2a03_state_add(c->apu, "", &s->apu);
     ok = ok && (c->cart = nes_part(s, &nes_cart_type, "cart")) &&
          nes_cart_state_add(c->cart, "", &s->cart);
     if (ok && s->fds_enabled)
         ok = (c->fds = nes_part(s, &nes_fds_type, "fds")) && fds_state_add(c->fds, "", &s->fds);
+    if (ok) {
+        /* the settings, into the chips */
+        s->apu.sweep_enabled = gemu_opt_bool(c->apu, "sweep_registers");
+        s->apu.dmc_enabled = gemu_opt_bool(c->apu, "dmc_channel");
+        s->apu.frame_irq_enabled = gemu_opt_bool(c->apu, "frame_irq");
+        if (!gemu_opt_bool(c->ppu, "odd_frame_skip")) s->ppu.no_odd_skip = true;
+        if (s->cfg->is_arcade) s->vs_dip = (uint8_t)gemu_opt_int(c->board, "dips");
+    }
     bool inited = gemu_machine_init(c->machine);
     static const GemuExecutorOps exec_ops = { .run = nes_exec_run, .elapsed = nes_exec_elapsed };
     ok = ok && inited && nes_bus_build(s) && nes_lines_build(s) &&
-         (c->exec = gemu_executor_new(c->cpu, s->pins.clock_hz, &exec_ops, s));
+         (c->exec = gemu_executor_new(c->cpu, s->pins.clock_hz, &exec_ops, s)) &&
+         nes_screen_build(s) && nes_sound_build(s);
     if (!inited || !ok || !gemu_machine_start(c->machine)) {
         fprintf(stderr, "nes: core machine: %s\n", gemu_machine_error(c->machine)[0]
                 ? gemu_machine_error(c->machine) : "a device couldn't be added");
@@ -1899,8 +1941,6 @@ NesState *nes_core_create(const MosConfig *cfg) {
     if (cfg->is_dendy) s->ppu.vblank_line = 291;  /* Dendy: 50 extra post-render lines */
     if (cfg->vga == MOS_VGA_RP2C04_0004)
         s->ppu.no_odd_skip = true;
-    if (cfg->disabled_features & MOS_FEATURE_ODD_FRAME_SKIP)
-        s->ppu.no_odd_skip = true;
     if (cfg->is_arcade && s->vs_palette_rgb[0])    /* 2C04 palette present */
         s->ppu.alt_palette_rgb = s->vs_palette_rgb;
     s->ppu.chr_read  = nes_cart_chr_read;
@@ -1936,10 +1976,7 @@ NesState *nes_core_create(const MosConfig *cfg) {
         s->apu.write_tap_ud = &s->apu_midi;
 #endif
     }
-    s->apu.sweep_enabled = (cfg->disabled_features & MOS_FEATURE_SWEEP_REGISTERS) == 0;
-    s->apu.dmc_enabled = (cfg->disabled_features & MOS_FEATURE_DMC_CHANNEL) == 0;
     s->apu.dma_external = true;   /* the DMC's fetches are DMAs that halt the CPU */
-    s->apu.frame_irq_enabled = (cfg->disabled_features & MOS_FEATURE_FRAME_IRQ) == 0;
 
     s->monitor = gemu_monitor_create();
     nes_monitor_setup(s);
@@ -1948,8 +1985,6 @@ NesState *nes_core_create(const MosConfig *cfg) {
     for (int p = 0; p < cfg->n_ports; p++)
         if (nes_device_is_rob(cfg->ports[p])) { rob_init(&s->rob); break; }
 #endif
-    if (cfg->is_arcade)
-        s->vs_dip = VS_DIP_DEFAULT;
     if (!nes_core_build(s)) {
         nes_core_destroy(s);
         return NULL;
@@ -2019,7 +2054,7 @@ void nes_run_frame(NesState *s) {
              s->ppu.ppuctrl, s->ppu.ppumask, s->ppu.ppustatus,
              s->cart.chr_off[0], s->cart.chr_off[4],
              s->cpu.nmi ? 1 : 0, s->cpu.irq ? 1 : 0);
-    /* the frame's audio out to the host */
+    /* the frame's audio out to the host: the APU's stream, through the mixer */
     nes_sync_apu_to_cpu(s, s->cpu.cycle_count);
-    apu2a03_flush(&s->apu);
+    gemu_mixer_run(s->core->machine);
 }

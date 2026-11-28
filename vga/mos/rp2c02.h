@@ -126,6 +126,8 @@ void    rp2c02_init(Rp2c02 *ppu, bool is_pal);
 /* Where a nametable address ($2000-$2FFF) lands in CIRAM (vram), with the
  * mirroring the board has set. */
 uint16_t rp2c02_ciram_index(const Rp2c02 *ppu, uint16_t addr);
+/* pixels_argb from pixels and the palette (after a state load). */
+void     rp2c02_refresh_argb(Rp2c02 *ppu);
 void    rp2c02_reset(Rp2c02 *ppu);
 
 uint8_t rp2c02_read(Rp2c02 *ppu, uint8_t reg);

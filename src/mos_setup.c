@@ -39,58 +39,6 @@ static const MachineDef machine_defs[] = {
     { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
-static bool parse_machine_feature_opts(MosConfig *cfg, const char *opts) {
-    if (!opts || !*opts) return true;
-
-    const char *p = opts;
-    while (*p) {
-        const char *next = strchr(p, ',');
-        size_t len = next ? (size_t)(next - p) : strlen(p);
-        if (len == 0) {
-            if (!next) break;
-            p = next + 1;
-            continue;
-        }
-
-        bool disable = false;
-        if (*p == '-' || *p == '+') {
-            disable = *p == '-';
-            p++;
-            len--;
-        }
-        if (len == 0) {
-            fprintf(stderr, "gemu: empty -M machine feature option\n");
-            return false;
-        }
-
-        char name[64];
-        if (len >= sizeof(name)) len = sizeof(name) - 1;
-        memcpy(name, p, len);
-        name[len] = '\0';
-
-        uint32_t bit = 0;
-        if (strcmp(name, "sweep_registers") == 0) {
-            bit = MOS_FEATURE_SWEEP_REGISTERS;
-        } else if (strcmp(name, "dmc_channel") == 0) {
-            bit = MOS_FEATURE_DMC_CHANNEL;
-        } else if (strcmp(name, "frame_irq") == 0) {
-            bit = MOS_FEATURE_FRAME_IRQ;
-        } else if (strcmp(name, "odd_frame_skip") == 0) {
-            bit = MOS_FEATURE_ODD_FRAME_SKIP;
-        } else {
-            fprintf(stderr, "gemu: unknown -M machine feature '%s'\n", name);
-            return false;
-        }
-
-        if (disable) cfg->disabled_features |= bit;
-        else         cfg->disabled_features &= ~bit;
-
-        if (!next) break;
-        p = next + 1;
-    }
-    return true;
-}
-
 /* ── Device registry ─────────────────────────────────────────────────────── */
 
 static const GemuDevDesc machines[] = {
@@ -508,8 +456,9 @@ int mos_setup(int argc, char *argv[]) {
         return 1;
     gemu_monitor_set_default((args.display_type == GEMU_DISPLAY_CURSES &&
                               !args.monitor_spec) ? "none" : args.monitor_spec);
-    if (!parse_machine_feature_opts(&cfg, args.machine_opts))
-        return 1;
+    /* -M NAME,OPTS: the machine's settings (only the NES has any; its
+     * devices check them: machine_nes.c) */
+    cfg.machine_opts = args.machine_opts && *args.machine_opts ? args.machine_opts : NULL;
     cfg.devices_none = wants_no_default_devices(rem, nrem);
 
     if (args.machine) {
@@ -581,8 +530,8 @@ int mos_setup(int argc, char *argv[]) {
             break;
         }
     }
-    if (cfg.disabled_features && cfg.machine != MOS_MACHINE_NES) {
-        fprintf(stderr, "gemu: selected -M machine feature option is not supported on this machine\n");
+    if (cfg.machine_opts && cfg.machine != MOS_MACHINE_NES) {
+        fprintf(stderr, "gemu: -M settings (%s) are not supported on this machine\n", cfg.machine_opts);
         return 1;
     }
 

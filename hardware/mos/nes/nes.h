@@ -144,6 +144,9 @@ void      nes_sync(NesState *s);
 /* Until the PPU finishes a frame, or the monitor stops at a breakpoint or
  * pauses; then the frame's audio goes out. */
 void      nes_run_frame(NesState *s);
+/* The PPU's picture as a core screen (gemu/dev/screen.h): what the front
+ * end shows. */
+struct GemuScreen *nes_screen(NesState *s);
 /* Real-time pacing without audio: sleep until the host catches up with the
  * console's time; hold (paused, waiting for the network) forgets it. */
 void      nes_pace(NesState *s, bool hold);

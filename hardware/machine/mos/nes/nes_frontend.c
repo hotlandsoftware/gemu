@@ -9,6 +9,7 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "nes_frontend.h"
+#include "gemu/dev/screen.h"
 #include "gemu/util.h"
 #include "storage/fds.h"
 #include "nes_ntsc_encode.h"
@@ -1009,13 +1010,14 @@ static void nes_present_frame(NesState *s, const MosConfig *cfg, bool end_of_fra
                        g_crt_argb, NES_CRT_WIDTH, NES_CRT_HEIGHT);
     }
 
-    /* PPU already builds pixels_argb. */
     if (g_display && cfg->crt_type != MOS_CRT_NONE && g_crt_argb) {
         gemu_display_render(g_display, g_crt_argb,
                             NES_CRT_WIDTH, NES_CRT_HEIGHT);
     } else if (g_display) {
-        gemu_display_render(g_display, s->ppu.pixels_argb,
-                            RP2C02_WIDTH, RP2C02_HEIGHT);
+        /* the PPU's screen (Lua's gui.* overlay included: it draws into the
+         * frame the screen is rendered from) */
+        const GemuBitmap *b = gemu_screen_render(nes_screen(s));
+        gemu_display_render(g_display, b->pix, b->width, b->height);
     }
 }
 

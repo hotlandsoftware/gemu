@@ -44,6 +44,12 @@ static uint16_t nt_mirror(const Rp2c02 *ppu, uint16_t addr) {
 
 uint16_t rp2c02_ciram_index(const Rp2c02 *ppu, uint16_t addr) { return nt_mirror(ppu, addr); }
 
+void rp2c02_refresh_argb(Rp2c02 *ppu) {
+    const uint32_t *pal = ppu->alt_palette_rgb ? ppu->alt_palette_rgb : rp2c02_palette_rgb;
+    for (size_t i = 0; i < (size_t)RP2C02_WIDTH * RP2C02_HEIGHT; i++)
+        ppu->pixels_argb[i] = pal[ppu->pixels[i] & 0x3Fu];
+}
+
 static uint8_t palette_index(uint8_t addr) {
     addr &= 0x1Fu;
     if ((addr & 0x13u) == 0x10u) addr &= (uint8_t)~0x10u;
