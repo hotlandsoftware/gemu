@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="ppi8255" description="Intel 8255 programmable peripheral interface" status="working">
+    <type symbol="gemu_ppi8255_type" source="hardware/device/controller/ppi8255_dev.c"/>
+</device>

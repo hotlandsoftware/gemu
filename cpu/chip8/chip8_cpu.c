@@ -274,9 +274,10 @@ static inline void exec_insn(Chip8State *s, const Chip8Insn *ins) {  /* used by 
 
     /* ── Misc ─────────────────────────────────────────────────────────── */
     case C8_RND_VX_KK: {
-        /* Use xorshift32 for speed over rand() */
-        static uint32_t rng = 0xDEADBEEF;
+        /* xorshift32 (the state's, so a save state replays it) */
+        uint32_t rng = s->rng;
         rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        s->rng = rng;
         V[ins->x] = (uint8_t)(rng & 0xFF) & ins->kk;
         s->PC += 2;
         break;
@@ -308,6 +309,15 @@ void chip8_execute_tb(Chip8State *s, GemuTb *tb) {
     }
 }
 
+bool chip8_exec_one(Chip8State *s) {
+    if (s->PC + 1 >= CHIP8_MEM_SIZE) return false;
+    uint16_t raw = (uint16_t)((s->mem[s->PC] << 8) | s->mem[s->PC + 1]);
+    Chip8Insn ins = chip8_decode(raw);
+    exec_insn(s, &ins);
+    s->insn_count++;
+    return true;
+}
+
 void chip8_exec_single(Chip8State *s) {
     if (s->PC + 1 >= CHIP8_MEM_SIZE) {
         printf("step: PC out of bounds (0x%04X)\n", s->PC);
@@ -315,7 +325,5 @@ void chip8_exec_single(Chip8State *s) {
     }
     uint16_t raw = (uint16_t)((s->mem[s->PC] << 8) | s->mem[s->PC + 1]);
     printf("step @ PC=0x%04X  [%04X]\n", s->PC, raw);
-    Chip8Insn ins = chip8_decode(raw);
-    exec_insn(s, &ins);
-    s->insn_count++;
+    chip8_exec_one(s);
 }

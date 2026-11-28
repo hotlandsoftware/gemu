@@ -37,6 +37,11 @@
  */
 #include "baby.h"
 #include "ssem.h"
+#include "ssem_dev.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/state.h"
 #include "vgafont16.h"
 #include "gemu/gemu_display.h"
 #include "gemu/monitor.h"
@@ -100,18 +105,20 @@ typedef struct { int x, y, w, h; CtlKind kind; int index; } Ctl;
 #define MAX_CTLS 64
 
 struct BabyState {
+    GemuMachine *machine;    /* the core machine (stage O1) */
+    GemuDevice  *board, *cpu;
+    GemuScreen  *screen;
     GemuDisplay *display;
     GemuMonitor *monitor;
     uint32_t     fb[FB_W * FB_H];
 
-    Ssem         m;
+    Ssem        *m;          /* the cpu device's */
     BabyTube     tube;       /* what the monitor shows */
     unsigned     lstat;      /* line switches, 5 bits */
     unsigned     fstat;      /* function switches, 3 bits */
     bool         erase;      /* Write/Erase at Erase */
     bool         manual;     /* Man/Auto at Manual */
-    bool         run;        /* Stop/Run at Run */
-    double       owed;       /* instructions due but not yet obeyed */
+    bool         run;        /* Stop/Run at Run (the cpu device runs while it is) */
 
     Ctl          ctls[MAX_CTLS];
     int          n_ctls;
@@ -207,7 +214,7 @@ static void raster_line(BabyState *s, int line, uint32_t word) {
 }
 
 static bool pi_exists(const BabyState *s) {
-    return s->run && !s->m.stopped;
+    return s->run && !s->m->stopped;
 }
 
 static void draw_tube(BabyState *s) {
@@ -215,11 +222,11 @@ static void draw_tube(BabyState *s) {
     fill(s, SCREEN_X, SCREEN_Y, SCREEN_W, SCREEN_H, COL_PHOSPHOR);
     for (int line = 0; line < SSEM_LINES; line++) {
         switch (s->tube) {
-        case TUBE_STORE:   raster_line(s, line, s->m.store[line]); break;
-        case TUBE_ACC:     raster_line(s, line, s->m.a); break;
+        case TUBE_STORE:   raster_line(s, line, s->m->store[line]); break;
+        case TUBE_ACC:     raster_line(s, line, s->m->a); break;
         case TUBE_CONTROL:
-            if (!(line & 1)) raster_line(s, line, s->m.ci);
-            else if (pi_exists(s)) raster_line(s, line, s->m.pi);
+            if (!(line & 1)) raster_line(s, line, s->m->ci);
+            else if (pi_exists(s)) raster_line(s, line, s->m->pi);
             break;
         }
     }
@@ -325,8 +332,8 @@ static void draw_panel(BabyState *s) {
 
     /* the stop lamp */
     disc(s, PANEL_X + 308, 412, 13, 0xFF101010u);
-    disc(s, PANEL_X + 308, 412, 11, s->m.stopped ? 0xFFFF5A3Cu : 0xFF4A2A24u);
-    text_centered(s, PANEL_X + 264, 88, 428, "STOP", s->m.stopped ? COL_TEXT : COL_DIM);
+    disc(s, PANEL_X + 308, 412, 11, s->m->stopped ? 0xFFFF5A3Cu : 0xFF4A2A24u);
+    text_centered(s, PANEL_X + 264, 88, 428, "STOP", s->m->stopped ? COL_TEXT : COL_DIM);
 
     text(s, PANEL_X, 456, "Space Run/Stop  Enter KC  M Man/Auto", COL_DIM);
     text(s, PANEL_X, 474, "W Wr/Erase  1-3 Display  C A L K Clear", COL_DIM);
@@ -341,37 +348,37 @@ static void baby_render(BabyState *s) {
 /* ── Operating the panel ───────────────────────────────────────────────── */
 
 static void clear_control(BabyState *s) {
-    s->m.ci = 0;
-    s->m.pi = 0;
+    s->m->ci = 0;
+    s->m->pi = 0;
 }
 
 static void set_run(BabyState *s, bool run) {
-    if (run && !s->run) s->m.stopped = false;    /* Stop -> Run carries on after STP */
+    if (run && !s->run) s->m->stopped = false;    /* Stop -> Run carries on after STP */
     s->run = run;
-    s->owed = 0;
+    gemu_ssem_set_running(s->cpu, run);
 }
 
 /* KC: one instruction, while stopped. */
 static void press_kc(BabyState *s) {
     if (s->run) return;
-    s->m.stopped = false;
-    if (s->manual) ssem_obey(&s->m, SSEM_INSN(s->fstat, s->lstat));
-    else ssem_step(&s->m);
+    s->m->stopped = false;
+    if (s->manual) ssem_obey(s->m, SSEM_INSN(s->fstat, s->lstat));
+    else ssem_step(s->m);
 }
 
 static void operate(BabyState *s, const Ctl *c) {
     switch (c->kind) {
     case C_TYPE:
         if (s->run) break;                         /* the typewriter works while stopped */
-        if (s->erase) s->m.store[s->lstat] &= ~(1u << c->index);
-        else          s->m.store[s->lstat] |= 1u << c->index;
+        if (s->erase) s->m->store[s->lstat] &= ~(1u << c->index);
+        else          s->m->store[s->lstat] |= 1u << c->index;
         break;
     case C_LSTAT:  s->lstat ^= 1u << c->index; break;
     case C_FSTAT:  s->fstat ^= 1u << c->index; break;
     case C_KCC:    clear_control(s); break;
-    case C_KAC:    s->m.a = 0; break;
-    case C_KLC:    s->m.store[s->lstat] = 0; break;
-    case C_KSC:    memset(s->m.store, 0, sizeof s->m.store); break;
+    case C_KAC:    s->m->a = 0; break;
+    case C_KLC:    s->m->store[s->lstat] = 0; break;
+    case C_KSC:    memset(s->m->store, 0, sizeof s->m->store); break;
     case C_WRITE:  s->erase = !s->erase; break;
     case C_MANUAL: s->manual = !s->manual; break;
     case C_RUN:    set_run(s, !s->run); break;
@@ -407,42 +414,48 @@ static void handle_input(BabyState *s, uint32_t actions) {
     if (down & GEMU_ACTION(A_MANUAL))  s->manual = !s->manual;
     if (down & GEMU_ACTION(A_WRITE))   s->erase = !s->erase;
     if (down & GEMU_ACTION(A_KCC))     clear_control(s);
-    if (down & GEMU_ACTION(A_KAC))     s->m.a = 0;
-    if (down & GEMU_ACTION(A_KLC))     s->m.store[s->lstat] = 0;
-    if (down & GEMU_ACTION(A_KSC))     memset(s->m.store, 0, sizeof s->m.store);
+    if (down & GEMU_ACTION(A_KAC))     s->m->a = 0;
+    if (down & GEMU_ACTION(A_KLC))     s->m->store[s->lstat] = 0;
+    if (down & GEMU_ACTION(A_KSC))     memset(s->m->store, 0, sizeof s->m->store);
 }
 
-/* A frame's worth of running. */
-static void baby_run_frame(BabyState *s) {
-    if (!s->run || s->m.stopped) return;
-    s->owed += (double)BABY_IPS / FPS;
-    while (s->owed >= 1 && ssem_step(&s->m)) s->owed -= 1;
-    if (s->m.stopped) s->owed = 0;
+/* A breakpoint at the next instruction's line (byte address 4 x line in
+ * the monitor's view of the store). */
+static bool baby_stop_before(void *ud) {
+    BabyState *s = ud;
+    return gemu_monitor_check_exec(s->monitor, SSEM_LINE(s->m->ci + 1) * 4u);
+}
+
+/* A frame's worth of running: the machine for 1/60 s (the cpu device runs
+ * at 1,100 instructions a second while the switch is at Run). */
+static void baby_frame(BabyState *s) {
+    gemu_ssem_set_stop_before(s->cpu, gemu_monitor_has_exec_breakpoints(s->monitor)
+                              ? baby_stop_before : NULL, s);
+    gemu_machine_run_until(s->machine, gemu_machine_time(s->machine) + gemu_clocks(FPS, 1));
 }
 
 /* ── Monitor ───────────────────────────────────────────────────────────── */
 
 static void baby_reset(BabyState *s) {
     clear_control(s);
-    s->m.a = 0;
-    s->m.stopped = false;
-    s->m.steps = 0;
-    s->run = false;
-    s->owed = 0;
+    s->m->a = 0;
+    s->m->stopped = false;
+    s->m->steps = 0;
+    set_run(s, false);
 }
 
 static void baby_cpu_state(void *ud, char *buf, size_t buf_len) {
     BabyState *s = ud;
     char pi[16] = "-";
-    if (pi_exists(s)) ssem_disasm(s->m.pi, pi, sizeof pi);
+    if (pi_exists(s)) ssem_disasm(s->m->pi, pi, sizeof pi);
     snprintf(buf, buf_len,
              "Manchester Baby (SSEM)\n"
              "  CI=%08X (line %u)  PI=%s  A=%08X (%d)\n"
              "  %s%s, %s, %s, L-stat=%u F-stat=%u (%s)  %llu instructions\n",
-             (unsigned)s->m.ci, SSEM_LINE(s->m.ci), pi, (unsigned)s->m.a, (int32_t)s->m.a,
-             s->run ? "run" : "stop", s->m.stopped ? " (stop lamp)" : "",
+             (unsigned)s->m->ci, SSEM_LINE(s->m->ci), pi, (unsigned)s->m->a, (int32_t)s->m->a,
+             s->run ? "run" : "stop", s->m->stopped ? " (stop lamp)" : "",
              s->manual ? "manual" : "auto", s->erase ? "erase" : "write",
-             s->lstat, s->fstat, ssem_mnemonic(s->fstat), (unsigned long long)s->m.steps);
+             s->lstat, s->fstat, ssem_mnemonic(s->fstat), (unsigned long long)s->m->steps);
 }
 
 static bool baby_screendump(void *ud, const char *path) {
@@ -454,7 +467,7 @@ static bool baby_screendump(void *ud, const char *path) {
 static bool baby_mem_read(void *ud, uint64_t addr, uint8_t *val) {
     BabyState *s = ud;
     if (addr >= SSEM_LINES * 4) return false;
-    *val = (uint8_t)(s->m.store[addr / 4] >> (addr % 4 * 8));
+    *val = (uint8_t)(s->m->store[addr / 4] >> (addr % 4 * 8));
     return true;
 }
 
@@ -462,17 +475,86 @@ static bool baby_mem_write(void *ud, uint64_t addr, uint8_t val) {
     BabyState *s = ud;
     if (addr >= SSEM_LINES * 4) return false;
     unsigned sh = (unsigned)(addr % 4 * 8);
-    s->m.store[addr / 4] = (s->m.store[addr / 4] & ~(0xFFu << sh)) | (uint32_t)val << sh;
+    s->m->store[addr / 4] = (s->m->store[addr / 4] & ~(0xFFu << sh)) | (uint32_t)val << sh;
     return true;
 }
 
 /* ── Lifecycle ─────────────────────────────────────────────────────────── */
+
+/* ── The core machine (stage O1) ─────────────────────────────────────────────
+ * board (baby-board): the panel's switches and the display switches; cpu
+ * (ssem): the machine's executor at 1,100 instructions a second, running
+ * while Stop/Run is at Run; the board's "screen" is the tube and the panel
+ * as drawn.  Before stage O each frame added 1,100/60 instructions to a
+ * floating-point sum and obeyed its whole part (the sum lost a little now
+ * and then, so a frame sometimes ran one fewer); now the speed is the
+ * executor's clock, exactly 1,100 a second.  Breakpoints are new: at a
+ * line, as the monitor's byte address (4 x the line). */
+static void baby_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    BabyState *s = ud;
+    baby_render(s);
+    for (int y = clip->y0; y < clip->y1; y++)
+        memcpy(bmp->pix + (size_t)y * (size_t)bmp->stride, s->fb + (size_t)y * FB_W,
+               FB_W * sizeof(uint32_t));
+}
+
+static void baby_board_describe(GemuDevice *d, char *buf, size_t len) {
+    const BabyState *s = *(BabyState **)d->priv;
+    static const char *const tubes[] = { "store", "accumulator", "control" };
+    snprintf(buf, len, "%s, %s, %s; line switches %u, function switches %u (%s); the tube shows the %s",
+             s->run ? "run" : "stop", s->manual ? "manual" : "auto", s->erase ? "erase" : "write",
+             s->lstat, s->fstat, ssem_mnemonic(s->fstat), tubes[s->tube]);
+}
+
+static const GemuDeviceType baby_board_type = {
+    .name = "baby-board", .desc = "Manchester Baby's panel and monitor tube",
+    .size = sizeof(BabyState *), .describe = baby_board_describe,
+};
+
+#define B(field) ok &= GEMU_STATE_MEMBER(d, "", s, field)
+/* The panel's state: its switches.  Not saved: the controls' layout, the
+ * mouse, the picture (drawn). */
+static bool baby_board_state(BabyState *s, GemuDevice *d) {
+    bool ok = true;
+    B(tube); B(lstat); B(fstat); B(erase); B(manual); B(run);
+    return ok;
+}
+#undef B
+
+static bool baby_core_build(BabyState *s) {
+    if (!(s->machine = gemu_machine_new("baby"))) return false;
+    bool ok = (s->board = gemu_device_add(s->machine, &baby_board_type, "board", NULL, NULL)) &&
+              (s->cpu = gemu_device_add(s->machine, &gemu_ssem_type, "cpu", NULL, NULL));
+    if (ok) {
+        *(BabyState **)s->board->priv = s;
+        ok = baby_board_state(s, s->board) && gemu_machine_init(s->machine);
+    }
+    if (ok) {
+        s->m = gemu_ssem(s->cpu);
+        ok = gemu_ssem_exec(s->cpu, BABY_IPS) &&
+             (s->screen = gemu_screen_new(s->board, "screen")) &&
+             gemu_screen_set_size(s->screen, FB_W, FB_H);
+    }
+    if (ok) {
+        gemu_screen_set_update(s->screen, baby_screen_update, s);
+        ok = gemu_machine_start(s->machine);
+    }
+    if (!ok)
+        fprintf(stderr, "gemu-other: core machine: %s\n", gemu_machine_error(s->machine)[0]
+                ? gemu_machine_error(s->machine) : "a device couldn't be added");
+    return ok;
+}
 
 BabyState *other_baby_create(const OtherConfig *cfg) {
     BabyState *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->held = -1;
     layout(s);
+    if (!baby_core_build(s)) {
+        gemu_machine_free(s->machine);
+        free(s);
+        return NULL;
+    }
     baby_reset(s);
 
     s->monitor = gemu_monitor_create();
@@ -480,6 +562,7 @@ BabyState *other_baby_create(const OtherConfig *cfg) {
     gemu_monitor_set_screendump_cb(s->monitor, baby_screendump, s);
     GemuMonMemory mem = { baby_mem_read, baby_mem_write, s, 7, false };
     gemu_monitor_set_memory(s->monitor, &mem);
+    gemu_monitor_attach_machine(s->monitor, s->machine, NULL);
 
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
@@ -493,8 +576,7 @@ BabyState *other_baby_create(const OtherConfig *cfg) {
         };
         s->display = gemu_display_create(cfg->display_type, &dc);
         if (!s->display) {
-            gemu_monitor_destroy(s->monitor);
-            free(s);
+            other_baby_destroy(s);
             return NULL;
         }
     }
@@ -505,6 +587,7 @@ void other_baby_destroy(BabyState *s) {
     if (!s) return;
     gemu_display_destroy(s->display);
     gemu_monitor_destroy(s->monitor);
+    gemu_machine_free(s->machine);
     free(s);
 }
 
@@ -535,20 +618,26 @@ void other_baby_run(BabyState *s, const OtherConfig *cfg) {
                 baby_reset(s);
             } else if (cmd == GEMU_MON_STEP) {
                 uint32_t n = gemu_monitor_step_count(s->monitor);
-                s->m.stopped = false;
-                for (uint32_t i = 0; i < n && ssem_step(&s->m); i++) {}
+                s->m->stopped = false;
+                for (uint32_t i = 0; i < n && ssem_step(s->m); i++) {}
             }
         }
         if (!running) break;
 
-        if (!gemu_monitor_is_paused(s->monitor))
-            baby_run_frame(s);
-        baby_render(s);
+        bool paused = gemu_monitor_is_paused(s->monitor);
+        if (!paused) baby_frame(s);
         if (s->display) {
-            gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
-            gemu_display_render(s->display, s->fb, FB_W, FB_H);
+            gemu_display_set_paused(s->display, paused);
+            const GemuBitmap *b = gemu_screen_render(s->screen);
+            gemu_display_render(s->display, b->pix, b->width, b->height);
         }
-        baby_sleep_frame();
+        /* Pace to the machine's time; paused, a frame's delay. */
+        if (!paused) {
+            gemu_machine_pace(s->machine, 0);
+        } else {
+            gemu_machine_pace_reset(s->machine);
+            baby_sleep_frame();
+        }
     }
     gemu_monitor_stop(s->monitor);
 }

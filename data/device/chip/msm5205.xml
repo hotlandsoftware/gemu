@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="msm5205" description="OKI MSM5205 ADPCM speech synthesizer" status="working">
+    <type symbol="gemu_msm5205_type" source="audio/msm5205_dev.c"/>
+</device>

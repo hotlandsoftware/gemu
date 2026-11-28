@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="adc0809" description="National ADC0809 8-channel A/D converter" status="working">
+    <type symbol="gemu_adc0809_type" source="hardware/device/controller/adc0809_dev.c"/>
+</device>

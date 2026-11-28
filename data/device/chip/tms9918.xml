@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="tms9918" description="TI TMS9918/9928/9128 video display processor" status="working">
+    <type symbol="gemu_tms9918_type" source="vga/multi/tms9918_dev.c"/>
+</device>

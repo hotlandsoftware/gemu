@@ -92,6 +92,7 @@ typedef struct Chip8State {
     uint64_t     insn_count;
     uint64_t     tb_hits;
     uint64_t     tb_misses;
+    uint32_t     rng;          /* RND's xorshift32 */
 } Chip8State;
 
 typedef struct Chip8Config {
@@ -113,9 +114,11 @@ typedef struct Chip8Config {
 /* cpu.c */
 GemuTb   *chip8_translate_block(Chip8State *s, uint16_t pc);
 void      chip8_execute_tb(Chip8State *s, GemuTb *tb);
-void      chip8_exec_single(Chip8State *s); /* monitor step */
+void      chip8_exec_single(Chip8State *s); /* monitor step (prints it) */
+bool      chip8_exec_one(Chip8State *s);    /* one instruction, quietly; false if PC is out of memory */
 
 /* machine.c */
-Chip8State *chip8_machine_create(const Chip8Config *cfg);
-void        chip8_machine_run(Chip8State *s, const Chip8Config *cfg);
-void        chip8_machine_destroy(Chip8State *s);
+typedef struct Chip8Machine Chip8Machine;
+Chip8Machine *chip8_machine_create(const Chip8Config *cfg);
+void          chip8_machine_run(Chip8Machine *s, const Chip8Config *cfg);
+void          chip8_machine_destroy(Chip8Machine *s);

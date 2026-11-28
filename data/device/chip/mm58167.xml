@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="mm58167" description="National MM58167 real-time clock" status="working">
+    <type symbol="gemu_mm58167_type" source="hardware/device/timer/mm58167_dev.c"/>
+</device>

@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="ssem" description="Manchester Baby (SSEM) processor" status="working">
+    <type symbol="gemu_ssem_type" source="cpu/other/ssem_dev.c"/>
+</device>

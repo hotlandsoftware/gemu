@@ -232,6 +232,7 @@ int rca_setup(int argc, char *argv[]) {
                 if (n == 0) {
                     fprintf(stderr, "gemu: no known ROMs found in '%s' for machine '%s'\n",
                             val, alias);
+                    romdb_print_needed(alias);
                     return 1;
                 }
             } else {

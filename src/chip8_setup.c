@@ -119,7 +119,7 @@ int chip8_setup(int argc, char *argv[]) {
         return 1;
     }
 
-    Chip8State *s = chip8_machine_create(&cfg);
+    Chip8Machine *s = chip8_machine_create(&cfg);
     if (!s) { if (sdl_up) SDL_Quit(); return 1; }
 
     chip8_machine_run(s, &cfg);

@@ -35,8 +35,11 @@
 #define Z80GEN_PORT_BDOS 0xFEu   /* -cpm: the BDOS entry's OUT */
 #define Z80GEN_PORT_EXIT 0xFFu   /* -cpm: warm boot */
 
+struct Z80GenCore;
+
 typedef struct Z80GenericState {
-    Z80              cpu;
+    struct Z80GenCore *core;    /* the core machine (stage Z2) */
+    Z80              *cpu;      /* the cpu device's */
     const Z80Config *cfg;
     uint8_t          mem[0x10000];
     uint8_t          rom_map[0x10000];   /* 1 = read-only */
@@ -44,14 +47,13 @@ typedef struct Z80GenericState {
     uint16_t timer_reload;
     uint8_t  timer_ctrl;
     bool     timer_pending;
-    uint64_t timer_next_fire;
 
     uint8_t  serial_ctrl;
     uint8_t  serial_rxq[16];
     uint8_t  serial_rxq_r, serial_rxq_w, serial_rxq_cnt;
 
     bool     exit_requested;   /* -cpm warm boot */
-    uint64_t insn_count;
+    uint64_t step_to;          /* monitor step: run to this instruction count (0: not stepping) */
 
     GemuMonitor *monitor;
 } Z80GenericState;

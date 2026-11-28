@@ -3,6 +3,10 @@
 #endif
 
 #include "tvgame6.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/state.h"
 #include "gemu/gemu_display.h"
 #include "gemu/monitor.h"
 #include "gemu/screendump.h"
@@ -134,10 +138,8 @@ static const ModePalette mode_palette[3] = {
                       0xff3a687f, 0xff51bc29, 0xff98ff8d, 0xffaefbff },
 };
 
-struct MitsuTvGame6State {
-    GemuDisplay *display;
-    GemuMonitor *monitor;
-    uint32_t fb[FB_W * FB_H];
+/* The M58815P's state: the m58815p device's. */
+typedef struct TvGame6 {
     TvGame6Mode mode;
     bool double_paddles;
     bool waiting_serve;
@@ -159,6 +161,19 @@ struct MitsuTvGame6State {
     int left_score;
     int right_score;
     uint32_t prev_actions;
+    uint32_t actions;      /* the controls, as the chip's pins see them this frame */
+    uint32_t rng;          /* volleyball's anti-stall pick (xorshift32) */
+} TvGame6;
+
+struct MitsuTvGame6State {
+    GemuMachine *machine;  /* the core machine (stage O2) */
+    GemuDevice  *board, *chip;
+    GemuTimer   *frame;
+    GemuScreen  *screen;
+    TvGame6     *g;        /* the chip device's */
+    GemuDisplay *display;
+    GemuMonitor *monitor;
+    uint32_t fb[FB_W * FB_H];
 };
 
 static const char *mode_name(TvGame6Mode mode) {
@@ -185,7 +200,7 @@ static const GemuActionDef tvgame6_actions[] = {
     { "resize_right",   ACT_RESIZE_R,      "7" },
 };
 
-static void tvgame6_reset_ball(MitsuTvGame6State *s, int dir) {
+static void tvgame6_reset_ball(TvGame6 *s, int dir) {
     s->ball_x = COURT_X + COURT_W / 2;
     s->ball_y = COURT_Y + COURT_H / 2;
     s->h_dir = dir >= 0 ? 1 : -1;
@@ -199,7 +214,7 @@ static void tvgame6_reset_ball(MitsuTvGame6State *s, int dir) {
     s->waiting_serve = true;
 }
 
-static void tvgame6_reset(MitsuTvGame6State *s) {
+static void tvgame6_reset(TvGame6 *s) {
     s->mode = TVG_TENNIS;
     s->double_paddles = false;
     s->waiting_serve = true;
@@ -215,7 +230,7 @@ static void tvgame6_reset(MitsuTvGame6State *s) {
 }
 
 static void tvgame6_cpu_state(void *ud, char *buf, size_t buf_len) {
-    MitsuTvGame6State *s = ud;
+    const TvGame6 *s = ((MitsuTvGame6State *)ud)->g;
     snprintf(buf, buf_len,
              "Nintendo Color TV-Game 6 (behavioral M58815P model)\n"
              "  mode=%s paddles=%s speed=%s score=%d-%d serve=%s\n"
@@ -228,49 +243,11 @@ static void tvgame6_cpu_state(void *ud, char *buf, size_t buf_len) {
              s->h_dir, s->h_step, s->v_dir, s->v_div, s->v_step, s->v_acc, s->bounce_count);
 }
 
+static void render_game(MitsuTvGame6State *s);
 static bool tvgame6_screendump(void *ud, const char *path) {
     MitsuTvGame6State *s = ud;
+    render_game(s);
     return gemu_screendump_argb(path, s->fb, FB_W, FB_H);
-}
-
-MitsuTvGame6State *mitsu_tvgame6_create(const MitsuConfig *cfg) {
-    MitsuTvGame6State *s = calloc(1, sizeof(*s));
-    if (!s)
-        return NULL;
-
-    srand((unsigned)time(NULL));
-    tvgame6_reset(s);
-
-    s->monitor = gemu_monitor_create();
-    gemu_monitor_set_cpu_state_cb(s->monitor, tvgame6_cpu_state, s);
-    gemu_monitor_set_screendump_cb(s->monitor, tvgame6_screendump, s);
-
-    if (gemu_display_wanted(cfg->display_type)) {
-        GemuDisplayConfig dc = {
-            .fb_width = FB_W,
-            .monitor = s->monitor,
-            .fb_height = FB_H,
-            .scale = cfg->display_scale,
-            .actions = tvgame6_actions,
-            .n_actions = (int)(sizeof tvgame6_actions / sizeof *tvgame6_actions),
-            .ini_section = "tvgame6",
-        };
-        s->display = gemu_display_create(cfg->display_type, &dc);
-        if (!s->display) {
-            gemu_monitor_destroy(s->monitor);
-            free(s);
-            return NULL;
-        }
-    }
-    return s;
-}
-
-void mitsu_tvgame6_destroy(MitsuTvGame6State *s) {
-    if (!s)
-        return;
-    gemu_display_destroy(s->display);
-    gemu_monitor_destroy(s->monitor);
-    free(s);
 }
 
 static void put_px(MitsuTvGame6State *s, int x, int y, uint32_t c) {
@@ -290,7 +267,7 @@ static void draw_paddle(MitsuTvGame6State *s, int x, int cy, int h, uint32_t c) 
 
 static void draw_side_paddles(MitsuTvGame6State *s, bool is_left, int x, int cy, int h, uint32_t c) {
     draw_paddle(s, x, cy, h, c);
-    if (!s->double_paddles)
+    if (!s->g->double_paddles)
         return;
     int x2 = x + (is_left ? PADDLE_OFFSET : -PADDLE_OFFSET);
     draw_paddle(s, x2, cy, h, c);
@@ -416,13 +393,13 @@ static bool in_rect(int x, int y, int rx, int ry, int rw, int rh) {
     return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
 }
 
-static bool ball_in_rect(const MitsuTvGame6State *s, int rx, int ry, int rw, int rh) {
+static bool ball_in_rect(const TvGame6 *s, int rx, int ry, int rw, int rh) {
     return in_rect(s->ball_x, s->ball_y,
                    rx - BALL_W / 2, ry - BALL_H / 2,
                    rw + BALL_W, rh + BALL_H);
 }
 
-static bool hit_side_paddles(const MitsuTvGame6State *s, bool left) {
+static bool hit_side_paddles(const TvGame6 *s, bool left) {
     int x = left ? 48 : 265;
     int cy = left ? s->left_y : s->right_y;
     int h = left ? s->left_h : s->right_h;
@@ -434,11 +411,11 @@ static bool hit_side_paddles(const MitsuTvGame6State *s, bool left) {
     return in_rect(s->ball_x, s->ball_y, x2 - 2, cy - h / 2 - 2, PADDLE_W + 4, h + 4);
 }
 
-static bool hit_marker_rect(const MitsuTvGame6State *s, int x, int y) {
+static bool hit_marker_rect(const TvGame6 *s, int x, int y) {
     return ball_in_rect(s, x, y, MARKER_W, MARKER_H);
 }
 
-static bool hit_barrier(const MitsuTvGame6State *s, int *color, int *zone) {
+static bool hit_barrier(const TvGame6 *s, int *color, int *zone) {
     for (int row = 0; row < 6; row++) {
         int gy = MARKER_GREEN_Y0 + row * MARKER_STEP;
         int ry = MARKER_RED_Y0 + row * MARKER_STEP;
@@ -483,7 +460,7 @@ static int paddle_zone_of(int ball_y, int paddle_cy, int paddle_h) {
     return zone > 4 ? 4 : zone;
 }
 
-static void apply_bounce(MitsuTvGame6State *s, int div, int step, int dir) {
+static void apply_bounce(TvGame6 *s, int div, int step, int dir) {
     s->h_dir = -s->h_dir;
     s->v_div = div;
     s->v_step = step;
@@ -491,7 +468,7 @@ static void apply_bounce(MitsuTvGame6State *s, int div, int step, int dir) {
     s->v_acc = 0;
 }
 
-static void set_mode(MitsuTvGame6State *s, TvGame6Mode mode) {
+static void set_mode(TvGame6 *s, TvGame6Mode mode) {
     if (s->mode == mode)
         return;
     s->mode = mode;
@@ -500,7 +477,7 @@ static void set_mode(MitsuTvGame6State *s, TvGame6Mode mode) {
     tvgame6_reset_ball(s, 1);
 }
 
-static void step_ball(MitsuTvGame6State *s) {
+static void step_ball(TvGame6 *s) {
     s->ball_x += s->h_dir * s->h_step;
     if (s->v_div > 0) {
         s->v_acc++;
@@ -511,7 +488,7 @@ static void step_ball(MitsuTvGame6State *s) {
     }
 }
 
-static void update_game(MitsuTvGame6State *s, uint32_t actions) {
+static void update_game(TvGame6 *s, uint32_t actions) {
     uint32_t pressed = actions & ~s->prev_actions;
     if (pressed & ACT_TENNIS) set_mode(s, TVG_TENNIS);
     if (pressed & ACT_VOLLEY) set_mode(s, TVG_VOLLEY);
@@ -586,7 +563,8 @@ static void update_game(MitsuTvGame6State *s, uint32_t actions) {
                      * instead of the one the ball geometrically hit - the
                      * flat (zone 1) entry is what actually lets the ball
                      * slip through the gap between tile rows next frame. */
-                    zone = rand() % 3;
+                    s->rng ^= s->rng << 13; s->rng ^= s->rng >> 17; s->rng ^= s->rng << 5;
+                    zone = (int)((s->rng & 0x7FFFFFFFu) % 3u);
                 }
                 apply_bounce(s, net_zone_div[zone], net_zone_step[zone], net_zone_dir[zone]);
                 s->bounce_count++;
@@ -617,7 +595,7 @@ static void update_game(MitsuTvGame6State *s, uint32_t actions) {
 }
 
 static void render_game(MitsuTvGame6State *s) {
-    const ModePalette *pal = &mode_palette[s->mode];
+    const ModePalette *pal = &mode_palette[s->g->mode];
 
     for (int i = 0; i < FB_W * FB_H; i++)
         s->fb[i] = pal->bg;
@@ -627,100 +605,214 @@ static void render_game(MitsuTvGame6State *s) {
     fill_rect(s, COURT_X, COURT_B - 1, COURT_W, 1, 0xff000000);
 
     uint32_t grad[GRAD_W];
-    wall_gradient(s->mode, pal->wall_base, grad);
+    wall_gradient(s->g->mode, pal->wall_base, grad);
     draw_wall_band(s, COURT_Y + 1, 5, grad);
     draw_wall_band(s, COURT_B - 6, 5, grad);
 
     draw_goals(s, pal->goal_l, pal->goal_r);
 
-    if (s->mode == TVG_VOLLEY)
+    if (s->g->mode == TVG_VOLLEY)
         draw_center_markers(s);
-    else if (s->mode == TVG_TENNIS)
+    else if (s->g->mode == TVG_TENNIS)
         draw_tennis_net(s, pal->net_ball);
-    else if (s->mode == TVG_HOCKEY)
+    else if (s->g->mode == TVG_HOCKEY)
         draw_hockey_walls(s, pal->net_ball);
 
     /* The reference shows the score continuously while the ball is
      * stationary waiting to be served - not a timed flash, but it reads as
      * "briefly comes up" since play resumes as soon as the point is
      * served. */
-    if (s->waiting_serve) {
-        draw_digit(s, COURT_X + 30, COURT_Y + 20, s->left_score, pal->score);
-        draw_digit(s, COURT_R - 30 - DIGIT_W, COURT_Y + 20, s->right_score, pal->score);
+    if (s->g->waiting_serve) {
+        draw_digit(s, COURT_X + 30, COURT_Y + 20, s->g->left_score, pal->score);
+        draw_digit(s, COURT_R - 30 - DIGIT_W, COURT_Y + 20, s->g->right_score, pal->score);
     }
 
-    draw_side_paddles(s, true, 48, s->left_y, s->left_h, pal->paddle);
-    draw_side_paddles(s, false, 265, s->right_y, s->right_h, pal->paddle);
-    fill_rect(s, s->ball_x - BALL_W / 2, s->ball_y - BALL_H / 2,
+    draw_side_paddles(s, true, 48, s->g->left_y, s->g->left_h, pal->paddle);
+    draw_side_paddles(s, false, 265, s->g->right_y, s->g->right_h, pal->paddle);
+    fill_rect(s, s->g->ball_x - BALL_W / 2, s->g->ball_y - BALL_H / 2,
               BALL_W, BALL_H, pal->net_ball);
+}
+
+/* ── The core machine (stage O2) ─────────────────────────────────────────────
+ * chip (m58815p): the behavioural model above, its state the game's; a
+ * frame timer (60 Hz) runs a frame of it (update_game) with the controls
+ * its pins see (tvgame6_set_actions); board (tvgame6-board): the picture,
+ * the board's "screen".  There is no CPU: the machine's time is the
+ * timer's.  Before stage O the run loop called update_game and slept; the
+ * anti-stall pick used the C library's rand() (seeded from the time, not
+ * in a save state), now the chip's own generator, seeded from the time at
+ * power-on and saved. */
+#define M(member) (ok &= GEMU_STATE_MEMBER(d, "", g, member))
+static bool chip_init(GemuDevice *d) {
+    TvGame6 *g = d->priv;
+    tvgame6_reset(g);
+    g->rng = 0x2545F491u;
+    bool ok = true;
+    M(mode); M(double_paddles); M(waiting_serve); M(turbo);
+    M(left_y); M(right_y); M(left_h); M(right_h);
+    M(ball_x); M(ball_y); M(h_dir); M(h_step); M(v_dir); M(v_div); M(v_step); M(v_acc);
+    M(marker_cooldown); M(bounce_count); M(left_score); M(right_score);
+    M(prev_actions); M(actions); M(rng);
+    return ok;
+}
+#undef M
+
+static void chip_describe(GemuDevice *d, char *buf, size_t len) {
+    const TvGame6 *g = d->priv;
+    snprintf(buf, len, "%s, %s paddles, %s; %d-%d%s; ball (%d,%d)", mode_name(g->mode),
+             g->double_paddles ? "double" : "single", g->turbo ? "turbo" : "normal speed",
+             g->left_score, g->right_score, g->waiting_serve ? ", waiting to serve" : "",
+             g->ball_x, g->ball_y);
+}
+
+static const GemuDeviceType m58815p_type = {
+    .name = "m58815p", .desc = "Mitsubishi M58815P (behavioural model of Nintendo's TV-Game 6 chip)",
+    .size = sizeof(TvGame6), .init = chip_init, .describe = chip_describe,
+};
+
+static const GemuDeviceType tvgame6_board_type = {
+    .name = "tvgame6-board", .desc = "Color TV-Game 6 board (the picture)",
+    .size = 0, .stateless = true,
+};
+
+/* A frame of the chip, with the controls its pins see. */
+static void tvgame6_tick(void *ud, int param) {
+    TvGame6 *g = ((MitsuTvGame6State *)ud)->g;
+    (void)param;
+    update_game(g, g->actions);
+}
+
+static void tvgame6_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    MitsuTvGame6State *s = ud;
+    render_game(s);
+    for (int y = clip->y0; y < clip->y1; y++)
+        memcpy(bmp->pix + (size_t)y * (size_t)bmp->stride, s->fb + (size_t)y * FB_W,
+               FB_W * sizeof(uint32_t));
+}
+
+static bool tvgame6_core_build(MitsuTvGame6State *s) {
+    if (!(s->machine = gemu_machine_new("tvgame6"))) return false;
+    bool ok = (s->board = gemu_device_add(s->machine, &tvgame6_board_type, "board", NULL, NULL)) &&
+              (s->chip = gemu_device_add(s->machine, &m58815p_type, "chip", NULL, NULL)) &&
+              (s->frame = gemu_timer_new(s->chip, tvgame6_tick, s)) &&
+              gemu_machine_init(s->machine);
+    if (ok) {
+        s->g = s->chip->priv;
+        ok = (s->screen = gemu_screen_new(s->board, "screen")) &&
+             gemu_screen_set_size(s->screen, FB_W, FB_H);
+    }
+    if (ok) {
+        gemu_screen_set_update(s->screen, tvgame6_screen_update, s);
+        ok = gemu_machine_start(s->machine);
+    }
+    if (ok) gemu_timer_start_clocks(s->frame, 60, 1, 1, 0);
+    else fprintf(stderr, "gemu-mitsu: core machine: %s\n", gemu_machine_error(s->machine)[0]
+                 ? gemu_machine_error(s->machine) : "a device couldn't be added");
+    return ok;
+}
+
+MitsuTvGame6State *mitsu_tvgame6_create(const MitsuConfig *cfg) {
+    MitsuTvGame6State *s = calloc(1, sizeof(*s));
+    if (!s)
+        return NULL;
+    if (!tvgame6_core_build(s)) {
+        gemu_machine_free(s->machine);
+        free(s);
+        return NULL;
+    }
+    s->g->rng = (uint32_t)time(NULL) | 1u;
+    s->monitor = gemu_monitor_create();
+    gemu_monitor_set_cpu_state_cb(s->monitor, tvgame6_cpu_state, s);
+    gemu_monitor_set_screendump_cb(s->monitor, tvgame6_screendump, s);
+    gemu_monitor_attach_machine(s->monitor, s->machine, NULL);
+    if (gemu_display_wanted(cfg->display_type)) {
+        GemuDisplayConfig dc = {
+            .fb_width = FB_W,
+            .monitor = s->monitor,
+            .fb_height = FB_H,
+            .scale = cfg->display_scale,
+            .actions = tvgame6_actions,
+            .n_actions = (int)(sizeof tvgame6_actions / sizeof *tvgame6_actions),
+            .ini_section = "tvgame6",
+        };
+        s->display = gemu_display_create(cfg->display_type, &dc);
+        if (!s->display) {
+            mitsu_tvgame6_destroy(s);
+            return NULL;
+        }
+    }
+    return s;
+}
+
+void mitsu_tvgame6_destroy(MitsuTvGame6State *s) {
+    if (!s)
+        return;
+    gemu_display_destroy(s->display);
+    gemu_monitor_destroy(s->monitor);
+    gemu_machine_free(s->machine);
+    free(s);
+}
+
+/* The controls held, for the frames to come. */
+static void tvgame6_set_actions(MitsuTvGame6State *s, uint32_t actions) { s->g->actions = actions; }
+
+/* One frame: the machine to the frame timer's next tick (exactly: 1/60 s
+ * added up would drift from it by rounding). */
+static void tvgame6_frame(MitsuTvGame6State *s) {
+    gemu_machine_run_until(s->machine, gemu_timer_expires(s->frame));
 }
 
 void mitsu_tvgame6_run(MitsuTvGame6State *s, const MitsuConfig *cfg) {
     printf("gemu-mitsu: Nintendo Color TV-Game 6 behavioral M58815P model\n");
-    render_game(s);
     gemu_monitor_start(s->monitor);
-
-    if (!s->display) {
-        bool running = true;
-        while (running) {
-            GemuMonCmd cmd;
-            while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
-                if (cmd == GEMU_MON_RESET) tvgame6_reset(s);
-                else if (cmd == GEMU_MON_QUIT) {
-                    if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true);
-                    else { running = false; break; }
-                } else if (cmd == GEMU_MON_STEP) {
-                    update_game(s, 0);
-                }
-            }
-            if (!running)
-                break;
-            if (!gemu_monitor_is_paused(s->monitor))
-                update_game(s, s->waiting_serve ? ACT_SERVE : 0);
-            render_game(s);
-            tvgame6_sleep_frame();
-        }
-        gemu_monitor_stop(s->monitor);
-        return;
-    }
-
     bool running = true;
     while (running) {
-        uint32_t actions = gemu_display_poll(s->display);
-        if (gemu_display_should_quit(s->display)) {
-            if (cfg->no_shutdown)
-                actions = 0;
-            else
-                running = false;
+        uint32_t actions = 0;
+        if (s->display) {
+            actions = gemu_display_poll(s->display);
+            if (gemu_display_should_quit(s->display)) {
+                if (cfg->no_shutdown)
+                    actions = 0;
+                else
+                    running = false;
+            }
+            if (gemu_display_reset_requested(s->display)) {
+                tvgame6_reset(s->g);
+                gemu_display_clear_flags(s->display);
+            }
+        } else if (s->g->waiting_serve) {
+            actions = ACT_SERVE;   /* headless: serve at once */
         }
-        if (gemu_display_reset_requested(s->display)) {
-            tvgame6_reset(s);
-            gemu_display_clear_flags(s->display);
-        }
-
         GemuMonCmd cmd;
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
             if (cmd == GEMU_MON_QUIT) {
                 if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true);
                 else { running = false; break; }
             } else if (cmd == GEMU_MON_RESET) {
-                tvgame6_reset(s);
+                tvgame6_reset(s->g);
             } else if (cmd == GEMU_MON_STEP) {
-                update_game(s, 0);
+                update_game(s->g, 0);
             }
         }
-        gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
-        if (gemu_monitor_is_paused(s->monitor)) {
-            render_game(s);
-            gemu_display_render(s->display, s->fb, FB_W, FB_H);
-            tvgame6_sleep_frame();
-            continue;
+        if (!running)
+            break;
+        bool paused = gemu_monitor_is_paused(s->monitor);
+        if (!paused) {
+            tvgame6_set_actions(s, actions);
+            tvgame6_frame(s);
         }
-
-        update_game(s, actions);
-        render_game(s);
-        gemu_display_render(s->display, s->fb, FB_W, FB_H);
-        tvgame6_sleep_frame();
+        if (s->display) {
+            gemu_display_set_paused(s->display, paused);
+            const GemuBitmap *b = gemu_screen_render(s->screen);
+            gemu_display_render(s->display, b->pix, b->width, b->height);
+        }
+        /* Pace to the machine's time; paused, a frame's delay. */
+        if (!paused) {
+            gemu_machine_pace(s->machine, 0);
+        } else {
+            gemu_machine_pace_reset(s->machine);
+            tvgame6_sleep_frame();
+        }
     }
     gemu_monitor_stop(s->monitor);
 }

@@ -46,7 +46,6 @@
 #define LAG_SPEECH_N   8          /* sockets A-H on the ASP32K; A-E fitted */
 #define LAG_VDP_N      3
 #define LAG_AUDIO_RATE 48000
-#define LAG_AUDIO_BUF  4096
 
 /* Gear selector positions, as the PRND21 display orders them. */
 enum { LAG_GEAR_P, LAG_GEAR_R, LAG_GEAR_N, LAG_GEAR_D, LAG_GEAR_2, LAG_GEAR_1 };
@@ -72,11 +71,18 @@ typedef struct {
     uint8_t  latch;        /* 74LS374 */
     uint16_t counter;      /* 4040: nibble address within the 2 KB message */
     bool     playing;
-    Msm5205  msm;
 } LagondaSpeech;
 
+struct LagondaCore;
+
 typedef struct LagondaState {
-    Z80          cpu;
+    struct LagondaCore *core;   /* the core machine (stage Z3) */
+    Z80          *cpu;          /* the devices' chips */
+    Tms9918      *vdp[LAG_VDP_N];
+    Ppi8255      *ppi;
+    Adc0809      *adc;
+    Mm58167      *rtc;
+    Msm5205      *msm;
     const Z80Config *cfg;
     double       clock_hz;
 
@@ -85,10 +91,6 @@ typedef struct LagondaState {
     uint8_t      speech_rom[LAG_SPEECH_N][LAG_ROM_SIZE];
     bool         speech_fitted[LAG_SPEECH_N];
 
-    Tms9918      vdp[LAG_VDP_N];
-    Ppi8255      ppi;
-    Adc0809      adc;
-    Mm58167      rtc;
     LagondaSpeech speech;
     uint16_t     trip_bcd;   /* the two 4518s */
     uint8_t      latch20;
@@ -99,15 +101,14 @@ typedef struct LagondaState {
     int          inject_frames;
 
     /* Bus-cycle schedule of the clocked parts */
-    double       next_line, next_vck, next_sample;
-    double       line_cycles, vck_cycles, sample_cycles;
+    double       next_line, next_vck;
+    double       line_cycles, vck_cycles;
     uint64_t     frame_cycle;       /* cycle the current VDP frame began */
-    uint64_t     insn_count;
+    bool         frame_done;        /* VDP 0 finished a frame this run */
+    uint64_t     step_to;           /* monitor step: run to this instruction count */
 
-    /* Audio: DAC -> filter -> output */
-    GemuAudioOut     *audio_dev;
-    float        audio_buf[LAG_AUDIO_BUF];
-    int          audio_n;
+    /* Audio: DAC -> filter -> the board's stream */
+    GemuAudioOut *audio_dev;
     double       lp1, lp2, dc_x, dc_y;
 
     uint32_t    *panel_fb;   /* head 0: the three screens side by side */

@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="z80" description="Zilog Z80 CPU" status="working">
+    <type symbol="gemu_z80_type" source="cpu/z80/z80_dev.c"/>
+</device>

@@ -11,7 +11,17 @@ static unsigned checks;
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); exit(1); \
 } } while (0)
 
+/* RCA_ROM=FILE (a real ROM image) stands in for the stand-in. */
 static const char *write_file(const char *name, const unsigned char *data, size_t len) {
+    static unsigned char real[0x10000];
+    const char *env = getenv("RCA_ROM");
+    if (env) {
+        FILE *r = fopen(env, "rb");
+        CHECK(r);
+        len = fread(real, 1, sizeof real, r);
+        fclose(r);
+        data = real;
+    }
     FILE *f = fopen(name, "wb");
     CHECK(f && fwrite(data, 1, len, f) == len);
     fclose(f);

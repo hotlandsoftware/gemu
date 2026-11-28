@@ -19,6 +19,18 @@
  * nibbles - the whole 2 KB, 1.024 s - the message is over.
  */
 #include "lagonda.h"
+#include "z80_dev.h"
+#include "tms9918_dev.h"
+#include "msm5205_dev.h"
+#include "timer/mm58167_dev.h"
+#include "controller/adc0809_dev.h"
+#include "controller/ppi8255_dev.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/space.h"
+#include "gemu/dev/state.h"
+#include "gemu/dev/stream.h"
 #include "gemu/screendump.h"
 #include <math.h>
 #include <stdio.h>
@@ -182,16 +194,16 @@ static double clampd(double v, double lo, double hi) { return v < lo ? lo : v > 
 
 static void update_adc_inputs(LagondaState *s) {
     const LagondaCar *c = &s->car;
-    s->adc.in[0] = clampd(c->rpm / 50.0, 0, 255);
-    s->adc.in[1] = clampd(c->speed_mph, 0, 255);
-    s->adc.in[2] = clampd(c->fuel_pct * 2.55, 0, 255);
-    s->adc.in[3] = clampd(c->temp, 0, 255);
-    for (int i = 0; i < 3; i++) s->adc.in[4 + i] = clampd(c->adc_extra[i], 0, 255);
-    s->adc.in[7] = clampd(c->battery, 0, 255);
+    s->adc->in[0] = clampd(c->rpm / 50.0, 0, 255);
+    s->adc->in[1] = clampd(c->speed_mph, 0, 255);
+    s->adc->in[2] = clampd(c->fuel_pct * 2.55, 0, 255);
+    s->adc->in[3] = clampd(c->temp, 0, 255);
+    for (int i = 0; i < 3; i++) s->adc->in[4 + i] = clampd(c->adc_extra[i], 0, 255);
+    s->adc->in[7] = clampd(c->battery, 0, 255);
 }
 
 static bool flasher_on(const LagondaState *s) {
-    double t = (double)s->cpu.cycles / s->clock_hz;
+    double t = (double)s->cpu->cycles / s->clock_hz;
     return fmod(t * FLASHER_HZ, 1.0) < 0.5;
 }
 
@@ -228,14 +240,17 @@ static uint8_t port_ff(const LagondaState *s) {
 
 /* ── Speech card ─────────────────────────────────────────────────────────── */
 
+static void sound_sync(LagondaState *s);
+
 static void speech_command(LagondaState *s, uint8_t v) {
     LagondaSpeech *sp = &s->speech;
+    sound_sync(s);
     sp->latch = v;
     sp->counter = 0;
     unsigned sock = v >> 4;
     sp->playing = (v & 1u) && sock >= 1 && sock <= LAG_SPEECH_N;
-    msm5205_set_reset(&sp->msm, true);
-    msm5205_set_reset(&sp->msm, !sp->playing);
+    msm5205_set_reset(s->msm, true);
+    msm5205_set_reset(s->msm, !sp->playing);
 }
 
 static void speech_vck(LagondaState *s) {
@@ -244,32 +259,39 @@ static void speech_vck(LagondaState *s) {
     unsigned sock = (sp->latch >> 4) - 1u;
     unsigned a = ((sp->latch & 2u) ? 0x800u : 0u) | (sp->counter >> 1);
     uint8_t byte = s->speech_fitted[sock] ? s->speech_rom[sock][a] : 0xFF;   /* empty socket: pull-ups */
-    msm5205_vck(&sp->msm, (sp->counter & 1u) ? (byte & 0x0Fu) : (uint8_t)(byte >> 4));
+    sound_sync(s);
+    msm5205_vck(s->msm, (sp->counter & 1u) ? (byte & 0x0Fu) : (uint8_t)(byte >> 4));
     if (++sp->counter == 4096) {
         sp->playing = false;
-        msm5205_set_reset(&sp->msm, true);
+        msm5205_set_reset(s->msm, true);
     }
 }
 
-/* DAC -> the card's op-amp low-pass -> LM384 -> speaker.  The filter
+/* DAC -> the card's op-amp low-pass -> LM384 -> speaker: the board's
+ * stream, at LAG_AUDIO_RATE, the DAC level held between VCKs (the stream
+ * is brought up to the machine's time before each change).  The filter
  * components aren't known: two poles at 1.8 kHz smooth the 4 kHz steps. */
-static void audio_sample(LagondaState *s) {
-    double x = msm5205_output(&s->speech.msm);
+static void sound_update(void *ud, float *const *out, unsigned n) {
+    LagondaState *s = ud;
+    double x = msm5205_output(s->msm);
     double a = 1.0 - exp(-2.0 * M_PI * 1800.0 / LAG_AUDIO_RATE);
-    s->lp1 += a * (x - s->lp1);
-    s->lp2 += a * (s->lp1 - s->lp2);
-    double y = s->lp2 - s->dc_x + 0.999 * s->dc_y;
-    s->dc_x = s->lp2;
-    s->dc_y = y;
-    double out = clampd(y * 1.5, -1.0, 1.0);
-    if (s->audio_dev && s->audio_n < LAG_AUDIO_BUF) s->audio_buf[s->audio_n++] = (float)out;
+    for (unsigned i = 0; i < n; i++) {
+        s->lp1 += a * (x - s->lp1);
+        s->lp2 += a * (s->lp1 - s->lp2);
+        double y = s->lp2 - s->dc_x + 0.999 * s->dc_y;
+        s->dc_x = s->lp2;
+        s->dc_y = y;
+        out[0][i] = (float)clampd(y * 1.5, -1.0, 1.0);
+    }
 }
 
 /* ── Bus ─────────────────────────────────────────────────────────────────── */
 
+static void lag_watch_hit(LagondaState *s);
+
 static uint8_t lag_read(void *ud, uint16_t a) {
     LagondaState *s = ud;
-    gemu_monitor_check_read(s->monitor, a);
+    if (gemu_monitor_check_read(s->monitor, a)) lag_watch_hit(s);
     switch (a >> 12) {
     case 0: return s->code[a];
     case 1: return s->gfx[a & 0x0FFFu];
@@ -281,41 +303,56 @@ static uint8_t lag_read(void *ud, uint16_t a) {
 
 static void lag_write(void *ud, uint16_t a, uint8_t v) {
     LagondaState *s = ud;
-    gemu_monitor_check_write(s->monitor, a);
+    if (gemu_monitor_check_write(s->monitor, a)) lag_watch_hit(s);
     if ((a >> 12) == 2) s->ram[0][a & 0x3FFu] = v;
     else if ((a >> 12) == 3) s->ram[1][a & 0x3FFu] = v;
 }
 
 static uint8_t bcd_byte(uint16_t bcd, int hi) { return (uint8_t)(hi ? bcd >> 8 : bcd); }
 
-static uint8_t lag_in(void *ud, uint16_t port) {
+/* The I/O space's board handlers (offsets from each mapping's base). */
+static uint8_t adc_r(void *ud, uint64_t off) {
     LagondaState *s = ud;
-    uint8_t p = (uint8_t)port;
-    if (p < 0x08) return ppi8255_read(&s->ppi, p & 3u);
-    if (p < 0x10) return adc0809_read(&s->adc, s->cpu.cycles);
-    if (p < 0x20) return bcd_byte(s->trip_bcd, p >= 0x18);
-    if (p >= 0x40 && p < 0x60) {
-        mm58167_sync(&s->rtc, s->cpu.cycles, s->clock_hz);
-        return mm58167_read(&s->rtc, p & 0x1Fu);
-    }
-    if (p >= 0x80 && p < 0x86) return tms9918_read(&s->vdp[(p - 0x80) >> 1], p & 1);
-    if (p == 0xFF) return port_ff(s);
-    return 0xFF;
+    (void)off;
+    return adc0809_read(s->adc, s->cpu->cycles);
 }
+static void adc_w(void *ud, uint64_t off, uint8_t v) {
+    LagondaState *s = ud;
+    (void)v;
+    adc0809_start(s->adc, (uint8_t)(off & 7u), s->cpu->cycles, ADC_CLK_HZ, s->clock_hz);
+}
+static uint8_t trip_r(void *ud, uint64_t off) {
+    return bcd_byte(((LagondaState *)ud)->trip_bcd, off >= 8);
+}
+static bool trip_peek(void *ud, uint64_t off, uint8_t *v) { *v = trip_r(ud, off); return true; }
+static void latch20_w(void *ud, uint64_t off, uint8_t v) { (void)off; ((LagondaState *)ud)->latch20 = v; }
+static uint8_t rtc_r(void *ud, uint64_t off) {
+    LagondaState *s = ud;
+    mm58167_sync(s->rtc, s->cpu->cycles, s->clock_hz);
+    return mm58167_read(s->rtc, (uint8_t)off);
+}
+static bool rtc_peek(void *ud, uint64_t off, uint8_t *v) {
+    *v = mm58167_peek(((LagondaState *)ud)->rtc, (uint8_t)off);
+    return true;
+}
+static void rtc_w(void *ud, uint64_t off, uint8_t v) {
+    LagondaState *s = ud;
+    mm58167_sync(s->rtc, s->cpu->cycles, s->clock_hz);
+    mm58167_write(s->rtc, (uint8_t)off, v);
+}
+static void speech_w(void *ud, uint64_t off, uint8_t v) { (void)off; speech_command(ud, v); }
+static uint8_t lamps_r(void *ud, uint64_t off) { (void)off; return port_ff(ud); }
+static bool lamps_peek(void *ud, uint64_t off, uint8_t *v) { *v = lamps_r(ud, off); return true; }
 
-static void lag_out(void *ud, uint16_t port, uint8_t v) {
-    LagondaState *s = ud;
-    uint8_t p = (uint8_t)port;
-    if (p < 0x08) ppi8255_write(&s->ppi, p & 3u, v);
-    else if (p < 0x10) adc0809_start(&s->adc, p & 7u, s->cpu.cycles, ADC_CLK_HZ, s->clock_hz);
-    else if (p >= 0x20 && p < 0x40) s->latch20 = v;
-    else if (p >= 0x40 && p < 0x60) {
-        mm58167_sync(&s->rtc, s->cpu.cycles, s->clock_hz);
-        mm58167_write(&s->rtc, p & 0x1Fu, v);
-    }
-    else if (p >= 0x80 && p < 0x86) tms9918_write(&s->vdp[(p - 0x80) >> 1], p & 1, v);
-    else if (p == 0xFE) speech_command(s, v);
-}
+static const GemuHandlers adc_io    = { .r8 = adc_r, .w8 = adc_w };
+static const GemuHandlers trip_io   = { .r8 = trip_r, .peek8 = trip_peek };
+static const GemuHandlers latch_io  = { .w8 = latch20_w };
+static const GemuHandlers rtc_io    = { .r8 = rtc_r, .w8 = rtc_w, .peek8 = rtc_peek };
+static const GemuHandlers speech_io = { .w8 = speech_w };
+static const GemuHandlers lamps_io  = { .r8 = lamps_r, .peek8 = lamps_peek };
+
+static uint8_t lag_in(void *ud, uint16_t port);
+static void lag_out(void *ud, uint16_t port, uint8_t v);
 
 /* ── Trip counter ────────────────────────────────────────────────────────── *
  * Two 4518s count the distance pulses (the speed sensor divided down on
@@ -340,36 +377,36 @@ static void advance_trip(LagondaState *s, double seconds) {
 
 /* ── Stepping ────────────────────────────────────────────────────────────── */
 
-/* Runs one instruction and everything clocked alongside it.  Returns true
- * when the VDPs finished a frame. */
-static bool lag_step(LagondaState *s) {
-    z80_step(&s->cpu);
-    s->insn_count++;
-    double now = (double)s->cpu.cycles;
+/* One instruction and everything clocked alongside it (the executor's
+ * insn hook): VCK, the scanlines.  VDP 0's frame sets frame_done. */
+static void lag_insn(void *ud) {
+    LagondaState *s = ud;
+    z80_step(s->cpu);
+    double now = (double)s->cpu->cycles;
     bool frame = false;
     while (now >= s->next_vck) { speech_vck(s); s->next_vck += s->vck_cycles; }
-    while (now >= s->next_sample) { audio_sample(s); s->next_sample += s->sample_cycles; }
     while (now >= s->next_line) {
         for (int i = 0; i < LAG_VDP_N; i++)
-            if (tms9918_scanline(&s->vdp[i]) && i == 0) frame = true;
+            if (tms9918_scanline(s->vdp[i]) && i == 0) frame = true;
         s->next_line += s->line_cycles;
     }
     if (frame) {
-        advance_trip(s, (double)(s->cpu.cycles - s->frame_cycle) / s->clock_hz);
-        s->frame_cycle = s->cpu.cycles;
+        advance_trip(s, (double)(s->cpu->cycles - s->frame_cycle) / s->clock_hz);
+        s->frame_cycle = s->cpu->cycles;
+        s->frame_done = true;
     }
-    return frame;
 }
 
 static void power_on(LagondaState *s) {
-    z80_reset(&s->cpu);
-    s->cpu.int_line = s->cpu.nmi_line = false;
+    z80_reset(s->cpu);
+    s->cpu->int_line = s->cpu->nmi_line = false;
     memset(s->ram, 0, sizeof(s->ram));
-    for (int i = 0; i < LAG_VDP_N; i++) tms9918_reset(&s->vdp[i]);
-    ppi8255_reset(&s->ppi);
-    adc0809_init(&s->adc);
+    for (int i = 0; i < LAG_VDP_N; i++) tms9918_reset(s->vdp[i]);
+    ppi8255_reset(s->ppi);
+    adc0809_init(s->adc);
     update_adc_inputs(s);
-    msm5205_init(&s->speech.msm);
+    sound_sync(s);
+    msm5205_init(s->msm);
     speech_command(s, 0x00);
     s->latch20 = 0;
 }
@@ -399,7 +436,7 @@ static bool lag_mon_write(void *ud, uint64_t addr, uint8_t val) {
 }
 
 static void lag_mon_cpu_state(void *ud, char *buf, size_t len) {
-    z80_format_state(&((const LagondaState *)ud)->cpu, buf, len);
+    z80_format_state(((const LagondaState *)ud)->cpu, buf, len);
 }
 
 static uint8_t dis_peek(void *ud, uint16_t a) {
@@ -412,7 +449,7 @@ static GemuMonCmd cmd_disas(GemuMonitor *mon, const char *args, void *ud) {
     LagondaState *s = ud;
     char a1[64] = "", a2[32] = "";
     sscanf(args, "%63s %31s", a1, a2);
-    uint64_t addr = s->cpu.pc;
+    uint64_t addr = s->cpu->pc;
     if (a1[0] && !gemu_monitor_parse_addr(mon, a1, &addr)) {
         gemu_monitor_printf(mon, "disas: bad address '%s'\n", a1);
         return GEMU_MON_NONE;
@@ -428,7 +465,7 @@ static GemuMonCmd cmd_disas(GemuMonitor *mon, const char *args, void *ud) {
         for (int b = 0; b < len; b++)
             snprintf(bytes + strlen(bytes), sizeof(bytes) - strlen(bytes), "%02X ",
                      dis_peek(s, (uint16_t)(pc + b)));
-        gemu_monitor_printf(mon, "%s%04X  %-12s %s\n", pc == s->cpu.pc ? ">" : " ", pc, bytes, text);
+        gemu_monitor_printf(mon, "%s%04X  %-12s %s\n", pc == s->cpu->pc ? ">" : " ", pc, bytes, text);
         pc = (uint16_t)(pc + len);
     }
     return GEMU_MON_NONE;
@@ -445,7 +482,7 @@ static GemuMonCmd cmd_vdp(GemuMonitor *mon, const char *args, void *ud) {
     for (int i = 0; i < LAG_VDP_N; i++) {
         if (only >= 0 && i != only) continue;
         char buf[512];
-        tms9918_describe(&s->vdp[i], buf, sizeof(buf));
+        tms9918_describe(s->vdp[i], buf, sizeof(buf));
         gemu_monitor_printf(mon, "VDP %d (%s, ports %02X/%02X): %s", i, names[i], 0x80 + 2 * i, 0x81 + 2 * i, buf);
     }
     return GEMU_MON_NONE;
@@ -467,7 +504,7 @@ static void sensor_list(GemuMonitor *mon, LagondaState *s) {
         "  trip     %.2f miles (counter %X%X%X.%X)\n"
         "Speech card: command %02Xh, %s\n"
         "Switches:\n",
-        c->speed_mph, s->adc.in[1], c->rpm, s->adc.in[0], c->fuel_pct, s->adc.in[2],
+        c->speed_mph, s->adc->in[1], c->rpm, s->adc->in[0], c->fuel_pct, s->adc->in[2],
         c->temp, c->battery, c->adc_extra[0], c->adc_extra[1], c->adc_extra[2],
         gear_names[c->gear], c->trip_miles,
         s->trip_bcd >> 12, (s->trip_bcd >> 8) & 15u, (s->trip_bcd >> 4) & 15u, s->trip_bcd & 15u,
@@ -624,7 +661,7 @@ static void build_panel(LagondaState *s) {
         for (int x = 0; x < PANEL_W; x++) o[x] = 0xFF202020;
         for (int i = 0; i < LAG_VDP_N; i++)
             memcpy(o + i * (TMS9918_FB_W + PANEL_GAP),
-                   s->vdp[panel_order[i]].fb + y * TMS9918_FB_W, TMS9918_FB_W * sizeof(uint32_t));
+                   s->vdp[panel_order[i]]->fb + y * TMS9918_FB_W, TMS9918_FB_W * sizeof(uint32_t));
     }
 }
 
@@ -635,7 +672,7 @@ static void present(LagondaState *s) {
         gemu_display_render_head(s->display, 0, s->panel_fb, PANEL_W, PANEL_H);
     for (int i = 0; i < LAG_VDP_N; i++)
         if (gemu_display_head_shown(s->display, 1 + i))
-            gemu_display_render_head(s->display, 1 + i, s->vdp[panel_order[i]].fb,
+            gemu_display_render_head(s->display, 1 + i, s->vdp[panel_order[i]]->fb,
                                      TMS9918_FB_W, TMS9918_FB_H);
 }
 
@@ -682,9 +719,173 @@ static bool load_roms(LagondaState *s, const Z80Config *cfg) {
     return true;
 }
 
-static bool audio_open(LagondaState *s) {
-    s->audio_dev = gemu_audio_open("lagonda", LAG_AUDIO_RATE);
-    return s->audio_dev != NULL;
+/* ── The core machine (stage Z3) ─────────────────────────────────────────────
+ * board (lagonda-board): the RAM, the car, the speech card's latch and
+ * counter, the trip counter, the output latch, the clocked parts' schedule,
+ * and the speech's stream (the filter after the DAC); cpu (z80): the
+ * machine's executor at 4 MHz, an instruction at a time through lag_insn
+ * (VCK and the scanlines, from the same fractional schedule as before);
+ * vdp0-vdp2 (tms9918), ppi (ppi8255), adc (adc0809), rtc (mm58167), msm
+ * (msm5205).
+ * The spaces: "program", the EPROMs and the two 1 KB RAMs mirrored through
+ * their 4 KB blocks (the CPU reads and writes memory directly, with the
+ * monitor's watchpoints, as before; the space is the monitor's view); "io",
+ * the CPU's ports: the 8255 (00h), the ADC (08h), the trip counter (10h),
+ * the output latch (20h), the clock (40h), the VDPs (80h), the speech
+ * latch (FEh), the lamps and buttons (FFh).
+ * The board's "panel" screen is the three CRTs side by side.
+ * Before stage Z the speech's samples were made after each instruction
+ * from a fractional schedule and queued straight to the audio device; now
+ * they are the board's stream through the mixer, the DAC's level held
+ * between VCKs (the same sound, a sample's phase apart). */
+typedef struct LagondaCore {
+    GemuMachine *machine;
+    GemuDevice  *board, *cpu, *vdp[LAG_VDP_N], *ppi, *adc, *rtc, *msm;
+    GemuSpace   *prog, *io;
+    GemuStream  *sound;
+    GemuScreen  *screen;
+} LagondaCore;
+
+static void sound_sync(LagondaState *s) {
+    if (s->core && s->core->sound) gemu_stream_update(s->core->sound);
+}
+
+static void lag_watch_hit(LagondaState *s) {
+    if (s->core) gemu_z80_end_run(s->core->cpu, GEMU_Z80_STOPPED);
+}
+
+static uint8_t lag_in(void *ud, uint16_t port) {
+    return gemu_space_read8(((LagondaState *)ud)->core->io, port & 0xFFu);
+}
+static void lag_out(void *ud, uint16_t port, uint8_t v) {
+    gemu_space_write8(((LagondaState *)ud)->core->io, port & 0xFFu, v);
+}
+
+static bool lag_spaces_build(LagondaState *s) {
+    LagondaCore *c = s->core;
+    GemuSpace *p = c->prog = gemu_space_new(c->machine, "program", 16, 8, GEMU_LITTLE_ENDIAN);
+    GemuSpace *io = c->io = gemu_space_new(c->machine, "io", 8, 8, GEMU_LITTLE_ENDIAN);
+    if (!p || !io) return false;
+    bool ok = gemu_space_map_ram(p, 0x0000, LAG_ROM_SIZE, s->code, GEMU_MAP_READONLY, 0) &&
+              gemu_space_map_ram(p, 0x1000, LAG_ROM_SIZE, s->gfx, GEMU_MAP_READONLY, 0) &&
+              gemu_space_map_ram(p, 0x2000, 0x400, s->ram[0], 0, 0) &&
+              gemu_space_map_ram(p, 0x3000, 0x400, s->ram[1], 0, 0) &&
+              gemu_space_mirror(p, 0x2000, 0x2000, 0xF3FF);
+    ok = ok && gemu_space_map(io, 0x00, 0x08, &gemu_ppi8255_bus, c->ppi, 0, 0) &&
+         gemu_space_map(io, 0x08, 0x08, &adc_io, s, 0, 0) &&
+         gemu_space_map(io, 0x10, 0x10, &trip_io, s, 0, 0) &&
+         gemu_space_map(io, 0x20, 0x20, &latch_io, s, 0, 0) &&
+         gemu_space_map(io, 0x40, 0x20, &rtc_io, s, 0, 0) &&
+         gemu_space_map(io, 0xFE, 0x01, &speech_io, s, 0, 0) &&
+         gemu_space_map(io, 0xFF, 0x01, &lamps_io, s, 0, 0);
+    for (int i = 0; ok && i < LAG_VDP_N; i++)
+        ok = gemu_space_map(io, 0x80u + 2u * (unsigned)i, 2, &gemu_tms9918_io, c->vdp[i], 0, 0) != NULL;
+    return ok;
+}
+
+static void lag_board_describe(GemuDevice *d, char *buf, size_t len) {
+    const LagondaState *s = *(LagondaState **)d->priv;
+    snprintf(buf, len, "%.0f mph, %.0f rpm, gear %s; trip %X%X%X.%X; speech %02Xh %s; latch 20h %02X",
+             s->car.speed_mph, s->car.rpm, gear_names[s->car.gear],
+             s->trip_bcd >> 12, (s->trip_bcd >> 8) & 15u, (s->trip_bcd >> 4) & 15u, s->trip_bcd & 15u,
+             s->speech.latch, s->speech.playing ? "playing" : "idle", s->latch20);
+}
+
+static const GemuDeviceType lag_board_type = {
+    .name = "lagonda-board", .desc = "Lagonda AUDIT board (RAM, the car, speech card, trip counter)",
+    .size = sizeof(LagondaState *), .describe = lag_board_describe,
+};
+
+#define B(field) ok &= GEMU_STATE_MEMBER(d, "", s, field)
+/* The board's state: the RAM, the car, the speech card, the trip counter,
+ * the latch, the schedule, the filter.  Not saved: the EPROMs (loaded),
+ * the keys held (the host's). */
+static bool lag_board_state(LagondaState *s, GemuDevice *d) {
+    bool ok = true;
+    B(ram); B(car); B(speech); B(trip_bcd); B(latch20);
+    B(next_line); B(next_vck); B(frame_cycle); B(frame_done);
+    B(lp1); B(lp2); B(dc_x); B(dc_y);
+    return ok;
+}
+#undef B
+
+static uint64_t lag_insns(const LagondaState *s) { return gemu_z80_insns(s->core->cpu); }
+
+static bool hook_stop_before(void *ud) {
+    LagondaState *s = ud;
+    return gemu_monitor_check_exec(s->monitor, s->cpu->pc);
+}
+static bool hook_done(void *ud) {
+    LagondaState *s = ud;
+    return s->step_to ? lag_insns(s) >= s->step_to : s->frame_done;
+}
+
+/* The hooks for a run: the instruction and its clocked parts, the frame's
+ * end (or a step's), and breakpoints only while some are set. */
+static void lag_set_hooks(LagondaState *s) {
+    GemuZ80Hooks h = { .insn = lag_insn, .done = hook_done, .ud = s };
+    if (!s->step_to && gemu_monitor_has_exec_breakpoints(s->monitor)) h.stop_before = hook_stop_before;
+    gemu_z80_set_hooks(s->core->cpu, &h);
+}
+
+static void build_panel(LagondaState *s);
+static void lag_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    LagondaState *s = ud;
+    build_panel(s);
+    for (int y = clip->y0; y < clip->y1; y++)
+        memcpy(bmp->pix + (size_t)y * (size_t)bmp->stride, s->panel_fb + (size_t)y * PANEL_W,
+               PANEL_W * sizeof(uint32_t));
+}
+
+static void lag_sound_out(void *ud, const float *samples, size_t frames) {
+    gemu_audio_queue(ud, samples, frames);
+}
+
+static bool lag_core_build(LagondaState *s) {
+    LagondaCore *c = s->core = calloc(1, sizeof *c);
+    if (!c || !(c->machine = gemu_machine_new("lagonda"))) return false;
+    static const char *const vdp_names[LAG_VDP_N] = { "vdp0", "vdp1", "vdp2" };
+    bool ok = (c->board = gemu_device_add(c->machine, &lag_board_type, "board", NULL, NULL)) &&
+              (c->cpu = gemu_device_add(c->machine, &gemu_z80_type, "cpu", NULL, NULL)) &&
+              (c->ppi = gemu_device_add(c->machine, &gemu_ppi8255_type, "ppi", NULL, NULL)) &&
+              (c->adc = gemu_device_add(c->machine, &gemu_adc0809_type, "adc", NULL, NULL)) &&
+              (c->rtc = gemu_device_add(c->machine, &gemu_mm58167_type, "rtc", NULL, NULL)) &&
+              (c->msm = gemu_device_add(c->machine, &gemu_msm5205_type, "msm", NULL, NULL));
+    for (int i = 0; ok && i < LAG_VDP_N; i++)
+        ok = (c->vdp[i] = gemu_device_add(c->machine, &gemu_tms9918_type, vdp_names[i], NULL, NULL)) != NULL;
+    if (ok) {
+        *(LagondaState **)c->board->priv = s;
+        ok = lag_board_state(s, c->board) &&
+             (c->sound = gemu_stream_new(c->board, "speech", 1, LAG_AUDIO_RATE, sound_update, s)) &&
+             gemu_machine_init(c->machine);
+    }
+    if (ok) {
+        s->cpu = gemu_z80(c->cpu);
+        for (int i = 0; i < LAG_VDP_N; i++) s->vdp[i] = gemu_tms9918(c->vdp[i]);
+        s->ppi = gemu_ppi8255(c->ppi);
+        s->adc = gemu_adc0809(c->adc);
+        s->rtc = gemu_mm58167(c->rtc);
+        s->msm = gemu_msm5205(c->msm);
+        s->cpu->read = lag_read;  s->cpu->write = lag_write;
+        s->cpu->in = lag_in;      s->cpu->out = lag_out;
+        s->cpu->ud = s;
+        s->ppi->read_pins = ppi_pins;
+        s->ppi->ud = s;
+        ok = lag_spaces_build(s) && gemu_z80_exec(c->cpu, (uint64_t)s->clock_hz, NULL) &&
+             (c->screen = gemu_screen_new(c->board, "panel")) &&
+             gemu_screen_set_size(c->screen, PANEL_W, PANEL_H);
+    }
+    if (ok) {
+        gemu_screen_set_update(c->screen, lag_screen_update, s);
+        lag_set_hooks(s);
+        ok = gemu_machine_start(c->machine);
+    }
+    if (!ok) {
+        fprintf(stderr, "lagonda: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    return true;
 }
 
 LagondaState *lagonda_create(const Z80Config *cfg) {
@@ -693,21 +894,13 @@ LagondaState *lagonda_create(const Z80Config *cfg) {
     s->cfg = cfg;
     s->clock_hz = cfg->clock_hz;
     s->panel_fb = calloc((size_t)PANEL_W * PANEL_H, sizeof(uint32_t));
-    if (!s->panel_fb || !load_roms(s, cfg)) { free(s->panel_fb); free(s); return NULL; }
+    s->monitor = gemu_monitor_create();
+    if (!s->panel_fb || !load_roms(s, cfg) || !lag_core_build(s)) { lagonda_destroy(s); return NULL; }
 
-    z80_init(&s->cpu);
-    s->cpu.read = lag_read;  s->cpu.write = lag_write;
-    s->cpu.in = lag_in;      s->cpu.out = lag_out;
-    s->cpu.ud = s;
-    s->ppi.read_pins = ppi_pins;
-    s->ppi.ud = s;
-
-    s->line_cycles   = s->clock_hz * TMS9918_CLOCKS_LINE / VDP_HZ;
-    s->vck_cycles    = s->clock_hz / VCK_HZ;
-    s->sample_cycles = s->clock_hz / LAG_AUDIO_RATE;
+    s->line_cycles = s->clock_hz * TMS9918_CLOCKS_LINE / VDP_HZ;
+    s->vck_cycles  = s->clock_hz / VCK_HZ;
     s->next_line = s->line_cycles;
     s->next_vck = s->vck_cycles;
-    s->next_sample = s->sample_cycles;
 
     /* The car as it sits with the ignition on: parked, engine off. */
     LagondaCar *c = &s->car;
@@ -719,7 +912,6 @@ LagondaState *lagonda_create(const Z80Config *cfg) {
     c->warn_b = 0xFE;   /* rear window heater off */
 
     /* The RTC's battery kept it running: start it at the host's time. */
-    mm58167_init(&s->rtc);
     time_t now = time(NULL);
     struct tm tm;
 #ifdef _WIN32
@@ -727,11 +919,10 @@ LagondaState *lagonda_create(const Z80Config *cfg) {
 #else
     localtime_r(&now, &tm);
 #endif
-    mm58167_set_time(&s->rtc, tm.tm_mon + 1, tm.tm_mday, tm.tm_wday + 1, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    mm58167_set_time(s->rtc, tm.tm_mon + 1, tm.tm_mday, tm.tm_wday + 1, tm.tm_hour, tm.tm_min, tm.tm_sec);
 
     power_on(s);
 
-    s->monitor = gemu_monitor_create();
     gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
         .read = lag_mon_read, .write = lag_mon_write, .ud = s,
         .addr_bits = 16, .big_endian = false });
@@ -743,6 +934,7 @@ LagondaState *lagonda_create(const Z80Config *cfg) {
     gemu_monitor_bind(s->monitor, "vdp", cmd_vdp, s);
     gemu_monitor_bind(s->monitor, "sensor", cmd_sensor, s);
     gemu_monitor_bind(s->monitor, "sendkey", cmd_sendkey, s);
+    gemu_monitor_attach_machine(s->monitor, s->core->machine, "program");
 
     if (gemu_display_wanted(cfg->display_type)) {
         GemuDisplayConfig dc = {
@@ -761,13 +953,20 @@ LagondaState *lagonda_create(const Z80Config *cfg) {
             { "Speedometer (VDP 1)", TMS9918_FB_W, TMS9918_FB_H, 4, 3 },
         };
         gemu_display_set_heads(s->display, heads, 1 + LAG_VDP_N);
-        if (!audio_open(s)) fprintf(stderr, "lagonda: no audio (continuing silently)\n");
+        s->audio_dev = gemu_audio_open("lagonda", LAG_AUDIO_RATE);
+        if (!s->audio_dev) fprintf(stderr, "lagonda: no audio (continuing silently)\n");
     }
+    gemu_mixer_set_output(s->core->machine, LAG_AUDIO_RATE, 1,
+                          s->audio_dev ? lag_sound_out : NULL, s->audio_dev);
     return s;
 }
 
 void lagonda_destroy(LagondaState *s) {
     if (!s) return;
+    if (s->core) {
+        gemu_machine_free(s->core->machine);
+        free(s->core);
+    }
     gemu_audio_close(s->audio_dev);
     gemu_display_destroy(s->display);
     gemu_monitor_destroy(s->monitor);
@@ -777,14 +976,39 @@ void lagonda_destroy(LagondaState *s) {
 
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
-#define AUDIO_QUEUE_MAX (3u * (LAG_AUDIO_RATE / 60u) * (unsigned)sizeof(float))
+/* A frame, about 66,750 T-states (262 lines of the VDPs' 342 dots); a run
+ * is given three, and ends at VDP 0's frame. */
+#define LAG_RUN_FRAMES 3
+
+/* One frame: the car follows the controls held, then the machine runs to
+ * the end of VDP 0's frame (or a breakpoint, or a watchpoint); its sound
+ * goes out. */
+static void lagonda_frame(LagondaState *s) {
+    handle_input(s, 1.0 / 59.94);
+    GemuMachine *m = s->core->machine;
+    s->frame_done = false;
+    lag_set_hooks(s);
+    uint64_t budget = (uint64_t)(LAG_RUN_FRAMES * TMS9918_LINES * s->line_cycles);
+    gemu_machine_run_until(m, gemu_machine_time(m) + gemu_clocks((uint64_t)s->clock_hz, budget));
+    gemu_mixer_run(m);
+}
+
+/* The monitor's step: n instructions through the machine. */
+static void lagonda_step(LagondaState *s, uint32_t n) {
+    if (!n) return;
+    GemuMachine *m = s->core->machine;
+    s->step_to = lag_insns(s) + n;
+    lag_set_hooks(s);
+    while (lag_insns(s) < s->step_to)
+        gemu_machine_run_until(m, gemu_machine_time(m) + gemu_clocks((uint64_t)s->clock_hz, 1000000));
+    s->step_to = 0;
+}
 
 void lagonda_run(LagondaState *s, const Z80Config *cfg) {
     gemu_monitor_start(s->monitor);
-    double carry_ms = 0;
+    GemuMachine *m = s->core->machine;
     bool quit = false;
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
         s->held = 0;
         if (s->display) {
             s->held = gemu_display_poll(s->display);
@@ -802,44 +1026,26 @@ void lagonda_run(LagondaState *s, const Z80Config *cfg) {
             } else if (cmd == GEMU_MON_RESET) {
                 power_on(s);
             } else if (cmd == GEMU_MON_STEP) {
-                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--) lag_step(s);
+                lagonda_step(s, gemu_monitor_step_count(s->monitor));
             }
         }
         if (quit) break;
         bool paused = gemu_monitor_is_paused(s->monitor);
         if (s->display) gemu_display_set_paused(s->display, paused);
 
-        handle_input(s, 1.0 / 59.94);
-
-        uint64_t start = s->cpu.cycles;
-        if (!paused) {
-            for (;;) {
-                if (gemu_monitor_check_exec(s->monitor, s->cpu.pc)) break;
-                bool frame = lag_step(s);
-                if (gemu_monitor_is_paused(s->monitor) || frame) break;
-            }
-            if (s->audio_dev && s->audio_n)
-                gemu_audio_queue(s->audio_dev, s->audio_buf, (size_t)s->audio_n);
-            s->audio_n = 0;
-        }
+        if (!paused) lagonda_frame(s);
+        else handle_input(s, 1.0 / 59.94);
         present(s);
 
-        if (s->audio_dev && !paused) {
-            while (gemu_audio_queued(s->audio_dev) > AUDIO_QUEUE_MAX) SDL_Delay(1);
+        /* Pace to the machine's time; paused, a frame's delay. */
+        if (!paused) {
+            gemu_machine_pace(m, 0);
         } else {
-            uint64_t ran = s->cpu.cycles - start;
-            double ms = ran ? ran * 1000.0 / s->clock_hz : 16.7;
-            carry_ms += ms - (SDL_GetTicks() - t0);
-            if (carry_ms > 0) {
-                Uint32 d = (Uint32)carry_ms;
-                SDL_Delay(d);
-                carry_ms -= d;
-            } else if (carry_ms < -100) {
-                carry_ms = 0;
-            }
+            gemu_machine_pace_reset(m);
+            SDL_Delay(17);
         }
     }
     gemu_monitor_stop(s->monitor);
     printf("lagonda: %llu T-states, %llu instructions\n",
-           (unsigned long long)s->cpu.cycles, (unsigned long long)s->insn_count);
+           (unsigned long long)s->cpu->cycles, (unsigned long long)lag_insns(s));
 }
