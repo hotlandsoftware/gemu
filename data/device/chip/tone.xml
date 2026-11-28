@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="tone" description="Gated square-wave tone (beeper)" status="working">
+    <type symbol="gemu_tone_type" source="hardware/device/audio/tone.c"/>
+</device>

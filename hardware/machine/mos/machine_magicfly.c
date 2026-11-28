@@ -4,7 +4,7 @@
 #include "magicfly.h"
 #include "gemu/util.h"
 #include "gemu/screendump.h"
-#include "mos_core.h"
+#include "gemu/dev/space_cache.h"
 #include "mos6502_dev.h"
 #include "gemu/dev/device.h"
 #include "gemu/dev/line.h"
@@ -496,7 +496,7 @@ typedef struct MagicflyCore {
     GemuMachine *machine;
     GemuDevice  *board, *cpu;
     GemuSpace   *bus;
-    MosBus       cache;
+    GemuSpaceCache       cache;
     GemuLine    *vsync;
     GemuTimer   *vsync_timer;
     GemuTime     frame_end;
@@ -508,11 +508,11 @@ typedef struct MagicflyCore {
 
 static uint8_t magicfly_read(uint16_t addr, void *ud) {
     MagicflyState *s = ud;
-    return mos_bus_read(&s->core->cache, addr);
+    return gemu_space_cache_read8(&s->core->cache, addr);
 }
 static void magicfly_write(uint16_t addr, uint8_t val, void *ud) {
     MagicflyState *s = ud;
-    mos_bus_write(&s->core->cache, addr, val);
+    gemu_space_cache_write8(&s->core->cache, addr, val);
 }
 
 static bool magicfly_bus_build(MagicflyState *s) {

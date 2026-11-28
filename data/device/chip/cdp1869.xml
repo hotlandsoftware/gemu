@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="cdp1869" description="RCA CDP1869/CDP1870 video interface system" status="working">
+    <type symbol="gemu_cdp1869_type" source="vga/rca/cdp1869_dev.c"/>
+</device>

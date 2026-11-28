@@ -2,7 +2,6 @@
 #include "cdp1802.h"
 #include "cdp1861.h"
 #include "rca.h"
-#include "pcspk.h"
 #include "gemu/monitor.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -16,9 +15,12 @@
 #define STUDIO2_BYTES_PER_LINE (STUDIO2_DISPLAY_W / 8)
 #define STUDIO2_CART_PATH_MAX 512
 
+struct RcaStudio2Core;
+
 typedef struct RcaStudio2State {
-    Cdp1802  cpu;
-    Cdp1861  vdc;
+    struct RcaStudio2Core *core;   /* the core machine (stage R3) */
+    Cdp1802 *cpu;                  /* the cpu device's */
+    Cdp1861 *vdc;                  /* the vdc device's */
     const RcaConfig *cfg;
 
     uint8_t  rom[STUDIO2_ROM_SIZE];    /* built-in 2 KB ROM */
@@ -37,7 +39,6 @@ typedef struct RcaStudio2State {
     bool     keys_b[10];   /* Player B: keys 0-9 */
 
     GemuMonitor  *monitor;
-    RcaPcSpeaker  *speaker;
 } RcaStudio2State;
 
 RcaStudio2State *rca_studio2_create(const RcaConfig *cfg);

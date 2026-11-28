@@ -3,7 +3,16 @@
 #endif
 #include "destroyer.h"
 #include "gemu/util.h"
-#include "pcspk.h"
+#include "cdp1802_dev.h"
+#include "cdp1869_dev.h"
+#include "audio/tone.h"
+#include "gemu/audio_out.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/space.h"
+#include "gemu/dev/space_cache.h"
+#include "gemu/dev/state.h"
+#include "gemu/dev/stream.h"
 #include "gemu/memory.h"
 #include "gemu/screendump.h"
 #include "gemu/gemu_display.h"
@@ -100,15 +109,6 @@ static const DestroyerDip destroyer_dips[] = {
      sizeof(destroyer_coinage_opts) / sizeof(destroyer_coinage_opts[0])},
 };
 
-static uint8_t destroyer_mem_read(uint16_t addr, void *ud) {
-    RcaDestroyerState *s = ud;
-    if (addr >= 0xf400 && addr <= 0xf7ff)
-        return cdp1869_char_read(&s->vis, (uint16_t)(addr - 0xf400));
-    if (addr >= 0xf800)
-        return cdp1869_page_read(&s->vis, (uint16_t)(addr - 0xf800));
-    return s->mem[addr];
-}
-
 static void destroyer_mem_write(uint16_t addr, uint8_t val, void *ud) {
     RcaDestroyerState *s = ud;
     if (addr <= 0x1fff)
@@ -118,11 +118,11 @@ static void destroyer_mem_write(uint16_t addr, uint8_t val, void *ud) {
         return;
     }
     if (addr >= 0xf400 && addr <= 0xf7ff) {
-        cdp1869_char_write(&s->vis, (uint16_t)(addr - 0xf400), val);
+        cdp1869_char_write(s->vis, (uint16_t)(addr - 0xf400), val);
         return;
     }
     if (addr >= 0xf800) {
-        cdp1869_page_write(&s->vis, (uint16_t)(addr - 0xf800), val);
+        cdp1869_page_write(s->vis, (uint16_t)(addr - 0xf800), val);
         return;
     }
     s->mem[addr] = val;
@@ -138,11 +138,11 @@ static uint8_t destroyer_io_in(uint8_t port, void *ud) {
         debug = getenv("GEMU_DESTROYER_DEBUG") != NULL;
 
     if (port == 1) {
-        uint8_t v = (uint8_t)(s->in0 | (!s->vis.pcb ? 0x80u : 0x00u));
+        uint8_t v = (uint8_t)(s->in0 | (!s->vis->pcb ? 0x80u : 0x00u));
         if (debug && v != last_in0) {
             fprintf(stderr,
                     "destroyer port1: %02x pcb=%u start1=%u start2=%u left=%u right=%u fire=%u\n",
-                    v, s->vis.pcb, s->start1, s->start2, s->left, s->right, s->fire);
+                    v, s->vis->pcb, s->start1, s->start2, s->left, s->right, s->fire);
             last_in0 = v;
         }
         return v;
@@ -160,11 +160,13 @@ static uint8_t destroyer_io_in(uint8_t port, void *ud) {
 /* CDP1869 dot clock: 5.7143 MHz for Destroyer (PAL) */
 #define DESTROYER_DOT_HZ 5714300u
 
+static GemuDevice *destroyer_tone(RcaDestroyerState *s);
 static void destroyer_update_sound(RcaDestroyerState *s) {
-    if (!s->speaker) return;
-    const Cdp1869 *vis = &s->vis;
+    GemuDevice *tone = destroyer_tone(s);
+    if (!tone) return;
+    const Cdp1869 *vis = s->vis;
     if (vis->tone_off || vis->tone_amp == 0) {
-        rca_pcspk_set_gate(s->speaker, 0);
+        gemu_tone_set_gate(tone, false);
         return;
     }
     /* f = (dot_hz / 2) / (512 >> tone_freq_sel) / (tone_div + 1) */
@@ -172,14 +174,14 @@ static void destroyer_update_sound(RcaDestroyerState *s) {
     unsigned freq = (DESTROYER_DOT_HZ / 2u) / prescaler / ((unsigned)vis->tone_div + 1u);
     if (freq < 20u)    freq = 20u;
     if (freq > 20000u) freq = 20000u;
-    rca_pcspk_set_freq(s->speaker, freq);
-    rca_pcspk_set_gate(s->speaker, 1);
+    gemu_tone_set_freq(tone, freq);
+    gemu_tone_set_gate(tone, true);
 }
 
 static void destroyer_io_out(uint8_t port, uint8_t val, void *ud) {
     RcaDestroyerState *s = ud;
     if (port >= 3 && port <= 7) {
-        cdp1869_out(&s->vis, port, s->cpu.memory_addr, val);
+        cdp1869_out(s->vis, port, s->cpu->memory_addr, val);
         if (port == 4)
             destroyer_update_sound(s);
     }
@@ -187,7 +189,7 @@ static void destroyer_io_out(uint8_t port, uint8_t val, void *ud) {
 
 static void destroyer_q_out(uint8_t q, void *ud) {
     RcaDestroyerState *s = ud;
-    s->vis.q = q & 1u;
+    s->vis->q = q & 1u;
 }
 
 static uint32_t cdp1869_rgb(int color, int luma) {
@@ -319,7 +321,7 @@ static bool destroyer_mon_read(void *ud, uint64_t addr, uint8_t *val) {
     if (addr > 0xffffu) return false;
     if (addr >= 0xf400 && addr <= 0xf7ff) return false;
     if (addr >= 0xf800) {
-        *val = cdp1869_page_read(&s->vis, (uint16_t)(addr - 0xf800));
+        *val = cdp1869_page_read(s->vis, (uint16_t)(addr - 0xf800));
         return true;
     }
     *val = s->mem[addr];
@@ -335,7 +337,7 @@ static bool destroyer_mon_write(void *ud, uint64_t addr, uint8_t val) {
 
 static void destroyer_mon_cpu_state(void *ud, char *buf, size_t len) {
     const RcaDestroyerState *s = ud;
-    cdp1802_format_state(&s->cpu, buf, len);
+    cdp1802_format_state(s->cpu, buf, len);
 }
 
 /*
@@ -371,20 +373,20 @@ static void destroyer_video_timing(RcaDestroyerState *s, unsigned frame_cycle) {
         ((DESTROYER_MCYCLES_PER_FRAME * DESTROYER_NONDISPLAY_END_LINE) /
          DESTROYER_PAL_LINES);
     unsigned display_end = DESTROYER_MCYCLES_PER_FRAME -
-                           destroyer_display_end_cycle(&s->vis);
+                           destroyer_display_end_cycle(s->vis);
 
     /* non_display: true during VBlank so CPU can access page/char RAM */
-    s->vis.non_display = frame_cycle < non_display_end ||
+    s->vis->non_display = frame_cycle < non_display_end ||
                          frame_cycle >= display_end ||
-                         s->vis.dispoff;
+                         s->vis->dispoff;
 
     /* EF1 (active-low) goes asserted one line before display starts */
-    s->cpu.EF[0] = !(frame_cycle >= predisplay && frame_cycle < display_end &&
-                     !s->vis.dispoff);
+    s->cpu->EF[0] = !(frame_cycle >= predisplay && frame_cycle < display_end &&
+                     !s->vis->dispoff);
 
     /* IRQ fires at the START of VBlank (= end of active display) */
-    if (frame_cycle == display_end && !s->vis.dispoff)
-        cdp1802_request_irq(&s->cpu);
+    if (frame_cycle == display_end && !s->vis->dispoff)
+        cdp1802_request_irq(s->cpu);
 }
 
 static void destroyer_rotate_bitmap(RcaDestroyerState *s) {
@@ -393,7 +395,7 @@ static void destroyer_rotate_bitmap(RcaDestroyerState *s) {
             int dx = DESTROYER_ROTATED_W - 1 - y;
             int dy = x;
             s->rotated_bitmap[dy * DESTROYER_ROTATED_W + dx] =
-                s->vis.bitmap[y * CDP1869_VISIBLE_W + x];
+                s->vis->bitmap[y * CDP1869_VISIBLE_W + x];
         }
     }
 }
@@ -406,9 +408,9 @@ static void destroyer_sync_inputs(RcaDestroyerState *s) {
     if (s->left)   s->in0 &= (uint8_t)~0x10u;
     if (s->fire)   s->in0 &= (uint8_t)~0x20u;
 
-    s->cpu.EF[1] = !s->service;
-    s->cpu.EF[2] = !(s->coin2 || s->coin2_latch > 0);
-    s->cpu.EF[3] = !(s->coin1 || s->coin1_latch > 0);
+    s->cpu->EF[1] = !s->service;
+    s->cpu->EF[2] = !(s->coin2 || s->coin2_latch > 0);
+    s->cpu->EF[3] = !(s->coin1 || s->coin1_latch > 0);
 }
 
 static void destroyer_default_inputs(RcaDestroyerState *s) {
@@ -428,10 +430,212 @@ static void destroyer_default_inputs(RcaDestroyerState *s) {
 
 static bool destroyer_screendump(void *ud, const char *path) {
     RcaDestroyerState *s = ud;
+    bool dirty = s->vis->dirty;
+    cdp1869_render(s->vis);
+    s->vis->dirty = dirty;
+    destroyer_rotate_bitmap(s);
     const uint8_t *buf = (s->cfg->vga == RCA_VGA_CDP1869)
-                         ? s->rotated_bitmap : s->vis.bitmap;
-    return gemu_screendump_mono(path, buf,
-                                CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
+                         ? s->rotated_bitmap : s->vis->bitmap;
+    /* the turned picture is 216x240 (HEAD wrote it as 240x216) */
+    bool turned = s->cfg->vga == RCA_VGA_CDP1869;
+    return gemu_screendump_mono(path, buf, turned ? DESTROYER_ROTATED_W : CDP1869_VISIBLE_W,
+                                turned ? DESTROYER_ROTATED_H : CDP1869_VISIBLE_H);
+}
+
+/* ── The core machine (stage R5) ─────────────────────────────────────────────
+ * board (destroyer-board): the RAM, the inputs and DIP switches, the coin
+ * latches, the beam (frame_cycle); cpu (cdp1802): the machine's executor at
+ * 447,350 machine cycles a second (destroyer_cycle: the VIS's timing for
+ * the cycle - non-display, EF1, the interrupt at the start of VBlank - then
+ * the CPU's cycle); vis (cdp1869); tone (with -soundhw pcspk): the VIS's
+ * tone generator, its pitch from OUT 4.
+ * The bus, "program": the ROM at $0000-$1FFF (writes dropped), RAM from
+ * $2000, the VIS's character RAM ($F400) and page RAM ($F800).  The board's
+ * "screen" is the VIS's 240x216 bitmap turned a quarter (the cabinet's
+ * monitor is on its side): 216x240.
+ * Before stage R the beam was the run loop's loop variable, restarted each
+ * frame, and step didn't clock it; now both run and step go through
+ * destroyer_cycle and a stopped frame carries on where it stopped. */
+typedef struct RcaDestroyerCore {
+    GemuMachine   *machine;
+    GemuDevice    *board, *cpu, *vis, *tone;
+    GemuSpace     *bus;
+    GemuSpaceCache cache;
+    GemuScreen    *screen;
+    GemuAudioOut  *audio;
+} RcaDestroyerCore;
+
+#define DESTROYER_MCYCLE_HZ (DESTROYER_MCYCLES_PER_FRAME * DESTROYER_FRAME_HZ)
+
+static GemuDevice *destroyer_tone(RcaDestroyerState *s) {
+    return s->core ? s->core->tone : NULL;
+}
+
+static uint8_t destroyer_bus_read(uint16_t addr, void *ud) {
+    return gemu_space_cache_read8(&((RcaDestroyerState *)ud)->core->cache, addr);
+}
+static void destroyer_bus_write(uint16_t addr, uint8_t val, void *ud) {
+    gemu_space_cache_write8(&((RcaDestroyerState *)ud)->core->cache, addr, val);
+}
+static uint8_t dvis_char_r(void *ud, uint64_t off) {
+    return cdp1869_char_read(((RcaDestroyerState *)ud)->vis, (uint16_t)off);
+}
+static void dvis_char_w(void *ud, uint64_t off, uint8_t v) {
+    cdp1869_char_write(((RcaDestroyerState *)ud)->vis, (uint16_t)off, v);
+}
+static uint8_t dvis_page_r(void *ud, uint64_t off) {
+    return cdp1869_page_read(((RcaDestroyerState *)ud)->vis, (uint16_t)off);
+}
+static void dvis_page_w(void *ud, uint64_t off, uint8_t v) {
+    cdp1869_page_write(((RcaDestroyerState *)ud)->vis, (uint16_t)off, v);
+}
+static const GemuHandlers dvis_char_handlers = { .r8 = dvis_char_r, .w8 = dvis_char_w };
+static const GemuHandlers dvis_page_handlers = { .r8 = dvis_page_r, .w8 = dvis_page_w };
+
+/* (Unmapped writes are dropped: the ROM's mapping is read-only.) */
+static bool destroyer_bus_build(RcaDestroyerState *s) {
+    RcaDestroyerCore *c = s->core;
+    GemuSpace *b = c->bus = gemu_space_new(c->machine, "program", 16, 8, GEMU_BIG_ENDIAN);
+    if (!b) return false;
+    c->cache.space = b;
+    return gemu_space_map_ram(b, 0x0000, 0x2000, s->mem, GEMU_MAP_READONLY, 0) &&
+           gemu_space_map_ram(b, 0x2000, 0xF400 - 0x2000, s->mem + 0x2000, 0, 0) &&
+           gemu_space_map(b, 0xF400, 0x400, &dvis_char_handlers, s, 0, 0) &&
+           gemu_space_map(b, 0xF800, 0x800, &dvis_page_handlers, s, 0, 0);
+}
+
+static void destroyer_board_describe(GemuDevice *d, char *buf, size_t len) {
+    const RcaDestroyerState *s = *(RcaDestroyerState **)d->priv;
+    snprintf(buf, len, "Destroyer; inputs %02X, DIP switches %02X; coin latches %d/%d; "
+             "frame cycle %u of %u", s->in0, s->in1, s->coin1_latch, s->coin2_latch,
+             s->frame_cycle, (unsigned)DESTROYER_MCYCLES_PER_FRAME);
+}
+
+static const GemuDeviceType destroyer_board_type = {
+    .name = "destroyer-board", .desc = "Destroyer board (RAM, inputs, DIP switches)",
+    .size = sizeof(RcaDestroyerState *), .describe = destroyer_board_describe,
+};
+
+#define B(field) ok &= GEMU_STATE_MEMBER(d, "", s, field)
+/* The board's state: the memory (the ROM part is loaded again anyway), the
+ * DIP switches, the coin latches, the beam.  Not saved: the inputs held
+ * (the host's). */
+static bool destroyer_board_state(RcaDestroyerState *s, GemuDevice *d) {
+    bool ok = true;
+    B(mem); B(in1); B(coin1_latch); B(coin2_latch); B(frame_cycle);
+    return ok;
+}
+#undef B
+
+/* One machine cycle on the beam. */
+static void destroyer_cycle(RcaDestroyerState *s) {
+    destroyer_video_timing(s, s->frame_cycle);
+    cdp1802_step(s->cpu);
+    if (++s->frame_cycle == DESTROYER_MCYCLES_PER_FRAME) s->frame_cycle = 0;
+}
+static bool destroyer_stop_before(void *ud) {
+    RcaDestroyerState *s = ud;
+    return gemu_monitor_check_exec(s->monitor, s->cpu->R[s->cpu->P]);
+}
+static void destroyer_hook_cycle(void *ud) { destroyer_cycle(ud); }
+static bool destroyer_stop_after(void *ud) {
+    return gemu_monitor_is_paused(((RcaDestroyerState *)ud)->monitor);
+}
+
+/* The VIS's settings on this board (cdp1869_reset puts some back). */
+static void destroyer_vis_setup(RcaDestroyerState *s) {
+    cdp1869_set_page_ram_mask(s->vis, 0x03ffu);
+    cdp1869_set_char_stride(s->vis, 8u);
+    cdp1869_set_block_cpu_access(s->vis, false);
+}
+
+static void destroyer_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    RcaDestroyerState *s = ud;
+    cdp1869_render(s->vis);
+    destroyer_rotate_bitmap(s);
+    for (int y = clip->y0; y < clip->y1; y++)
+        for (int x = 0; x < DESTROYER_ROTATED_W; x++)
+            bmp->pix[(size_t)y * (size_t)bmp->stride + (size_t)x] =
+                destroyer_palette[s->rotated_bitmap[y * DESTROYER_ROTATED_W + x]];
+}
+
+static void destroyer_sound_out(void *ud, const float *samples, size_t frames) {
+    gemu_audio_queue(ud, samples, frames);
+}
+
+static bool destroyer_core_fail(RcaDestroyerCore *c) {
+    fprintf(stderr, "gemu-rca: destroyer: core machine: %s\n", gemu_machine_error(c->machine)[0]
+            ? gemu_machine_error(c->machine) : "a device couldn't be added");
+    return false;
+}
+
+static bool destroyer_core_build(RcaDestroyerState *s) {
+    const RcaConfig *cfg = s->cfg;
+    RcaDestroyerCore *c = s->core = calloc(1, sizeof *c);
+    if (!c || !(c->machine = gemu_machine_new("destroyer")))
+        return false;
+    bool ok = (c->board = gemu_device_add(c->machine, &destroyer_board_type, "board", NULL, NULL)) &&
+              (c->cpu = gemu_device_add(c->machine, &gemu_cdp1802_type, "cpu", NULL, NULL)) &&
+              (c->vis = gemu_device_add(c->machine, &gemu_cdp1869_type, "vis", NULL, NULL));
+    if (ok && cfg->sound_hw != RCA_SOUND_NONE)
+        ok = (c->tone = gemu_device_add(c->machine, &gemu_tone_type, "tone", NULL, "freq=440"));
+    if (ok) {
+        *(RcaDestroyerState **)c->board->priv = s;
+        ok = destroyer_board_state(s, c->board);
+    }
+    if (!ok || !gemu_machine_init(c->machine))
+        return destroyer_core_fail(c);
+    s->cpu = gemu_cdp1802(c->cpu);
+    s->vis = gemu_cdp1869(c->vis);
+    Cdp1802 *cpu = s->cpu;
+    cpu->mem_read  = destroyer_bus_read;
+    cpu->mem_write = destroyer_bus_write;
+    cpu->io_in     = destroyer_io_in;
+    cpu->io_out    = destroyer_io_out;
+    cpu->q_out     = destroyer_q_out;
+    cpu->io_ud     = s;
+    destroyer_vis_setup(s);
+    GemuCdp1802Hooks h = { .stop_before = destroyer_stop_before, .cycle = destroyer_hook_cycle,
+                           .stop_after = destroyer_stop_after, .ud = s };
+    ok = destroyer_bus_build(s) && gemu_cdp1802_exec(c->cpu, DESTROYER_MCYCLE_HZ, &h) &&
+         (c->screen = gemu_screen_new(c->board, "screen")) &&
+         gemu_screen_set_size(c->screen, DESTROYER_ROTATED_W, DESTROYER_ROTATED_H);
+    if (ok) {
+        gemu_screen_set_update(c->screen, destroyer_screen_update, s);
+        if (c->tone) c->audio = gemu_audio_open("destroyer", 44100);
+        gemu_mixer_set_output(c->machine, 44100, 1, c->audio ? destroyer_sound_out : NULL, c->audio);
+    }
+    if (!ok || !gemu_machine_start(c->machine))
+        return destroyer_core_fail(c);
+    gemu_monitor_attach_machine(s->monitor, c->machine, "program");
+    return true;
+}
+
+static void destroyer_core_free(RcaDestroyerState *s) {
+    if (!s->core) return;
+    gemu_machine_free(s->core->machine);
+    gemu_audio_close(s->core->audio);
+    free(s->core);
+    s->core = NULL;
+}
+
+/* One frame: the machine run to the frame's end (from wherever the beam
+ * is), then, at a frame's end, VBlank for the host's turn (page and
+ * character RAM writable, EF1 off) and the coin latches count down; the
+ * frame's sound out. */
+static void destroyer_frame(RcaDestroyerState *s) {
+    RcaDestroyerCore *c = s->core;
+    uint64_t left = DESTROYER_MCYCLES_PER_FRAME - s->frame_cycle;
+    gemu_machine_run_until(c->machine,
+                           gemu_machine_time(c->machine) + gemu_clocks(DESTROYER_MCYCLE_HZ, left));
+    if (s->frame_cycle == 0) {
+        s->vis->non_display = true;
+        s->cpu->EF[0] = true;
+        if (s->coin1_latch > 0) s->coin1_latch--;
+        if (s->coin2_latch > 0) s->coin2_latch--;
+        gemu_screen_frame_begin(c->screen);
+    }
+    gemu_mixer_run(c->machine);
 }
 
 RcaDestroyerState *rca_destroyer_create(const RcaConfig *cfg) {
@@ -440,22 +644,7 @@ RcaDestroyerState *rca_destroyer_create(const RcaConfig *cfg) {
 
     s->cfg = cfg;
     destroyer_init_palette();
-    cdp1802_init(&s->cpu, s->mem, DESTRYER_MEM_SIZE);
-    s->cpu.io_in = destroyer_io_in;
-    s->cpu.io_out = destroyer_io_out;
-    s->cpu.mem_read = destroyer_mem_read;
-    s->cpu.mem_write = destroyer_mem_write;
-    s->cpu.q_out = destroyer_q_out;
-    s->cpu.io_ud = s;
-    cdp1869_init(&s->vis);
-    cdp1869_set_page_ram_mask(&s->vis, 0x03ffu);
-    cdp1869_set_char_stride(&s->vis, 8u);
-    cdp1869_set_block_cpu_access(&s->vis, false);
     destroyer_default_inputs(s);
-    destroyer_sync_inputs(s);
-
-    if (cfg->sound_hw != RCA_SOUND_NONE)
-        s->speaker = rca_pcspk_create(440u);
 
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_screendump_cb(s->monitor, destroyer_screendump, s);
@@ -478,14 +667,26 @@ RcaDestroyerState *rca_destroyer_create(const RcaConfig *cfg) {
         gemu_monitor_register_rom(s->monitor, cfg->roms[i].addr, (uint32_t)len,
                                   cfg->roms[i].path);
     }
+    if (!destroyer_core_build(s)) {
+        rca_destroyer_destroy(s);
+        return NULL;
+    }
+    destroyer_sync_inputs(s);
     return s;
 }
 
+/* The DIP switches are kept; HEAD's reset put them back to the defaults
+ * (and left the VIS blocking the CPU during the display). */
 static void rca_destroyer_reset(RcaDestroyerState *s, const RcaConfig *cfg) {
     memset(s->mem + 0x2000, 0, 0x100);
-    cdp1802_reset(&s->cpu);
-    cdp1869_reset(&s->vis);
+    cdp1802_reset(s->cpu);
+    cdp1869_reset(s->vis);
+    destroyer_vis_setup(s);
+    if (destroyer_tone(s)) gemu_tone_set_gate(destroyer_tone(s), false);
+    uint8_t dips = s->in1;
     destroyer_default_inputs(s);
+    s->in1 = dips;
+    s->frame_cycle = 0;
     destroyer_sync_inputs(s);
 
     GemuMemory tmp = {.data = s->mem, .size = DESTRYER_MEM_SIZE};
@@ -495,7 +696,7 @@ static void rca_destroyer_reset(RcaDestroyerState *s, const RcaConfig *cfg) {
 
 void rca_destroyer_destroy(RcaDestroyerState *s) {
     if (!s) return;
-    rca_pcspk_destroy(s->speaker);
+    destroyer_core_free(s);
     gemu_monitor_destroy(s->monitor);
     free(s);
 }
@@ -529,20 +730,18 @@ static void destroyer_apply_held(RcaDestroyerState *s, uint32_t held) {
     }
 }
 
-/* Draw the (rotated) CDP1869 picture: every frame while running, and every
- * pass while paused so monitor steps show. */
+/* The board's core screen (the turned VIS picture) to the window, when the
+ * VIS has changed (running, or stepped from the monitor while paused). */
 static void destroyer_present(RcaDestroyerState *s, const RcaConfig *cfg,
-                              GemuDisplay *display, uint32_t *argb) {
+                              GemuDisplay *display) {
     if (!display) return;
     if (cfg->vga == RCA_VGA_CDP1869) {
-        cdp1869_render(&s->vis);
-        destroyer_rotate_bitmap(s);
-        for (int i = 0; i < DESTROYER_ROTATED_W * DESTROYER_ROTATED_H; i++)
-            argb[i] = destroyer_palette[s->rotated_bitmap[i]];
-        gemu_display_render(display, argb, DESTROYER_ROTATED_W, DESTROYER_ROTATED_H);
+        if (!s->vis->dirty) return;
+        const GemuBitmap *b = gemu_screen_render(s->core->screen);
+        gemu_display_render(display, b->pix, b->width, b->height);
     } else if (cfg->vga == RCA_VGA_CDP1861) {
-        memset(argb, 0, sizeof(uint32_t) * (size_t)(CDP1861_DISPLAY_W * CDP1861_DISPLAY_H));
-        gemu_display_render(display, argb, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
+        static uint32_t black[CDP1861_DISPLAY_W * CDP1861_DISPLAY_H];
+        gemu_display_render(display, black, CDP1861_DISPLAY_W, CDP1861_DISPLAY_H);
     }
 }
 
@@ -574,7 +773,6 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
     gemu_monitor_start(s->monitor);
 
     const unsigned frame_ms = 1000u / DESTROYER_FRAME_HZ;
-    uint32_t argb[DESTROYER_ROTATED_W * DESTROYER_ROTATED_H];
     bool quit = false;
 
     while (!quit) {
@@ -600,33 +798,34 @@ void rca_destroyer_run(RcaDestroyerState *s, const RcaConfig *cfg) {
             else if (cmd == GEMU_MON_RESET) rca_destroyer_reset(s, cfg);
             else if (cmd == GEMU_MON_STEP) {
                 uint32_t n = gemu_monitor_step_count(s->monitor);
-                for (uint32_t i = 0; i < n; i++) cdp1802_step(&s->cpu);
+                for (uint32_t k = 0; k < n; k++) {
+                    /* a machine cycle at a time to the instruction's end
+                     * (bounded, in case of IDL) */
+                    uint64_t start = s->cpu->insn_count;
+                    for (int i = 0; i < 1024 && s->cpu->insn_count == start; i++)
+                        destroyer_cycle(s);
+                }
             }
         }
         if (quit) break;
         gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));
 
-        if (!gemu_monitor_is_paused(s->monitor)) {
-            for (unsigned i = 0; i < DESTROYER_MCYCLES_PER_FRAME; i++) {
-                destroyer_video_timing(s, i);
-                cdp1802_step(&s->cpu);
-            }
-            s->vis.non_display = true;
-            s->cpu.EF[0] = true;
+        bool paused = gemu_monitor_is_paused(s->monitor);
+        if (!paused) destroyer_frame(s);       /* the cpu device's executor */
+        destroyer_present(s, cfg, display);    /* (paused: shows monitor steps) */
 
-            destroyer_present(s, cfg, display, argb);
+        /* Pace to the machine's time; paused, a frame's delay. */
+        if (!paused) {
+            gemu_machine_pace(s->core->machine, 0);
         } else {
-            destroyer_present(s, cfg, display, argb);   /* show monitor steps */
+            gemu_machine_pace_reset(s->core->machine);
+            gemu_sleep_ms(frame_ms);
         }
-
-        if (s->coin1_latch > 0) s->coin1_latch--;
-        if (s->coin2_latch > 0) s->coin2_latch--;
-        gemu_sleep_ms(frame_ms);
     }
 
     printf("gemu-rca: %llu machine cycles, %llu instructions\n",
-           (unsigned long long)s->cpu.cycle_count,
-           (unsigned long long)s->cpu.insn_count);
+           (unsigned long long)s->cpu->cycle_count,
+           (unsigned long long)s->cpu->insn_count);
     gemu_monitor_stop(s->monitor);
     gemu_display_destroy(display);
 }

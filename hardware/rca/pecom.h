@@ -2,7 +2,6 @@
 #include "cdp1802.h"
 #include "cdp1869.h"
 #include "rca.h"
-#include "pcspk.h"
 #include "gemu/monitor.h"
 #include "gemu/gemu_display.h"
 #include <stdlib.h>
@@ -38,9 +37,13 @@
 /* CDP1869 PAL timing: 312 lines × 14 machine cycles per line */
 #define PECOM32_MCYCLES_PER_FRAME  CDP1869_MCYCLES_PER_FRAME
 
+struct RcaPecomCore;
+
 typedef struct RcaPecom32State {
-    Cdp1802          cpu;
-    Cdp1869          vis;
+    struct RcaPecomCore *core;   /* the core machine (stage R4) */
+    Cdp1802         *cpu;        /* the cpu device's */
+    Cdp1869         *vis;        /* the vis device's */
+    uint32_t         frame_cycle;   /* machine cycle within the frame (the beam) */
     const RcaConfig *cfg;
 
     uint8_t  rom[PECOM64_ROM_SIZE];   /* 32 KB buffer; Pecom 32 uses first 16 KB */
@@ -68,7 +71,6 @@ typedef struct RcaPecom32State {
     bool     caps_key_prev; /* Caps Lock held last poll (edge detect) */
 
     GemuMonitor  *monitor;
-    RcaPcSpeaker *speaker;
 } RcaPecom32State;
 
 /* ── Public API ──────────────────────────────────────────────────────────── */

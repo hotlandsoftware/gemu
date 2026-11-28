@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 # ── Source file lists per family ───────────────────────────────────────────────
 
 CORE_SRC = [
-    'core/src/memory.c', 'core/src/dev/device.c', 'core/src/dev/space.c', 'core/src/dev/scheduler.c', 'core/src/dev/line.c', 'core/src/dev/option.c', 'core/src/dev/state.c', 'core/src/dev/screen.c', 'core/src/dev/stream.c', 'core/src/dev/bench.c', 'core/src/tcg.c', 'jit/jit_mem.c', 'jit/jit_backend_x64.c', 'core/src/monitor.c',
+    'core/src/memory.c', 'core/src/dev/device.c', 'core/src/dev/space.c', 'core/src/dev/space_cache.c', 'core/src/dev/scheduler.c', 'core/src/dev/line.c', 'core/src/dev/option.c', 'core/src/dev/state.c', 'core/src/dev/screen.c', 'core/src/dev/stream.c', 'core/src/dev/bench.c', 'core/src/tcg.c', 'jit/jit_mem.c', 'jit/jit_backend_x64.c', 'core/src/monitor.c',
     'core/src/monitor_cmds.c', 'core/src/monitor_dev.c', 'core/src/monitor_qmp.c',
     'core/src/monitor_block.c', 'core/src/monitor_symbols.c',
     'core/third_party/cjson/cJSON.c',
@@ -147,7 +147,7 @@ FAMILY_SRC = {
     ],
     'mos': [
         'cpu/mos/mos6502.c', 'cpu/mos/mos6502_dis.c', 'cpu/mos/mos6502_state.c',
-        'cpu/mos/mos6502_dev.c', 'hardware/mos/mos_core.c',
+        'cpu/mos/mos6502_dev.c',
         'vga/mos/rp2c02.c', 'vga/mos/rp2c02_state.c', 'vga/mos/ppu_sh6578.c', 'vga/mos/ppu_sh6578_state.c', 'vga/multi/input_menu.c',
         'audio/apu2a03.c', 'audio/apu2a03_state.c', 'audio/okim6295.c', 'audio/okim6295_state.c',
         'hardware/machine/mos/machine_mos.c', 'hardware/machine/mos/machine_apple1.c',
@@ -188,9 +188,9 @@ FAMILY_SRC = {
         'src/mos_setup.c',
     ],
     'rca': [
-        'cpu/rca/cdp1802.c',
+        'cpu/rca/cdp1802.c', 'cpu/rca/cdp1802_state.c', 'cpu/rca/cdp1802_dev.c',
+        'vga/rca/cdp1861_dev.c', 'vga/rca/cdp1869_dev.c', 'hardware/device/audio/tone.c',
         'vga/rca/cdp1861.c', 'vga/rca/cdp1869.c', 'vga/multi/input_menu.c',
-        'audio/pcspk.c',
         'hardware/machine/rca/machine_vip.c', 'hardware/machine/rca/machine_destroyer.c',
         'hardware/machine/rca/machine_studio2.c', 'hardware/machine/rca/machine_pecom.c',
         'hardware/device/input/rca_keyboard.c', 'hardware/device/storage/tape.c', 'hardware/romdb.c',
@@ -265,7 +265,7 @@ I460GX_TEST_LINKS = [
     'hardware/device/i2c/lm87.c', 'hardware/device/storage/fwh82802.c',
 ]
 # the core device framework (core/src/dev/): one machine needs all of it
-DEV_CORE_LINKS = ['core/src/dev/device.c', 'core/src/dev/space.c',
+DEV_CORE_LINKS = ['core/src/dev/device.c', 'core/src/dev/space.c', 'core/src/dev/space_cache.c',
                   'core/src/dev/scheduler.c', 'core/src/dev/line.c',
                   'core/src/dev/option.c', 'core/src/dev/state.c',
                   'core/src/dev/screen.c', 'core/src/dev/stream.c',
@@ -288,6 +288,12 @@ TESTS = [
          cflags='-Werror'),
     dict(name='pia6821', family=None, kind='device', src='tests/pia6821.c',
          links=['hardware/device/controller/pia6821.c'], cflags='-Werror'),
+    dict(name='rca_devices', family='rca', kind='device', src='tests/rca_devices.c',
+         links=DEV_CORE_LINKS + ['cpu/rca/cdp1802.c', 'cpu/rca/cdp1802_state.c',
+                                 'cpu/rca/cdp1802_dev.c', 'vga/rca/cdp1861.c',
+                                 'vga/rca/cdp1861_dev.c', 'vga/rca/cdp1869.c',
+                                 'vga/rca/cdp1869_dev.c', 'hardware/device/audio/tone.c'],
+         cflags='-Werror'),
     dict(name='mos_devices', family='mos', kind='device', src='tests/mos_devices.c',
          links=DEV_CORE_LINKS + ['cpu/mos/mos6502.c', 'cpu/mos/mos6502_state.c',
                                  'cpu/mos/mos6502_dev.c',
@@ -380,6 +386,14 @@ TESTS = [
          replaces=['hardware/machine/mos/machine_magicfly.c']),
     dict(name='um6578_core', family='mos', kind='program', src='tests/um6578_core.c',
          replaces=['hardware/machine/mos/machine_um6578.c']),
+    dict(name='vip_core', family='rca', kind='program', src='tests/vip_core.c',
+         replaces=['hardware/machine/rca/machine_vip.c']),
+    dict(name='studio2_core', family='rca', kind='program', src='tests/studio2_core.c',
+         replaces=['hardware/machine/rca/machine_studio2.c']),
+    dict(name='pecom_core', family='rca', kind='program', src='tests/pecom_core.c',
+         replaces=['hardware/machine/rca/machine_pecom.c']),
+    dict(name='destroyer_core', family='rca', kind='program', src='tests/destroyer_core.c',
+         replaces=['hardware/machine/rca/machine_destroyer.c']),
 ]
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 #include "machine_mos.h"
-#include "mos_core.h"
+#include "gemu/dev/space_cache.h"
 #include "mos6502_dev.h"
 #include "gemu/memory.h"
 #include "gemu/dev/device.h"
@@ -201,7 +201,7 @@ typedef struct MosGenericCore {
     GemuMachine *machine;
     GemuDevice  *board, *cpu;
     GemuSpace   *bus;
-    MosBus       cache;
+    GemuSpaceCache       cache;
     GemuLine    *irq;
 } MosGenericCore;
 
@@ -212,13 +212,13 @@ static void generic_irq_line(MosGenericState *s, bool level) {
 static uint8_t generic_mem_read(uint16_t addr, void *ud) {
     MosGenericState *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
-    return mos_bus_read(&s->core->cache, addr);
+    return gemu_space_cache_read8(&s->core->cache, addr);
 }
 
 static void generic_mem_write(uint16_t addr, uint8_t val, void *ud) {
     MosGenericState *s = ud;
     gemu_monitor_check_write(s->monitor, addr);
-    mos_bus_write(&s->core->cache, addr, val);
+    gemu_space_cache_write8(&s->core->cache, addr, val);
 }
 
 static void generic_board_describe(GemuDevice *d, char *buf, size_t len) {

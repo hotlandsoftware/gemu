@@ -4,7 +4,7 @@
 #include "5clown.h"
 #include "gemu/util.h"
 #include "gemu/screendump.h"
-#include "mos_core.h"
+#include "gemu/dev/space_cache.h"
 #include "mos6502_dev.h"
 #include "okim6295_state.h"
 #include "controller/pia6821_dev.h"
@@ -370,7 +370,7 @@ typedef struct FiveClownCore {
     GemuMachine *machine;
     GemuDevice  *board, *cpu, *audiocpu, *pia0, *pia1, *oki;
     GemuSpace   *bus, *audio_bus;
-    MosBus       cache, audio_cache;
+    GemuSpaceCache       cache, audio_cache;
     GemuLine    *vsync, *sound_nmi;
     GemuTimer   *vsync_timer;
     GemuTime     frame_end;          /* the end of the frame in progress */
@@ -386,19 +386,19 @@ static void fiveclown_sound_nmi(FiveClownState *s, bool level) {
 
 static uint8_t main_read(uint16_t addr, void *ud) {
     FiveClownState *s = ud;
-    return mos_bus_read(&s->core->cache, addr);
+    return gemu_space_cache_read8(&s->core->cache, addr);
 }
 static void main_write(uint16_t addr, uint8_t val, void *ud) {
     FiveClownState *s = ud;
-    mos_bus_write(&s->core->cache, addr, val);
+    gemu_space_cache_write8(&s->core->cache, addr, val);
 }
 static uint8_t audio_read(uint16_t addr, void *ud) {
     FiveClownState *s = ud;
-    return mos_bus_read(&s->core->audio_cache, addr);
+    return gemu_space_cache_read8(&s->core->audio_cache, addr);
 }
 static void audio_write(uint16_t addr, uint8_t val, void *ud) {
     FiveClownState *s = ud;
-    mos_bus_write(&s->core->audio_cache, addr, val);
+    gemu_space_cache_write8(&s->core->audio_cache, addr, val);
 }
 
 static bool fiveclown_bus_build(FiveClownState *s) {

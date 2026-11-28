@@ -1,14 +1,14 @@
-/* Shared pieces for the mos family's machines on the core: see mos_core.h. */
-#include "mos_core.h"
+/* A CPU's cache of a 16-bit space's decode: see gemu/dev/space_cache.h. */
+#include "gemu/dev/space_cache.h"
 #include <string.h>
 
-struct MosBusSlot *mos_bus_fill(MosBus *b, uint16_t addr, bool write) {
+struct GemuSpaceCacheSlot *gemu_space_cache_fill(GemuSpaceCache *b, uint16_t addr, bool write) {
     uint64_t gen = gemu_space_generation(b->space);
     if (b->gen != gen) {
         memset(b->slot, 0, sizeof b->slot);
         b->gen = gen;
     }
-    struct MosBusSlot *sl = &b->slot[write][addr >> 8];
+    struct GemuSpaceCacheSlot *sl = &b->slot[write][addr >> 8];
     unsigned lo = addr & 0xFFu;
     GemuSpaceRun r;
     if (gemu_space_run(b->space, addr, write, &r)) {

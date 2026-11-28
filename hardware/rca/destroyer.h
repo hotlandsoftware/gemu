@@ -4,19 +4,21 @@
 #include "cdp1869.h"
 #include "rca.h"
 #include "gemu/monitor.h"
-#include "pcspk.h"
 #include "gemu/gemu_display.h"
 
 #define DESTRYER_MEM_SIZE 65536u
 
+struct RcaDestroyerCore;
+
 typedef struct RcaDestroyerState {
-    Cdp1802 cpu;
-    Cdp1869 vis;
+    struct RcaDestroyerCore *core;   /* the core machine (stage R5) */
+    Cdp1802 *cpu;                    /* the cpu device's */
+    Cdp1869 *vis;                    /* the vis device's */
+    uint32_t frame_cycle;            /* machine cycle within the frame (the beam) */
     const RcaConfig *cfg;
     uint8_t mem[DESTRYER_MEM_SIZE];
     uint8_t rotated_bitmap[CDP1869_VISIBLE_W * CDP1869_VISIBLE_H];
     GemuMonitor *monitor;
-    RcaPcSpeaker *speaker;
 
     uint8_t in0;
     uint8_t in1;

@@ -6,7 +6,7 @@
 #include "gemu/sha256.h"
 #include "gemu/vnc.h"
 #include "romdb.h"
-#include "mos_core.h"
+#include "gemu/dev/space_cache.h"
 #include "mos6502_dev.h"
 #include "controller/pia6821_dev.h"
 #include "gemu/dev/device.h"
@@ -901,7 +901,7 @@ typedef struct Apple1Core {
     GemuMachine *machine;
     GemuDevice  *board, *cpu, *pia;
     GemuSpace   *bus;
-    MosBus       cache;
+    GemuSpaceCache       cache;
     GemuScreen  *screen;
 } Apple1Core;
 
@@ -910,12 +910,12 @@ static struct GemuScreen *apple1_screen(Apple1State *s) { return s->core->screen
 static uint8_t apple1_read(uint16_t addr, void *ud) {
     Apple1State *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
-    return mos_bus_read(&s->core->cache, addr);
+    return gemu_space_cache_read8(&s->core->cache, addr);
 }
 static void apple1_write(uint16_t addr, uint8_t val, void *ud) {
     Apple1State *s = ud;
     gemu_monitor_check_write(s->monitor, addr);
-    mos_bus_write(&s->core->cache, addr, val);
+    gemu_space_cache_write8(&s->core->cache, addr, val);
 }
 
 static void rom_w8(void *ud, uint64_t off, uint8_t val) { (void)ud; (void)off; (void)val; }

@@ -2,7 +2,7 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "kim1.h"
-#include "mos_core.h"
+#include "gemu/dev/space_cache.h"
 #include "mos6502_dev.h"
 #include "controller/m6530_dev.h"
 #include "gemu/screendump.h"
@@ -1043,7 +1043,7 @@ typedef struct Kim1Core {
     GemuMachine *machine;
     GemuDevice  *board, *cpu, *riot003, *riot002;
     GemuSpace   *bus;
-    MosBus       cache;
+    GemuSpaceCache       cache;
     GemuLine    *nmi;
     GemuScreen  *screen;
 } Kim1Core;
@@ -1051,7 +1051,7 @@ typedef struct Kim1Core {
 static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
     Kim1State *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
-    return mos_bus_read(&s->core->cache, addr);
+    return gemu_space_cache_read8(&s->core->cache, addr);
 }
 
 /* The ROM page ($1800-$1FFF in every 8K block): the 6530s' ROMs, with the
@@ -1147,7 +1147,7 @@ static bool kim1_bus_build(Kim1State *s) {
 static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
     Kim1State *s = ud;
     gemu_monitor_check_write(s->monitor, addr);
-    mos_bus_write(&s->core->cache, addr, val);
+    gemu_space_cache_write8(&s->core->cache, addr, val);
 }
 
 /* ── Monitor ─────────────────────────────────────────────────────────────── */

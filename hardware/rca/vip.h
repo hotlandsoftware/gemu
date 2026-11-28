@@ -3,7 +3,6 @@
 #include "cdp1861.h"
 #include "cdp1869.h"
 #include "rca.h"
-#include "pcspk.h"
 #include "storage/tape.h"
 #include "gemu/monitor.h"
 #include <stdlib.h>
@@ -12,14 +11,16 @@
 
 #define VIP_MEM_SIZE 65536u
 
+struct RcaVipCore;
+
 typedef struct RcaVipState {
-    Cdp1802  cpu;
-    Cdp1861  vdc;
-    Cdp1869  vis;
+    struct RcaVipCore *core;   /* the core machine (stage R2) */
+    Cdp1802 *cpu;              /* the cpu device's */
+    Cdp1861 *vdc;              /* the vdc device's (CDP1861), or NULL */
+    Cdp1869 *vis;              /* the vis device's (a VP-590's CDP1869), or NULL */
     const RcaConfig *cfg;
     uint8_t  mem[VIP_MEM_SIZE];
     GemuMonitor *monitor;
-    RcaPcSpeaker *speaker;
 
     /* Compact cassette tape */
     VipTape  tape;

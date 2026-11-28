@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="cdp1802" description="RCA CDP1802 COSMAC CPU" status="working">
+    <type symbol="gemu_cdp1802_type" source="cpu/rca/cdp1802_dev.c"/>
+</device>

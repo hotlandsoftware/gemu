@@ -2,6 +2,17 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "pecom.h"
+#include "cdp1802_dev.h"
+#include "cdp1869_dev.h"
+#include "audio/tone.h"
+#include "gemu/audio_out.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/space.h"
+#include "gemu/dev/space_cache.h"
+#include "gemu/dev/state.h"
+#include "gemu/dev/stream.h"
 #include "gemu/util.h"
 #include "gemu/gemu.h"
 #include "gemu/gemu_display.h"
@@ -40,8 +51,11 @@ static void pecom_init_palette(void) {
     done = true;
 }
 
+static void pecom_maps_sync(RcaPecom32State *s);
+
 /* ── Memory map ──────────────────────────────────────────────────────────── */
 
+/* The decode, for the monitor's view (the CPU goes through the bus). */
 static uint8_t pecom_mem_read(uint16_t addr, void *ud) {
     RcaPecom32State *s = ud;
 
@@ -55,11 +69,11 @@ static uint8_t pecom_mem_read(uint16_t addr, void *ud) {
 
     /* VIS-1870 char RAM: 0xF400–0xF7FF */
     if (addr >= PECOM32_CRAM_BASE && addr < PECOM32_PRAM_BASE)
-        return cdp1869_char_read(&s->vis, addr - PECOM32_CRAM_BASE);
+        return cdp1869_char_read(s->vis, addr - PECOM32_CRAM_BASE);
 
     /* VIS-1870 page RAM: 0xF800–0xFFFF */
     if (addr >= PECOM32_PRAM_BASE)
-        return cdp1869_page_read(&s->vis, addr - PECOM32_PRAM_BASE);
+        return cdp1869_page_read(s->vis, addr - PECOM32_PRAM_BASE);
 
     /* 0xC000–0xF3FF: ROM chip 2 (Pecom 64) or RAM bank 2 (Pecom 32) */
     if (addr >= 0xC000u) {
@@ -81,13 +95,13 @@ static void pecom_mem_write(uint16_t addr, uint8_t val, void *ud) {
 
     /* VIS-1870 char RAM: 0xF400–0xF7FF */
     if (addr >= PECOM32_CRAM_BASE && addr < PECOM32_PRAM_BASE) {
-        cdp1869_char_write(&s->vis, addr - PECOM32_CRAM_BASE, val);
+        cdp1869_char_write(s->vis, addr - PECOM32_CRAM_BASE, val);
         return;
     }
 
     /* VIS-1870 page RAM: 0xF800–0xFFFF */
     if (addr >= PECOM32_PRAM_BASE) {
-        cdp1869_page_write(&s->vis, addr - PECOM32_PRAM_BASE, val);
+        cdp1869_page_write(s->vis, addr - PECOM32_PRAM_BASE, val);
         return;
     }
 
@@ -126,7 +140,7 @@ static bool pecom_mon_write(void *ud, uint64_t addr, uint8_t val) {
 
 static void pecom_mon_cpu_state(void *ud, char *buf, size_t len) {
     const RcaPecom32State *s = ud;
-    cdp1802_format_state(&s->cpu, buf, len);
+    cdp1802_format_state(s->cpu, buf, len);
 }
 
 /* ── I/O ─────────────────────────────────────────────────────────────────── */
@@ -228,7 +242,7 @@ static uint8_t pecom_io_in(uint8_t port, void *ud) {
         /* IN 3 in iogroup 0: matrix keyboard row read.
          * R[X] (the memory address register at IN time) selects the row
          * via the lower 6 bits.  Active-high: bit set = key pressed. */
-        uint8_t row = (uint8_t)(s->cpu.R[s->cpu.X] & 0x3Fu);
+        uint8_t row = (uint8_t)(s->cpu->R[s->cpu->X] & 0x3Fu);
         return s->keys[row];
     }
     return 0xFFu;
@@ -240,7 +254,10 @@ static void pecom_io_out(uint8_t port, uint8_t val, void *ud) {
     if (port == 1) {
         /* OUT 1: iogroup selector (bit 1 = 1 → iogroup 2 / VIS-1870) */
         s->iogroup = (val & 0x02u) ? 2 : 0;
-        s->boot_mirror = false;
+        if (s->boot_mirror) {
+            s->boot_mirror = false;
+            pecom_maps_sync(s);
+        }
         return;
     }
 
@@ -249,15 +266,18 @@ static void pecom_io_out(uint8_t port, uint8_t val, void *ud) {
         return;
 
     if (s->iogroup == 2 && port >= 3 && port <= 7) {
-        cdp1869_out(&s->vis, port, s->cpu.memory_addr, val);
+        cdp1869_out(s->vis, port, s->cpu->memory_addr, val);
         return;
     }
 }
 
+static void pecom_tone_gate(RcaPecom32State *s, uint8_t q);
+static void pecom_maps_sync(RcaPecom32State *s);
+
 static void pecom_q_out(uint8_t q, void *ud) {
     RcaPecom32State *s = ud;
-    s->vis.q = q & 1u;
-    rca_pcspk_set_gate(s->speaker, q);
+    s->vis->q = q & 1u;
+    pecom_tone_gate(s, q);
 }
 
 /* ── Per-frame video timing ──────────────────────────────────────────────── */
@@ -270,30 +290,245 @@ static void pecom_video_timing(RcaPecom32State *s, unsigned frame_cycle) {
     /* non_display: true during VBlank (lines 0–47 and 264–311) */
     bool nd = (vis_line < CDP1869_DISPLAY_START ||
                vis_line >= CDP1869_DISPLAY_END);
-    s->vis.non_display = nd || s->vis.dispoff;
+    s->vis->non_display = nd || s->vis->dispoff;
 
     /* EF1: open-drain shared between VIS-1870 display timing and CTRL key.
      * High only when NOT in active display AND CTRL is not pressed. */
-    s->cpu.EF[0] = s->vis.non_display && !s->key_ctrl;
+    s->cpu->EF[0] = s->vis->non_display && !s->key_ctrl;
 
     /* EF2 = SHIFT key, active-low: 0 when pressed, 1 when released. */
-    s->cpu.EF[1] = !s->key_shift;
+    s->cpu->EF[1] = !s->key_shift;
 
     /* EF3 = CAPS LOCK (pol=rev): 1 = not locked, 0 = locked.
      * BN3 fires when EF3=1 (caps not active), routing to lowercase path. */
-    s->cpu.EF[2] = !s->caps_locked;
+    s->cpu->EF[2] = !s->caps_locked;
 
     /* EF4 = ESC key, active-low. */
-    s->cpu.EF[3] = !s->key_esc;
+    s->cpu->EF[3] = !s->key_esc;
 
     /* Single interrupt per frame at "line 2" (start of VBlank) */
     unsigned int_cycle =
         (2u * PECOM32_MCYCLES_PER_FRAME) / CDP1869_LINES_TOTAL;
     if (frame_cycle == int_cycle)
-        cdp1802_request_irq(&s->cpu);
+        cdp1802_request_irq(s->cpu);
 }
 
 /* ── Machine lifecycle ───────────────────────────────────────────────────── */
+
+static bool pecom_core_build(RcaPecom32State *s);
+static void pecom_core_free(RcaPecom32State *s);
+
+/* ── The core machine (stage R4) ─────────────────────────────────────────────
+ * board (pecom-board): RAM, the boot mirror, the I/O group, CAPS LOCK, the
+ * beam (frame_cycle); cpu (cdp1802): the machine's executor at 220,000
+ * machine cycles a second (pecom_cycle: the VIS's timing for the cycle -
+ * non-display, EF1-EF4, the frame interrupt - then the CPU's cycle); vis
+ * (cdp1869); tone (with -soundhw pcspk): Q's 250 Hz beeper.
+ * The bus, "program": RAM bank 1 at $0000, under the ROM's boot mirror
+ * until the first OUT 1; the ROM at $8000; at $C000 RAM bank 2 (Pecom 32)
+ * or the second ROM (Pecom 64); the VIS's character RAM ($F400) and page
+ * RAM ($F800).  The board's "screen" is the VIS's 240x216 bitmap.
+ * Before stage R the beam was the run loop's loop variable, restarted each
+ * frame, and step didn't clock it; now both run and step go through
+ * pecom_cycle and a stopped frame carries on where it stopped. */
+typedef struct RcaPecomCore {
+    GemuMachine   *machine;
+    GemuDevice    *board, *cpu, *vis, *tone;
+    GemuSpace     *bus;
+    GemuSpaceCache cache;
+    GemuMapping   *mirror, *mirror_drop;
+    GemuScreen    *screen;
+    GemuAudioOut  *audio;
+} RcaPecomCore;
+
+#define PECOM_MCYCLE_HZ CDP1802_MCYCLES_PER_SEC
+
+static void pecom_tone_gate(RcaPecom32State *s, uint8_t q) {
+    if (s->core && s->core->tone) gemu_tone_set_gate(s->core->tone, q);
+}
+
+static uint8_t pecom_bus_read(uint16_t addr, void *ud) {
+    return gemu_space_cache_read8(&((RcaPecom32State *)ud)->core->cache, addr);
+}
+static void pecom_bus_write(uint16_t addr, uint8_t val, void *ud) {
+    gemu_space_cache_write8(&((RcaPecom32State *)ud)->core->cache, addr, val);
+}
+static uint8_t vis_char_r(void *ud, uint64_t off) {
+    return cdp1869_char_read(((RcaPecom32State *)ud)->vis, (uint16_t)off);
+}
+static void vis_char_w(void *ud, uint64_t off, uint8_t v) {
+    cdp1869_char_write(((RcaPecom32State *)ud)->vis, (uint16_t)off, v);
+}
+static uint8_t vis_page_r(void *ud, uint64_t off) {
+    return cdp1869_page_read(((RcaPecom32State *)ud)->vis, (uint16_t)off);
+}
+static void vis_page_w(void *ud, uint64_t off, uint8_t v) {
+    cdp1869_page_write(((RcaPecom32State *)ud)->vis, (uint16_t)off, v);
+}
+static void drop_w(void *ud, uint64_t off, uint8_t v) { (void)ud; (void)off; (void)v; }
+static const GemuHandlers vis_char_handlers = { .r8 = vis_char_r, .w8 = vis_char_w };
+static const GemuHandlers vis_page_handlers = { .r8 = vis_page_r, .w8 = vis_page_w };
+static const GemuHandlers drop_handlers     = { .w8 = drop_w };
+
+/* The boot mirror, on until the first OUT 1. */
+static void pecom_maps_sync(RcaPecom32State *s) {
+    RcaPecomCore *c = s->core;
+    if (!c || !c->mirror) return;
+    gemu_mapping_enable(c->mirror, s->boot_mirror);
+    gemu_mapping_enable(c->mirror_drop, s->boot_mirror);
+}
+
+static bool pecom_bus_build(RcaPecom32State *s) {
+    RcaPecomCore *c = s->core;
+    GemuSpace *b = c->bus = gemu_space_new(c->machine, "program", 16, 8, GEMU_BIG_ENDIAN);
+    if (!b) return false;
+    c->cache.space = b;
+    bool p64 = s->rom_size > PECOM32_ROM_SIZE;
+    bool ok = gemu_space_map_ram(b, 0x0000, PECOM32_RAM1_SIZE, s->ram1, 0, 0) &&
+              (c->mirror = gemu_space_map_ram(b, 0x0000, 0x4000, s->rom, GEMU_MAP_READONLY, 1)) &&
+              (c->mirror_drop = gemu_space_map(b, 0x0000, 0x4000, &drop_handlers, s, 1, 0)) &&
+              gemu_space_map_ram(b, 0x8000, 0x4000, s->rom, GEMU_MAP_READONLY, 0) &&
+              (p64 ? gemu_space_map_ram(b, 0xC000, 0x3400, s->rom + 0x4000, GEMU_MAP_READONLY, 0)
+                   : gemu_space_map_ram(b, 0xC000, 0x3400, s->ram2, 0, 0)) &&
+              gemu_space_map(b, PECOM32_CRAM_BASE, 0x400, &vis_char_handlers, s, 0, 0) &&
+              gemu_space_map(b, PECOM32_PRAM_BASE, 0x800, &vis_page_handlers, s, 0, 0);
+    if (ok) pecom_maps_sync(s);
+    return ok;
+}
+
+static void pecom_board_describe(GemuDevice *d, char *buf, size_t len) {
+    const RcaPecom32State *s = *(RcaPecom32State **)d->priv;
+    snprintf(buf, len, "Pecom %s; %s; I/O group %u; CAPS %s; frame cycle %u of %u",
+             s->rom_size > PECOM32_ROM_SIZE ? "64" : "32",
+             s->boot_mirror ? "booting (ROM at $0000)" : "RAM at $0000", s->iogroup,
+             s->caps_locked ? "locked" : "off", s->frame_cycle, (unsigned)PECOM32_MCYCLES_PER_FRAME);
+}
+
+static void pecom_board_post_load(GemuDevice *d);
+static const GemuDeviceType pecom_board_type = {
+    .name = "pecom-board", .desc = "Pecom 32/64 board (RAM, ROM, keyboard)",
+    .size = sizeof(RcaPecom32State *), .describe = pecom_board_describe,
+    .post_load = pecom_board_post_load,
+};
+
+#define B(field) ok &= GEMU_STATE_MEMBER(d, "", s, field)
+/* The board's state: the RAM, the boot mirror, the I/O group, CAPS LOCK,
+ * the beam.  Not saved: the ROM (loaded), the keys held (the host's). */
+static bool pecom_board_state(RcaPecom32State *s, GemuDevice *d) {
+    bool ok = true;
+    B(ram1); B(ram2); B(boot_mirror); B(iogroup); B(caps_locked); B(caps_key_prev); B(frame_cycle);
+    return ok;
+}
+#undef B
+
+/* After a load: the boot mirror as the state has it. */
+static void pecom_board_post_load(GemuDevice *d) {
+    pecom_maps_sync(*(RcaPecom32State **)d->priv);
+}
+
+static void pecom_video_timing(RcaPecom32State *s, unsigned frame_cycle);
+/* One machine cycle on the beam. */
+static void pecom_cycle(RcaPecom32State *s) {
+    pecom_video_timing(s, s->frame_cycle);
+    cdp1802_step(s->cpu);
+    if (++s->frame_cycle == PECOM32_MCYCLES_PER_FRAME) s->frame_cycle = 0;
+}
+static bool pecom_stop_before(void *ud) {
+    RcaPecom32State *s = ud;
+    return gemu_monitor_check_exec(s->monitor, s->cpu->R[s->cpu->P]);
+}
+static void pecom_hook_cycle(void *ud) { pecom_cycle(ud); }
+static bool pecom_stop_after(void *ud) { return gemu_monitor_is_paused(((RcaPecom32State *)ud)->monitor); }
+
+static void pecom_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    RcaPecom32State *s = ud;
+    cdp1869_render(s->vis);
+    for (int y = clip->y0; y < clip->y1; y++)
+        for (int x = 0; x < CDP1869_VISIBLE_W; x++)
+            bmp->pix[(size_t)y * (size_t)bmp->stride + (size_t)x] =
+                pecom_palette[s->vis->bitmap[y * CDP1869_VISIBLE_W + x] & 7u];
+}
+
+static void pecom_sound_out(void *ud, const float *samples, size_t frames) {
+    gemu_audio_queue(ud, samples, frames);
+}
+
+static bool pecom_core_build(RcaPecom32State *s) {
+    const RcaConfig *cfg = s->cfg;
+    RcaPecomCore *c = s->core = calloc(1, sizeof *c);
+    if (!c || !(c->machine = gemu_machine_new("pecom")))
+        return false;
+    bool ok = (c->board = gemu_device_add(c->machine, &pecom_board_type, "board", NULL, NULL)) &&
+              (c->cpu = gemu_device_add(c->machine, &gemu_cdp1802_type, "cpu", NULL, NULL)) &&
+              (c->vis = gemu_device_add(c->machine, &gemu_cdp1869_type, "vis", NULL, NULL));
+    if (ok && cfg->sound_hw == RCA_SOUND_PCSPK)
+        ok = (c->tone = gemu_device_add(c->machine, &gemu_tone_type, "tone", NULL, "freq=250"));
+    if (ok) {
+        *(RcaPecom32State **)c->board->priv = s;
+        ok = pecom_board_state(s, c->board);
+    }
+    if (!ok) {
+        fprintf(stderr, "gemu-rca: pecom32: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    bool inited = gemu_machine_init(c->machine);
+    if (inited) {
+        s->cpu = gemu_cdp1802(c->cpu);
+        s->vis = gemu_cdp1869(c->vis);
+        Cdp1802 *cpu = s->cpu;
+        cpu->mem_read  = pecom_bus_read;
+        cpu->mem_write = pecom_bus_write;
+        cpu->io_in     = pecom_io_in;
+        cpu->io_out    = pecom_io_out;
+        cpu->q_out     = pecom_q_out;
+        cpu->io_ud     = s;
+        /* on_sync not used: the timing is pecom_cycle's */
+        cdp1869_set_page_ram_mask(s->vis, 0x3FFu);  /* 1 KB page RAM */
+        cdp1869_set_char_stride(s->vis, 16u);        /* 16 scan lines / char */
+        cdp1869_set_block_cpu_access(s->vis, true);  /* block during active display */
+    }
+    GemuCdp1802Hooks h = { .stop_before = pecom_stop_before, .cycle = pecom_hook_cycle,
+                           .stop_after = pecom_stop_after, .ud = s };
+    ok = inited && pecom_bus_build(s) && gemu_cdp1802_exec(c->cpu, PECOM_MCYCLE_HZ, &h) &&
+         (c->screen = gemu_screen_new(c->board, "screen")) &&
+         gemu_screen_set_size(c->screen, CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
+    if (ok) {
+        gemu_screen_set_update(c->screen, pecom_screen_update, s);
+        if (c->tone) c->audio = gemu_audio_open("pecom", 44100);
+        gemu_mixer_set_output(c->machine, 44100, 1, c->audio ? pecom_sound_out : NULL, c->audio);
+    }
+    if (!ok || !gemu_machine_start(c->machine)) {
+        fprintf(stderr, "gemu-rca: pecom32: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    gemu_monitor_attach_machine(s->monitor, c->machine, "program");
+    return true;
+}
+
+static void pecom_core_free(RcaPecom32State *s) {
+    if (!s->core) return;
+    gemu_machine_free(s->core->machine);
+    gemu_audio_close(s->core->audio);
+    free(s->core);
+    s->core = NULL;
+}
+
+/* One frame: the machine run to the frame's end (from wherever the beam
+ * is), then, at a frame's end, VBlank for the host's turn (page and
+ * character RAM writable, EF1 the CTRL key alone); the frame's sound out. */
+static void pecom_frame(RcaPecom32State *s) {
+    RcaPecomCore *c = s->core;
+    uint64_t left = PECOM32_MCYCLES_PER_FRAME - s->frame_cycle;
+    gemu_machine_run_until(c->machine, gemu_machine_time(c->machine) + gemu_clocks(PECOM_MCYCLE_HZ, left));
+    if (s->frame_cycle == 0) {
+        s->vis->non_display = true;
+        s->cpu->EF[0] = !s->key_ctrl;
+        gemu_screen_frame_begin(c->screen);
+    }
+    gemu_mixer_run(c->machine);
+}
 
 RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg) {
     pecom_init_palette();
@@ -307,31 +542,11 @@ RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg) {
 
     memset(s->keys,       0, sizeof(s->keys));
 
-    cdp1802_init(&s->cpu, NULL, 0);
-    s->cpu.mem_read  = pecom_mem_read;
-    s->cpu.mem_write = pecom_mem_write;
-    s->cpu.io_in     = pecom_io_in;
-    s->cpu.io_out    = pecom_io_out;
-    s->cpu.q_out     = pecom_q_out;
-    s->cpu.io_ud     = s;
-    /* on_sync not used - timing driven by pecom_video_timing in the run loop */
-
-    cdp1869_init(&s->vis);
-    cdp1869_set_page_ram_mask(&s->vis, 0x3FFu);  /* 1 KB page RAM */
-    cdp1869_set_char_stride(&s->vis, 16u);        /* 16 scan lines / char */
-    cdp1869_set_block_cpu_access(&s->vis, true);  /* block during active display */
-
     s->monitor = gemu_monitor_create();
     gemu_monitor_set_memory(s->monitor, &(GemuMonMemory){
         .read = pecom_mon_read, .write = pecom_mon_write, .ud = s,
         .addr_bits = 16, .big_endian = true });
     gemu_monitor_set_cpu_state_cb(s->monitor, pecom_mon_cpu_state, s);
-
-    if (cfg->sound_hw == RCA_SOUND_PCSPK) {
-        s->speaker = rca_pcspk_create(250u);
-        if (!s->speaker)
-            fprintf(stderr, "gemu-rca: pecom32: failed to init audio\n");
-    }
 
     /* Load ROM (16 KB for Pecom 32, 32 KB across two chips for Pecom 64) */
     s->rom_size = 0;
@@ -352,16 +567,20 @@ RcaPecom32State *rca_pecom32_create(const RcaConfig *cfg) {
         gemu_monitor_register_rom(s->monitor, off, (uint32_t)len, cfg->roms[i].path);
     }
 
+    if (!pecom_core_build(s)) {
+        rca_pecom32_destroy(s);
+        return NULL;
+    }
     return s;
 }
 
 static void rca_pecom32_reset(RcaPecom32State *s, const RcaConfig *cfg) {
-    cdp1802_reset(&s->cpu);
-    cdp1869_reset(&s->vis);
-    cdp1869_set_page_ram_mask(&s->vis, 0x3FFu);
-    cdp1869_set_char_stride(&s->vis, 16u);
-    cdp1869_set_block_cpu_access(&s->vis, true);
-    rca_pcspk_set_gate(s->speaker, 0);
+    cdp1802_reset(s->cpu);
+    cdp1869_reset(s->vis);
+    cdp1869_set_page_ram_mask(s->vis, 0x3FFu);
+    cdp1869_set_char_stride(s->vis, 16u);
+    cdp1869_set_block_cpu_access(s->vis, true);
+    pecom_tone_gate(s, 0);
 
     s->boot_mirror = true;
     s->iogroup     = 0;
@@ -381,11 +600,12 @@ static void rca_pecom32_reset(RcaPecom32State *s, const RcaConfig *cfg) {
         uint32_t end = cfg->roms[i].addr + (uint32_t)len;
         if (end > s->rom_size) s->rom_size = end;
     }
+    pecom_maps_sync(s);
 }
 
 void rca_pecom32_destroy(RcaPecom32State *s) {
     if (!s) return;
-    rca_pcspk_destroy(s->speaker);
+    pecom_core_free(s);
     gemu_monitor_destroy(s->monitor);
     free(s);
 }
@@ -449,15 +669,11 @@ static void pecom_poll_keys(RcaPecom32State *s, GemuDisplay *display) {
 
 /* Draw the CDP1869 picture if video RAM or registers changed since the last
  * time (running, or stepped from the monitor while paused). */
-static void pecom_present(RcaPecom32State *s, GemuDisplay *display, uint32_t *argb) {
-    if (!s->vis.dirty) return;
-    cdp1869_render(&s->vis);
-    if (display) {
-        int n = CDP1869_VISIBLE_W * CDP1869_VISIBLE_H;
-        for (int i = 0; i < n; i++)
-            argb[i] = pecom_palette[s->vis.bitmap[i] & 7u];
-        gemu_display_render(display, argb, CDP1869_VISIBLE_W, CDP1869_VISIBLE_H);
-    }
+/* The board's core screen to the window, when the VIS has changed. */
+static void pecom_present(RcaPecom32State *s, GemuDisplay *display) {
+    if (!s->vis->dirty) return;
+    const GemuBitmap *b = gemu_screen_render(s->core->screen);
+    if (display) gemu_display_render(display, b->pix, b->width, b->height);
 }
 
 void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
@@ -486,16 +702,10 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
     /* PAL 50 Hz */
     const unsigned frame_ms = 1000u / PECOM32_FRAME_HZ;
 
-    /* ARGB framebuffer for gemu_display_render() */
-    uint32_t argb[CDP1869_VISIBLE_W * CDP1869_VISIBLE_H];
-
     gemu_monitor_start(s->monitor);
 
     bool quit = false;
     while (!quit) {
-        struct timespec t0;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-
         if (display) {
             gemu_display_poll(display);
             if (gemu_display_should_quit(display)) break;
@@ -515,42 +725,31 @@ void rca_pecom32_run(RcaPecom32State *s, const RcaConfig *cfg) {
                 for (uint32_t k = 0; k < n; k++) {
                     /* cdp1802_step advances one machine cycle; run until an
                      * instruction completes (bounded, in case of IDL). */
-                    uint64_t start = s->cpu.insn_count;
-                    for (int i = 0; i < 1024 && s->cpu.insn_count == start; i++)
-                        cdp1802_step(&s->cpu);
+                    uint64_t start = s->cpu->insn_count;
+                    for (int i = 0; i < 1024 && s->cpu->insn_count == start; i++)
+                        pecom_cycle(s);
                 }
             }
         }
         if (quit) break;
         gemu_display_set_paused(display, gemu_monitor_is_paused(s->monitor));
 
-        if (!gemu_monitor_is_paused(s->monitor)) {
-            for (unsigned i = 0; i < PECOM32_MCYCLES_PER_FRAME; i++) {
-                pecom_video_timing(s, i);
-                cdp1802_step(&s->cpu);
-            }
+        bool paused = gemu_monitor_is_paused(s->monitor);
+        if (!paused) pecom_frame(s);   /* the cpu device's executor */
+        pecom_present(s, display);     /* (paused: shows monitor steps) */
 
-            /* Ensure non_display=true at frame boundary so page/char RAM is writable */
-            s->vis.non_display = true;
-            s->cpu.EF[0] = !s->key_ctrl;
-
-            pecom_present(s, display, argb);
+        /* Pace to the machine's time; paused, a frame's delay. */
+        if (!paused) {
+            gemu_machine_pace(s->core->machine, 0);
         } else {
-            pecom_present(s, display, argb);   /* show monitor steps */
+            gemu_machine_pace_reset(s->core->machine);
+            gemu_sleep_ms(frame_ms);
         }
-
-        struct timespec t1;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        unsigned elapsed_ms = (unsigned)(
-            (t1.tv_sec  - t0.tv_sec)  * 1000u +
-            (t1.tv_nsec - t0.tv_nsec) / 1000000u);
-        if (elapsed_ms < frame_ms)
-            gemu_sleep_ms(frame_ms - elapsed_ms);
     }
 
     printf("gemu-rca: %llu machine cycles, %llu instructions\n",
-           (unsigned long long)s->cpu.cycle_count,
-           (unsigned long long)s->cpu.insn_count);
+           (unsigned long long)s->cpu->cycle_count,
+           (unsigned long long)s->cpu->insn_count);
 
     gemu_monitor_stop(s->monitor);
     gemu_display_destroy(display);

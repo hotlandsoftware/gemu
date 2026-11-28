@@ -2,7 +2,7 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "um6578.h"
-#include "mos_core.h"
+#include "gemu/dev/space_cache.h"
 #include "mos6502_dev.h"
 #include "apu2a03_state.h"
 #include "ppu_sh6578_state.h"
@@ -840,7 +840,7 @@ typedef struct Um6578Core {
     GemuMachine *machine;
     GemuDevice  *board, *cpu, *ppu, *apu, *cart;
     GemuSpace   *bus;
-    MosBus       cache;
+    GemuSpaceCache       cache;
     GemuMapping *bank_map[8];
     uint8_t     *bank_ptr[8];
     GemuLine    *irq, *nmi;
@@ -859,11 +859,11 @@ static void um6578_nmi_line(Um6578State *s) {
 
 static uint8_t um6578_read(uint16_t addr, void *ud) {
     Um6578State *s = ud;
-    return mos_bus_read(&s->core->cache, addr);
+    return gemu_space_cache_read8(&s->core->cache, addr);
 }
 static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
     Um6578State *s = ud;
-    mos_bus_write(&s->core->cache, addr, val);
+    gemu_space_cache_write8(&s->core->cache, addr, val);
 }
 
 static uint8_t page_r(void *ud, uint64_t off) {          /* $2000 and $4000 pages */
