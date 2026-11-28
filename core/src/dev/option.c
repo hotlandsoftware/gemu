@@ -325,3 +325,46 @@ bool gemu_device_spec_split(const char *spec, char *type, unsigned type_len, con
     *opts = comma ? comma + 1 : NULL;
     return true;
 }
+
+bool gemu_opts_route(const char *spec, const GemuDeviceType *const *types, unsigned n,
+                     char (*out)[GEMU_OPTS_ROUTE_LEN], char *err, size_t err_len) {
+    if (err_len) err[0] = 0;
+    for (unsigned i = 0; i < n; i++) out[i][0] = 0;
+    const char *p = spec ? spec : "";
+    while (*p) {
+        size_t len = strcspn(p, ",");
+        char tok[128];
+        if (len && len < sizeof tok) {
+            memcpy(tok, p, len);
+            tok[len] = 0;
+            const char *name = tok, *val = NULL;
+            if (*name == '-' || *name == '+') { val = *name == '-' ? "off" : "on"; name++; }
+            char *eq = strchr(tok, '=');
+            if (eq) { *eq = 0; val = eq + 1; }
+            int found = -1;
+            for (unsigned i = 0; i < n && found < 0; i++)
+                for (const GemuOptionDef *o = types[i]->options; o && o->name; o++)
+                    if (!strcmp(o->name, name)) { found = (int)i; break; }
+            if (found < 0) {
+                int at = snprintf(err, err_len, "unknown -M setting '%s'; ", name);
+                bool any = false;
+                for (unsigned i = 0; i < n; i++)
+                    for (const GemuOptionDef *o = types[i]->options; o && o->name; o++) {
+                        if (at >= 0 && (size_t)at < err_len)
+                            at += snprintf(err + at, err_len - (size_t)at, "%s %s",
+                                           any ? "" : "this machine has:", o->name);
+                        any = true;
+                    }
+                if (!any && at >= 0 && (size_t)at < err_len)
+                    snprintf(err + at, err_len - (size_t)at, "this machine has no settings");
+                return false;
+            }
+            size_t at = strlen(out[found]);
+            snprintf(out[found] + at, GEMU_OPTS_ROUTE_LEN - at, "%s%s%s%s", at ? "," : "", name,
+                     val ? "=" : "", val ? val : "");
+        }
+        p += len;
+        if (*p == ',') p++;
+    }
+    return true;
+}

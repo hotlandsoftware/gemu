@@ -179,3 +179,24 @@ bool gemu_space_peek8(GemuSpace *s, uint64_t addr, uint8_t *v);
  * that direction; *avail = bytes usable from there (to the page end).
  * NULL otherwise (use the access functions). */
 uint8_t *gemu_space_ptr(GemuSpace *s, uint64_t addr, bool write, uint64_t *avail);
+/* As gemu_space_ptr(), and also inside a page that isn't direct: host
+ * memory behind addr when one RAM mapping alone serves it there; *avail =
+ * the bytes from addr it serves contiguously (to the end of its run in the
+ * page, of the mapping, or of a mirror's repeat).  NULL otherwise.  Good
+ * while the generation stays the same. */
+uint8_t *gemu_space_ptr_run(GemuSpace *s, uint64_t addr, bool write, uint64_t *avail);
+
+/* How addr is served, for a CPU's own cache of the decode: plain memory
+ * (ram: host memory for addr) or one handler mapping alone (map, and off:
+ * addr's offset into it; it has an 8-bit handler that way), either for
+ * avail bytes from addr on (contiguously, as gemu_space_ptr_run()).  False
+ * for anything else (unmapped, a SHARED stack, a narrower or wider handler
+ * only).  Good while the generation stays the same: calling map's handler
+ * directly is then what an access would do, without the space's checks
+ * for a handler that changes the map. */
+typedef struct {
+    uint8_t     *ram;
+    GemuMapping *map;
+    uint64_t     off, avail;
+} GemuSpaceRun;
+bool gemu_space_run(GemuSpace *s, uint64_t addr, bool write, GemuSpaceRun *run);

@@ -17,6 +17,7 @@
  */
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct GemuDevice GemuDevice;
@@ -48,6 +49,16 @@ const char *gemu_opt_str(const GemuDevice *d, const char *name);   /* string, fi
 int         gemu_opt_choice(const GemuDevice *d, const char *name); /* index into choices */
 /* Whether the option string gave it (rather than the default). */
 bool        gemu_opt_given(const GemuDevice *d, const char *name);
+
+/* A machine's settings (-M machine,SETTINGS): comma-separated "-name"
+ * (off), "+name" (on), "name" or "name=value", each to whichever of the n
+ * types has an option of that name; out[i] gets the option string for
+ * types[i] (for gemu_device_add(), which checks the values).  False, with
+ * the reason in err (listing the settings there are), on a name none has. */
+typedef struct GemuDeviceType GemuDeviceType;
+#define GEMU_OPTS_ROUTE_LEN 256
+bool gemu_opts_route(const char *spec, const GemuDeviceType *const *types, unsigned n,
+                     char (*out)[GEMU_OPTS_ROUTE_LEN], char *err, size_t err_len);
 
 /* A -device argument, "type,key=val,...": the type name and the rest.
  * Returns false if there's no type name. */

@@ -953,6 +953,55 @@ uint8_t *gemu_space_ptr(GemuSpace *s, uint64_t addr, bool write, uint64_t *avail
     return p->dir[write ? WR : RD].fast + off;
 }
 
+bool gemu_space_run(GemuSpace *s, uint64_t addr, bool write, GemuSpaceRun *run) {
+    memset(run, 0, sizeof *run);
+    uint64_t n;
+    uint8_t *host = gemu_space_ptr(s, addr, write, &n);
+    if (host) {
+        run->ram = host;
+        run->avail = n;
+        return true;
+    }
+    addr &= s->mask;
+    const Page *p = page_get(s, addr);
+    uint64_t gap_end;
+    const Seg *g = find_seg(s, p, write ? WR : RD, addr, &gap_end);
+    if (!g || g->n != 1)
+        return false;
+    GemuMapping *m = g->maps[0];
+    if (!m->ram && !(write ? m->h.w8 != NULL : m->h.r8 != NULL))
+        return false;
+    uint64_t eff = addr & g->mask;
+    /* contiguous while the mirror keeps the low bits: up to the first bit
+     * it clears, the segment's end and the mapping's */
+    uint64_t span = g->hi - addr + 1, cleared = ~g->mask & s->mask;
+    if (cleared) {
+        uint64_t unit = cleared & -cleared;
+        uint64_t left = unit - (addr & (unit - 1));
+        if (left < span)
+            span = left;
+    }
+    if (m->base + m->size - eff < span)
+        span = m->base + m->size - eff;
+    run->avail = span;
+    if (m->ram)
+        run->ram = m->ram + (eff - m->base);
+    else {
+        run->map = m;
+        run->off = eff - m->base;
+    }
+    return true;
+}
+
+uint8_t *gemu_space_ptr_run(GemuSpace *s, uint64_t addr, bool write, uint64_t *avail) {
+    GemuSpaceRun r;
+    if (!gemu_space_run(s, addr, write, &r) || !r.ram)
+        return NULL;
+    if (avail)
+        *avail = r.avail;
+    return r.ram;
+}
+
 bool gemu_space_mirror_get(const GemuSpace *s, unsigned i, uint64_t *base, uint64_t *size,
                            uint64_t *mask) {
     const Mirror *mi = s->mirrors;

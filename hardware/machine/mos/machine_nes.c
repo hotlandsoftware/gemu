@@ -1716,7 +1716,7 @@ static void nes_board_post_load(GemuDevice *d) {
     s->apu_deadline = 0;
 }
 /* The machine's settings (stage N7): -M nes,-frame_irq and the like go to
- * whichever of these devices has the option (nes_machine_opts()). */
+ * whichever of these devices has the option (gemu_opts_route()). */
 static const GemuOptionDef nes_board_opts[] = {
     { "dips", "VS. System DIP switches SW1 1-8, as a byte", GEMU_OPT_INT, "0", 0, 255, NULL },
     { NULL, NULL, 0, NULL, 0, 0, NULL },
@@ -1784,44 +1784,6 @@ static bool nes_board_state(NesState *s, GemuDevice *d) {
 }
 #undef BOARD
 
-/* -M's settings, "-name", "+name", "name" or "name=value", each to the
- * device whose type has the option: opts[i] for types[i]. */
-static bool nes_machine_opts(const char *spec, const GemuDeviceType *const *types, char (*opts)[256],
-                             int n) {
-    for (int i = 0; i < n; i++) opts[i][0] = 0;
-    const char *p = spec ? spec : "";
-    while (*p) {
-        size_t len = strcspn(p, ",");
-        char tok[128];
-        if (len && len < sizeof tok) {
-            memcpy(tok, p, len);
-            tok[len] = 0;
-            const char *name = tok, *val = NULL;
-            if (*name == '-' || *name == '+') { val = *name == '-' ? "off" : "on"; name++; }
-            char *eq = strchr(tok, '=');
-            if (eq) { *eq = 0; val = eq + 1; }
-            int found = -1;
-            for (int i = 0; i < n && found < 0; i++)
-                for (const GemuOptionDef *o = types[i]->options; o && o->name; o++)
-                    if (!strcmp(o->name, name)) { found = i; break; }
-            if (found < 0) {
-                fprintf(stderr, "gemu: unknown -M setting '%s'; this machine has:", name);
-                for (int i = 0; i < n; i++)
-                    for (const GemuOptionDef *o = types[i]->options; o && o->name; o++)
-                        fprintf(stderr, " %s", o->name);
-                fprintf(stderr, "\n");
-                return false;
-            }
-            size_t at = strlen(opts[found]);
-            snprintf(opts[found] + at, sizeof opts[found] - at, "%s%s%s%s", at ? "," : "", name,
-                     val ? "=" : "", val ? val : "");
-        }
-        p += len;
-        if (*p == ',') p++;
-    }
-    return true;
-}
-
 static GemuDevice *nes_part_opts(NesState *s, const GemuDeviceType *t, const char *name,
                                  const char *opts);
 static GemuDevice *nes_part(NesState *s, const GemuDeviceType *t, const char *name) {
@@ -1841,9 +1803,11 @@ static bool nes_core_build(NesState *s) {
     if (!c || !(c->machine = gemu_machine_new("nes")))
         return false;
     static const GemuDeviceType *const set_types[] = { &nes_board_type, &nes_apu_type, &nes_ppu_type };
-    char set[3][256];
-    if (!nes_machine_opts(s->cfg->machine_opts, set_types, set, 3))
+    char set[3][GEMU_OPTS_ROUTE_LEN], why[512];
+    if (!gemu_opts_route(s->cfg->machine_opts, set_types, 3, set, why, sizeof why)) {
+        fprintf(stderr, "gemu: %s\n", why);
         return false;
+    }
     bool ok = (c->board = nes_part_opts(s, &nes_board_type, "board", set[0])) &&
               nes_board_state(s, c->board);
     ok = ok && (c->cpu = nes_part(s, &nes_cpu_type, "cpu")) &&
@@ -1863,6 +1827,11 @@ static bool nes_core_build(NesState *s) {
         s->apu.frame_irq_enabled = gemu_opt_bool(c->apu, "frame_irq");
         if (!gemu_opt_bool(c->ppu, "odd_frame_skip")) s->ppu.no_odd_skip = true;
         if (s->cfg->is_arcade) s->vs_dip = (uint8_t)gemu_opt_int(c->board, "dips");
+    }
+    if (!ok) {   /* before init, which clears the reason (a bad setting, say) */
+        fprintf(stderr, "nes: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
     }
     bool inited = gemu_machine_init(c->machine);
     static const GemuExecutorOps exec_ops = { .run = nes_exec_run, .elapsed = nes_exec_elapsed };

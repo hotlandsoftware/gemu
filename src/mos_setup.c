@@ -530,7 +530,8 @@ int mos_setup(int argc, char *argv[]) {
             break;
         }
     }
-    if (cfg.machine_opts && cfg.machine != MOS_MACHINE_NES) {
+    if (cfg.machine_opts && cfg.machine != MOS_MACHINE_NES && cfg.machine != MOS_MACHINE_ATARI2600 &&
+        cfg.machine != MOS_MACHINE_ATARI400) {   /* the machines on the core route their own */
         fprintf(stderr, "gemu: -M settings (%s) are not supported on this machine\n", cfg.machine_opts);
         return 1;
     }

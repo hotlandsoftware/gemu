@@ -4,6 +4,18 @@
  */
 #include "atari400.h"
 #include "gemu/screendump.h"
+#include "antic_state.h"
+#include "pokey_state.h"
+#include "controller/pia6821_state.h"
+#include "mos6502_state.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/option.h"
+#include "gemu/dev/state.h"
+#include "gemu/dev/line.h"
+#include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/space.h"
+#include <inttypes.h>
 #include <SDL2/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,66 +153,107 @@ static bool a400_maxflash_control(Atari400State *s, uint16_t addr) {
     return false;
 }
 
+/* ── The bus as a core space (stage T2) ──────────────────────────────────────
+ * "program", 16 bits:
+ *   RAM from $0000 (ram_size); the OS ROM at $D800 (read-only);
+ *   GTIA $D000, POKEY $D200, PIA $D300, ANTIC $D400 (WSYNC), CCTL $D500
+ *   (the Maxflash banking), one page each; the rest of $D000-$D7FF is
+ *   unmapped and reads $FF;
+ *   at priority 1, Axlon's window on $4000-$7FFF (bank 1-63) and its bank
+ *   selects at $0FC0-$0FFF (a write also lands in RAM: the handler has no
+ *   read and passes it on) and $CFC0-$CFFF;
+ *   at priority 2, the cartridge: its ROM read-only, and a handler that
+ *   drops writes, so RAM under it isn't written.
+ * a400_maps_sync() points the cartridge and Axlon windows after anything
+ * that moves them.  The NMI (ANTIC's VBI) and /IRQ (POKEY) are lines. */
+static void a400_maps_sync(Atari400State *s);
+
+static uint8_t bus_gtia_r(void *ud, uint64_t off) {
+    Atari400State *s = ud;
+    uint8_t trig[4] = { 1, 1, 1, 1 };
+    if (s->held_actions & GEMU_ACTION(A400_ACT_FIRE)) trig[0] = 0;
+    return gtia_reg_read(&s->antic, (uint8_t)off, a400_consol(s), trig);
+}
+static void bus_gtia_w(void *ud, uint64_t off, uint8_t v) {
+    gtia_reg_write(&((Atari400State *)ud)->antic, (uint8_t)off, v);
+}
+static uint8_t bus_pokey_r(void *ud, uint64_t off) {
+    return pokey_read(&((Atari400State *)ud)->pokey, (uint8_t)off);
+}
+static void bus_pokey_w(void *ud, uint64_t off, uint8_t v) {
+    pokey_write(&((Atari400State *)ud)->pokey, (uint8_t)off, v);
+}
+static uint8_t bus_pia_r(void *ud, uint64_t off) {
+    return pia6821_read(&((Atari400State *)ud)->pia, (unsigned)off & 3u);
+}
+static void bus_pia_w(void *ud, uint64_t off, uint8_t v) {
+    pia6821_write(&((Atari400State *)ud)->pia, (unsigned)off & 3u, v);
+}
+static uint8_t bus_antic_r(void *ud, uint64_t off) {
+    return antic_reg_read(&((Atari400State *)ud)->antic, (uint8_t)off);
+}
+static void bus_antic_w(void *ud, uint64_t off, uint8_t v) {
+    Atari400State *s = ud;
+    if ((off & 0x0Fu) == 0x0A) s->wsync = true;      /* WSYNC */
+    else antic_reg_write(&s->antic, (uint8_t)off, v);
+}
+static uint8_t bus_cctl_r(void *ud, uint64_t off) {
+    Atari400State *s = ud;
+    if (a400_maxflash_control(s, (uint16_t)(0xD500u + off))) a400_maps_sync(s);
+    return 0xFF;
+}
+static void bus_cctl_w(void *ud, uint64_t off, uint8_t v) {
+    (void)v;
+    bus_cctl_r(ud, off);
+}
+static void bus_axlon_lo_w(void *ud, uint64_t off, uint8_t v) {
+    Atari400State *s = ud;
+    s->ram[0x0FC0u + off] = v;           /* the low selectors are ordinary RAM too */
+    s->axlon_bank = v & 0x3Fu;
+    a400_maps_sync(s);
+}
+static void bus_axlon_hi_w(void *ud, uint64_t off, uint8_t v) {
+    (void)off;
+    Atari400State *s = ud;
+    s->axlon_bank = v & 0x3Fu;
+    a400_maps_sync(s);
+}
+static void bus_drop_w(void *ud, uint64_t off, uint8_t v) { (void)ud; (void)off; (void)v; }
+
+static const GemuHandlers bus_gtia   = { .r8 = bus_gtia_r,  .w8 = bus_gtia_w };
+static const GemuHandlers bus_pokey  = { .r8 = bus_pokey_r, .w8 = bus_pokey_w };
+static const GemuHandlers bus_pia    = { .r8 = bus_pia_r,   .w8 = bus_pia_w };
+static const GemuHandlers bus_antic  = { .r8 = bus_antic_r, .w8 = bus_antic_w };
+static const GemuHandlers bus_cctl   = { .r8 = bus_cctl_r,  .w8 = bus_cctl_w };
+static const GemuHandlers bus_axlon_lo = { .w8 = bus_axlon_lo_w };
+static const GemuHandlers bus_axlon_hi = { .w8 = bus_axlon_hi_w };
+static const GemuHandlers bus_drop   = { .w8 = bus_drop_w };
+
+typedef struct A400Slot {
+    uint8_t     *ram;
+    GemuMapping *map;
+    uint32_t     off;
+    uint8_t      kind;     /* 0 = not looked up, 1 = ram, 2 = map, 3 = the space */
+} A400Slot;
+
+/* A400Core: see "The core machine" below. */
+static inline A400Slot *a400_slot(Atari400State *s, uint16_t addr, bool write);
+static GemuSpace *a400_space(const Atari400State *s);
+
 static uint8_t a400_read(uint16_t addr, void *ud) {
     Atari400State *s = ud;
-    if (a400_maxflash_control(s, addr)) return 0xFF;
-    if (s->cart_enabled && s->cart_base && addr >= s->cart_base &&
-        addr < (s->cart_type ? 0xC000u : s->cart_base + s->cart_size)) {
-        if (s->cart_type == 41u || s->cart_type == 42u)
-            return s->cart[(size_t)s->cart_bank * 0x2000u +
-                           (addr - 0xA000u)];
-        if (addr < s->cart_base + s->cart_size)
-            return s->cart[addr - s->cart_base];
-    }
-    if (s->axlon_ram && s->axlon_bank && addr >= 0x4000u && addr < 0x8000u)
-        return s->axlon_ram[(size_t)(s->axlon_bank - 1u) * A400_AXLON_BANK_SIZE +
-                            (addr - 0x4000u)];
-    if (addr < s->ram_size) return s->ram[addr];
-    if (addr >= 0xD800u) return s->os_rom[addr - 0xD800u];
-    switch (addr & 0xFF00u) {
-    case 0xD000u: {
-        uint8_t trig[4] = { 1, 1, 1, 1 };
-        if (s->held_actions & GEMU_ACTION(A400_ACT_FIRE)) trig[0] = 0;
-        return gtia_reg_read(&s->antic, (uint8_t)addr, a400_consol(s), trig);
-    }
-    case 0xD200u: return pokey_read(&s->pokey, (uint8_t)addr);
-    case 0xD300u: return pia6821_read(&s->pia, addr & 3u);
-    case 0xD400u: return antic_reg_read(&s->antic, (uint8_t)addr);
-    default:      return 0xFF;            /* open bus */
-    }
+    A400Slot *sl = a400_slot(s, addr, false);
+    if (sl->kind == 1) return sl->ram[addr & 0xFFu];
+    if (sl->kind == 2) return sl->map->h.r8(sl->map->ud, sl->off + (addr & 0xFFu));
+    return gemu_space_read8(a400_space(s), addr);
 }
 
 static void a400_write(uint16_t addr, uint8_t val, void *ud) {
     Atari400State *s = ud;
-    if (a400_maxflash_control(s, addr)) return;
-    if (s->cart_enabled && s->cart_base && addr >= s->cart_base &&
-        addr < (s->cart_type ? 0xC000u : s->cart_base + s->cart_size))
-        return;                            /* cartridge ROM overlays RAM */
-    bool axlon_select = s->axlon_ram &&
-        ((addr >= 0x0FC0u && addr <= 0x0FFFu) ||
-         (addr >= 0xCFC0u && addr <= 0xCFFFu));
-    if (axlon_select) {
-        s->axlon_bank = val & 0x3Fu;
-        /* The low mirror is also ordinary base RAM; the high selector range
-         * is otherwise open bus on a 48K 400. */
-        if (addr >= 0xCFC0u) return;
-    }
-    if (s->axlon_ram && s->axlon_bank && addr >= 0x4000u && addr < 0x8000u) {
-        s->axlon_ram[(size_t)(s->axlon_bank - 1u) * A400_AXLON_BANK_SIZE +
-                     (addr - 0x4000u)] = val;
-        return;
-    }
-    if (addr < s->ram_size) { s->ram[addr] = val; return; }
-    switch (addr & 0xFF00u) {
-    case 0xD000u: gtia_reg_write(&s->antic, (uint8_t)addr, val); break;
-    case 0xD200u: pokey_write(&s->pokey, (uint8_t)addr, val); break;
-    case 0xD300u: pia6821_write(&s->pia, addr & 3u, val); break;
-    case 0xD400u:
-        if ((addr & 0x0Fu) == 0x0A) s->wsync = true;      /* WSYNC */
-        else antic_reg_write(&s->antic, (uint8_t)addr, val);
-        break;
-    default: break;                       /* ROM / open bus */
-    }
+    A400Slot *sl = a400_slot(s, addr, true);
+    if (sl->kind == 1)      sl->ram[addr & 0xFFu] = val;
+    else if (sl->kind == 2) sl->map->h.w8(sl->map->ud, sl->off + (addr & 0xFFu), val);
+    else                    gemu_space_write8(a400_space(s), addr, val);
 }
 
 /* ── Reset / screendump / monitor commands ──────────────────────────────── */
@@ -216,6 +269,7 @@ static void a400_reset(Atari400State *s) {
     s->axlon_bank = 0;
     s->cart_bank = 0;
     s->cart_enabled = s->cart != NULL;
+    a400_maps_sync(s);
     s->keyq_head = s->keyq_tail = 0;
     s->key_hold_frames = s->key_gap_frames = 0;
     mos6502_reset(&s->cpu);
@@ -555,6 +609,7 @@ static GemuMediaResult a400_cart_change(void *ud, const char *arg,
         snprintf(err, err_len, "failed to load '%s'", arg);
         return GEMU_MEDIA_ERR;
     }
+    a400_maps_sync(s);
     return GEMU_MEDIA_OK_RESET;
 }
 
@@ -568,6 +623,7 @@ static GemuMediaResult a400_cart_eject(void *ud, char *err, size_t err_len) {
     s->cart_type = 0;
     s->cart_enabled = false;
     s->ram_size = a400_installed_ram_size(s);
+    a400_maps_sync(s);
     return GEMU_MEDIA_OK_RESET;
 }
 
@@ -639,6 +695,478 @@ static bool a400_sio_trap(Atari400State *s) {
     }
     a400_sio_return(s, status);
     return true;
+}
+
+
+/* ── The core machine (stage T) ──────────────────────────────────────────────
+ * As the NES's (stage N1): the parts stay where Atari400State keeps them;
+ * each device describes its part and registers its state.  board: RAM, the
+ * WSYNC hold, the keyboard queue and the frame count; cpu; antic (ANTIC and
+ * GTIA, modelled as one); pokey; pia; cart: the slot and its bank; axlon
+ * (-device axlon1056): the banked RAM; fdd (the 810, a high-level trap on
+ * the OS's SIO vector, no state of its own; the disk is read-only). */
+typedef struct A400Core {
+    GemuMachine *machine;
+    GemuDevice  *board, *cpu, *antic, *pokey, *pia, *cart, *axlon, *fdd;
+    /* T2: the bus, the windows on it, the CPU's cache of its decode */
+    GemuSpace   *bus;
+    GemuMapping *cart_rom, *cart_drop, *axlon_win;
+    uint16_t     cart_lo;              /* the cartridge mappings' range, [lo, hi) */
+    uint32_t     cart_hi;
+    A400Slot     slot[2][256];         /* reads, writes: per 256-byte page */
+    uint64_t     slot_gen;
+    GemuLine    *nmi, *irq;            /* ANTIC's VBI, POKEY's /IRQ */
+    GemuLineIn  *cpu_nmi, *cpu_irq;
+    /* T3: the 6502 runs the machine (a400_exec_run()) */
+    GemuExecutor *exec;
+    uint64_t     run_start;            /* cpu.cycle_count when this run began */
+    bool         stopped;              /* the last run ended at a breakpoint or a pause */
+    bool         frame_done;           /* ... or it finished a frame */
+    /* T4: ANTIC's picture */
+    GemuScreen  *screen;
+} A400Core;
+
+static GemuSpace *a400_space(const Atari400State *s) { return s->core->bus; }
+
+static __attribute__((noinline)) A400Slot *a400_slot_fill(A400Core *c, uint16_t addr, bool write) {
+    uint64_t gen = gemu_space_generation(c->bus);
+    if (c->slot_gen != gen) {
+        memset(c->slot, 0, sizeof c->slot);
+        c->slot_gen = gen;
+    }
+    A400Slot *sl = &c->slot[write][addr >> 8];
+    if (!sl->kind) {
+        GemuSpaceRun r;
+        sl->kind = 3;
+        if (gemu_space_run(c->bus, addr & 0xFF00u, write, &r) && r.avail >= 256) {
+            if (r.ram) { sl->ram = r.ram; sl->kind = 1; }
+            else       { sl->map = r.map; sl->off = (uint32_t)r.off; sl->kind = 2; }
+        }
+    }
+    return sl;
+}
+
+/* How the page at addr is served: plain memory, one handler, or neither
+ * (the space), looked up (gemu_space_run()) and kept while the space's
+ * generation holds. */
+static inline A400Slot *a400_slot(Atari400State *s, uint16_t addr, bool write) {
+    A400Core *c = s->core;
+    A400Slot *sl = &c->slot[write][addr >> 8];
+    if (__builtin_expect(!sl->kind || c->slot_gen != gemu_space_generation(c->bus), 0))
+        sl = a400_slot_fill(c, addr, write);
+    return sl;
+}
+
+static bool a400_bus_build(Atari400State *s) {
+    A400Core *c = s->core;
+    if (!(c->bus = gemu_space_new(c->machine, "program", 16, 8, GEMU_LITTLE_ENDIAN)))
+        return false;
+    GemuMapping *ram, *os;
+    bool ok = (ram = gemu_space_map_ram(c->bus, 0x0000, s->ram_size, s->ram, 0, 0)) &&
+              (os = gemu_space_map_ram(c->bus, 0xD800, ATARI400_OS_SIZE, s->os_rom,
+                                       GEMU_MAP_READONLY, 0)) &&
+              gemu_space_map(c->bus, 0xD000, 0x100, &bus_gtia, s, 0, 0) &&
+              gemu_space_map(c->bus, 0xD200, 0x100, &bus_pokey, s, 0, 0) &&
+              gemu_space_map(c->bus, 0xD300, 0x100, &bus_pia, s, 0, 0) &&
+              gemu_space_map(c->bus, 0xD400, 0x100, &bus_antic, s, 0, 0) &&
+              gemu_space_map(c->bus, 0xD500, 0x100, &bus_cctl, s, 0, 0);
+    if (ok) {
+        gemu_mapping_set_name(ram, "RAM");
+        gemu_mapping_set_name(os, "OS ROM");
+    }
+    if (ok && s->axlon_ram)
+        ok = gemu_space_map(c->bus, 0x0FC0, 0x40, &bus_axlon_lo, s, 1, 0) &&
+             gemu_space_map(c->bus, 0xCFC0, 0x40, &bus_axlon_hi, s, 1, 0) &&
+             (c->axlon_win = gemu_space_map_ram(c->bus, 0x4000, A400_AXLON_BANK_SIZE, s->axlon_ram, 0, 1));
+    if (ok && c->axlon_win)
+        gemu_mapping_set_name(c->axlon_win, "Axlon bank");
+    if (ok) a400_maps_sync(s);
+    return ok;
+}
+
+/* The cartridge's window (where it is, which bank, whether it's switched
+ * on) and Axlon's (which bank, if any): after a cartridge change, a reset,
+ * CCTL, an Axlon select and a load. */
+static void a400_maps_sync(Atari400State *s) {
+    A400Core *c = s->core;
+    if (!c || !c->bus) return;
+    bool on = s->cart && s->cart_base && s->cart_enabled;
+    uint16_t lo = s->cart ? s->cart_base : 0;
+    uint32_t hi = !s->cart ? 0 : s->cart_type ? 0xC000u : (uint32_t)s->cart_base + s->cart_size;
+    bool maxflash = s->cart_type == 41u || s->cart_type == 42u;
+    uint8_t *ptr = !s->cart ? NULL : maxflash ? s->cart + (size_t)s->cart_bank * 0x2000u : s->cart;
+    if (c->cart_rom && (c->cart_lo != lo || c->cart_hi != hi || !ptr)) {
+        gemu_mapping_remove(c->cart_rom);
+        gemu_mapping_remove(c->cart_drop);
+        c->cart_rom = c->cart_drop = NULL;
+    }
+    if (!c->cart_rom && ptr && hi > lo) {
+        c->cart_lo = lo;
+        c->cart_hi = hi;
+        c->cart_rom = gemu_space_map_ram(c->bus, lo, hi - lo, ptr, GEMU_MAP_READONLY, 2);
+        c->cart_drop = gemu_space_map(c->bus, lo, hi - lo, &bus_drop, s, 2, 0);
+        if (c->cart_rom) gemu_mapping_set_name(c->cart_rom, "cartridge");
+    }
+    if (c->cart_rom) {
+        gemu_mapping_set_ptr(c->cart_rom, ptr);
+        if (c->cart_rom->enabled != on) {
+            gemu_mapping_enable(c->cart_rom, on);
+            gemu_mapping_enable(c->cart_drop, on);
+        }
+    }
+    if (c->axlon_win) {
+        if (s->axlon_bank)
+            gemu_mapping_set_ptr(c->axlon_win, s->axlon_ram +
+                                 (size_t)(s->axlon_bank - 1u) * A400_AXLON_BANK_SIZE);
+        if (c->axlon_win->enabled != (s->axlon_bank != 0))
+            gemu_mapping_enable(c->axlon_win, s->axlon_bank != 0);
+    }
+}
+
+/* The 6502's /NMI (an edge: ANTIC's VBI) and /IRQ (level: POKEY). */
+static void cpu_nmi_in(void *ud, int idx, bool level) {
+    (void)idx;
+    if (level) ((Atari400State *)ud)->cpu.nmi = true;
+}
+static void cpu_irq_in(void *ud, int idx, bool level) {
+    (void)idx;
+    ((Atari400State *)ud)->cpu.irq = level;
+}
+static bool a400_lines_build(Atari400State *s) {
+    A400Core *c = s->core;
+    return (c->cpu_nmi = gemu_line_in(c->cpu, "nmi", cpu_nmi_in, s, 0)) &&
+           (c->cpu_irq = gemu_line_in(c->cpu, "irq", cpu_irq_in, s, 0)) &&
+           (c->nmi = gemu_line_out(c->antic, "nmi")) &&
+           (c->irq = gemu_line_out(c->pokey, "irq")) &&
+           gemu_line_connect_in(c->nmi, c->cpu_nmi, 0) &&
+           gemu_line_connect_in(c->irq, c->cpu_irq, 0);
+}
+static inline void a400_irq_update(Atari400State *s) {
+    gemu_line_set(s->core->irq, pokey_irq_asserted(&s->pokey));
+}
+static void a400_vbi(Atari400State *s) {
+    s->antic.nmist |= ANTIC_NMI_VBI;
+    if (s->antic.nmien & ANTIC_NMI_VBI) gemu_line_pulse(s->core->nmi);
+}
+
+static Atari400State *a400_of(GemuDevice *d) { return *(Atari400State **)d->priv; }
+
+static void a400_board_describe(GemuDevice *d, char *buf, size_t len) {
+    const Atari400State *s = a400_of(d);
+    snprintf(buf, len, "%u KB RAM, frame %" PRIu64 "%s\n"
+             "keyboard queue %d, key %s",
+             (unsigned)(s->ram_size / 1024), s->frame, s->wsync ? ", WSYNC held" : "",
+             (s->keyq_tail - s->keyq_head + A400_KEYQ_LEN) % A400_KEYQ_LEN,
+             s->key_hold_frames ? "down" : "up");
+}
+
+static void a400_cpu_describe(GemuDevice *d, char *buf, size_t len) {
+    const Mos6502 *c = &a400_of(d)->cpu;
+    snprintf(buf, len, "PC %04X  A %02X  X %02X  Y %02X  SP %02X  P %02X\n"
+             "cycle %" PRIu64 ", instruction %" PRIu64 "%s%s",
+             c->PC, c->A, c->X, c->Y, c->SP, c->P, c->cycle_count, c->insn_count,
+             c->nmi ? ", NMI pending" : "", c->irq ? ", /IRQ low" : "");
+}
+
+static void a400_antic_describe(GemuDevice *d, char *buf, size_t len) {
+    const Antic *a = &a400_of(d)->antic;
+    snprintf(buf, len, "line %d of %d, DMACTL %02X, display list %04X, CHBASE %02X\n"
+             "NMIEN %02X  NMIST %02X  COLPF %02X %02X %02X %02X  COLBK %02X  PRIOR %02X",
+             a->scanline, a->lines_total, a->dmactl, a->dlist, a->chbase, a->nmien, a->nmist,
+             a->colpf[0], a->colpf[1], a->colpf[2], a->colpf[3], a->colbk, a->prior);
+}
+
+static void a400_pokey_describe(GemuDevice *d, char *buf, size_t len) {
+    const Pokey *p = &a400_of(d)->pokey;
+    snprintf(buf, len, "IRQEN %02X, pending %02X, SKCTL %02X, SKSTAT %02X, KBCODE %02X\n"
+             "AUDF %02X %02X %02X %02X  AUDC %02X %02X %02X %02X  AUDCTL %02X (not played)",
+             p->irqen, p->irq_pending, p->skctl, p->skstat, p->kbcode,
+             p->audf[0], p->audf[1], p->audf[2], p->audf[3],
+             p->audc[0], p->audc[1], p->audc[2], p->audc[3], p->audctl);
+}
+
+static void a400_pia_describe(GemuDevice *d, char *buf, size_t len) {
+    const Pia6821 *p = &a400_of(d)->pia;
+    snprintf(buf, len, "port A %02X (DDR %02X, CR %02X), port B %02X (DDR %02X, CR %02X)",
+             p->ora, p->ddra, p->cra, p->orb, p->ddrb, p->crb);
+}
+
+static void a400_cart_status(void *ud, char *buf, size_t buf_len);
+static void a400_cart_slot_describe(GemuDevice *d, char *buf, size_t len) {
+    const Atari400State *s = a400_of(d);
+    char st[96];
+    a400_cart_status((void *)s, st, sizeof st);
+    if (s->cart_type == 41u || s->cart_type == 42u)
+        snprintf(buf, len, "%s, bank %u", st, s->cart_bank);
+    else
+        snprintf(buf, len, "%s", st);
+}
+
+static void a400_axlon_describe(GemuDevice *d, char *buf, size_t len) {
+    const Atari400State *s = a400_of(d);
+    snprintf(buf, len, "1008 KB in 63 banks; bank %u at $4000%s", s->axlon_bank,
+             s->axlon_bank ? "" : " (base RAM)");
+}
+
+static void a400_floppy_status(void *ud, char *buf, size_t buf_len);
+static void a400_fdd_describe(GemuDevice *d, char *buf, size_t len) {
+    a400_floppy_status(a400_of(d), buf, len);
+}
+
+/* After a load: the ARGB frame from the colour codes; the cartridge's and
+ * Axlon's windows. */
+static void a400_board_post_load(GemuDevice *d) {
+    Atari400State *s = a400_of(d);
+    antic_refresh_argb(&s->antic);
+    a400_maps_sync(s);
+}
+
+/* ── "info": which cartridge is in the slot ── its size, CAR type and base
+ * (0 for none).  A state for another is refused. */
+static void a400_cart_info_save(void *ud, GemuStateWriter *w) {
+    const Atari400State *s = ud;
+    gemu_state_write_u32(w, s->cart ? s->cart_size : 0);
+    gemu_state_write_u32(w, s->cart ? s->cart_type : 0);
+    gemu_state_write_u32(w, s->cart ? s->cart_base : 0);
+}
+static bool a400_cart_info_check(void *ud, GemuStateReader *r) {
+    const Atari400State *s = ud;
+    uint32_t size, type, base;
+    if (gemu_state_left(r) != 12 || !gemu_state_read_u32(r, &size) ||
+        !gemu_state_read_u32(r, &type) || !gemu_state_read_u32(r, &base)) {
+        gemu_state_refuse(r, "atari400 cartridge: bad info item");
+        return false;
+    }
+    uint32_t hs = s->cart ? s->cart_size : 0, ht = s->cart ? s->cart_type : 0;
+    if (size != hs || type != ht) {
+        gemu_state_refuse(r, "atari400 cartridge: the state is for %s%uK (type %u); the slot "
+                          "holds %s%uK (type %u)", size ? "" : "no cartridge, ", size / 1024, type,
+                          hs ? "" : "no cartridge, ", hs / 1024, ht);
+        return false;
+    }
+    return true;
+}
+static bool a400_cart_info_load(void *ud, GemuStateReader *r) { return a400_cart_info_check(ud, r); }
+
+#define A400_TYPE(var, tname, tdesc, describe_fn) \
+    static const GemuDeviceType var = { .name = tname, .desc = tdesc, \
+        .size = sizeof(Atari400State *), .describe = describe_fn }
+static const GemuDeviceType a400_board_type = {
+    .name = "atari400-board", .desc = "Atari 400/800 main board", .size = sizeof(Atari400State *),
+    .describe = a400_board_describe, .post_load = a400_board_post_load,
+};
+A400_TYPE(a400_cpu_type, "mos6502", "MOS 6502 CPU", a400_cpu_describe);
+A400_TYPE(a400_antic_type, "antic-gtia", "Atari ANTIC and GTIA (display)", a400_antic_describe);
+A400_TYPE(a400_pokey_type, "pokey", "Atari POKEY (keyboard, IRQs, timers, serial)", a400_pokey_describe);
+A400_TYPE(a400_pia_type, "pia6821", "Motorola 6820/6821 PIA (joystick ports)", a400_pia_describe);
+A400_TYPE(a400_cart_type, "atari400-cart-slot", "Atari 400/800 cartridge slot", a400_cart_slot_describe);
+A400_TYPE(a400_axlon_type, "axlon1056", "Axlon RAMPower 1056K banked RAM", a400_axlon_describe);
+static const GemuDeviceType a400_fdd_type = {
+    .name = "atari810", .desc = "Atari 810 disk drive (SIO, high-level)", .size = sizeof(Atari400State *),
+    .describe = a400_fdd_describe, .stateless = true,
+};
+
+#define M(dev, field) ok &= GEMU_STATE_MEMBER(dev, "", s, field)
+/* The parts' own state.  Not saved: the configuration (cfg, ram_size), the
+ * OS ROM, the cartridge and disk images (media: "info" checks the
+ * cartridge), the host's input (held_actions, prev_arrow) and the front
+ * end. */
+static bool a400_parts_state(Atari400State *s) {
+    A400Core *c = s->core;
+    bool ok = true;
+    M(c->board, ram);
+    M(c->board, wsync);
+    M(c->board, keyq);
+    M(c->board, keyq_head);
+    M(c->board, keyq_tail);
+    M(c->board, key_hold_frames);
+    M(c->board, key_gap_frames);
+    M(c->board, frame);
+    M(c->board, line);
+    M(c->board, line_begun);
+    M(c->board, frame_start);
+    ok &= gemu_state_add_custom(c->cart, "info", a400_cart_info_save, a400_cart_info_check,
+                                a400_cart_info_load, s);
+    M(c->cart, cart_bank);
+    M(c->cart, cart_enabled);
+    if (c->axlon) {
+        M(c->axlon, axlon_bank);
+        ok &= gemu_state_add(c->axlon, "ram", s->axlon_ram, A400_AXLON_BANK_SIZE, A400_AXLON_EXT_BANKS);
+    }
+    return ok;
+}
+#undef M
+
+static GemuDevice *a400_part(Atari400State *s, const GemuDeviceType *t, const char *name) {
+    GemuDevice *d = gemu_device_add(s->core->machine, t, name, NULL, NULL);
+    if (d)
+        *(Atari400State **)d->priv = s;
+    return d;
+}
+
+static uint64_t a400_exec_run(void *ud, uint64_t budget);
+static uint64_t a400_exec_elapsed(void *ud);
+static uint64_t a400_cpu_hz(const Atari400State *s);
+
+/* ── ANTIC's screen (stage T4) ───────────────────────────────────────────────
+ * 320×240, ANTIC's ARGB frame (lines 8-247).  Device-timed: a frame begins
+ * when ANTIC paints one (a400_insn()).  The raw timing describes the beam:
+ * 114 CPU cycles a line, four hi-res pixels to a cycle, 320 of the 456
+ * shown, the region's lines. */
+static void a400_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    const Atari400State *s = ud;
+    for (int y = clip->y0; y < clip->y1; y++)
+        memcpy(bmp->pix + (size_t)y * (size_t)bmp->stride, s->antic.pixels_argb + (size_t)y * ANTIC_FB_W,
+               ANTIC_FB_W * sizeof(uint32_t));
+}
+
+static bool a400_screen_build(Atari400State *s) {
+    A400Core *c = s->core;
+    if (!(c->screen = gemu_screen_new(c->antic, "screen")) ||
+        !gemu_screen_set_size(c->screen, ANTIC_FB_W, ANTIC_FB_H))
+        return false;
+    gemu_screen_set_aspect(c->screen, 4, 3);
+    gemu_screen_set_update(c->screen, a400_screen_update, s);
+    int htotal = ANTIC_CYCLES_PER_LINE * 4, hbend = (htotal - ANTIC_FB_W) / 2;
+    return gemu_screen_set_raw(c->screen, a400_cpu_hz(s) * 4u, htotal, hbend, hbend + ANTIC_FB_W,
+                               s->antic.lines_total, ANTIC_FIRST_VISIBLE,
+                               ANTIC_FIRST_VISIBLE + ANTIC_FB_H, false);
+}
+
+GemuScreen *a400_screen(Atari400State *s) { return s->core ? s->core->screen : NULL; }
+
+static bool a400_core_build(Atari400State *s) {
+    A400Core *c = s->core = calloc(1, sizeof *c);
+    if (!c || !(c->machine = gemu_machine_new("atari400")))
+        return false;
+    /* -M settings (stage T7): its devices have none, so any is refused */
+    static const GemuDeviceType *const set_types[] = { &a400_board_type, &a400_cpu_type,
+        &a400_antic_type, &a400_pokey_type, &a400_pia_type, &a400_cart_type };
+    char set[6][GEMU_OPTS_ROUTE_LEN], why[512];
+    if (!gemu_opts_route(s->cfg->machine_opts, set_types, 6, set, why, sizeof why)) {
+        fprintf(stderr, "gemu: %s\n", why);
+        return false;
+    }
+    bool ok = (c->board = a400_part(s, &a400_board_type, "board")) &&
+              (c->cpu = a400_part(s, &a400_cpu_type, "cpu")) && mos6502_state_add(c->cpu, "", &s->cpu) &&
+              (c->antic = a400_part(s, &a400_antic_type, "antic")) &&
+              antic_state_add(c->antic, "", &s->antic) &&
+              (c->pokey = a400_part(s, &a400_pokey_type, "pokey")) &&
+              pokey_state_add(c->pokey, "", &s->pokey) &&
+              (c->pia = a400_part(s, &a400_pia_type, "pia")) && pia6821_state_add(c->pia, "", &s->pia) &&
+              (c->cart = a400_part(s, &a400_cart_type, "cart"));
+    if (ok && s->axlon_ram) ok = (c->axlon = a400_part(s, &a400_axlon_type, "axlon")) != NULL;
+    if (ok && s->cfg->atari810) ok = (c->fdd = a400_part(s, &a400_fdd_type, "fdd")) != NULL;
+    ok = ok && a400_parts_state(s);
+    if (!ok) {   /* before init, which clears the reason (a bad setting, say) */
+        fprintf(stderr, "atari400: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    bool inited = gemu_machine_init(c->machine);
+    static const GemuExecutorOps exec_ops = { .run = a400_exec_run, .elapsed = a400_exec_elapsed };
+    ok = ok && inited && a400_bus_build(s) && a400_lines_build(s) &&
+         (c->exec = gemu_executor_new(c->cpu, a400_cpu_hz(s), &exec_ops, s)) &&
+         a400_screen_build(s);
+    if (!ok || !inited || !gemu_machine_start(c->machine)) {
+        fprintf(stderr, "atari400: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    gemu_monitor_attach_machine(s->monitor, c->machine, "program");
+    return true;
+}
+
+static void a400_core_free(Atari400State *s) {
+    if (!s->core) return;
+    gemu_machine_free(s->core->machine);
+    free(s->core);
+    s->core = NULL;
+}
+
+/* ── The beam and the 6502 as the machine's executor (stage T3) ─────────────
+ * 114 CPU cycles a line, lines_total lines a frame.  A line's start sets
+ * VCOUNT's line, raises the VBI on line 248 and ticks POKEY; WSYNC holds
+ * the CPU to the line's end; after the last line ANTIC paints the frame.
+ * Before T3 this was the run loop's own loop, restarted at line 0 after
+ * every stop; now it is machine state (line, line_begun, frame_start) and a
+ * run carries on where the last one stopped.  The monitor's step goes
+ * through the same instruction, so it clocks the beam too (before, it
+ * didn't: no VBI, no POKEY ticks while stepping). */
+static void a400_line_begin(Atari400State *s) {
+    if (s->line_begun) return;
+    s->line_begun = true;
+    s->antic.scanline = s->line;
+    if (s->line == ANTIC_VBI_LINE) a400_vbi(s);
+    pokey_tick(&s->pokey);
+}
+
+static uint64_t a400_line_end(const Atari400State *s) {
+    return s->frame_start + (uint64_t)(s->line + 1) * ANTIC_CYCLES_PER_LINE;
+}
+
+/* One instruction (or an SIO trap) on the beam; true if it finished the
+ * frame. */
+static bool a400_insn(Atari400State *s) {
+    a400_line_begin(s);
+    uint64_t end = a400_line_end(s);
+    if (!a400_sio_trap(s)) {
+        a400_irq_update(s);
+        mos6502_step(&s->cpu);
+        if (s->wsync) {
+            s->wsync = false;
+            if (s->cpu.cycle_count < end) s->cpu.cycle_count = end;
+        }
+    }
+    while (s->cpu.cycle_count >= a400_line_end(s)) {
+        s->line_begun = false;
+        if (++s->line == s->antic.lines_total) {
+            s->line = 0;
+            s->frame_start = s->cpu.cycle_count;
+            antic_render_frame(&s->antic);
+            s->frame++;
+            if (s->core->screen) gemu_screen_frame_begin(s->core->screen);
+            return true;
+        }
+        a400_line_begin(s);
+    }
+    return false;
+}
+
+static uint64_t a400_exec_run(void *ud, uint64_t budget) {
+    Atari400State *s = ud;
+    A400Core *c = s->core;
+    (void)budget;
+    uint64_t start = c->run_start = s->cpu.cycle_count;
+    while (s->cpu.cycle_count - start < gemu_executor_budget(c->exec)) {
+        a400_line_begin(s);
+        if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) { c->stopped = true; break; }
+        bool done = a400_insn(s);
+        if (gemu_monitor_is_paused(s->monitor)) { c->stopped = true; break; }
+        if (done) { c->frame_done = true; break; }
+    }
+    if (c->stopped || c->frame_done)
+        gemu_machine_stop(c->machine);
+    return s->cpu.cycle_count - start;
+}
+
+static uint64_t a400_exec_elapsed(void *ud) {
+    Atari400State *s = ud;
+    return s->cpu.cycle_count - s->core->run_start;
+}
+
+static uint64_t a400_cpu_hz(const Atari400State *s) {
+    return s->cfg->is_pal ? (uint64_t)ATARI400_CPU_HZ_PAL : (uint64_t)ATARI400_CPU_HZ_NTSC;
+}
+
+/* Run until the frame is painted or something stops the machine. */
+static void a400_run_frame(Atari400State *s) {
+    A400Core *c = s->core;
+    c->stopped = c->frame_done = false;
+    uint64_t cycles = (uint64_t)s->antic.lines_total * ANTIC_CYCLES_PER_LINE + 1u;
+    while (!c->frame_done && !c->stopped)
+        gemu_machine_run_until(c->machine, gemu_machine_time(c->machine) +
+                               gemu_clocks(a400_cpu_hz(s), cycles));
 }
 
 /* ── Create / destroy ───────────────────────────────────────────────────── */
@@ -733,12 +1261,18 @@ Atari400State *atari400_create(const MosConfig *cfg) {
         });
     }
 
+    if (!a400_core_build(s)) {   /* the bus first: reset reads the vector */
+        atari400_destroy(s);
+        return NULL;
+    }
     a400_reset(s);
+    s->frame_start = s->cpu.cycle_count;   /* frame 0 begins after the reset */
     return s;
 }
 
 void atari400_destroy(Atari400State *s) {
     if (!s) return;
+    a400_core_free(s);
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
     free(s->disk_data);
@@ -752,14 +1286,8 @@ void atari400_destroy(Atari400State *s) {
 void atari400_run(Atari400State *s, const MosConfig *cfg) {
     gemu_monitor_start(s->monitor);
 
-    const int lines = s->antic.lines_total;
-    const Uint32 frame_ms = cfg->is_pal ? 20u : 16u;
-    uint64_t frame_start = s->cpu.cycle_count;
-
     bool quit = false;
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
-
         if (s->display) {
             s->held_actions = gemu_display_poll(s->display);
             if (gemu_display_should_quit(s->display)) break;
@@ -787,12 +1315,8 @@ void atari400_run(Atari400State *s, const MosConfig *cfg) {
             } else if (cmd == GEMU_MON_RESET) {
                 a400_reset(s);
             } else if (cmd == GEMU_MON_STEP) {
-                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--) {
-                    if (a400_sio_trap(s)) continue;
-                    s->cpu.irq = pokey_irq_asserted(&s->pokey);
-                    mos6502_step(&s->cpu);
-                    s->wsync = false;
-                }
+                for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
+                    a400_insn(s);
                 antic_render_frame(&s->antic);   /* the window follows stepping */
             }
         }
@@ -802,45 +1326,30 @@ void atari400_run(Atari400State *s, const MosConfig *cfg) {
 
         a400_key_pump(s);
 
-        if (!gemu_monitor_is_paused(s->monitor)) {
-            bool stop = false;
-            for (int line = 0; line < lines && !stop; line++) {
-                s->antic.scanline = line;
-                if (line == ANTIC_VBI_LINE) {
-                    s->antic.nmist |= ANTIC_NMI_VBI;
-                    if (s->antic.nmien & ANTIC_NMI_VBI) s->cpu.nmi = true;
-                }
-                pokey_tick(&s->pokey);
-                uint64_t target = frame_start +
-                    (uint64_t)(line + 1) * ANTIC_CYCLES_PER_LINE;
-                while (s->cpu.cycle_count < target) {
-                    if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) { stop = true; break; }
-                    if (a400_sio_trap(s)) continue;
-                    s->cpu.irq = pokey_irq_asserted(&s->pokey);
-                    mos6502_step(&s->cpu);
-                    if (s->wsync) {
-                        s->wsync = false;
-                        if (s->cpu.cycle_count < target)
-                            s->cpu.cycle_count = target;
-                    }
-                    if (gemu_monitor_is_paused(s->monitor)) { stop = true; break; }
-                }
-            }
-            frame_start = s->cpu.cycle_count;
-            antic_render_frame(&s->antic);
-            s->frame++;
+        bool paused = gemu_monitor_is_paused(s->monitor);
+        if (!paused) {
+            a400_run_frame(s);
+            if (s->core->stopped)
+                antic_render_frame(&s->antic);   /* the window shows where it stopped */
         }
 
         if (s->display) {
             if (cfg->display_type == GEMU_DISPLAY_CURSES)
                 a400_render_curses_text(s);
-            else
-                gemu_display_render(s->display, s->antic.pixels_argb,
-                                    ANTIC_FB_W, ANTIC_FB_H);
+            else {
+                const GemuBitmap *b = gemu_screen_render(a400_screen(s));
+                gemu_display_render(s->display, b->pix, b->width, b->height);
+            }
         }
 
-        Uint32 dt = SDL_GetTicks() - t0;
-        if (dt < frame_ms) SDL_Delay(frame_ms - dt);
+        /* Pace to the machine's time (the CPU's cycles at its clock);
+         * after a pause, start over. */
+        if (paused) {
+            gemu_machine_pace_reset(s->core->machine);
+            SDL_Delay(16);
+        } else {
+            gemu_machine_pace(s->core->machine, 0);
+        }
     }
 
     gemu_monitor_stop(s->monitor);

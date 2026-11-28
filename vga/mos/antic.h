@@ -76,3 +76,5 @@ void    gtia_reg_write (Antic *a, uint8_t reg, uint8_t v);
 
 /* Walk the display list once and paint the full frame. */
 void antic_render_frame(Antic *a);
+/* pixels_argb from pixels (after a load). */
+void antic_refresh_argb(Antic *a);

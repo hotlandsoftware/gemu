@@ -17,7 +17,8 @@
  * is checked against the machine first - every device, item, timer,
  * executor and line present on both sides, with the same sizes - and the
  * machine is left untouched if anything doesn't match; then it is applied
- * and the post_load hooks run (pre-order).  The machine must be started and
+ * and the post_load hooks run (pre-order); pacing (gemu_machine_pace) starts
+ * over from the loaded time.  The machine must be started and
  * not inside gemu_machine_run_until().
  *
  * Items of 2, 4 and 8 bytes are stored little-endian (the hosts GEMU builds

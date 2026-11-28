@@ -548,6 +548,7 @@ bool gemu_machine_load_state(GemuMachine *m, const uint8_t *buf, size_t len) {
     if (!load_pass(m, buf, len, true, epoch))
         return false;
     gemu_streams_after_load(m);            /* the sound so far was another timeline's */
+    gemu_machine_pace_reset(m);            /* and real time starts over from the loaded time */
     gemu_device_walk(&m->root, post_load_cb, NULL);
     return true;
 }

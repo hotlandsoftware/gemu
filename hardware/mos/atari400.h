@@ -63,7 +63,10 @@ enum {
 
 #define A400_KEYQ_LEN 64
 
+struct A400Core;
+
 typedef struct Atari400State {
+    struct A400Core *core;  /* the core machine (stage T) */
     Mos6502  cpu;
     Antic    antic;
     Pokey    pokey;
@@ -89,6 +92,9 @@ typedef struct Atari400State {
     uint32_t  disk_sectors;
 
     bool     wsync;         /* WSYNC written; stall to end of scanline */
+    int      line;          /* the beam: scanline, 0..lines_total-1 */
+    bool     line_begun;    /* its start (VCOUNT, the VBI, POKEY's tick) done */
+    uint64_t frame_start;   /* cpu.cycle_count when this frame began */
 
     /* Keyboard pacing: queued POKEY codes, one every few frames */
     uint8_t  keyq[A400_KEYQ_LEN];
@@ -104,6 +110,9 @@ typedef struct Atari400State {
 
     uint64_t frame;
 } Atari400State;
+
+/* machine_atari400.c: ANTIC's core screen (stage T4) */
+struct GemuScreen *a400_screen(Atari400State *s);
 
 Atari400State *atari400_create (const MosConfig *cfg);
 void           atari400_run    (Atari400State *s, const MosConfig *cfg);

@@ -279,6 +279,27 @@ static void fixed_cases(void) {
     CHECK(gemu_space_read8(nes, 0x2000) == 0xFF);
     gemu_space_free(nes);
 
+    /* gemu_space_run(): the 2600's bus - RAM and a chip sharing a page,
+     * A8, A10 and A11 not decoded below $1000 */
+    GemuSpace *vcs = gemu_space_new(NULL, "vcs", 13, 8, GEMU_LITTLE_ENDIAN);
+    static uint8_t riot[0x80];
+    Dev tia = { .id = 0x26 };
+    CHECK(gemu_space_mirror(vcs, 0, 0x1000, 0x2FF));
+    gemu_space_map(vcs, 0x000, 0x80, &H8NP, &tia, 0, 0);
+    gemu_space_map_ram(vcs, 0x080, 0x80, riot, 0, 0);
+    GemuSpaceRun run;
+    CHECK(!gemu_space_ptr(vcs, 0x080, false, NULL));                 /* not a whole page */
+    CHECK(gemu_space_run(vcs, 0x0C0, false, &run) && run.ram == riot + 0x40 && !run.map &&
+          run.avail == 0x40);
+    CHECK(gemu_space_run(vcs, 0x590, true, &run) && run.ram == riot + 0x10 && run.avail == 0x70);
+    CHECK(gemu_space_ptr_run(vcs, 0xD80, false, &avail) == riot && avail == 0x80);
+    CHECK(gemu_space_run(vcs, 0x140, false, &run) && run.map && run.map->ud == &tia &&
+          run.off == 0x40 && run.avail == 0x40 && !run.ram);
+    CHECK(run.map->h.r8(run.map->ud, run.off) == gemu_space_read8(vcs, 0x140));
+    CHECK(!gemu_space_run(vcs, 0x1000, false, &run));               /* unmapped */
+    CHECK(!gemu_space_ptr_run(vcs, 0x040, false, NULL));            /* a handler */
+    gemu_space_free(vcs);
+
     /* ── Bad arguments ── */
     CHECK(!gemu_space_map_ram(s, 0, 0, ram, 0, 0));
     CHECK(!gemu_space_map_ram(s, 0xFFFFFFFF, 2, ram, 0, 0));

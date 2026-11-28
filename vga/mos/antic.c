@@ -269,6 +269,11 @@ static void render_map_row(Render *r, int mode, int bytes, int x0, int n_lines) 
     }
 }
 
+void antic_refresh_argb(Antic *a) {
+    for (int i = 0; i < ANTIC_FB_W * ANTIC_FB_H; i++)
+        a->pixels_argb[i] = antic_palette_rgb[a->pixels[i]];
+}
+
 void antic_render_frame(Antic *a) {
     /* Background fill (border + blank lines + DMA-off). */
     uint8_t bg = a->colbk;

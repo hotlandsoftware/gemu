@@ -164,8 +164,11 @@ FAMILY_SRC = {
         'hardware/machine/mos/machine_atari400.c',
         'hardware/machine/mos/machine_atari2600.c', 'hardware/machine/mos/a2600/a2600_cart.c',
         'hardware/machine/mos/a2600/a2600_debug.c', 'hardware/machine/mos/a2600/a2600_bus.c',
-        'vga/mos/tia.c', 'audio/tia_sound.c', 'hardware/device/controller/m6532.c',
-        'vga/mos/antic.c', 'audio/pokey.c',
+        'hardware/machine/mos/a2600/a2600_cart_state.c',
+        'vga/mos/tia.c', 'vga/mos/tia_state.c', 'audio/tia_sound.c',
+        'hardware/device/controller/m6532.c', 'hardware/device/controller/m6532_state.c',
+        'hardware/device/controller/pia6821_state.c',
+        'vga/mos/antic.c', 'vga/mos/antic_state.c', 'audio/pokey.c', 'audio/pokey_state.c',
         'crt/ntsc_decode.c', 'crt/nes_ntsc_encode.c', 'crt/crt_tube.c',
         'hardware/device/storage/fds.c', 'hardware/device/storage/fds_hle.c',
         'hardware/device/storage/fds_state.c',
@@ -354,6 +357,10 @@ TESTS = [
     dict(name='merced_msr', family='ia64', kind='program', src='tests/merced_msr.c'),
     dict(name='nes_core', family='mos', kind='program', src='tests/nes_core.c',
          replaces=['hardware/machine/mos/machine_nes.c']),
+    dict(name='atari2600_core', family='mos', kind='program', src='tests/atari2600_core.c',
+         replaces=['hardware/machine/mos/machine_atari2600.c']),
+    dict(name='atari400_core', family='mos', kind='program', src='tests/atari400_core.c',
+         replaces=['hardware/machine/mos/machine_atari400.c']),
 ]
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

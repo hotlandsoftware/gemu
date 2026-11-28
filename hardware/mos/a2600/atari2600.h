@@ -70,7 +70,10 @@ typedef struct {
     uint32_t *full_fb;         /* A26_FULL_W x A26_FULL_H */
 } A26Debug;
 
+struct A26Core;
+
 typedef struct Atari2600State {
+    struct A26Core *core;   /* the core machine (stage T) */
     Mos6502   cpu;
     Tia       tia;
     M6532     riot;
@@ -108,6 +111,9 @@ typedef struct Atari2600State {
     GemuMonitor *monitor;
     HexEditor   *hex_editor;
 } Atari2600State;
+
+/* machine_atari2600.c: the TIA's core screen (stage T4) */
+struct GemuScreen *a26_screen(Atari2600State *s);
 
 /* machine_atari2600.c, for the debugger */
 bool a26_reload_cart(Atari2600State *s, char *err, size_t err_len);
