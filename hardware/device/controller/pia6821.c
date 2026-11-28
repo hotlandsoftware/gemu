@@ -23,6 +23,7 @@ void pia6821_init(Pia6821 *p) {
     p->set_irq_a = wiring.set_irq_a;
     p->set_irq_b = wiring.set_irq_b;
     p->ud = wiring.ud;
+    p->irq_ud = wiring.irq_ud;
 }
 
 /* One side's state, so the A and B logic is written once. */
@@ -45,7 +46,7 @@ static void update_irq(Pia6821 *p, Side s) {
                ((cr & CR_IRQ2) && (cr & CR_C2_B3) && !(cr & CR_C2_OUT));
     if (irq != *s.irq) {
         *s.irq = irq;
-        if (s.set_irq) s.set_irq(p->ud, irq);
+        if (s.set_irq) s.set_irq(p->irq_ud ? p->irq_ud : p->ud, irq);
     }
 }
 

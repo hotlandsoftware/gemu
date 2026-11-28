@@ -531,7 +531,11 @@ int mos_setup(int argc, char *argv[]) {
         }
     }
     if (cfg.machine_opts && cfg.machine != MOS_MACHINE_NES && cfg.machine != MOS_MACHINE_ATARI2600 &&
-        cfg.machine != MOS_MACHINE_ATARI400) {   /* the machines on the core route their own */
+        cfg.machine != MOS_MACHINE_ATARI400 && cfg.machine != MOS_MACHINE_GENERIC &&
+        cfg.machine != MOS_MACHINE_APPLE1 && cfg.machine != MOS_MACHINE_KIM1 &&
+        cfg.machine != MOS_MACHINE_5CLOWN && cfg.machine != MOS_MACHINE_MAGICFLY &&
+        cfg.machine != MOS_MACHINE_UM6578) {
+        /* the machines on the core route their own */
         fprintf(stderr, "gemu: -M settings (%s) are not supported on this machine\n", cfg.machine_opts);
         return 1;
     }

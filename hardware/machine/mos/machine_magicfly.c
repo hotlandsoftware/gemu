@@ -4,6 +4,16 @@
 #include "magicfly.h"
 #include "gemu/util.h"
 #include "gemu/screendump.h"
+#include "mos_core.h"
+#include "mos6502_dev.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/line.h"
+#include "gemu/dev/option.h"
+#include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/space.h"
+#include "gemu/dev/state.h"
+#include "gemu/dev/stream.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,27 +143,30 @@ static void mux_port_w(MagicflyState *s, uint8_t val) {
      * drive in GEMU, so just ignored, matching 5clown's convention. */
 }
 
-static uint8_t magicfly_read(uint16_t addr, void *ud) {
+/* ── The bus (stage M6) ──────────────────────────────────────────────────────
+ * "program": NVRAM $0000, video RAM $1000, colour RAM $1800 and the program
+ * ROM ($C000, read-only) as memory; handlers for the CRTC ($0800-$0801),
+ * the input mux ($2800, read) and the mux select / DAC ($3000, write).
+ * Anything else reads $FF. */
+static uint8_t crtc_r(void *ud, uint64_t off) {
     MagicflyState *s = ud;
-    if (addr < 0x0800) return s->nvram[addr];
-    if (addr == 0x0801) return s->crtc_regs[s->crtc_addr];
-    if (addr >= 0x1000 && addr <= 0x13FF) return s->videoram[addr - 0x1000];
-    if (addr >= 0x1800 && addr <= 0x1BFF) return s->colorram[addr - 0x1800];
-    if (addr == 0x2800) return mux_port_r(s);
-    if (addr >= 0xC000) return s->prg[addr - 0xC000];
-    return 0xFF;
+    return off == 1 ? s->crtc_regs[s->crtc_addr] : 0xFF;
 }
+static void crtc_w(void *ud, uint64_t off, uint8_t val) {
+    MagicflyState *s = ud;
+    if (off == 0) s->crtc_addr = (uint8_t)(val & 0x1F);
+    else          s->crtc_regs[s->crtc_addr] = val;
+}
+static uint8_t mux_r(void *ud, uint64_t off) { (void)off; return mux_port_r(ud); }
+static void mux_w(void *ud, uint64_t off, uint8_t val) { (void)off; mux_port_w(ud, val); }
+static const GemuHandlers crtc_handlers = { .r8 = crtc_r, .w8 = crtc_w };
+static const GemuHandlers mux_r_handlers = { .r8 = mux_r };
+static const GemuHandlers mux_w_handlers = { .w8 = mux_w };
 
-static void magicfly_write(uint16_t addr, uint8_t val, void *ud) {
-    MagicflyState *s = ud;
-    if (addr < 0x0800) { s->nvram[addr] = val; return; }
-    if (addr == 0x0800) { s->crtc_addr = (uint8_t)(val & 0x1F); return; }
-    if (addr == 0x0801) { s->crtc_regs[s->crtc_addr] = val; return; }
-    if (addr >= 0x1000 && addr <= 0x13FF) { s->videoram[addr - 0x1000] = val; return; }
-    if (addr >= 0x1800 && addr <= 0x1BFF) { s->colorram[addr - 0x1800] = val; return; }
-    if (addr == 0x3000) { mux_port_w(s, val); return; }
-    /* ROM region: no effect */
-}
+static uint8_t magicfly_read(uint16_t addr, void *ud);
+static void    magicfly_write(uint16_t addr, uint8_t val, void *ud);
+static bool    magicfly_core_build(MagicflyState *s);
+static void    magicfly_core_free(MagicflyState *s);
 
 /* ── Video: whole-frame tilemap render ───────────────────────────────────── */
 
@@ -231,12 +244,6 @@ static void magicfly_dac_tick(MagicflyState *s) {
     }
 }
 
-static void magicfly_dac_flush(MagicflyState *s) {
-    if (!s->audio_dev || s->dac_frame_n == 0) { s->dac_frame_n = 0; return; }
-    gemu_audio_queue(s->audio_dev, s->dac_frame_buf, (size_t)s->dac_frame_n);
-    s->dac_frame_n = 0;
-}
-
 /* ── Input: local display actions (VNC input is merged in by the display) ── */
 
 static void magicfly_handle_keys(MagicflyState *s, uint32_t held) {
@@ -283,7 +290,7 @@ static bool magicfly_mon_write(void *ud, uint64_t addr, uint8_t val) {
 
 static void magicfly_mon_cpu_state(void *ud, char *buf, size_t len) {
     const MagicflyState *s = ud;
-    mos6502_format_state(&s->cpu, buf, len);
+    mos6502_format_state(s->cpu, buf, len);
 }
 
 static GemuMonCmd magicfly_cmd_coin(GemuMonitor *mon, const char *args, void *ud) {
@@ -416,16 +423,10 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
             s->palette[pal_7m[i].pen] = pal_7m[i].rgb;
     }
 
-    /* DSW0 default: all 4 physical switches (bits 4/6/7 = unknown, bit 4 =
+    /* DSW0 default (the board's dsw option's, stage M6): all 4 physical switches (bits 4/6/7 = unknown, bit 4 =
      * Maximum Bet on Magic Fly only) default to their MAME "off" position,
      * i.e. all bits set. */
     s->dsw0 = 0xFF;
-
-    mos6502_init(&s->cpu);
-    s->cpu.mem_read  = magicfly_read;
-    s->cpu.mem_write = magicfly_write;
-    s->cpu.mem_ud    = s;
-    mos_cpu_apply(&s->cpu, cfg->cpu);
 
     s->monitor = gemu_monitor_create();
     if (!s->monitor) { free(s->prg); free(s->gfxbnk0); free(s->gfxbnk1); free(s); return NULL; }
@@ -445,6 +446,11 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
         s->audio_dev = gemu_audio_open(name, 44100);
     }
 
+    if (!magicfly_core_build(s)) {
+        magicfly_destroy(s);
+        return NULL;
+    }
+
     if (gemu_display_wanted(cfg->display_type)) {
         const GemuActionDef *actions = mf ? magicfly_actions_mf : magicfly_actions_7m;
         int n_actions = mf ? (int)(sizeof(magicfly_actions_mf)/sizeof(magicfly_actions_mf[0]))
@@ -461,13 +467,14 @@ MagicflyState *magicfly_create(const MosConfig *cfg) {
         });
     }
 
-    mos6502_reset(&s->cpu);
+    mos6502_reset(s->cpu);
     return s;
 }
 
 void magicfly_destroy(MagicflyState *s) {
     if (!s) return;
-    magicfly_nvram_save(s);
+    if (s->core) magicfly_nvram_save(s);
+    magicfly_core_free(s);
     gemu_audio_close(s->audio_dev);
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
@@ -477,13 +484,216 @@ void magicfly_destroy(MagicflyState *s) {
     free(s);
 }
 
+/* ── The core machine (stage M6) ─────────────────────────────────────────────
+ * board (magicfly-board): NVRAM, video and colour RAM, the CRTC's
+ * registers, the input mux and DIP switches, the DAC; cpu (mos6502): the
+ * machine's executor at 625 kHz, the DAC clocked for each instruction's
+ * cycles.  The board's "vsync" line pulses the CPU's nmi once a frame (a
+ * timer, every 10,417 cycles).  Its "screen" (256x232) is the tilemap,
+ * drawn at each frame's end; its "sound" the DAC's samples, through the
+ * mixer. */
+typedef struct MagicflyCore {
+    GemuMachine *machine;
+    GemuDevice  *board, *cpu;
+    GemuSpace   *bus;
+    MosBus       cache;
+    GemuLine    *vsync;
+    GemuTimer   *vsync_timer;
+    GemuTime     frame_end;
+    GemuScreen  *screen;
+    GemuStream  *sound;
+} MagicflyCore;
+
+#define MAGICFLY_FRAME gemu_clocks(MAGICFLY_CPU_HZ, MAGICFLY_CYCLES_PER_FRAME)
+
+static uint8_t magicfly_read(uint16_t addr, void *ud) {
+    MagicflyState *s = ud;
+    return mos_bus_read(&s->core->cache, addr);
+}
+static void magicfly_write(uint16_t addr, uint8_t val, void *ud) {
+    MagicflyState *s = ud;
+    mos_bus_write(&s->core->cache, addr, val);
+}
+
+static bool magicfly_bus_build(MagicflyState *s) {
+    MagicflyCore *c = s->core;
+    GemuSpace *b = c->bus = gemu_space_new(c->machine, "program", 16, 8, GEMU_LITTLE_ENDIAN);
+    if (!b) return false;
+    c->cache.space = b;
+    return gemu_space_map_ram(b, 0x0000, MAGICFLY_NVRAM_SIZE, s->nvram, 0, 0) &&
+           gemu_space_map(b, 0x0800, 2, &crtc_handlers, s, 0, 0) &&
+           gemu_space_map_ram(b, 0x1000, MAGICFLY_VRAM_SIZE, s->videoram, 0, 0) &&
+           gemu_space_map_ram(b, 0x1800, MAGICFLY_VRAM_SIZE, s->colorram, 0, 0) &&
+           gemu_space_map(b, 0x2800, 1, &mux_r_handlers, s, 0, 0) &&
+           gemu_space_map(b, 0x3000, 1, &mux_w_handlers, s, 0, 0) &&
+           gemu_space_map_ram(b, 0xC000, MAGICFLY_PRG_SIZE, s->prg, GEMU_MAP_READONLY, 0);
+}
+
+static void magicfly_board_describe(GemuDevice *d, char *buf, size_t len) {
+    const MagicflyState *s = *(MagicflyState **)d->priv;
+    snprintf(buf, len, "%s, frame %llu; input select %X, DIP %02X, DAC %d; CRTC R%u",
+             s->cfg->is_7mezzo ? "7 e Mezzo" : "Magic Fly", (unsigned long long)s->frame,
+             s->input_selector, s->dsw0, s->dac_bit, s->crtc_addr);
+}
+
+static void magicfly_board_post_load(GemuDevice *d);
+/* The machine's settings (stage M6): the DIP bank, -M magicfly,dsw=0x7F. */
+static const GemuOptionDef magicfly_board_opts[] = {
+    { "dsw", "DIP switches (input select 0)", GEMU_OPT_INT, "0xFF", 0, 255, NULL },
+    { NULL, NULL, 0, NULL, 0, 0, NULL },
+};
+static const GemuDeviceType magicfly_board_type = {
+    .name = "magicfly-board", .desc = "Magic Fly / 7 e Mezzo board", .size = sizeof(MagicflyState *),
+    .describe = magicfly_board_describe, .post_load = magicfly_board_post_load,
+    .options = magicfly_board_opts,
+};
+
+#define B(field) ok &= GEMU_STATE_MEMBER(d, "", s, field)
+/* The board's state.  Not saved: the ROMs and palette, the host's input,
+ * the picture (drawn again after a load), the DAC's unsent samples and its
+ * rate (configuration). */
+static bool magicfly_board_state(MagicflyState *s, GemuDevice *d) {
+    bool ok = true;
+    B(nvram); B(videoram); B(colorram); B(crtc_addr); B(crtc_regs); B(input_selector); B(dsw0);
+    B(coin_latch); B(dac_bit); B(dac_sample_acc); B(frame);
+    ok &= GEMU_STATE_VAR(d, "frame_end", s->core->frame_end);
+    return ok;
+}
+#undef B
+
+/* After a load: the picture drawn again, unsent samples dropped. */
+static void magicfly_board_post_load(GemuDevice *d) {
+    MagicflyState *s = *(MagicflyState **)d->priv;
+    magicfly_render(s);
+    s->dac_frame_n = 0;
+}
+
+static void magicfly_step_insn(MagicflyState *s);
+static bool magicfly_stop_before(void *ud) {
+    MagicflyState *s = ud;
+    return gemu_monitor_check_exec(s->monitor, s->cpu->PC);
+}
+static void magicfly_insn(void *ud) { magicfly_step_insn(ud); }
+static bool magicfly_stop_after(void *ud) {
+    return gemu_monitor_is_paused(((MagicflyState *)ud)->monitor);
+}
+
+static void magicfly_vsync(void *ud, int param) {
+    (void)param;
+    MagicflyState *s = ud;
+    gemu_line_pulse(s->core->vsync);
+    gemu_screen_frame_begin(s->core->screen);
+}
+
+static void magicfly_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    const MagicflyState *s = ud;
+    for (int y = clip->y0; y < clip->y1; y++)
+        memcpy(bmp->pix + (size_t)y * (size_t)bmp->stride, s->pixels_argb + (size_t)y * MAGICFLY_FB_WIDTH,
+               MAGICFLY_FB_WIDTH * sizeof(uint32_t));
+}
+
+/* The DAC's samples as the mixer asks, in order, none lost (as the NES's
+ * APU stream). */
+static void magicfly_sound_update(void *ud, float *const *out, unsigned n) {
+    MagicflyState *s = ud;
+    unsigned have = (unsigned)s->dac_frame_n, take = n < have ? n : have;
+    memcpy(out[0], s->dac_frame_buf, take * sizeof(float));
+    float last = take ? out[0][take - 1] : (have ? s->dac_frame_buf[0] : 0.0f);
+    for (unsigned i = take; i < n; i++) out[0][i] = last;
+    if (take < have)
+        memmove(s->dac_frame_buf, s->dac_frame_buf + take, (have - take) * sizeof(float));
+    s->dac_frame_n = (int)(have - take);
+}
+static void magicfly_sound_out(void *ud, const float *samples, size_t frames) {
+    gemu_audio_queue(ud, samples, frames);
+}
+
+static bool magicfly_core_build(MagicflyState *s) {
+    MagicflyCore *c = s->core = calloc(1, sizeof *c);
+    if (!c || !(c->machine = gemu_machine_new(s->cfg->is_7mezzo ? "7mezzo" : "magicfly")))
+        return false;
+    static const GemuDeviceType *const set_types[] = { &magicfly_board_type };
+    char set[1][GEMU_OPTS_ROUTE_LEN], why[512];
+    if (!gemu_opts_route(s->cfg->machine_opts, set_types, 1, set, why, sizeof why)) {
+        fprintf(stderr, "gemu: %s\n", why);
+        return false;
+    }
+    static const char *const variant[] = { "6502", "2a03", "2a07", "6501", "6507" };
+    char cpu_opts[32];
+    snprintf(cpu_opts, sizeof cpu_opts, "variant=%s", variant[s->cfg->cpu]);
+    bool ok = (c->board = gemu_device_add(c->machine, &magicfly_board_type, "board", NULL,
+                                          set[0][0] ? set[0] : NULL)) &&
+              (c->cpu = gemu_device_add(c->machine, &gemu_mos6502_type, "cpu", NULL, cpu_opts));
+    if (ok) {
+        *(MagicflyState **)c->board->priv = s;
+        ok = magicfly_board_state(s, c->board);
+    }
+    if (!ok) {
+        fprintf(stderr, "magicfly: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    s->dsw0 = (uint8_t)gemu_opt_int(c->board, "dsw");
+    bool inited = gemu_machine_init(c->machine);
+    if (inited) {
+        s->cpu = gemu_mos6502(c->cpu);
+        s->cpu->mem_read = magicfly_read;
+        s->cpu->mem_write = magicfly_write;
+        s->cpu->mem_ud = s;
+    }
+    GemuMos6502Hooks h = { .stop_before = magicfly_stop_before, .insn = magicfly_insn,
+                           .stop_after = magicfly_stop_after, .ud = s };
+    ok = inited && magicfly_bus_build(s) && gemu_mos6502_exec(c->cpu, MAGICFLY_CPU_HZ, &h) &&
+         (c->vsync = gemu_line_out(c->board, "vsync")) && gemu_line_connect(c->vsync, c->cpu, "nmi", 0) &&
+         (c->vsync_timer = gemu_timer_new(c->board, magicfly_vsync, s)) &&
+         (c->screen = gemu_screen_new(c->board, "screen")) &&
+         gemu_screen_set_size(c->screen, MAGICFLY_FB_WIDTH, MAGICFLY_FB_HEIGHT) &&
+         (c->sound = gemu_stream_new(c->board, "sound", 1, 44100, magicfly_sound_update, s));
+    if (ok) {
+        gemu_screen_set_update(c->screen, magicfly_screen_update, s);
+        gemu_mixer_set_output(c->machine, 44100, 1, s->audio_dev ? magicfly_sound_out : NULL,
+                              s->audio_dev);
+    }
+    if (!ok || !gemu_machine_start(c->machine)) {
+        fprintf(stderr, "magicfly: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    gemu_timer_start(c->vsync_timer, 0, MAGICFLY_FRAME, 0);
+    c->frame_end = gemu_machine_time(c->machine) + MAGICFLY_FRAME;
+    gemu_monitor_attach_machine(s->monitor, c->machine, "program");
+    return true;
+}
+
+static void magicfly_core_free(MagicflyState *s) {
+    if (!s->core) return;
+    gemu_machine_free(s->core->machine);
+    free(s->core);
+    s->core = NULL;
+}
+
+/* One frame: the machine run to the frame's end (the vsync at its start),
+ * the frame's sound out through the mixer, the picture drawn.  A stop
+ * leaves the frame to finish next time. */
+static void magicfly_frame(MagicflyState *s) {
+    MagicflyCore *c = s->core;
+    gemu_machine_run_until(c->machine, c->frame_end);
+    bool done = gemu_machine_time(c->machine) >= c->frame_end;
+    gemu_mixer_run(c->machine);
+    magicfly_render(s);
+    if (done) {
+        c->frame_end += MAGICFLY_FRAME;
+        s->frame++;
+    }
+}
+
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
 /* Execute one CPU instruction and clock the DAC for its cycles. */
 static void magicfly_step_insn(MagicflyState *s) {
-    uint64_t prev = s->cpu.cycle_count;
-    mos6502_step(&s->cpu);
-    uint64_t delta = s->cpu.cycle_count - prev;
+    uint64_t prev = s->cpu->cycle_count;
+    mos6502_step(s->cpu);
+    uint64_t delta = s->cpu->cycle_count - prev;
     for (uint64_t i = 0; i < delta; i++) magicfly_dac_tick(s);
 }
 
@@ -494,8 +704,6 @@ void magicfly_run(MagicflyState *s, const MosConfig *cfg) {
 
     bool quit = false;
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
-
         uint32_t held = 0;
         if (s->display) {
             held = gemu_display_poll(s->display);
@@ -503,7 +711,7 @@ void magicfly_run(MagicflyState *s, const MosConfig *cfg) {
             if (gemu_display_reset_requested(s->display)) {
                 gemu_display_clear_flags(s->display);
                 magicfly_nvram_save(s);
-                mos6502_reset(&s->cpu);
+                mos6502_reset(s->cpu);
             }
         }
 
@@ -514,7 +722,7 @@ void magicfly_run(MagicflyState *s, const MosConfig *cfg) {
                 else { quit = true; break; }
             } else if (cmd == GEMU_MON_RESET) {
                 magicfly_nvram_save(s);
-                mos6502_reset(&s->cpu);
+                mos6502_reset(s->cpu);
             } else if (cmd == GEMU_MON_STEP) {
                 for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
                     magicfly_step_insn(s);
@@ -527,30 +735,26 @@ void magicfly_run(MagicflyState *s, const MosConfig *cfg) {
         magicfly_handle_keys(s, held);
         if (s->coin_latch > 0) s->coin_latch--;
 
-        if (!gemu_monitor_is_paused(s->monitor)) {
-            s->cpu.nmi = true; /* CRTC vsync, once per frame */
+        bool paused = gemu_monitor_is_paused(s->monitor);
+        if (!paused) magicfly_frame(s);
 
-            uint64_t target = s->cpu.cycle_count + MAGICFLY_CYCLES_PER_FRAME;
-            while (s->cpu.cycle_count < target) {
-                if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-                magicfly_step_insn(s);
-            }
-            magicfly_dac_flush(s);
-
-            magicfly_render(s);
-            s->frame++;
+        if (s->display) {
+            const GemuBitmap *b = gemu_screen_render(s->core->screen);
+            gemu_display_render(s->display, b->pix, b->width, b->height);
         }
 
-        if (s->display)
-            gemu_display_render(s->display, s->pixels_argb, MAGICFLY_FB_WIDTH, MAGICFLY_FB_HEIGHT);
-
-        Uint32 dt = SDL_GetTicks() - t0;
-        Uint32 frame_ms = 1000u / 60u;
-        if (dt < frame_ms) SDL_Delay(frame_ms - dt);
+        /* Pace to the machine's time (60 frames a second); paused, a
+         * frame's delay. */
+        if (!paused) {
+            gemu_machine_pace(s->core->machine, 0);
+        } else {
+            gemu_machine_pace_reset(s->core->machine);
+            SDL_Delay(1000u / 60u);
+        }
     }
 
     magicfly_nvram_save(s);
     gemu_monitor_stop(s->monitor);
     printf("%s: %llu frames, %llu cpu cycles\n",
-           name, (unsigned long long)s->frame, (unsigned long long)s->cpu.cycle_count);
+           name, (unsigned long long)s->frame, (unsigned long long)s->cpu->cycle_count);
 }

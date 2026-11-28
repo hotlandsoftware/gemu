@@ -84,9 +84,12 @@ enum {
     FIVECLOWN_NUM_ACTIONS,
 };
 
+struct FiveClownCore;
+
 typedef struct FiveClownState {
-    Mos6502 cpu;       /* main CPU */
-    Mos6502 audiocpu;  /* sound CPU */
+    struct FiveClownCore *core; /* the core machine (stage M5) */
+    Mos6502 *cpu;      /* main CPU (the cpu device's) */
+    Mos6502 *audiocpu; /* sound CPU (the audiocpu device's) */
 
     const MosConfig *cfg;
 
@@ -106,7 +109,7 @@ typedef struct FiveClownState {
     uint8_t crtc_addr;
     uint8_t crtc_regs[32];
 
-    Pia6821 pia0, pia1;
+    Pia6821 *pia0, *pia1;   /* the pia0 and pia1 devices' */
     Okim6295 oki;      /* only ticked/used when cfg->sound_hw_mask & MOS_SOUNDHW_OKI6295 */
 
     uint8_t mux_data;         /* PIA1 port B: input mux select (inverted) */

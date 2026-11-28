@@ -6,6 +6,15 @@
 #include "gemu/sha256.h"
 #include "gemu/vnc.h"
 #include "romdb.h"
+#include "mos_core.h"
+#include "mos6502_dev.h"
+#include "controller/pia6821_dev.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/option.h"
+#include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/space.h"
+#include "gemu/dev/state.h"
 #include <SDL2/SDL.h>
 #include <ctype.h>
 #include <errno.h>
@@ -253,7 +262,7 @@ static void apple1_display_clear(Apple1Display *d) {
 static void apple1_pia_setup(Apple1State *s);
 
 static void apple1_reset_machine(Apple1State *s) {
-    mos6502_reset(&s->cpu);
+    mos6502_reset(s->cpu);
     apple1_pia_setup(s);
     s->native_monitor = !s->have_monitor_rom;
     s->quit_requested = false;
@@ -379,17 +388,14 @@ static void apple1_poll_input_devices(Apple1State *s) {
 }
 
 /* Mirror the custom SDL window to VNC (no-op without -vnc). */
-static void apple1_update_vnc(Apple1State *s, bool paused) {
-    static uint32_t argb[A1_FB_W * A1_FB_H];
-    GemuVncServer *vnc = gemu_vnc_get();
-    if (!vnc || !s || !s->display)
-        return;
-
-    for (size_t i = 0; i < (size_t)A1_FB_W * A1_FB_H; i++)
-        argb[i] = 0xFF000000u;
+/* The terminal as ARGB, 280x192 (40x24 cells of 7x8; the glyph's 5x8 at
+ * the cell's left), white on black, the cursor an '@' when cursor_phase. */
+static void apple1_render_argb(const Apple1State *s, uint32_t *argb, int stride, bool cursor_phase) {
+    for (int y = 0; y < A1_FB_H; y++)
+        for (int x = 0; x < A1_FB_W; x++)
+            argb[(size_t)y * (size_t)stride + (size_t)x] = 0xFF000000u;
+    if (!s->display) return;
     const uint8_t *font = apple1_display_font(s->display);
-    bool cursor_phase = paused ? s->display->cursor_phase
-                               : ((SDL_GetTicks() / 500u) & 1u) != 0;
     for (int row = 0; row < A1_ROWS; row++) {
         for (int col = 0; col < A1_COLS; col++) {
             uint8_t ch = s->display->screen[row][col];
@@ -404,56 +410,56 @@ static void apple1_update_vnc(Apple1State *s, bool paused) {
                 uint8_t bits = glyph[gy];
                 for (int gx = 0; gx < 5; gx++) {
                     if (bits & (uint8_t)(0x10u >> gx))
-                        argb[(y0 + gy) * A1_FB_W + x0 + gx] = 0xFFFFFFFFu;
+                        argb[(size_t)(y0 + gy) * (size_t)stride + (size_t)(x0 + gx)] = 0xFFFFFFFFu;
                 }
             }
         }
     }
+}
+
+static void apple1_update_vnc(Apple1State *s, bool paused) {
+    static uint32_t argb[A1_FB_W * A1_FB_H];
+    GemuVncServer *vnc = gemu_vnc_get();
+    if (!vnc || !s || !s->display)
+        return;
+    bool cursor_phase = paused ? s->display->cursor_phase
+                               : ((SDL_GetTicks() / 500u) & 1u) != 0;
+    apple1_render_argb(s, argb, A1_FB_W, cursor_phase);
     gemu_vnc_update_argb(vnc, argb, A1_FB_W, A1_FB_H);
 }
 
+/* The core screen's picture (stage M3): the terminal, its cursor as the
+ * window last drew it. */
+static void apple1_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    (void)clip;
+    const Apple1State *s = ud;
+    apple1_render_argb(s, bmp->pix, bmp->stride, s->display && s->display->cursor_phase);
+}
+
+static struct GemuScreen *apple1_screen(Apple1State *s);
+/* What the core screen shows. */
 static bool apple1_screendump(void *ud, const char *path) {
     Apple1State *s = ud;
-    int w = A1_FB_W, h = A1_FB_H;
-    uint8_t *rgb = calloc((size_t)w * (size_t)h * 3, 1); /* pre-zeroed = black bg */
-    if (!rgb) return false;
-
-    const uint8_t *font = apple1_display_font(s->display);
-    bool cursor_phase = s->display && s->display->cursor_phase;
-    for (int row = 0; row < A1_ROWS; row++) {
-        for (int col = 0; col < A1_COLS; col++) {
-            uint8_t ch = s->display->screen[row][col];
-            if (cursor_phase && row == s->display->row && col == s->display->col)
-                ch = '@';
-            int idx = apple1_glyph_index(ch);
-            if (idx < 0) continue;
-            const uint8_t *glyph = &font[idx * 8];
-            int x0 = col * A1_CELL_W;
-            int y0 = row * A1_CELL_H;
-            for (int gy = 0; gy < 8; gy++) {
-                uint8_t bits = glyph[gy];
-                for (int gx = 0; gx < 5; gx++) {
-                    if (!(bits & (uint8_t)(0x10u >> gx))) continue;
-                    uint8_t *p = &rgb[(size_t)(y0 + gy) * w * 3 + (size_t)(x0 + gx) * 3];
-                    p[0] = p[1] = p[2] = 255;
-                }
-            }
-        }
-    }
-    bool ok = gemu_screendump(path, rgb, w, h);
-    free(rgb);
+    const GemuBitmap *b = gemu_screen_render(apple1_screen(s));
+    uint32_t *argb = malloc((size_t)A1_FB_W * A1_FB_H * sizeof *argb);
+    if (!argb) return false;
+    for (int y = 0; y < A1_FB_H; y++)
+        memcpy(argb + (size_t)y * A1_FB_W, b->pix + (size_t)y * (size_t)b->stride,
+               A1_FB_W * sizeof *argb);
+    bool ok = gemu_screendump_argb(path, argb, A1_FB_W, A1_FB_H);
+    free(argb);
     return ok;
 }
 
 /* A key reaches the PIA: its code on port A and a strobe on CA1, which sets
  * CRA bit 7 until the program reads the key.  The next key waits until then. */
 static bool apple1_key_waiting(const Apple1State *s) {
-    return (s->pia.cra & 0x80u) != 0;
+    return (s->pia->cra & 0x80u) != 0;
 }
 static void apple1_key_strobe(Apple1State *s, uint8_t key) {
     s->key_data = key;
-    pia6821_set_ca1(&s->pia, true);
-    pia6821_set_ca1(&s->pia, false);
+    pia6821_set_ca1(s->pia, true);
+    pia6821_set_ca1(s->pia, false);
 }
 
 static void apple1_poll_keyboard(Apple1State *s) {
@@ -511,31 +517,31 @@ static void apple1_pia_write_pb(void *ud, uint8_t val) {
  * (DDRB $7F), and both control registers $A7 (output registers selected,
  * CA1/CB1 active on the rising edge). */
 static void apple1_pia_setup(Apple1State *s) {
-    s->pia.read_pa = apple1_pia_read_pa;
-    s->pia.read_pb = apple1_pia_read_pb;
-    s->pia.write_pb = apple1_pia_write_pb;
-    s->pia.ud = s;
-    pia6821_init(&s->pia);
+    s->pia->read_pa = apple1_pia_read_pa;
+    s->pia->read_pb = apple1_pia_read_pb;
+    s->pia->write_pb = apple1_pia_write_pb;
+    s->pia->ud = s;
+    pia6821_init(s->pia);
     if (!s->have_monitor_rom) {
-        pia6821_write(&s->pia, 2, 0x7F);
-        pia6821_write(&s->pia, 1, 0xA7);
-        pia6821_write(&s->pia, 3, 0xA7);
+        pia6821_write(s->pia, 2, 0x7F);
+        pia6821_write(s->pia, 1, 0xA7);
+        pia6821_write(s->pia, 3, 0xA7);
     }
 }
 
 static bool apple1_romless_woz_trap(Apple1State *s) {
-    if (!s || s->have_monitor_rom || s->cpu.PC != APPLE1_WOZ_ECHO)
+    if (!s || s->have_monitor_rom || s->cpu->PC != APPLE1_WOZ_ECHO)
         return false;
 
-    apple1_write_display(s, s->cpu.A);
-    s->cpu.SP++;
-    uint8_t lo = apple1_read((uint16_t)(0x0100u | s->cpu.SP), s);
-    s->cpu.SP++;
-    uint8_t hi = apple1_read((uint16_t)(0x0100u | s->cpu.SP), s);
-    s->cpu.PC = (uint16_t)(((uint16_t)hi << 8) | lo);
-    s->cpu.PC++;
-    s->cpu.cycle_count += APPLE1_ECHO_CYCLES;
-    s->cpu.insn_count++;
+    apple1_write_display(s, s->cpu->A);
+    s->cpu->SP++;
+    uint8_t lo = apple1_read((uint16_t)(0x0100u | s->cpu->SP), s);
+    s->cpu->SP++;
+    uint8_t hi = apple1_read((uint16_t)(0x0100u | s->cpu->SP), s);
+    s->cpu->PC = (uint16_t)(((uint16_t)hi << 8) | lo);
+    s->cpu->PC++;
+    s->cpu->cycle_count += APPLE1_ECHO_CYCLES;
+    s->cpu->insn_count++;
     return true;
 }
 
@@ -634,7 +640,7 @@ static void apple1_monitor_execute(Apple1State *s, const char *line) {
     if (!have_addr) {
         if (*p == '\0') return;
         if (toupper((unsigned char)*p) == 'R') {
-            s->cpu.PC = s->mon_last_addr;
+            s->cpu->PC = s->mon_last_addr;
             s->native_monitor = false;
             return;
         }
@@ -653,7 +659,7 @@ static void apple1_monitor_execute(Apple1State *s, const char *line) {
         }
         apple1_monitor_dump(s, addr, end);
     } else if (toupper((unsigned char)*p) == 'R') {
-        s->cpu.PC = addr;
+        s->cpu->PC = addr;
         s->native_monitor = false;
     } else if (*p == '\0') {
         apple1_monitor_dump(s, addr, addr);
@@ -883,29 +889,62 @@ static void apple1_tape_status(void *ud, char *buf, size_t buf_len) {
                  (unsigned)(s->tape_addr + s->tape_size - 1u));
 }
 
+/* ── The core machine (stage M3) ─────────────────────────────────────────────
+ * board (apple1-board): the memory, the keyboard latch, the built-in
+ * monitor's line and the terminal; cpu (mos6502): the CPU and the machine's
+ * executor at 1 MHz; pia (pia6821): the keyboard and display PIA, its IRQs
+ * not wired (as on the board).
+ * The bus, "program" (16 bits): RAM from $0000 (ram_size); each run of ROM
+ * (rom_map) read-only over it, with a handler that drops writes; the PIA at
+ * $D010-$D013.  Anything else reads $00. */
+typedef struct Apple1Core {
+    GemuMachine *machine;
+    GemuDevice  *board, *cpu, *pia;
+    GemuSpace   *bus;
+    MosBus       cache;
+    GemuScreen  *screen;
+} Apple1Core;
+
+static struct GemuScreen *apple1_screen(Apple1State *s) { return s->core->screen; }
+
 static uint8_t apple1_read(uint16_t addr, void *ud) {
     Apple1State *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
-
-    if (addr >= APPLE1_KBD && addr <= APPLE1_DSPCR)
-        return pia6821_read(&s->pia, addr & 3u);
-
-    if (!s->rom_map[addr] && addr >= s->ram_size)
-        return 0x00u;
-    return s->mem[addr];
+    return mos_bus_read(&s->core->cache, addr);
 }
-
 static void apple1_write(uint16_t addr, uint8_t val, void *ud) {
     Apple1State *s = ud;
     gemu_monitor_check_write(s->monitor, addr);
+    mos_bus_write(&s->core->cache, addr, val);
+}
 
-    if (addr >= APPLE1_KBD && addr <= APPLE1_DSPCR) {
-        pia6821_write(&s->pia, addr & 3u, val);
-        return;
+static void rom_w8(void *ud, uint64_t off, uint8_t val) { (void)ud; (void)off; (void)val; }
+static const GemuHandlers rom_drop = { .w8 = rom_w8 };
+
+/* The ROMs' runs as read-only memory, after loading them. */
+static void apple1_rom_maps(Apple1State *s) {
+    Apple1Core *c = s->core;
+    for (uint32_t a = 0; a < 0x10000u; ) {
+        if (!s->rom_map[a]) { a++; continue; }
+        uint32_t end = a;
+        while (end < 0x10000u && s->rom_map[end]) end++;
+        GemuMapping *mp = gemu_space_map_ram(c->bus, a, end - a, s->mem + a, GEMU_MAP_READONLY, 1);
+        if (mp) gemu_mapping_set_name(mp, "ROM");
+        gemu_space_map(c->bus, a, end - a, &rom_drop, s, 1, 0);
+        a = end;
     }
+}
 
-    if (!s->rom_map[addr] && addr < s->ram_size)
-        s->mem[addr] = val;
+static bool apple1_bus_build(Apple1State *s) {
+    Apple1Core *c = s->core;
+    if (!(c->bus = gemu_space_new(c->machine, "program", 16, 8, GEMU_LITTLE_ENDIAN)))
+        return false;
+    c->cache.space = c->bus;
+    gemu_space_set_unmapped(c->bus, 0, NULL, NULL, NULL);
+    GemuMapping *ram = gemu_space_map_ram(c->bus, 0, s->ram_size, s->mem, 0, 0);
+    if (!ram) return false;
+    gemu_mapping_set_name(ram, "RAM");
+    return gemu_space_map(c->bus, APPLE1_KBD, 4, &gemu_pia6821_bus, c->pia, 2, 0) != NULL;
 }
 
 /* Monitor memory view: RAM and ROM as the CPU sees them.  The PIA keyboard
@@ -914,7 +953,7 @@ static bool apple1_mon_read(void *ud, uint64_t addr, uint8_t *val) {
     Apple1State *s = ud;
     if (addr > 0xFFFF) return false;
     if (addr >= APPLE1_KBD && addr <= APPLE1_DSPCR) {
-        *val = pia6821_peek(&s->pia, (unsigned)addr & 3u);
+        *val = pia6821_peek(s->pia, (unsigned)addr & 3u);
         return true;
     }
     *val = apple1_peek_mem(s, (uint16_t)addr);
@@ -933,7 +972,145 @@ static bool apple1_mon_write(void *ud, uint64_t addr, uint8_t val) {
 
 static void apple1_mon_cpu_state(void *ud, char *buf, size_t len) {
     const Apple1State *s = ud;
-    mos6502_format_state(&s->cpu, buf, len);
+    mos6502_format_state(s->cpu, buf, len);
+}
+
+static void apple1_board_describe(GemuDevice *d, char *buf, size_t len) {
+    const Apple1State *s = *(Apple1State **)d->priv;
+    snprintf(buf, len, "%u KB RAM, %s monitor%s, keyboard latch %02X\n"
+             "terminal: cursor at row %d, column %d",
+             (unsigned)(s->ram_size / 1024), s->have_monitor_rom ? "ROM" : "built-in",
+             s->native_monitor ? " (in it)" : "", s->key_data,
+             s->display ? s->display->row : 0, s->display ? s->display->col : 0);
+}
+
+/* The terminal: its 24 rows of 40 characters and the cursor (the display's
+ * own; zeros without one). */
+static void term_save(void *ud, GemuStateWriter *w) {
+    const Apple1State *s = ud;
+    uint8_t screen[A1_ROWS][A1_COLS];
+    uint32_t row = 0, col = 0;
+    memset(screen, 0, sizeof screen);
+    if (s->display) {
+        memcpy(screen, s->display->screen, sizeof screen);
+        row = (uint32_t)s->display->row;
+        col = (uint32_t)s->display->col;
+    }
+    gemu_state_write(w, screen, sizeof screen);
+    gemu_state_write_u32(w, row);
+    gemu_state_write_u32(w, col);
+}
+static bool term_check(void *ud, GemuStateReader *r) {
+    (void)ud;
+    if (gemu_state_left(r) != A1_ROWS * A1_COLS + 8) {
+        gemu_state_refuse(r, "apple1 terminal: bad item");
+        return false;
+    }
+    return true;
+}
+static bool term_load(void *ud, GemuStateReader *r) {
+    Apple1State *s = ud;
+    uint8_t screen[A1_ROWS][A1_COLS];
+    uint32_t row, col;
+    if (!gemu_state_read(r, screen, sizeof screen) || !gemu_state_read_u32(r, &row) ||
+        !gemu_state_read_u32(r, &col) || row >= A1_ROWS || col >= A1_COLS)
+        return false;
+    if (s->display) {
+        memcpy(s->display->screen, screen, sizeof screen);
+        s->display->row = (int)row;
+        s->display->col = (int)col;
+        s->display->dirty = true;
+    }
+    return true;
+}
+
+static const GemuDeviceType apple1_board_type = {
+    .name = "apple1-board", .desc = "Apple I board (memory, keyboard, terminal)",
+    .size = sizeof(Apple1State *), .describe = apple1_board_describe,
+};
+
+#define B(field) ok &= GEMU_STATE_MEMBER(d, "", s, field)
+/* The board's state: the memory (the ROMs' bytes included), the keyboard
+ * latch, the built-in monitor (whether it's in charge, its line), the
+ * terminal.  Not saved: the configuration (ram_size, rom_map,
+ * have_monitor_rom), the tape (media), the host's input queue. */
+static bool apple1_board_state(Apple1State *s, GemuDevice *d) {
+    bool ok = true;
+    B(mem); B(key_data); B(native_monitor); B(mon_line); B(mon_len); B(mon_last_addr);
+    ok &= gemu_state_add_custom(d, "terminal", term_save, term_check, term_load, s);
+    return ok;
+}
+#undef B
+
+static bool apple1_stop_before(void *ud) {
+    Apple1State *s = ud;
+    return gemu_monitor_check_exec(s->monitor, s->cpu->PC);
+}
+static void apple1_insn(void *ud) {
+    Apple1State *s = ud;
+    if (!apple1_romless_woz_trap(s))
+        mos6502_step(s->cpu);
+}
+static bool apple1_stop_after(void *ud) {
+    return gemu_monitor_is_paused(((Apple1State *)ud)->monitor);
+}
+
+static bool apple1_core_build(Apple1State *s) {
+    Apple1Core *c = s->core = calloc(1, sizeof *c);
+    if (!c || !(c->machine = gemu_machine_new("apple1")))
+        return false;
+    static const GemuDeviceType *const set_types[] = { &apple1_board_type };
+    char set[1][GEMU_OPTS_ROUTE_LEN], why[512];
+    if (!gemu_opts_route(s->cfg->machine_opts, set_types, 1, set, why, sizeof why)) {
+        fprintf(stderr, "gemu: %s\n", why);
+        return false;
+    }
+    static const char *const variant[] = { "6502", "2a03", "2a07", "6501", "6507" };
+    char cpu_opts[32];
+    snprintf(cpu_opts, sizeof cpu_opts, "variant=%s", variant[s->cfg->cpu]);
+    bool ok = (c->board = gemu_device_add(c->machine, &apple1_board_type, "board", NULL, NULL)) &&
+              (c->cpu = gemu_device_add(c->machine, &gemu_mos6502_type, "cpu", NULL, cpu_opts)) &&
+              (c->pia = gemu_device_add(c->machine, &gemu_pia6821_type, "pia", NULL, NULL));
+    if (ok) {
+        *(Apple1State **)c->board->priv = s;
+        ok = apple1_board_state(s, c->board);
+    }
+    if (!ok) {
+        fprintf(stderr, "apple1: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    bool inited = gemu_machine_init(c->machine);
+    if (inited) {
+        s->cpu = gemu_mos6502(c->cpu);
+        s->pia = gemu_pia6821(c->pia);
+        s->cpu->mem_read = apple1_read;
+        s->cpu->mem_write = apple1_write;
+        s->cpu->mem_ud = s;
+    }
+    GemuMos6502Hooks h = { .stop_before = apple1_stop_before, .insn = apple1_insn,
+                           .stop_after = apple1_stop_after, .ud = s };
+    ok = inited && apple1_bus_build(s) && gemu_mos6502_exec(c->cpu, APPLE1_HZ, &h) &&
+         (c->screen = gemu_screen_new(c->board, "screen")) &&
+         gemu_screen_set_size(c->screen, A1_FB_W, A1_FB_H);
+    if (ok) {
+        gemu_screen_set_aspect(c->screen, 4, 3);
+        gemu_screen_set_update(c->screen, apple1_screen_update, s);
+    }
+    if (!ok || !gemu_machine_start(c->machine)) {
+        fprintf(stderr, "apple1: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    gemu_monitor_attach_machine(s->monitor, c->machine, "program");
+    return true;
+}
+
+static void apple1_core_free(Apple1State *s) {
+    if (!s->core) return;
+    gemu_machine_free(s->core->machine);
+    free(s->core);
+    s->core = NULL;
 }
 
 static bool apple1_load_roms(Apple1State *s, const MosConfig *cfg) {
@@ -1032,10 +1209,11 @@ Apple1State *apple1_create(const MosConfig *cfg) {
     if (cfg->display_type != GEMU_DISPLAY_NONE && !s->display)
         fprintf(stderr, "apple1: display unavailable, falling back to stdio\n");
 
-    if (!apple1_load_roms(s, cfg)) {
+    if (!apple1_core_build(s) || !apple1_load_roms(s, cfg)) {
         apple1_destroy(s);
         return NULL;
     }
+    apple1_rom_maps(s);
     apple1_pia_setup(s);
     if (!s->have_monitor_rom) {
         s->native_monitor = true;
@@ -1077,14 +1255,9 @@ Apple1State *apple1_create(const MosConfig *cfg) {
         return NULL;
     }
 
-    mos6502_init(&s->cpu);
-    s->cpu.mem_read = apple1_read;
-    s->cpu.mem_write = apple1_write;
-    s->cpu.mem_ud = s;
-    mos_cpu_apply(&s->cpu, cfg->cpu);
-    mos6502_reset(&s->cpu);
+    mos6502_reset(s->cpu);
     if (cfg->has_start_addr)
-        s->cpu.PC = cfg->start_addr;
+        s->cpu->PC = cfg->start_addr;
     apple1_display_clear(s->display);
     if (s->native_monitor)
         apple1_monitor_prompt(s);
@@ -1095,6 +1268,7 @@ Apple1State *apple1_create(const MosConfig *cfg) {
 
 void apple1_destroy(Apple1State *s) {
     if (!s) return;
+    apple1_core_free(s);
     gemu_monitor_destroy(s->monitor);
     apple1_display_destroy(s->display);
     free(s);
@@ -1106,7 +1280,6 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
 
     bool quit = false;
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
         GemuSerial *ser = s->cfg->serial;
         if (ser && ser->should_quit(ser->ud))
             quit = true;
@@ -1124,8 +1297,7 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
                 apple1_reset_machine(s);
             } else if (cmd == GEMU_MON_STEP) {
                 for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
-                    if (!apple1_romless_woz_trap(s))
-                        mos6502_step(&s->cpu);
+                    apple1_insn(s);
             }
         }
 
@@ -1137,21 +1309,23 @@ void apple1_run(Apple1State *s, const MosConfig *cfg) {
                 apple1_monitor_poll(s);
         } else if (!paused) {
             apple1_poll_keyboard(s);
-            uint64_t target = s->cpu.cycle_count + APPLE1_CPF;
-            while (!quit && s->cpu.cycle_count < target) {
-                if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-                if (apple1_romless_woz_trap(s)) continue;
-                mos6502_step(&s->cpu);
-            }
+            GemuMachine *m = s->core->machine;   /* 1/60 s of machine time */
+            gemu_machine_run_until(m, gemu_machine_time(m) + gemu_clocks(APPLE1_HZ, APPLE1_CPF));
+            gemu_screen_frame_begin(s->core->screen);
         }
         apple1_display_render(s->display, paused);
         apple1_update_vnc(s, paused);
 
-        Uint32 dt = SDL_GetTicks() - t0;
-        Uint32 frame_ms = 1000u / APPLE1_FPS;
-        if (dt < frame_ms) SDL_Delay(frame_ms - dt);
+        /* Pace to the machine's time; with the CPU idle (paused, or the
+         * built-in monitor in charge), a frame's delay. */
+        if (!paused && !s->native_monitor) {
+            gemu_machine_pace(s->core->machine, 0);
+        } else {
+            gemu_machine_pace_reset(s->core->machine);
+            SDL_Delay(1000u / APPLE1_FPS);
+        }
     }
 
     printf("apple1: %llu cpu cycles\n",
-           (unsigned long long)s->cpu.cycle_count);
+           (unsigned long long)s->cpu->cycle_count);
 }

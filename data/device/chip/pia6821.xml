@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="pia6821" description="Motorola 6820/6821 PIA" status="working">
+    <type symbol="gemu_pia6821_type" source="hardware/device/controller/pia6821_dev.c"/>
+</device>

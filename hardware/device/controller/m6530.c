@@ -7,7 +7,7 @@ void m6530_reset(M6530 *r) {
     r->prescale = 1;
     r->irq_en = r->running = r->irq_flag = false;
     r->next_fire = 0;
-    if (r->irq_changed) r->irq_changed(r->ud);
+    if (r->irq_changed) r->irq_changed(r->irq_ud ? r->irq_ud : r->ud);
 }
 
 bool m6530_irq(const M6530 *r) {
@@ -17,7 +17,7 @@ bool m6530_irq(const M6530 *r) {
 static void set_flag(M6530 *r, bool flag) {
     if (r->irq_flag == flag) return;
     r->irq_flag = flag;
-    if (r->irq_changed) r->irq_changed(r->ud);
+    if (r->irq_changed) r->irq_changed(r->irq_ud ? r->irq_ud : r->ud);
 }
 
 /* The live count: from the value loaded down to 0 (the underflow), then
@@ -86,7 +86,7 @@ void m6530_write(M6530 *r, unsigned reg, uint8_t val, uint64_t cycle) {
         r->running = true;
         r->next_fire = cycle + (uint64_t)(val ? val : 256u) * r->prescale;
         r->irq_flag = false;
-        if (r->irq_changed) r->irq_changed(r->ud);   /* flag and irq_en both changed */
+        if (r->irq_changed) r->irq_changed(r->irq_ud ? r->irq_ud : r->ud);   /* flag and irq_en both changed */
         break;
     default:
         break;

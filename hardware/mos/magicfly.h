@@ -84,8 +84,11 @@ enum {
     MAGICFLY_NUM_ACTIONS,
 };
 
+struct MagicflyCore;
+
 typedef struct MagicflyState {
-    Mos6502 cpu;
+    struct MagicflyCore *core;   /* the core machine (stage M6) */
+    Mos6502 *cpu;                /* the cpu device's */
     const MosConfig *cfg;
 
     uint8_t nvram[MAGICFLY_NVRAM_SIZE]; /* $0000-$07FF */

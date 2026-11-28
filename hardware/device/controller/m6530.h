@@ -41,6 +41,7 @@ typedef struct M6530 {
     void    (*write_pb)(void *ud, uint8_t val);
     void    (*irq_changed)(void *ud);   /* m6530_irq() may have changed */
     void    *ud;
+    void    *irq_ud;    /* irq_changed's context instead of ud, if set (m6530_dev.c) */
 } M6530;
 
 /* Reset: registers, timer and flag cleared (prescaler /1), wiring and RAM

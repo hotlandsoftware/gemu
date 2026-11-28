@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="m6530" description="MOS 6530 RRIOT (RAM, I/O, timer)" status="working">
+    <type symbol="gemu_m6530_type" source="hardware/device/controller/m6530_dev.c"/>
+</device>

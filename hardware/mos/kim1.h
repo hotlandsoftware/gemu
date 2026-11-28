@@ -102,8 +102,11 @@
 #define KIM1_NUM_ACTIONS  23
 
 
+struct Kim1Core;
+
 typedef struct Kim1State {
-    Mos6502          cpu;
+    struct Kim1Core *core;              /* the core machine (stage M4) */
+    Mos6502         *cpu;               /* the cpu device's */
     const MosConfig *cfg;
     uint8_t          ram[1024];
     uint8_t          rom_002[1024];
@@ -112,8 +115,8 @@ typedef struct Kim1State {
     /* The two 6530s: -003 (I/O $1700, RAM $1780) for the application
      * ports, -002 (I/O $1740, RAM $17C0) for the display, keypad and tape.
      * Their ROMs are rom_002/rom_003 above. */
-    M6530            rriot_003;
-    M6530            rriot_002;
+    M6530           *rriot_003;         /* the riot003 and riot002 devices' */
+    M6530           *rriot_002;
 
     /* Display */
     uint8_t          seg_cache[KIM1_NUM_DIGITS]; /* segment patterns cached from Port A/B writes */

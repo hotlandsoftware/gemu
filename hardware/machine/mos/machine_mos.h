@@ -27,6 +27,7 @@
  *            bit 0  RX IRQ enable
  *
  * Timer counts down in CPU cycles; reload=0 treated as 65536.
+ * The CPU runs at 1 MHz.
  * For interactive use callers should put stdin in raw/no-echo mode.
  *
  * Legacy debug port: write a byte to $F001 → stdout (test ROM compat).
@@ -35,8 +36,11 @@
 #define GENERIC_IO_BASE 0xDF00u
 #define GENERIC_IO_END  0xDFFFu
 
+struct MosGenericCore;
+
 typedef struct MosGenericState {
-    Mos6502          cpu;
+    struct MosGenericCore *core;   /* the core machine (stage M2) */
+    Mos6502         *cpu;          /* the cpu device's */
     const MosConfig *cfg;
     uint8_t         *mem;      /* flat address space (heap, mem_size bytes) */
     uint8_t         *rom_map;  /* 1 = read-only at that address (heap, mem_size bytes) */

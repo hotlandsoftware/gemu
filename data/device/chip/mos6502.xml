@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- A chip machines build in, not a -device option (no <machine>). -->
+<device name="mos6502" description="MOS 6502 CPU" status="working">
+    <type symbol="gemu_mos6502_type" source="cpu/mos/mos6502_dev.c"/>
+</device>

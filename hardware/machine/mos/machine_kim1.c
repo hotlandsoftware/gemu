@@ -2,6 +2,17 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "kim1.h"
+#include "mos_core.h"
+#include "mos6502_dev.h"
+#include "controller/m6530_dev.h"
+#include "gemu/screendump.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/line.h"
+#include "gemu/dev/option.h"
+#include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/space.h"
+#include "gemu/dev/state.h"
 #include "gemu/util.h"
 #include "wozmon_rom.h"
 #  include "hex_editor.h"
@@ -19,6 +30,7 @@
 #endif
 
 static void kim1_reset_rriots(Kim1State *s);
+static void kim1_nmi(Kim1State *s);   /* the ST key: the board's nmi line */
 static uint8_t kim1_mem_read(uint16_t addr, void *ud);
 static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud);
 static void kim1_update_monitor_display(Kim1State *s);
@@ -316,13 +328,13 @@ static void kim1_queue_keypress(Kim1State *s, uint32_t newly_pressed) {
         if (key >= 0) {
             kim1_panel_command(s, (uint8_t)key);
         } else if (bit == KIM1_ACT_RS) {
-            mos6502_reset(&s->cpu);
+            mos6502_reset(s->cpu);
             kim1_reset_rriots(s);
         } else if (bit == KIM1_ACT_ST) {
             if (s->kim_running_user)
-                s->kim_saved_pc = s->cpu.PC;
+                s->kim_saved_pc = s->cpu->PC;
             s->kim_running_user = false;
-            s->cpu.nmi = true;
+            kim1_nmi(s);
         }
         return;
     }
@@ -358,11 +370,11 @@ static uint32_t kim1_raw_key_to_action(uint32_t cp) {
  * PC is redirected to $1C4F (MONITR entry) after either op.
  */
 
-#define TAPE_SAL  (s->rriot_002.ram[0x35])   /* $17F5 */
-#define TAPE_SAH  (s->rriot_002.ram[0x36])   /* $17F6 */
-#define TAPE_EAL  (s->rriot_002.ram[0x37])   /* $17F7 */
-#define TAPE_EAH  (s->rriot_002.ram[0x38])   /* $17F8 */
-#define TAPE_ID   (s->rriot_002.ram[0x39])   /* $17F9 */
+#define TAPE_SAL  (s->rriot_002->ram[0x35])   /* $17F5 */
+#define TAPE_SAH  (s->rriot_002->ram[0x36])   /* $17F6 */
+#define TAPE_EAL  (s->rriot_002->ram[0x37])   /* $17F7 */
+#define TAPE_EAH  (s->rriot_002->ram[0x38])   /* $17F8 */
+#define TAPE_ID   (s->rriot_002->ram[0x39])   /* $17F9 */
 
 static void tape_ok(Kim1State *s) {
     s->ram[0xFA] = 0x00;
@@ -781,8 +793,8 @@ static void kim1_tape_load(Kim1State *s) {
 #undef TAPE_ID
 
 static void kim1_set_a_nz(Kim1State *s, uint8_t v) {
-    s->cpu.A = v;
-    s->cpu.P = (uint8_t)((s->cpu.P & ~(MOS6502_P_N | MOS6502_P_Z))
+    s->cpu->A = v;
+    s->cpu->P = (uint8_t)((s->cpu->P & ~(MOS6502_P_N | MOS6502_P_Z))
              | (v == 0 ? MOS6502_P_Z : 0)
              | (v & 0x80u ? MOS6502_P_N : 0));
 }
@@ -830,7 +842,7 @@ static void kim1_panel_command(Kim1State *s, uint8_t key) {
         break;
     case 0x13: /* GO */
         s->kim_saved_pc = s->kim_panel_addr;
-        s->cpu.PC = s->kim_panel_addr;
+        s->cpu->PC = s->kim_panel_addr;
         s->kim_running_user = true;
         kim1_display_blank(s);
         break;
@@ -889,11 +901,8 @@ static void kim1_render_fb(Kim1State *s) {
 
 /* ── 6530 timer helpers ─────────────────────────────────────────────────── */
 
-/* The 6530s' IRQ outputs are wired-OR onto the CPU's IRQ. */
-static void kim1_rriot_irq(void *ud) {
-    Kim1State *s = ud;
-    s->cpu.irq = m6530_irq(&s->rriot_002) || m6530_irq(&s->rriot_003);
-}
+/* The 6530s' IRQ outputs are wired-OR onto the CPU's IRQ (lines: see
+ * "The core machine"). */
 
 /* 6530-002 port A: the keypad's columns (PA0-PA5, active low) for the row
  * the 74145 decoder selects from PB1-PB4 (values 0-3); PA7 is the TTY's
@@ -901,7 +910,7 @@ static void kim1_rriot_irq(void *ud) {
 static uint8_t kim1_keypad_read(void *ud) {
     Kim1State *s = ud;
     uint8_t in = 0xFFu;
-    int dec = (s->rriot_002.pb >> 1) & 0x0F;
+    int dec = (s->rriot_002->pb >> 1) & 0x0F;
     if (dec <= 3) {
         for (int col = 0; col < 6; col++) {
             uint32_t bit = hw_keymap[dec][col];
@@ -922,7 +931,7 @@ static uint8_t kim1_rriot_pb_read(void *ud) {
  * 74145 (values 4-9 are LEDs 1-6). */
 static void kim1_segments_write(void *ud, uint8_t val) {
     Kim1State *s = ud;
-    int dec = (s->rriot_002.pb >> 1) & 0x0F;
+    int dec = (s->rriot_002->pb >> 1) & 0x0F;
     if (dec >= 4 && dec <= 9) {
         s->seg_cache[dec - 4] = val;
         s->display_dirty = true;
@@ -933,15 +942,15 @@ static void kim1_digit_select(void *ud, uint8_t val) {
     Kim1State *s = ud;
     int dec = (val >> 1) & 0x0F;
     if (dec >= 4 && dec <= 9) {
-        s->seg_cache[dec - 4] = s->rriot_002.pa;
+        s->seg_cache[dec - 4] = s->rriot_002->pa;
         s->display_dirty = true;
     }
 }
 
 /* The 6530 RAM at $1780-$17FF: -003's at $1780, -002's at $17C0. */
 static uint8_t *kim1_rriot_ram(Kim1State *s, uint16_t a) {
-    return a < 0x17C0u ? &s->rriot_003.ram[a - 0x1780u]
-                       : &s->rriot_002.ram[a - 0x17C0u];
+    return a < 0x17C0u ? &s->rriot_003->ram[a - 0x1780u]
+                       : &s->rriot_002->ram[a - 0x17C0u];
 }
 
 /* ── 6530 RRIOT reset state ─────────────────────────────────────────────── */
@@ -955,27 +964,24 @@ static void kim1_reset_rriots(Kim1State *s) {
     s->kim_saved_pc = 0x0000u;
     s->kim_running_user = false;
 
-    s->rriot_003.read_pb = kim1_rriot_pb_read;
-    s->rriot_003.irq_changed = kim1_rriot_irq;
-    s->rriot_003.ud = s;
-    s->rriot_002.read_pa = kim1_keypad_read;
-    s->rriot_002.read_pb = kim1_rriot_pb_read;
-    s->rriot_002.write_pa = kim1_segments_write;
-    s->rriot_002.write_pb = kim1_digit_select;
-    s->rriot_002.irq_changed = kim1_rriot_irq;
-    s->rriot_002.ud = s;
-    m6530_reset(&s->rriot_003);
-    m6530_reset(&s->rriot_002);
+    s->rriot_003->read_pb = kim1_rriot_pb_read;
+    s->rriot_003->ud = s;
+    s->rriot_002->read_pa = kim1_keypad_read;
+    s->rriot_002->read_pb = kim1_rriot_pb_read;
+    s->rriot_002->write_pa = kim1_segments_write;
+    s->rriot_002->write_pb = kim1_digit_select;
+    s->rriot_002->ud = s;
+    m6530_reset(s->rriot_003);
+    m6530_reset(s->rriot_002);
 
     /* The monitor's setup runs as traps, so leave the chips as it would:
      * 6530-002 PB0=1 (TTY idle high) with PB0-PB5 outputs.  Both timer
      * flags start set, so the monitor's first BIT $1747 spin exits instead
      * of waiting for a timer that hasn't been started. */
-    s->rriot_002.pb = 0x01u;
-    s->rriot_002.ddrb = 0x3Fu;
-    s->rriot_003.irq_flag = true;
-    s->rriot_002.irq_flag = true;
-    kim1_rriot_irq(s);
+    s->rriot_002->pb = 0x01u;
+    s->rriot_002->ddrb = 0x3Fu;
+    s->rriot_003->irq_flag = true;
+    s->rriot_002->irq_flag = true;   /* (not loaded through C-F: no IRQ) */
     kim1_panel_refresh(s);
 }
 
@@ -1017,134 +1023,131 @@ static void kim1_update_monitor_display(Kim1State *s) {
 
 /* ── Memory callbacks ────────────────────────────────────────────────────── */
 
+#define KIM1_HZ        1000000u   /* the CPU's clock */
+#define KIM1_FRAME_HZ  60u        /* host frames */
+
+/* ── The core machine (stage M4) ─────────────────────────────────────────────
+ * board (kim1-board): the 1 KB RAM, the ROMs, expansion RAM, the display's
+ * segments and the panel's high-level monitor state; cpu (mos6502): the
+ * CPU and the machine's executor at 1 MHz; riot003, riot002 (m6530): the
+ * two RRIOTs, their irqs wire-ORed onto the CPU's; the board's "nmi" line
+ * (the ST key) to the CPU's.
+ * The bus, "program" (16 bits).  The RRIOTs and ROM decode A12-A0 only, so
+ * in every 8K block, at priority 2: -003's I/O at +$1700, -002's at +$1740,
+ * their RAM at +$1780 and +$17C0, and the ROM page at +$1800 (a handler:
+ * the reads carry the monitor's traps, the writes are dropped).  Expansion
+ * RAM ($0400 up, all 16 bits) at priority 1; the 1 KB RAM at $0000 and,
+ * at priority 0 under expansion RAM, at the start of every other 8K block.
+ * Anything else reads $00. */
+typedef struct Kim1Core {
+    GemuMachine *machine;
+    GemuDevice  *board, *cpu, *riot003, *riot002;
+    GemuSpace   *bus;
+    MosBus       cache;
+    GemuLine    *nmi;
+    GemuScreen  *screen;
+} Kim1Core;
+
 static uint8_t kim1_mem_read(uint16_t addr, void *ud) {
     Kim1State *s = ud;
     gemu_monitor_check_read(s->monitor, addr);
+    return mos_bus_read(&s->core->cache, addr);
+}
 
-    /* RRIOT I/O and ROM use incomplete address decoding - present at every
-     * $2000 mirror. Check these first via masked address so they shadow
-     * expansion RAM at mirrored positions (including the CPU vectors at
-     * $FFFA–$FFFF, which mirror to ROM at $1FFA–$1FFF). */
-    uint16_t a = addr & 0x1FFFu;
-
-    if (a >= KIM1_U2_BASE && a < KIM1_U2_BASE + 0x0080u) {
-        M6530 *r = (a & 0x0040u) ? &s->rriot_002 : &s->rriot_003;
-        return m6530_read(r, a & 0x0Fu, s->cpu.cycle_count);
+/* The ROM page ($1800-$1FFF in every 8K block): the 6530s' ROMs, with the
+ * monitor's routines trapped as the CPU reads their first bytes. */
+static uint8_t kim1_rom_r8(void *ud, uint64_t off) {
+    Kim1State *s = ud;
+    uint16_t a = (uint16_t)(0x1800u + off);
+    if (a == 0x1F1Fu) {
+        if (!s->kim_running_user)
+            kim1_update_monitor_display(s);
+        s->cpu->PC = 0x1F44u;
+        return 0xEAu;
     }
-
-    /* RRIOT internal RAM: 6530-003 @ $1780–$17BF, 6530-002 @ $17C0–$17FF */
-    if (a >= 0x1780u && a < 0x1800u)
-        return *kim1_rriot_ram(s, a);
-
-    if (a >= 0x1800u) {
-        if (a == 0x1F1Fu) {
-            if (!s->kim_running_user)
-                kim1_update_monitor_display(s);
-            s->cpu.PC = 0x1F44u;
-            return 0xEAu;
-        }
-        if (a == 0x1EFEu) {
-            kim1_set_a_nz(s, s->kim_key_pending ? 0xFFu : 0x00u);
-            s->cpu.PC = 0x1F17u;
-            return 0xEAu;
-        }
-        if (a == 0x1F6Au) {
-            kim1_set_a_nz(s, s->kim_key_pending ? s->kim_key_number : 0x15u);
-            s->kim_key_pending = false;
-            s->cpu.PC = 0x1F8Fu;
-            return 0xEAu;
-        }
-        /* DUMPT: CPU about to execute at $1800 - save memory block to tape */
-        if (a == 0x1800u) {
-            kim1_tape_save(s);
-            s->cpu.PC = 0x1C4Fu;
-            return 0xEAu;
-        }
-        /* LOADT: CPU about to execute at $1873 - load tape into memory */
-        if (a == 0x1873u) {
-            kim1_tape_load(s);
-            s->cpu.PC = 0x1C4Fu;
-            return 0xEAu;
-        }
-        /* OUTCH: CPU about to execute at $1EA0 - output char in A to serial terminal */
-        if (s->serial && a == 0x1EA0u) {
-            s->serial->write_byte(s->serial->ud, s->cpu.A);
-            s->cpu.PC = 0x1ED4u;   /* skip to OUTCH's RTS */
-            return 0xEAu;
-        }
-        /* GETCH: CPU about to execute at $1E5A - read char from serial terminal (blocking) */
-        if (s->serial && a == 0x1E5Au) {
-            while (!s->serial->key_available(s->serial->ud)) {
-                s->serial->poll(s->serial->ud);
-                if (s->serial->should_quit(s->serial->ud)) break;
-                if (s->display) {
-                    gemu_display_poll(s->display);
-                    if (gemu_display_should_quit(s->display)) break;
-                    kim1_render_fb(s);
-                    gemu_display_render(s->display, s->fb,
-                                        KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
-                }
-                SDL_Delay(1);
+    if (a == 0x1EFEu) {
+        kim1_set_a_nz(s, s->kim_key_pending ? 0xFFu : 0x00u);
+        s->cpu->PC = 0x1F17u;
+        return 0xEAu;
+    }
+    if (a == 0x1F6Au) {
+        kim1_set_a_nz(s, s->kim_key_pending ? s->kim_key_number : 0x15u);
+        s->kim_key_pending = false;
+        s->cpu->PC = 0x1F8Fu;
+        return 0xEAu;
+    }
+    /* DUMPT: CPU about to execute at $1800 - save memory block to tape */
+    if (a == 0x1800u) {
+        kim1_tape_save(s);
+        s->cpu->PC = 0x1C4Fu;
+        return 0xEAu;
+    }
+    /* LOADT: CPU about to execute at $1873 - load tape into memory */
+    if (a == 0x1873u) {
+        kim1_tape_load(s);
+        s->cpu->PC = 0x1C4Fu;
+        return 0xEAu;
+    }
+    /* OUTCH: CPU about to execute at $1EA0 - output char in A to serial terminal */
+    if (s->serial && a == 0x1EA0u) {
+        s->serial->write_byte(s->serial->ud, s->cpu->A);
+        s->cpu->PC = 0x1ED4u;   /* skip to OUTCH's RTS */
+        return 0xEAu;
+    }
+    /* GETCH: CPU about to execute at $1E5A - read char from serial terminal (blocking) */
+    if (s->serial && a == 0x1E5Au) {
+        while (!s->serial->key_available(s->serial->ud)) {
+            s->serial->poll(s->serial->ud);
+            if (s->serial->should_quit(s->serial->ud)) break;
+            if (s->display) {
+                gemu_display_poll(s->display);
+                if (gemu_display_should_quit(s->display)) break;
+                kim1_render_fb(s);
+                gemu_display_render(s->display, s->fb,
+                                    KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
             }
-            kim1_set_a_nz(s, s->serial->read_byte(s->serial->ud));
-            s->cpu.PC = 0x1E88u;   /* skip to GETCH's RTS */
-            return 0xEAu;
+            SDL_Delay(1);
         }
-        if (a < 0x1C00u) return s->rom_002[a - 0x1800u];
-        return s->rom_003[a - 0x1C00u];
+        kim1_set_a_nz(s, s->serial->read_byte(s->serial->ud));
+        s->cpu->PC = 0x1E88u;   /* skip to GETCH's RTS */
+        return 0xEAu;
     }
+    if (a < 0x1C00u) return s->rom_002[a - 0x1800u];
+    return s->rom_003[a - 0x1C00u];
+}
+static void kim1_rom_w8(void *ud, uint64_t off, uint8_t val) { (void)ud; (void)off; (void)val; }
+static bool kim1_rom_peek(void *ud, uint64_t off, uint8_t *v) {
+    const Kim1State *s = ud;
+    *v = off < 0x400u ? s->rom_002[off] : s->rom_003[off - 0x400u];
+    return true;
+}
+static const GemuHandlers kim1_rom_handlers = { .r8 = kim1_rom_r8, .w8 = kim1_rom_w8,
+                                               .peek8 = kim1_rom_peek };
 
-    /* On-board 1 KB RAM */
-    if (addr < 0x0400u)
-        return s->ram[addr];
-
-    /* Expansion RAM: full address, no mirroring ($0400–ext_ram_top-1) */
-    if (s->ext_ram && addr >= 0x0400u && addr < s->ext_ram_top)
-        return s->ext_ram[addr - 0x0400u];
-
-    /* KIM-1 mirror: on-board RAM mirrors at $2000, $4000, … */
-    if (a < 0x0400u)
-        return s->ram[a];
-
-    return 0u;
+static bool kim1_bus_build(Kim1State *s) {
+    Kim1Core *c = s->core;
+    if (!(c->bus = gemu_space_new(c->machine, "program", 16, 8, GEMU_LITTLE_ENDIAN)))
+        return false;
+    c->cache.space = c->bus;
+    gemu_space_set_unmapped(c->bus, 0, NULL, NULL, NULL);
+    bool ok = true;
+    for (uint32_t base = 0; base < 0x10000u && ok; base += 0x2000u) {
+        ok = gemu_space_map(c->bus, base + 0x1700u, 0x40, &gemu_m6530_io, c->riot003, 2, 0) &&
+             gemu_space_map(c->bus, base + 0x1740u, 0x40, &gemu_m6530_io, c->riot002, 2, 0) &&
+             gemu_space_map_ram(c->bus, base + 0x1780u, 0x40, s->rriot_003->ram, 0, 2) &&
+             gemu_space_map_ram(c->bus, base + 0x17C0u, 0x40, s->rriot_002->ram, 0, 2) &&
+             gemu_space_map(c->bus, base + 0x1800u, 0x800, &kim1_rom_handlers, s, 2, 0) &&
+             gemu_space_map_ram(c->bus, base, 0x400, s->ram, 0, base ? 0 : 2);
+    }
+    if (ok && s->ext_ram)
+        ok = gemu_space_map_ram(c->bus, 0x0400u, s->ext_ram_top - 0x0400u, s->ext_ram, 0, 1) != NULL;
+    return ok;
 }
 
 static void kim1_mem_write(uint16_t addr, uint8_t val, void *ud) {
     Kim1State *s = ud;
     gemu_monitor_check_write(s->monitor, addr);
-
-    uint16_t a = addr & 0x1FFFu;
-
-    if (a >= KIM1_U2_BASE && a < KIM1_U2_BASE + 0x0080u) {
-        M6530 *r = (a & 0x0040u) ? &s->rriot_002 : &s->rriot_003;
-        m6530_write(r, a & 0x0Fu, val, s->cpu.cycle_count);
-        return;
-    }
-
-    /* RRIOT internal RAM: 6530-003 @ $1780–$17BF, 6530-002 @ $17C0–$17FF */
-    if (a >= 0x1780u && a < 0x1800u) {
-        *kim1_rriot_ram(s, a) = val;
-        return;
-    }
-
-    /* ROM: writes silently ignored */
-    if (a >= 0x1800u) return;
-
-    /* On-board 1 KB RAM */
-    if (addr < 0x0400u) {
-        s->ram[addr] = val;
-        return;
-    }
-
-    /* Expansion RAM */
-    if (s->ext_ram && addr >= 0x0400u && addr < s->ext_ram_top) {
-        s->ext_ram[addr - 0x0400u] = val;
-        return;
-    }
-
-    /* KIM-1 mirror: on-board RAM mirrors at $2000, $4000, … */
-    if (a < 0x0400u)
-        s->ram[a] = val;
+    mos_bus_write(&s->core->cache, addr, val);
 }
 
 /* ── Monitor ─────────────────────────────────────────────────────────────── */
@@ -1185,7 +1188,7 @@ static bool kim1_mon_write(void *ud, uint64_t addr, uint8_t val) {
 
 static void kim1_mon_cpu_state(void *ud, char *buf, size_t len) {
     const Kim1State *s = ud;
-    mos6502_format_state(&s->cpu, buf, len);
+    mos6502_format_state(s->cpu, buf, len);
 }
 
 static GemuMonCmd kim1_cmd_hexeditor(GemuMonitor *mon, const char *args, void *ud) {
@@ -1263,6 +1266,134 @@ static bool load_roms(Kim1State *s) {
     return true;
 }
 
+/* ── The core machine's devices, state, executor and screen (stage M4) ── */
+
+static void kim1_board_describe(GemuDevice *d, char *buf, size_t len) {
+    const Kim1State *s = *(Kim1State **)d->priv;
+    snprintf(buf, len, "1 KB RAM%s; display %02X %02X %02X %02X %02X %02X\n"
+             "panel: %s mode, address %04X%s%s",
+             s->ext_ram ? " + expansion" : "",
+             s->seg_cache[0], s->seg_cache[1], s->seg_cache[2], s->seg_cache[3],
+             s->seg_cache[4], s->seg_cache[5],
+             s->kim_address_mode ? "address" : "data", s->kim_panel_addr,
+             s->kim_key_pending ? ", a key waiting" : "",
+             s->kim_running_user ? ", running a program" : "");
+}
+
+static const GemuDeviceType kim1_board_type = {
+    .name = "kim1-board", .desc = "KIM-1 board (RAM, ROM, LED display, keypad)",
+    .size = sizeof(Kim1State *), .describe = kim1_board_describe,
+};
+
+#define B(field) ok &= GEMU_STATE_MEMBER(d, "", s, field)
+/* The board's state: the RAM, the display's segments, the panel's
+ * high-level monitor (key, mode, address, the program's PC), expansion RAM.
+ * Not saved: the ROMs (loaded; WozMon patched in), the host's keys this
+ * frame, the frame buffer (drawn from the rest). */
+static bool kim1_board_state(Kim1State *s, GemuDevice *d) {
+    bool ok = true;
+    B(ram); B(seg_cache);
+    B(kim_key_pending); B(kim_key_number); B(kim_address_mode); B(kim_panel_addr);
+    B(kim_saved_pc); B(kim_running_user);
+    if (s->ext_ram) ok &= gemu_state_add(d, "ext_ram", s->ext_ram, 1, s->ext_ram_top - 0x0400u);
+    return ok;
+}
+#undef B
+
+static void kim1_step_insn(Kim1State *s);
+static bool kim1_stop_before(void *ud) {
+    Kim1State *s = ud;
+    return gemu_monitor_check_exec(s->monitor, s->cpu->PC);
+}
+static void kim1_insn(void *ud) { kim1_step_insn(ud); }
+static bool kim1_stop_after(void *ud) {
+    return gemu_monitor_is_paused(((Kim1State *)ud)->monitor);
+}
+static uint64_t kim1_cycles(void *ud) { return ((Kim1State *)ud)->cpu->cycle_count; }
+
+/* The panel as a core screen (board's "screen", 520x960): the LED digits
+ * and the keypad, drawn when the screen is rendered. */
+static void kim1_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    Kim1State *s = ud;
+    kim1_render_fb(s);
+    for (int y = clip->y0; y < clip->y1; y++)
+        memcpy(bmp->pix + (size_t)y * (size_t)bmp->stride, s->fb + (size_t)y * KIM1_FB_WIDTH,
+               KIM1_FB_WIDTH * sizeof(uint32_t));
+}
+
+static bool kim1_screendump(void *ud, const char *path) {
+    Kim1State *s = ud;
+    const GemuBitmap *b = gemu_screen_render(s->core->screen);
+    (void)b;   /* the update drew s->fb, the same pixels */
+    return gemu_screendump_argb(path, s->fb, KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
+}
+
+static bool kim1_core_build(Kim1State *s) {
+    Kim1Core *c = s->core = calloc(1, sizeof *c);
+    if (!c || !(c->machine = gemu_machine_new("kim1")))
+        return false;
+    static const GemuDeviceType *const set_types[] = { &kim1_board_type };
+    char set[1][GEMU_OPTS_ROUTE_LEN], why[512];
+    if (!gemu_opts_route(s->cfg->machine_opts, set_types, 1, set, why, sizeof why)) {
+        fprintf(stderr, "gemu: %s\n", why);
+        return false;
+    }
+    static const char *const variant[] = { "6502", "2a03", "2a07", "6501", "6507" };
+    char cpu_opts[32];
+    snprintf(cpu_opts, sizeof cpu_opts, "variant=%s", variant[s->cfg->cpu]);
+    bool ok = (c->board = gemu_device_add(c->machine, &kim1_board_type, "board", NULL, NULL)) &&
+              (c->cpu = gemu_device_add(c->machine, &gemu_mos6502_type, "cpu", NULL, cpu_opts)) &&
+              (c->riot003 = gemu_device_add(c->machine, &gemu_m6530_type, "riot003", NULL, NULL)) &&
+              (c->riot002 = gemu_device_add(c->machine, &gemu_m6530_type, "riot002", NULL, NULL));
+    if (ok) {
+        *(Kim1State **)c->board->priv = s;
+        ok = kim1_board_state(s, c->board);
+    }
+    if (!ok) {
+        fprintf(stderr, "gemu-kim1: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    bool inited = gemu_machine_init(c->machine);
+    if (inited) {
+        s->cpu = gemu_mos6502(c->cpu);
+        s->rriot_003 = gemu_m6530(c->riot003);
+        s->rriot_002 = gemu_m6530(c->riot002);
+        s->cpu->mem_read  = kim1_mem_read;
+        s->cpu->mem_write = kim1_mem_write;
+        s->cpu->mem_ud    = s;
+        gemu_m6530_set_cycles(c->riot003, kim1_cycles, s);
+        gemu_m6530_set_cycles(c->riot002, kim1_cycles, s);
+    }
+    GemuMos6502Hooks h = { .stop_before = kim1_stop_before, .insn = kim1_insn,
+                           .stop_after = kim1_stop_after, .ud = s };
+    ok = inited && kim1_bus_build(s) &&
+         gemu_line_connect(gemu_line_find_out(c->riot003, "irq"), c->cpu, "irq", 0) &&
+         gemu_line_connect(gemu_line_find_out(c->riot002, "irq"), c->cpu, "irq", 0) &&
+         (c->nmi = gemu_line_out(c->board, "nmi")) && gemu_line_connect(c->nmi, c->cpu, "nmi", 0) &&
+         gemu_mos6502_exec(c->cpu, KIM1_HZ, &h) &&
+         (c->screen = gemu_screen_new(c->board, "screen")) &&
+         gemu_screen_set_size(c->screen, KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
+    if (ok)
+        gemu_screen_set_update(c->screen, kim1_screen_update, s);
+    if (!ok || !gemu_machine_start(c->machine)) {
+        fprintf(stderr, "gemu-kim1: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    gemu_monitor_attach_machine(s->monitor, c->machine, "program");
+    return true;
+}
+
+static void kim1_nmi(Kim1State *s) { gemu_line_pulse(s->core->nmi); }
+
+static void kim1_core_free(Kim1State *s) {
+    if (!s->core) return;
+    gemu_machine_free(s->core->machine);
+    free(s->core);
+    s->core = NULL;
+}
+
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
 
 Kim1State *kim1_create(const MosConfig *cfg) {
@@ -1277,12 +1408,6 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         .addr_bits = 16, .big_endian = false });
     gemu_monitor_set_cpu_state_cb(s->monitor, kim1_mon_cpu_state, s);
     gemu_monitor_bind(s->monitor, "hexeditor", kim1_cmd_hexeditor, s);
-
-    mos6502_init(&s->cpu);
-    s->cpu.mem_read  = kim1_mem_read;
-    s->cpu.mem_write = kim1_mem_write;
-    s->cpu.mem_ud    = s;
-    mos_cpu_apply(&s->cpu, cfg->cpu);
 
     if (!load_roms(s)) {
         gemu_monitor_destroy(s->monitor);
@@ -1342,11 +1467,17 @@ Kim1State *kim1_create(const MosConfig *cfg) {
         }
     }
 
+    if (!kim1_core_build(s)) {
+        kim1_destroy(s);
+        return NULL;
+    }
+    gemu_monitor_set_screendump_cb(s->monitor, kim1_screendump, s);
+
     {   /* for the display in use (none with -display none or curses) */
         HexRegion kim1_regions[6] = {
             { "RAM ($0000-$03FF)",      s->ram,      sizeof(s->ram),      false, 0x0000u },
-            { "6530-003 RAM ($1780)",   s->rriot_003.ram, sizeof(s->rriot_003.ram), false, 0x1780u },
-            { "6530-002 RAM ($17C0)",   s->rriot_002.ram, sizeof(s->rriot_002.ram), false, 0x17C0u },
+            { "6530-003 RAM ($1780)",   s->rriot_003->ram, sizeof(s->rriot_003->ram), false, 0x1780u },
+            { "6530-002 RAM ($17C0)",   s->rriot_002->ram, sizeof(s->rriot_002->ram), false, 0x17C0u },
             { "ROM 6530-002 ($1800)",   s->rom_002,  sizeof(s->rom_002),  true,  0x1800u },
             { "ROM 6530-003 ($1C00)",   s->rom_003,  sizeof(s->rom_003),  true,  0x1C00u },
         };
@@ -1367,13 +1498,14 @@ Kim1State *kim1_create(const MosConfig *cfg) {
     s->serial = cfg->serial;
     s->display_dirty = true;
 
-    mos6502_reset(&s->cpu);
+    mos6502_reset(s->cpu);
     if (cfg->has_start_addr)
-        s->cpu.PC = cfg->start_addr;
+        s->cpu->PC = cfg->start_addr;
     return s;
 }
 
 void kim1_destroy(Kim1State *s) {
+    kim1_core_free(s);
     hex_editor_destroy(s->hex_editor);
     gemu_display_destroy(s->display);
     gemu_monitor_destroy(s->monitor);
@@ -1383,16 +1515,12 @@ void kim1_destroy(Kim1State *s) {
 
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
-#define KIM1_HZ                1000000u
-#define KIM1_FRAME_HZ          60u
-#define KIM1_CYCLES_PER_FRAME  (KIM1_HZ / KIM1_FRAME_HZ)
-#define KIM1_FRAME_MS          (1000u / KIM1_FRAME_HZ)
 
 /* Execute one CPU instruction and advance the RRIOT timers with it. */
 static void kim1_step_insn(Kim1State *s) {
-    mos6502_step(&s->cpu);
-    m6530_tick(&s->rriot_003, s->cpu.cycle_count);
-    m6530_tick(&s->rriot_002, s->cpu.cycle_count);
+    mos6502_step(s->cpu);
+    gemu_m6530_tick(s->core->riot003);
+    gemu_m6530_tick(s->core->riot002);
 }
 
 void kim1_run(Kim1State *s, const MosConfig *cfg) {
@@ -1429,7 +1557,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
                 quit = true;
             if (gemu_display_reset_requested(s->display)) {
                 gemu_display_clear_flags(s->display);
-                mos6502_reset(&s->cpu);
+                mos6502_reset(s->cpu);
                 kim1_reset_rriots(s);
             }
         }
@@ -1438,7 +1566,7 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
         while ((cmd = gemu_monitor_poll(s->monitor)) != GEMU_MON_NONE) {
             if      (cmd == GEMU_MON_QUIT)   { if (cfg->no_shutdown) gemu_monitor_shutdown_or_pause(s->monitor, true); else { quit = true; break; } }
             else if (cmd == GEMU_MON_RESET) {
-                mos6502_reset(&s->cpu);
+                mos6502_reset(s->cpu);
                 kim1_reset_rriots(s);
             }
             else if (cmd == GEMU_MON_STEP) {
@@ -1449,31 +1577,34 @@ void kim1_run(Kim1State *s, const MosConfig *cfg) {
         if (quit) break;
         gemu_display_set_paused(s->display, gemu_monitor_is_paused(s->monitor));
 
-        if (!gemu_monitor_is_paused(s->monitor)) {
-            uint64_t target = s->cpu.cycle_count + KIM1_CYCLES_PER_FRAME;
-            while (s->cpu.cycle_count < target) {
-                if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-                kim1_step_insn(s);
-                if (gemu_monitor_is_paused(s->monitor)) break;
-            }
+        bool paused = gemu_monitor_is_paused(s->monitor);
+        GemuMachine *m = s->core->machine;
+        if (!paused) {   /* 1/60 s of machine time (the cpu device's executor) */
+            gemu_machine_run_until(m, gemu_machine_time(m) + GEMU_SEC(1) / KIM1_FRAME_HZ);
+            gemu_screen_frame_begin(s->core->screen);
         }
 
 
         if (s->display && s->display_dirty) {
-            kim1_render_fb(s);
             s->display_dirty = false;
-            gemu_display_render(s->display, s->fb,
-                                KIM1_FB_WIDTH, KIM1_FB_HEIGHT);
+            const GemuBitmap *b = gemu_screen_render(s->core->screen);
+            gemu_display_render(s->display, b->pix, b->width, b->height);
         }
 
         hex_editor_refresh(s->hex_editor);
 
-        gemu_sleep_ms(KIM1_FRAME_MS);
+        /* Pace to the machine's time; paused, a frame's delay. */
+        if (!paused) {
+            gemu_machine_pace(m, 0);
+        } else {
+            gemu_machine_pace_reset(m);
+            gemu_sleep_ms(1000u / KIM1_FRAME_HZ);
+        }
     }
 
     printf("gemu-kim1: %llu cycles, %llu instructions\n",
-           (unsigned long long)s->cpu.cycle_count,
-           (unsigned long long)s->cpu.insn_count);
+           (unsigned long long)s->cpu->cycle_count,
+           (unsigned long long)s->cpu->insn_count);
 
     gemu_monitor_stop(s->monitor);
     (void)cfg;

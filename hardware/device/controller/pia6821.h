@@ -45,6 +45,7 @@ typedef struct Pia6821 {
     void (*set_irq_a)(void *ud, bool level);   /* IRQA, active high here */
     void (*set_irq_b)(void *ud, bool level);
     void *ud;
+    void *irq_ud;   /* set_irq_a/b's context instead of ud, if set (pia6821_dev.c) */
 } Pia6821;
 
 /* Reset: everything cleared (ports and lines as inputs), wiring kept. */

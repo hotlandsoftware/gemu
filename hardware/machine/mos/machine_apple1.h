@@ -9,8 +9,11 @@
 
 typedef struct Apple1Display Apple1Display;
 
+struct Apple1Core;
+
 typedef struct Apple1State {
-    Mos6502          cpu;
+    struct Apple1Core *core;   /* the core machine (stage M3) */
+    Mos6502         *cpu;      /* the cpu device's */
     const MosConfig *cfg;
     GemuMonitor     *monitor;
     Apple1Display   *display;
@@ -27,7 +30,7 @@ typedef struct Apple1State {
     /* The 6821 at $D010-$D013: the keyboard on port A (a key's code, bit 7
      * set, latched in key_data; its strobe on CA1), the display on port B
      * (PB0-6 the character, PB7 busy). */
-    Pia6821          pia;
+    Pia6821         *pia;      /* the pia device's */
     uint8_t          key_data;
     bool             have_monitor_rom;
     bool             native_monitor;

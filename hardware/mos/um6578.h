@@ -101,8 +101,11 @@ enum {
     UM6578_NUM_ACTIONS,
 };
 
+struct Um6578Core;
+
 typedef struct Um6578State {
-    Mos6502   cpu;
+    struct Um6578Core *core;   /* the core machine (stage M7) */
+    Mos6502  *cpu;             /* the cpu device's */
     Sh6578Ppu ppu;
     Apu2a03   apu;
     const MosConfig *cfg;

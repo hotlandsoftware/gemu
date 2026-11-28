@@ -2,6 +2,18 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "um6578.h"
+#include "mos_core.h"
+#include "mos6502_dev.h"
+#include "apu2a03_state.h"
+#include "ppu_sh6578_state.h"
+#include "gemu/dev/device.h"
+#include "gemu/dev/line.h"
+#include "gemu/dev/option.h"
+#include "gemu/dev/scheduler.h"
+#include "gemu/dev/screen.h"
+#include "gemu/dev/space.h"
+#include "gemu/dev/state.h"
+#include "gemu/dev/stream.h"
 #include "gemu/screendump.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,7 +94,7 @@ static uint32_t um6578_subor_mouse_word(Um6578State *s) {
         fprintf(stderr,
                 "um6578: mouse sample (legacy $4016) x=%d y=%d rel=%d,%d dx=%d dy=%d left=%d right=%d pc=%04X\n",
                 ptr.x, ptr.y, ptr.rel_x, ptr.rel_y, dx, dy,
-                left ? 1 : 0, right ? 1 : 0, s->cpu.PC);
+                left ? 1 : 0, right ? 1 : 0, s->cpu->PC);
 
     int ax = dx < 0 ? -dx : dx;
     int ay = dy < 0 ? -dy : dy;
@@ -106,8 +118,12 @@ static uint32_t um6578_subor_mouse_word(Um6578State *s) {
 #define UM6578_IRQ_MOUSE    0x40u
 #define UM6578_IRQ_KEYBOARD 0x20u
 
+static void um6578_irq_line(Um6578State *s, bool level);
+static void um6578_nmi_line(Um6578State *s);
+static void um6578_banks_moved(Um6578State *s);
+
 static void irq_recompute(Um6578State *s) {
-    s->cpu.irq = (s->irq_pending & (uint8_t)~s->irq_mask) != 0;
+    um6578_irq_line(s, (s->irq_pending & (uint8_t)~s->irq_mask) != 0);
 }
 
 static void irq_raise(Um6578State *s, uint8_t bit) {
@@ -186,7 +202,7 @@ static void um6578_queue_ps2_mouse_packet(Um6578State *s, int dx, int dy,
     mouse_queue_push(s, (uint8_t)ps2_dy);
     if (s->trace_io)
         fprintf(stderr, "um6578: queue mouse ps2 %02X %02X %02X dx=%d dy=%d pc=%04X\n",
-                flags, (uint8_t)ps2_dx, (uint8_t)ps2_dy, dx, dy, s->cpu.PC);
+                flags, (uint8_t)ps2_dx, (uint8_t)ps2_dy, dx, dy, s->cpu->PC);
     s->mouse_prev_left = left;
     s->mouse_prev_right = right;
     /* Connie-chan services PS/2 bytes through the keyboard byte IRQ. */
@@ -195,7 +211,7 @@ static void um6578_queue_ps2_mouse_packet(Um6578State *s, int dx, int dy,
 
 static void um6578_mouse_device_command(Um6578State *s, uint8_t val) {
     if (s->trace_io)
-        fprintf(stderr, "um6578: mouse cmd %02X pc=%04X\n", val, s->cpu.PC);
+        fprintf(stderr, "um6578: mouse cmd %02X pc=%04X\n", val, s->cpu->PC);
 
     if (s->mouse_param_cmd) {
         static const uint8_t ack[] = { 0xFAu };
@@ -321,6 +337,8 @@ static void timer_maybe_tick(Um6578State *s, bool is_scanline_edge) {
 
 static uint8_t um6578_read(uint16_t addr, void *ud);
 static void    um6578_write(uint16_t addr, uint8_t val, void *ud);
+static uint8_t um6578_decode_read(uint16_t addr, void *ud);
+static void    um6578_decode_write(uint16_t addr, uint8_t val, void *ud);
 
 static bool um6578_mouse_ram_addr(uint16_t addr) {
     switch (addr) {
@@ -374,7 +392,7 @@ static void do_dma(Um6578State *s) {
     }
 }
 
-static uint8_t um6578_read(uint16_t addr, void *ud) {
+static uint8_t um6578_decode_read(uint16_t addr, void *ud) {
     Um6578State *s = ud;
 
     if (addr < 0x2000) return s->ram_lo[addr];
@@ -394,7 +412,7 @@ static uint8_t um6578_read(uint16_t addr, void *ud) {
         }
         if (s->trace_4016)
             fprintf(stderr, "um6578: read  $4016 -> %02X pc=%04X mouse=%d latch=%06X\n",
-                    v, s->cpu.PC, s->io_mouse_active ? 1 : 0,
+                    v, s->cpu->PC, s->io_mouse_active ? 1 : 0,
                     (unsigned)(s->iolatch & 0xFFFFFFu));
         return v;
     }
@@ -402,19 +420,19 @@ static uint8_t um6578_read(uint16_t addr, void *ud) {
     if (addr == 0x4020) {
         uint8_t v = mouse_queue_pop(s);
         if (s->trace_io)
-            fprintf(stderr, "um6578: read  $4020 -> %02X pc=%04X\n", v, s->cpu.PC);
+            fprintf(stderr, "um6578: read  $4020 -> %02X pc=%04X\n", v, s->cpu->PC);
         return v; /* keyboard/mouse byte queue; empty reads as 0xFF */
     }
     if (addr == 0x4026) {
         uint8_t v = 0xFFu; /* EXT/status lines idle high; mouse buttons arrive in PS/2 packets */
         if (s->trace_io)
-            fprintf(stderr, "um6578: read  $4026 -> %02X pc=%04X\n", v, s->cpu.PC);
+            fprintf(stderr, "um6578: read  $4026 -> %02X pc=%04X\n", v, s->cpu->PC);
         return v;
     }
     if (addr == 0x4033) {
         if (s->trace_io && s->irq_pending &&
             (s->trace_timer || (s->irq_pending & (UM6578_IRQ_MOUSE | UM6578_IRQ_KEYBOARD)) != 0))
-            fprintf(stderr, "um6578: read  $4033 -> %02X pc=%04X\n", s->irq_pending, s->cpu.PC);
+            fprintf(stderr, "um6578: read  $4033 -> %02X pc=%04X\n", s->irq_pending, s->cpu->PC);
         return s->irq_pending;
     }
     if (addr == 0x4036) return s->timer_count;
@@ -439,12 +457,12 @@ static uint8_t um6578_read(uint16_t addr, void *ud) {
     return 0xFF;
 }
 
-static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
+static void um6578_decode_write(uint16_t addr, uint8_t val, void *ud) {
     Um6578State *s = ud;
 
     if (addr < 0x2000) {
         if (s->trace_mouse_state && um6578_mouse_ram_addr(addr) && s->ram_lo[addr] != val)
-            fprintf(stderr, "um6578: z%02X <- %02X pc=%04X\n", addr, val, s->cpu.PC);
+            fprintf(stderr, "um6578: z%02X <- %02X pc=%04X\n", addr, val, s->cpu->PC);
         s->ram_lo[addr] = val;
         return;
     }
@@ -472,11 +490,11 @@ static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
             }
             if (s->trace_4016)
                 fprintf(stderr, "um6578: latch $4016 pc=%04X mouse=%d value=%06X\n",
-                        s->cpu.PC, s->io_mouse_active ? 1 : 0,
+                        s->cpu->PC, s->io_mouse_active ? 1 : 0,
                         (unsigned)(s->iolatch & 0xFFFFFFu));
         }
         if (s->trace_4016)
-            fprintf(stderr, "um6578: write $4016 <- %02X pc=%04X\n", val, s->cpu.PC);
+            fprintf(stderr, "um6578: write $4016 <- %02X pc=%04X\n", val, s->cpu->PC);
         s->prev_io = val;
         return;
     }
@@ -484,28 +502,28 @@ static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
 
     if (addr == 0x4020) {
         if (s->trace_io)
-            fprintf(stderr, "um6578: write $4020 <- %02X pc=%04X\n", val, s->cpu.PC);
+            fprintf(stderr, "um6578: write $4020 <- %02X pc=%04X\n", val, s->cpu->PC);
         return; /* keyboard-related write, unmodelled */
     }
     if (addr == 0x4021) {
         if (s->cfg->n_ports > 0 && s->cfg->ports[0] == NES_DEVICE_MOUSE) {
             um6578_mouse_device_command(s, val);
         } else if (s->trace_io) {
-            fprintf(stderr, "um6578: write $4021 <- %02X pc=%04X\n", val, s->cpu.PC);
+            fprintf(stderr, "um6578: write $4021 <- %02X pc=%04X\n", val, s->cpu->PC);
         }
         return;
     }
     if (addr == 0x4022) {
         if (s->trace_io)
-            fprintf(stderr, "um6578: write $4022 <- %02X pc=%04X\n", val, s->cpu.PC);
+            fprintf(stderr, "um6578: write $4022 <- %02X pc=%04X\n", val, s->cpu->PC);
         if (val == 0x80 && s->cfg->n_ports > 0 && s->cfg->ports[0] == NES_DEVICE_MOUSE &&
-            !(s->cpu.PC >= 0xDCF1 && s->cpu.PC <= 0xDD50))
+            !(s->cpu->PC >= 0xDCF1 && s->cpu->PC <= 0xDD50))
             mouse_maybe_queue_command_response(s);
         return;
     }
     if (addr == 0x4026) {
         if (s->trace_io)
-            fprintf(stderr, "um6578: write $4026 <- %02X pc=%04X\n", val, s->cpu.PC);
+            fprintf(stderr, "um6578: write $4026 <- %02X pc=%04X\n", val, s->cpu->PC);
         return; /* EXT write: stub */
     }
     if (addr == 0x4027) return; /* DAC data register: unmodelled */
@@ -514,7 +532,7 @@ static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
         if (s->trace_io &&
             (s->trace_timer || (s->irq_pending & (UM6578_IRQ_MOUSE | UM6578_IRQ_KEYBOARD)) != 0))
             fprintf(stderr, "um6578: write $4032 <- %02X pc=%04X pending=%02X\n",
-                    val, s->cpu.PC, s->irq_pending);
+                    val, s->cpu->PC, s->irq_pending);
         s->irq_mask = val;
         s->irq_pending &= (uint8_t)~val; /* a 1 bit acknowledges (clears) that pending line */
         irq_recompute(s);
@@ -524,20 +542,24 @@ static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
     }
     if (addr == 0x4034) {
         if (s->trace_io)
-            fprintf(stderr, "um6578: write $4034 <- %02X pc=%04X\n", val, s->cpu.PC);
+            fprintf(stderr, "um6578: write $4034 <- %02X pc=%04X\n", val, s->cpu->PC);
         s->timer_ctrl = val;
         s->timer_prescale_acc = 0;
         return;
     }
     if (addr == 0x4035) {
         if (s->trace_io)
-            fprintf(stderr, "um6578: write $4035 <- %02X pc=%04X\n", val, s->cpu.PC);
+            fprintf(stderr, "um6578: write $4035 <- %02X pc=%04X\n", val, s->cpu->PC);
         s->timer_preset = val;
         s->timer_count = val; /* writing the preset also resets the live count */
         return;
     }
 
-    if (addr >= 0x4040 && addr <= 0x4047) { s->bankswitch[addr - 0x4040] = val; return; }
+    if (addr >= 0x4040 && addr <= 0x4047) {
+        s->bankswitch[addr - 0x4040] = val;
+        um6578_banks_moved(s);
+        return;
+    }
     if (addr >= 0x4048 && addr <= 0x404F) {
         switch (addr - 0x4048) {
         case 0: s->dma_control = val; do_dma(s); break;
@@ -772,7 +794,7 @@ static bool um6578_mon_write(void *ud, uint64_t addr, uint8_t val) {
 
 static void um6578_mon_cpu_state(void *ud, char *buf, size_t len) {
     const Um6578State *s = ud;
-    mos6502_format_state(&s->cpu, buf, len);
+    mos6502_format_state(s->cpu, buf, len);
 }
 
 /* ── PPU/CPU cycle sync ──────────────────────────────────────────────────── */
@@ -785,7 +807,7 @@ static void um6578_sync_ppu(Um6578State *s, uint64_t cpu_cycle) {
 
         ppu_sh6578_tick(&s->ppu);
         if (s->ppu.nmi_pending) {
-            s->cpu.nmi = true;
+            um6578_nmi_line(s);
             s->ppu.nmi_pending = false;
         }
         if (s->ppu.scanline_tick) {
@@ -798,6 +820,303 @@ static void um6578_sync_ppu(Um6578State *s, uint64_t cpu_cycle) {
 }
 
 /* ── Create / destroy ────────────────────────────────────────────────────── */
+
+/* ── The core machine (stage M7) ─────────────────────────────────────────────
+ * board (um6578-board): RAM, the bank registers, DMA, the IRQ mux, the
+ * timer, the controller port and the mouse's protocol; cpu (mos6502): the
+ * machine's executor at 1,789,773 Hz, the APU and PPU brought up to each
+ * instruction (um6578_step_insn); ppu (sh6578-ppu); apu (um6578-apu, the
+ * 2A03's); cart (um6578-cart): the ROM image, which the banks can write.
+ * Lines: the board's "irq" (the IRQ mux) to the CPU's irq; the PPU's
+ * "nmi" (VBlank) to its nmi.
+ * The bus, "program": RAM at $0000 and $5000; the PPU's page ($2000-$207F)
+ * and the I/O page ($4000-$404F) through the board's decoder; the eight 4K
+ * banks at $8000 as memory windows on the image (read and write, as the
+ * banks allow), re-pointed when a bank register changes, over the decoder
+ * for a bank past the image's end.  Anything else reads $FF.
+ * The PPU's frame ends a run (the executor's done hook); the PPU's ARGB
+ * frame is its screen; the APU's samples its stream, through the mixer. */
+typedef struct Um6578Core {
+    GemuMachine *machine;
+    GemuDevice  *board, *cpu, *ppu, *apu, *cart;
+    GemuSpace   *bus;
+    MosBus       cache;
+    GemuMapping *bank_map[8];
+    uint8_t     *bank_ptr[8];
+    GemuLine    *irq, *nmi;
+    GemuScreen  *screen;
+    GemuStream  *sound;
+} Um6578Core;
+
+#define UM6578_EXEC_HZ 1789773u
+
+static void um6578_irq_line(Um6578State *s, bool level) {
+    if (s->core) gemu_line_set(s->core->irq, level);
+}
+static void um6578_nmi_line(Um6578State *s) {
+    gemu_line_pulse(s->core->nmi);
+}
+
+static uint8_t um6578_read(uint16_t addr, void *ud) {
+    Um6578State *s = ud;
+    return mos_bus_read(&s->core->cache, addr);
+}
+static void um6578_write(uint16_t addr, uint8_t val, void *ud) {
+    Um6578State *s = ud;
+    mos_bus_write(&s->core->cache, addr, val);
+}
+
+static uint8_t page_r(void *ud, uint64_t off) {          /* $2000 and $4000 pages */
+    return um6578_decode_read((uint16_t)off, ud);
+}
+static void page_w(void *ud, uint64_t off, uint8_t v) {
+    um6578_decode_write((uint16_t)off, v, ud);
+}
+static uint8_t ppu_r(void *ud, uint64_t off) { return page_r(ud, 0x2000u + off); }
+static void ppu_w(void *ud, uint64_t off, uint8_t v) { page_w(ud, 0x2000u + off, v); }
+static uint8_t io_r(void *ud, uint64_t off) { return page_r(ud, 0x4000u + off); }
+static void io_w(void *ud, uint64_t off, uint8_t v) { page_w(ud, 0x4000u + off, v); }
+static uint8_t banks_r(void *ud, uint64_t off) { return page_r(ud, 0x8000u + off); }
+static void banks_w(void *ud, uint64_t off, uint8_t v) { page_w(ud, 0x8000u + off, v); }
+static const GemuHandlers ppu_handlers   = { .r8 = ppu_r, .w8 = ppu_w };
+static const GemuHandlers io_handlers    = { .r8 = io_r, .w8 = io_w };
+static const GemuHandlers banks_handlers = { .r8 = banks_r, .w8 = banks_w };
+
+/* The eight 4K windows: where each bank register points, if its whole page
+ * is in the image. */
+static void um6578_banks_moved(Um6578State *s) {
+    Um6578Core *c = s->core;
+    if (!c || !c->bus) return;
+    for (int i = 0; i < 8; i++) {
+        uint32_t at = (uint32_t)s->bankswitch[i] << 12;
+        uint8_t *p = at + 0x1000u <= s->rom_size ? s->rom + at : NULL;
+        if (p == c->bank_ptr[i]) continue;
+        if (!c->bank_map[i] && p) {
+            c->bank_map[i] = gemu_space_map_ram(c->bus, 0x8000u + 0x1000u * (unsigned)i, 0x1000, p, 0, 1);
+            if (c->bank_map[i]) gemu_mapping_set_name(c->bank_map[i], "ROM bank");
+        } else if (c->bank_map[i]) {
+            if (p) gemu_mapping_set_ptr(c->bank_map[i], p);
+            gemu_mapping_enable(c->bank_map[i], p != NULL);
+        }
+        c->bank_ptr[i] = p;
+    }
+}
+
+static bool um6578_bus_build(Um6578State *s) {
+    Um6578Core *c = s->core;
+    GemuSpace *b = c->bus = gemu_space_new(c->machine, "program", 16, 8, GEMU_LITTLE_ENDIAN);
+    if (!b) return false;
+    c->cache.space = b;
+    bool ok = gemu_space_map_ram(b, 0x0000, 0x2000, s->ram_lo, 0, 0) &&
+              gemu_space_map(b, 0x2000, 0x80, &ppu_handlers, s, 0, 0) &&
+              gemu_space_map(b, 0x4000, 0x50, &io_handlers, s, 0, 0) &&
+              gemu_space_map_ram(b, 0x5000, 0x3000, s->ram_hi, 0, 0) &&
+              gemu_space_map(b, 0x8000, 0x8000, &banks_handlers, s, 0, 0);
+    if (ok) um6578_banks_moved(s);
+    return ok;
+}
+
+static void um6578_board_describe(GemuDevice *d, char *buf, size_t len) {
+    const Um6578State *s = *(Um6578State **)d->priv;
+    snprintf(buf, len, "frame %llu; banks %02X %02X %02X %02X %02X %02X %02X %02X\n"
+             "IRQ mux: pending %02X, mask %02X; timer %02X (preset %02X, control %02X)",
+             (unsigned long long)s->frame, s->bankswitch[0], s->bankswitch[1], s->bankswitch[2],
+             s->bankswitch[3], s->bankswitch[4], s->bankswitch[5], s->bankswitch[6], s->bankswitch[7],
+             s->irq_pending, s->irq_mask, s->timer_count, s->timer_preset, s->timer_ctrl);
+}
+static void um6578_ppu_describe(GemuDevice *d, char *buf, size_t len) {
+    const Sh6578Ppu *p = &(*(Um6578State **)d->priv)->ppu;
+    snprintf(buf, len, "frame %llu, scanline %d\nCTRL %02X  MASK %02X  STATUS %02X  ext %02X  v %04X",
+             (unsigned long long)p->frame, p->scanline, p->ppuctrl, p->ppumask, p->ppustatus,
+             p->colsel_pntstart, p->v);
+}
+static void um6578_apu_describe(GemuDevice *d, char *buf, size_t len) {
+    const Apu2a03 *a = &(*(Um6578State **)d->priv)->apu;
+    snprintf(buf, len, "%s; channels %s%s%s%s%s", a->audio_dev ? "sound on" : "silent",
+             a->ch_en[0] ? "P1 " : "", a->ch_en[1] ? "P2 " : "", a->ch_en[2] ? "T " : "",
+             a->ch_en[3] ? "N " : "", a->ch_en[4] ? "DMC" : "");
+}
+static void um6578_cart_describe(GemuDevice *d, char *buf, size_t len) {
+    const Um6578State *s = *(Um6578State **)d->priv;
+    snprintf(buf, len, "%u KB image", (unsigned)(s->rom_size / 1024u));
+}
+
+static void um6578_board_post_load(GemuDevice *d);
+#define UM_TYPE(var, tname, tdesc, describe_fn) \
+    static const GemuDeviceType var = { .name = tname, .desc = tdesc, \
+        .size = sizeof(Um6578State *), .describe = describe_fn }
+static const GemuDeviceType um6578_board_type = {
+    .name = "um6578-board", .desc = "UMC UM6578 system (RAM, banks, DMA, IRQs, timer, ports)",
+    .size = sizeof(Um6578State *), .describe = um6578_board_describe, .post_load = um6578_board_post_load,
+};
+UM_TYPE(um6578_ppu_type, "sh6578-ppu", "SH6578 PPU", um6578_ppu_describe);
+UM_TYPE(um6578_apu_type, "um6578-apu", "2A03-compatible APU (UM6578's)", um6578_apu_describe);
+UM_TYPE(um6578_cart_type, "um6578-cart", "UM6578 cartridge image", um6578_cart_describe);
+
+/* "info": the image's size.  A state for another is refused. */
+static void cart_info_save(void *ud, GemuStateWriter *w) {
+    gemu_state_write_u32(w, ((Um6578State *)ud)->rom_size);
+}
+static bool cart_info_check(void *ud, GemuStateReader *r) {
+    uint32_t size;
+    if (gemu_state_left(r) != 4 || !gemu_state_read_u32(r, &size)) {
+        gemu_state_refuse(r, "um6578 cartridge: bad info item");
+        return false;
+    }
+    if (size != ((Um6578State *)ud)->rom_size) {
+        gemu_state_refuse(r, "um6578 cartridge: the state is for a %u KB image; this one is %u KB",
+                          size / 1024u, ((Um6578State *)ud)->rom_size / 1024u);
+        return false;
+    }
+    return true;
+}
+static bool cart_info_load(void *ud, GemuStateReader *r) { return cart_info_check(ud, r); }
+
+#define B(field) ok &= GEMU_STATE_MEMBER(d, "", s, field)
+/* The board's state.  Not saved: the host's input (held_actions, the
+ * pointer's positions, injection), the trace switches, the configuration. */
+static bool um6578_board_state(Um6578State *s, GemuDevice *d) {
+    bool ok = true;
+    B(ram_lo); B(ram_hi); B(bankswitch);
+    B(dma_control); B(dma_bank); B(dma_source); B(dma_dest); B(dma_length);
+    B(irq_mask); B(irq_pending);
+    B(timer_ctrl); B(timer_preset); B(timer_count); B(timer_prescale_acc);
+    B(mouse_synth_active); B(mouse_synth_x); B(mouse_synth_y); B(mouse_synth_left);
+    B(mouse_synth_right); B(mouse_prev_left); B(mouse_prev_right); B(mouse_stream_enabled);
+    B(mouse_param_cmd); B(mouse_cmd_resp); B(mouse_cmd_resp_len); B(mouse_cmd_resp_pos);
+    B(mouse_queue); B(mouse_qhead); B(mouse_qtail);
+    B(prev_io); B(iolatch); B(io_mouse_active); B(ppu_synced_cpu_cycle); B(frame);
+    return ok;
+}
+#undef B
+
+/* After a load: the bank windows; unsent samples dropped. */
+static void um6578_board_post_load(GemuDevice *d) {
+    Um6578State *s = *(Um6578State **)d->priv;
+    um6578_banks_moved(s);
+    s->apu.frame_n = 0;
+}
+
+static void um6578_step_insn(Um6578State *s);
+static bool um6578_stop_before(void *ud) {
+    Um6578State *s = ud;
+    return gemu_monitor_check_exec(s->monitor, s->cpu->PC);
+}
+static void um6578_insn(void *ud) { um6578_step_insn(ud); }
+static bool um6578_stop_after(void *ud) {
+    return gemu_monitor_is_paused(((Um6578State *)ud)->monitor);
+}
+static bool um6578_done(void *ud) { return ((Um6578State *)ud)->ppu.dirty; }
+
+static void um6578_screen_update(void *ud, GemuBitmap *bmp, const GemuRect *clip) {
+    const Um6578State *s = ud;
+    for (int y = clip->y0; y < clip->y1; y++)
+        memcpy(bmp->pix + (size_t)y * (size_t)bmp->stride, s->ppu.pixels_argb + (size_t)y * SH6578_WIDTH,
+               SH6578_WIDTH * sizeof(uint32_t));
+}
+
+/* The APU's samples as the mixer asks (as the NES's stream). */
+static void um6578_sound_update(void *ud, float *const *out, unsigned n) {
+    Um6578State *s = ud;
+    Apu2a03 *a = &s->apu;
+    unsigned have = (unsigned)a->frame_n, take = n < have ? n : have;
+    memcpy(out[0], a->frame_buf, take * sizeof(float));
+    float last = take ? out[0][take - 1] : (have ? a->frame_buf[0] : 0.0f);
+    for (unsigned i = take; i < n; i++) out[0][i] = last;
+    if (take < have) memmove(a->frame_buf, a->frame_buf + take, (have - take) * sizeof(float));
+    a->frame_n = (int)(have - take);
+}
+static void um6578_sound_out(void *ud, const float *samples, size_t frames) {
+    gemu_audio_queue(ud, samples, frames);
+}
+
+static GemuDevice *um6578_part(Um6578State *s, const GemuDeviceType *t, const char *name, const char *opts) {
+    GemuDevice *d = gemu_device_add(s->core->machine, t, name, NULL, opts);
+    if (d && t != &gemu_mos6502_type)
+        *(Um6578State **)d->priv = s;
+    return d;
+}
+
+static bool um6578_core_build(Um6578State *s) {
+    Um6578Core *c = s->core = calloc(1, sizeof *c);
+    if (!c || !(c->machine = gemu_machine_new("um6578")))
+        return false;
+    static const GemuDeviceType *const set_types[] = { &um6578_board_type };
+    char set[1][GEMU_OPTS_ROUTE_LEN], why[512];
+    if (!gemu_opts_route(s->cfg->machine_opts, set_types, 1, set, why, sizeof why)) {
+        fprintf(stderr, "gemu: %s\n", why);
+        return false;
+    }
+    static const char *const variant[] = { "6502", "2a03", "2a07", "6501", "6507" };
+    char cpu_opts[32];
+    snprintf(cpu_opts, sizeof cpu_opts, "variant=%s", variant[s->cfg->cpu]);
+    bool ok = (c->board = um6578_part(s, &um6578_board_type, "board", NULL)) &&
+              (c->cpu = um6578_part(s, &gemu_mos6502_type, "cpu", cpu_opts)) &&
+              (c->ppu = um6578_part(s, &um6578_ppu_type, "ppu", NULL)) &&
+              (c->apu = um6578_part(s, &um6578_apu_type, "apu", NULL)) &&
+              (c->cart = um6578_part(s, &um6578_cart_type, "cart", NULL)) &&
+              um6578_board_state(s, c->board) && ppu_sh6578_state_add(c->ppu, "", &s->ppu) &&
+              apu2a03_state_add(c->apu, "", &s->apu) &&
+              gemu_state_add_custom(c->cart, "info", cart_info_save, cart_info_check, cart_info_load, s) &&
+              gemu_state_add(c->cart, "image", s->rom, 1, s->rom_size);
+    if (!ok) {
+        fprintf(stderr, "um6578: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    bool inited = gemu_machine_init(c->machine);
+    if (inited) {
+        s->cpu = gemu_mos6502(c->cpu);
+        s->cpu->mem_read  = um6578_read;
+        s->cpu->mem_write = um6578_write;
+        s->cpu->mem_ud    = s;
+    }
+    GemuMos6502Hooks h = { .stop_before = um6578_stop_before, .insn = um6578_insn,
+                           .stop_after = um6578_stop_after, .done = um6578_done, .ud = s };
+    ok = inited && um6578_bus_build(s) && gemu_mos6502_exec(c->cpu, UM6578_EXEC_HZ, &h) &&
+         (c->irq = gemu_line_out(c->board, "irq")) && gemu_line_connect(c->irq, c->cpu, "irq", 0) &&
+         (c->nmi = gemu_line_out(c->ppu, "nmi")) && gemu_line_connect(c->nmi, c->cpu, "nmi", 0) &&
+         (c->screen = gemu_screen_new(c->ppu, "screen")) &&
+         gemu_screen_set_size(c->screen, SH6578_WIDTH, SH6578_HEIGHT) &&
+         (c->sound = gemu_stream_new(c->apu, "sound", 1, APU2A03_SAMPLE_RATE, um6578_sound_update, s));
+    if (ok) {
+        gemu_screen_set_update(c->screen, um6578_screen_update, s);
+        gemu_mixer_set_output(c->machine, APU2A03_SAMPLE_RATE, 1,
+                              s->apu.audio_dev ? um6578_sound_out : NULL, s->apu.audio_dev);
+    }
+    if (!ok || !gemu_machine_start(c->machine)) {
+        fprintf(stderr, "um6578: core machine: %s\n", gemu_machine_error(c->machine)[0]
+                ? gemu_machine_error(c->machine) : "a device couldn't be added");
+        return false;
+    }
+    gemu_monitor_attach_machine(s->monitor, c->machine, "program");
+    return true;
+}
+
+static void um6578_core_free(Um6578State *s) {
+    if (!s->core) return;
+    gemu_machine_free(s->core->machine);
+    free(s->core);
+    s->core = NULL;
+}
+
+/* One frame: the machine run until the PPU finishes one (or something
+ * stops it), a frame's cycles at a time; the frame's sound out through the
+ * mixer. */
+static void um6578_frame(Um6578State *s) {
+    Um6578Core *c = s->core;
+    s->ppu.dirty = false;
+    uint64_t cycles = (uint64_t)UM6578_LINES_TOTAL * 114u + 1u;
+    do {
+        gemu_machine_run_until(c->machine, gemu_machine_time(c->machine) +
+                               gemu_clocks(UM6578_EXEC_HZ, cycles));
+    } while (!s->ppu.dirty && gemu_mos6502_ended(c->cpu) != GEMU_MOS6502_STOPPED);
+    gemu_mixer_run(c->machine);
+    if (s->ppu.dirty) {
+        gemu_screen_frame_begin(c->screen);
+        s->frame++;
+    }
+}
 
 Um6578State *um6578_create(const MosConfig *cfg) {
     Um6578State *s = calloc(1, sizeof(*s));
@@ -850,14 +1169,6 @@ Um6578State *um6578_create(const MosConfig *cfg) {
 
     ppu_sh6578_init(&s->ppu, UM6578_CPU_HZ, UM6578_REFRESH_HZ, UM6578_LINES_TOTAL, UM6578_VBLANK_LINE);
 
-    mos6502_init(&s->cpu);
-    s->cpu.mem_read  = um6578_read;
-    s->cpu.mem_write = um6578_write;
-    s->cpu.mem_ud    = s;
-    mos_cpu_apply(&s->cpu, cfg->cpu);
-    /* real M6502 core on this hardware - decimal mode stays enabled
-     * (decimal_disable defaults false), unlike the NES's 2A03. */
-
     s->monitor = gemu_monitor_create();
     if (!s->monitor) { free(s->rom); free(s); return NULL; }
     gemu_monitor_set_screendump_cb(s->monitor, um6578_screendump, s);
@@ -876,6 +1187,12 @@ Um6578State *um6578_create(const MosConfig *cfg) {
             fprintf(stderr, "um6578: APU audio init failed (continuing silently)\n");
         s->apu.mem_read = um6578_apu_mem_read;
         s->apu.mem_ud   = s;
+    }
+
+    for (int i = 0; i < 8; i++) s->bankswitch[i] = (uint8_t)i;
+    if (!um6578_core_build(s)) {
+        um6578_destroy(s);
+        return NULL;
     }
 
     if (gemu_display_wanted(cfg->display_type)) {
@@ -898,13 +1215,13 @@ Um6578State *um6578_create(const MosConfig *cfg) {
         });
     }
 
-    for (int i = 0; i < 8; i++) s->bankswitch[i] = (uint8_t)i;
-    mos6502_reset(&s->cpu);
+    mos6502_reset(s->cpu);
     return s;
 }
 
 void um6578_destroy(Um6578State *s) {
     if (!s) return;
+    um6578_core_free(s);
     apu2a03_destroy(&s->apu);
     gemu_monitor_destroy(s->monitor);
     gemu_display_destroy(s->display);
@@ -916,12 +1233,12 @@ void um6578_destroy(Um6578State *s) {
 
 /* Execute one CPU instruction and bring the APU and PPU up to its cycle. */
 static void um6578_step_insn(Um6578State *s) {
-    uint64_t prev = s->cpu.cycle_count;
-    mos6502_step(&s->cpu);
-    uint64_t delta = s->cpu.cycle_count - prev;
+    uint64_t prev = s->cpu->cycle_count;
+    mos6502_step(s->cpu);
+    uint64_t delta = s->cpu->cycle_count - prev;
     for (uint64_t i = 0; i < delta; i++)
         if (s->apu.audio_dev) apu2a03_tick(&s->apu);
-    um6578_sync_ppu(s, s->cpu.cycle_count);
+    um6578_sync_ppu(s, s->cpu->cycle_count);
 }
 
 void um6578_run(Um6578State *s, const MosConfig *cfg) {
@@ -929,8 +1246,6 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
 
     bool quit = false;
     while (!quit) {
-        Uint32 t0 = SDL_GetTicks();
-
         uint32_t held = 0;
         if (s->display) {
             held = gemu_display_poll(s->display);
@@ -938,7 +1253,8 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
             if (gemu_display_reset_requested(s->display)) {
                 gemu_display_clear_flags(s->display);
                 for (int i = 0; i < 8; i++) s->bankswitch[i] = (uint8_t)i;
-                mos6502_reset(&s->cpu);
+                um6578_banks_moved(s);
+                mos6502_reset(s->cpu);
             }
         }
 
@@ -949,7 +1265,8 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
                 else { quit = true; break; }
             } else if (cmd == GEMU_MON_RESET) {
                 for (int i = 0; i < 8; i++) s->bankswitch[i] = (uint8_t)i;
-                mos6502_reset(&s->cpu);
+                um6578_banks_moved(s);
+                mos6502_reset(s->cpu);
             } else if (cmd == GEMU_MON_STEP) {
                 for (uint32_t n = gemu_monitor_step_count(s->monitor); n; n--)
                     um6578_step_insn(s);
@@ -961,26 +1278,24 @@ void um6578_run(Um6578State *s, const MosConfig *cfg) {
         um6578_handle_keys(s, held);
         um6578_mouse_frame_tick(s);
 
-        if (!gemu_monitor_is_paused(s->monitor)) {
-            s->ppu.dirty = false;
-            while (!s->ppu.dirty) {
-                if (gemu_monitor_check_exec(s->monitor, s->cpu.PC)) break;
-                um6578_step_insn(s);
-                if (gemu_monitor_is_paused(s->monitor)) break;
-            }
-            apu2a03_flush(&s->apu);
-            s->frame++;
+        bool paused = gemu_monitor_is_paused(s->monitor);
+        if (!paused) um6578_frame(s);
+
+        if (s->display) {
+            const GemuBitmap *b = gemu_screen_render(s->core->screen);
+            gemu_display_render(s->display, b->pix, b->width, b->height);
         }
 
-        if (s->display)
-            gemu_display_render(s->display, s->ppu.pixels_argb, SH6578_WIDTH, SH6578_HEIGHT);
-
-        Uint32 dt = SDL_GetTicks() - t0;
-        Uint32 frame_ms = 1000u / 60u;
-        if (dt < frame_ms) SDL_Delay(frame_ms - dt);
+        /* Pace to the machine's time; paused, a frame's delay. */
+        if (!paused) {
+            gemu_machine_pace(s->core->machine, 0);
+        } else {
+            gemu_machine_pace_reset(s->core->machine);
+            SDL_Delay(1000u / 60u);
+        }
     }
 
     gemu_monitor_stop(s->monitor);
     printf("um6578: %llu frames, %llu cpu cycles\n",
-           (unsigned long long)s->frame, (unsigned long long)s->cpu.cycle_count);
+           (unsigned long long)s->frame, (unsigned long long)s->cpu->cycle_count);
 }
